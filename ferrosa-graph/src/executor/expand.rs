@@ -31,6 +31,8 @@ struct MergeWriteShape {
 }
 
 struct MatchedTableRow {
+    key: DecoratedKey,
+    clustering: Vec<u8>,
     json: serde_json::Value,
 }
 
@@ -867,6 +869,8 @@ async fn find_edge_match(
             if row_source.as_deref() == Some(source_id) && row_target.as_deref() == Some(target_id)
             {
                 return Ok(Some(MatchedTableRow {
+                    key: partition.key.clone(),
+                    clustering: row.clustering.clone(),
                     json: row_to_json(meta, &partition, row),
                 }));
             }
@@ -898,12 +902,71 @@ async fn find_vertex_match(
                 continue;
             };
             if vertex_key.key.as_bytes() == neighbor_id {
-                return Ok(Some(MatchedTableRow { json: row_json }));
+                return Ok(Some(MatchedTableRow {
+                    key: partition.key.clone(),
+                    clustering: row.clustering.clone(),
+                    json: row_json,
+                }));
             }
         }
     }
 
     Ok(None)
+}
+
+async fn find_table_row_by_props(
+    write_path: &WritePath,
+    table_id: &TableId,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    props: &[(String, Expr)],
+    var_name: &str,
+) -> Result<Option<MatchedTableRow>> {
+    for partition in write_path.range_read(table_id).await? {
+        if is_partition_dead(&partition) {
+            continue;
+        }
+        for row in &partition.rows {
+            let row_json = row_to_json(meta, &partition, row);
+            if !prop_map_passes(var_name, props, &row_json)? {
+                continue;
+            }
+            return Ok(Some(MatchedTableRow {
+                key: partition.key.clone(),
+                clustering: row.clustering.clone(),
+                json: row_json,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn json_value_to_expr(value: &serde_json::Value) -> Option<Expr> {
+    match value {
+        serde_json::Value::String(s) => Some(Expr::Literal(Literal::String(s.clone()))),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(|i| Expr::Literal(Literal::Integer(i)))
+            .or_else(|| n.as_f64().map(|f| Expr::Literal(Literal::Float(f)))),
+        serde_json::Value::Bool(b) => Some(Expr::Literal(Literal::Bool(*b))),
+        serde_json::Value::Null => Some(Expr::Literal(Literal::Null)),
+        _ => None,
+    }
+}
+
+fn resolve_table_by_graph_label(
+    schema: &Schema,
+    keyspace: &str,
+    label: &str,
+) -> Option<ferrosa_schema::metadata::table::TableMetadata> {
+    let snap = schema.snapshot();
+    snap.tables.values().find_map(|meta| {
+        (meta.keyspace == keyspace
+            && meta
+                .extensions
+                .get("graph.label")
+                .is_some_and(|graph_label| graph_label == label))
+        .then(|| meta.clone())
+    })
 }
 
 /// Convert a `Literal` from the AST into raw bytes for storage.
@@ -1098,7 +1161,28 @@ async fn execute_merge(
             })
             .unwrap_or_default();
 
-        let shape = build_merge_write_shape(op, &op_set_props, schema, timestamp)?;
+        let mut shape = build_merge_write_shape(op, &op_set_props, schema, timestamp)?;
+        if !shape.used_schema_layout {
+            if let Some(schema_ref) = schema {
+                if let Some(inferred) = infer_schema_aware_merge_shape(
+                    write_path,
+                    op,
+                    &op_set_props,
+                    schema_ref,
+                    timestamp,
+                )
+                .await?
+                {
+                    shape = inferred;
+                } else if schema_merge_requires_hidden_key_resolution(op, &op_set_props, schema_ref)
+                {
+                    return Err(GraphError::Validation(format!(
+                        "MERGE on '{}.{}' is missing required scoped key columns; match existing scoped vertices or set the missing key properties explicitly",
+                        op.table.keyspace, op.table.table
+                    )));
+                }
+            }
+        }
         let key = shape.key.clone();
         let clustering = shape.clustering.clone();
 
@@ -1457,6 +1541,270 @@ fn build_schema_aware_merge_shape(
         create_cells,
         used_schema_layout: true,
     }))
+}
+
+async fn infer_schema_aware_merge_shape(
+    write_path: &WritePath,
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: &Schema,
+    timestamp: i64,
+) -> Result<Option<MergeWriteShape>> {
+    let snap = schema.snapshot();
+    let Some(meta) = snap
+        .tables
+        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+
+    let mut property_exprs: HashMap<String, Expr> = HashMap::new();
+    for (name, expr) in op.match_props.iter().chain(op.create_props.iter()) {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+    for (name, expr) in set_props {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+
+    if op.table.graph_type == "edge" {
+        if let Some(source_col) = meta.extensions.get("graph.source") {
+            if !property_exprs.contains_key(source_col) {
+                if let Some(source_type) = meta
+                    .columns
+                    .get(source_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.src_match_props.as_deref(),
+                        source_col,
+                        source_type,
+                    ) {
+                        property_exprs.insert(source_col.clone(), expr);
+                    }
+                }
+            }
+        }
+        if let Some(target_col) = meta.extensions.get("graph.target") {
+            if !property_exprs.contains_key(target_col) {
+                if let Some(target_type) = meta
+                    .columns
+                    .get(target_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.dst_match_props.as_deref(),
+                        target_col,
+                        target_type,
+                    ) {
+                        property_exprs.insert(target_col.clone(), expr);
+                    }
+                }
+            }
+        }
+
+        let source_match = if let (Some(source_label), Some(source_props)) = (
+            meta.extensions.get("graph.source_label"),
+            op.src_match_props.as_deref(),
+        ) {
+            if let Some(source_meta) =
+                resolve_table_by_graph_label(schema, &op.table.keyspace, source_label)
+            {
+                let source_tid = TableId::new(&source_meta.keyspace, &source_meta.name);
+                find_table_row_by_props(write_path, &source_tid, &source_meta, source_props, "src")
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let target_match = if let (Some(target_label), Some(target_props)) = (
+            meta.extensions.get("graph.target_label"),
+            op.dst_match_props.as_deref(),
+        ) {
+            if let Some(target_meta) =
+                resolve_table_by_graph_label(schema, &op.table.keyspace, target_label)
+            {
+                let target_tid = TableId::new(&target_meta.keyspace, &target_meta.name);
+                find_table_row_by_props(write_path, &target_tid, &target_meta, target_props, "dst")
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        for key_name in meta
+            .partition_key
+            .iter()
+            .chain(meta.clustering_key.iter().map(|(name, _)| name))
+        {
+            if property_exprs.contains_key(key_name) {
+                continue;
+            }
+
+            let source_value = source_match
+                .as_ref()
+                .and_then(|row| row.json.get(key_name))
+                .and_then(json_value_to_expr);
+            let target_value = target_match
+                .as_ref()
+                .and_then(|row| row.json.get(key_name))
+                .and_then(json_value_to_expr);
+
+            let inferred = match (source_value, target_value) {
+                (Some(src), Some(dst)) if src == dst => Some(src),
+                (Some(src), None) => Some(src),
+                (None, Some(dst)) => Some(dst),
+                _ => None,
+            };
+            if let Some(expr) = inferred {
+                property_exprs.insert(key_name.clone(), expr);
+            }
+        }
+    } else {
+        let table_tid = TableId::new(&meta.keyspace, &meta.name);
+        if let Some(existing) =
+            find_table_row_by_props(write_path, &table_tid, &meta, &op.match_props, "n").await?
+        {
+            return Ok(Some(MergeWriteShape {
+                key: existing.key,
+                clustering: existing.clustering,
+                create_cells: vec![],
+                used_schema_layout: true,
+            }));
+        }
+    }
+
+    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
+    for pk_name in &meta.partition_key {
+        let Some(expr) = property_exprs.get(pk_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(pk_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        partition_components.push(bytes);
+    }
+
+    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
+    for (ck_name, _) in &meta.clustering_key {
+        let Some(expr) = property_exprs.get(ck_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(ck_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        clustering_components.push(bytes);
+    }
+
+    let partition_key = encode_partition_components(&partition_components);
+    let clustering = encode_clustering_components(&clustering_components);
+    let mut create_cells = Vec::new();
+    let mut regular_idx = 0u16;
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some(expr) = property_exprs.get(&column.name) {
+                    let bytes = encode_expr_for_column_type(expr, &column.column_type)?;
+                    create_cells.push((regular_idx, CellValue::live(bytes, timestamp)));
+                }
+                regular_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Some(MergeWriteShape {
+        key: DecoratedKey::new(PartitionKey::new(partition_key)),
+        clustering,
+        create_cells,
+        used_schema_layout: true,
+    }))
+}
+
+fn schema_merge_requires_hidden_key_resolution(
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: &Schema,
+) -> bool {
+    let snap = schema.snapshot();
+    let Some(meta) = snap
+        .tables
+        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
+    else {
+        return false;
+    };
+
+    let mut property_names: std::collections::HashSet<String> = op
+        .match_props
+        .iter()
+        .chain(op.create_props.iter())
+        .map(|(name, _)| name.clone())
+        .collect();
+    property_names.extend(set_props.iter().map(|(name, _)| name.clone()));
+
+    if op.table.graph_type == "edge" {
+        if let Some(source_col) = meta.extensions.get("graph.source") {
+            if let Some(source_type) = meta
+                .columns
+                .get(source_col)
+                .map(|col| col.column_type.as_str())
+            {
+                if resolve_endpoint_property_expr(
+                    op.src_match_props.as_deref(),
+                    source_col,
+                    source_type,
+                )
+                .is_some()
+                {
+                    property_names.insert(source_col.clone());
+                }
+            }
+        }
+        if let Some(target_col) = meta.extensions.get("graph.target") {
+            if let Some(target_type) = meta
+                .columns
+                .get(target_col)
+                .map(|col| col.column_type.as_str())
+            {
+                if resolve_endpoint_property_expr(
+                    op.dst_match_props.as_deref(),
+                    target_col,
+                    target_type,
+                )
+                .is_some()
+                {
+                    property_names.insert(target_col.clone());
+                }
+            }
+        }
+    }
+
+    let mut saw_present = false;
+    let mut saw_missing = false;
+    for name in meta
+        .partition_key
+        .iter()
+        .chain(meta.clustering_key.iter().map(|(name, _)| name))
+    {
+        if property_names.contains(name) {
+            saw_present = true;
+        } else {
+            saw_missing = true;
+        }
+    }
+
+    saw_present && saw_missing
 }
 
 fn resolve_endpoint_property_expr(

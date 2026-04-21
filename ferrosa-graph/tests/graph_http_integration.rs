@@ -1947,6 +1947,8 @@ async fn full_shape_typed_edge_merge_materializes_real_agent_memory_row() {
     let (schema, storage, _dir) = setup();
     create_agent_memory_real_graph_schema(&schema);
     register_agent_memory_real_tables_with_storage(&storage);
+    seed_agent_memory_entity(&storage, tenant_id, session_id, src_id, "src");
+    seed_agent_memory_entity(&storage, tenant_id, session_id, dst_id, "dst");
 
     let query = format!(
         "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
@@ -2009,6 +2011,8 @@ async fn full_shape_typed_edge_merge_writes_real_agent_memory_adjacency() {
     let (schema, storage, _dir) = setup();
     create_agent_memory_real_graph_schema(&schema);
     register_agent_memory_real_tables_with_storage(&storage);
+    seed_agent_memory_entity(&storage, tenant_id, session_id, src_id, "src");
+    seed_agent_memory_entity(&storage, tenant_id, session_id, dst_id, "dst");
 
     let query = format!(
         "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
@@ -2108,6 +2112,93 @@ async fn full_shape_typed_edge_merge_is_immediately_matchable_in_real_agent_memo
     assert_eq!(
         count, 1,
         "real agent_memory graph rows must be immediately matchable after public MERGE"
+    );
+}
+
+#[tokio::test]
+async fn canonical_typed_edge_merge_infers_scope_from_existing_entities() {
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    seed_agent_memory_entity(&storage, tenant_id, session_id, src_id, "src");
+    seed_agent_memory_entity(&storage, tenant_id, session_id, dst_id, "dst");
+
+    let merge_query = format!(
+        "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
+         MERGE (b:Entity {{entity_id: '{dst_id}'}}) \
+         MERGE (a)-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->(b) \
+         SET r.weight = 1.0 \
+         RETURN r"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": merge_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let partition_key =
+        encode_composite_partition_key(&[tenant_id.as_bytes(), session_id.as_bytes()]);
+    let row_clustering =
+        encode_multi_clustering_key(&[src_id.as_bytes(), b"related_to", dst_id.as_bytes()]);
+    let partition = storage
+        .read(
+            &TableId::new("agent_memory", "typed_edges"),
+            &DecoratedKey::new(PartitionKey::new(partition_key)),
+        )
+        .unwrap()
+        .expect("typed_edges partition must exist after canonical MERGE using existing entities");
+    assert!(
+        partition.rows.iter().any(|row| row.clustering == row_clustering),
+        "canonical MERGE must infer tenant/session scope from matched entities and materialize the typed edge row",
+    );
+}
+
+#[tokio::test]
+async fn canonical_typed_edge_merge_without_scoped_entities_returns_validation_error() {
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+
+    let merge_query = format!(
+        "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
+         MERGE (b:Entity {{entity_id: '{dst_id}'}}) \
+         MERGE (a)-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->(b) \
+         SET r.weight = 1.0 \
+         RETURN r"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": merge_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "unscoped canonical MERGE must fail instead of acknowledging success without materializing a row"
     );
 }
 
