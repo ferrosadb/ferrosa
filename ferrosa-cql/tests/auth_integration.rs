@@ -393,7 +393,7 @@ fn seed_bootstrap_creates_three_roles() {
     // app_reader — not superuser, can login.
     let ar = snap
         .roles
-        .get("app_reader")
+        .get("ferrosa_user")
         .expect("app_reader role must be created by seed_default_roles");
     assert!(!ar.is_superuser, "app_reader must NOT be a superuser");
     assert!(ar.can_login, "app_reader must have LOGIN=true");
@@ -511,7 +511,7 @@ fn seed_bootstrap_roles_authenticate_with_default_passwords() {
     assert!(!ge.is_superuser);
 
     let ar = schema
-        .authenticate("app_reader", "ferrosa_user")
+        .authenticate("ferrosa_user", "ferrosa_user")
         .expect("app_reader must authenticate with password 'ferrosa_user'");
     assert!(!ar.is_superuser);
 }

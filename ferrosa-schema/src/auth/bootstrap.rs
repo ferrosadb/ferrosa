@@ -62,11 +62,21 @@ pub const SEED_ADMIN_PASSWORD: &str = "ferrosa_admin";
 /// Seed role name for the graph-engine internal service account.
 pub const SEED_GRAPH_ENGINE_USER: &str = "graph_engine";
 
-/// Seed role name for the application-layer read-only service account.
-pub const SEED_APP_READER_USER: &str = "app_reader";
+/// Seed role name for the application-layer normal-user account.
+///
+/// Historically named `app_reader`, renamed to `ferrosa_user` to match
+/// the documented public credential contract (see
+/// `specs/in-process/bug-seeded-ferrosa-user-cannot-authenticate-to-graph-http.md`
+/// and `specs/decisions/design-cql-role-auth-rollout.md`).
+pub const SEED_APP_READER_USER: &str = "ferrosa_user";
+
+/// Preferred name alias — matches the role-name string. New callers
+/// should prefer this. `SEED_APP_READER_USER` remains for backwards
+/// compatibility with existing call sites.
+pub const SEED_APP_USER: &str = SEED_APP_READER_USER;
 
 /// Default password shared by `SEED_GRAPH_ENGINE_USER` and
-/// `SEED_APP_READER_USER`. Same rotation guidance as `SEED_ADMIN_PASSWORD`.
+/// `SEED_APP_USER`. Same rotation guidance as `SEED_ADMIN_PASSWORD`.
 pub const SEED_APP_PASSWORD: &str = "ferrosa_user";
 
 /// Bootstrap the three default seed roles on a `Schema`.
@@ -296,6 +306,75 @@ mod tests {
         let schema = test_schema();
         seed_default_roles(&schema).unwrap();
         assert!(admin_password_is_default(&schema));
+    }
+
+    /// Bug: `ferrosa_user` / `ferrosa_user` is documented as the
+    /// public normal-user credential but was never seeded — prior
+    /// bootstrap seeded `app_reader` under the same password instead,
+    /// so clients using the documented `ferrosa_user` login got
+    /// "authentication failed" on the graph HTTP endpoint. See
+    /// `specs/in-process/bug-seeded-ferrosa-user-cannot-authenticate-to-graph-http.md`.
+    #[test]
+    fn seeded_ferrosa_user_role_exists_after_bootstrap() {
+        let schema = test_schema();
+        seed_default_roles(&schema).unwrap();
+        let snap = schema.snapshot();
+        assert!(
+            snap.roles.contains_key(SEED_APP_USER),
+            "ferrosa_user role must be seeded — see bug-seeded-ferrosa-user-cannot-authenticate-to-graph-http.md"
+        );
+        let role = snap.roles.get(SEED_APP_USER).unwrap();
+        assert!(role.can_login, "ferrosa_user must be a LOGIN role");
+        assert!(!role.is_superuser, "ferrosa_user must NOT be a superuser");
+    }
+
+    #[test]
+    fn seeded_ferrosa_user_authenticates_with_default_password() {
+        let schema = test_schema();
+        seed_default_roles(&schema).unwrap();
+        // The same authentication path the graph HTTP endpoint takes.
+        let auth_ctx = schema
+            .authenticate(SEED_APP_USER, SEED_APP_PASSWORD)
+            .expect("ferrosa_user must authenticate with its default password");
+        assert_eq!(auth_ctx.role, SEED_APP_USER);
+    }
+
+    #[test]
+    fn seeded_ferrosa_user_has_select_on_graph_tables() {
+        let schema = test_schema();
+        seed_default_roles(&schema).unwrap();
+        let snap = schema.snapshot();
+        let auth = AuthContext {
+            role: SEED_APP_USER.to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+
+        for table in AGENT_MEMORY_GRAPH_TABLES {
+            let resource = Resource::Table("agent_memory".to_string(), table.to_string());
+            assert!(
+                check_permission(&snap, &auth, Permission::Select, &resource).is_ok(),
+                "ferrosa_user must have SELECT on agent_memory.{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_ferrosa_user_does_not_have_modify_on_graph_tables() {
+        let schema = test_schema();
+        seed_default_roles(&schema).unwrap();
+        let snap = schema.snapshot();
+        let auth = AuthContext {
+            role: SEED_APP_USER.to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        let resource =
+            Resource::Table("agent_memory".to_string(), "typed_edges".to_string());
+        assert!(
+            check_permission(&snap, &auth, Permission::Modify, &resource).is_err(),
+            "ferrosa_user must NOT have MODIFY on graph tables"
+        );
     }
 
     // ── Grant matrix tests ────────────────────────────────────────────────────

@@ -129,8 +129,8 @@ fn auth_warn_permits_but_logs_on_denial() {
 
     let schema = make_schema();
     // Role exists with NO grants on the target table.
-    seed_role(&schema, "app_reader", vec![]);
-    let ctx = normal_ctx("app_reader");
+    seed_role(&schema, "ferrosa_user", vec![]);
+    let ctx = normal_ctx("ferrosa_user");
     let resource = Resource::Table("agent_memory".into(), "typed_edges".into());
 
     let (result, logs) = with_log_capture(|_| {
@@ -153,7 +153,7 @@ fn auth_warn_permits_but_logs_on_denial() {
         "log line must be tagged 'WARN MODE' so operators can grep for soak-mode denials. got:\n{logs}"
     );
     assert!(
-        logs.contains("app_reader"),
+        logs.contains("ferrosa_user"),
         "log must mention the role. got:\n{logs}"
     );
     assert!(
@@ -167,7 +167,7 @@ fn auth_warn_permits_but_logs_on_denial() {
 
     let snap = warn_denial_stats();
     assert_eq!(snap.total, 1, "counter must have ticked once, got {snap:?}");
-    assert_eq!(snap.by_role.get("app_reader").copied(), Some(1));
+    assert_eq!(snap.by_role.get("ferrosa_user").copied(), Some(1));
     assert_eq!(
         snap.by_resource
             .get("table agent_memory.typed_edges")

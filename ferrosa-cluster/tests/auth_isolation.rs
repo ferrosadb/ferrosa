@@ -25,7 +25,7 @@ use ferrosa_schema::{
 
 const ADMIN_USER: &str = "ferrosa_admin";
 const ADMIN_PASS: &str = "ferrosa_admin";
-const APP_USER: &str = "app_reader";
+const APP_USER: &str = "ferrosa_user";
 const APP_PASS: &str = "ferrosa_user";
 
 /// Build a Schema configured for auth tests (permissive policy, Bcrypt cost 4
