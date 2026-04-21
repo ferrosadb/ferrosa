@@ -20,6 +20,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod cql_broadcast;
 mod runtime;
 mod web;
 
@@ -598,52 +599,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_tls: cql_require_tls == "true" || cql_require_tls == "1",
         ..ferrosa_cql::server::ServerConfig::default()
     };
-    // Determine the advertised CQL address for system.local.rpc_address.
-    // CQL drivers use this to create connection pools, so it must be a
-    // reachable address (not 0.0.0.0).
-    let cql_broadcast_addr = match std::env::var("FERROSA_CQL_BROADCAST") {
-        Ok(addr_str) => addr_str
-            .parse::<std::net::IpAddr>()
-            .or_else(|_| {
-                // Try parsing as SocketAddr (ip:port) and extract IP.
-                addr_str.parse::<std::net::SocketAddr>().map(|sa| sa.ip())
-            })
-            .or_else(|_: std::net::AddrParseError| {
-                // Try DNS resolution for hostnames like "host.containers.internal:19043".
-                // Strip the port if present, resolve the hostname, use the first result.
-                let host = addr_str
-                    .rsplit_once(':')
-                    .map_or(addr_str.as_str(), |(h, _)| h);
-                use std::net::ToSocketAddrs;
-                format!("{host}:0")
-                    .to_socket_addrs()
-                    .map_err(|_| "dns failed".parse::<std::net::IpAddr>().unwrap_err())
-                    .and_then(|mut addrs| {
-                        addrs
-                            .next()
-                            .map(|sa| sa.ip())
-                            .ok_or_else(|| "no addrs".parse::<std::net::IpAddr>().unwrap_err())
-                    })
-            })
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    "FERROSA_CQL_BROADCAST={addr_str} could not be resolved, \
-                         falling back to 127.0.0.1"
-                );
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            }),
+    // Determine the advertised CQL address+port for system.local.
+    // Both are what drivers like cdrs-tokio use to reconcile contact
+    // points against the advertised local node during session bootstrap;
+    // advertising the container-bind port (9042) when the host-reachable
+    // port is 19042 hangs session build. See cql_broadcast::parse_cql_broadcast.
+    let (cql_broadcast_addr, cql_broadcast_port) = match std::env::var("FERROSA_CQL_BROADCAST") {
+        Ok(addr_str) => cql_broadcast::parse_cql_broadcast(&addr_str, cql_bind.port()),
         Err(_) => {
-            if cql_bind.ip().is_unspecified() {
-                // 0.0.0.0 → substitute 127.0.0.1 as safe local default.
+            let ip = if cql_bind.ip().is_unspecified() {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
             } else {
                 cql_bind.ip()
-            }
+            };
+            (ip, cql_bind.port())
         }
     };
+    tracing::info!(
+        broadcast_address = %cql_broadcast_addr,
+        broadcast_port = cql_broadcast_port,
+        bind_port = cql_bind.port(),
+        "CQL broadcast configured — clients will reconnect via this address"
+    );
     let node_config = Arc::new(ferrosa_schema::NodeConfig {
         rpc_address: cql_broadcast_addr,
-        rpc_port: cql_bind.port(),
+        rpc_port: cql_broadcast_port,
         host_id,
         listen_port: internode_addr.port(),
         ..ferrosa_schema::NodeConfig::default()
