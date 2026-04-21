@@ -78,7 +78,7 @@ fn peer_connect_transitions_to_pair() {
 
     // Create a PeerManager and set it
     let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
-    controller.set_peer_manager(pm);
+    controller.set_peer_manager(pm.clone());
 
     // Simulate peer connection
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
@@ -108,7 +108,7 @@ fn peer_disconnect_transitions_to_degraded() {
     );
 
     let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
-    controller.set_peer_manager(pm);
+    controller.set_peer_manager(pm.clone());
 
     // Connect then disconnect
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
@@ -164,7 +164,7 @@ async fn promote_from_degraded_pair_restores_writes() {
     );
 
     let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
-    controller.set_peer_manager(pm);
+    controller.set_peer_manager(pm.clone());
 
     // Enter pair mode via inbound connection (Primary)
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
@@ -621,11 +621,15 @@ async fn existing_cluster_member_does_not_queue_duplicate_join() {
     );
 
     let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
-    controller.set_peer_manager(pm);
+    controller.set_peer_manager(pm.clone());
 
     controller.on_peer_connected((peer1_id, "127.0.0.1:7001".parse().unwrap()));
     controller.on_peer_connected((peer2_id, "127.0.0.2:7002".parse().unwrap()));
     assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    pm.add_peer_entry((peer2_id, "127.0.0.2:7002".parse().unwrap()))
+        .await;
+    controller.pending_joins.lock().clear();
 
     // peer2 is already part of the seeded ring for this cluster transition.
     controller.on_peer_connected((peer2_id, "127.0.0.2:7002".parse().unwrap()));
@@ -634,6 +638,49 @@ async fn existing_cluster_member_does_not_queue_duplicate_join() {
     assert!(
         !pending.contains(&peer2_id),
         "existing cluster members must not queue duplicate join work"
+    );
+}
+
+#[tokio::test]
+async fn existing_cluster_member_without_outbound_pool_requeues_join_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        auto_join: true,
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm.clone());
+
+    controller.on_peer_connected((peer1_id, "127.0.0.1:7001".parse().unwrap()));
+    controller.on_peer_connected((peer2_id, "127.0.0.2:7002".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    pm.remove_peer(peer2_id).await;
+    controller.on_peer_connected((peer2_id, "127.0.0.2:7002".parse().unwrap()));
+
+    let pending = controller.pending_joins.lock();
+    assert!(
+        pending.contains(&peer2_id),
+        "existing cluster members must rebuild outbound peer pools after reconnect"
     );
 }
 

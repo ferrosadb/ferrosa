@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use ferrosa_net::pool::PriorityPool;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -267,6 +268,11 @@ impl ModeController {
         addr: std::net::SocketAddr,
         cql_broadcast: Option<String>,
     ) {
+        let peer_manager = self.peer_manager.load().as_ref().as_ref().cloned();
+        let has_outbound_peer = peer_manager
+            .as_ref()
+            .map(|pm| pm.has_peer(host_id))
+            .unwrap_or(false);
         let peer_node_id = uuid_to_node_id(host_id);
         let existing_member = self
             .token_ring()
@@ -274,7 +280,9 @@ impl ModeController {
             .and_then(|ring| ring.get_node(peer_node_id).cloned());
 
         if let Some(existing) = existing_member.as_ref() {
-            if !cluster_member_metadata_changed(existing, addr, cql_broadcast.as_deref()) {
+            if !cluster_member_metadata_changed(existing, addr, cql_broadcast.as_deref())
+                && has_outbound_peer
+            {
                 tracing::debug!(
                     peer = %host_id,
                     node_id = peer_node_id,
@@ -318,8 +326,46 @@ impl ModeController {
         let config_clone = self.config.clone();
         let existing_member = existing_member.clone();
         let cql_broadcast = cql_broadcast.clone();
+        let peer_manager = peer_manager.clone();
+        let net_config = self.net_config.clone();
+        let local_host_id = self.local_host_id;
+        let raft_runtime = self.raft_runtime.get().cloned();
+        let data_runtime = self.data_runtime.get().cloned();
 
         self.spawn_tracked(async move {
+            if let Some(pm) = peer_manager.as_ref() {
+                if !pm.has_peer(host_id) {
+                    match PriorityPool::connect(
+                        net_config.clone(),
+                        local_host_id,
+                        &addr.to_string(),
+                        raft_runtime.as_deref(),
+                        data_runtime.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(pool) => {
+                            pm.add_peer((host_id, addr), pool).await;
+                            tracing::info!(
+                                peer = %host_id,
+                                %addr,
+                                "cluster member reverse connection established before join refresh"
+                            );
+                        }
+                        Err(e) => {
+                            clear_pending_join(&pending_joins, host_id);
+                            tracing::warn!(
+                                peer = %host_id,
+                                %addr,
+                                %e,
+                                "failed to establish reverse connection for cluster member"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+
             let mut raft = None;
             for attempt in 0..60 {
                 if let Some(r) = &**raft_instance.load() {
