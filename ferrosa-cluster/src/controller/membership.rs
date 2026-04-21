@@ -276,6 +276,24 @@ impl ModeController {
                 }
             };
 
+            let mut leader = None;
+            for attempt in 0..60 {
+                if let Some(lid) = raft.current_leader().await {
+                    leader = Some(lid);
+                    break;
+                }
+                let backoff =
+                    std::time::Duration::from_millis(if attempt < 10 { 100 } else { 500 });
+                tokio::time::sleep(backoff).await;
+            }
+            let Some(leader) = leader else {
+                tracing::warn!(
+                    peer = %host_id,
+                    "raft leader not elected yet, cannot admit peer — will retry on next connect"
+                );
+                return;
+            };
+
             // Propose JoinNode via Raft.
             let node_info = NodeInfo {
                 host_id,
@@ -291,7 +309,7 @@ impl ModeController {
                 schema_version: Uuid::new_v4(),
             };
             if let Err(e) = raft.client_write(join_cmd).await {
-                tracing::warn!(peer = %host_id, %e, "JoinNode proposal failed");
+                tracing::warn!(peer = %host_id, leader, %e, "JoinNode proposal failed");
                 return;
             }
 
@@ -309,13 +327,14 @@ impl ModeController {
                 schema_version: Uuid::new_v4(),
             };
             if let Err(e) = raft.client_write(assign_cmd).await {
-                tracing::warn!(peer = %host_id, %e, "AssignTokens proposal failed");
+                tracing::warn!(peer = %host_id, leader, %e, "AssignTokens proposal failed");
                 return;
             }
 
             tracing::info!(
                 peer = %host_id,
                 node_id = peer_node_id,
+                leader,
                 "peer admitted to cluster via on_peer_connected"
             );
         });

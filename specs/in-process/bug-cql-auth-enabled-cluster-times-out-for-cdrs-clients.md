@@ -26,7 +26,7 @@ path.
 
 ## Observed on
 
-- Ferrosa commit: `2faab48` (re-verified), previously `3f868db` and `6fce814`
+- Ferrosa commit: `fe11d50` (re-verified), previously `2faab48`, `3f868db`, and `6fce814`
 - Cluster: local 3-node podman cluster from
   `/Users/bkearns/src/ferrosa-memory/docker-compose.yml`
 - Auth: enabled
@@ -223,7 +223,7 @@ match the real failing path much more closely:
 
 ### Result on rebuilt cluster
 
-Rebuilt local cluster from Ferrosa commit `2faab48`, then ran:
+Rebuilt local cluster from Ferrosa commit `fe11d50`, then ran:
 
 ```bash
 FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-memory-core --test cql_live \
@@ -272,7 +272,7 @@ The current best hypothesis is:
 That keeps this issue open even though the four handshake regressions
 are green.
 
-## Workbench confirmation on `2faab48`
+## Workbench confirmation on `fe11d50`
 
 With `ferrosa-memory-mcp` restarted against the rebuilt local cluster:
 
@@ -284,7 +284,7 @@ With `ferrosa-memory-mcp` restarted against the rebuilt local cluster:
 - `POST /workbench/api/sparql/query` still succeeds
 
 So the live application symptom and the focused repro tests still line up on
-`2faab48`.
+`fe11d50`.
 
 ## Second root cause + fix (2026-04-21)
 

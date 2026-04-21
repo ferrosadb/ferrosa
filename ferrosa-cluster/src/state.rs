@@ -27,6 +27,7 @@ impl ClusterState for SingleNodeClusterState {
 pub struct PairClusterState {
     config: Arc<ClusterConfig>,
     state: Arc<RwLock<PairState>>,
+    broadcast_resolver: Option<Arc<dyn BroadcastResolver>>,
     /// Cached peers result — returned on `RwLock` contention instead of
     /// an empty vec. Updated each time `peers()` successfully reads state.
     cached_peers: ArcSwap<Vec<PeerInfo>>,
@@ -37,6 +38,20 @@ impl PairClusterState {
         Self {
             config,
             state,
+            broadcast_resolver: None,
+            cached_peers: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+
+    pub fn with_peer_manager(
+        config: Arc<ClusterConfig>,
+        state: Arc<RwLock<PairState>>,
+        peer_manager: Arc<ferrosa_net::peer::PeerManager>,
+    ) -> Self {
+        Self {
+            config,
+            state,
+            broadcast_resolver: Some(peer_manager as Arc<dyn BroadcastResolver>),
             cached_peers: ArcSwap::from_pointee(Vec::new()),
         }
     }
@@ -53,6 +68,23 @@ impl ClusterState for PairClusterState {
         let peer_addr = state.peer_addr;
         let ip = peer_addr.ip();
         let port = peer_addr.port();
+        let peer_broadcast = self
+            .broadcast_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve_broadcast(state.peer_host_id));
+        let (native_addr, native_port) = if let Some(ref broadcast) = peer_broadcast {
+            parse_addr(broadcast).unwrap_or((ip, 9042))
+        } else {
+            (ip, 9042)
+        };
+        let peer_node_id = crate::raft::uuid_to_node_id(state.peer_host_id);
+        let tokens: Vec<String> = crate::controller::deterministic_tokens_for_node(
+            peer_node_id,
+            self.config.num_tokens as usize,
+        )
+        .into_iter()
+        .map(|t| t.to_string())
+        .collect();
 
         let result = vec![PeerInfo {
             peer: ip,
@@ -62,10 +94,10 @@ impl ClusterState for PairClusterState {
             host_id: state.peer_host_id,
             preferred_ip: None,
             preferred_port: None,
-            native_address: ip,
-            native_port: 9042,
+            native_address: native_addr,
+            native_port,
             schema_version: uuid::Uuid::nil(),
-            tokens: vec![],
+            tokens,
             release_version: ferrosa_schema::system::RELEASE_VERSION.to_string(),
         }];
 
@@ -215,6 +247,30 @@ mod tests {
         assert_eq!(peers[0].host_id, peer_id);
         assert_eq!(peers[0].peer, "10.0.1.5".parse::<IpAddr>().unwrap());
         assert_eq!(peers[0].peer_port, 7000);
+    }
+
+    #[test]
+    fn pair_cluster_state_populates_deterministic_tokens_for_peer() {
+        let config = Arc::new(ClusterConfig::default());
+        let peer_id = Uuid::new_v4();
+        let peer_addr = "10.0.1.5:7000".parse().unwrap();
+        let state = Arc::new(RwLock::new(PairState::new(
+            PairRole::Primary,
+            peer_id,
+            peer_addr,
+        )));
+        let cluster_state = PairClusterState::new(config, state);
+
+        let peers = cluster_state.peers();
+        assert_eq!(peers.len(), 1);
+        assert!(
+            !peers[0].tokens.is_empty(),
+            "pair-mode peer rows must carry tokens so cdrs-tokio accepts them"
+        );
+        for tok in &peers[0].tokens {
+            tok.parse::<i64>()
+                .expect("pair-mode token strings must round-trip through i64");
+        }
     }
 
     /// Pin the bug fix from
@@ -501,6 +557,46 @@ mod tests {
             "without PeerManager, native_address must be the container IP"
         );
         assert_eq!(peers[0].native_port, 9042);
+    }
+
+    #[tokio::test]
+    async fn pair_cluster_state_uses_peer_manager_broadcast_for_native_address() {
+        use ferrosa_net::config::NetConfig;
+        use ferrosa_net::peer::PeerManager;
+
+        struct NoopListener;
+        impl ferrosa_net::peer::PeerEventListener for NoopListener {
+            fn on_peer_connected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_disconnected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_suspected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_recovered(&self, _: uuid::Uuid) {}
+            fn on_peer_failed(&self, _: uuid::Uuid) {}
+        }
+
+        let config = Arc::new(ClusterConfig::default());
+        let peer_id = Uuid::new_v4();
+        let peer_addr = "172.17.0.3:7000".parse().unwrap();
+        let state = Arc::new(RwLock::new(PairState::new(
+            PairRole::Primary,
+            peer_id,
+            peer_addr,
+        )));
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        pm.set_peer_cql_broadcast(peer_id, "127.0.0.1:19043".to_string())
+            .await;
+
+        let cluster_state = PairClusterState::with_peer_manager(config, state, pm);
+        let peers = cluster_state.peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].native_address,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(peers[0].native_port, 19043);
     }
 
     /// BUG-020: system.peers release_version must match system.local

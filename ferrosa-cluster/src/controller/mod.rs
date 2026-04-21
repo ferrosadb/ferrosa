@@ -18,6 +18,7 @@ mod pair;
 mod peer_events;
 mod token;
 
+pub(crate) use token::deterministic_tokens_for_node;
 #[cfg(test)]
 pub(crate) use token::generate_deterministic_token;
 

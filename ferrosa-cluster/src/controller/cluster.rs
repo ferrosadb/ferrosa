@@ -776,64 +776,6 @@ impl ModeController {
                 if let Err(e) = raft_arc.initialize(members).await {
                     tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
                 }
-
-                // After Raft is initialized, the seed authors a canonical
-                // RaftOp::JoinNode + RaftOp::AssignTokens for every peer
-                // it knows about. These commands replicate via AppendEntries
-                // and apply on every node's state machine, calling sync_ring()
-                // to rebuild the live ring from canonical state.
-                //
-                // Closes bug-token-ring-inconsistency-causes-data-scatter.md:
-                // followers no longer derive token ownership from their local
-                // (possibly stale) view of `peers` — they apply the seed-
-                // authored Raft commands directly. Tokens are computed from
-                // peer node_id (pure function), so they're identical to what
-                // each peer would generate for itself.
-                let seed_num_tokens = config_for_promotion.num_tokens as usize;
-                for (peer_uuid, addr) in &peers {
-                    let peer_node_id = uuid_to_node_id(*peer_uuid);
-                    let node_info = crate::raft::NodeInfo {
-                        host_id: *peer_uuid,
-                        addr: addr.to_string(),
-                        data_center: config_for_promotion.data_center.clone(),
-                        rack: config_for_promotion.rack.clone(),
-                        state: crate::raft::NodeState::Normal,
-                        cql_broadcast: None,
-                    };
-                    let join_cmd = crate::raft::RaftCommand {
-                        op: crate::raft::RaftOp::JoinNode(node_info),
-                        schema_version: Uuid::new_v4(),
-                    };
-                    if let Err(e) = raft_arc.client_write(join_cmd).await {
-                        tracing::warn!(
-                            peer = %peer_uuid,
-                            %e,
-                            "seed: JoinNode for peer failed during transition_to_cluster"
-                        );
-                    }
-                    let peer_tokens = crate::controller::token::deterministic_tokens_for_node(
-                        peer_node_id,
-                        seed_num_tokens,
-                    );
-                    let assign_cmd = crate::raft::RaftCommand {
-                        op: crate::raft::RaftOp::AssignTokens {
-                            node_id: peer_node_id,
-                            tokens: peer_tokens,
-                        },
-                        schema_version: Uuid::new_v4(),
-                    };
-                    if let Err(e) = raft_arc.client_write(assign_cmd).await {
-                        tracing::warn!(
-                            peer = %peer_uuid,
-                            %e,
-                            "seed: AssignTokens for peer failed during transition_to_cluster"
-                        );
-                    }
-                }
-                tracing::info!(
-                    peer_count = peers.len(),
-                    "seed: submitted JoinNode + AssignTokens via Raft for every peer"
-                );
             } else {
                 tracing::info!("non-seed node — skipping raft.initialize(), waiting for leader AppendEntries");
             }
@@ -856,6 +798,60 @@ impl ModeController {
                         leader = lid,
                         "raft leader elected, swapping DDL path to Cluster"
                     );
+                    if was_seed {
+                        // Author peer topology only AFTER a leader exists.
+                        // Firing client_write() immediately after initialize()
+                        // races with leader election and yields
+                        // "has to forward request to: None, None" on the seed.
+                        let seed_num_tokens = config_for_promotion.num_tokens as usize;
+                        for (peer_uuid, addr) in &peers {
+                            let peer_node_id = uuid_to_node_id(*peer_uuid);
+                            let node_info = crate::raft::NodeInfo {
+                                host_id: *peer_uuid,
+                                addr: addr.to_string(),
+                                data_center: config_for_promotion.data_center.clone(),
+                                rack: config_for_promotion.rack.clone(),
+                                state: crate::raft::NodeState::Normal,
+                                cql_broadcast: None,
+                            };
+                            let join_cmd = crate::raft::RaftCommand {
+                                op: crate::raft::RaftOp::JoinNode(node_info),
+                                schema_version: Uuid::new_v4(),
+                            };
+                            if let Err(e) = raft_arc.client_write(join_cmd).await {
+                                tracing::warn!(
+                                    peer = %peer_uuid,
+                                    leader = lid,
+                                    %e,
+                                    "seed: JoinNode for peer failed after leader election"
+                                );
+                            }
+                            let peer_tokens = crate::controller::token::deterministic_tokens_for_node(
+                                peer_node_id,
+                                seed_num_tokens,
+                            );
+                            let assign_cmd = crate::raft::RaftCommand {
+                                op: crate::raft::RaftOp::AssignTokens {
+                                    node_id: peer_node_id,
+                                    tokens: peer_tokens,
+                                },
+                                schema_version: Uuid::new_v4(),
+                            };
+                            if let Err(e) = raft_arc.client_write(assign_cmd).await {
+                                tracing::warn!(
+                                    peer = %peer_uuid,
+                                    leader = lid,
+                                    %e,
+                                    "seed: AssignTokens for peer failed after leader election"
+                                );
+                            }
+                        }
+                        tracing::info!(
+                            peer_count = peers.len(),
+                            leader = lid,
+                            "seed: submitted JoinNode + AssignTokens via Raft for every peer"
+                        );
+                    }
                     // Register the cluster DDL forward handler so that when a
                     // non-leader forwards a PairDdlForward to the leader, the
                     // leader proposes it through Raft rather than applying

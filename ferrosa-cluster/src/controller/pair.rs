@@ -108,11 +108,13 @@ impl ModeController {
             peer_host_id,
             peer_addr,
         )));
-        self.cluster_state
-            .store(Arc::new(ClusterStateHolder::Pair(PairClusterState::new(
+        self.cluster_state.store(Arc::new(ClusterStateHolder::Pair(
+            PairClusterState::with_peer_manager(
                 self.config.clone(),
                 pair_state,
-            ))));
+                peer_manager.clone(),
+            ),
+        )));
 
         // Store pair context for switchover/promote
         *self.pair_context.lock() = Some(PairContext {
