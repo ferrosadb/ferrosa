@@ -97,6 +97,15 @@ impl ModeController {
                 return;
             }
         };
+        let peer_cql_broadcasts: std::collections::HashMap<Uuid, Option<String>> = peers
+            .iter()
+            .map(|(peer_uuid, _)| {
+                (
+                    *peer_uuid,
+                    peer_manager.get_peer_cql_broadcast_sync(*peer_uuid),
+                )
+            })
+            .collect();
 
         // Determine whether this node is the seed (responsible for calling
         // raft.initialize()). The seed is the node with the highest UUID among
@@ -241,9 +250,10 @@ impl ModeController {
                     // as Joining caused every coordinator to only consider ITSELF
                     // as a valid replica, scattering writes across all nodes.
                     state: NodeState::Normal,
-                    // Peer's cql_broadcast is unknown at this point; it will be
-                    // propagated through Raft NodeInfo once the peer joins.
-                    cql_broadcast: None,
+                    // Prefer the CQL broadcast learned during the internode
+                    // handshake so the first system.peers view after cluster
+                    // formation already advertises host-reachable endpoints.
+                    cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
                 },
             );
         }
@@ -812,7 +822,10 @@ impl ModeController {
                                 data_center: config_for_promotion.data_center.clone(),
                                 rack: config_for_promotion.rack.clone(),
                                 state: crate::raft::NodeState::Normal,
-                                cql_broadcast: None,
+                                cql_broadcast: peer_cql_broadcasts
+                                    .get(peer_uuid)
+                                    .cloned()
+                                    .flatten(),
                             };
                             let join_cmd = crate::raft::RaftCommand {
                                 op: crate::raft::RaftOp::JoinNode(node_info),
