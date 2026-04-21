@@ -369,8 +369,7 @@ mod tests {
             is_superuser: false,
             must_change_password: false,
         };
-        let resource =
-            Resource::Table("agent_memory".to_string(), "typed_edges".to_string());
+        let resource = Resource::Table("agent_memory".to_string(), "typed_edges".to_string());
         assert!(
             check_permission(&snap, &auth, Permission::Modify, &resource).is_err(),
             "ferrosa_user must NOT have MODIFY on graph tables"

@@ -93,3 +93,47 @@ It should not hang until timeout on session establishment.
 SELECT * FROM agent_memory.entity_store LIMIT 1
 ```
 
+## Investigation (2026-04-20)
+
+Reproduction was **attempted against HEAD via four new regression tests
+in `ferrosa-cql/tests/handshake.rs`** and none of them fail:
+
+- `seeded_ferrosa_admin_can_authenticate_over_v4_tcp` — full STARTUP →
+  AUTHENTICATE → AUTH_RESPONSE → AUTH_SUCCESS with seeded roles.
+- `seeded_ferrosa_user_can_authenticate_over_v4_tcp` — same for the
+  other seeded role.
+- `cdrs_tokio_shaped_handshake_options_then_startup_then_auth` — adds
+  the OPTIONS → SUPPORTED prelude cdrs-tokio sends before STARTUP.
+- `cdrs_tokio_startup_with_lz4_compression_completes_handshake` —
+  STARTUP advertises `COMPRESSION=lz4`, asserts AUTH_SUCCESS goes out
+  UNCOMPRESSED (compression flip only happens after AUTH_SUCCESS per
+  CQL spec, so this pins server behavior).
+
+All four pass. Handshake is correct for both v4 raw TCP and the
+cdrs-tokio-shaped sequence, including LZ4 negotiation.
+
+**Running cluster image is stale.** The podman image the bug reproduced
+against was built at `2026-04-19 11:05 PDT` from a working tree that
+predates:
+
+- `6fce814` — writer Gate A + Gate B (restored from next-writervalidate image)
+- `7f8c98f` — adjacency keyspace/table registered before observer starts
+- `ddb4eba` — renamed seeded role `app_reader` → `ferrosa_user`
+
+Before re-filing, **rebuild the cluster image from current HEAD** and
+repro against that. If the bug persists, the next most likely suspects:
+
+1. Cluster-mode-specific auth path the standalone harness does not
+   exercise (Raft-mediated schema read on auth, if any).
+2. `SELECT ... FROM system.local / system.peers` right after
+   AUTH_SUCCESS — cdrs-tokio runs this during session-build. Add a
+   test that issues these under `ferrosa_admin` and confirms no hang.
+3. Frame compression state getting out-of-sync between client and
+   server at the compression-flip point (after AUTH_SUCCESS).
+
+## Implementation Notes
+
+Partial: the 4 handshake tests above are regression coverage and stay
+green. Root-cause localization requires a cluster rebuild + live repro
+and is deferred until then.
+

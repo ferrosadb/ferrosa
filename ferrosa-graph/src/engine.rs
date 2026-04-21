@@ -123,11 +123,10 @@ impl GraphEngine {
                     ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
                         name: adj_ks.clone(),
                         durable_writes: true,
-                        replication:
-                            ferrosa_schema::metadata::keyspace::ReplicationParams {
-                                strategy: "SimpleStrategy".to_string(),
-                                options: std::collections::HashMap::new(),
-                            },
+                        replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                            strategy: "SimpleStrategy".to_string(),
+                            options: std::collections::HashMap::new(),
+                        },
                     },
                 ) {
                     tracing::error!(
@@ -147,8 +146,7 @@ impl GraphEngine {
                 // keyspace shares the adjacency table). Any other error means
                 // derived mutations would drop — refuse to start the observer.
                 let msg = e.to_string();
-                let already = msg.contains("already registered")
-                    || msg.contains("already exists");
+                let already = msg.contains("already registered") || msg.contains("already exists");
                 if !already {
                     tracing::error!(
                         keyspace = %adj_ks,
