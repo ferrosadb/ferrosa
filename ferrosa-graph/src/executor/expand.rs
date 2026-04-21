@@ -1453,30 +1453,36 @@ pub fn column_names_for_table(schema: Option<&Schema>, keyspace: &str, table: &s
 
 /// Extract the neighbor ID from an adjacency row's clustering key.
 ///
-/// Clustering format:
-///   direction(1 byte) + edge_label_len(2 bytes BE) + edge_label + neighbor_id_len(2 bytes BE) + neighbor_id
+/// Clustering format (standard composite, per SSTable writer's multi-column
+/// composite parser): each component is `[u16 BE length][bytes]`.
+///   0: [u16 1][1 byte direction]
+///   1: [u16 label_len][edge_label bytes]
+///   2: [u16 id_len][neighbor_id bytes]
 ///
-/// If `expected_label` is Some, only returns the neighbor ID if the edge label matches.
+/// If `expected_label` is Some, only returns the neighbor ID if the edge
+/// label matches (case-insensitive).
 pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> Option<Vec<u8>> {
-    // Minimum: 1 (direction) + 2 (label_len) + 0 (label) + 2 (id_len) + 0 (id)
-    if clustering.len() < 5 {
+    // Minimum: 2+1 (direction component) + 2 (label_len) + 2 (id_len) = 7
+    if clustering.len() < 7 {
         return None;
     }
 
-    let mut pos = 1; // skip direction byte
+    // Component 0: direction. Skip [u16 len][1 byte].
+    let dir_len = u16::from_be_bytes([clustering[0], clustering[1]]) as usize;
+    let mut pos = 2 + dir_len;
+    if pos + 2 > clustering.len() {
+        return None;
+    }
 
-    // Read edge label length (2 bytes BE).
+    // Component 1: edge_label.
     let label_len = u16::from_be_bytes([clustering[pos], clustering[pos + 1]]) as usize;
     pos += 2;
-
     if pos + label_len > clustering.len() {
         return None;
     }
-
     let label_bytes = &clustering[pos..pos + label_len];
     pos += label_len;
 
-    // Check label filter.
     if let Some(expected) = expected_label {
         let label_str = std::str::from_utf8(label_bytes).ok()?;
         if !label_str.eq_ignore_ascii_case(expected) {
@@ -1484,17 +1490,15 @@ pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> O
         }
     }
 
-    // Read neighbor ID length (2 bytes BE).
+    // Component 2: neighbor_id.
     if pos + 2 > clustering.len() {
         return None;
     }
     let id_len = u16::from_be_bytes([clustering[pos], clustering[pos + 1]]) as usize;
     pos += 2;
-
     if pos + id_len > clustering.len() {
         return None;
     }
-
     Some(clustering[pos..pos + id_len].to_vec())
 }
 
@@ -1962,6 +1966,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![1u8, 2, 3];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes()); // direction component len
         clustering.push(0u8); // direction OUT
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -1977,6 +1982,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![4u8, 5, 6];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes());
         clustering.push(0u8);
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -1992,6 +1998,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![7u8, 8];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes());
         clustering.push(0u8);
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -2007,6 +2014,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![1u8];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes());
         clustering.push(0u8);
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -2025,8 +2033,8 @@ mod tests {
 
     #[test]
     fn extract_neighbor_id_empty_label_and_id() {
-        // direction + label_len(0) + id_len(0)
-        let clustering = vec![0u8, 0, 0, 0, 0];
+        // [u16 1][1B direction=0][u16 0][u16 0]
+        let clustering = vec![0u8, 1, 0, 0, 0, 0, 0];
         let result = extract_neighbor_id(&clustering, None);
         assert_eq!(result, Some(vec![]));
     }

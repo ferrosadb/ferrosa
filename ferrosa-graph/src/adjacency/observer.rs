@@ -125,8 +125,14 @@ pub(crate) fn make_adjacency_mutation(
 
     let key = DecoratedKey::new(PartitionKey::new(vertex_id.to_vec()));
 
-    // Clustering: direction (1 byte) + edge_label (len-prefixed) + neighbor_id (len-prefixed)
+    // Clustering uses standard composite layout: each component is
+    // [u16 BE length][bytes]. Required by the SSTable writer's multi-column
+    // composite parser (and Gate A `validate_clustering_shape`). Components:
+    //   0: direction (tinyint, 1 byte)
+    //   1: edge_label (text)
+    //   2: neighbor_id (blob)
     let mut clustering = Vec::new();
+    clustering.extend_from_slice(&1u16.to_be_bytes()); // direction is 1 byte
     clustering.push(direction);
     clustering.extend_from_slice(&(edge_label.len() as u16).to_be_bytes());
     clustering.extend_from_slice(edge_label.as_bytes());
@@ -185,6 +191,41 @@ mod tests {
             "social.knows",
             1000,
         );
-        assert_eq!(m.rows[0].clustering[0], DIRECTION_IN);
+        // Clustering is now standard composite: [u16 1][1B direction][...].
+        // The direction byte sits at offset 2 (after the u16 length prefix).
+        assert_eq!(m.rows[0].clustering[2], DIRECTION_IN);
+    }
+
+    /// Pin the adjacency clustering wire format. The SSTable writer's
+    /// multi-column composite parser (and Gate A in
+    /// `ferrosa-sstable/src/writer.rs::validate_clustering_shape`) requires
+    /// every component to be `[u16 BE length][bytes]`. Adjacency must follow
+    /// that layout or the writer rejects the row at flush time:
+    /// "truncated composite clustering — column 0 (ByteType) length prefix
+    ///  claims 256 bytes but only 52 remain"
+    /// (the old custom `[1B direction][u16][label][u16][nid]` layout caused
+    /// the writer to read the direction+label_len_high as a 256-byte prefix.)
+    #[test]
+    fn adjacency_clustering_uses_standard_composite_layout() {
+        let m = make_adjacency_mutation(
+            "system_graph_social",
+            b"alice",
+            DIRECTION_OUT,
+            "knows",
+            b"bob",
+            "social.knows",
+            1000,
+        );
+        let c = &m.rows[0].clustering;
+        // Component 0 (direction tinyint): [u16 1][1B]
+        assert_eq!(&c[0..2], &[0x00, 0x01], "direction must be u16-prefixed");
+        assert_eq!(c[2], DIRECTION_OUT, "direction value at offset 2");
+        // Component 1 (edge_label text): [u16 5][b'k'..]
+        assert_eq!(&c[3..5], &[0x00, 0x05], "edge_label u16 length prefix");
+        assert_eq!(&c[5..10], b"knows", "edge_label bytes");
+        // Component 2 (neighbor_id blob): [u16 3][b'b'..]
+        assert_eq!(&c[10..12], &[0x00, 0x03], "neighbor_id u16 length prefix");
+        assert_eq!(&c[12..15], b"bob", "neighbor_id bytes");
+        assert_eq!(c.len(), 15, "exact composite length");
     }
 }

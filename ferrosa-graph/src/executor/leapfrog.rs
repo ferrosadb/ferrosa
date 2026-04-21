@@ -333,8 +333,9 @@ async fn enumerate_bindings(
                 let mut neighbors = Vec::new();
                 if let Some(p) = partition {
                     for row in &p.rows {
-                        // Filter for IN direction (byte 0x01) and matching label.
-                        if !row.clustering.is_empty() && row.clustering[0] == 0x01 {
+                        // Standard composite: [u16 1][1B direction][...].
+                        // Direction sits at offset 2; filter for IN (0x01).
+                        if row.clustering.len() >= 3 && row.clustering[2] == 0x01 {
                             if let Some(nid) =
                                 extract_neighbor_id(&row.clustering, rel.edge_label.as_deref())
                             {
