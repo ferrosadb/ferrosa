@@ -36,6 +36,7 @@ pub mod router;
 pub mod server;
 pub mod session;
 pub mod subscribe;
+pub mod topology;
 pub mod transaction_keys;
 pub mod transaction_limits;
 pub mod types;

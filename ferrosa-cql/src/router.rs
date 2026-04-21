@@ -21,8 +21,8 @@ use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
 use ferrosa_schema::{
-    query_columns, query_keyspaces, query_local, query_peers, query_role_members,
-    query_role_permissions, query_roles, query_tables, AuthContext,
+    query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
+    query_role_members, query_role_permissions, query_roles, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
@@ -39,6 +39,7 @@ use crate::observability::{CqlMetrics, CqlOpcode};
 use crate::planner::{self, ScanPlan};
 use crate::prepared::PreparedCache;
 use crate::result;
+use crate::topology::ClientTopologyPolicy;
 use crate::types::{CqlType, CqlValue};
 use crate::virtual_tables::active_queries::QueryTracker;
 use crate::virtual_tables::connections::ConnectionTracker;
@@ -155,6 +156,9 @@ pub struct SharedState {
     pub mode_controller: Arc<ferrosa_cluster::ModeController>,
     /// CQL request metrics (per-opcode counters and error counter).
     pub cql_metrics: Arc<CqlMetrics>,
+    /// Decides whether a given connection should see public or internal
+    /// topology addresses in `system.local` / `system.peers_v2`.
+    pub topology_policy: ClientTopologyPolicy,
     /// When `true`, permission failures are logged as warnings and allowed
     /// through instead of returning 0x2100 Unauthorized.  Set from
     /// `FERROSA_AUTH_WARN=true` to enable the soak observation period.
@@ -488,7 +492,10 @@ async fn route_select(
     // System table dispatch — no permission check needed for system tables.
     match (ks, s.table.as_str()) {
         ("system", "local") => {
-            let info = query_local(&state.schema, &state.node_config);
+            let topology_view = state
+                .topology_policy
+                .topology_view_for_client_address(&ctx.client_address);
+            let info = query_local_with_view(&state.schema, &state.node_config, topology_view);
             let col_names: Vec<String> = vec![
                 "key",
                 "cluster_name",
@@ -562,7 +569,14 @@ async fn route_select(
             ))
         }
         ("system", "peers" | "peers_v2") => {
-            let peers = query_peers(&state.schema, state.cluster_state.load().as_ref());
+            let topology_view = state
+                .topology_policy
+                .topology_view_for_client_address(&ctx.client_address);
+            let peers = query_peers_with_view(
+                &state.schema,
+                state.cluster_state.load().as_ref(),
+                topology_view,
+            );
             let col_names: Vec<String> = vec![
                 "peer",
                 "peer_port",
@@ -6328,6 +6342,8 @@ mod tests {
             broadcast_address: "127.0.0.1".parse().unwrap(),
             broadcast_port: 7000,
             rpc_address: "127.0.0.1".parse().unwrap(),
+            internal_rpc_address: "127.0.0.1".parse().unwrap(),
+            internal_rpc_port: 9042,
             tokens: vec![],
         });
 
@@ -6352,6 +6368,7 @@ mod tests {
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,
             cql_metrics: Arc::new(CqlMetrics::new()),
+            topology_policy: ClientTopologyPolicy::default(),
             auth_warn: false,
         };
         (state, dir)
@@ -6546,6 +6563,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn internal_client_sees_internal_system_local_endpoint() {
+        let (mut state, _dir) = setup();
+        let mut node_config = (*state.node_config).clone();
+        node_config.rpc_address = "127.0.0.1".parse().unwrap();
+        node_config.rpc_port = 19042;
+        node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
+        node_config.internal_rpc_port = 9042;
+        state.node_config = Arc::new(node_config);
+        state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "10.89.1.60:32123".into(),
+        };
+        let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_column_names(b), vec!["rpc_address", "rpc_port"]);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "10.89.1.48".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 9042);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
     /// system.local. Without it, cqlsh prints "'local' not found in
     /// keyspace 'system'" during startup introspection.
@@ -6668,6 +6720,73 @@ mod tests {
         let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_client_sees_internal_system_peers_endpoint() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+        use ferrosa_cluster::ring::TokenRing;
+
+        let (mut state, _dir) = setup();
+        state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.48:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19042".to_string()),
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.49:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                ferrosa_cluster::RaftClusterState::new(
+                    Arc::new(ArcSwap::from_pointee(ring)),
+                    local_id,
+                ),
+            )));
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "10.89.1.60:32123".into(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "10.89.1.49".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 9042);
+            }
             _ => panic!("expected Result"),
         }
     }
@@ -7662,6 +7781,67 @@ mod tests {
             "expected Rows result kind"
         );
         i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize
+    }
+
+    /// Extract the first row's raw cell payloads from a Rows result buffer.
+    fn extract_single_row_cells(buf: &[u8], expected_cols: usize) -> Vec<Option<Vec<u8>>> {
+        assert_eq!(extract_row_count(buf), 1, "expected exactly one row");
+
+        let col_count = extract_column_count(buf);
+        assert_eq!(col_count, expected_cols, "unexpected column count");
+
+        let mut off = 12;
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+
+        let row_count = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        assert_eq!(row_count, 1, "expected exactly one row");
+        off += 4;
+
+        let mut cells = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            if len < 0 {
+                cells.push(None);
+                continue;
+            }
+            let len = len as usize;
+            cells.push(Some(buf[off..off + len].to_vec()));
+            off += len;
+        }
+        cells
+    }
+
+    fn decode_int_cell(cell: &[u8]) -> i32 {
+        i32::from_be_bytes(cell.try_into().unwrap())
+    }
+
+    fn decode_inet_cell(cell: &[u8]) -> std::net::IpAddr {
+        match cell.len() {
+            4 => std::net::IpAddr::V4(std::net::Ipv4Addr::new(cell[0], cell[1], cell[2], cell[3])),
+            16 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(cell).unwrap(),
+            )),
+            len => panic!("unexpected inet length: {len}"),
+        }
     }
 
     // ── gocql / Temporal compatibility ──────────────────────────────────

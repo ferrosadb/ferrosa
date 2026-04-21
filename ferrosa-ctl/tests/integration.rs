@@ -12,6 +12,7 @@ use ferrosa_cql::client::{CqlClient, QueryResult, ResultRow};
 use ferrosa_cql::prepared::PreparedCache;
 use ferrosa_cql::router::SharedState;
 use ferrosa_cql::server::{CqlServer, ServerConfig};
+use ferrosa_cql::topology::ClientTopologyPolicy;
 use ferrosa_cql::virtual_tables::active_queries::{ActiveQueriesTable, QueryTracker};
 use ferrosa_cql::virtual_tables::connections::{ConnectionTracker, ConnectionsTable};
 
@@ -92,6 +93,8 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         broadcast_address: "127.0.0.1".parse().unwrap(),
         broadcast_port: 7000,
         rpc_address: "127.0.0.1".parse().unwrap(),
+        internal_rpc_address: "127.0.0.1".parse().unwrap(),
+        internal_rpc_port: 9042,
         tokens: vec![],
     });
     let connection_tracker = Arc::new(ConnectionTracker::new());
@@ -130,6 +133,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller,
+        topology_policy: ClientTopologyPolicy::default(),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         auth_warn: false,
     });

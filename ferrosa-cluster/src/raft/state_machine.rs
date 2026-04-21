@@ -357,11 +357,13 @@ impl FerrosStateMachine {
             // ---- DDL: Tables -------------------------------------------
             RaftOp::CreateTable(table) => {
                 let key = (table.keyspace.clone(), table.name.clone());
-                let inserted = if self.state.tables.contains_key(&key) {
-                    false
-                } else {
-                    self.state.tables.insert(key, *table.clone());
+                let inserted = if let std::collections::btree_map::Entry::Vacant(entry) =
+                    self.state.tables.entry(key)
+                {
+                    entry.insert(*table.clone());
                     true
+                } else {
+                    false
                 };
                 schema_changed = inserted;
                 if inserted {

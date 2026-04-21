@@ -648,9 +648,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_port = cql_bind.port(),
         "CQL broadcast configured — clients will reconnect via this address"
     );
+    let internal_topology_cidrs = config_val(
+        "FERROSA_CQL_INTERNAL_CLIENT_CIDRS",
+        &file_config,
+        "cql",
+        "internal_client_cidrs",
+        "",
+    );
+    let topology_policy =
+        ferrosa_cql::topology::ClientTopologyPolicy::from_csv(&internal_topology_cidrs)
+            .map_err(|err| format!("invalid FERROSA_CQL_INTERNAL_CLIENT_CIDRS: {err}"))?;
+    if topology_policy.is_empty() {
+        tracing::info!("CQL topology view policy: all clients receive public addresses");
+    } else {
+        tracing::info!(
+            cidrs = %internal_topology_cidrs,
+            "CQL topology view policy: matching clients receive internal addresses"
+        );
+    }
     let node_config = Arc::new(ferrosa_schema::NodeConfig {
         rpc_address: cql_broadcast_addr,
         rpc_port: cql_broadcast_port,
+        internal_rpc_address: net_config.broadcast_addr.ip(),
+        internal_rpc_port: cql_bind.port(),
         host_id,
         listen_port: internode_addr.port(),
         ..ferrosa_schema::NodeConfig::default()
@@ -676,6 +696,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller: Arc::clone(&mode_controller),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
+        topology_policy,
         auth_warn: storage_auth_warn,
     });
     let auth_disabled = cql_config.auth_disabled;
