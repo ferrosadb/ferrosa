@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use ferrosa_cluster::consistency::ConsistencyLevel;
+use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_schema::{Schema, VirtualTableRegistry};
@@ -34,6 +36,30 @@ struct MatchedTableRow {
     key: DecoratedKey,
     clustering: Vec<u8>,
     json: serde_json::Value,
+}
+
+fn graph_replication_strategy(
+    schema: Option<&Schema>,
+    keyspace: &str,
+) -> Result<ReplicationStrategy> {
+    let Some(schema) = schema else {
+        return Ok(ReplicationStrategy::Simple {
+            replication_factor: 1,
+        });
+    };
+
+    let snap = schema.snapshot();
+    let Some(keyspace_meta) = snap.keyspaces.get(keyspace) else {
+        return Ok(ReplicationStrategy::Simple {
+            replication_factor: 1,
+        });
+    };
+
+    ReplicationStrategy::try_from(&keyspace_meta.replication).map_err(|err| {
+        GraphError::Validation(format!(
+            "invalid replication strategy for keyspace '{keyspace}': {err}"
+        ))
+    })
 }
 
 /// Configuration for the graph query engine (T4 DoS limits).
@@ -108,7 +134,17 @@ pub async fn execute(
         PhysicalPlan::CreateNodes {
             creates,
             return_clause,
-        } => execute_create(write_path, &creates, return_clause.as_ref(), config, start).await,
+        } => {
+            execute_create(
+                write_path,
+                &creates,
+                return_clause.as_ref(),
+                config,
+                start,
+                schema,
+            )
+            .await
+        }
         PhysicalPlan::SetProperties {
             expand,
             assignments,
@@ -1006,6 +1042,7 @@ async fn execute_create(
     return_clause: Option<&crate::parser::ReturnClause>,
     _config: &GraphEngineConfig,
     start: Instant,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
     let timestamp = now_micros();
@@ -1016,6 +1053,7 @@ async fn execute_create(
 
     for op in creates {
         let table_id = TableId::new(&op.table.keyspace, &op.table.table);
+        let strategy = graph_replication_strategy(schema, &op.table.keyspace)?;
 
         // Generate a unique key for the new vertex/edge using a UUID.
         let key_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
@@ -1046,10 +1084,8 @@ async fn execute_create(
                 &key,
                 row,
                 timestamp,
-                ferrosa_cluster::consistency::ConsistencyLevel::One,
-                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                    replication_factor: 1,
-                },
+                ConsistencyLevel::One,
+                &strategy,
             )
             .await?;
         stats.vertices_written += 1;
@@ -1141,6 +1177,13 @@ async fn execute_merge(
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
     let timestamp = now_micros();
+    let strategy = graph_replication_strategy(
+        schema,
+        merges
+            .first()
+            .map(|op| op.table.keyspace.as_str())
+            .unwrap_or_default(),
+    )?;
 
     // var_name -> (table_id, key, clustering) so that SET can update the same row
     // that MERGE created or matched, including edge rows.
@@ -1219,10 +1262,8 @@ async fn execute_merge(
                     &key,
                     row,
                     timestamp,
-                    ferrosa_cluster::consistency::ConsistencyLevel::One,
-                    &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                        replication_factor: 1,
-                    },
+                    ConsistencyLevel::One,
+                    &strategy,
                 )
                 .await
                 .map_err(|e| {
@@ -1309,10 +1350,8 @@ async fn execute_merge(
                 key,
                 update_row,
                 timestamp,
-                ferrosa_cluster::consistency::ConsistencyLevel::One,
-                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                    replication_factor: 1,
-                },
+                ConsistencyLevel::One,
+                &strategy,
             )
             .await
             .map_err(|e| {
@@ -1972,6 +2011,7 @@ async fn execute_set(
     stats.edges_read = expand_result.stats.edges_read;
 
     let timestamp = now_micros();
+    let strategy = graph_replication_strategy(schema, keyspace)?;
 
     // For each matched vertex, apply the assignments.
     // The expand result rows contain vertex IDs (hex-encoded).
@@ -2023,10 +2063,8 @@ async fn execute_set(
                         &key,
                         update_row,
                         timestamp,
-                        ferrosa_cluster::consistency::ConsistencyLevel::One,
-                        &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                            replication_factor: 1,
-                        },
+                        ConsistencyLevel::One,
+                        &strategy,
                     )
                     .await?;
                 stats.vertices_written += 1;
@@ -2079,6 +2117,7 @@ async fn execute_delete(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32;
+    let strategy = graph_replication_strategy(schema, keyspace)?;
 
     // For each matched vertex in the specified variables, write a tombstone.
     for row_values in &expand_result.rows {
@@ -2127,10 +2166,8 @@ async fn execute_delete(
                         &key,
                         tombstone_row,
                         timestamp,
-                        ferrosa_cluster::consistency::ConsistencyLevel::One,
-                        &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                            replication_factor: 1,
-                        },
+                        ConsistencyLevel::One,
+                        &strategy,
                     )
                     .await?;
                 stats.vertices_deleted += 1;
@@ -3100,6 +3137,61 @@ mod tests {
             auth_warn: false,
         };
         Arc::new(ferrosa_storage::StorageEngine::new(config, None).unwrap())
+    }
+
+    fn test_schema() -> Schema {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+            RateLimitConfig, SchemaConfig, TestAuditSink,
+        };
+
+        Schema::new(SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn graph_replication_strategy_defaults_to_rf1_without_schema() {
+        let strategy = graph_replication_strategy(None, "agent_memory").unwrap();
+        match strategy {
+            ReplicationStrategy::Simple { replication_factor } => {
+                assert_eq!(replication_factor, 1);
+            }
+            other => panic!("expected SimpleStrategy fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_replication_strategy_uses_keyspace_replication() {
+        use ferrosa_schema::metadata::keyspace::ReplicationParams;
+        use ferrosa_schema::KeyspaceMetadata;
+
+        let schema = test_schema();
+        schema
+            .create_keyspace_internal(KeyspaceMetadata {
+                name: "agent_memory".into(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), "3".into())].into(),
+                },
+            })
+            .unwrap();
+
+        let strategy = graph_replication_strategy(Some(&schema), "agent_memory").unwrap();
+        match strategy {
+            ReplicationStrategy::Simple { replication_factor } => {
+                assert_eq!(replication_factor, 3);
+            }
+            other => panic!("expected SimpleStrategy, got {other:?}"),
+        }
     }
 
     #[test]
