@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 /// Configuration for the ferrosa-net transport layer.
@@ -64,6 +64,22 @@ impl Default for NetConfig {
 }
 
 impl NetConfig {
+    fn parse_socket_addr(raw: &str) -> Option<SocketAddr> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(addr) = trimmed.parse() {
+            return Some(addr);
+        }
+        let mut resolved = trimmed.to_socket_addrs().ok()?;
+        resolved.next()
+    }
+
+    fn parse_seed_list(raw: &str) -> Vec<SocketAddr> {
+        raw.split(',').filter_map(Self::parse_socket_addr).collect()
+    }
+
     /// Build config from environment variables, with defaults.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
@@ -74,12 +90,12 @@ impl NetConfig {
             }
         }
         if let Ok(v) = std::env::var("FERROSA_INTERNODE_BROADCAST") {
-            if let Ok(addr) = v.parse() {
+            if let Some(addr) = Self::parse_socket_addr(&v) {
                 cfg.broadcast_addr = addr;
             }
         }
         if let Ok(v) = std::env::var("FERROSA_SEED") {
-            cfg.seeds = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            cfg.seeds = Self::parse_seed_list(&v);
         }
         if let Ok(v) = std::env::var("FERROSA_CLUSTER_NAME") {
             cfg.cluster_name = v;
@@ -153,5 +169,22 @@ mod tests {
         assert_eq!(cfg.heartbeat_interval, Duration::from_millis(500));
         assert_eq!(cfg.heartbeat_timeout, Duration::from_millis(1500));
         assert_eq!(cfg.handshake_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parse_socket_addr_accepts_hostname_entries() {
+        let addr =
+            NetConfig::parse_socket_addr("localhost:7000").expect("localhost should resolve");
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 7000);
+    }
+
+    #[test]
+    fn parse_seed_list_accepts_hostname_entries() {
+        let seeds = NetConfig::parse_seed_list("localhost:7000,127.0.0.1:7001");
+        assert_eq!(seeds.len(), 2);
+        assert!(seeds[0].ip().is_loopback());
+        assert_eq!(seeds[0].port(), 7000);
+        assert_eq!(seeds[1], "127.0.0.1:7001".parse().unwrap());
     }
 }

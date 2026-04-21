@@ -428,9 +428,9 @@ session.execute(<span class="str">"""
     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>FERROSA_CLUSTER_NAME</code></td><td><code>ferrosa</code></td><td>Cluster name (must match across nodes)</td></tr>
-      <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses</td></tr>
+      <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses; each entry may be an IP:port or resolvable hostname:port</td></tr>
       <tr><td><code>FERROSA_INTERNODE_BIND</code></td><td><code>0.0.0.0:7000</code></td><td>Internode protocol bind address</td></tr>
-      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td><code>127.0.0.1:7000</code></td><td>Address other nodes use to reach this node; also forms the default internal topology view</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td><code>127.0.0.1:7000</code></td><td>Address other nodes use to reach this node; also forms the default internal topology view. May be an IP:port or resolvable hostname:port.</td></tr>
       <tr><td><code>FERROSA_INTERNODE_PSK</code></td><td>—</td><td>Pre-shared key for internode auth (HMAC-SHA256)</td></tr>
       <tr><td><code>FERROSA_INTERNODE_TLS_CERT</code></td><td>—</td><td>PEM certificate path for internode TLS</td></tr>
       <tr><td><code>FERROSA_INTERNODE_TLS_KEY</code></td><td>—</td><td>PEM private-key path for internode TLS</td></tr>
@@ -684,7 +684,7 @@ session.execute(<span class="str">"""
   <p>Use two address families:</p>
   <ul>
     <li><code>FERROSA_CQL_BROADCAST</code> should point at the host- or externally-reachable CQL endpoint that off-node clients should dial after topology discovery.</li>
-    <li><code>FERROSA_INTERNODE_BROADCAST</code> should point at the address other Ferrosa nodes use to reach this node. Ferrosa also uses this address family as the internal topology view.</li>
+    <li><code>FERROSA_INTERNODE_BROADCAST</code> should point at the address other Ferrosa nodes use to reach this node. Ferrosa also uses this address family as the internal topology view. Use either a stable IP:port or a hostname:port that resolves correctly from the other nodes.</li>
     <li><code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code> should list the container or pod CIDRs whose clients need the internal topology view.</li>
   </ul>
   <p>Clients whose source IP falls inside <code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code> receive internal addresses from <code>system.local</code> and <code>system.peers_v2</code>. Other clients receive the public CQL broadcast address.</p>
