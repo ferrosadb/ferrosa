@@ -13,7 +13,7 @@ use serde::Serialize;
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
-use ferrosa_storage::StorageEngine;
+use ferrosa_storage::{ObserverMode, StorageEngine, WriteObserver};
 
 use tokio_util::sync::CancellationToken;
 
@@ -203,19 +203,30 @@ impl GraphEngine {
 
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
 
-            if tokio::runtime::Handle::try_current().is_ok() {
-                // Runtime available: register the observer with an engine-side drain task.
-                // The drain task applies derived adjacency mutations through the full write
-                // path (commit log + memtable) and catches observer panics loudly at ERROR.
-                storage.register_async_observer_with_drain(
-                    observer as Arc<dyn ferrosa_storage::WriteObserver>,
-                    Arc::clone(&storage),
-                );
-            } else {
-                // No runtime available (e.g., proptest sync context): fall back to
-                // register_observer which drops the receiver. Adjacency entries are not
-                // written in this context, but the engine does not panic.
-                storage.register_observer(observer);
+            match observer.mode() {
+                ObserverMode::Sync => {
+                    // Sync observers apply derived adjacency mutations inline on
+                    // the write path, so follow-up MATCH queries can see the
+                    // relationship immediately after MERGE returns.
+                    storage.register_observer(observer);
+                }
+                ObserverMode::Async => {
+                    if tokio::runtime::Handle::try_current().is_ok() {
+                        // Runtime available: register the observer with an engine-side
+                        // drain task. The drain task applies derived adjacency mutations
+                        // through the full write path and catches observer panics loudly.
+                        storage.register_async_observer_with_drain(
+                            observer as Arc<dyn ferrosa_storage::WriteObserver>,
+                            Arc::clone(&storage),
+                        );
+                    } else {
+                        // No runtime available (e.g., proptest sync context): fall back
+                        // to register_observer. Async observers registered this way will
+                        // drop derived writes because nothing drains the channel, but the
+                        // engine still comes up without panicking.
+                        storage.register_observer(observer);
+                    }
+                }
             }
 
             // spawn_reconciliation requires a tokio runtime. In test

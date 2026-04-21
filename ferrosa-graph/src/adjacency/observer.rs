@@ -1,4 +1,4 @@
-//! AdjacencyIndexObserver — async WriteObserver that maintains the adjacency index.
+//! AdjacencyIndexObserver — WriteObserver that maintains the adjacency index.
 //!
 //! Watches all tables with `extensions["graph.type"] == "edge"`. On each mutation,
 //! extracts source and target key bytes and generates OUT and IN adjacency entries.
@@ -10,7 +10,7 @@ use ferrosa_storage::{Mutation, ObserverMode, TableId, WriteObserver};
 
 use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
 
-/// Async observer that maintains per-keyspace adjacency index entries.
+/// Observer that maintains per-keyspace adjacency index entries.
 pub struct AdjacencyIndexObserver {
     /// Schema registry for discovering edge tables and reading extensions.
     schema: Arc<Schema>,
@@ -39,7 +39,7 @@ impl AdjacencyIndexObserver {
 
 impl WriteObserver for AdjacencyIndexObserver {
     fn mode(&self) -> ObserverMode {
-        ObserverMode::Async
+        ObserverMode::Sync
     }
 
     fn tables(&self) -> Vec<TableId> {

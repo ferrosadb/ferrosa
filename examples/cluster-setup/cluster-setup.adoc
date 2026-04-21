@@ -10,6 +10,8 @@ This guide walks you through installing Docker, creating a Ferrosa cluster, and 
 
 NOTE: *Time estimate:* About 5 minutes if Docker is already installed, 10-15 minutes if you're starting from scratch. No prior database experience required.
 
+TIP: Need one cluster to serve both host clients and in-network container clients? See `docker-compose.mixed-clients.yml` in this directory. It shows the supported split-address pattern with `FERROSA_CQL_BROADCAST`, `FERROSA_CQL_INTERNAL_CLIENT_CIDRS`, and fixed internal node addresses.
+
 == Prerequisites
 
 You don't need any database knowledge to follow this guide. Here's what you do need:
@@ -78,6 +80,8 @@ Let's break down what this file does:
 * *node1* -- The seed node. It starts first in `standalone` mode and acts as the initial contact point for the other nodes.
 * *node2* -- Joins node1 in `pair` mode, forming a two-node high-availability pair.
 * *node3* -- The third node triggers the transition to full `cluster` mode with Raft consensus.
+
+If your deployment needs host clients to use `127.0.0.1:1904x` while in-network clients use container addresses like `172.28.0.x:9042`, start from `docker-compose.mixed-clients.yml` instead of the simpler file above.
 
 NOTE: *About the host IDs:* Each Ferrosa node needs a unique UUID. The simple values used here (`11111111-...`, `22222222-...`, `33333333-...`) are just for the tutorial. In production, you would use randomly generated UUIDs.
 

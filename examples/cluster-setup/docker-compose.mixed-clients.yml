@@ -1,0 +1,221 @@
+# docker-compose.mixed-clients.yml — 3-node Ferrosa cluster for mixed host + container clients
+#
+# This example shows the supported split-address pattern:
+# - host/outside clients bootstrap against 127.0.0.1:19042/19043/19044
+# - in-network clients bootstrap against node1:9042 and then discover
+#   172.28.0.x:9042 peer addresses from system.local / system.peers_v2
+#
+# There is no special client handshake to ask for the "outside" addresses.
+# Ferrosa decides which topology view to return based on the source IP of the
+# connection doing the topology queries.
+#
+# Run with:
+#   docker compose -f docker-compose.mixed-clients.yml up -d
+#
+# Host-side examples:
+#   cqlsh 127.0.0.1 19042
+#   curl http://127.0.0.1:19090/api/cluster/status
+#
+# In-network example:
+#   docker compose -f docker-compose.mixed-clients.yml exec app sh
+#   # from inside the container network, connect to node1:9042
+#
+# In this file:
+# - FERROSA_CQL_BROADCAST is the host/public address family
+# - FERROSA_CQL_INTERNAL_CLIENT_CIDRS marks container clients
+# - FERROSA_INTERNODE_BROADCAST is the internal node-to-node address family
+
+services:
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - rustfs-data:/data
+    networks:
+      ferrosa_net:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa --ignore-existing &&
+             echo 'bucket ferrosa ready'"
+    restart: "no"
+    networks:
+      - ferrosa_net
+
+  node1:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "19042:9042"
+      - "19090:9090"
+      - "17474:7474"
+    environment:
+      FERROSA_HOST_ID: 11111111-1111-1111-1111-111111111111
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      # Host/public clients should reconnect to this address after topology discovery.
+      FERROSA_CQL_BROADCAST: "127.0.0.1:19042"
+      # Clients from the container network should get internal 172.28.0.x:9042 addresses.
+      FERROSA_CQL_INTERNAL_CLIENT_CIDRS: "172.28.0.0/16"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_CLUSTER_NAME: ferrosa-mixed-clients
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "172.28.0.11:7000"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node1
+    volumes:
+      - node1-data:/var/lib/ferrosa
+    networks:
+      ferrosa_net:
+        ipv4_address: 172.28.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  node2:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "19043:9042"
+      - "19091:9090"
+      - "17475:7474"
+    environment:
+      FERROSA_HOST_ID: 22222222-2222-2222-2222-222222222222
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:19043"
+      FERROSA_CQL_INTERNAL_CLIENT_CIDRS: "172.28.0.0/16"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_CLUSTER_NAME: ferrosa-mixed-clients
+      FERROSA_SEED: "172.28.0.11:7000"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "172.28.0.12:7000"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node2
+    volumes:
+      - node2-data:/var/lib/ferrosa
+    networks:
+      ferrosa_net:
+        ipv4_address: 172.28.0.12
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  node3:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    ports:
+      - "19044:9042"
+      - "19092:9090"
+      - "17476:7474"
+    environment:
+      FERROSA_HOST_ID: 33333333-3333-3333-3333-333333333333
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:19044"
+      FERROSA_CQL_INTERNAL_CLIENT_CIDRS: "172.28.0.0/16"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_CLUSTER_NAME: ferrosa-mixed-clients
+      FERROSA_SEED: "172.28.0.11:7000"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "172.28.0.13:7000"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node3
+    volumes:
+      - node3-data:/var/lib/ferrosa
+    networks:
+      ferrosa_net:
+        ipv4_address: 172.28.0.13
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # Optional scratch container for testing the in-network view.
+  # Run:
+  #   docker compose -f docker-compose.mixed-clients.yml exec app sh
+  # Then connect to node1:9042 from inside the network.
+  app:
+    image: alpine:3.20
+    command: ["sh", "-c", "sleep infinity"]
+    depends_on:
+      node1:
+        condition: service_healthy
+    networks:
+      ferrosa_net:
+        ipv4_address: 172.28.0.50
+
+networks:
+  ferrosa_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  rustfs-data:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -1641,6 +1641,10 @@ const MIGRATION_TYPED_EDGE_UPSERT: &str = "MERGE (a:Entity {entity_id: 'src-001'
      SET r.weight = 1.0 \
      RETURN r";
 
+const MIGRATION_TYPED_EDGE_MATCH_COUNT: &str =
+    "MATCH (a:Entity {entity_id: 'src-001'})-[r:TYPED_EDGE {edge_type: 'folded_into'}]->\
+     (b:Entity {entity_id: 'dst-001'}) RETURN count(r)";
+
 /// ferrosa-memory folded_into edge shape.
 const MIGRATION_FOLDED_INTO: &str = "MERGE (a:Entity {entity_id: 'fold-src'}) \
      MERGE (b:Entity {entity_id: 'fold-dst'}) \
@@ -1684,6 +1688,91 @@ async fn migration_proof_typed_edge_upsert_no_direct_table_ref() {
     assert!(
         body.get("rows").is_some(),
         "typed-edge upsert response must contain 'rows'"
+    );
+}
+
+#[tokio::test]
+async fn migration_proof_typed_edge_upsert_materializes_and_matches() {
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    let (schema, storage, _dir) = setup();
+    create_memory_graph_schema(&schema);
+    register_memory_tables_with_storage(&storage);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": MIGRATION_TYPED_EDGE_UPSERT,
+            "keyspace": "memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "canonical ferrosa-memory typed-edge upsert must succeed via public Cypher API"
+    );
+    let body = response_json(resp).await;
+    assert!(
+        body["rows"].is_array(),
+        "typed-edge upsert response must include 'rows'"
+    );
+
+    let src_key_bytes = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"entity_id\x00src-001\x00");
+        h.finalize().as_bytes().to_vec()
+    };
+    let dst_key_bytes = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"entity_id\x00dst-001\x00");
+        h.finalize().as_bytes().to_vec()
+    };
+
+    let typed_edge_tid = TableId::new("memory", "typed_edge_e");
+    let src_key = DecoratedKey::new(PartitionKey::new(src_key_bytes));
+    let partition = storage.read(&typed_edge_tid, &src_key).unwrap();
+
+    let partition = partition
+        .expect("typed_edge_e partition for src-001 must exist after canonical TYPED_EDGE MERGE");
+    assert!(
+        !partition.rows.is_empty(),
+        "typed_edge_e must contain at least one row after canonical TYPED_EDGE MERGE"
+    );
+    assert_eq!(
+        partition.rows[0].clustering, dst_key_bytes,
+        "typed-edge row clustering must point at dst-001 so the relationship is readable"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": MIGRATION_TYPED_EDGE_MATCH_COUNT,
+            "keyspace": "memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "typed-edge MATCH readback must succeed after canonical MERGE"
+    );
+    let body = response_json(resp).await;
+    let rows = body["rows"]
+        .as_array()
+        .expect("MATCH count response must include rows");
+    assert_eq!(rows.len(), 1, "MATCH count must return exactly one row");
+    let count = rows[0][0]
+        .as_i64()
+        .expect("count(r) must serialize as a JSON integer");
+    assert_eq!(
+        count, 1,
+        "canonical typed-edge MERGE must be immediately visible to follow-up MATCH"
     );
 }
 

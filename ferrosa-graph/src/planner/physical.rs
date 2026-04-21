@@ -16,6 +16,8 @@ use crate::planner::logical::{LogicalPlan, ResolvedTable};
 pub struct Hop {
     /// Variable binding for this hop's target node (if any).
     pub var: Option<String>,
+    /// Variable binding for this hop's relationship (if any).
+    pub rel_var: Option<String>,
     /// Edge label to filter by (if specified).
     pub edge_label: Option<String>,
     /// Direction of the edge traversal.
@@ -382,7 +384,8 @@ fn plan_merge(
     return_clause: Option<&ReturnClause>,
 ) -> Result<PhysicalPlan> {
     let mut merges = Vec::new();
-    collect_merge_ops(patterns, bindings, &mut merges)?;
+    let mut merge_props_by_var = HashMap::new();
+    collect_merge_ops(patterns, bindings, &mut merge_props_by_var, &mut merges)?;
 
     if merges.is_empty() {
         return Err(GraphError::Validation(
@@ -413,6 +416,7 @@ fn plan_merge(
 fn collect_merge_ops(
     patterns: &[crate::parser::Pattern],
     bindings: &std::collections::HashMap<String, ResolvedTable>,
+    merge_props_by_var: &mut HashMap<String, Vec<(String, crate::parser::Expr)>>,
     merges: &mut Vec<MergeOp>,
 ) -> Result<()> {
     for pat in patterns {
@@ -424,6 +428,11 @@ fn collect_merge_ops(
                     None
                 };
                 if let Some(table) = resolved {
+                    if !props.is_empty() {
+                        if let Some(var_name) = var.as_ref() {
+                            merge_props_by_var.insert(var_name.clone(), props.clone());
+                        }
+                    }
                     merges.push(MergeOp {
                         var: var.clone(),
                         table,
@@ -477,7 +486,7 @@ fn collect_merge_ops(
                 }
             }
             crate::parser::Pattern::Path(elements) => {
-                collect_merge_ops_from_path(elements, bindings, merges)?;
+                collect_merge_ops_from_path(elements, bindings, merge_props_by_var, merges)?;
             }
         }
     }
@@ -493,6 +502,7 @@ fn collect_merge_ops(
 fn collect_merge_ops_from_path(
     elements: &[crate::parser::Pattern],
     bindings: &std::collections::HashMap<String, ResolvedTable>,
+    merge_props_by_var: &mut HashMap<String, Vec<(String, crate::parser::Expr)>>,
     merges: &mut Vec<MergeOp>,
 ) -> Result<()> {
     let mut i = 0;
@@ -508,6 +518,11 @@ fn collect_merge_ops_from_path(
                     None
                 };
                 if let Some(table) = resolved {
+                    if !props.is_empty() {
+                        if let Some(var_name) = var.as_ref() {
+                            merge_props_by_var.insert(var_name.clone(), props.clone());
+                        }
+                    }
                     merges.push(MergeOp {
                         var: var.clone(),
                         table,
@@ -545,10 +560,18 @@ fn collect_merge_ops_from_path(
                 // Peek at the source node (i-1) for src_match_props.
                 let src_match_props: Option<Vec<(String, crate::parser::Expr)>> = if i > 0 {
                     if let crate::parser::Pattern::Node {
-                        props: src_props, ..
+                        var: src_var,
+                        props: src_props,
+                        ..
                     } = &elements[i - 1]
                     {
-                        Some(src_props.clone())
+                        if src_props.is_empty() {
+                            src_var
+                                .as_ref()
+                                .and_then(|name| merge_props_by_var.get(name).cloned())
+                        } else {
+                            Some(src_props.clone())
+                        }
                     } else {
                         None
                     }
@@ -560,10 +583,18 @@ fn collect_merge_ops_from_path(
                 let dst_match_props: Option<Vec<(String, crate::parser::Expr)>> =
                     if i + 1 < elements.len() {
                         if let crate::parser::Pattern::Node {
-                            props: dst_props, ..
+                            var: dst_var,
+                            props: dst_props,
+                            ..
                         } = &elements[i + 1]
                         {
-                            Some(dst_props.clone())
+                            if dst_props.is_empty() {
+                                dst_var
+                                    .as_ref()
+                                    .and_then(|name| merge_props_by_var.get(name).cloned())
+                            } else {
+                                Some(dst_props.clone())
+                            }
                         } else {
                             None
                         }
@@ -591,7 +622,7 @@ fn collect_merge_ops_from_path(
                 i += 1;
             }
             crate::parser::Pattern::Path(inner) => {
-                collect_merge_ops_from_path(inner, bindings, merges)?;
+                collect_merge_ops_from_path(inner, bindings, merge_props_by_var, merges)?;
                 i += 1;
             }
         }
@@ -906,7 +937,7 @@ fn plan_match(
                 i += 1;
             }
             Pattern::Rel {
-                var: _,
+                var,
                 rel_type,
                 direction,
                 props,
@@ -943,6 +974,7 @@ fn plan_match(
                 if let Some((min, max_opt)) = length_range {
                     let hop = Hop {
                         var: next_var,
+                        rel_var: var.clone(),
                         edge_label,
                         direction: *direction,
                         edge_table,
@@ -969,6 +1001,7 @@ fn plan_match(
 
                 hops.push(Hop {
                     var: next_var,
+                    rel_var: var.clone(),
                     edge_label,
                     direction: *direction,
                     edge_table,
@@ -1173,6 +1206,7 @@ mod tests {
                 assert_eq!(hops.len(), 1);
                 assert_eq!(hops[0].edge_label, Some("KNOWS".to_string()));
                 assert_eq!(hops[0].direction, Direction::Out);
+                assert_eq!(hops[0].rel_var, Some("r".to_string()));
                 assert_eq!(hops[0].var, Some("b".to_string()));
             }
             _ => panic!("expected Expand plan"),

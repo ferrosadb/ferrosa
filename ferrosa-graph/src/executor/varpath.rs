@@ -390,6 +390,7 @@ mod tests {
     fn make_hop(var: &str) -> Hop {
         Hop {
             var: Some(var.to_string()),
+            rel_var: None,
             edge_label: Some("KNOWS".to_string()),
             direction: Direction::Out,
             edge_table: None,

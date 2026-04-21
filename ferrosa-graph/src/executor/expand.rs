@@ -214,6 +214,7 @@ pub async fn execute(
                 return_clause.as_ref(),
                 config,
                 start,
+                schema,
             )
             .await
         }
@@ -233,6 +234,11 @@ async fn execute_expand(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
+    struct ExpandState {
+        current_key: DecoratedKey,
+        bindings: HashMap<String, serde_json::Value>,
+    }
+
     let mut stats = QueryStats::default();
 
     // Step 1: Anchor lookup.
@@ -270,7 +276,7 @@ async fn execute_expand(
     // and no live static row) — these represent deleted vertices whose
     // tombstones have not yet been purged by compaction.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-    let mut current_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
+    let mut current_states: Vec<ExpandState> = Vec::with_capacity(anchor_partitions.len());
     for partition in &anchor_partitions {
         if is_partition_dead(partition) {
             continue;
@@ -289,7 +295,10 @@ async fn execute_expand(
             }
         }
         if passes {
-            current_keys.push(partition.key.clone());
+            current_states.push(ExpandState {
+                current_key: partition.key.clone(),
+                bindings,
+            });
         }
     }
 
@@ -300,8 +309,9 @@ async fn execute_expand(
     for hop in hops {
         check_timeout(start, config.query_timeout)?;
 
-        let mut next_keys = Vec::new();
-        for vertex_key in &current_keys {
+        let mut next_states = Vec::new();
+        for state in &current_states {
+            let vertex_key = &state.current_key;
             // Read adjacency entries for this vertex.
             let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
             if let Some(partition) = adj_partition {
@@ -309,7 +319,7 @@ async fn execute_expand(
 
                 // If this hop has property filters and an edge table, read
                 // the edge partition once so we can check edge properties.
-                let edge_partition = if !hop.prop_filters.is_empty() {
+                let edge_partition = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
                     if let Some(ref et) = hop.edge_table {
                         let edge_tid = TableId::new(&et.keyspace, &et.table);
                         write_path.read(&edge_tid, vertex_key).await?
@@ -319,6 +329,19 @@ async fn execute_expand(
                 } else {
                     None
                 };
+
+                let edge_col_names = hop
+                    .edge_table
+                    .as_ref()
+                    .map(|et| column_names_for_table(schema, &et.keyspace, &et.table));
+                let vertex_table_id = hop
+                    .vertex_table
+                    .as_ref()
+                    .map(|vt| TableId::new(&vt.keyspace, &vt.table));
+                let vertex_col_names = hop
+                    .vertex_table
+                    .as_ref()
+                    .map(|vt| column_names_for_table(schema, &vt.keyspace, &vt.table));
 
                 for row in &partition.rows {
                     if let Some(neighbor_id) =
@@ -334,57 +357,79 @@ async fn execute_expand(
                         {
                             continue;
                         }
-                        next_keys.push(DecoratedKey::new(ferrosa_common::PartitionKey::new(
-                            neighbor_id,
-                        )));
+
+                        let mut bindings = state.bindings.clone();
+                        let neighbor_key = DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                            neighbor_id.clone(),
+                        ));
+
+                        if let Some(var_name) = &hop.var {
+                            let neighbor_json = if let (Some(vertex_tid), Some(col_names)) =
+                                (vertex_table_id.as_ref(), vertex_col_names.as_ref())
+                            {
+                                let neighbor_partition =
+                                    write_path.read(vertex_tid, &neighbor_key).await?;
+                                let neighbor_hex = hex::encode(&neighbor_id);
+                                if let Some(ref part) = neighbor_partition {
+                                    eval::partition_to_json(part, &neighbor_hex, col_names)
+                                } else {
+                                    serde_json::Value::String(neighbor_hex)
+                                }
+                            } else {
+                                serde_json::Value::String(hex::encode(&neighbor_id))
+                            };
+                            bindings.insert(var_name.clone(), neighbor_json);
+                        }
+
+                        if let Some(rel_var) = &hop.rel_var {
+                            let edge_json = edge_binding_json(
+                                row,
+                                edge_partition.as_ref(),
+                                edge_col_names.as_deref(),
+                                hop.edge_label.as_deref(),
+                                vertex_key,
+                                &neighbor_id,
+                            );
+                            bindings.insert(rel_var.clone(), edge_json);
+                        }
+
+                        next_states.push(ExpandState {
+                            current_key: neighbor_key,
+                            bindings,
+                        });
                     }
                 }
 
                 // T4: fan-out limit per hop.
-                if next_keys.len() > config.max_fan_out_per_hop {
+                if next_states.len() > config.max_fan_out_per_hop {
                     return Err(GraphError::ResourceLimit(format!(
                         "fan-out limit exceeded: {} neighbors (limit: {})",
-                        next_keys.len(),
+                        next_states.len(),
                         config.max_fan_out_per_hop
                     )));
                 }
             }
         }
 
-        stats.vertices_read += next_keys.len();
-        current_keys = next_keys;
+        stats.vertices_read += next_states.len();
+        current_states = next_states;
     }
 
     // Step 3: Build result from return clause, projecting property values.
     let columns = build_columns(return_clause);
-    let anchor_table_id_for_proj = TableId::new(&anchor.table.keyspace, &anchor.table.table);
 
     let mut rows = Vec::new();
-    for key in &current_keys {
+    for state in &current_states {
         if rows.len() >= config.max_result_rows {
             break;
         }
 
-        // Read the full partition from storage for property projection.
-        let partition = write_path.read(&anchor_table_id_for_proj, key).await?;
-
-        let hex_id = hex::encode(key.key.as_bytes());
-
-        // Build bindings for eval_expr: the anchor variable maps to the
-        // partition's JSON representation so that RETURN expressions
-        // (arithmetic, function calls, property lookups) all work.
-        let row_json = if let Some(ref part) = partition {
-            eval::partition_to_json(part, &hex_id, &anchor_col_names)
-        } else {
-            serde_json::Value::String(hex_id.clone())
-        };
-        let mut bindings = HashMap::new();
-        bindings.insert(anchor_var.to_string(), row_json);
-
         let row: Vec<serde_json::Value> = return_clause
             .items
             .iter()
-            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
+            .map(|item| {
+                eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
+            })
             .collect();
         rows.push(row);
     }
@@ -464,6 +509,79 @@ fn edge_row_passes_filters(
     }
 
     true
+}
+
+fn edge_binding_json(
+    adjacency_row: &Row,
+    edge_partition: Option<&ferrosa_sstable::types::Partition>,
+    column_names: Option<&[String]>,
+    edge_label: Option<&str>,
+    src_key: &DecoratedKey,
+    neighbor_id: &[u8],
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "_id".to_string(),
+        serde_json::Value::String(format!(
+            "{}:{}:{}",
+            hex::encode(src_key.key.as_bytes()),
+            edge_label.unwrap_or_default(),
+            hex::encode(neighbor_id)
+        )),
+    );
+    map.insert(
+        "_src".to_string(),
+        serde_json::Value::String(hex::encode(src_key.key.as_bytes())),
+    );
+    map.insert(
+        "_dst".to_string(),
+        serde_json::Value::String(hex::encode(neighbor_id)),
+    );
+    if let Some(label) = edge_label {
+        map.insert(
+            "_type".to_string(),
+            serde_json::Value::String(label.to_string()),
+        );
+    }
+
+    if let Some(edge_row) = edge_partition.and_then(|partition| {
+        partition
+            .rows
+            .iter()
+            .find(|row| row.clustering == neighbor_id)
+    }) {
+        for (col_idx, cell) in &edge_row.cells {
+            let key = column_names
+                .and_then(|names| names.get(*col_idx as usize))
+                .cloned()
+                .unwrap_or_else(|| format!("col_{col_idx}"));
+            let value = match &cell.value {
+                Some(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(s) => serde_json::Value::String(s.to_string()),
+                    Err(_) => serde_json::Value::String(hex::encode(bytes)),
+                },
+                None => serde_json::Value::Null,
+            };
+            map.insert(key, value);
+        }
+    } else {
+        for (col_idx, cell) in &adjacency_row.cells {
+            let key = column_names
+                .and_then(|names| names.get(*col_idx as usize))
+                .cloned()
+                .unwrap_or_else(|| format!("col_{col_idx}"));
+            let value = match &cell.value {
+                Some(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(s) => serde_json::Value::String(s.to_string()),
+                    Err(_) => serde_json::Value::String(hex::encode(bytes)),
+                },
+                None => serde_json::Value::Null,
+            };
+            map.insert(key, value);
+        }
+    }
+
+    serde_json::Value::Object(map)
 }
 
 /// Convert a `Literal` from the AST into raw bytes for storage.
@@ -634,12 +752,14 @@ async fn execute_merge(
     _return_clause: Option<&crate::parser::ReturnClause>,
     _config: &GraphEngineConfig,
     start: Instant,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
     let timestamp = now_micros();
 
-    // var_name -> (table_id, key) so that SET can locate the written row.
-    let mut var_keys: HashMap<String, (TableId, DecoratedKey)> = HashMap::new();
+    // var_name -> (table_id, key, clustering) so that SET can update the same row
+    // that MERGE created or matched, including edge rows.
+    let mut var_keys: HashMap<String, (TableId, DecoratedKey, Vec<u8>)> = HashMap::new();
 
     for op in merges {
         // --- Precondition: table must be identified ---
@@ -681,6 +801,34 @@ async fn execute_merge(
         };
         let key = DecoratedKey::new(PartitionKey::new(key_bytes));
 
+        let clustering: Vec<u8> = if op.table.graph_type == "edge" {
+            match &op.dst_match_props {
+                Some(dst_props) => content_addressed_key(dst_props),
+                None => {
+                    tracing::error!(
+                        file = file!(),
+                        line = line!(),
+                        table = %op.table.table,
+                        graph_type = %op.table.graph_type,
+                        "execute_merge: edge MergeOp has no dst_match_props — \
+                         cannot derive clustering key for adjacency index. \
+                         The planner did not thread the destination node's props \
+                         into this MergeOp. This is a planner bug."
+                    );
+                    return Err(crate::error::GraphError::Validation(format!(
+                        "execute_merge: edge MergeOp for table '{}' has no \
+                         dst_match_props; cannot derive clustering key \
+                         (file: {}, line: {})",
+                        op.table.table,
+                        file!(),
+                        line!()
+                    )));
+                }
+            }
+        } else {
+            vec![]
+        };
+
         // Step 2: read-before-write — check for existing row.
         let existing = write_path.read(&table_id, &key).await.map_err(|e| {
             tracing::error!(
@@ -717,36 +865,8 @@ async fn execute_merge(
             // Fail loud if we see an edge MergeOp without dst_match_props — that
             // means the planner failed to thread the destination node's props and
             // we would silently create an invisible edge (the original bug).
-            let clustering: Vec<u8> = if op.table.graph_type == "edge" {
-                match &op.dst_match_props {
-                    Some(dst_props) => content_addressed_key(dst_props),
-                    None => {
-                        tracing::error!(
-                            file = file!(),
-                            line = line!(),
-                            table = %op.table.table,
-                            graph_type = %op.table.graph_type,
-                            "execute_merge: edge MergeOp has no dst_match_props — \
-                             cannot derive clustering key for adjacency index. \
-                             The planner did not thread the destination node's props \
-                             into this MergeOp. This is a planner bug."
-                        );
-                        return Err(crate::error::GraphError::Validation(format!(
-                            "execute_merge: edge MergeOp for table '{}' has no \
-                             dst_match_props; cannot derive clustering key \
-                             (file: {}, line: {})",
-                            op.table.table,
-                            file!(),
-                            line!()
-                        )));
-                    }
-                }
-            } else {
-                vec![]
-            };
-
             let row = Row {
-                clustering,
+                clustering: clustering.clone(),
                 cells,
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
@@ -780,13 +900,13 @@ async fn execute_merge(
         stats.vertices_read += 1;
 
         if let Some(var_name) = &op.var {
-            var_keys.insert(var_name.clone(), (table_id, key));
+            var_keys.insert(var_name.clone(), (table_id, key, clustering));
         }
     }
 
     // Step 4: apply trailing SET assignments.
     for (var, property, val_expr) in set_clause {
-        let Some((table_id, key)) = var_keys.get(var) else {
+        let Some((table_id, key, clustering)) = var_keys.get(var) else {
             return Err(GraphError::Validation(format!(
                 "execute_merge: SET references variable '{}' which was not bound by any MERGE; \
                  check that the MERGE pattern declares a variable binding \
@@ -809,9 +929,21 @@ async fn execute_merge(
             e
         })?;
 
+        let Some(column_idx) = regular_column_index_for_property(
+            schema,
+            table_id.keyspace.as_str(),
+            table_id.table.as_str(),
+            property,
+        ) else {
+            return Err(GraphError::Validation(format!(
+                "execute_merge: SET references unknown property '{}' on table '{}.{}'",
+                property, table_id.keyspace, table_id.table
+            )));
+        };
+
         let update_row = Row {
-            clustering: vec![],
-            cells: vec![(0u16, CellValue::live(bytes, timestamp))],
+            clustering: clustering.clone(),
+            cells: vec![(column_idx, CellValue::live(bytes, timestamp))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::NONE,
         };
@@ -1449,6 +1581,28 @@ pub fn column_names_for_table(schema: Option<&Schema>, keyspace: &str, table: &s
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn regular_column_index_for_property(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+) -> Option<u16> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    let meta = snap
+        .tables
+        .get(&(keyspace.to_string(), table.to_string()))?;
+
+    meta.columns
+        .values()
+        .filter(|col| {
+            col.kind == ferrosa_schema::metadata::column::ColumnKind::Regular
+                || col.kind == ferrosa_schema::metadata::column::ColumnKind::Static
+        })
+        .enumerate()
+        .find_map(|(idx, col)| (col.name == property).then_some(idx as u16))
 }
 
 /// Extract the neighbor ID from an adjacency row's clustering key.

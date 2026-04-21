@@ -14,6 +14,7 @@ NOTE: *Before you begin:* Every tutorial in this collection uses the same 3-node
 
 link:cluster-setup.html[*3-Node Cluster Setup*]::
 Install Docker and launch a production-like Ferrosa cluster in 5 minutes.
+ The directory also includes `docker-compose.mixed-clients.yml` for deployments that need host/public CQL addresses and separate in-network/internal addresses from the same cluster.
 
 link:cluster-scaling.html[*Cluster Scaling: Development to Production*] _New!_::
 Watch Ferrosa scale from a single development node to a 3-node production cluster with zero downtime. Writes and schema changes continue uninterrupted during each transition.
