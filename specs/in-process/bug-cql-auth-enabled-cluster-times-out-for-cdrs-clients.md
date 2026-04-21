@@ -26,7 +26,7 @@ path.
 
 ## Observed on
 
-- Ferrosa commit: `6fce814`
+- Ferrosa commit: `2faab48` (re-verified), previously `3f868db` and `6fce814`
 - Cluster: local 3-node podman cluster from
   `/Users/bkearns/src/ferrosa-memory/docker-compose.yml`
 - Auth: enabled
@@ -223,7 +223,7 @@ match the real failing path much more closely:
 
 ### Result on rebuilt cluster
 
-Rebuilt local cluster from Ferrosa commit `3f868db`, then ran:
+Rebuilt local cluster from Ferrosa commit `2faab48`, then ran:
 
 ```bash
 FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-memory-core --test cql_live \
@@ -271,3 +271,63 @@ The current best hypothesis is:
 
 That keeps this issue open even though the four handshake regressions
 are green.
+
+## Workbench confirmation on `2faab48`
+
+With `ferrosa-memory-mcp` restarted against the rebuilt local cluster:
+
+- `GET https://127.0.0.1:28765/healthz/ready` => `not ready`
+- `GET http://127.0.0.1:28766/workbench/api/summary` =>
+  `{"status":"not_ready","error":"CQL connection not yet established, retrying in background...",...}`
+- `POST /workbench/api/cql/query` =>
+  `{"error":"CQL connection not yet established, retrying in background..."}`
+- `POST /workbench/api/sparql/query` still succeeds
+
+So the live application symptom and the focused repro tests still line up on
+`2faab48`.
+
+## Second root cause + fix (2026-04-21)
+
+The `rpc_port` fix (5061f13) was necessary but not sufficient. After
+the contact-point handshake completes, cdrs-tokio's
+`cluster_metadata_manager::refresh_node_infos` runs `is_peer_row_valid`
+on every row of `system.peers`. That validator (cdrs-tokio's
+`cluster_metadata_manager.rs:210-222`) requires the `tokens` column to
+be NON-empty:
+
+```rust
+fn is_peer_row_valid(row: &Row) -> bool {
+    let has_rpc_address = ...;
+    has_rpc_address
+        && !row.is_empty_by_name("host_id")
+        && !row.is_empty_by_name("data_center")
+        && !row.is_empty_by_name("rack")
+        && !row.is_empty_by_name("tokens")        // <-- the problem
+        && !row.is_empty_by_name("schema_version")
+}
+```
+
+Ferrosa's `RaftClusterState::peers()` was returning `tokens: vec![]`
+for every peer regardless of how many tokens the ring had assigned to
+that peer. cdrs-tokio's `filter_map` therefore dropped every peer row,
+leaving the topology pool effectively single-node and driving an
+internal state where session-build never converges. On the wire side
+this manifested as `failed to fill whole buffer` retries until the
+10s session-build timer fired.
+
+Fix: populate `tokens` in `RaftClusterState::peers()` from the live
+`TokenRing` via `ring.tokens_for_node(id)`, formatted as decimal
+strings (matching Cassandra's `set<text>` shape on `system.peers`).
+
+Regression coverage:
+- `ferrosa-cluster::state::tests::raft_cluster_state_populates_tokens_from_ring_for_peers`
+  pins that any peer with ring-assigned tokens reports a non-empty
+  `tokens` field.
+- `ferrosa-cql::tests::handshake::cdrs_tokio_session_bootstrap_queries_return_well_formed_results`
+  pins that the four exact queries cdrs-tokio's
+  `cluster_metadata_manager` runs (system.local, system.peers,
+  system.peers_v2, `SELECT keyspace_name, toJson(replication) AS
+  replication FROM system_schema.keyspaces`) all return well-formed
+  Rows results under authenticated context.
+- `ferrosa-cql::tests::handshake::auth_enabled_post_auth_introspection_does_not_hang`
+  pins the broader cqlsh-style introspection sequence under auth.

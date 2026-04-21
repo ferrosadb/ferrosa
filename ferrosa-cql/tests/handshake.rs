@@ -434,6 +434,131 @@ async fn seeded_ferrosa_admin_can_authenticate_over_v4_tcp() {
     );
 }
 
+/// Reproduce the exact post-AUTH_SUCCESS sequence that cdrs-tokio's
+/// session builder runs: introspect system.local + system.peers +
+/// system_schema.* under authenticated context. If any of these hangs
+/// or returns a malformed frame, cdrs-tokio's transport logs
+/// "failed to fill whole buffer" and the 10s session-build timer
+/// fires. See specs/in-process/bug-cql-auth-enabled-cluster-times-
+/// out-for-cdrs-clients.md.
+#[tokio::test]
+async fn auth_enabled_post_auth_introspection_does_not_hang() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // STARTUP → AUTHENTICATE → AUTH_RESPONSE → AUTH_SUCCESS
+    let startup = encode_startup_frame();
+    stream.write_all(&startup).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
+    stream.write_all(&auth).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::AuthSuccess);
+
+    // The same introspection sequence cqlsh + cdrs-tokio session build run.
+    let introspection = [
+        "SELECT * FROM system.local",
+        "SELECT * FROM system.peers",
+        "SELECT * FROM system.peers_v2",
+        "SELECT * FROM system_schema.keyspaces",
+        "SELECT * FROM system_schema.tables",
+        "SELECT * FROM system_schema.columns",
+        "SELECT * FROM system_schema.types",
+        "SELECT * FROM system_schema.functions",
+        "SELECT * FROM system_schema.aggregates",
+        "SELECT * FROM system_schema.triggers",
+        "SELECT * FROM system_schema.views",
+        "SELECT * FROM system_schema.indexes",
+    ];
+
+    for cql in &introspection {
+        let body = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        let resp = read_frame(&mut stream).await;
+        assert_eq!(
+            resp.opcode,
+            Opcode::Result,
+            "{cql} under authenticated context must return RESULT — got opcode={:?} body_len={}",
+            resp.opcode,
+            resp.body.len()
+        );
+        // Result kind: Rows = 0x0002. If we got Error or partial bytes the body
+        // would be too short or kind would be different.
+        assert!(
+            resp.body.len() >= 4,
+            "{cql} result body must be at least 4 bytes (kind tag) — got {}",
+            resp.body.len()
+        );
+        let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+        assert_eq!(
+            kind, 0x0002,
+            "{cql} result kind must be Rows (0x0002) — got {kind:#x}"
+        );
+    }
+}
+
+/// cdrs-tokio's `cluster_metadata_manager` runs the EXACT queries below
+/// during session bootstrap (see cluster_metadata_manager.rs:497, 665, 729,
+/// 757). If any of these returns a malformed RESULT body, cdrs-tokio's
+/// row decoder fails and the session-build retries forever (manifesting
+/// as `IO error: failed to fill whole buffer` on the wire side).
+///
+/// See specs/in-process/bug-cql-auth-enabled-cluster-times-out-for-cdrs-clients.md.
+#[tokio::test]
+async fn cdrs_tokio_session_bootstrap_queries_return_well_formed_results() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // STARTUP → AUTHENTICATE → AUTH_RESPONSE → AUTH_SUCCESS
+    let startup = encode_startup_frame();
+    stream.write_all(&startup).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
+    stream.write_all(&auth).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::AuthSuccess);
+
+    // The four EXACT queries cdrs-tokio's cluster_metadata_manager fires.
+    let session_bootstrap_queries = [
+        "SELECT * FROM system.local",
+        "SELECT * FROM system.peers",
+        "SELECT * FROM system.peers_v2",
+        // toJson() on the system_schema.keyspaces.replication map column.
+        // cdrs-tokio expects a single Varchar column called "replication"
+        // holding a JSON object; any other shape and its row decoder fails.
+        "SELECT keyspace_name, toJson(replication) AS replication FROM system_schema.keyspaces",
+    ];
+
+    for cql in &session_bootstrap_queries {
+        let body = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        let resp = read_frame(&mut stream).await;
+        assert_eq!(
+            resp.opcode,
+            Opcode::Result,
+            "{cql} must return RESULT — got opcode={:?}",
+            resp.opcode
+        );
+        assert!(
+            resp.body.len() >= 4,
+            "{cql} body too short ({} bytes)",
+            resp.body.len()
+        );
+        let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+        assert_eq!(
+            kind, 0x0002,
+            "{cql} kind must be Rows (0x0002), got {kind:#x}"
+        );
+    }
+}
+
 /// Reproduce cdrs-tokio's actual handshake: OPTIONS first, THEN
 /// STARTUP. If SUPPORTED or AUTHENTICATE is mis-encoded, cdrs-tokio's
 /// transport logs `IO error: failed to fill whole buffer` and the

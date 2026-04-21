@@ -151,6 +151,19 @@ impl ClusterState for RaftClusterState {
                 } else {
                     (ip, 9042)
                 };
+                // Populate `tokens` from the ring. cdrs-tokio's
+                // `is_peer_row_valid` filters out any peer row whose
+                // `tokens` column is empty — and on an empty pool the
+                // session-build hangs (see
+                // specs/in-process/bug-cql-auth-enabled-cluster-times-
+                // out-for-cdrs-clients.md). Tokens are formatted as
+                // decimal strings, matching Cassandra's system.peers
+                // wire shape (`set<text>`).
+                let tokens: Vec<String> = ring
+                    .tokens_for_node(id)
+                    .into_iter()
+                    .map(|t| t.to_string())
+                    .collect();
                 Some(PeerInfo {
                     peer: ip,
                     peer_port: port,
@@ -162,7 +175,7 @@ impl ClusterState for RaftClusterState {
                     native_address: native_addr,
                     native_port,
                     schema_version: uuid::Uuid::nil(),
-                    tokens: vec![],
+                    tokens,
                     release_version: ferrosa_schema::system::RELEASE_VERSION.to_string(),
                 })
             })
@@ -202,6 +215,66 @@ mod tests {
         assert_eq!(peers[0].host_id, peer_id);
         assert_eq!(peers[0].peer, "10.0.1.5".parse::<IpAddr>().unwrap());
         assert_eq!(peers[0].peer_port, 7000);
+    }
+
+    /// Pin the bug fix from
+    /// `specs/in-process/bug-cql-auth-enabled-cluster-times-out-for-cdrs-clients.md`:
+    /// `system.peers.tokens` MUST be non-empty for any peer that has tokens
+    /// assigned in the ring. cdrs-tokio's `is_peer_row_valid` filters out
+    /// peer rows whose `tokens` column is empty, leaving the session-build
+    /// pool effectively single-node and causing intermittent hangs.
+    #[test]
+    fn raft_cluster_state_populates_tokens_from_ring_for_peers() {
+        use crate::raft::{NodeInfo, NodeState};
+        use crate::ring::TokenRing;
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "10.0.0.1:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "10.0.0.2:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        // Assign a few tokens to the peer.
+        ring.assign_tokens(peer_id, &[-1000, 0, 1000, i64::MAX]);
+
+        let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+        let state = RaftClusterState::new(ring_arc, local_id);
+        let peers = state.peers();
+
+        assert_eq!(peers.len(), 1);
+        let peer = &peers[0];
+        assert!(
+            !peer.tokens.is_empty(),
+            "peer.tokens must be non-empty so cdrs-tokio's is_peer_row_valid \
+             accepts the row — empty tokens cause session-build hangs"
+        );
+        assert_eq!(peer.tokens.len(), 4, "expected all 4 ring tokens");
+        // Token strings parse as i64 (Cassandra wire format for set<text>).
+        for tok_str in &peer.tokens {
+            tok_str
+                .parse::<i64>()
+                .expect("each token string must round-trip through i64");
+        }
     }
 
     #[test]
