@@ -2294,6 +2294,161 @@ async fn full_shape_typed_edge_merge_is_immediately_matchable_in_real_agent_memo
 }
 
 #[tokio::test]
+async fn full_shape_typed_edge_match_returns_relationship_properties_in_real_agent_memory_schema() {
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    seed_agent_memory_entity(&storage, tenant_id, session_id, src_id, "src");
+    seed_agent_memory_entity(&storage, tenant_id, session_id, dst_id, "dst");
+
+    let merge_query = format!(
+        "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
+         MERGE (b:Entity {{entity_id: '{dst_id}'}}) \
+         MERGE (a)-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->(b) \
+         SET r.tenant_id = '{tenant_id}', \
+             r.session_id = '{session_id}', \
+             r.weight = 1.0 \
+         RETURN r"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": merge_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let match_query = format!(
+        "MATCH (a:Entity {{entity_id: '{src_id}'}})-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->\
+         (b:Entity {{entity_id: '{dst_id}'}}) RETURN r.edge_type, r.weight"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": match_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"]
+        .as_array()
+        .expect("MATCH relationship projection response must include rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "MATCH must return exactly one relationship row"
+    );
+    assert_eq!(rows[0][0], serde_json::json!("related_to"));
+    assert_eq!(rows[0][1], serde_json::json!(1.0));
+}
+
+#[tokio::test]
+async fn full_shape_typed_edge_match_finds_edge_when_entities_exist_in_multiple_scopes() {
+    let expected_tenant_id = Uuid::parse_str("6792702e-2a9c-4465-ba65-ba100b5aaafa").unwrap();
+    let expected_session_id = Uuid::parse_str("909e2671-aea0-534a-83bc-bb5efc544b0f").unwrap();
+    let other_tenant_id = Uuid::parse_str("0e66aeeb-0228-461d-a1ff-28571da15443").unwrap();
+    let other_session_id = Uuid::parse_str("870a223e-d134-5057-a0c9-92e12f408ebc").unwrap();
+    let src_id = Uuid::parse_str("41753309-7297-454e-8f2d-c6546740cf2b").unwrap();
+    let dst_id = Uuid::parse_str("f6ffe258-9194-470d-9811-5b3e23b33103").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+
+    seed_agent_memory_entity(
+        &storage,
+        expected_tenant_id,
+        expected_session_id,
+        src_id,
+        "src",
+    );
+    seed_agent_memory_entity(
+        &storage,
+        expected_tenant_id,
+        expected_session_id,
+        dst_id,
+        "dst",
+    );
+    seed_agent_memory_entity(
+        &storage,
+        other_tenant_id,
+        other_session_id,
+        src_id,
+        "src-other",
+    );
+    seed_agent_memory_entity(
+        &storage,
+        other_tenant_id,
+        other_session_id,
+        dst_id,
+        "dst-other",
+    );
+
+    let merge_query = format!(
+        "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
+         MERGE (b:Entity {{entity_id: '{dst_id}'}}) \
+         MERGE (a)-[r:TYPED_EDGE {{edge_type: 'implements'}}]->(b) \
+         SET r.tenant_id = '{expected_tenant_id}', \
+             r.session_id = '{expected_session_id}', \
+             r.weight = 1.0 \
+         RETURN r"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": merge_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let match_query = format!(
+        "MATCH (a:Entity {{entity_id: '{src_id}'}})-[r:TYPED_EDGE {{edge_type: 'implements'}}]->\
+         (b:Entity {{entity_id: '{dst_id}'}}) RETURN r.edge_type, r.weight"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": match_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"]
+        .as_array()
+        .expect("MATCH relationship projection response must include rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "MATCH must still find the scoped edge when duplicate entity rows exist in other scopes"
+    );
+    assert_eq!(rows[0][0], serde_json::json!("implements"));
+    assert_eq!(rows[0][1], serde_json::json!(1.0));
+}
+
+#[tokio::test]
 async fn canonical_typed_edge_merge_infers_scope_from_existing_entities() {
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
     use ferrosa_storage::TableId;

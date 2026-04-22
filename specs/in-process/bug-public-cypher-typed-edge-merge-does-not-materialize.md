@@ -1,11 +1,10 @@
-# Bug: Public Cypher `MERGE` for `TYPED_EDGE` returns success but does not materialize a row
+# Bug: Public Cypher `TYPED_EDGE` writes persist to CQL but are not readable back through graph queries
 
 ## Summary
 
-Ferrosa's public graph HTTP mutation path accepts the canonical typed-edge
-`MERGE` shape and does not return an error, but no row appears in
-`agent_memory.typed_edges` afterward and follow-up graph reads report zero
-matching relationships.
+Ferrosa's public graph HTTP mutation path now accepts canonical typed-edge
+`MERGE` writes and persists rows into `agent_memory.typed_edges`, but follow-up
+public graph reads still do not return those relationships correctly.
 
 This blocks `ferrosa-memory` Sprint 9 graph-write cutover. The client is
 already routing typed-edge writes through the public graph API and failing
@@ -27,7 +26,8 @@ Expected results:
 
 1. `POST /graph/query` returns a success payload.
 2. A row exists in `agent_memory.typed_edges` for `(src_id, edge_type, dst_id)`.
-3. A follow-up Cypher `MATCH` with the same identifiers sees `count(r) = 1`.
+3. A follow-up Cypher `MATCH` with the same identifiers returns the written
+   edge and properties.
 
 ## Actual
 
@@ -35,10 +35,61 @@ Observed against the local three-node auth-enabled cluster used by
 `ferrosa-memory`:
 
 1. `ferrosa-memory` tool `create_edge` returns success.
-2. Direct execution of the canonical Cypher `MERGE` shape also does not
-   return a useful graph error.
-3. Follow-up CQL shows no row in `agent_memory.typed_edges`.
-4. Follow-up Cypher `MATCH ... RETURN count(r)` reports `0`.
+2. Direct execution of the canonical Cypher `MERGE` shape returns success.
+3. Follow-up CQL shows the expected row in `agent_memory.typed_edges`.
+4. Follow-up Cypher `MATCH ...-[r:TYPED_EDGE]->... RETURN r.edge_type, r.weight`
+   still returns no matching rows, or returns unrelated edge labels.
+
+### Re-verified on `d6573c1`
+
+Retested on the local three-node auth-enabled cluster rebuilt from Ferrosa
+commit `d6573c141071716eeade7ec87213c2decb8d0b33`, with `ferrosa-memory`
+running successfully on `18765/18766`.
+
+Live observations:
+
+- `SPARQL` passthrough works through `ferrosa-memory`.
+- direct canonical public typed-edge `MERGE` returns success:
+
+```json
+{"columns":["status"],"rows":[["merged 5 vertices, 1 properties updated"]]}
+```
+
+- exact CQL readback shows the `related_to` row exists:
+
+```json
+{"count":1,"rows":[{"src_id":"41753309-7297-454e-8f2d-c6546740cf2b","edge_type":"related_to","dst_id":"f6ffe258-9194-470d-9811-5b3e23b33103","weight":1.0}]}
+```
+
+- `ferrosa-memory` `create_edge` also returns success:
+
+```json
+{"created":true,"dst_id":"f6ffe258-9194-470d-9811-5b3e23b33103","edge_type":"references","src_id":"41753309-7297-454e-8f2d-c6546740cf2b","weight":0.75}
+```
+
+- exact CQL readback also shows that `references` row exists:
+
+```json
+{"count":1,"rows":[{"src_id":"41753309-7297-454e-8f2d-c6546740cf2b","edge_type":"references","dst_id":"f6ffe258-9194-470d-9811-5b3e23b33103","weight":0.75}]}
+```
+
+- but public graph readback is still wrong:
+
+```json
+{"columns":["r.edge_type","r.weight"],"rows":[]}
+```
+
+and a broader read on the same endpoints returned unrelated graph edges:
+
+```json
+{"columns":["r.edge_type","r.weight"],"rows":[["TAGGED_AS",1.0],["TAGGED_AS",1.0]]}
+```
+
+That narrows the current bug to:
+
+> public typed-edge writes now persist correctly, but public graph query
+> readback for those typed edges is still not honoring the expected
+> `TYPED_EDGE` relationship semantics.
 
 ### Re-verified on `23ca6c4`
 
@@ -210,10 +261,10 @@ Observed:
 
 ## Why this matters
 
-`ferrosa-memory` can no longer complete the graph-write cutover safely if
-public typed-edge mutations acknowledge success without making the edge
-observable. Falling back to direct `INSERT INTO typed_edges` would violate the
-role-auth and public-boundary design.
+`ferrosa-memory` can no longer safely validate graph-write cutover if public
+typed-edge writes persist to CQL but the public graph read surface cannot read
+them back correctly. Falling back to direct reads against internal graph tables
+would violate the public-boundary design.
 
 ## Acceptance criteria
 

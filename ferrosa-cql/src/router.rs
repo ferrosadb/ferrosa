@@ -47,6 +47,34 @@ use crate::virtual_tables::connections::ConnectionTracker;
 
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
+const COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
+
+async fn extend_rows_from_partitions(
+    partitions: &[ferrosa_sstable::types::Partition],
+    all_rows: &mut Vec<Vec<Option<CqlValue>>>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+) {
+    for (idx, partition) in partitions.iter().enumerate() {
+        let mut prows = bridge::partition_to_rows(
+            partition,
+            all_col_names,
+            all_col_types,
+            pk_indices,
+            ck_indices,
+        );
+        all_rows.append(&mut prows);
+        if should_yield_during_partition_scan(idx + 1, COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+fn should_yield_during_partition_scan(processed_partitions: usize, yield_every: usize) -> bool {
+    yield_every > 0 && processed_partitions > 0 && processed_partitions % yield_every == 0
+}
 
 /// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
 const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
@@ -1297,16 +1325,15 @@ async fn route_select_user_table(
                 // Fall through to a full scan rather than panicking.
                 let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
                 all_rows.retain(|row| {
                     evaluate_where_predicates(
                         row,
@@ -1377,16 +1404,15 @@ async fn route_select_user_table(
                 };
 
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
 
                 // Always apply post-filter as defensive measure.
                 // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
@@ -1439,16 +1465,15 @@ async fn route_select_user_table(
                 };
 
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
 
                 all_rows.retain(|row| {
                     evaluate_where_predicates(
@@ -1495,16 +1520,15 @@ async fn route_select_user_table(
                 // not before, to avoid cutting off matching rows (FRSA-BUG-003).
                 let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
                 all_rows.retain(|row| {
                     evaluate_where_predicates(
                         row,
@@ -6600,7 +6624,7 @@ mod tests {
 
     #[tokio::test]
     async fn internal_client_sees_internal_system_local_endpoint() {
-        let (state, _dir) = setup();
+        let (mut state, _dir) = setup();
         let mut node_config = (*state.node_config).clone();
         node_config.rpc_address = "127.0.0.1".parse().unwrap();
         node_config.rpc_port = 19042;
@@ -6972,7 +6996,7 @@ mod tests {
         use ferrosa_cluster::raft::{NodeInfo, NodeState};
         use ferrosa_cluster::ring::TokenRing;
 
-        let (mut state, _dir) = setup();
+        let (state, _dir) = setup();
 
         let local_id = 1_u64;
         let peer_id = 2_u64;
@@ -9048,6 +9072,19 @@ mod tests {
     // memory.  Queries without ALLOW FILTERING on non-indexed columns
     // are still rejected.
 
+    #[test]
+    fn partition_scan_yield_policy_triggers_at_threshold() {
+        assert!(!should_yield_during_partition_scan(0, 32));
+        assert!(!should_yield_during_partition_scan(31, 32));
+        assert!(should_yield_during_partition_scan(32, 32));
+        assert!(should_yield_during_partition_scan(64, 32));
+    }
+
+    #[test]
+    fn partition_scan_yield_policy_can_be_disabled() {
+        assert!(!should_yield_during_partition_scan(32, 0));
+    }
+
     #[tokio::test]
     async fn allow_filtering_executes_full_scan() {
         let (state, _dir) = setup();
@@ -9292,6 +9329,97 @@ mod tests {
             filtered_count, 2,
             "ALLOW FILTERING on entity_type='person' should return 2 rows, got {filtered_count}"
         );
+    }
+
+    #[tokio::test]
+    async fn composite_clustering_text_predicate_matches_exact_pk_lookup() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE agent WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE agent.typed_edges (
+                    tenant_id uuid,
+                    session_id uuid,
+                    src_id uuid,
+                    edge_type text,
+                    dst_id uuid,
+                    weight double,
+                    PRIMARY KEY ((tenant_id, session_id), src_id, edge_type, dst_id)
+                )",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let tid = "6792702e-2a9c-4465-ba65-ba100b5aaafa";
+        let sid = "909e2671-aea0-534a-83bc-bb5efc544b0f";
+        let src = "41753309-7297-454e-8f2d-c6546740cf2b";
+        let dst = "f6ffe258-9194-470d-9811-5b3e23b33103";
+
+        for edge_type in ["related_to", "afteradj_1776880700"] {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO agent.typed_edges \
+                     (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                     VALUES ({tid}, {sid}, {src}, '{edge_type}', {dst}, 1.0)"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let stmt = crate::parser::parse(&format!(
+            "SELECT src_id, edge_type, dst_id, weight FROM agent.typed_edges \
+             WHERE tenant_id = {tid} AND session_id = {sid} AND src_id = {src} \
+             AND edge_type = 'afteradj_1776880700'"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, 1,
+            "exact PK lookup including text clustering column should return the matching row"
+        );
+
+        let stmt = crate::parser::parse(&format!(
+            "SELECT src_id, edge_type, dst_id, weight FROM agent.typed_edges \
+             WHERE edge_type = 'afteradj_1776880700' ALLOW FILTERING"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let filtered_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(filtered_count, 1);
     }
 
     // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────

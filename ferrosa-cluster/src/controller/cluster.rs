@@ -42,8 +42,44 @@ use super::{ClusterStateHolder, ModeController};
 pub(super) fn should_initialize_seed_membership(
     was_seed: bool,
     has_recovered_membership: bool,
+    has_recovered_topology_state: bool,
 ) -> bool {
-    was_seed && !has_recovered_membership
+    was_seed && !has_recovered_membership && !has_recovered_topology_state
+}
+
+pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool) -> bool {
+    !has_recovered_topology_state
+}
+
+pub(super) fn build_recovered_topology_refresh_plan(
+    local_host_id: uuid::Uuid,
+    local_addr: String,
+    local_cql_broadcast: Option<String>,
+    data_center: &str,
+    rack: &str,
+    peers: &[(uuid::Uuid, SocketAddr)],
+    peer_cql_broadcasts: &std::collections::HashMap<uuid::Uuid, Option<String>>,
+) -> Vec<crate::raft::NodeInfo> {
+    let mut plan = Vec::with_capacity(peers.len() + 1);
+    plan.push(crate::raft::NodeInfo {
+        host_id: local_host_id,
+        addr: local_addr,
+        data_center: data_center.to_string(),
+        rack: rack.to_string(),
+        state: crate::raft::NodeState::Normal,
+        cql_broadcast: local_cql_broadcast,
+    });
+    for (peer_uuid, addr) in peers {
+        plan.push(crate::raft::NodeInfo {
+            host_id: *peer_uuid,
+            addr: addr.to_string(),
+            data_center: data_center.to_string(),
+            rack: rack.to_string(),
+            state: crate::raft::NodeState::Normal,
+            cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
+        });
+    }
+    plan
 }
 
 impl ModeController {
@@ -260,6 +296,7 @@ impl ModeController {
                 recovered_from_topology
             }
         };
+        let has_recovered_topology_state = state_machine.has_topology_state();
 
         // 3. Create network factory
         let network_factory = FerrosRaftNetworkFactory::new(peer_manager.clone());
@@ -281,6 +318,9 @@ impl ModeController {
         // will consume `peer_manager` below).
         let peer_manager_for_ddl = peer_manager.clone();
         let peer_manager_for_bootstrap = peer_manager.clone();
+        let local_host_id_for_refresh = self.local_host_id;
+        let local_addr_for_refresh = self.net_config.broadcast_addr.to_string();
+        let local_cql_broadcast_for_refresh = self.config.cql_broadcast.clone();
 
         // 4. Build TokenRing with deterministic initial tokens.
         // If a durable snapshot was recovered, let the state machine repopulate
@@ -856,10 +896,12 @@ impl ModeController {
             // Non-seed nodes will receive their membership via AppendEntries
             // from the leader. This prevents CF-T17 (membership race from
             // independent initialize() calls with potentially different member lists).
-            if should_initialize_seed_membership(
+            let initialized_seed_membership = should_initialize_seed_membership(
                 was_seed,
                 has_recovered_membership,
-            ) {
+                has_recovered_topology_state,
+            );
+            if initialized_seed_membership {
                 if let Err(e) = raft_arc.initialize(members).await {
                     tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
                 }
@@ -868,6 +910,7 @@ impl ModeController {
                     has_persisted_log = persisted_raft_state.0,
                     has_persisted_vote = persisted_raft_state.1,
                     has_recovered_membership,
+                    has_recovered_topology_state,
                     "seed has persisted raft state; skipping initialize and waiting for election"
                 );
             } else {
@@ -892,7 +935,34 @@ impl ModeController {
                         leader = lid,
                         "raft leader elected, swapping DDL path to Cluster"
                     );
-                    if was_seed {
+                    if has_recovered_topology_state && lid == local_node_id {
+                        let refresh_plan = build_recovered_topology_refresh_plan(
+                            local_host_id_for_refresh,
+                            local_addr_for_refresh.clone(),
+                            local_cql_broadcast_for_refresh.clone(),
+                            &config_for_promotion.data_center,
+                            &config_for_promotion.rack,
+                            &peers,
+                            &peer_cql_broadcasts,
+                        );
+                        for node_info in refresh_plan {
+                            if let Err(e) = raft_arc
+                                .client_write(crate::raft::RaftCommand {
+                                    op: crate::raft::RaftOp::UpdateNodeInfo(node_info.clone()),
+                                    schema_version: Uuid::new_v4(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    host_id = %node_info.host_id,
+                                    leader = lid,
+                                    %e,
+                                    "leader failed to refresh recovered topology metadata"
+                                );
+                            }
+                        }
+                    }
+                    if initialized_seed_membership {
                         // Author peer topology only AFTER a leader exists.
                         // Firing client_write() immediately after initialize()
                         // races with leader election and yields
@@ -1066,322 +1136,286 @@ impl ModeController {
                         }
                     }
 
-                    // --- Phase B: Bootstrap streaming (all nodes) ---
-                    //
-                    // Every node reads from its local storage and streams
-                    // partitions that belong to other nodes per the new ring.
-                    // Nodes with no data complete instantly (zero iterations).
-                    //
-                    // Two paths:
-                    //   1. Row-based (default): serialize each partition's rows
-                    //      individually via bincode. Good for small tables.
-                    //   2. SSTable file-based (bulk): when partition count exceeds
-                    //      BOOTSTRAP_SSTABLE_THRESHOLD, flush the table to disk and
-                    //      stream the SSTable component files directly. Much faster
-                    //      for large datasets since it avoids per-row serialization.
-                    tracing::info!("starting bootstrap streaming to new token owners");
+                    if should_run_bootstrap_streaming(has_recovered_topology_state) {
+                        // --- Phase B: Bootstrap streaming (all nodes) ---
+                        //
+                        // Every node reads from its local storage and streams
+                        // partitions that belong to other nodes per the new ring.
+                        // Nodes with no data complete instantly (zero iterations).
+                        //
+                        // Skip this on restart when topology was already recovered:
+                        // the cluster is reforming, not adding new token owners.
+                        tracing::info!("starting bootstrap streaming to new token owners");
 
-                    /// Partition count threshold above which we switch from
-                    /// per-row streaming to SSTable file-based bulk transfer.
-                    const BOOTSTRAP_SSTABLE_THRESHOLD: usize = 1_000;
+                        /// Partition count threshold above which we switch from
+                        /// per-row streaming to SSTable file-based bulk transfer.
+                        const BOOTSTRAP_SSTABLE_THRESHOLD: usize = 1_000;
 
-                    if let Some(ring) = &**ring_for_bootstrap.load() {
-                        let schema_snap = schema_for_bootstrap.snapshot();
-                        let config = StreamConfig::default();
-                        let node_map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner()).clone();
-                        let mut session_counter = 0_u64;
+                        if let Some(ring) = &**ring_for_bootstrap.load() {
+                            let schema_snap = schema_for_bootstrap.snapshot();
+                            let config = StreamConfig::default();
+                            let node_map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner()).clone();
+                            let mut session_counter = 0_u64;
 
-                        for (ks, tbl) in schema_snap.tables.keys() {
-                            if ks.starts_with("system") {
-                                continue;
-                            }
-                            let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
-                            // Cap per-table read to 100k partitions to prevent OOM.
-                            // Tables larger than this will have partial bootstrap;
-                            // anti-entropy repair catches the rest.
-                            const BOOTSTRAP_READ_LIMIT: usize = 100_000;
-                            let partitions = match storage_for_bootstrap.read_range(
-                                &table_id,
-                                None,
-                                None,
-                                BOOTSTRAP_READ_LIMIT,
-                            ) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!(%e, ks, tbl, "bootstrap: failed to read table");
+                            for (ks, tbl) in schema_snap.tables.keys() {
+                                if ks.starts_with("system") {
                                     continue;
                                 }
-                            };
+                                let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
+                                const BOOTSTRAP_READ_LIMIT: usize = 100_000;
+                                let partitions = match storage_for_bootstrap.read_range(
+                                    &table_id,
+                                    None,
+                                    None,
+                                    BOOTSTRAP_READ_LIMIT,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to read table");
+                                        continue;
+                                    }
+                                };
 
-                            // --- SSTable bulk path ---
-                            // When partition count exceeds the threshold, flush
-                            // the table to an SSTable on disk and stream the raw
-                            // component files. This is O(file-size) rather than
-                            // O(partitions * rows * cells).
-                            if partitions.len() >= BOOTSTRAP_SSTABLE_THRESHOLD {
-                                tracing::info!(
-                                    ks,
-                                    tbl,
-                                    partitions = partitions.len(),
-                                    "bootstrap: using SSTable bulk transfer (threshold: {BOOTSTRAP_SSTABLE_THRESHOLD})"
-                                );
+                                if partitions.len() >= BOOTSTRAP_SSTABLE_THRESHOLD {
+                                    tracing::info!(
+                                        ks,
+                                        tbl,
+                                        partitions = partitions.len(),
+                                        "bootstrap: using SSTable bulk transfer (threshold: {BOOTSTRAP_SSTABLE_THRESHOLD})"
+                                    );
 
-                                // Ensure data is flushed to disk before streaming.
-                                if let Err(e) = storage_for_bootstrap.flush_all() {
-                                    tracing::warn!(%e, ks, tbl, "bootstrap: flush before SSTable stream failed, falling back to row path");
-                                    // Fall through to the row-based path below.
-                                } else {
-                                    // Look for SSTable directories for this table.
-                                    let sstable_base = storage_for_bootstrap
-                                        .data_dir()
-                                        .join("sstables")
-                                        .join(table_id.to_string());
+                                    if let Err(e) = storage_for_bootstrap.flush_all() {
+                                        tracing::warn!(%e, ks, tbl, "bootstrap: flush before SSTable stream failed, falling back to row path");
+                                    } else {
+                                        let sstable_base = storage_for_bootstrap
+                                            .data_dir()
+                                            .join("sstables")
+                                            .join(table_id.to_string());
 
-                                    let sstable_dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&sstable_base) {
-                                        Ok(entries) => entries
-                                            .filter_map(|e| e.ok())
-                                            .filter(|e| e.path().is_dir())
-                                            .map(|e| e.path())
-                                            .collect(),
-                                        Err(_) => {
-                                            tracing::debug!(ks, tbl, "bootstrap: no SSTable dir at {}, using row path", sstable_base.display());
-                                            vec![]
-                                        }
-                                    };
+                                        let sstable_dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&sstable_base) {
+                                            Ok(entries) => entries
+                                                .filter_map(|e| e.ok())
+                                                .filter(|e| e.path().is_dir())
+                                                .map(|e| e.path())
+                                                .collect(),
+                                            Err(_) => {
+                                                tracing::debug!(ks, tbl, "bootstrap: no SSTable dir at {}, using row path", sstable_base.display());
+                                                vec![]
+                                            }
+                                        };
 
-                                    if !sstable_dirs.is_empty() {
-                                        // Stream each SSTable directory to all non-local peers.
-                                        // TODO(S4): partition SSTables by target node token range
-                                        // instead of broadcasting all SSTables to all peers.
-                                        let mut sstable_streamed = false;
-                                        for sstable_dir in &sstable_dirs {
-                                            let sstable_id = sstable_dir
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().to_string())
-                                                .unwrap_or_else(|| "unknown".to_string());
+                                        if !sstable_dirs.is_empty() {
+                                            let mut sstable_streamed = false;
+                                            for sstable_dir in &sstable_dirs {
+                                                let sstable_id = sstable_dir
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().to_string())
+                                                    .unwrap_or_else(|| "unknown".to_string());
 
-                                            for (&target_node_id, &target_uuid) in &node_map {
-                                                if target_node_id == local_node_id {
-                                                    continue;
-                                                }
-                                                session_counter += 1;
-                                                let request = SstableSendRequest {
-                                                    sstable_dir,
-                                                    keyspace: ks,
-                                                    table: tbl,
-                                                    sstable_id: &sstable_id,
-                                                    session_id: session_counter,
-                                                    source_node: local_node_id,
-                                                    chunk_size: config.chunk_size_bytes,
-                                                };
-                                                match StreamSender::send_sstable_files(
-                                                    &request,
-                                                    &peer_manager_for_bootstrap,
-                                                    target_uuid,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(bytes) => {
-                                                        tracing::info!(
-                                                            target = target_node_id,
-                                                            bytes,
-                                                            sstable_id = %sstable_id,
-                                                            "bootstrap: SSTable streamed {ks}.{tbl}"
-                                                        );
-                                                        sstable_streamed = true;
+                                                for (&target_node_id, &target_uuid) in &node_map {
+                                                    if target_node_id == local_node_id {
+                                                        continue;
                                                     }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            %e,
-                                                            target = target_node_id,
-                                                            sstable_id = %sstable_id,
-                                                            "bootstrap: SSTable stream failed for {ks}.{tbl}"
-                                                        );
+                                                    session_counter += 1;
+                                                    let request = SstableSendRequest {
+                                                        sstable_dir,
+                                                        keyspace: ks,
+                                                        table: tbl,
+                                                        sstable_id: &sstable_id,
+                                                        session_id: session_counter,
+                                                        source_node: local_node_id,
+                                                        chunk_size: config.chunk_size_bytes,
+                                                    };
+                                                    match StreamSender::send_sstable_files(
+                                                        &request,
+                                                        &peer_manager_for_bootstrap,
+                                                        target_uuid,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(bytes) => {
+                                                            tracing::info!(
+                                                                target = target_node_id,
+                                                                bytes,
+                                                                sstable_id = %sstable_id,
+                                                                "bootstrap: SSTable streamed {ks}.{tbl}"
+                                                            );
+                                                            sstable_streamed = true;
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                %e,
+                                                                target = target_node_id,
+                                                                sstable_id = %sstable_id,
+                                                                "bootstrap: SSTable stream failed for {ks}.{tbl}"
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
+                                            if sstable_streamed {
+                                                continue;
+                                            }
                                         }
-                                        if sstable_streamed {
-                                            continue; // Skip row-based path for this table.
-                                        }
-                                        // If all SSTable streams failed, fall through to row path.
                                     }
                                 }
-                            }
 
-                            // --- Row-based path (default / fallback) ---
-                            // Group partitions by target node (using all nodes, including
-                            // Joining — they need the data even though they're not serving yet)
-                            let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
-                                std::collections::HashMap::new();
-                            for partition in &partitions {
-                                let token = partition.key.token.0; // Token(i64) → i64
-                                // Find the node that WILL own this token once promoted
-                                // to Normal (includes Joining nodes).
-                                let owner = ring
-                                    .primary_owner(token)
-                                    .unwrap_or(local_node_id);
+                                let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
+                                    std::collections::HashMap::new();
+                                for partition in &partitions {
+                                    let token = partition.key.token.0;
+                                    let owner = ring.primary_owner(token).unwrap_or(local_node_id);
 
-                                if owner != local_node_id {
-                                    // Serialize all rows via RowWire for full fidelity
-                                    // (clustering keys, all cells, deletion, liveness).
-                                    use crate::raft::handlers::RowWire;
-                                    let wire_rows: Vec<RowWire> = partition.rows
-                                        .iter()
-                                        .cloned()
-                                        .map(RowWire::from)
-                                        .collect();
-                                    let row_bytes = match bincode::serialize(&wire_rows) {
-                                        Ok(bytes) => bytes,
-                                        Err(e) => {
-                                            tracing::error!(
+                                    if owner != local_node_id {
+                                        use crate::raft::handlers::RowWire;
+                                        let wire_rows: Vec<RowWire> = partition.rows
+                                            .iter()
+                                            .cloned()
+                                            .map(RowWire::from)
+                                            .collect();
+                                        let row_bytes = match bincode::serialize(&wire_rows) {
+                                            Ok(bytes) => bytes,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    %e,
+                                                    partition_key = ?partition.key,
+                                                    "bootstrap: failed to serialize rows, skipping partition (data loss avoided)"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        let ts = partition.rows.first()
+                                            .and_then(|r| r.cells.first())
+                                            .map(|(_, cv)| cv.timestamp)
+                                            .unwrap_or(0);
+
+                                        by_node.entry(owner).or_default().push(StreamedMutation {
+                                            keyspace: ks.clone(),
+                                            table: tbl.clone(),
+                                            key: partition.key.key.as_bytes().to_vec(),
+                                            row: row_bytes,
+                                            timestamp: ts,
+                                        });
+                                    }
+                                }
+
+                                for (target_node_id, mutations) in by_node {
+                                    let target_uuid = node_map.get(&target_node_id).copied();
+
+                                    if let Some(uuid) = target_uuid {
+                                        session_counter += 1;
+                                        let count = mutations.len();
+                                        if let Err(e) = StreamSender::send_stream(
+                                            mutations,
+                                            &peer_manager_for_bootstrap,
+                                            uuid,
+                                            session_counter,
+                                            (i64::MIN, i64::MAX),
+                                            local_node_id,
+                                            &config,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
                                                 %e,
-                                                partition_key = ?partition.key,
-                                                "bootstrap: failed to serialize rows, skipping partition (data loss avoided)"
+                                                target = target_node_id,
+                                                "bootstrap streaming failed for {ks}.{tbl}"
                                             );
-                                            continue;
+                                        } else {
+                                            tracing::info!(
+                                                target = target_node_id,
+                                                count,
+                                                "bootstrapped {ks}.{tbl} to node {target_node_id}"
+                                            );
                                         }
-                                    };
-                                    let ts = partition.rows.first()
-                                        .and_then(|r| r.cells.first())
-                                        .map(|(_, cv)| cv.timestamp)
-                                        .unwrap_or(0);
-
-                                    by_node.entry(owner).or_default().push(StreamedMutation {
-                                        keyspace: ks.clone(),
-                                        table: tbl.clone(),
-                                        key: partition.key.key.as_bytes().to_vec(),
-                                        row: row_bytes,
-                                        timestamp: ts,
-                                    });
+                                    }
                                 }
                             }
+                            tracing::info!("bootstrap streaming complete on this node");
+                        }
 
-                            for (target_node_id, mutations) in by_node {
-                                let target_uuid = node_map.get(&target_node_id).copied();
-
-                                if let Some(uuid) = target_uuid {
-                                    session_counter += 1;
-                                    let count = mutations.len();
-                                    if let Err(e) = StreamSender::send_stream(
-                                        mutations,
-                                        &peer_manager_for_bootstrap,
-                                        uuid,
-                                        session_counter,
-                                        (i64::MIN, i64::MAX),
-                                        local_node_id,
-                                        &config,
-                                    )
+                        if lid != local_node_id {
+                            let leader_uuid = {
+                                let map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner());
+                                map.get(&lid).copied()
+                            };
+                            if let Some(leader_uuid) = leader_uuid {
+                                let msg = Message::BootstrapComplete {
+                                    node_id: local_id,
+                                };
+                                if let Err(e) = peer_manager_for_bootstrap
+                                    .send(leader_uuid, msg, Lane::Data)
                                     .await
-                                    {
+                                {
+                                    tracing::warn!(%e, "failed to send BootstrapComplete to leader");
+                                } else {
+                                    tracing::info!("sent BootstrapComplete to leader");
+                                }
+                            }
+                        }
+
+                        if lid == local_node_id {
+                            let promotion_timeout = config_for_promotion
+                                .formation_timeout_secs
+                                .map(|s| s / 3)
+                                .unwrap_or(20);
+
+                            let expected_count = all_node_ids_for_bootstrap
+                                .iter()
+                                .filter(|&&nid| nid != local_node_id)
+                                .count();
+                            let mut received_count = 0usize;
+                            let deadline = tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(promotion_timeout);
+
+                            tracing::info!(
+                                expected = expected_count,
+                                timeout_secs = promotion_timeout,
+                                "leader waiting for BootstrapComplete from joining nodes"
+                            );
+
+                            while received_count < expected_count {
+                                if tokio::time::Instant::now() >= deadline {
+                                    tracing::warn!(
+                                        received = received_count,
+                                        expected = expected_count,
+                                        "promotion timeout — proceeding with available nodes"
+                                    );
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                received_count = bootstrap_complete_counter
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                            }
+
+                            tracing::info!(
+                                received = received_count,
+                                "proceeding to promote joining nodes"
+                            );
+                            for &nid in &all_node_ids_for_bootstrap {
+                                if nid != local_node_id {
+                                    let cmd = crate::raft::RaftCommand {
+                                        op: crate::raft::RaftOp::SetNodeState {
+                                            node_id: nid,
+                                            state: NodeState::Normal,
+                                        },
+                                        schema_version: Uuid::new_v4(),
+                                    };
+                                    if let Err(e) = raft_arc.client_write(cmd).await {
                                         tracing::warn!(
+                                            node_id = nid,
                                             %e,
-                                            target = target_node_id,
-                                            "bootstrap streaming failed for {ks}.{tbl}"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            target = target_node_id,
-                                            count,
-                                            "bootstrapped {ks}.{tbl} to node {target_node_id}"
+                                            "failed to promote node to Normal"
                                         );
                                     }
                                 }
                             }
+                            tracing::info!("bootstrap complete — all nodes promoted to Normal");
                         }
-                        tracing::info!("bootstrap streaming complete on this node");
-                    }
-
-                    // Non-leader: send BootstrapComplete to leader so it can
-                    // promote without a fixed delay.
-                    if lid != local_node_id {
-                        let leader_uuid = {
-                            let map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner());
-                            map.get(&lid).copied()
-                        };
-                        if let Some(leader_uuid) = leader_uuid {
-                            let msg = Message::BootstrapComplete {
-                                node_id: local_id,
-                            };
-                            if let Err(e) = peer_manager_for_bootstrap
-                                .send(leader_uuid, msg, Lane::Data)
-                                .await
-                            {
-                                tracing::warn!(%e, "failed to send BootstrapComplete to leader");
-                            } else {
-                                tracing::info!("sent BootstrapComplete to leader");
-                            }
-                        }
-                    }
-
-                    // --- Phase C: Promote to Normal (leader only) ---
-                    //
-                    // Wait for BootstrapComplete from all joining nodes, with a
-                    // configurable timeout as a safety net.
-                    if lid == local_node_id {
-                        let promotion_timeout = config_for_promotion
-                            .formation_timeout_secs
-                            .map(|s| s / 3)
-                            .unwrap_or(20);
-
-                        // Collect BootstrapComplete from all non-leader nodes.
-                        let expected_count = all_node_ids_for_bootstrap
-                            .iter()
-                            .filter(|&&nid| nid != local_node_id)
-                            .count();
-                        let mut received_count = 0usize;
-                        let deadline = tokio::time::Instant::now()
-                            + std::time::Duration::from_secs(promotion_timeout);
-
+                    } else {
                         tracing::info!(
-                            expected = expected_count,
-                            timeout_secs = promotion_timeout,
-                            "leader waiting for BootstrapComplete from joining nodes"
+                            "raft recovered committed topology; skipping bootstrap streaming and promotion"
                         );
-
-                        // Poll for BootstrapComplete messages until all received or timeout.
-                        while received_count < expected_count {
-                            if tokio::time::Instant::now() >= deadline {
-                                tracing::warn!(
-                                    received = received_count,
-                                    expected = expected_count,
-                                    "promotion timeout — proceeding with available nodes"
-                                );
-                                break;
-                            }
-                            // Short sleep between polls — BootstrapComplete messages
-                            // arrive via the RPC handler and are counted here.
-                            // In a production system this would use a channel/notify,
-                            // but polling is correct and simple.
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            // Read the counter incremented by BootstrapCompleteHandler.
-                            received_count = bootstrap_complete_counter
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                        }
-
-                        tracing::info!(
-                            received = received_count,
-                            "proceeding to promote joining nodes"
-                        );
-                        for &nid in &all_node_ids_for_bootstrap {
-                            if nid != local_node_id {
-                                let cmd = crate::raft::RaftCommand {
-                                    op: crate::raft::RaftOp::SetNodeState {
-                                        node_id: nid,
-                                        state: NodeState::Normal,
-                                    },
-                                    schema_version: Uuid::new_v4(),
-                                };
-                                if let Err(e) = raft_arc.client_write(cmd).await {
-                                    tracing::warn!(
-                                        node_id = nid,
-                                        %e,
-                                        "failed to promote node to Normal"
-                                    );
-                                }
-                            }
-                        }
-                        tracing::info!("bootstrap complete — all nodes promoted to Normal");
                     }
                 }
                 None => {

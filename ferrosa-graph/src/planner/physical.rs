@@ -523,9 +523,14 @@ fn collect_merge_ops_from_path(
     while i < elements.len() {
         match &elements[i] {
             crate::parser::Pattern::Node { var, label, props } => {
-                // Emit a node MergeOp only on the first pass (i == 0) or when
-                // this node is NOT immediately preceded by a Rel we already
-                // handled (even indices in a well-formed path are always nodes).
+                let reuses_prior_binding = var.as_ref().is_some_and(|var_name| {
+                    props.is_empty() && merge_props_by_var.contains_key(var_name)
+                });
+                if reuses_prior_binding {
+                    i += 1;
+                    continue;
+                }
+
                 let resolved = if let Some(var_name) = var {
                     bindings.get(var_name).cloned()
                 } else {
@@ -1952,6 +1957,86 @@ mod tests {
                 assert_eq!(merges[0].match_props.len(), 1);
                 assert_eq!(merges[0].match_props[0].0, "name");
                 assert!(set_clause.is_empty());
+            }
+            other => panic!("expected MergeUpsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_merge_path_reuses_previously_bound_nodes_without_zero_prop_remerge() {
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+        bindings.insert("r".to_string(), knows_table());
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Merge {
+                patterns: vec![
+                    crate::parser::Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![(
+                            "name".into(),
+                            Expr::Literal(crate::parser::Literal::String("Alice".into())),
+                        )],
+                    },
+                    crate::parser::Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![(
+                            "name".into(),
+                            Expr::Literal(crate::parser::Literal::String("Bob".into())),
+                        )],
+                    },
+                    crate::parser::Pattern::Path(vec![
+                        crate::parser::Pattern::Node {
+                            var: Some("a".into()),
+                            label: None,
+                            props: vec![],
+                        },
+                        crate::parser::Pattern::Rel {
+                            var: Some("r".into()),
+                            rel_type: Some("KNOWS".into()),
+                            direction: Direction::Out,
+                            props: vec![],
+                            length_range: None,
+                        },
+                        crate::parser::Pattern::Node {
+                            var: Some("b".into()),
+                            label: None,
+                            props: vec![],
+                        },
+                    ]),
+                ],
+                set_clause: vec![Assignment {
+                    var: "r".into(),
+                    property: "since".into(),
+                    value: Expr::Literal(crate::parser::Literal::Integer(2026)),
+                }],
+                return_clause: None,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::MergeUpsert { merges, .. } => {
+                assert_eq!(merges.len(), 3, "expected only a, b, and r merge ops");
+                assert_eq!(merges[0].var.as_deref(), Some("a"));
+                assert_eq!(merges[1].var.as_deref(), Some("b"));
+                assert_eq!(merges[2].var.as_deref(), Some("r"));
+                assert_eq!(merges[2].table.table, "knows_e");
+                assert_eq!(
+                    merges[2].src_match_props.as_ref().map(Vec::len),
+                    Some(1),
+                    "edge merge should retain source match props from the earlier node merge"
+                );
+                assert_eq!(
+                    merges[2].dst_match_props.as_ref().map(Vec::len),
+                    Some(1),
+                    "edge merge should retain destination match props from the earlier node merge"
+                );
             }
             other => panic!("expected MergeUpsert, got {other:?}"),
         }

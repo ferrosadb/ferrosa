@@ -23,6 +23,22 @@ use super::token::send_schema_sync_to_peer;
 use super::{ClusterStateHolder, ModeController, PairContext};
 
 impl ModeController {
+    fn choose_pair_role(
+        &self,
+        peer_host_id: Uuid,
+        _peer_addr: SocketAddr,
+        _need_reverse: bool,
+        was_promoted: bool,
+    ) -> PairRole {
+        if was_promoted {
+            PairRole::Primary
+        } else if self.local_host_id <= peer_host_id {
+            PairRole::Primary
+        } else {
+            PairRole::Secondary
+        }
+    }
+
     pub(super) fn transition_to_pair(
         &self,
         peer_host_id: Uuid,
@@ -37,20 +53,19 @@ impl ModeController {
             }
         };
 
-        // Role is determined by connection direction:
-        //   need_reverse = true  → inbound connection → this node is Primary (seed)
-        //   need_reverse = false → outbound connection → this node is Secondary (joiner)
+        // Pair-role election must be deterministic across both directions of the
+        // same peer relationship. During cluster bootstrap a joiner can receive
+        // the seed's reverse inbound connection before its own outbound
+        // `on_peer_connected()` fires; if role selection depends only on
+        // connection direction, both sides can become primary and stale pair-mode
+        // handlers will keep forwarding writes after cluster promotion.
         //
-        // Force-promoted nodes stay primary. If both nodes were force-promoted
-        // (partition healed), the higher promote_epoch wins. If epochs are equal,
-        // UUID comparison breaks the tie.
+        // Keep force-promoted nodes primary, otherwise use host-id ordering so the
+        // same two nodes always elect the same primary no matter which socket
+        // wins the race.
         let was_promoted = self.force_promoted.swap(false, Ordering::AcqRel);
         let local_epoch = self.promote_epoch.load(Ordering::SeqCst);
-        let role = if was_promoted {
-            PairRole::Primary
-        } else {
-            PairRole::from_connection_direction(need_reverse)
-        };
+        let role = self.choose_pair_role(peer_host_id, peer_addr, need_reverse, was_promoted);
         let role_arc = Arc::new(ArcSwap::from_pointee(role));
 
         let coordinator = Arc::new(PairCoordinator::new(

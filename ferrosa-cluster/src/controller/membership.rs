@@ -334,11 +334,16 @@ impl ModeController {
 
         self.spawn_tracked(async move {
             if let Some(pm) = peer_manager.as_ref() {
-                if !pm.has_live_peer(host_id) {
+                let current_addr = pm.peer_addr(host_id).await;
+                let desired_addr = addr.to_string();
+                let needs_reverse_refresh =
+                    !pm.has_live_peer(host_id) || current_addr.as_deref() != Some(&desired_addr);
+
+                if needs_reverse_refresh {
                     match PriorityPool::connect(
                         net_config.clone(),
                         local_host_id,
-                        &addr.to_string(),
+                        &desired_addr,
                         raft_runtime.as_deref(),
                         data_runtime.as_deref(),
                     )
@@ -349,6 +354,7 @@ impl ModeController {
                             tracing::info!(
                                 peer = %host_id,
                                 %addr,
+                                previous_addr = ?current_addr,
                                 "cluster member reverse connection established before join refresh"
                             );
                         }
@@ -357,6 +363,7 @@ impl ModeController {
                             tracing::warn!(
                                 peer = %host_id,
                                 %addr,
+                                previous_addr = ?current_addr,
                                 %e,
                                 "failed to establish reverse connection for cluster member"
                             );

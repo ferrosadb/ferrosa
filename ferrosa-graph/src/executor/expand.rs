@@ -15,8 +15,9 @@ use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_schema::{Schema, VirtualTableRegistry};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
-use ferrosa_storage::TableId;
+use ferrosa_storage::{Mutation, TableId};
 
+use crate::adjacency::observer::derive_adjacency_mutations;
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
@@ -1248,11 +1249,13 @@ async fn execute_create(
             .write(
                 &table_id,
                 &key,
-                row,
+                row.clone(),
                 timestamp,
-                ConsistencyLevel::One,
+                graph_write_consistency(),
                 &strategy,
             )
+            .await?;
+        write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
             .await?;
         stats.vertices_written += 1;
         var_keys.push((op.var.clone(), hex_key));
@@ -1320,6 +1323,10 @@ fn content_addressed_key(match_props: &[(String, Expr)]) -> Vec<u8> {
         hasher.update(b"\x00");
     }
     hasher.finalize().as_bytes().to_vec()
+}
+
+fn graph_write_consistency() -> ConsistencyLevel {
+    ConsistencyLevel::Quorum
 }
 
 /// Execute a MERGE plan: match-or-create with content-addressed deterministic key.
@@ -1437,9 +1444,9 @@ async fn execute_merge(
                 .write(
                     &table_id,
                     &key,
-                    row,
+                    row.clone(),
                     timestamp,
-                    ConsistencyLevel::One,
+                    graph_write_consistency(),
                     &strategy,
                 )
                 .await
@@ -1453,6 +1460,8 @@ async fn execute_merge(
                     );
                     e
                 })?;
+            write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
+                .await?;
             stats.vertices_written += 1;
         }
         // Existing row: no create needed, count as read.
@@ -1545,7 +1554,7 @@ async fn execute_merge(
                 key,
                 update_row,
                 timestamp,
-                ConsistencyLevel::One,
+                graph_write_consistency(),
                 &strategy,
             )
             .await
@@ -1574,6 +1583,52 @@ async fn execute_merge(
         ))]],
         stats,
     })
+}
+
+async fn write_explicit_adjacency_entries(
+    write_path: &WritePath,
+    table_id: &TableId,
+    key: &DecoratedKey,
+    row: &Row,
+    timestamp: i64,
+    schema: Option<&Schema>,
+) -> Result<()> {
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+
+    let mutation = Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        key.clone(),
+        vec![row.clone()],
+        timestamp,
+    );
+
+    for derived in derive_adjacency_mutations(schema, table_id, &mutation) {
+        let adj_table_id = TableId::new(&derived.keyspace, &derived.table);
+        let strategy = graph_replication_strategy(Some(schema), &derived.keyspace)?;
+        for derived_row in derived.rows {
+            write_path
+                .write(
+                    &adj_table_id,
+                    &derived.key,
+                    derived_row,
+                    derived.timestamp,
+                    graph_write_consistency(),
+                    &strategy,
+                )
+                .await
+                .map_err(|e| {
+                    GraphError::Storage(ferrosa_common::Error::InvalidData(format!(
+                        "failed to write derived adjacency row for {}.{}: {e}",
+                        table_id.keyspace, table_id.table
+                    )))
+                })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn build_merge_write_shape(
@@ -2279,7 +2334,7 @@ async fn execute_set(
                         &key,
                         update_row,
                         timestamp,
-                        ConsistencyLevel::One,
+                        graph_write_consistency(),
                         &strategy,
                     )
                     .await?;
@@ -2382,7 +2437,7 @@ async fn execute_delete(
                         &key,
                         tombstone_row,
                         timestamp,
-                        ConsistencyLevel::One,
+                        graph_write_consistency(),
                         &strategy,
                     )
                     .await?;
@@ -2946,6 +3001,8 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 mod tests {
     use super::*;
 
+    use crate::adjacency::observer::make_adjacency_mutation;
+    use crate::adjacency::schema::adjacency_table_metadata;
     use indexmap::IndexMap;
     use std::sync::Arc;
 
@@ -3406,6 +3463,252 @@ mod tests {
                 b"related_to".to_vec(),
                 dst_id.as_bytes().to_vec(),
             ]),
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_merge_writes_adjacency_rows_without_registered_observer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let auth = ferrosa_schema::auth::role::AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        let user_ks = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: "agent_memory".to_string(),
+            durable_writes: true,
+            replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+        schema.create_keyspace(user_ks.clone(), &auth).unwrap();
+        schema
+            .create_keyspace(
+                ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                    name: adjacency_keyspace_name("agent_memory"),
+                    ..user_ks
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let mut entity_meta = scoped_entity_meta();
+        entity_meta
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        entity_meta
+            .extensions
+            .insert("graph.label".to_string(), "Entity".to_string());
+        let mut edge_meta = scoped_typed_edge_meta();
+        edge_meta
+            .extensions
+            .insert("graph.type".to_string(), "edge".to_string());
+        edge_meta
+            .extensions
+            .insert("graph.label".to_string(), "TYPED_EDGE".to_string());
+        edge_meta
+            .extensions
+            .insert("graph.source_label".to_string(), "Entity".to_string());
+        edge_meta
+            .extensions
+            .insert("graph.target_label".to_string(), "Entity".to_string());
+        let adjacency_meta = adjacency_table_metadata("agent_memory");
+        schema.create_table(entity_meta.clone(), &auth).unwrap();
+        schema.create_table(edge_meta.clone(), &auth).unwrap();
+        schema.create_table(adjacency_meta.clone(), &auth).unwrap();
+        storage
+            .register_table(entity_meta.to_storage_schema())
+            .unwrap();
+        storage
+            .register_table(edge_meta.to_storage_schema())
+            .unwrap();
+        storage
+            .register_table(adjacency_meta.to_storage_schema())
+            .unwrap();
+
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let src_id = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let dst_id = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+        let entity_tid = TableId::new("agent_memory", "entity_store");
+        let partition_key = encode_partition_components(&[
+            tenant_id.as_bytes().to_vec(),
+            session_id.as_bytes().to_vec(),
+        ]);
+        let src_row = Row {
+            clustering: encode_clustering_components(&[src_id.as_bytes().to_vec()]),
+            cells: vec![(0, CellValue::live(b"src".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        let dst_row = Row {
+            clustering: encode_clustering_components(&[dst_id.as_bytes().to_vec()]),
+            cells: vec![(0, CellValue::live(b"dst".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        storage
+            .write(
+                &entity_tid,
+                &DecoratedKey::new(PartitionKey::new(partition_key.clone())),
+                src_row,
+                1000,
+            )
+            .unwrap();
+        storage
+            .write(
+                &entity_tid,
+                &DecoratedKey::new(PartitionKey::new(partition_key)),
+                dst_row,
+                1000,
+            )
+            .unwrap();
+
+        let merges = vec![
+            MergeOp {
+                var: Some("a".to_string()),
+                table: crate::planner::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "entity_store".to_string(),
+                    label: "Entity".to_string(),
+                    graph_type: "vertex".to_string(),
+                },
+                match_props: vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(src_id.to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: None,
+                src_var: None,
+                dst_match_props: None,
+                dst_var: None,
+            },
+            MergeOp {
+                var: Some("b".to_string()),
+                table: crate::planner::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "entity_store".to_string(),
+                    label: "Entity".to_string(),
+                    graph_type: "vertex".to_string(),
+                },
+                match_props: vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(dst_id.to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: None,
+                src_var: None,
+                dst_match_props: None,
+                dst_var: None,
+            },
+            MergeOp {
+                var: Some("r".to_string()),
+                table: crate::planner::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "typed_edges".to_string(),
+                    label: "TYPED_EDGE".to_string(),
+                    graph_type: "edge".to_string(),
+                },
+                match_props: vec![(
+                    "edge_type".to_string(),
+                    Expr::Literal(Literal::String("implements".to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(src_id.to_string())),
+                )]),
+                src_var: Some("a".to_string()),
+                dst_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(dst_id.to_string())),
+                )]),
+                dst_var: Some("b".to_string()),
+            },
+        ];
+
+        let write_path = ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage));
+        execute_merge(
+            &write_path,
+            &merges,
+            &[(
+                "r".to_string(),
+                "weight".to_string(),
+                Expr::Literal(Literal::Float(1.0)),
+            )],
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            Some(&schema),
+        )
+        .await
+        .unwrap();
+
+        let adj_tid = TableId::new(&adjacency_keyspace_name("agent_memory"), "adjacency");
+        let src_adj = write_path
+            .read(
+                &adj_tid,
+                &DecoratedKey::new(PartitionKey::new(src_id.as_bytes().to_vec())),
+            )
+            .await
+            .unwrap()
+            .expect("source adjacency partition should exist immediately after merge");
+        let dst_adj = write_path
+            .read(
+                &adj_tid,
+                &DecoratedKey::new(PartitionKey::new(dst_id.as_bytes().to_vec())),
+            )
+            .await
+            .unwrap()
+            .expect("target adjacency partition should exist immediately after merge");
+
+        let expected_out = make_adjacency_mutation(
+            &adjacency_keyspace_name("agent_memory"),
+            src_id.as_bytes(),
+            crate::adjacency::schema::DIRECTION_OUT,
+            "TYPED_EDGE",
+            dst_id.as_bytes(),
+            "agent_memory.typed_edges",
+            0,
+        );
+        let expected_in = make_adjacency_mutation(
+            &adjacency_keyspace_name("agent_memory"),
+            dst_id.as_bytes(),
+            crate::adjacency::schema::DIRECTION_IN,
+            "TYPED_EDGE",
+            src_id.as_bytes(),
+            "agent_memory.typed_edges",
+            0,
+        );
+
+        assert!(
+            src_adj
+                .rows
+                .iter()
+                .any(|row| row.clustering == expected_out.rows[0].clustering),
+            "source adjacency should contain OUT entry for merged edge"
+        );
+        assert!(
+            dst_adj
+                .rows
+                .iter()
+                .any(|row| row.clustering == expected_in.rows[0].clustering),
+            "target adjacency should contain IN entry for merged edge"
         );
     }
 
@@ -4101,5 +4404,10 @@ mod tests {
         assert_eq!(result.columns, vec!["count(*)"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], serde_json::json!(3u64));
+    }
+
+    #[test]
+    fn graph_write_consistency_is_quorum() {
+        assert_eq!(graph_write_consistency(), ConsistencyLevel::Quorum);
     }
 }

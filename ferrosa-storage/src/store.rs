@@ -775,15 +775,17 @@ impl<F: FlushTarget> TableStore<F> {
         // would be lost when we clear `flushing`. Re-snapshot the old memtable
         // and replay any entries not in the original flush to the new active.
         let late_partitions = old_active.snapshot();
-        if late_partitions.len() > partitions.len() {
+        if !late_partitions.is_empty() {
             let current_view = self.view.load();
             let schema = self.schema.load();
-            // The original partitions were sorted by key. Build a set of flushed keys.
-            let flushed_keys: std::collections::BTreeSet<_> =
-                partitions.iter().map(|p| &p.key).collect();
+            let flushed_by_key: std::collections::BTreeMap<_, _> =
+                partitions.iter().map(|p| (p.key.clone(), p)).collect();
             for p in &late_partitions {
-                if !flushed_keys.contains(&p.key) {
-                    // Late write — replay to the current active memtable.
+                if late_partition_needs_replay(&flushed_by_key, p) {
+                    // Late write into either a brand-new partition or an existing
+                    // partition that changed after the flush snapshot. Replay the
+                    // current partition image into the new active memtable so the
+                    // post-swap view retains those rows.
                     for row in &p.rows {
                         if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
                             tracing::error!(%e, "flush: late-writer replay put failed");
@@ -1392,6 +1394,16 @@ impl<F: FlushTarget> TableStore<F> {
     }
 }
 
+fn late_partition_needs_replay(
+    flushed_by_key: &std::collections::BTreeMap<ferrosa_common::key::DecoratedKey, &Partition>,
+    late_partition: &Partition,
+) -> bool {
+    match flushed_by_key.get(&late_partition.key) {
+        None => true,
+        Some(flushed_partition) => *flushed_partition != late_partition,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,8 +1437,12 @@ mod tests {
     }
 
     fn make_row(value: &[u8], timestamp: i64) -> Row {
+        make_row_with_ck(1, value, timestamp)
+    }
+
+    fn make_row_with_ck(ck: i32, value: &[u8], timestamp: i64) -> Row {
         Row {
-            clustering: vec![0x00, 0x00, 0x00, 0x01], // Int32Type = 4 bytes big-endian
+            clustering: ck.to_be_bytes().to_vec(),
             cells: vec![(0, CellValue::live(value.to_vec(), timestamp))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
@@ -1503,6 +1519,49 @@ mod tests {
 
         assert_eq!(store.sstable_count(), 1);
         assert_eq!(store.memtable_partition_count(), 0);
+    }
+
+    #[test]
+    fn late_partition_replay_detects_changes_within_existing_partition() {
+        let key = make_key("pk1");
+        let flushed = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![make_row_with_ck(1, b"before", 1000)],
+        };
+        let late_same_key = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![
+                make_row_with_ck(1, b"before", 1000),
+                make_row_with_ck(2, b"late", 2000),
+            ],
+        };
+        let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
+
+        assert!(
+            late_partition_needs_replay(&flushed_by_key, &late_same_key),
+            "late writes that add rows to an existing partition must be replayed"
+        );
+    }
+
+    #[test]
+    fn late_partition_replay_skips_unchanged_existing_partition() {
+        let key = make_key("pk1");
+        let flushed = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![make_row_with_ck(1, b"before", 1000)],
+        };
+        let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
+
+        assert!(
+            !late_partition_needs_replay(&flushed_by_key, &flushed),
+            "unchanged partitions should not be replayed into the new active memtable"
+        );
     }
 
     // -------------------------------------------------------------------------

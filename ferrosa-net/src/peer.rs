@@ -112,15 +112,6 @@ impl PeerManager {
     /// Uses the provided address string (IP:port or resolvable hostname:port)
     /// to establish the pool if one is not already present.
     pub async fn ensure_peer(&self, host_id: uuid::Uuid, addr: &str) -> crate::error::Result<()> {
-        {
-            let peers = self.peers.read().await;
-            if let Some(state) = peers.get(&host_id) {
-                if state.pool.is_some() {
-                    return Ok(());
-                }
-            }
-        }
-
         let resolved = addr
             .to_socket_addrs()
             .map_err(|e| {
@@ -132,6 +123,15 @@ impl PeerManager {
                     "peer address '{addr}' resolved to no socket addresses"
                 ))
             })?;
+
+        {
+            let peers = self.peers.read().await;
+            if let Some(state) = peers.get(&host_id) {
+                if state.pool.is_some() && state.peer_id.1 == resolved {
+                    return Ok(());
+                }
+            }
+        }
 
         let pool = PriorityPool::connect(self.config.clone(), self.local_host_id, addr, None, None)
             .await?;
@@ -183,7 +183,9 @@ impl PeerManager {
                 }
             }
         };
-        pool.send(msg, lane).await
+        let resp = pool.send(msg, lane).await?;
+        self.record_activity(host_id).await;
+        Ok(resp)
     }
 
     /// Send a message to a peer on the specified lane with a custom timeout.
@@ -214,7 +216,9 @@ impl PeerManager {
                 }
             }
         };
-        pool.send_with_timeout(msg, lane, timeout).await
+        let resp = pool.send_with_timeout(msg, lane, timeout).await?;
+        self.record_activity(host_id).await;
+        Ok(resp)
     }
 
     /// Fire-and-forget a message to a peer on the specified lane.
@@ -241,7 +245,9 @@ impl PeerManager {
                 }
             }
         };
-        pool.fire(msg, lane).await
+        pool.fire(msg, lane).await?;
+        self.record_activity(host_id).await;
+        Ok(())
     }
 
     /// Heartbeat loop: sends Ping at configured interval, marks peers suspected
@@ -348,6 +354,11 @@ impl PeerManager {
 
     /// Called when Pong received -- reset heartbeat timer and missed counter.
     pub async fn record_heartbeat(&self, host_id: uuid::Uuid) {
+        self.record_activity(host_id).await;
+    }
+
+    /// Called when recent successful peer traffic proves the connection is alive.
+    pub async fn record_activity(&self, host_id: uuid::Uuid) {
         let mut peers = self.peers.write().await;
         if let Some(state) = peers.get_mut(&host_id) {
             state.last_heartbeat = tokio::time::Instant::now();
@@ -529,6 +540,82 @@ mod tests {
         }
 
         assert_eq!(listener.suspected_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recent_peer_activity_keeps_peer_alive() {
+        let config = Arc::new(NetConfig {
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_millis(300),
+            ..NetConfig::default()
+        });
+        let listener = Arc::new(TestListener::new());
+        let pm = Arc::new(PeerManager::new(
+            config,
+            uuid::Uuid::new_v4(),
+            listener.clone(),
+        ));
+        let host_id = uuid::Uuid::new_v4();
+        let peer_id = (host_id, "127.0.0.1:7000".parse().unwrap());
+        pm.add_peer_entry(peer_id).await;
+
+        let pm_clone = pm.clone();
+        tokio::spawn(async move { pm_clone.run_heartbeat_loop().await });
+
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_millis(90)).await;
+            pm.record_activity(host_id).await;
+        }
+
+        assert_eq!(
+            listener.suspected_count.load(Ordering::Relaxed),
+            0,
+            "recent peer activity should count as liveness and avoid false dead-peer suspicion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_send_refreshes_peer_activity() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_millis(300),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            listener.clone(),
+        ));
+        pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+
+        let pm_clone = pm.clone();
+        tokio::spawn(async move { pm_clone.run_heartbeat_loop().await });
+
+        for nonce in 0..6 {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            let resp = pm
+                .send(server_id, Message::Ping { nonce, sent_at: 0 }, Lane::Data)
+                .await
+                .unwrap();
+            assert!(matches!(resp, Message::Pong { .. }));
+        }
+
+        assert_eq!(
+            listener.suspected_count.load(Ordering::Relaxed),
+            0,
+            "successful send/response traffic should refresh peer liveness"
+        );
+
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     /// Verify that suspecting a peer (with no real pool) fires on_peer_suspected
@@ -719,6 +806,60 @@ mod tests {
         );
 
         server.shutdown(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn ensure_peer_reconnects_when_address_changes() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+
+        let registry1 = Arc::new(HandlerRegistry::new());
+        registry1.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server1 = Arc::new(RpcServer::new(config.clone(), server_id, registry1));
+        let addr1 = server1.start_and_get_addr().await.unwrap();
+
+        let registry2 = Arc::new(HandlerRegistry::new());
+        registry2.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server2 = Arc::new(RpcServer::new(config.clone(), server_id, registry2));
+        let addr2 = server2.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(Arc::new(config), uuid::Uuid::new_v4(), listener);
+        let addr1_str = addr1.to_string();
+        let addr2_str = addr2.to_string();
+
+        pm.ensure_peer(server_id, &addr1_str).await.unwrap();
+        assert_eq!(
+            pm.peer_addr(server_id).await.as_deref(),
+            Some(addr1_str.as_str())
+        );
+
+        server1.shutdown(Duration::from_millis(50)).await;
+
+        pm.ensure_peer(server_id, &addr2_str).await.unwrap();
+
+        assert_eq!(
+            pm.peer_addr(server_id).await.as_deref(),
+            Some(addr2_str.as_str())
+        );
+        let resp = pm
+            .send(
+                server_id,
+                Message::Ping {
+                    nonce: 11,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 11, .. }));
+
+        server2.shutdown(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

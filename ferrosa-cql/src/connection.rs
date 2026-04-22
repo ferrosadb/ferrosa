@@ -225,6 +225,11 @@ pub async fn handle_connection<S>(
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
 
+                debug!(
+                    "received {:?} from {peer} stream={} phase={:?}",
+                    maybe_frame.header.opcode, stream_id, phase
+                );
+
                 let request_span = tracing::info_span!(
                     "cql.request",
                     cql.opcode = ?maybe_frame.header.opcode,
@@ -248,6 +253,10 @@ pub async fn handle_connection<S>(
                 .await
                 {
                     HandleResult::Reply(opcode, body) => {
+                        debug!(
+                            "replying {:?} to {peer} stream={} phase={:?}",
+                            opcode, stream_id, phase
+                        );
                         if was_awaiting_startup
                             && matches!(phase, ConnectionPhase::Authenticating { .. })
                         {
@@ -593,6 +602,11 @@ fn handle_startup(
         let err = CqlError::Protocol("STARTUP missing CQL_VERSION".into());
         return HandleResult::Reply(Opcode::Error, err.encode_body());
     }
+
+    debug!(
+        "startup options: cql_version={:?} compression={:?} auth_disabled={}",
+        cql_version, compression_name, auth_disabled
+    );
 
     // Validate and store the requested compression algorithm.
     if let Some(name) = compression_name {

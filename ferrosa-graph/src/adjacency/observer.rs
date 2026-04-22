@@ -47,75 +47,78 @@ impl WriteObserver for AdjacencyIndexObserver {
     }
 
     fn on_write(&self, table: &TableId, mutation: &Mutation) -> Vec<Mutation> {
-        let snap = self.schema.schema_ref().load();
-        let key = (table.keyspace.clone(), table.table.clone());
-        let meta = match snap.tables.get(&key) {
-            Some(m) => m,
-            None => return vec![],
-        };
-
-        // Verify this is a valid edge table with source and target extensions.
-        // Phase 1 uses partition key as source and clustering as target;
-        // full column-name mapping will use these values in a later phase.
-        if !meta.extensions.contains_key("graph.source")
-            || !meta.extensions.contains_key("graph.target")
-        {
-            return vec![];
-        }
-        let Some(source_col) = meta.extensions.get("graph.source") else {
-            return vec![];
-        };
-        let Some(target_col) = meta.extensions.get("graph.target") else {
-            return vec![];
-        };
-
-        let adj_ks = adjacency_keyspace_name(&self.keyspace);
-        // Use the graph label from schema extensions (e.g. "KNOWS") so that the
-        // adjacency clustering key matches what the hop executor filters by.
-        // Fall back to the table name if the extension is missing.
-        let edge_label = meta
-            .extensions
-            .get("graph.label")
-            .cloned()
-            .unwrap_or_else(|| table.table.clone());
-        let edge_table = format!("{}.{}", table.keyspace, table.table);
-
-        let mut derived = Vec::new();
-        for row in &mutation.rows {
-            let Some(source_id) = extract_graph_column_bytes(meta, mutation, row, source_col)
-            else {
-                continue;
-            };
-            let Some(target_id) = extract_graph_column_bytes(meta, mutation, row, target_col)
-            else {
-                continue;
-            };
-
-            // OUT entry: (source -> target)
-            derived.push(make_adjacency_mutation(
-                &adj_ks,
-                &source_id,
-                DIRECTION_OUT,
-                &edge_label,
-                &target_id,
-                &edge_table,
-                mutation.timestamp,
-            ));
-
-            // IN entry: (target -> source)
-            derived.push(make_adjacency_mutation(
-                &adj_ks,
-                &target_id,
-                DIRECTION_IN,
-                &edge_label,
-                &source_id,
-                &edge_table,
-                mutation.timestamp,
-            ));
-        }
-
-        derived
+        derive_adjacency_mutations(&self.schema, table, mutation)
     }
+}
+
+pub(crate) fn derive_adjacency_mutations(
+    schema: &Schema,
+    table: &TableId,
+    mutation: &Mutation,
+) -> Vec<Mutation> {
+    let snap = schema.schema_ref().load();
+    let key = (table.keyspace.clone(), table.table.clone());
+    let meta = match snap.tables.get(&key) {
+        Some(m) => m,
+        None => return vec![],
+    };
+
+    // Verify this is a valid edge table with source and target extensions.
+    // Phase 1 uses partition key as source and clustering as target;
+    // full column-name mapping will use these values in a later phase.
+    if !meta.extensions.contains_key("graph.source")
+        || !meta.extensions.contains_key("graph.target")
+    {
+        return vec![];
+    }
+    let Some(source_col) = meta.extensions.get("graph.source") else {
+        return vec![];
+    };
+    let Some(target_col) = meta.extensions.get("graph.target") else {
+        return vec![];
+    };
+
+    let adj_ks = adjacency_keyspace_name(&table.keyspace);
+    // Use the graph label from schema extensions (e.g. "KNOWS") so that the
+    // adjacency clustering key matches what the hop executor filters by.
+    // Fall back to the table name if the extension is missing.
+    let edge_label = meta
+        .extensions
+        .get("graph.label")
+        .cloned()
+        .unwrap_or_else(|| table.table.clone());
+    let edge_table = format!("{}.{}", table.keyspace, table.table);
+
+    let mut derived = Vec::new();
+    for row in &mutation.rows {
+        let Some(source_id) = extract_graph_column_bytes(meta, mutation, row, source_col) else {
+            continue;
+        };
+        let Some(target_id) = extract_graph_column_bytes(meta, mutation, row, target_col) else {
+            continue;
+        };
+
+        derived.push(make_adjacency_mutation(
+            &adj_ks,
+            &source_id,
+            DIRECTION_OUT,
+            &edge_label,
+            &target_id,
+            &edge_table,
+            mutation.timestamp,
+        ));
+        derived.push(make_adjacency_mutation(
+            &adj_ks,
+            &target_id,
+            DIRECTION_IN,
+            &edge_label,
+            &source_id,
+            &edge_table,
+            mutation.timestamp,
+        ));
+    }
+
+    derived
 }
 
 /// Build an adjacency table mutation.

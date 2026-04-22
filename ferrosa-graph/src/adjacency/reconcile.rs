@@ -31,6 +31,12 @@ pub struct ReconcileMetrics {
 /// Retained for future use when WritePath supports batched range reads.
 #[allow(dead_code)]
 const BATCH_LIMIT: usize = 1000;
+const RECONCILE_YIELD_EVERY_CHECKED_ENTRIES: usize = 256;
+const RECONCILE_YIELD_EVERY_PARTITIONS: usize = 32;
+
+fn should_yield_during_reconciliation(processed: usize, yield_every: usize) -> bool {
+    yield_every > 0 && processed > 0 && processed % yield_every == 0
+}
 
 /// Run one reconciliation pass for a keyspace.
 pub async fn reconcile_once(
@@ -72,7 +78,9 @@ pub async fn reconcile_once(
             Err(_) => continue,
         };
 
+        let mut edge_partitions_scanned = 0usize;
         for partition in &partitions {
+            edge_partitions_scanned += 1;
             let source_id = partition.key.key.as_bytes().to_vec();
             let source_key = partition.key.clone();
 
@@ -132,6 +140,20 @@ pub async fn reconcile_once(
                         metrics.entries_repaired += 1;
                     }
                 }
+
+                if should_yield_during_reconciliation(
+                    metrics.entries_checked,
+                    RECONCILE_YIELD_EVERY_CHECKED_ENTRIES,
+                ) {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            if should_yield_during_reconciliation(
+                edge_partitions_scanned,
+                RECONCILE_YIELD_EVERY_PARTITIONS,
+            ) {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -144,7 +166,9 @@ pub async fn reconcile_once(
         .unwrap_or_default();
 
     {
+        let mut adjacency_partitions_scanned = 0usize;
         for partition in &adj_partitions {
+            adjacency_partitions_scanned += 1;
             let vertex_id = partition.key.key.as_bytes().to_vec();
 
             for row in &partition.rows {
@@ -214,6 +238,20 @@ pub async fn reconcile_once(
                         metrics.orphans_removed += 1;
                     }
                 }
+
+                if should_yield_during_reconciliation(
+                    metrics.entries_checked + metrics.orphans_removed,
+                    RECONCILE_YIELD_EVERY_CHECKED_ENTRIES,
+                ) {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            if should_yield_during_reconciliation(
+                adjacency_partitions_scanned,
+                RECONCILE_YIELD_EVERY_PARTITIONS,
+            ) {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -392,6 +430,19 @@ mod tests {
         CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
     };
     use indexmap::IndexMap;
+
+    #[test]
+    fn reconcile_yield_policy_triggers_at_threshold() {
+        assert!(!should_yield_during_reconciliation(0, 32));
+        assert!(!should_yield_during_reconciliation(31, 32));
+        assert!(should_yield_during_reconciliation(32, 32));
+        assert!(should_yield_during_reconciliation(64, 32));
+    }
+
+    #[test]
+    fn reconcile_yield_policy_can_be_disabled() {
+        assert!(!should_yield_during_reconciliation(32, 0));
+    }
 
     fn test_storage_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {

@@ -1,4 +1,7 @@
-use super::cluster::should_initialize_seed_membership;
+use super::cluster::{
+    build_recovered_topology_refresh_plan, should_initialize_seed_membership,
+    should_run_bootstrap_streaming,
+};
 use super::*;
 
 fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
@@ -151,8 +154,8 @@ async fn promote_from_degraded_pair_restores_writes() {
     let schema = test_schema();
     let config = Arc::new(ClusterConfig::default());
     let net_config = Arc::new(NetConfig::default());
-    let local_id = Uuid::new_v4();
-    let peer_id = Uuid::new_v4();
+    let local_id = Uuid::from_u128(1);
+    let peer_id = Uuid::from_u128(2);
 
     let registry = Arc::new(HandlerRegistry::new());
     let (controller, _handles) = ModeController::new(
@@ -167,7 +170,7 @@ async fn promote_from_degraded_pair_restores_writes() {
     let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
     controller.set_peer_manager(pm.clone());
 
-    // Enter pair mode via inbound connection (Primary)
+    // Enter pair mode via inbound connection. Lower host-id wins primary.
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
     controller.on_inbound_peer((peer_id, peer_addr), None);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
@@ -196,8 +199,8 @@ async fn degraded_pair_serves_stale_reads() {
     let schema = test_schema();
     let config = Arc::new(ClusterConfig::default());
     let net_config = Arc::new(NetConfig::default());
-    let local_id = Uuid::new_v4();
-    let peer_id = Uuid::new_v4();
+    let local_id = Uuid::from_u128(2);
+    let peer_id = Uuid::from_u128(1);
 
     let registry = Arc::new(HandlerRegistry::new());
     let (controller, _handles) = ModeController::new(
@@ -421,18 +424,21 @@ fn fresh_seed_with_no_persisted_raft_state_still_initializes_membership() {
     assert!(should_initialize_seed_membership(
         true,  // was_seed
         false, // has_recovered_membership
+        false, // has_recovered_topology_state
     ));
 }
 
 #[test]
 fn seed_restart_with_recovered_membership_skips_initialize() {
     assert!(!should_initialize_seed_membership(
-        true, // was_seed
-        true, // has_recovered_membership
+        true,  // was_seed
+        true,  // has_recovered_membership
+        false, // has_recovered_topology_state
     ));
     assert!(!should_initialize_seed_membership(
         false, // was_seed
         false, // has_recovered_membership
+        false, // has_recovered_topology_state
     ));
 }
 
@@ -441,6 +447,7 @@ fn seed_restart_with_recovered_topology_backed_membership_skips_initialize() {
     assert!(!should_initialize_seed_membership(
         true, // was_seed
         true, // recovered from topology state
+        true, // has_recovered_topology_state
     ));
 }
 
@@ -449,11 +456,56 @@ fn seed_restart_with_only_persisted_vote_or_log_still_initializes_membership() {
     assert!(should_initialize_seed_membership(
         true,  // was_seed
         false, // has_recovered_membership
+        false, // has_recovered_topology_state
     ));
     assert!(!should_initialize_seed_membership(
         false, // was_seed
         false, // has_recovered_membership
+        false, // has_recovered_topology_state
     ));
+}
+
+#[test]
+fn seed_restart_with_recovered_topology_but_empty_membership_skips_initialize() {
+    assert!(!should_initialize_seed_membership(
+        true,  // was_seed
+        false, // has_recovered_membership
+        true,  // has_recovered_topology_state
+    ));
+}
+
+#[test]
+fn recovered_topology_restart_skips_bootstrap_streaming() {
+    assert!(!should_run_bootstrap_streaming(true));
+    assert!(should_run_bootstrap_streaming(false));
+}
+
+#[test]
+fn recovered_topology_refresh_plan_uses_current_live_addresses() {
+    let local_host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let peer_host_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let peers = vec![(peer_host_id, "10.89.5.18:7000".parse().unwrap())];
+    let peer_cql_broadcasts =
+        std::collections::HashMap::from([(peer_host_id, Some("127.0.0.1:38043".to_string()))]);
+
+    let plan = build_recovered_topology_refresh_plan(
+        local_host_id,
+        "10.89.5.17:7000".to_string(),
+        Some("127.0.0.1:38042".to_string()),
+        "dc1",
+        "rack1",
+        &peers,
+        &peer_cql_broadcasts,
+    );
+
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].host_id, local_host_id);
+    assert_eq!(plan[0].addr, "10.89.5.17:7000");
+    assert_eq!(plan[0].cql_broadcast.as_deref(), Some("127.0.0.1:38042"));
+
+    assert_eq!(plan[1].host_id, peer_host_id);
+    assert_eq!(plan[1].addr, "10.89.5.18:7000");
+    assert_eq!(plan[1].cql_broadcast.as_deref(), Some("127.0.0.1:38043"));
 }
 
 #[tokio::test]
@@ -870,6 +922,52 @@ async fn existing_inbound_cluster_member_with_ephemeral_source_port_does_not_que
 }
 
 #[tokio::test]
+async fn existing_cluster_member_with_changed_addr_requeues_join_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        auto_join: true,
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm.clone());
+
+    controller.on_peer_connected((peer1_id, "10.0.0.2:7000".parse().unwrap()));
+    controller.on_peer_connected((peer2_id, "10.0.0.3:7000".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    pm.add_peer_entry((peer2_id, "10.0.0.3:7000".parse().unwrap()))
+        .await;
+    controller.pending_joins.lock().clear();
+
+    controller.on_peer_connected((peer2_id, "10.0.0.4:7000".parse().unwrap()));
+
+    let pending = controller.pending_joins.lock();
+    assert!(
+        pending.contains(&peer2_id),
+        "existing cluster members reconnecting with a new IP must queue a metadata/pool refresh"
+    );
+}
+
+#[tokio::test]
 async fn decommission_requires_raft() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
@@ -935,7 +1033,7 @@ fn is_cql_ready_pair_secondary_returns_false() {
     let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
     controller.set_peer_manager(pm);
 
-    // Outbound connection (on_peer_connected) → this node is Secondary (joiner).
+    // Outbound connection to a lower host-id peer keeps this node secondary.
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
     controller.on_peer_connected((peer_id, peer_addr));
     assert_eq!(controller.mode(), DeploymentMode::Pair);
@@ -944,6 +1042,46 @@ fn is_cql_ready_pair_secondary_returns_false() {
         !controller.is_cql_ready(),
         "pair secondary must NOT accept CQL connections"
     );
+}
+
+#[tokio::test]
+async fn reverse_inbound_race_does_not_promote_joiner_to_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(2);
+    let peer_id = Uuid::from_u128(1);
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    use ferrosa_net::rpc::InboundPeerCallback;
+
+    // Live 38xxx shape: the seed's reverse inbound arrives on an ephemeral
+    // port before the joiner's canonical outbound `:7000` peer-connected event.
+    controller.on_inbound_peer((peer_id, "10.0.0.1:40370".parse().unwrap()), None);
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+    assert_eq!(
+        controller.role(),
+        Some(PairRole::Secondary),
+        "joiner must stay secondary even if the reverse inbound wins the race"
+    );
+
+    controller.on_peer_connected((peer_id, "10.0.0.1:7000".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
 }
 
 // -----------------------------------------------------------------------
