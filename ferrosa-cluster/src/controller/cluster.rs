@@ -156,7 +156,7 @@ impl ModeController {
         let raft_rt_for_connect = self.raft_runtime.get().cloned();
         let data_rt_for_connect = self.data_runtime.get().cloned();
         for (peer_uuid, peer_addr) in &peers {
-            if !peer_manager.has_peer(*peer_uuid) {
+            if !peer_manager.has_live_peer(*peer_uuid) {
                 let pm = peer_manager.clone();
                 let cfg = net_cfg.clone();
                 let uuid = *peer_uuid;
@@ -701,7 +701,7 @@ impl ModeController {
                     + std::time::Duration::from_secs(10);
                 for (peer_uuid, _) in &peers {
                     let mut waited = false;
-                    while !peer_manager_for_bootstrap.has_peer(*peer_uuid) {
+                    while !peer_manager_for_bootstrap.has_live_peer(*peer_uuid) {
                         if !waited {
                             tracing::debug!(
                                 peer = %peer_uuid,
@@ -1445,7 +1445,7 @@ impl RpcHandler for ClusterInviteHandler {
             if *peer_id == self.local_host_id {
                 continue; // skip self
             }
-            if self.peer_manager.has_peer(*peer_id) {
+            if self.peer_manager.has_live_peer(*peer_id) {
                 continue; // peer_manager already knows this peer
             }
             new_peers.push((*peer_id, *peer_addr));

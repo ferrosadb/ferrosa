@@ -87,6 +87,19 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Returns `true` only if there is an established outbound pool for this peer.
+    pub fn has_live_peer(&self, host_id: uuid::Uuid) -> bool {
+        self.peers
+            .try_read()
+            .map(|peers| {
+                peers
+                    .get(&host_id)
+                    .map(|state| state.pool.is_some())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     /// Return the last known socket address for `host_id`, even if this peer
     /// currently has no active outbound pool.
     pub async fn peer_addr(&self, host_id: uuid::Uuid) -> Option<String> {
@@ -700,7 +713,30 @@ mod tests {
             2,
             "add_peer_entry plus ensure_peer should emit a second connected event when the pool is established"
         );
+        assert!(
+            pm.has_live_peer(server_id),
+            "ensure_peer should upgrade placeholder peers into a live outbound pool"
+        );
 
         server.shutdown(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn has_live_peer_is_false_for_placeholder_entries() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener);
+
+        let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        pm.add_peer_entry(peer_id).await;
+
+        assert!(
+            pm.has_peer(peer_id.0),
+            "placeholder entries are still tracked"
+        );
+        assert!(
+            !pm.has_live_peer(peer_id.0),
+            "placeholder entries must not count as live outbound pools"
+        );
     }
 }

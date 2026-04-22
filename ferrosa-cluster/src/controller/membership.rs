@@ -271,7 +271,7 @@ impl ModeController {
         let peer_manager = self.peer_manager.load().as_ref().as_ref().cloned();
         let has_outbound_peer = peer_manager
             .as_ref()
-            .map(|pm| pm.has_peer(host_id))
+            .map(|pm| pm.has_live_peer(host_id))
             .unwrap_or(false);
         let peer_node_id = uuid_to_node_id(host_id);
         let existing_member = self
@@ -334,7 +334,7 @@ impl ModeController {
 
         self.spawn_tracked(async move {
             if let Some(pm) = peer_manager.as_ref() {
-                if !pm.has_peer(host_id) {
+                if !pm.has_live_peer(host_id) {
                     match PriorityPool::connect(
                         net_config.clone(),
                         local_host_id,
