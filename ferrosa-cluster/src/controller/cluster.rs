@@ -215,6 +215,21 @@ impl ModeController {
             Err(e) => tracing::warn!(%e, "failed to read last_purged from log store"),
         }
 
+        if !state_machine.has_topology_state() {
+            match log_store.recover_topology_state() {
+                Ok(topology) if !topology.members.is_empty() || !topology.token_map.is_empty() => {
+                    tracing::warn!(
+                        member_count = topology.members.len(),
+                        token_count = topology.token_map.len(),
+                        "raft state machine snapshot missing topology; recovered committed topology from raft log"
+                    );
+                    state_machine.seed_topology(topology.members, topology.token_map);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(%e, "failed to recover topology from raft log"),
+            }
+        }
+
         // Recover membership from the log if it was lost (e.g., OOM kill
         // before snapshot persisted). Without valid membership, no election
         // can happen and the cluster stays stuck as Learners.

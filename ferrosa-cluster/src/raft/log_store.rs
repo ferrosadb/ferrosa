@@ -10,6 +10,7 @@
 //! - **`meta`** — small metadata values: `vote`, `committed`, and
 //!   `last_purged`.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::RangeBounds;
 use std::path::Path;
@@ -257,6 +258,12 @@ const META_VOTE: &[u8] = b"vote";
 const META_COMMITTED: &[u8] = b"committed";
 const META_LAST_PURGED: &[u8] = b"last_purged";
 
+#[derive(Debug, Default, Clone)]
+pub struct RecoveredTopology {
+    pub members: BTreeMap<u64, NodeInfo>,
+    pub token_map: BTreeMap<Token, u64>,
+}
+
 // ---------------------------------------------------------------------------
 // SledLogStore
 // ---------------------------------------------------------------------------
@@ -367,6 +374,50 @@ impl SledLogStore {
             }
         }
         Ok(None)
+    }
+
+    /// Reconstruct committed topology state from normal Raft log entries.
+    ///
+    /// This is the restart fallback when the state-machine snapshot is absent
+    /// or stale: we replay only topology-affecting commands from oldest to
+    /// newest and rebuild the committed member/token view.
+    pub fn recover_topology_state(&self) -> Result<RecoveredTopology, StorageIOError<u64>> {
+        use openraft::EntryPayload;
+
+        let mut members = BTreeMap::new();
+        let mut token_map = BTreeMap::new();
+
+        for item in self.log.iter() {
+            let (_k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
+            let entry = Self::deserialize_entry(&v)?;
+            let EntryPayload::Normal(cmd) = entry.payload else {
+                continue;
+            };
+
+            match cmd.op {
+                RaftOp::JoinNode(node) | RaftOp::UpdateNodeInfo(node) => {
+                    members.insert(super::uuid_to_node_id(node.host_id), node);
+                }
+                RaftOp::LeaveNode { node_id } => {
+                    members.remove(&node_id);
+                    token_map.retain(|_, owner| *owner != node_id);
+                }
+                RaftOp::AssignTokens { node_id, tokens } => {
+                    token_map.retain(|_, owner| *owner != node_id);
+                    for token in tokens {
+                        token_map.insert(token, node_id);
+                    }
+                }
+                RaftOp::SetNodeState { node_id, state } => {
+                    if let Some(node) = members.get_mut(&node_id) {
+                        node.state = state;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(RecoveredTopology { members, token_map })
     }
 
     /// Return the last entry currently present in the log tree.
@@ -585,6 +636,16 @@ mod tests {
         }
     }
 
+    fn normal_entry(term: u64, index: u64, op: RaftOp) -> Entry<FerrosRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
+            payload: EntryPayload::Normal(RaftCommand {
+                op,
+                schema_version: Uuid::new_v4(),
+            }),
+        }
+    }
+
     // -- append_and_read_back ---------------------------------------------
 
     #[tokio::test]
@@ -765,6 +826,99 @@ mod tests {
             }
             other => panic!("expected legacy LeaveNode to decode, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn recover_topology_state_replays_topology_commands_from_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SledLogStore::new(dir.path()).unwrap();
+        let node1 = Uuid::from_u128(1);
+        let node2 = Uuid::from_u128(2);
+        let node1_id = super::super::uuid_to_node_id(node1);
+        let node2_id = super::super::uuid_to_node_id(node2);
+
+        let mut batch = sled::Batch::default();
+        for entry in [
+            normal_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: node1,
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Joining,
+                    cql_broadcast: Some("127.0.0.1:19042".to_string()),
+                }),
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: node2,
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Joining,
+                    cql_broadcast: Some("127.0.0.1:19043".to_string()),
+                }),
+            ),
+            normal_entry(
+                1,
+                3,
+                RaftOp::AssignTokens {
+                    node_id: node1_id,
+                    tokens: vec![-10, 10],
+                },
+            ),
+            normal_entry(
+                1,
+                4,
+                RaftOp::AssignTokens {
+                    node_id: node2_id,
+                    tokens: vec![20, 30],
+                },
+            ),
+            normal_entry(
+                1,
+                5,
+                RaftOp::SetNodeState {
+                    node_id: node1_id,
+                    state: NodeState::Normal,
+                },
+            ),
+            normal_entry(
+                1,
+                6,
+                RaftOp::UpdateNodeInfo(NodeInfo {
+                    host_id: node2,
+                    addr: "10.0.0.22:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack2".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: Some("127.0.0.1:29043".to_string()),
+                }),
+            ),
+            normal_entry(1, 7, RaftOp::LeaveNode { node_id: node1_id }),
+        ] {
+            let key = SledLogStore::index_key(entry.log_id.index);
+            let val = SledLogStore::serialize_entry(&entry).unwrap();
+            batch.insert(&key, val);
+        }
+        store.log.apply_batch(batch).unwrap();
+
+        let topology = store.recover_topology_state().unwrap();
+
+        assert_eq!(topology.members.len(), 1);
+        let node2_info = topology.members.get(&node2_id).unwrap();
+        assert_eq!(node2_info.addr, "10.0.0.22:7000");
+        assert_eq!(node2_info.rack, "rack2");
+        assert_eq!(node2_info.cql_broadcast.as_deref(), Some("127.0.0.1:29043"));
+        assert_eq!(node2_info.state, NodeState::Normal);
+        assert_eq!(topology.token_map.len(), 2);
+        assert_eq!(topology.token_map.get(&20), Some(&node2_id));
+        assert_eq!(topology.token_map.get(&30), Some(&node2_id));
+        assert!(!topology.token_map.values().any(|owner| *owner == node1_id));
     }
 
     // -- save_committed / read_committed round-trip -----------------------
