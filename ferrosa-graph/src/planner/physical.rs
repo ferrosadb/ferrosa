@@ -84,10 +84,16 @@ pub struct MergeOp {
     /// `src_key_bytes` (the SSTable partition key for the edge row).
     /// `None` for node MergeOps.
     pub src_match_props: Option<Vec<(String, Expr)>>,
+    /// For edge MergeOps: the source node variable name, used to reuse
+    /// the already-bound row during schema-aware hidden-key inference.
+    pub src_var: Option<String>,
     /// For edge MergeOps: the destination vertex's match properties, used to
     /// derive `dst_key_bytes` (the SSTable clustering key for the edge row).
     /// `None` for node MergeOps.
     pub dst_match_props: Option<Vec<(String, Expr)>>,
+    /// For edge MergeOps: the destination node variable name, used to reuse
+    /// the already-bound row during schema-aware hidden-key inference.
+    pub dst_var: Option<String>,
 }
 
 /// A projection in an aggregate plan.
@@ -443,7 +449,9 @@ fn collect_merge_ops(
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props: None,
+                        src_var: None,
                         dst_match_props: None,
+                        dst_var: None,
                     });
                 } else if label.is_some() {
                     return Err(GraphError::Validation(format!(
@@ -480,7 +488,9 @@ fn collect_merge_ops(
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props: None,
+                        src_var: None,
                         dst_match_props: None,
+                        dst_var: None,
                     });
                 } else if rel_type.is_some() {
                     return Err(GraphError::Validation(format!(
@@ -533,7 +543,9 @@ fn collect_merge_ops_from_path(
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props: None,
+                        src_var: None,
                         dst_match_props: None,
+                        dst_var: None,
                     });
                 } else if label.is_some() {
                     return Err(GraphError::Validation(format!(
@@ -582,6 +594,15 @@ fn collect_merge_ops_from_path(
                 } else {
                     None
                 };
+                let src_var = if i > 0 {
+                    if let crate::parser::Pattern::Node { var: src_var, .. } = &elements[i - 1] {
+                        src_var.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 // Peek at the destination node (i+1) for dst_match_props.
                 let dst_match_props: Option<Vec<(String, crate::parser::Expr)>> =
@@ -605,6 +626,15 @@ fn collect_merge_ops_from_path(
                     } else {
                         None
                     };
+                let dst_var = if i + 1 < elements.len() {
+                    if let crate::parser::Pattern::Node { var: dst_var, .. } = &elements[i + 1] {
+                        dst_var.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 if let Some(table) = resolved {
                     merges.push(MergeOp {
@@ -613,7 +643,9 @@ fn collect_merge_ops_from_path(
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props,
+                        src_var,
                         dst_match_props,
+                        dst_var,
                     });
                 } else if rel_type.is_some() {
                     return Err(GraphError::Validation(format!(
