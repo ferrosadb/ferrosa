@@ -39,6 +39,15 @@ use crate::write_path::WritePath;
 
 use super::{ClusterStateHolder, ModeController};
 
+pub(super) fn should_initialize_seed_membership(
+    was_seed: bool,
+    has_persisted_log: bool,
+    has_persisted_vote: bool,
+    has_recovered_membership: bool,
+) -> bool {
+    was_seed && !(has_persisted_log || has_persisted_vote || has_recovered_membership)
+}
+
 impl ModeController {
     fn normalize_cluster_peer_addr(&self, addr: SocketAddr) -> SocketAddr {
         SocketAddr::new(addr.ip(), self.net_config.bind_addr.port())
@@ -176,7 +185,7 @@ impl ModeController {
                 std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
             std::path::Path::new(&data_dir).join("raft")
         };
-        let log_store = match SledLogStore::new(&raft_dir) {
+        let mut log_store = match SledLogStore::new(&raft_dir) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(%e, "failed to create Raft log store");
@@ -200,10 +209,17 @@ impl ModeController {
         // Recover membership from the log if it was lost (e.g., OOM kill
         // before snapshot persisted). Without valid membership, no election
         // can happen and the cluster stays stuck as Learners.
-        match log_store.find_last_membership() {
-            Ok(membership) => state_machine.recover_membership(membership),
-            Err(e) => tracing::warn!(%e, "failed to scan log for membership"),
-        }
+        let has_recovered_membership = match log_store.find_last_membership() {
+            Ok(membership) => {
+                let has_membership = membership.is_some();
+                state_machine.recover_membership(membership);
+                has_membership
+            }
+            Err(e) => {
+                tracing::warn!(%e, "failed to scan log for membership");
+                false
+            }
+        };
 
         // 3. Create network factory
         let network_factory = FerrosRaftNetworkFactory::new(peer_manager.clone());
@@ -408,6 +424,7 @@ impl ModeController {
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
         let raft_runtime: Option<Arc<tokio::runtime::Runtime>> = self.raft_runtime.get().cloned();
+        let has_recovered_membership = has_recovered_membership;
 
         // Register Raft RPC handlers BEFORE spawning the init task.
         // Handlers use LazyRaft to wait for the instance to be ready.
@@ -715,6 +732,36 @@ impl ModeController {
             // internal tasks (replication, election) run there. This keeps
             // reply_rx.await off the busy main runtime, eliminating 100ms+
             // scheduling delays on heartbeat round-trips.
+            let persisted_raft_state = match <SledLogStore as openraft::storage::RaftLogStorage<
+                crate::raft::FerrosRaftConfig,
+            >>::get_log_state(&mut log_store)
+            .await
+            {
+                Ok(log_state) => {
+                    let has_persisted_vote =
+                        match <SledLogStore as openraft::storage::RaftLogStorage<
+                            crate::raft::FerrosRaftConfig,
+                        >>::read_vote(&mut log_store)
+                        .await
+                        {
+                            Ok(vote) => vote.is_some(),
+                            Err(e) => {
+                                tracing::warn!(%e, "failed to read raft vote before bootstrap");
+                                false
+                            }
+                        };
+                    (
+                        log_state.last_log_id.is_some(),
+                        has_persisted_vote,
+                        has_recovered_membership,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "failed to read raft log state before bootstrap");
+                    (false, false, has_recovered_membership)
+                }
+            };
+
             let raft = if let Some(raft_rt) = raft_runtime.as_ref() {
                 match raft_rt
                     .spawn(async move {
@@ -790,10 +837,22 @@ impl ModeController {
             // Non-seed nodes will receive their membership via AppendEntries
             // from the leader. This prevents CF-T17 (membership race from
             // independent initialize() calls with potentially different member lists).
-            if was_seed {
+            if should_initialize_seed_membership(
+                was_seed,
+                persisted_raft_state.0,
+                persisted_raft_state.1,
+                persisted_raft_state.2,
+            ) {
                 if let Err(e) = raft_arc.initialize(members).await {
                     tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
                 }
+            } else if was_seed {
+                tracing::info!(
+                    has_persisted_log = persisted_raft_state.0,
+                    has_persisted_vote = persisted_raft_state.1,
+                    has_recovered_membership = persisted_raft_state.2,
+                    "seed has persisted raft state; skipping initialize and waiting for election"
+                );
             } else {
                 tracing::info!("non-seed node — skipping raft.initialize(), waiting for leader AppendEntries");
             }

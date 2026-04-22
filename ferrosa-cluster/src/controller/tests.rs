@@ -1,3 +1,4 @@
+use super::cluster::should_initialize_seed_membership;
 use super::*;
 
 fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
@@ -413,6 +414,44 @@ async fn transition_to_cluster_normalizes_ephemeral_peer_ports_before_seeding_ri
 
     assert_eq!(peer1.addr, "10.89.1.53:7000");
     assert_eq!(peer2.addr, "10.89.1.54:7000");
+}
+
+#[test]
+fn fresh_seed_with_no_persisted_raft_state_still_initializes_membership() {
+    assert!(should_initialize_seed_membership(
+        true,  // was_seed
+        false, // has_persisted_log
+        false, // has_persisted_vote
+        false, // has_recovered_membership
+    ));
+}
+
+#[test]
+fn seed_restart_with_persisted_raft_state_skips_initialize() {
+    assert!(!should_initialize_seed_membership(
+        true,  // was_seed
+        true,  // has_persisted_log
+        false, // has_persisted_vote
+        false, // has_recovered_membership
+    ));
+    assert!(!should_initialize_seed_membership(
+        true,  // was_seed
+        false, // has_persisted_log
+        true,  // has_persisted_vote
+        false, // has_recovered_membership
+    ));
+    assert!(!should_initialize_seed_membership(
+        true,  // was_seed
+        false, // has_persisted_log
+        false, // has_persisted_vote
+        true,  // has_recovered_membership
+    ));
+    assert!(!should_initialize_seed_membership(
+        false, // was_seed
+        false, // has_persisted_log
+        false, // has_persisted_vote
+        false, // has_recovered_membership
+    ));
 }
 
 #[tokio::test]
