@@ -18,8 +18,236 @@ use openraft::storage::LogFlushed;
 use openraft::{
     AnyError, Entry, LogId, LogState, RaftLogReader, StorageError, StorageIOError, Vote,
 };
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use super::FerrosRaftConfig;
+use super::{
+    FerrosRaftConfig, IndexNodeStatus, NodeInfo, NodeState, RaftCommand, RaftOp, RaftResponse,
+    Token,
+};
+use crate::config::ClusterConfig;
+use ferrosa_common::CqlType;
+use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
+use ferrosa_schema::metadata::function::UserFunctionMetadata;
+use ferrosa_schema::metadata::index::IndexMetadata;
+use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
+use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
+use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+use ferrosa_schema::{GrantEntry, Permission, Resource, RoleMetadata, RoleUpdates};
+
+openraft::declare_raft_types!(
+    /// Legacy Raft type configuration for entries written before UpdateNodeInfo
+    /// was inserted into the middle of `RaftOp`.
+    #[allow(dead_code)]
+    LegacyFerrosRaftConfigPreUpdateNodeInfo:
+        D            = LegacyRaftCommandPreUpdateNodeInfo,
+        R            = RaftResponse,
+        NodeId       = u64,
+        Node         = openraft::BasicNode,
+        Entry        = openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>,
+        SnapshotData = std::io::Cursor<Vec<u8>>,
+        AsyncRuntime = openraft::TokioRuntime,
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyRaftCommandPreUpdateNodeInfo {
+    op: LegacyRaftOpPreUpdateNodeInfo,
+    schema_version: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyRaftOpPreUpdateNodeInfo {
+    CreateKeyspace(KeyspaceMetadata),
+    DropKeyspace(String),
+    CreateTable(Box<TableMetadata>),
+    DropTable {
+        keyspace: String,
+        table: String,
+    },
+    AlterKeyspace {
+        name: String,
+        updates: KeyspaceUpdates,
+    },
+    AlterTable {
+        keyspace: String,
+        table: String,
+        updates: Box<TableUpdates>,
+    },
+    CreateRole(RoleMetadata),
+    AlterRole {
+        name: String,
+        updates: RoleUpdates,
+    },
+    DropRole(String),
+    Grant(GrantEntry),
+    Revoke {
+        role: String,
+        resource: Resource,
+        permission: Permission,
+    },
+    CreateIndex(IndexMetadata),
+    DropIndex {
+        keyspace: String,
+        table: String,
+        index: String,
+    },
+    IndexStatus {
+        node_id: u64,
+        keyspace: String,
+        table: String,
+        index_name: String,
+        status: IndexNodeStatus,
+    },
+    CreateType(UserTypeMetadata),
+    DropType {
+        keyspace: String,
+        name: String,
+    },
+    CreateFunction(UserFunctionMetadata),
+    DropFunction {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
+    },
+    CreateAggregate(UserAggregateMetadata),
+    DropAggregate {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
+    },
+    JoinNode(NodeInfo),
+    LeaveNode {
+        node_id: u64,
+    },
+    AssignTokens {
+        node_id: u64,
+        tokens: Vec<Token>,
+    },
+    UpdateConfig(ClusterConfig),
+    ApproveNode {
+        host_id: Uuid,
+    },
+    SetNodeState {
+        node_id: u64,
+        state: NodeState,
+    },
+}
+
+impl From<LegacyRaftOpPreUpdateNodeInfo> for RaftOp {
+    fn from(value: LegacyRaftOpPreUpdateNodeInfo) -> Self {
+        match value {
+            LegacyRaftOpPreUpdateNodeInfo::CreateKeyspace(ks) => Self::CreateKeyspace(ks),
+            LegacyRaftOpPreUpdateNodeInfo::DropKeyspace(name) => Self::DropKeyspace(name),
+            LegacyRaftOpPreUpdateNodeInfo::CreateTable(table) => Self::CreateTable(table),
+            LegacyRaftOpPreUpdateNodeInfo::DropTable { keyspace, table } => {
+                Self::DropTable { keyspace, table }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::AlterKeyspace { name, updates } => {
+                Self::AlterKeyspace { name, updates }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::AlterTable {
+                keyspace,
+                table,
+                updates,
+            } => Self::AlterTable {
+                keyspace,
+                table,
+                updates,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateRole(role) => Self::CreateRole(role),
+            LegacyRaftOpPreUpdateNodeInfo::AlterRole { name, updates } => {
+                Self::AlterRole { name, updates }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::DropRole(name) => Self::DropRole(name),
+            LegacyRaftOpPreUpdateNodeInfo::Grant(entry) => Self::Grant(entry),
+            LegacyRaftOpPreUpdateNodeInfo::Revoke {
+                role,
+                resource,
+                permission,
+            } => Self::Revoke {
+                role,
+                resource,
+                permission,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateIndex(index) => Self::CreateIndex(index),
+            LegacyRaftOpPreUpdateNodeInfo::DropIndex {
+                keyspace,
+                table,
+                index,
+            } => Self::DropIndex {
+                keyspace,
+                table,
+                index,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::IndexStatus {
+                node_id,
+                keyspace,
+                table,
+                index_name,
+                status,
+            } => Self::IndexStatus {
+                node_id,
+                keyspace,
+                table,
+                index_name,
+                status,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateType(udt) => Self::CreateType(udt),
+            LegacyRaftOpPreUpdateNodeInfo::DropType { keyspace, name } => {
+                Self::DropType { keyspace, name }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::CreateFunction(func) => Self::CreateFunction(func),
+            LegacyRaftOpPreUpdateNodeInfo::DropFunction {
+                keyspace,
+                name,
+                arg_types,
+            } => Self::DropFunction {
+                keyspace,
+                name,
+                arg_types,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateAggregate(agg) => Self::CreateAggregate(agg),
+            LegacyRaftOpPreUpdateNodeInfo::DropAggregate {
+                keyspace,
+                name,
+                arg_types,
+            } => Self::DropAggregate {
+                keyspace,
+                name,
+                arg_types,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::JoinNode(node) => Self::JoinNode(node),
+            LegacyRaftOpPreUpdateNodeInfo::LeaveNode { node_id } => Self::LeaveNode { node_id },
+            LegacyRaftOpPreUpdateNodeInfo::AssignTokens { node_id, tokens } => {
+                Self::AssignTokens { node_id, tokens }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::UpdateConfig(config) => Self::UpdateConfig(config),
+            LegacyRaftOpPreUpdateNodeInfo::ApproveNode { host_id } => Self::ApproveNode { host_id },
+            LegacyRaftOpPreUpdateNodeInfo::SetNodeState { node_id, state } => {
+                Self::SetNodeState { node_id, state }
+            }
+        }
+    }
+}
+
+fn convert_legacy_entry_pre_update_node_info(
+    entry: openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>,
+) -> Entry<FerrosRaftConfig> {
+    let payload = match entry.payload {
+        openraft::EntryPayload::Blank => openraft::EntryPayload::Blank,
+        openraft::EntryPayload::Membership(membership) => {
+            openraft::EntryPayload::Membership(membership)
+        }
+        openraft::EntryPayload::Normal(cmd) => openraft::EntryPayload::Normal(RaftCommand {
+            op: cmd.op.into(),
+            schema_version: cmd.schema_version,
+        }),
+    };
+    Entry {
+        log_id: entry.log_id,
+        payload,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Meta-tree keys
@@ -65,7 +293,17 @@ impl SledLogStore {
     }
 
     fn deserialize_entry(bytes: &[u8]) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
-        bincode::deserialize(bytes).map_err(|e| StorageIOError::read_logs(to_any_error(e)))
+        match bincode::deserialize(bytes) {
+            Ok(entry) => Ok(entry),
+            Err(current_err) => {
+                match bincode::deserialize::<openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>>(
+                    bytes,
+                ) {
+                    Ok(entry) => Ok(convert_legacy_entry_pre_update_node_info(entry)),
+                    Err(_) => Err(StorageIOError::read_logs(to_any_error(current_err))),
+                }
+            }
+        }
     }
 
     fn save_meta<T: serde::Serialize>(
@@ -501,6 +739,32 @@ mod tests {
         assert_eq!(state.last_purged_log_id, None);
         assert!(state.last_log_id.is_some());
         assert_eq!(state.last_log_id.unwrap().index, 3);
+    }
+
+    #[test]
+    fn deserialize_entry_reads_pre_update_node_info_log_format() {
+        let schema_version = Uuid::new_v4();
+        let legacy_entry = openraft::Entry::<LegacyFerrosRaftConfigPreUpdateNodeInfo> {
+            log_id: LogId::new(CommittedLeaderId::new(7, 3), 42),
+            payload: EntryPayload::Normal(LegacyRaftCommandPreUpdateNodeInfo {
+                op: LegacyRaftOpPreUpdateNodeInfo::LeaveNode { node_id: 9 },
+                schema_version,
+            }),
+        };
+
+        let encoded = bincode::serialize(&legacy_entry).unwrap();
+        let decoded = SledLogStore::deserialize_entry(&encoded).unwrap();
+
+        match decoded.payload {
+            EntryPayload::Normal(RaftCommand {
+                op: RaftOp::LeaveNode { node_id },
+                schema_version: decoded_version,
+            }) => {
+                assert_eq!(node_id, 9);
+                assert_eq!(decoded_version, schema_version);
+            }
+            other => panic!("expected legacy LeaveNode to decode, got {other:?}"),
+        }
     }
 
     // -- save_committed / read_committed round-trip -----------------------
