@@ -41,11 +41,9 @@ use super::{ClusterStateHolder, ModeController};
 
 pub(super) fn should_initialize_seed_membership(
     was_seed: bool,
-    has_persisted_log: bool,
-    has_persisted_vote: bool,
     has_recovered_membership: bool,
 ) -> bool {
-    was_seed && !(has_persisted_log || has_persisted_vote || has_recovered_membership)
+    was_seed && !has_recovered_membership
 }
 
 impl ModeController {
@@ -750,15 +748,11 @@ impl ModeController {
                                 false
                             }
                         };
-                    (
-                        log_state.last_log_id.is_some(),
-                        has_persisted_vote,
-                        has_recovered_membership,
-                    )
+                    (log_state.last_log_id.is_some(), has_persisted_vote)
                 }
                 Err(e) => {
                     tracing::warn!(%e, "failed to read raft log state before bootstrap");
-                    (false, false, has_recovered_membership)
+                    (false, false)
                 }
             };
 
@@ -839,9 +833,7 @@ impl ModeController {
             // independent initialize() calls with potentially different member lists).
             if should_initialize_seed_membership(
                 was_seed,
-                persisted_raft_state.0,
-                persisted_raft_state.1,
-                persisted_raft_state.2,
+                has_recovered_membership,
             ) {
                 if let Err(e) = raft_arc.initialize(members).await {
                     tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
@@ -850,7 +842,7 @@ impl ModeController {
                 tracing::info!(
                     has_persisted_log = persisted_raft_state.0,
                     has_persisted_vote = persisted_raft_state.1,
-                    has_recovered_membership = persisted_raft_state.2,
+                    has_recovered_membership,
                     "seed has persisted raft state; skipping initialize and waiting for election"
                 );
             } else {
