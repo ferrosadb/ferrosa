@@ -190,10 +190,21 @@ impl ModeController {
                 return;
             }
         };
+        let snapshot_path = raft_dir.join("state-machine.snapshot.bin");
 
         // 2. Create state machine from current schema
-        let mut state_machine =
-            FerrosStateMachine::with_side_effects(self.schema.clone(), self.storage.clone());
+        let mut state_machine = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            self.schema.clone(),
+            self.storage.clone(),
+            snapshot_path,
+        );
+        let recovered_persisted_snapshot = match state_machine.recover_from_persisted_snapshot() {
+            Ok(recovered) => recovered,
+            Err(e) => {
+                tracing::warn!(%e, "failed to recover persisted raft snapshot");
+                false
+            }
+        };
 
         // Recover last_applied from the log store's purge point if the state
         // machine was lost (e.g., OOM kill before snapshot persisted). Without
@@ -209,13 +220,29 @@ impl ModeController {
         // can happen and the cluster stays stuck as Learners.
         let has_recovered_membership = match log_store.find_last_membership() {
             Ok(membership) => {
-                let has_membership = membership.is_some();
+                let recovered_from_log = membership.is_some();
                 state_machine.recover_membership(membership);
-                has_membership
+                let recovered_from_topology =
+                    state_machine.recover_membership_from_topology_state();
+                if recovered_from_topology && !recovered_from_log {
+                    tracing::warn!(
+                        member_count = state_machine.state().members.len(),
+                        "raft membership was missing from log; synthesized voters from committed topology state"
+                    );
+                }
+                recovered_from_log || recovered_from_topology
             }
             Err(e) => {
                 tracing::warn!(%e, "failed to scan log for membership");
-                false
+                let recovered_from_topology =
+                    state_machine.recover_membership_from_topology_state();
+                if recovered_from_topology {
+                    tracing::warn!(
+                        member_count = state_machine.state().members.len(),
+                        "raft membership scan failed; synthesized voters from committed topology state"
+                    );
+                }
+                recovered_from_topology
             }
         };
 
@@ -240,84 +267,67 @@ impl ModeController {
         let peer_manager_for_ddl = peer_manager.clone();
         let peer_manager_for_bootstrap = peer_manager.clone();
 
-        // 4. Build TokenRing with deterministic initial tokens
-        let mut ring = TokenRing::new();
+        // 4. Build TokenRing with deterministic initial tokens.
+        // If a durable snapshot was recovered, let the state machine repopulate
+        // the live ring from committed topology instead of reseeding a fresh
+        // local-only bootstrap view.
+        let ring_arc = Arc::new(ArcSwap::from_pointee(TokenRing::new()));
+        if state_machine.has_topology_state() {
+            tracing::info!(
+                recovered_persisted_snapshot,
+                member_count = state_machine.state().members.len(),
+                token_count = state_machine.state().token_map.len(),
+                "recovered raft topology from persisted state machine snapshot"
+            );
+            state_machine.set_ring(ring_arc.clone());
+            state_machine.sync_live_ring_from_state();
+        } else {
+            let mut ring = TokenRing::new();
 
-        // Add local node
-        let broadcast = self.net_config.broadcast_addr.to_string();
-        ring.add_node(
-            local_node_id,
-            NodeInfo {
-                host_id: self.local_host_id,
-                addr: broadcast,
-                data_center: self.config.data_center.clone(),
-                rack: self.config.rack.clone(),
-                state: NodeState::Normal,
-                cql_broadcast: self.config.cql_broadcast.clone(),
-            },
-        );
-
-        // Add peers
-        for (peer_uuid, addr) in &peers {
-            let peer_node_id = uuid_to_node_id(*peer_uuid);
+            // Add local node
+            let broadcast = self.net_config.broadcast_addr.to_string();
             ring.add_node(
-                peer_node_id,
+                local_node_id,
                 NodeInfo {
-                    host_id: *peer_uuid,
-                    addr: addr.to_string(),
+                    host_id: self.local_host_id,
+                    addr: broadcast,
                     data_center: self.config.data_center.clone(),
                     rack: self.config.rack.clone(),
-                    // Start as Normal — all nodes in a pair→cluster transition
-                    // already have data (replicated via pair mode). Marking them
-                    // as Joining caused every coordinator to only consider ITSELF
-                    // as a valid replica, scattering writes across all nodes.
                     state: NodeState::Normal,
-                    // Prefer the CQL broadcast learned during the internode
-                    // handshake so the first system.peers view after cluster
-                    // formation already advertises host-reachable endpoints.
-                    cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
+                    cql_broadcast: self.config.cql_broadcast.clone(),
                 },
             );
-        }
 
-        // Assign deterministic tokens for THIS NODE ONLY.
-        //
-        // Previously every node assigned tokens for every peer based on its
-        // local view of `peers`. If two nodes saw different peer sets at the
-        // moment of transition (a real race during cluster formation), they
-        // built divergent token rings — coordinator routing then sent the
-        // same partition key to different replicas depending on which
-        // coordinator handled the request, scattering data across nodes
-        // (the 67/67/33 split observed in the bug evidence).
-        //
-        // Fix: each node seeds only its own tokens. Peer JoinNode +
-        // AssignTokens are submitted via Raft below (seed) or arrive via
-        // AppendEntries (followers). `generate_deterministic_token(nid, i)`
-        // is a pure function of the peer's node_id, so every node computes
-        // the same tokens for the same peer regardless of who proposed
-        // them. State machine `sync_ring()` rebuilds the live ring from
-        // the canonical Raft state. See
-        // `specs/in-process/bug-token-ring-inconsistency-causes-data-scatter.md`
-        // and `controller::token::tests`.
-        let num_tokens = self.config.num_tokens as usize;
-        let local_tokens =
-            crate::controller::token::deterministic_tokens_for_node(local_node_id, num_tokens);
-        ring.assign_tokens(local_node_id, &local_tokens);
+            // Add peers
+            for (peer_uuid, addr) in &peers {
+                let peer_node_id = uuid_to_node_id(*peer_uuid);
+                ring.add_node(
+                    peer_node_id,
+                    NodeInfo {
+                        host_id: *peer_uuid,
+                        addr: addr.to_string(),
+                        data_center: self.config.data_center.clone(),
+                        rack: self.config.rack.clone(),
+                        state: NodeState::Normal,
+                        cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
+                    },
+                );
+            }
 
-        tracing::info!(
-            local = local_node_id,
-            peer_count = peers.len(),
-            num_tokens,
-            "building initial token ring (self-only); peers will populate via Raft"
-        );
+            let num_tokens = self.config.num_tokens as usize;
+            let local_tokens =
+                crate::controller::token::deterministic_tokens_for_node(local_node_id, num_tokens);
+            ring.assign_tokens(local_node_id, &local_tokens);
 
-        let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+            tracing::info!(
+                local = local_node_id,
+                peer_count = peers.len(),
+                num_tokens,
+                "building initial token ring (self-only); peers will populate via Raft"
+            );
 
-        // Seed the state machine with the local node only.
-        //
-        // sync_ring() will populate the live ring with peer entries as
-        // RaftOp::JoinNode / RaftOp::AssignTokens commands replicate.
-        {
+            ring_arc.store(Arc::new(ring));
+
             let mut members = std::collections::BTreeMap::new();
             let mut token_map = std::collections::BTreeMap::new();
             let ring_snap = ring_arc.load();

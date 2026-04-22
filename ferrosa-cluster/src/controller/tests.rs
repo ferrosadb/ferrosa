@@ -437,6 +437,14 @@ fn seed_restart_with_recovered_membership_skips_initialize() {
 }
 
 #[test]
+fn seed_restart_with_recovered_topology_backed_membership_skips_initialize() {
+    assert!(!should_initialize_seed_membership(
+        true, // was_seed
+        true, // recovered from topology state
+    ));
+}
+
+#[test]
 fn seed_restart_with_only_persisted_vote_or_log_still_initializes_membership() {
     assert!(should_initialize_seed_membership(
         true,  // was_seed
