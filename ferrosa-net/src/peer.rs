@@ -87,13 +87,25 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Return the last known socket address for `host_id`, even if this peer
+    /// currently has no active outbound pool.
+    pub async fn peer_addr(&self, host_id: uuid::Uuid) -> Option<String> {
+        let peers = self.peers.read().await;
+        peers.get(&host_id).map(|state| state.peer_id.1.to_string())
+    }
+
     /// Ensure there is an outbound connection pool for `host_id`.
     ///
     /// Uses the provided address string (IP:port or resolvable hostname:port)
     /// to establish the pool if one is not already present.
     pub async fn ensure_peer(&self, host_id: uuid::Uuid, addr: &str) -> crate::error::Result<()> {
-        if self.has_peer(host_id) {
-            return Ok(());
+        {
+            let peers = self.peers.read().await;
+            if let Some(state) = peers.get(&host_id) {
+                if state.pool.is_some() {
+                    return Ok(());
+                }
+            }
         }
 
         let resolved = addr
@@ -632,6 +644,62 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(resp, Message::Pong { nonce: 99, .. }));
+
+        server.shutdown(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn peer_addr_returns_cached_peer_entry_address() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener);
+
+        let host_id = uuid::Uuid::new_v4();
+        let addr = "127.0.0.1:9042".parse().unwrap();
+        pm.add_peer_entry((host_id, addr)).await;
+
+        assert_eq!(
+            pm.peer_addr(host_id).await.as_deref(),
+            Some("127.0.0.1:9042")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_peer_replaces_entry_without_pool() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(Arc::new(config), uuid::Uuid::new_v4(), listener.clone());
+        pm.add_peer_entry((server_id, addr)).await;
+
+        pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+
+        let resp = pm
+            .send(
+                server_id,
+                Message::Ping {
+                    nonce: 7,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 7, .. }));
+        assert_eq!(
+            listener.connected_count.load(Ordering::Relaxed),
+            2,
+            "add_peer_entry plus ensure_peer should emit a second connected event when the pool is established"
+        );
 
         server.shutdown(Duration::from_millis(50)).await;
     }
