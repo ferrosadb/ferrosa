@@ -40,6 +40,10 @@ use crate::write_path::WritePath;
 use super::{ClusterStateHolder, ModeController};
 
 impl ModeController {
+    fn normalize_cluster_peer_addr(&self, addr: SocketAddr) -> SocketAddr {
+        SocketAddr::new(addr.ip(), self.net_config.bind_addr.port())
+    }
+
     /// Transition from Pair to Forming: broadcast ClusterInvite and prepare
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
@@ -90,6 +94,10 @@ impl ModeController {
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        let peers: Vec<(Uuid, SocketAddr)> = peers
+            .into_iter()
+            .map(|(peer_uuid, addr)| (peer_uuid, self.normalize_cluster_peer_addr(addr)))
+            .collect();
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {

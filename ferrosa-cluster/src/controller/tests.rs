@@ -364,6 +364,58 @@ async fn raft_initializes_on_third_peer() {
 }
 
 #[tokio::test]
+async fn transition_to_cluster_normalizes_ephemeral_peer_ports_before_seeding_ring() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    controller.transition_to_cluster(vec![
+        (peer1_id, "10.89.1.53:50318".parse().unwrap()),
+        (peer2_id, "10.89.1.54:50319".parse().unwrap()),
+    ]);
+
+    let ring = controller
+        .token_ring()
+        .expect("cluster transition should publish a token ring snapshot");
+
+    let peer1 = ring
+        .get_node(uuid_to_node_id(peer1_id))
+        .expect("peer1 should be seeded into the initial ring");
+    let peer2 = ring
+        .get_node(uuid_to_node_id(peer2_id))
+        .expect("peer2 should be seeded into the initial ring");
+
+    assert_eq!(peer1.addr, "10.89.1.53:7000");
+    assert_eq!(peer2.addr, "10.89.1.54:7000");
+}
+
+#[tokio::test]
 async fn raft_accessor_returns_none_before_init() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
