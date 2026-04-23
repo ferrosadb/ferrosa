@@ -32,7 +32,7 @@ use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
 use crate::router::{RequestContext, RouteResult, SharedState};
 use crate::subscribe::SubscriptionState;
-use crate::types::{decode_value, CqlType, CqlValue};
+use crate::types::{decode_value, encode_value, CqlType, CqlValue};
 use crate::virtual_tables::connections::{ConnectionInfo, ConnectionTracker};
 
 use ferrosa_schema::AuthContext;
@@ -236,7 +236,7 @@ pub async fn handle_connection<S>(
                     client.address = %peer,
                 );
 
-                match async {
+                match (async {
                     handle_frame(
                         &mut phase,
                         &mut auth_context,
@@ -248,7 +248,7 @@ pub async fn handle_connection<S>(
                         peer,
                     )
                     .await
-                }
+                })
                 .instrument(request_span)
                 .await
                 {
@@ -1359,9 +1359,10 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
                 .collect(),
         ),
         CqlValue::Vector(_) | CqlValue::Udt(_) => {
-            // Opaque types: pass as debug string. The router handles these
-            // through the typed path, not AST substitution.
-            Term::StringLiteral(format!("{v:?}"))
+            // Opaque typed values must preserve their exact wire payload across
+            // bind substitution. Re-rendering them as debug strings makes later
+            // INSERT/UPDATE execution re-parse the value through the wrong type.
+            Term::BlobLiteral(encode_value(v))
         }
     }
 }
@@ -1377,7 +1378,7 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
 fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
     match cql_type {
         // Collection types: pass bytes through unchanged for storage fidelity.
-        CqlType::Map(_, _) | CqlType::List(_) | CqlType::Set(_) => {
+        CqlType::Map(_, _) | CqlType::List(_) | CqlType::Set(_) | CqlType::Vector(_, _) => {
             Term::BlobLiteral(bytes.to_vec())
         }
         // All other types: decode to a typed CqlValue, then convert to Term.
@@ -2051,6 +2052,51 @@ mod tests {
                 "BUG-021: WHERE value should be IntegerLiteral(42), got {:?}",
                 u.where_clauses[0].value
             );
+        } else {
+            panic!("expected Update statement");
+        }
+    }
+
+    /// Existing-entity regression: a prepared UPDATE that binds a vector value
+    /// must preserve the raw vector payload so the router can decode it back
+    /// into the storage cell format. Converting it to a debug string makes the
+    /// later UPDATE path reject or mis-handle the embedding.
+    #[test]
+    fn bind_values_update_preserves_vector_payload() {
+        let plan = make_plan(
+            "UPDATE ks.entity_store SET entity_embedding = ? WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+            vec![
+                ("entity_embedding", CqlType::Vector(Box::new(CqlType::Float), 3)),
+                ("tenant_id", CqlType::Uuid),
+                ("session_id", CqlType::Uuid),
+                ("entity_id", CqlType::Uuid),
+            ],
+        );
+
+        let embedding = ferrosa_index::vec_f32_to_bytes(&[1.0, 2.0, 3.0]);
+        let tenant_id = uuid::Uuid::from_bytes([0x11; 16]);
+        let session_id = uuid::Uuid::from_bytes([0x22; 16]);
+        let entity_id = uuid::Uuid::from_bytes([0x33; 16]);
+        let payload = encode_values(&[
+            &embedding,
+            tenant_id.as_bytes(),
+            session_id.as_bytes(),
+            entity_id.as_bytes(),
+        ]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        if let Statement::Update(u) = &result {
+            assert_eq!(u.assignments.len(), 1, "expected one assignment");
+            if let Assignment::Simple { value, .. } = &u.assignments[0] {
+                assert!(
+                    matches!(value, Term::BlobLiteral(bytes) if *bytes == embedding),
+                    "vector bind value should remain BlobLiteral(raw-bytes), got {:?}",
+                    value
+                );
+            } else {
+                panic!("expected Simple assignment");
+            }
         } else {
             panic!("expected Update statement");
         }

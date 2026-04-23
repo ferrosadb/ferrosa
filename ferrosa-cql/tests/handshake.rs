@@ -1560,6 +1560,21 @@ fn encode_query_body_with_values(query: &str, values: &[&[u8]]) -> Vec<u8> {
     body
 }
 
+/// Encode a CQL v4 EXECUTE frame body with positional bind values.
+fn encode_execute_body_with_values(prepared_id: &[u8; 16], values: &[&[u8]]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&16u16.to_be_bytes()); // prepared id len
+    body.extend_from_slice(prepared_id);
+    body.extend_from_slice(&1u16.to_be_bytes()); // consistency = ONE
+    body.push(0x01); // values present
+    body.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for val in values {
+        body.extend_from_slice(&(val.len() as i32).to_be_bytes());
+        body.extend_from_slice(val);
+    }
+    body
+}
+
 /// Extract row count from a CQL RESULT Rows frame body.
 fn extract_row_count_from_result(body: &[u8]) -> i32 {
     assert!(body.len() >= 4, "result body too short");
@@ -1593,6 +1608,87 @@ fn extract_row_count_from_result(body: &[u8]) -> i32 {
     }
     // row_count
     i32::from_be_bytes(body[off..off + 4].try_into().unwrap())
+}
+
+/// Return the raw column bytes for the first row in a Rows result.
+fn extract_first_row_values_from_result(body: &[u8]) -> Vec<Option<Vec<u8>>> {
+    assert!(body.len() >= 4, "result body too short");
+    let kind = i32::from_be_bytes(body[0..4].try_into().unwrap());
+    assert_eq!(kind, 0x0002, "expected Rows result kind, got {kind:#06x}");
+
+    let col_count = i32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+    let mut off = 12;
+
+    let ks_len = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+    off += 2 + ks_len;
+    let tbl_len = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+    off += 2 + tbl_len;
+
+    for _ in 0..col_count {
+        let name_len = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + name_len;
+        let type_id = u16::from_be_bytes(body[off..off + 2].try_into().unwrap());
+        off += 2;
+        match type_id {
+            0x0000 => {
+                let custom_len =
+                    u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                off += 2 + custom_len;
+            }
+            0x0020 | 0x0022 => off += 2, // List/Set element type
+            0x0021 => off += 4,          // Map key/value type
+            0x0030 => {
+                let ks_len = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                off += 2 + ks_len;
+                let type_name_len =
+                    u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                off += 2 + type_name_len;
+                let field_count =
+                    u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                off += 2;
+                for _ in 0..field_count {
+                    let field_name_len =
+                        u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + field_name_len;
+                    let nested_type_id = u16::from_be_bytes(body[off..off + 2].try_into().unwrap());
+                    off += 2;
+                    match nested_type_id {
+                        0x0000 => {
+                            let nested_len =
+                                u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                            off += 2 + nested_len;
+                        }
+                        0x0020 | 0x0022 => off += 2,
+                        0x0021 => off += 4,
+                        _ => {}
+                    }
+                }
+            }
+            0x0031 => {
+                let n = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                off += 2 + n * 2;
+            }
+            _ => {}
+        }
+    }
+
+    let row_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    assert!(row_count >= 1, "expected at least one row");
+
+    let mut values = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let len = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+        off += 4;
+        if len < 0 {
+            values.push(None);
+        } else {
+            let len = len as usize;
+            values.push(Some(body[off..off + len].to_vec()));
+            off += len;
+        }
+    }
+    values
 }
 
 #[tokio::test]
@@ -1871,6 +1967,98 @@ async fn query_with_bind_values_entity_store_scenario() {
         paged_count, 1,
         "bind value QUERY with ALLOW FILTERING + page_size should return 1 row, \
          got {paged_count}"
+    );
+}
+
+#[tokio::test]
+async fn prepared_update_existing_entity_store_row_is_visible_to_readback() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body(
+        "CREATE KEYSPACE agent_memory WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let body = encode_query_body(
+        "CREATE TABLE agent_memory.entity_store (\
+         tenant_id uuid, session_id uuid, entity_id uuid, \
+         entity_name text, updated_at timestamp, entity_embedding vector<float, 3>, \
+         PRIMARY KEY ((tenant_id, session_id), entity_id))",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let eid = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+
+    let body = encode_query_body(&format!(
+        "INSERT INTO agent_memory.entity_store \
+         (tenant_id, session_id, entity_id, entity_name, updated_at) \
+         VALUES ({tid}, {sid}, {eid}, 'test-entity', 1711036800000)"
+    ));
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let prep_body = encode_prepare_body(
+        "UPDATE agent_memory.entity_store \
+         SET updated_at = ?, entity_embedding = ? \
+         WHERE tenant_id = ? AND session_id = ? AND entity_id = ?",
+    );
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    assert!(resp.body.len() >= 22, "PREPARED response too short");
+    let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+    assert_eq!(kind, 0x0004, "expected PREPARED result kind");
+    let mut prepared_id = [0u8; 16];
+    prepared_id.copy_from_slice(&resp.body[6..22]);
+
+    let updated_at = 1712036800000i64.to_be_bytes();
+    let embedding = ferrosa_index::vec_f32_to_bytes(&[1.0, 2.0, 3.0]);
+    let tid_uuid = uuid::Uuid::parse_str(tid).unwrap();
+    let sid_uuid = uuid::Uuid::parse_str(sid).unwrap();
+    let eid_uuid = uuid::Uuid::parse_str(eid).unwrap();
+    let exec_body = encode_execute_body_with_values(
+        &prepared_id,
+        &[
+            &updated_at,
+            &embedding,
+            tid_uuid.as_bytes(),
+            sid_uuid.as_bytes(),
+            eid_uuid.as_bytes(),
+        ],
+    );
+    send_raw_frame(&mut stream, Opcode::Execute, &exec_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let body = encode_query_body(&format!(
+        "SELECT updated_at, entity_embedding \
+         FROM agent_memory.entity_store \
+         WHERE tenant_id = {tid} AND session_id = {sid} AND entity_id = {eid}"
+    ));
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let values = extract_first_row_values_from_result(&resp.body);
+    assert_eq!(values.len(), 2, "expected updated_at and entity_embedding");
+    assert_eq!(
+        values[0].as_deref(),
+        Some(updated_at.as_slice()),
+        "updated_at should reflect the prepared UPDATE value"
+    );
+    assert_eq!(
+        values[1].as_deref(),
+        Some(embedding.as_slice()),
+        "entity_embedding should reflect the prepared UPDATE value"
     );
 }
 

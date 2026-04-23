@@ -2903,4 +2903,119 @@ mod tests {
             results[0].score
         );
     }
+
+    #[test]
+    fn sparse_vector_update_on_existing_row_becomes_visible_to_readback_and_ann() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            TableSchema {
+                keyspace: "agent_memory".to_string(),
+                table: "entity_store".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "entity_id".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                static_columns: vec![],
+                regular_columns: vec![
+                    ColumnDefinition {
+                        name: "entity_name".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "entity_embedding".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.VectorType(FloatType,3)"
+                            .to_string(),
+                    },
+                ],
+                extensions: Default::default(),
+            },
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "entity_embedding_ann".to_string(),
+            column_position: 1,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        let key = make_key("tenant-session");
+        let clustering = 7i32.to_be_bytes().to_vec();
+
+        // Given an existing entity row without an embedding.
+        store
+            .write(
+                &key,
+                Row {
+                    clustering: clustering.clone(),
+                    cells: vec![(0, CellValue::live(b"compile-project".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .ann_search("entity_embedding_ann", &[1.0, 0.0, 0.0], 1, 10)
+                .unwrap()
+                .is_empty(),
+            "row without an embedding must not appear in ANN search"
+        );
+
+        let embedding = ferrosa_index::vec_f32_to_bytes(&[1.0, 0.0, 0.0]);
+
+        // When a later sparse update adds only the embedding cell.
+        store
+            .write(
+                &key,
+                Row {
+                    clustering: clustering.clone(),
+                    cells: vec![(1, CellValue::live(embedding.clone(), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                },
+            )
+            .unwrap();
+
+        // Then point readback sees the merged row.
+        let partition = store.read(&key).unwrap().expect("partition should exist");
+        assert_eq!(partition.rows.len(), 1, "expected exactly one logical row");
+        let row = &partition.rows[0];
+        assert_eq!(
+            row.cells.len(),
+            2,
+            "sparse update should merge into existing row"
+        );
+        assert_eq!(
+            row.cells[1].1.value.as_deref(),
+            Some(embedding.as_slice()),
+            "merged row should expose the updated embedding bytes"
+        );
+
+        // And ANN sees the updated entity immediately from the memtable.
+        let memtable_results = store
+            .ann_search("entity_embedding_ann", &[1.0, 0.0, 0.0], 1, 10)
+            .unwrap();
+        assert_eq!(
+            memtable_results.len(),
+            1,
+            "sparse vector update should become visible to ANN before flush"
+        );
+
+        // Flush and verify the sidecar path still returns the row.
+        store.flush().unwrap();
+        let flushed_results = store
+            .ann_search("entity_embedding_ann", &[1.0, 0.0, 0.0], 1, 10)
+            .unwrap();
+        assert_eq!(
+            flushed_results.len(),
+            1,
+            "sparse vector update should remain visible to ANN after flush"
+        );
+    }
 }
