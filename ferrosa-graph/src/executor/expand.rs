@@ -460,6 +460,13 @@ async fn execute_expand(
                             neighbor_id.clone(),
                         ));
 
+                        let mut target_bindings = HashMap::new();
+                        if let Some(var_name) = &hop.var {
+                            if let Some(value) = state.bindings.get(var_name) {
+                                target_bindings.insert(var_name.clone(), value.clone());
+                            }
+                        }
+
                         let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
                             hop.vertex_table
                                 .as_ref()
@@ -470,7 +477,7 @@ async fn execute_expand(
                                 write_path,
                                 &vertex_tid,
                                 meta,
-                                &bindings,
+                                &target_bindings,
                                 &neighbor_id,
                                 hop.target_props.as_slice(),
                                 hop.var.as_deref().unwrap_or("_hop"),
@@ -902,6 +909,7 @@ fn extract_column_bytes_from_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn find_edge_match(
     write_path: &WritePath,
     table_id: &TableId,
@@ -943,6 +951,7 @@ async fn find_edge_match(
                 }));
             }
         }
+        return Ok(None);
     }
 
     for partition in write_path.range_read(table_id).await? {
@@ -965,6 +974,7 @@ async fn find_edge_match(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn find_vertex_match(
     write_path: &WritePath,
     table_id: &TableId,
@@ -3659,7 +3669,7 @@ mod tests {
         .await
         .unwrap();
 
-        let adj_tid = TableId::new(&adjacency_keyspace_name("agent_memory"), "adjacency");
+        let adj_tid = TableId::new(adjacency_keyspace_name("agent_memory"), "adjacency");
         let src_adj = write_path
             .read(
                 &adj_tid,

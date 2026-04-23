@@ -150,18 +150,19 @@ impl ClusterCoordinator {
         host_id: uuid::Uuid,
         addr: &str,
         message: Message,
+        lane: Lane,
         timeout: std::time::Duration,
     ) -> crate::error::Result<Message> {
         match self
             .peer_manager
-            .send_with_timeout(host_id, message.clone(), Lane::Data, timeout)
+            .send_with_timeout(host_id, message.clone(), lane, timeout)
             .await
         {
             Ok(resp) => Ok(resp),
             Err(e) if should_retry_missing_peer_error(&e.to_string()) => {
                 self.peer_manager.ensure_peer(host_id, addr).await?;
                 self.peer_manager
-                    .send_with_timeout(host_id, message, Lane::Data, timeout)
+                    .send_with_timeout(host_id, message, lane, timeout)
                     .await
                     .map_err(Into::into)
             }
@@ -816,7 +817,7 @@ impl ClusterCoordinator {
     /// coordinator returns a result (even partial/error) before the client
     /// gives up. A 120s timeout caused SELECT to hang on startup when
     /// remote nodes hadn't established connections yet.
-    const RANGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const BULK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     pub async fn coordinate_range_read(
         &self,
@@ -870,7 +871,8 @@ impl ClusterCoordinator {
                                 hid,
                                 &addr,
                                 Message::RangeReadRequest(req_body),
-                                Self::RANGE_READ_TIMEOUT,
+                                Lane::Bulk,
+                                Self::BULK_READ_TIMEOUT,
                             )
                             .await
                             .map_err(|e| {
@@ -1036,7 +1038,8 @@ impl ClusterCoordinator {
                                 hid,
                                 &addr,
                                 Message::IndexReadRequest(req_body),
-                                Self::RANGE_READ_TIMEOUT,
+                                Lane::Bulk,
+                                Self::BULK_READ_TIMEOUT,
                             )
                             .await
                             .map_err(|e| {
@@ -1336,6 +1339,53 @@ mod tests {
             let Message::IndexReadRequest(_) = msg else {
                 return None;
             };
+            let payload = IndexReadResponsePayload {
+                partitions: vec![crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )],
+            };
+            Some(Message::IndexReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    struct DelayedRangeReadHandler {
+        partition: Partition,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DelayedRangeReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::RangeReadRequest(_) = msg else {
+                return None;
+            };
+            tokio::time::sleep(self.delay).await;
+            let payload = RangeReadResponsePayload {
+                partitions: vec![crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )],
+                truncated: false,
+            };
+            Some(Message::RangeReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    struct DelayedIndexReadHandler {
+        partition: Partition,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DelayedIndexReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::IndexReadRequest(_) = msg else {
+                return None;
+            };
+            tokio::time::sleep(self.delay).await;
             let payload = IndexReadResponsePayload {
                 partitions: vec![crate::raft::handlers::partition_to_wire(
                     self.partition.clone(),
@@ -2566,6 +2616,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn coordinate_range_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(4321)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::RangeReadRequest,
+            Arc::new(DelayedRangeReadHandler {
+                partition: partition.clone(),
+                delay: std::time::Duration::from_secs(6),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(2u64, &[42]);
+
+        let coordinator =
+            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let partitions = coordinator.coordinate_range_read(&table_id).await.unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "slow remote range scans should complete on the bulk lane"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "coordinator should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
     // -----------------------------------------------------------------------
     // Additional coverage: empty ring range read
     // -----------------------------------------------------------------------
@@ -2590,6 +2692,65 @@ mod tests {
         // Empty ring means no nodes to contact at all, should return Ok([])
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinate_index_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(9876)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::IndexReadRequest,
+            Arc::new(DelayedIndexReadHandler {
+                partition: partition.clone(),
+                delay: std::time::Duration::from_secs(6),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(2u64, &[42]);
+
+        let coordinator =
+            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let partitions = coordinator
+            .coordinate_index_read(
+                &table_id,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"slow".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "slow remote index scans should complete on the bulk lane"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "coordinator should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     // -----------------------------------------------------------------------

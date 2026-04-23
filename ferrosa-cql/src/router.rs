@@ -73,7 +73,7 @@ async fn extend_rows_from_partitions(
 }
 
 fn should_yield_during_partition_scan(processed_partitions: usize, yield_every: usize) -> bool {
-    yield_every > 0 && processed_partitions > 0 && processed_partitions % yield_every == 0
+    yield_every > 0 && processed_partitions > 0 && processed_partitions.is_multiple_of(yield_every)
 }
 
 /// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
@@ -9409,10 +9409,10 @@ mod tests {
             "exact PK lookup including text clustering column should return the matching row"
         );
 
-        let stmt = crate::parser::parse(&format!(
+        let stmt = crate::parser::parse(
             "SELECT src_id, edge_type, dst_id, weight FROM agent.typed_edges \
-             WHERE edge_type = 'afteradj_1776880700' ALLOW FILTERING"
-        ))
+             WHERE edge_type = 'afteradj_1776880700' ALLOW FILTERING",
+        )
         .unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
         let filtered_count = match &result {

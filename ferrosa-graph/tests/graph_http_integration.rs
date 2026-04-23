@@ -1216,12 +1216,13 @@ async fn merge_triggers_adjacency_index_entry() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
     assert_eq!(
-        resp.status(),
         StatusCode::OK,
+        status,
         "hop query after MERGE must return 200 — executor must not crash on empty adjacency table"
     );
-    let body = response_json(resp).await;
     assert!(
         body["rows"].is_array(),
         "hop query response must contain a 'rows' array"
@@ -1385,12 +1386,13 @@ async fn merge_triggers_adjacency_index_entry_hop_returns_rows() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
     assert_eq!(
-        resp.status(),
         StatusCode::OK,
+        status,
         "hop query must return 200 after adjacency index is populated"
     );
-    let body = response_json(resp).await;
     let rows = body["rows"]
         .as_array()
         .expect("hop query response must have 'rows' array");

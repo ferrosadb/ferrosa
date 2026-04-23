@@ -14,6 +14,8 @@ use crate::pair::coordinator::encode_mutation;
 
 use super::ClusterCoordinator;
 
+type ReplicaWriteTarget = (u64, Option<(uuid::Uuid, String)>, String);
+
 /// Result of a single replica write attempt.
 enum ReplicaResult {
     Ack,
@@ -347,7 +349,7 @@ impl ClusterCoordinator {
         );
         let body = encode_mutation(&mutation);
 
-        let replica_targets: Vec<(u64, Option<(uuid::Uuid, String)>, String)> = replicas
+        let replica_targets: Vec<ReplicaWriteTarget> = replicas
             .iter()
             .map(|&replica_id| {
                 let node = ring.get_node(replica_id);

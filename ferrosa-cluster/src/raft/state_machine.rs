@@ -333,6 +333,7 @@ impl FerrosStateMachine {
         !self.state.members.is_empty() || !self.state.token_map.is_empty()
     }
 
+    #[allow(clippy::result_large_err)]
     fn apply_snapshot_data(
         &mut self,
         meta: SnapshotMeta<u64, BasicNode>,
@@ -349,6 +350,7 @@ impl FerrosStateMachine {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn persist_snapshot_to_disk(
         path: &Path,
         meta: &SnapshotMeta<u64, BasicNode>,
@@ -372,6 +374,7 @@ impl FerrosStateMachine {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn recover_from_persisted_snapshot(&mut self) -> Result<bool, StorageIOError<u64>> {
         let Some(path) = self.snapshot_path.clone() else {
             return Ok(false);
@@ -1026,6 +1029,7 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
         if let Some(path) = self.snapshot_path.clone() {
             let meta_for_disk = meta.clone();
             let bytes_for_disk = bytes.clone();
+            #[allow(clippy::result_large_err)]
             tokio::task::spawn_blocking(move || {
                 Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
             })
@@ -1113,6 +1117,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         self.apply_snapshot_data(meta.clone(), bytes.clone())?;
         if let Some(path) = self.snapshot_path.clone() {
             let meta_for_disk = meta.clone();
+            #[allow(clippy::result_large_err)]
             tokio::task::spawn_blocking(move || {
                 Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes)
             })

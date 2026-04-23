@@ -35,7 +35,7 @@ const RECONCILE_YIELD_EVERY_CHECKED_ENTRIES: usize = 256;
 const RECONCILE_YIELD_EVERY_PARTITIONS: usize = 32;
 
 fn should_yield_during_reconciliation(processed: usize, yield_every: usize) -> bool {
-    yield_every > 0 && processed > 0 && processed % yield_every == 0
+    yield_every > 0 && processed > 0 && processed.is_multiple_of(yield_every)
 }
 
 /// Run one reconciliation pass for a keyspace.

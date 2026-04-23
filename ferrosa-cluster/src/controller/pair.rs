@@ -30,9 +30,7 @@ impl ModeController {
         _need_reverse: bool,
         was_promoted: bool,
     ) -> PairRole {
-        if was_promoted {
-            PairRole::Primary
-        } else if self.local_host_id <= peer_host_id {
+        if was_promoted || self.local_host_id <= peer_host_id {
             PairRole::Primary
         } else {
             PairRole::Secondary

@@ -487,8 +487,6 @@ impl ModeController {
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
         let raft_runtime: Option<Arc<tokio::runtime::Runtime>> = self.raft_runtime.get().cloned();
-        let has_recovered_membership = has_recovered_membership;
-
         // Register Raft RPC handlers BEFORE spawning the init task.
         // Handlers use LazyRaft to wait for the instance to be ready.
         // This eliminates the race where vote requests arrive before

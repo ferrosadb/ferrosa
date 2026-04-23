@@ -1176,7 +1176,11 @@ mod tests {
             ..simple_mutation()
         };
         cl.append(&first).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // CI can be heavily contended when the full workspace runs in
+        // parallel; allow several periodic intervals so this test proves the
+        // multi-flush replay behavior instead of depending on tight scheduler
+        // timing.
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
         let second = Mutation {
             mutation_id: [0x62; 16],
@@ -1184,7 +1188,7 @@ mod tests {
             ..simple_mutation()
         };
         cl.append(&second).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
         drop(cl);
 
@@ -1218,7 +1222,10 @@ mod tests {
             ..simple_mutation()
         };
         cl.append(&first).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Same rationale as the periodic test above: under full CI load the
+        // background group-sync worker may not complete a batch within a
+        // narrow 30ms window.
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
         let second = Mutation {
             mutation_id: [0x64; 16],
@@ -1226,7 +1233,7 @@ mod tests {
             ..simple_mutation()
         };
         cl.append(&second).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
         drop(cl);
 

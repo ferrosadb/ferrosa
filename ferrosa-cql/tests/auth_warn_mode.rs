@@ -17,6 +17,7 @@
 //! `auth_enabled=false, auth_warn=true` combination is covered.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use ferrosa_cql::auth::{
@@ -77,6 +78,11 @@ fn with_log_capture<R>(f: impl FnOnce(&CapturedLogs) -> R) -> (R, String) {
     (r, logs)
 }
 
+fn auth_warn_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
 // ── Schema fixture ─────────────────────────────────────────────────────
 
 fn make_schema() -> Schema {
@@ -125,6 +131,7 @@ fn normal_ctx(role: &str) -> AuthContext {
 
 #[test]
 fn auth_warn_permits_but_logs_on_denial() {
+    let _guard = auth_warn_test_guard();
     __clear_warn_denial_counters_for_tests();
 
     let schema = make_schema();
@@ -179,6 +186,7 @@ fn auth_warn_permits_but_logs_on_denial() {
 
 #[test]
 fn auth_warn_false_returns_err_on_denial() {
+    let _guard = auth_warn_test_guard();
     __clear_warn_denial_counters_for_tests();
 
     let schema = make_schema();
@@ -211,6 +219,7 @@ fn auth_warn_false_returns_err_on_denial() {
 
 #[test]
 fn auth_warn_does_not_fire_when_permitted() {
+    let _guard = auth_warn_test_guard();
     __clear_warn_denial_counters_for_tests();
 
     let schema = make_schema();
@@ -247,6 +256,7 @@ fn auth_warn_does_not_fire_when_permitted() {
 
 #[test]
 fn contradictory_config_logs_error_at_startup() {
+    let _guard = auth_warn_test_guard();
     // `auth_enabled=false, auth_warn=true` is nonsensical: auth isn't
     // checked, so there is nothing to warn about. The helper must log
     // at ERROR level so an operator paging through startup logs sees it.
