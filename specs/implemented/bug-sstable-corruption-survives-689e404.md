@@ -5,26 +5,48 @@ reported-by: human+agent
 implemented-by: ""
 verified-by: ""
 created: 2026-04-06
-updated: 2026-04-06
+updated: 2026-04-18
 source: ferrosa-memory DIKW pipeline test
 source-location: "ferrosa-memory/scripts/test-dikw-pipeline.sh"
-related: "specs/verified/bug-large-write-causes-data-loss-in-partition.md"
-branch: "fix/compaction-data-loss @ e9703f8"
+related: "specs/implemented/bug-sstable-writer-produces-zero-byte-rows-db.md"
+branch: "fix/sstable-zero-byte-rows-db @ ca0817f"
 ---
 
 # SSTable corruption persists after 689e404 — data lost on restart
 
 ## Implementation Notes
 
-### Root Cause (confirmed via CQL integration test)
+### Root Cause (final, 2026-04-18)
 
-`build_row()` in `ferrosa-cql/src/bridge.rs` constructed `Row.cells` in INSERT-statement column order (e.g., `entity_name` before `confidence`), but the SSTable reader reads cells in column-index order from the bitmap. When columns are listed in non-schema order AND have different value sizes (float=4 bytes vs text=10+ bytes), the reader misinterprets cell boundaries, causing parse drift that corrupts every subsequent row and partition.
+`e9703f8` fixed one cell-ordering bug but not the dominant one. The real
+root cause of the persistent entity_store data loss was schema drift
+between `ALTER TABLE` and the storage engine's per-table schema — so the
+flush path built a `SerializationHeader` with the pre-ALTER column count
+and the SSTable writer silently accepted cells whose `col_idx` was
+out-of-range. See `specs/implemented/bug-sstable-writer-produces-zero-byte-rows-db.md`
+for the full analysis and fix.
 
-**Why entity_store was affected but typed_edges wasn't:** entity_store has 5+ regular columns with mixed types. The INSERT statements list columns out of schema order. typed_edges has fewer columns and happened to list them in order.
+Why entity_store suffered and typed_edges didn't: entity_store has 8
+`ALTER TABLE ADD` statements in `ferrosa-memory/ddl/020_rich_entity_schema.cql`;
+typed_edges has none. The drift only manifests when post-ALTER writes
+land before the next process restart (when registration rebuilds from
+the current cluster schema).
 
-### Fix (e9703f8)
+End-to-end verification (2026-04-18 on the ferrosa-memory cluster,
+fresh 3-node deployment at `ferrosa-memory-node:latest@e899ec9c`):
 
-One line in `bridge.rs:build_row()`: `cells.sort_by_key(|(idx, _)| *idx);`
+| Metric                                  | Pre-fix | Post-fix |
+|-----------------------------------------|---------|----------|
+| "corrupted DeletionTime flags" WARNs    | 375     | 0        |
+| Durable entity_store rows (acked ~7.5k) | 1,242   | 7,422    |
+| Durable typed_edges rows                | 13,345  | 13,361   |
+
+### Previous partial fix (e9703f8)
+
+`build_row()` in `ferrosa-cql/src/bridge.rs` now sorts `Row.cells` by
+column index. This is still correct and necessary — it fixes a second,
+smaller drift class that the writer assertion now also catches at
+serialization time. Kept as a defence-in-depth measure.
 
 ### Test
 
