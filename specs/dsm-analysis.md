@@ -1,7 +1,7 @@
 # Design Structure Matrix — Ferrosa Workspace
 
 > **Last refreshed:** 2026-04-20
-> **Source:** `cargo metadata --format-version 1 --manifest-path /Users/bkearns/src/ferrosa/Cargo.toml`
+> **Source:** `cargo metadata --format-version 1 --manifest-path /Users/bkearns/src/ferrosa-suite/ferrosa/Cargo.toml`
 > **Methodology:** Workspace-internal dependency graph, derived from `Cargo.toml` normal (non-dev) deps. Dev-only edges are listed separately and excluded from the layer topology so test helpers cannot mask production cycles.
 
 ## Executive Summary
@@ -121,7 +121,7 @@ Ideal profile (low external, low internal) belongs to `ferrosa-common`, `ferrosa
 
 ### `ferrosa-memory` → ferrosa-graph schema
 
-This is the most important finding of this refresh. It is **not** in the cargo graph because `ferrosa-memory` (a separate workspace at `/Users/bkearns/src/ferrosa-memory`) does not depend on any ferrosa Rust crate. It talks to ferrosa only over CQL wire.
+This is the most important finding of this refresh. It is **not** in the cargo graph because `ferrosa-memory` (a separate workspace at `/Users/bkearns/src/ferrosa-suite/ferrosa-memory`) does not depend on any ferrosa Rust crate. It talks to ferrosa only over CQL wire.
 
 But it does not talk to ferrosa-graph's *Cypher executor.* It opens a raw CQL connection and writes directly to tables owned by `ferrosa-graph`:
 

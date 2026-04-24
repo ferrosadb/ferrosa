@@ -119,9 +119,9 @@ podman compose up -d
 # Normal write workload
 python3 /tmp/seed-skills.py /Users/bkearns/src/research/skills   # 79 skills
 # via forge MCP:
-#   mcp__forge__ingest(path="/Users/bkearns/src/ferrosa")
-#   mcp__forge__ingest(path="/Users/bkearns/src/ferrosa-dbaas")
-#   mcp__forge__ingest(path="/Users/bkearns/src/ferrosa-memory")
+#   mcp__forge__ingest(path="/Users/bkearns/src/ferrosa-suite/ferrosa")
+#   mcp__forge__ingest(path="/Users/bkearns/src/ferrosa-suite/ferrosa-dbaas")
+#   mcp__forge__ingest(path="/Users/bkearns/src/ferrosa-suite/ferrosa-memory")
 
 # Inspect
 find ~/data/ferrosa-memory/node1/sstables -type f -size 0 | wc -l

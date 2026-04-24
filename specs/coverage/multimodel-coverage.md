@@ -162,7 +162,7 @@
 The `overview.md` and external documentation list MERGE as a supported Cypher operation. There is no `Merge` AST variant, no parser branch for `MERGE`, and no executor path. Clients using MERGE (including `ferrosa-memory` if/when writes are moved to Cypher) will fail. This is a correctness gap, not a missing test.
 
 **P0-2: ferrosa-memory bypasses the graph API with direct CQL writes to graph-owned tables**
-Documented in `/Users/bkearns/src/ferrosa-memory/specs/todo/bug-ferrosa-memory-bypasses-graph-api-for-writes.md`. `ferrosa-memory-core/src/cql_storage.rs` issues `INSERT INTO {ks}.typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, `supersedes`, `derived_edges_by_pred`, `derived_edges_by_src` directly via CQL. The graph engine's adjacency invariants, reconciliation task, and Cypher-level hooks (auth, audit, rate limits) are bypassed entirely. Any schema change to those tables silently corrupts ferrosa-memory writes. The fix requires MERGE support in ferrosa-graph (P0-1 above) before it can be resolved.
+Documented in `/Users/bkearns/src/ferrosa-suite/ferrosa-memory/specs/todo/bug-ferrosa-memory-bypasses-graph-api-for-writes.md`. `ferrosa-memory-core/src/cql_storage.rs` issues `INSERT INTO {ks}.typed_edges`, `folded_into`, `mentioned_in`, `co_occurs_with`, `supersedes`, `derived_edges_by_pred`, `derived_edges_by_src` directly via CQL. The graph engine's adjacency invariants, reconciliation task, and Cypher-level hooks (auth, audit, rate limits) are bypassed entirely. Any schema change to those tables silently corrupts ferrosa-memory writes. The fix requires MERGE support in ferrosa-graph (P0-1 above) before it can be resolved.
 
 ### P1 Gaps
 

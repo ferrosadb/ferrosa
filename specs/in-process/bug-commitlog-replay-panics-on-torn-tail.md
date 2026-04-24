@@ -23,7 +23,7 @@ not a slice-bounds panic.
 
 - Ferrosa commit: `c47bfa8` (branch `fix/mixed-client-topology-and-typed-edge-bugs`)
 - Cluster: local 3-node podman cluster from
-  `/Users/bkearns/src/ferrosa-memory/docker-compose.yml`
+  `/Users/bkearns/src/ferrosa-suite/ferrosa-memory/docker-compose.yml`
 - Two of three nodes crash-looped on startup:
   - `node1`: segment `commitlog-173.log`, 786432 bytes
   - `node3`: segment `commitlog-101.log`, 655360 bytes

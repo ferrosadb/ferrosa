@@ -26,7 +26,7 @@ moment anyone issues a second GRANT.
 
 - Ferrosa commit: `c47bfa8` (branch `fix/mixed-client-topology-and-typed-edge-bugs`)
 - Cluster: local 3-node podman cluster from
-  `/Users/bkearns/src/ferrosa-memory/docker-compose.yml`, auth enabled
+  `/Users/bkearns/src/ferrosa-suite/ferrosa-memory/docker-compose.yml`, auth enabled
 
 ## Symptom
 
