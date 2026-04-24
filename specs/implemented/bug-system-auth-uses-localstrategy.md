@@ -1,7 +1,7 @@
 ---
 type: todo
 priority: P1
-status: draft
+status: implemented
 created: 2026-04-23
 updated: 2026-04-23
 ---
@@ -90,3 +90,47 @@ launchctl agent was already doing). Viz now consistently loads. The
 clean split (`ferrosa_user` for runtime + explicit GRANTs + `ferrosa_admin`
 only for DDL) is blocked on this bug and on the node3 handshake
 regression filed separately.
+
+## Implementation Notes
+
+Fix applied in two places:
+
+1. **Bootstrap default** (`ferrosa-schema/src/registry.rs` `Schema::new`).
+   `system_auth` now seeds with `NetworkTopologyStrategy` and
+   `datacenter1 = 1`. `system`, `system_schema`, and
+   `system_observability` stay on `LocalStrategy` (per-node semantics
+   are correct for those).
+
+2. **`system_schema.keyspaces` view**
+   (`ferrosa-schema/src/system/schema_tables.rs` `query_keyspaces`). The
+   function previously emitted hardcoded `LocalStrategy` rows for all
+   four system keyspaces *and* the snapshot's rows, causing duplicate
+   rows for each system keyspace. After the bootstrap change this
+   surfaced as the cqlsh-visible bug (the hardcoded LocalStrategy row
+   masked the snapshot's NTS row). Reworked to prefer the snapshot as
+   the single source of truth and fall back to hardcoded rows only for
+   keyspaces the snapshot is missing (the bare `SchemaSnapshot::new()`
+   test path).
+
+Regression tests in `ferrosa-schema/src/registry.rs` tests module:
+
+- `system_auth_keyspace_uses_network_topology_strategy_at_bootstrap`
+- `system_schema_keyspaces_view_shows_system_auth_as_network_topology`
+- `other_system_keyspaces_remain_local_strategy_at_bootstrap`
+
+### Out of scope (follow-up)
+
+RF on `system_auth` is `1` at bootstrap. In a multi-node cluster this
+fixes the primary bug (NTS routing makes GRANTs visible to every
+coordinator) but leaves a fault-tolerance gap: losing the single
+replica owner makes auth unavailable. Auto-bumping RF to `min(3, N)`
+on membership change requires a new Raft command and a once-only
+cluster-wide ALTER — deferred to a separate work item. Operator
+workaround meanwhile:
+
+```sql
+ALTER KEYSPACE system_auth
+  WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': '3'};
+```
+
+followed by `nodetool repair system_auth`.

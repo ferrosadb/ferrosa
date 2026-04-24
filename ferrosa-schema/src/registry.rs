@@ -175,13 +175,15 @@ impl Schema {
         snapshot.roles.insert("cassandra".to_string(), role);
 
         // Bootstrap system keyspaces so they are visible in the schema snapshot.
+        //
+        // `system`, `system_schema`, and `system_observability` hold per-node
+        // state and stay on LocalStrategy. `system_auth` holds roles, password
+        // hashes, and grants, all of which every coordinator must see — so it
+        // defaults to NetworkTopologyStrategy with RF=1 on `datacenter1`. The
+        // cluster controller bumps RF to `min(3, node_count)` as nodes join;
+        // see `specs/in-process/bug-system-auth-uses-localstrategy.md`.
         use crate::metadata::keyspace::ReplicationParams;
-        for ks_name in &[
-            "system",
-            "system_schema",
-            "system_auth",
-            "system_observability",
-        ] {
+        for ks_name in &["system", "system_schema", "system_observability"] {
             snapshot.keyspaces.insert(
                 ks_name.to_string(),
                 KeyspaceMetadata {
@@ -194,6 +196,21 @@ impl Schema {
                 },
             );
         }
+        snapshot.keyspaces.insert(
+            "system_auth".to_string(),
+            KeyspaceMetadata {
+                name: "system_auth".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "NetworkTopologyStrategy".to_string(),
+                    options: {
+                        let mut opts = HashMap::new();
+                        opts.insert("datacenter1".to_string(), "1".to_string());
+                        opts
+                    },
+                },
+            },
+        );
 
         let mut default_password_roles = HashSet::new();
         if is_default {
@@ -3489,6 +3506,79 @@ mod tests {
         );
         let ks = &snap.keyspaces["system_observability"];
         assert_eq!(ks.replication.strategy, "LocalStrategy");
+    }
+
+    /// Regression: `system_auth` must default to NetworkTopologyStrategy so
+    /// GRANTs and role changes replicate across the cluster. Previously it
+    /// was bootstrapped as LocalStrategy, which made auth state diverge
+    /// per-node and caused round-robin queries to fail intermittently.
+    /// See `specs/in-process/bug-system-auth-uses-localstrategy.md`.
+    #[test]
+    fn system_auth_keyspace_uses_network_topology_strategy_at_bootstrap() {
+        let schema = Schema::new_for_test();
+        let snap = schema.snapshot();
+        let ks = snap
+            .keyspaces
+            .get("system_auth")
+            .expect("system_auth keyspace must exist after Schema::new()");
+        assert_eq!(
+            ks.replication.strategy, "NetworkTopologyStrategy",
+            "system_auth must default to NetworkTopologyStrategy so auth state \
+             replicates — LocalStrategy made GRANTs node-local"
+        );
+        assert_eq!(
+            ks.replication.options.get("datacenter1"),
+            Some(&"1".to_string()),
+            "system_auth must start with RF=1 on datacenter1 at initial \
+             single-node bootstrap; cluster formation bumps this to min(3, N)"
+        );
+    }
+
+    /// Regression: `SELECT * FROM system_schema.keyspaces` must report
+    /// `system_auth` as `NetworkTopologyStrategy`, not `LocalStrategy`.
+    /// The bug spec showed this row is what cqlsh observed and why
+    /// GRANTs were node-local. Fixing `Schema::new()` alone was
+    /// insufficient — `query_keyspaces` had a second hardcoded emitter.
+    #[test]
+    fn system_schema_keyspaces_view_shows_system_auth_as_network_topology() {
+        use crate::system::schema_tables::query_keyspaces;
+        let schema = Schema::new_for_test();
+        let snap = schema.snapshot();
+        let rows = query_keyspaces(&snap);
+        let auth_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.keyspace_name == "system_auth")
+            .collect();
+        assert_eq!(
+            auth_rows.len(),
+            1,
+            "system_schema.keyspaces must contain exactly one row for \
+             system_auth — duplicates mask the real replication strategy"
+        );
+        assert_eq!(
+            auth_rows[0].replication.get("class"),
+            Some(&"NetworkTopologyStrategy".to_string()),
+            "cqlsh-facing view of system_auth must advertise \
+             NetworkTopologyStrategy"
+        );
+    }
+
+    /// The other system keyspaces hold per-node data and must stay on
+    /// LocalStrategy — only `system_auth` replicates across the cluster.
+    #[test]
+    fn other_system_keyspaces_remain_local_strategy_at_bootstrap() {
+        let schema = Schema::new_for_test();
+        let snap = schema.snapshot();
+        for name in ["system", "system_schema", "system_observability"] {
+            let ks = snap
+                .keyspaces
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} keyspace must exist"));
+            assert_eq!(
+                ks.replication.strategy, "LocalStrategy",
+                "{name} must remain LocalStrategy (per-node semantics)"
+            );
+        }
     }
 
     #[test]
