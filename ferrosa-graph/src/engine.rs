@@ -13,7 +13,7 @@ use serde::Serialize;
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
-use ferrosa_storage::StorageEngine;
+use ferrosa_storage::{ObserverMode, StorageEngine, WriteObserver};
 
 use tokio_util::sync::CancellationToken;
 
@@ -183,6 +183,15 @@ impl GraphEngine {
                 }
             }
             let adj_meta = adjacency_table_metadata(ks);
+            if let Err(e) = schema.create_table_internal(adj_meta.clone()) {
+                tracing::error!(
+                    keyspace = %adj_ks,
+                    error = %e,
+                    "graph engine: failed to register adjacency table in schema — \
+                     derived mutations and graph traversals will be unavailable for {ks}"
+                );
+                continue;
+            }
             let adj_schema = adj_meta.to_storage_schema();
             if let Err(e) = storage.register_table(adj_schema) {
                 // Already-registered is fine (another edge table in the same
@@ -203,19 +212,30 @@ impl GraphEngine {
 
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
 
-            if tokio::runtime::Handle::try_current().is_ok() {
-                // Runtime available: register the observer with an engine-side drain task.
-                // The drain task applies derived adjacency mutations through the full write
-                // path (commit log + memtable) and catches observer panics loudly at ERROR.
-                storage.register_async_observer_with_drain(
-                    observer as Arc<dyn ferrosa_storage::WriteObserver>,
-                    Arc::clone(&storage),
-                );
-            } else {
-                // No runtime available (e.g., proptest sync context): fall back to
-                // register_observer which drops the receiver. Adjacency entries are not
-                // written in this context, but the engine does not panic.
-                storage.register_observer(observer);
+            match observer.mode() {
+                ObserverMode::Sync => {
+                    // Sync observers apply derived adjacency mutations inline on
+                    // the write path, so follow-up MATCH queries can see the
+                    // relationship immediately after MERGE returns.
+                    storage.register_observer(observer);
+                }
+                ObserverMode::Async => {
+                    if tokio::runtime::Handle::try_current().is_ok() {
+                        // Runtime available: register the observer with an engine-side
+                        // drain task. The drain task applies derived adjacency mutations
+                        // through the full write path and catches observer panics loudly.
+                        storage.register_async_observer_with_drain(
+                            observer as Arc<dyn ferrosa_storage::WriteObserver>,
+                            Arc::clone(&storage),
+                        );
+                    } else {
+                        // No runtime available (e.g., proptest sync context): fall back
+                        // to register_observer. Async observers registered this way will
+                        // drop derived writes because nothing drains the channel, but the
+                        // engine still comes up without panicking.
+                        storage.register_observer(observer);
+                    }
+                }
             }
 
             // spawn_reconciliation requires a tokio runtime. In test
@@ -688,6 +708,7 @@ mod tests {
                     graph_type: "vertex".to_string(),
                     label: "Person".to_string(),
                 },
+                props: vec![],
                 filters: vec![],
             },
             hops: vec![],
@@ -783,5 +804,161 @@ mod tests {
             options: std::collections::HashMap::new(),
         };
         assert!(replication_needs_repair(&broken));
+    }
+
+    #[test]
+    fn engine_startup_re_registers_adjacency_table_in_schema() {
+        use std::collections::{HashMap, HashSet};
+
+        use ferrosa_schema::{
+            ClusteringOrder, ColumnKind, ColumnMetadata, TableFlag, TableMetadata, TableParams,
+        };
+        use indexmap::IndexMap;
+
+        let schema = Arc::new(test_schema());
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: "agent_memory".to_string(),
+                durable_writes: true,
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: std::collections::HashMap::from([(
+                        "replication_factor".to_string(),
+                        "1".to_string(),
+                    )]),
+                },
+            })
+            .unwrap();
+
+        let mut extensions = HashMap::new();
+        extensions.insert("graph.type".to_string(), "edge".to_string());
+        extensions.insert("graph.label".to_string(), "TYPED_EDGE".to_string());
+        extensions.insert("graph.source".to_string(), "src_id".to_string());
+        extensions.insert("graph.target".to_string(), "dst_id".to_string());
+        extensions.insert("graph.source_label".to_string(), "Entity".to_string());
+        extensions.insert("graph.target_label".to_string(), "Entity".to_string());
+
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "tenant_id".to_string(),
+            ColumnMetadata {
+                name: "tenant_id".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "session_id".to_string(),
+            ColumnMetadata {
+                name: "session_id".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 1,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "src_id".to_string(),
+            ColumnMetadata {
+                name: "src_id".to_string(),
+                kind: ColumnKind::Clustering,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::Asc,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "edge_type".to_string(),
+            ColumnMetadata {
+                name: "edge_type".to_string(),
+                kind: ColumnKind::Clustering,
+                position: 1,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::Asc,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "dst_id".to_string(),
+            ColumnMetadata {
+                name: "dst_id".to_string(),
+                kind: ColumnKind::Clustering,
+                position: 2,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::Asc,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "weight".to_string(),
+            ColumnMetadata {
+                name: "weight".to_string(),
+                kind: ColumnKind::Regular,
+                position: -1,
+                column_type: "float".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+
+        schema
+            .create_table_internal(TableMetadata {
+                keyspace: "agent_memory".to_string(),
+                name: "typed_edges".to_string(),
+                id: uuid::Uuid::new_v4(),
+                columns,
+                partition_key: vec!["tenant_id".to_string(), "session_id".to_string()],
+                clustering_key: vec![
+                    ("src_id".to_string(), ClusteringOrder::Asc),
+                    ("edge_type".to_string(), ClusteringOrder::Asc),
+                    ("dst_id".to_string(), ClusteringOrder::Asc),
+                ],
+                params: TableParams::default(),
+                flags: HashSet::from([TableFlag::Compound]),
+                extensions,
+                is_system: false,
+            })
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(test_storage_engine(dir.path()));
+        storage
+            .register_table(
+                schema
+                    .snapshot()
+                    .tables
+                    .get(&("agent_memory".to_string(), "typed_edges".to_string()))
+                    .unwrap()
+                    .to_storage_schema(),
+            )
+            .unwrap();
+
+        let _engine = GraphEngine::new(
+            Arc::clone(&schema),
+            storage.clone(),
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                ferrosa_cluster::write_path::WritePath::direct(storage),
+            )),
+            GraphEngineConfig::default(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let snap = schema.snapshot();
+        assert!(
+            snap.keyspaces.contains_key("system_graph_agent_memory"),
+            "graph engine startup must restore the adjacency keyspace into the live schema"
+        );
+        assert!(
+            snap.tables.contains_key(&(
+                "system_graph_agent_memory".to_string(),
+                "adjacency".to_string()
+            )),
+            "graph engine startup must restore the adjacency table into the live schema"
+        );
     }
 }

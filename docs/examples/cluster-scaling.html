@@ -8,7 +8,6 @@
 <title>Cluster Scaling: Development to Production</title>
 <link rel="stylesheet" href="./theme/ferrosa.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
-<link rel="stylesheet" href="./rouge-github.css">
 <link rel="icon" type="image/svg+xml" href="../favicon.svg">
 </head>
 <body class="article toc2 toc-left">
@@ -89,7 +88,7 @@ It starts fast, uses minimal resources, and gives you a fully functional CQL end
 <h3 id="_start_node1">Start node1</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose up <span class="nt">-d</span></code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -117,21 +116,21 @@ Wait for node1 to report healthy:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 1: Development / Standalone Mode</span>
-<span class="c1">-- Create the application keyspace and core table.</span>
-<span class="c1">-- RF=1 is appropriate for single-node development.</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Act 1: Development / Standalone Mode
+-- Create the application keyspace and core table.
+-- RF=1 is appropriate for single-node development.
 
-<span class="k">CREATE</span> <span class="n">KEYSPACE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">app</span>
-    <span class="k">WITH</span> <span class="n">replication</span> <span class="o">=</span> <span class="p">{</span><span class="s1">'class'</span><span class="p">:</span> <span class="s1">'SimpleStrategy'</span><span class="p">,</span> <span class="s1">'replication_factor'</span><span class="p">:</span> <span class="mi">1</span><span class="p">};</span>
+CREATE KEYSPACE IF NOT EXISTS app
+    WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
 
-<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">app</span><span class="p">.</span><span class="n">events</span> <span class="p">(</span>
-    <span class="n">tenant_id</span>  <span class="nb">text</span><span class="p">,</span>
-    <span class="n">event_date</span> <span class="nb">text</span><span class="p">,</span>
-    <span class="n">event_id</span>   <span class="nb">int</span><span class="p">,</span>
-    <span class="n">event_type</span> <span class="nb">text</span><span class="p">,</span>
-    <span class="n">payload</span>    <span class="nb">text</span><span class="p">,</span>
-    <span class="k">PRIMARY</span> <span class="k">KEY</span> <span class="p">((</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">),</span> <span class="n">event_id</span><span class="p">)</span>
-<span class="p">)</span> <span class="k">WITH</span> <span class="n">CLUSTERING</span> <span class="k">ORDER</span> <span class="k">BY</span> <span class="p">(</span><span class="n">event_id</span> <span class="k">ASC</span><span class="p">);</span></code></pre>
+CREATE TABLE IF NOT EXISTS app.events (
+    tenant_id  text,
+    event_date text,
+    event_id   int,
+    event_type text,
+    payload    text,
+    PRIMARY KEY ((tenant_id, event_date), event_id)
+) WITH CLUSTERING ORDER BY (event_id ASC);</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -142,40 +141,40 @@ Wait for node1 to report healthy:</p>
 <h3 id="_insert_seed_data">Insert seed data</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 1: Standalone — seed initial event data</span>
-<span class="c1">-- 5 events for acme, 5 for globex (10 total)</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Act 1: Standalone — seed initial event data
+-- 5 events for acme, 5 for globex (10 total)
 
-<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+USE app;
 
-<span class="c1">-- acme events (IDs 1-5)</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/home"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "signup"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="s1">'signup'</span><span class="p">,</span> <span class="s1">'{"plan": "free"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/dashboard"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="s1">'purchase'</span><span class="p">,</span> <span class="s1">'{"item": "pro_plan", "amount": 29.99}'</span><span class="p">);</span>
+-- acme events (IDs 1-5)
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 1, 'page_view', '{"url": "/home"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 2, 'click', '{"button": "signup"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 3, 'signup', '{"plan": "free"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 4, 'page_view', '{"url": "/dashboard"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 5, 'purchase', '{"item": "pro_plan", "amount": 29.99}');
 
-<span class="c1">-- globex events (IDs 1-5)</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/products"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "add_to_cart"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="s1">'purchase'</span><span class="p">,</span> <span class="s1">'{"item": "widget", "amount": 9.99}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/checkout"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="s1">'signup'</span><span class="p">,</span> <span class="s1">'{"plan": "enterprise"}'</span><span class="p">);</span>
+-- globex events (IDs 1-5)
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('globex', '2026-03-18', 1, 'page_view', '{"url": "/products"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('globex', '2026-03-18', 2, 'click', '{"button": "add_to_cart"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('globex', '2026-03-18', 3, 'purchase', '{"item": "widget", "amount": 9.99}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('globex', '2026-03-18', 4, 'page_view', '{"url": "/checkout"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('globex', '2026-03-18', 5, 'signup', '{"plan": "enterprise"}');
 
-<span class="c1">-- Verify counts</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 5</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 5</span></code></pre>
+-- Verify counts
+SELECT COUNT(*) FROM events WHERE tenant_id = 'acme' AND event_date = '2026-03-18';
+-- Expected: 5
+SELECT COUNT(*) FROM events WHERE tenant_id = 'globex' AND event_date = '2026-03-18';
+-- Expected: 5</code></pre>
 </div>
 </div>
 <div class="admonitionblock tip">
@@ -208,7 +207,7 @@ Think of it like PostgreSQL streaming replication, but it also replicates DDL&#8
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose <span class="nt">-f</span> docker-compose.yml <span class="nt">-f</span> docker-compose.pair.yml up <span class="nt">-d</span></code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -232,7 +231,7 @@ Writes continue uninterrupted during this transition. Node1 accepts CQL commands
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose logs <span class="nt">-f</span> node1 node2</code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose logs -f node1 node2</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -248,30 +247,30 @@ These writes replicate to node2 in real time:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 2: Pair mode — writes replicated to second node</span>
-<span class="c1">-- 3 more for acme (total 8), 2 more for globex (total 7)</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Act 2: Pair mode — writes replicated to second node
+-- 3 more for acme (total 8), 2 more for globex (total 7)
 
-<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+USE app;
 
-<span class="c1">-- acme events (IDs 6-8)</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "export_csv"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/reports"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="s1">'purchase'</span><span class="p">,</span> <span class="s1">'{"item": "addon_analytics", "amount": 14.99}'</span><span class="p">);</span>
+-- acme events (IDs 6-8)
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 6, 'click', '{"button": "export_csv"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 7, 'page_view', '{"url": "/reports"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 8, 'purchase', '{"item": "addon_analytics", "amount": 14.99}');
 
-<span class="c1">-- globex events (IDs 6-7)</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/settings"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "invite_team"}'</span><span class="p">);</span>
+-- globex events (IDs 6-7)
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('globex', '2026-03-18', 6, 'page_view', '{"url": "/settings"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('globex', '2026-03-18', 7, 'click', '{"button": "invite_team"}');
 
-<span class="c1">-- Verify counts after pair writes</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 8</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 7</span></code></pre>
+-- Verify counts after pair writes
+SELECT COUNT(*) FROM events WHERE tenant_id = 'acme' AND event_date = '2026-03-18';
+-- Expected: 8
+SELECT COUNT(*) FROM events WHERE tenant_id = 'globex' AND event_date = '2026-03-18';
+-- Expected: 7</code></pre>
 </div>
 </div>
 </div>
@@ -283,42 +282,42 @@ Add a new column and a secondary index&#8201;&#8212;&#8201;the schema change pro
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Phase 2: Pair mode — DDL replication test</span>
-<span class="c1">-- Create a counter table and populate it with daily summaries</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Phase 2: Pair mode — DDL replication test
+-- Create a counter table and populate it with daily summaries
 
-<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+USE app;
 
-<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">daily_summary</span> <span class="p">(</span>
-    <span class="n">tenant_id</span>  <span class="nb">text</span><span class="p">,</span>
-    <span class="n">event_date</span> <span class="nb">date</span><span class="p">,</span>
-    <span class="n">event_type</span> <span class="nb">text</span><span class="p">,</span>
-    <span class="n">event_count</span> <span class="n">counter</span><span class="p">,</span>
-    <span class="k">PRIMARY</span> <span class="k">KEY</span> <span class="p">((</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">),</span> <span class="n">event_type</span><span class="p">)</span>
-<span class="p">);</span>
+CREATE TABLE IF NOT EXISTS daily_summary (
+    tenant_id  text,
+    event_date date,
+    event_type text,
+    event_count counter,
+    PRIMARY KEY ((tenant_id, event_date), event_type)
+);
 
-<span class="c1">-- acme summaries for 2026-03-18</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">3</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'page_view'</span><span class="p">;</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">2</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'click'</span><span class="p">;</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">1</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'signup'</span><span class="p">;</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">2</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'purchase'</span><span class="p">;</span>
+-- acme summaries for 2026-03-18
+UPDATE daily_summary SET event_count = event_count + 3
+    WHERE tenant_id = 'acme' AND event_date = '2026-03-18' AND event_type = 'page_view';
+UPDATE daily_summary SET event_count = event_count + 2
+    WHERE tenant_id = 'acme' AND event_date = '2026-03-18' AND event_type = 'click';
+UPDATE daily_summary SET event_count = event_count + 1
+    WHERE tenant_id = 'acme' AND event_date = '2026-03-18' AND event_type = 'signup';
+UPDATE daily_summary SET event_count = event_count + 2
+    WHERE tenant_id = 'acme' AND event_date = '2026-03-18' AND event_type = 'purchase';
 
-<span class="c1">-- globex summaries for 2026-03-18</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">3</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'page_view'</span><span class="p">;</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">2</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'click'</span><span class="p">;</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">1</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'signup'</span><span class="p">;</span>
-<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">1</span>
-    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'purchase'</span><span class="p">;</span>
+-- globex summaries for 2026-03-18
+UPDATE daily_summary SET event_count = event_count + 3
+    WHERE tenant_id = 'globex' AND event_date = '2026-03-18' AND event_type = 'page_view';
+UPDATE daily_summary SET event_count = event_count + 2
+    WHERE tenant_id = 'globex' AND event_date = '2026-03-18' AND event_type = 'click';
+UPDATE daily_summary SET event_count = event_count + 1
+    WHERE tenant_id = 'globex' AND event_date = '2026-03-18' AND event_type = 'signup';
+UPDATE daily_summary SET event_count = event_count + 1
+    WHERE tenant_id = 'globex' AND event_date = '2026-03-18' AND event_type = 'purchase';
 
-<span class="c1">-- Verify counter table</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span></code></pre>
+-- Verify counter table
+SELECT * FROM daily_summary WHERE tenant_id = 'acme' AND event_date = '2026-03-18';
+SELECT * FROM daily_summary WHERE tenant_id = 'globex' AND event_date = '2026-03-18';</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -326,7 +325,7 @@ Add a new column and a secondary index&#8201;&#8212;&#8201;the schema change pro
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9043 <span class="nt">-e</span> <span class="s2">"DESCRIBE TABLE app.events;"</span></code></pre>
+<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9043 -e "DESCRIBE TABLE app.events;"</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -374,7 +373,7 @@ Three nodes give you:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose <span class="nt">-f</span> docker-compose.yml <span class="nt">-f</span> docker-compose.pair.yml <span class="nt">-f</span> docker-compose.cluster.yml up <span class="nt">-d</span></code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -383,7 +382,7 @@ Node3 joins, a Raft leader election completes, and the cluster stabilizes.</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose logs <span class="nt">-f</span> node1 node2 node3</code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose logs -f node1 node2 node3</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -411,32 +410,32 @@ Insert more events&#8201;&#8212;&#8201;these are acknowledged after a quorum (2 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 3: Raft cluster — writes across a 3-node cluster</span>
-<span class="c1">-- 2 more for acme (total 10), 3 for new tenant initech (total 3)</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Act 3: Raft cluster — writes across a 3-node cluster
+-- 2 more for acme (total 10), 3 for new tenant initech (total 3)
 
-<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+USE app;
 
-<span class="c1">-- acme events (IDs 9-10)</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">9</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/billing"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "upgrade_plan"}'</span><span class="p">);</span>
+-- acme events (IDs 9-10)
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 9, 'page_view', '{"url": "/billing"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('acme', '2026-03-18', 10, 'click', '{"button": "upgrade_plan"}');
 
-<span class="c1">-- initech events (IDs 1-3, new tenant)</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/home"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="s1">'signup'</span><span class="p">,</span> <span class="s1">'{"plan": "trial"}'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/onboarding"}'</span><span class="p">);</span>
+-- initech events (IDs 1-3, new tenant)
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('initech', '2026-03-18', 1, 'page_view', '{"url": "/home"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('initech', '2026-03-18', 2, 'signup', '{"plan": "trial"}');
+INSERT INTO events (tenant_id, event_date, event_id, event_type, payload)
+    VALUES ('initech', '2026-03-18', 3, 'page_view', '{"url": "/onboarding"}');
 
-<span class="c1">-- Verify counts across all tenants</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 10</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 7</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'initech'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 3</span></code></pre>
+-- Verify counts across all tenants
+SELECT COUNT(*) FROM events WHERE tenant_id = 'acme' AND event_date = '2026-03-18';
+-- Expected: 10
+SELECT COUNT(*) FROM events WHERE tenant_id = 'globex' AND event_date = '2026-03-18';
+-- Expected: 7
+SELECT COUNT(*) FROM events WHERE tenant_id = 'initech' AND event_date = '2026-03-18';
+-- Expected: 3</code></pre>
 </div>
 </div>
 </div>
@@ -447,28 +446,28 @@ Insert more events&#8201;&#8212;&#8201;these are acknowledged after a quorum (2 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Phase 3: Raft cluster — DDL through consensus</span>
-<span class="c1">-- Create a tenants table and register all known tenants</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Phase 3: Raft cluster — DDL through consensus
+-- Create a tenants table and register all known tenants
 
-<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+USE app;
 
-<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">tenants</span> <span class="p">(</span>
-    <span class="n">tenant_id</span>   <span class="nb">text</span> <span class="k">PRIMARY</span> <span class="k">KEY</span><span class="p">,</span>
-    <span class="n">name</span>        <span class="nb">text</span><span class="p">,</span>
-    <span class="n">plan</span>        <span class="nb">text</span><span class="p">,</span>
-    <span class="n">created_at</span>  <span class="nb">timestamp</span><span class="p">,</span>
-    <span class="n">contact</span>     <span class="nb">text</span>
-<span class="p">);</span>
+CREATE TABLE IF NOT EXISTS tenants (
+    tenant_id   text PRIMARY KEY,
+    name        text,
+    plan        text,
+    created_at  timestamp,
+    contact     text
+);
 
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">tenants</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">created_at</span><span class="p">,</span> <span class="n">contact</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'Acme Corporation'</span><span class="p">,</span> <span class="s1">'pro'</span><span class="p">,</span> <span class="s1">'2026-01-15T09:00:00Z'</span><span class="p">,</span> <span class="s1">'admin@acme.example'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">tenants</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">created_at</span><span class="p">,</span> <span class="n">contact</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'Globex Corporation'</span><span class="p">,</span> <span class="s1">'enterprise'</span><span class="p">,</span> <span class="s1">'2026-02-01T14:30:00Z'</span><span class="p">,</span> <span class="s1">'ops@globex.example'</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">tenants</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">created_at</span><span class="p">,</span> <span class="n">contact</span><span class="p">)</span>
-    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'Initech'</span><span class="p">,</span> <span class="s1">'trial'</span><span class="p">,</span> <span class="s1">'2026-03-18T10:00:00Z'</span><span class="p">,</span> <span class="s1">'peter@initech.example'</span><span class="p">);</span>
+INSERT INTO tenants (tenant_id, name, plan, created_at, contact)
+    VALUES ('acme', 'Acme Corporation', 'pro', '2026-01-15T09:00:00Z', 'admin@acme.example');
+INSERT INTO tenants (tenant_id, name, plan, created_at, contact)
+    VALUES ('globex', 'Globex Corporation', 'enterprise', '2026-02-01T14:30:00Z', 'ops@globex.example');
+INSERT INTO tenants (tenant_id, name, plan, created_at, contact)
+    VALUES ('initech', 'Initech', 'trial', '2026-03-18T10:00:00Z', 'peter@initech.example');
 
-<span class="c1">-- Verify tenant records</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">tenants</span><span class="p">;</span></code></pre>
+-- Verify tenant records
+SELECT * FROM tenants;</code></pre>
 </div>
 </div>
 <div class="admonitionblock tip">
@@ -494,28 +493,28 @@ In cluster mode, DDL statements are linearizable. A <code>CREATE TABLE</code> th
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Final verification: confirm all data across the scaled cluster</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Final verification: confirm all data across the scaled cluster
 
-<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+USE app;
 
-<span class="c1">-- Event counts per tenant</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 10</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 7</span>
-<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'initech'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="c1">-- Expected: 3</span>
+-- Event counts per tenant
+SELECT COUNT(*) FROM events WHERE tenant_id = 'acme' AND event_date = '2026-03-18';
+-- Expected: 10
+SELECT COUNT(*) FROM events WHERE tenant_id = 'globex' AND event_date = '2026-03-18';
+-- Expected: 7
+SELECT COUNT(*) FROM events WHERE tenant_id = 'initech' AND event_date = '2026-03-18';
+-- Expected: 3
 
-<span class="c1">-- Daily summaries</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+-- Daily summaries
+SELECT * FROM daily_summary WHERE tenant_id = 'acme' AND event_date = '2026-03-18';
+SELECT * FROM daily_summary WHERE tenant_id = 'globex' AND event_date = '2026-03-18';
 
-<span class="c1">-- Tenant registry</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">tenants</span><span class="p">;</span>
+-- Tenant registry
+SELECT * FROM tenants;
 
-<span class="c1">-- Cluster health</span>
-<span class="k">SELECT</span> <span class="n">cluster_name</span><span class="p">,</span> <span class="n">listen_address</span><span class="p">,</span> <span class="n">data_center</span><span class="p">,</span> <span class="n">rack</span> <span class="k">FROM</span> <span class="k">system</span><span class="p">.</span><span class="k">local</span><span class="p">;</span>
-<span class="k">SELECT</span> <span class="n">peer</span><span class="p">,</span> <span class="n">data_center</span> <span class="k">FROM</span> <span class="k">system</span><span class="p">.</span><span class="n">peers</span><span class="p">;</span></code></pre>
+-- Cluster health
+SELECT cluster_name, listen_address, data_center, rack FROM system.local;
+SELECT peer, data_center FROM system.peers;</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -536,7 +535,7 @@ In cluster mode, DDL statements are linearizable. A <code>CREATE TABLE</code> th
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">curl <span class="nt">-s</span> http://localhost:9090/api/cluster/status | python3 <span class="nt">-m</span> json.tool</code></pre>
+<pre class="rouge highlight"><code data-lang="bash">curl -s http://localhost:9090/api/cluster/status | python3 -m json.tool</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -568,7 +567,7 @@ In cluster mode, DDL statements are linearizable. A <code>CREATE TABLE</code> th
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose <span class="nt">-f</span> docker-compose.yml <span class="nt">-f</span> docker-compose.pair.yml <span class="nt">-f</span> docker-compose.cluster.yml down <span class="nt">-v</span></code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml down -v</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -579,7 +578,7 @@ In cluster mode, DDL statements are linearizable. A <code>CREATE TABLE</code> th
 </div>
 <div id="footer">
 <div id="footer-text">
-Last updated 2026-03-18 22:08:59 UTC
+Last updated 2026-03-26 20:29:23 -0700
 </div>
 </div>
 </body>

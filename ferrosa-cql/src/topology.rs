@@ -55,10 +55,33 @@ impl ClientTopologyPolicy {
     /// `client_address` is stored as `"ip:port"` by the CQL connection layer.
     /// Parse failures fall back to the public view.
     pub fn topology_view_for_client_address(&self, client_address: &str) -> TopologyView {
+        self.topology_view_for_client_with_locals(client_address, &[])
+    }
+
+    /// Select the topology view for a client address string with awareness of
+    /// the local node's internal addresses.
+    ///
+    /// Podman host-to-container NAT on macOS can make a host client appear to
+    /// the server as the node's own container IP. Treating that as internal
+    /// breaks mixed host/container deployments because the host then receives
+    /// `system.local` / `system.peers` endpoints that are only valid on the
+    /// container network. When the parsed client IP matches one of the local
+    /// addresses, force the public view.
+    pub fn topology_view_for_client_with_locals(
+        &self,
+        client_address: &str,
+        local_addresses: &[IpAddr],
+    ) -> TopologyView {
         if let Ok(addr) = client_address.parse::<SocketAddr>() {
+            if local_addresses.contains(&addr.ip()) {
+                return TopologyView::Public;
+            }
             return self.topology_view_for_ip(addr.ip());
         }
         if let Ok(ip) = client_address.parse::<IpAddr>() {
+            if local_addresses.contains(&ip) {
+                return TopologyView::Public;
+            }
             return self.topology_view_for_ip(ip);
         }
         TopologyView::Public
@@ -156,6 +179,19 @@ mod tests {
 
         assert_eq!(
             policy.topology_view_for_client_address("127.0.0.1:54321"),
+            TopologyView::Public
+        );
+    }
+
+    #[test]
+    fn client_that_looks_like_local_container_ip_gets_public_view() {
+        let policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
+
+        assert_eq!(
+            policy.topology_view_for_client_with_locals(
+                "10.89.1.6:35628",
+                &["10.89.1.6".parse().unwrap()]
+            ),
             TopologyView::Public
         );
     }

@@ -109,8 +109,10 @@ impl SegmentReader {
                 // EOF marker: read entries until the end of the data.
                 self.data.len()
             } else {
-                // Entries end at the next sync marker offset.
-                next_marker_offset as usize
+                // Clamp to file length: a torn tail can leave a valid sync
+                // marker pointing past EOF. Treat the missing bytes as
+                // truncated entries so the payload slice below can't panic.
+                (next_marker_offset as usize).min(self.data.len())
             };
 
             // Read entries within this section.
@@ -390,6 +392,50 @@ mod tests {
         let entries = reader.read_all().unwrap();
 
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn torn_tail_past_sync_marker_does_not_panic() {
+        // Regression: a sync marker whose next_marker_offset points past the
+        // end of the file (torn write where the marker was flushed but the
+        // bytes after it were not) used to panic when the reader sliced the
+        // payload. section_end must be clamped to data.len().
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(1, 4096, dir.path());
+
+        let m = simple_mutation();
+        let total = Segment::entry_total_size(&m);
+        let off = segment.allocate(total).unwrap();
+        segment.write_entry(off, &m);
+        segment.flush_to_disk().unwrap();
+
+        let path = segment.path().to_path_buf();
+        let mut data = fs::read(&path).unwrap();
+
+        // Truncate the file in the middle of the entry's payload. Entry
+        // header (size + size_crc) stays intact, payload runs off the end.
+        let payload_start = off as usize + 8;
+        let payload_size = m.serialized_size();
+        let truncated_len = payload_start + payload_size / 2;
+        data.truncate(truncated_len);
+
+        // Patch the initial sync marker so next_marker_offset points past
+        // the entry's claimed end. Without the fix, section_end =
+        // next_marker_offset, the entry_end-vs-section_end guard passes,
+        // and the payload slice runs off the buffer.
+        let fake_next = (payload_start + payload_size + 64) as u32;
+        let mut crc_input = [0u8; 12];
+        crc_input[..8].copy_from_slice(&1u64.to_be_bytes());
+        crc_input[8..12].copy_from_slice(&fake_next.to_be_bytes());
+        let new_crc = crc32fast::hash(&crc_input);
+        data[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&fake_next.to_be_bytes());
+        data[HEADER_SIZE + 4..HEADER_SIZE + 8].copy_from_slice(&new_crc.to_be_bytes());
+
+        fs::write(&path, &data).unwrap();
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        let entries = reader.read_all().unwrap();
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]

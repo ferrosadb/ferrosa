@@ -113,11 +113,63 @@ fn decode_read_response(bytes: &[u8]) -> Option<ReadResponsePayload> {
         .ok()
 }
 
+fn should_retry_missing_peer_error(err: &str) -> bool {
+    err.contains("unknown peer") || err.contains("no connection pool")
+}
+
 // ---------------------------------------------------------------------------
 // coordinate_read
 // ---------------------------------------------------------------------------
 
 impl ClusterCoordinator {
+    async fn send_remote_with_reconnect(
+        &self,
+        host_id: uuid::Uuid,
+        addr: &str,
+        message: Message,
+    ) -> crate::error::Result<Message> {
+        match self
+            .peer_manager
+            .send(host_id, message.clone(), Lane::Data)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(e) if should_retry_missing_peer_error(&e.to_string()) => {
+                self.peer_manager.ensure_peer(host_id, addr).await?;
+                self.peer_manager
+                    .send(host_id, message, Lane::Data)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn send_remote_with_reconnect_timeout(
+        &self,
+        host_id: uuid::Uuid,
+        addr: &str,
+        message: Message,
+        lane: Lane,
+        timeout: std::time::Duration,
+    ) -> crate::error::Result<Message> {
+        match self
+            .peer_manager
+            .send_with_timeout(host_id, message.clone(), lane, timeout)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(e) if should_retry_missing_peer_error(&e.to_string()) => {
+                self.peer_manager.ensure_peer(host_id, addr).await?;
+                self.peer_manager
+                    .send_with_timeout(host_id, message, lane, timeout)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Coordinate a read from the appropriate replicas.
     ///
     /// For CL = ONE: contact a single replica (local preferred).
@@ -144,6 +196,14 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         host_id: uuid::Uuid,
     ) -> Option<Partition> {
+        let addr = {
+            let ring = self.ring.load();
+            ring.node_ids()
+                .into_iter()
+                .filter_map(|node_id| ring.get_node(node_id))
+                .find(|node| node.host_id == host_id)
+                .map(|node| node.addr.clone())
+        }?;
         let payload = ReadRequestPayload {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
@@ -154,8 +214,7 @@ impl ClusterCoordinator {
         };
         let body = encode_read_request(&payload);
         match self
-            .peer_manager
-            .send(host_id, Message::ReadRequest(body), Lane::Data)
+            .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body))
             .await
         {
             Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -225,10 +284,13 @@ impl ClusterCoordinator {
             .collect();
 
         // Collect node metadata before dropping the ring guard.
-        let full_host_id = ring.get_node(full_replica).map(|n| n.host_id);
-        let digest_host_ids: Vec<(u64, Option<uuid::Uuid>)> = digest_replicas
+        let full_remote = ring
+            .get_node(full_replica)
+            .map(|n| (n.host_id, n.addr.clone()));
+        let full_host_id = full_remote.as_ref().map(|(host_id, _)| *host_id);
+        let digest_remotes: Vec<(u64, Option<(uuid::Uuid, String)>)> = digest_replicas
             .iter()
-            .map(|&r| (r, ring.get_node(r).map(|n| n.host_id)))
+            .map(|&r| (r, ring.get_node(r).map(|n| (n.host_id, n.addr.clone()))))
             .collect();
         drop(ring);
 
@@ -240,7 +302,7 @@ impl ClusterCoordinator {
             // Full-read future
             let full_future = {
                 let storage = self.storage.clone();
-                let peer_manager = self.peer_manager.clone();
+                let coordinator = self;
                 let table_id = table_id.clone();
                 let key = key.clone();
                 let local_node_id = self.local_node_id;
@@ -266,11 +328,15 @@ impl ClusterCoordinator {
                             page_state: vec![],
                         };
                         let body = encode_read_request(&payload);
-                        match full_host_id {
+                        match full_remote {
                             None => ReplicaRead::Failed,
-                            Some(hid) => {
-                                match peer_manager
-                                    .send(hid, Message::ReadRequest(body), Lane::Data)
+                            Some((hid, addr)) => {
+                                match coordinator
+                                    .send_remote_with_reconnect(
+                                        hid,
+                                        &addr,
+                                        Message::ReadRequest(body),
+                                    )
                                     .await
                                 {
                                     Ok(Message::ReadResponse(b)) => {
@@ -293,9 +359,9 @@ impl ClusterCoordinator {
             };
 
             // Digest-only futures
-            let digest_futures = digest_host_ids.into_iter().map(|(replica_id, host_id)| {
+            let digest_futures = digest_remotes.into_iter().map(|(replica_id, remote)| {
                 let storage = self.storage.clone();
-                let peer_manager = self.peer_manager.clone();
+                let coordinator = self;
                 let table_id = table_id.clone();
                 let key = key.clone();
                 let local_node_id = self.local_node_id;
@@ -340,11 +406,15 @@ impl ClusterCoordinator {
                             page_state: vec![],
                         };
                         let body = encode_read_request(&payload);
-                        match host_id {
+                        match remote {
                             None => ReplicaRead::Failed,
-                            Some(hid) => {
-                                match peer_manager
-                                    .send(hid, Message::ReadRequest(body), Lane::Data)
+                            Some((hid, addr)) => {
+                                match coordinator
+                                    .send_remote_with_reconnect(
+                                        hid,
+                                        &addr,
+                                        Message::ReadRequest(body),
+                                    )
                                     .await
                                 {
                                     Ok(Message::ReadResponse(b)) => {
@@ -352,7 +422,7 @@ impl ClusterCoordinator {
                                             Some(resp) => ReplicaRead::Digest {
                                                 digest: resp.digest,
                                                 timestamp: resp.timestamp,
-                                                host_id,
+                                                host_id: Some(hid),
                                             },
                                             None => ReplicaRead::Failed,
                                         }
@@ -605,8 +675,8 @@ impl ClusterCoordinator {
 
             // Remote replica — use paged reads to avoid Data lane timeout
             // on large partitions (e.g., 70K rows / 209MB).
-            let host_id = match ring.get_node(target).map(|n| n.host_id) {
-                Some(hid) => hid,
+            let (host_id, addr) = match ring.get_node(target).map(|n| (n.host_id, n.addr.clone())) {
+                Some(remote) => remote,
                 None => continue,
             };
 
@@ -630,8 +700,7 @@ impl ClusterCoordinator {
                 };
                 let body = encode_read_request(&payload);
                 match self
-                    .peer_manager
-                    .send(host_id, Message::ReadRequest(body), Lane::Data)
+                    .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body))
                     .await
                 {
                     Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -748,7 +817,7 @@ impl ClusterCoordinator {
     /// coordinator returns a result (even partial/error) before the client
     /// gives up. A 120s timeout caused SELECT to hang on startup when
     /// remote nodes hadn't established connections yet.
-    const RANGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const BULK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     pub async fn coordinate_range_read(
         &self,
@@ -757,10 +826,10 @@ impl ClusterCoordinator {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
 
-        // Collect (node_id, host_id) pairs while the ring guard is held.
-        let nodes: Vec<(u64, Option<uuid::Uuid>)> = node_ids
+        // Collect (node_id, host_id, internode addr) while the ring guard is held.
+        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
             .iter()
-            .map(|&id| (id, ring.get_node(id).map(|n| n.host_id)))
+            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
             .collect();
         drop(ring);
 
@@ -774,17 +843,16 @@ impl ClusterCoordinator {
         // Each future returns Result — errors are NOT silently swallowed.
         let local_id = self.local_node_id;
         let storage = self.storage.clone();
-        let peer_manager = self.peer_manager.clone();
         let table_id_clone = table_id.clone();
         let total_nodes = nodes.len();
 
         let mut futs: FuturesUnordered<_> = nodes
             .into_iter()
-            .map(|(node_id, host_id)| {
+            .map(|(node_id, remote)| {
                 let storage = storage.clone();
-                let peer_manager = peer_manager.clone();
                 let table_id = table_id_clone.clone();
                 let req_body = req_body.clone();
+                let coordinator = self;
 
                 async move {
                     if node_id == local_id {
@@ -792,23 +860,24 @@ impl ClusterCoordinator {
                             .read_range(&table_id, None, None, 1_000_000)
                             .map_err(ClusterError::Storage)
                     } else {
-                        let hid = host_id.ok_or_else(|| {
+                        let (hid, addr) = remote.ok_or_else(|| {
                             ClusterError::Internal(format!(
                                 "range read: node {node_id} has no host_id"
                             ))
                         })?;
 
-                        let resp = peer_manager
-                            .send_with_timeout(
+                        let resp = coordinator
+                            .send_remote_with_reconnect_timeout(
                                 hid,
+                                &addr,
                                 Message::RangeReadRequest(req_body),
-                                Lane::Data,
-                                Self::RANGE_READ_TIMEOUT,
+                                Lane::Bulk,
+                                Self::BULK_READ_TIMEOUT,
                             )
                             .await
                             .map_err(|e| {
                                 ClusterError::Internal(format!(
-                                    "range read from node {node_id} ({hid}): {e}"
+                                    "range read from node {node_id} ({hid}) via {addr}: {e}"
                                 ))
                             })?;
 
@@ -921,9 +990,9 @@ impl ClusterCoordinator {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
 
-        let nodes: Vec<(u64, Option<uuid::Uuid>)> = node_ids
+        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
             .iter()
-            .map(|&id| (id, ring.get_node(id).map(|n| n.host_id)))
+            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
             .collect();
         drop(ring);
 
@@ -937,7 +1006,6 @@ impl ClusterCoordinator {
 
         let local_id = self.local_node_id;
         let storage = self.storage.clone();
-        let peer_manager = self.peer_manager.clone();
         let table_id_clone = table_id.clone();
         let index_name_owned = index_name.to_string();
         let index_key_clone = index_key.clone();
@@ -945,13 +1013,13 @@ impl ClusterCoordinator {
 
         let mut futs: FuturesUnordered<_> = nodes
             .into_iter()
-            .map(|(node_id, host_id)| {
+            .map(|(node_id, remote)| {
                 let storage = storage.clone();
-                let peer_manager = peer_manager.clone();
                 let table_id = table_id_clone.clone();
                 let index_name = index_name_owned.clone();
                 let index_key = index_key_clone.clone();
                 let req_body = req_body.clone();
+                let coordinator = self;
 
                 async move {
                     if node_id == local_id {
@@ -959,23 +1027,24 @@ impl ClusterCoordinator {
                             .read_by_index(&table_id, &index_name, &index_key)
                             .map_err(ClusterError::Storage)
                     } else {
-                        let hid = host_id.ok_or_else(|| {
+                        let (hid, addr) = remote.ok_or_else(|| {
                             ClusterError::Internal(format!(
                                 "index read: node {node_id} has no host_id"
                             ))
                         })?;
 
-                        let resp = peer_manager
-                            .send_with_timeout(
+                        let resp = coordinator
+                            .send_remote_with_reconnect_timeout(
                                 hid,
+                                &addr,
                                 Message::IndexReadRequest(req_body),
-                                Lane::Data,
-                                Self::RANGE_READ_TIMEOUT,
+                                Lane::Bulk,
+                                Self::BULK_READ_TIMEOUT,
                             )
                             .await
                             .map_err(|e| {
                                 ClusterError::Internal(format!(
-                                    "index read from node {node_id} ({hid}): {e}"
+                                    "index read from node {node_id} ({hid}) via {addr}: {e}"
                                 ))
                             })?;
 
@@ -1136,9 +1205,12 @@ mod tests {
     use ferrosa_common::key::DecoratedKey;
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     use ferrosa_common::{CellValue, PartitionKey, Token};
+    use ferrosa_net::codec::MsgType;
     use ferrosa_net::config::NetConfig;
+    use ferrosa_net::message::Message;
     use ferrosa_net::peer::{PeerEventListener, PeerManager};
-    use ferrosa_net::rpc::handler::PeerId;
+    use ferrosa_net::rpc::handler::{HandlerRegistry, PeerId, RpcHandler};
+    use ferrosa_net::rpc::server::RpcServer;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig};
 
@@ -1225,6 +1297,145 @@ mod tests {
         fn on_peer_failed(&self, _peer_id: uuid::Uuid) {}
     }
 
+    struct StaticReadHandler {
+        partition: Partition,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for StaticReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::ReadRequest(_) = msg else {
+                return None;
+            };
+            let payload = ReadResponsePayload {
+                found: true,
+                partition: Some(crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )),
+                digest: None,
+                timestamp: self
+                    .partition
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter().map(|(_, cell)| cell.timestamp))
+                    .max()
+                    .unwrap_or(i64::MIN),
+                has_more: false,
+                next_page_state: vec![],
+            };
+            Some(Message::ReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    struct StaticIndexReadHandler {
+        partition: Partition,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for StaticIndexReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::IndexReadRequest(_) = msg else {
+                return None;
+            };
+            let payload = IndexReadResponsePayload {
+                partitions: vec![crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )],
+            };
+            Some(Message::IndexReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    struct DelayedRangeReadHandler {
+        partition: Partition,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DelayedRangeReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::RangeReadRequest(_) = msg else {
+                return None;
+            };
+            tokio::time::sleep(self.delay).await;
+            let payload = RangeReadResponsePayload {
+                partitions: vec![crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )],
+                truncated: false,
+            };
+            Some(Message::RangeReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    struct DelayedIndexReadHandler {
+        partition: Partition,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DelayedIndexReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::IndexReadRequest(_) = msg else {
+                return None;
+            };
+            tokio::time::sleep(self.delay).await;
+            let payload = IndexReadResponsePayload {
+                partitions: vec![crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )],
+            };
+            Some(Message::IndexReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    struct StaticDigestReadHandler {
+        partition: Partition,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for StaticDigestReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::ReadRequest(body) = msg else {
+                return None;
+            };
+            let req: ReadRequestPayload = bincode::deserialize(&body).ok()?;
+            let digest = crate::raft::handlers::compute_partition_digest(&self.partition).ok();
+            let timestamp = self
+                .partition
+                .rows
+                .iter()
+                .flat_map(|row| row.cells.iter().map(|(_, cell)| cell.timestamp))
+                .max()
+                .unwrap_or(i64::MIN);
+            let payload = ReadResponsePayload {
+                found: true,
+                partition: if req.digest_only {
+                    None
+                } else {
+                    Some(crate::raft::handlers::partition_to_wire(
+                        self.partition.clone(),
+                    ))
+                },
+                digest,
+                timestamp,
+                has_more: false,
+                next_page_state: vec![],
+            };
+            Some(Message::ReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
     fn noop_peer_manager() -> Arc<PeerManager> {
         Arc::new(PeerManager::new(
             Arc::new(NetConfig::default()),
@@ -1249,6 +1460,22 @@ mod tests {
             rf,
             cl,
         )
+    }
+
+    async fn start_rpc_server(
+        msg_type: MsgType,
+        handler: Arc<dyn RpcHandler>,
+    ) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(msg_type, handler);
+        let server = Arc::new(RpcServer::new(config, server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+        (server, addr, server_id)
     }
 
     // -----------------------------------------------------------------------
@@ -1495,6 +1722,186 @@ mod tests {
             }
             other => panic!("expected ReadTimeout, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn coordinate_read_reconnects_missing_remote_peer_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(777)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(StaticReadHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(2u64, &[42]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            1u64,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
+        assert!(
+            result.is_some(),
+            "remote read should succeed after reconnect"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "coordinator should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn coordinate_index_read_reconnects_missing_remote_peer_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(888)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::IndexReadRequest,
+            Arc::new(StaticIndexReadHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(2u64, &[42]);
+
+        let coordinator =
+            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let partitions = coordinator
+            .coordinate_index_read(
+                &table_id,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "index read should succeed after reconnect"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "coordinator should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn coordinate_read_quorum_reconnects_missing_digest_peer_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(999)],
+        };
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &key, partition.rows[0].clone(), 999)
+            .unwrap();
+
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(StaticDigestReadHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[42]);
+        ring.assign_tokens(2u64, &[142]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage,
+            2,
+            ConsistencyLevel::Quorum,
+        );
+
+        let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
+        assert!(
+            result.is_some(),
+            "quorum read should succeed after reconnect"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "digest path should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     // -----------------------------------------------------------------------
@@ -2209,6 +2616,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn coordinate_range_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(4321)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::RangeReadRequest,
+            Arc::new(DelayedRangeReadHandler {
+                partition: partition.clone(),
+                delay: std::time::Duration::from_secs(6),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(2u64, &[42]);
+
+        let coordinator =
+            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let partitions = coordinator.coordinate_range_read(&table_id).await.unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "slow remote range scans should complete on the bulk lane"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "coordinator should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
     // -----------------------------------------------------------------------
     // Additional coverage: empty ring range read
     // -----------------------------------------------------------------------
@@ -2233,6 +2692,65 @@ mod tests {
         // Empty ring means no nodes to contact at all, should return Ok([])
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinate_index_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(9876)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::IndexReadRequest,
+            Arc::new(DelayedIndexReadHandler {
+                partition: partition.clone(),
+                delay: std::time::Duration::from_secs(6),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(2u64, &[42]);
+
+        let coordinator =
+            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let partitions = coordinator
+            .coordinate_index_read(
+                &table_id,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"slow".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "slow remote index scans should complete on the bulk lane"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "coordinator should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     // -----------------------------------------------------------------------

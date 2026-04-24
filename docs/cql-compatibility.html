@@ -273,6 +273,19 @@
   <h3>Authentication</h3>
   <p>SASL PLAIN authentication via the standard <code>org.apache.cassandra.auth.PasswordAuthenticator</code> flow. Passwords are hashed with bcrypt or argon2. Disable with <code>FERROSA_AUTH_DISABLED=true</code> for development.</p>
 
+  <h3>Driver bootstrap and topology discovery</h3>
+  <p>Driver bootstrap follows the standard Cassandra-compatible sequence. There is no Ferrosa-specific handshake required to unlock topology metadata:</p>
+  <ol>
+    <li>Connect to an initial contact point.</li>
+    <li>Optionally exchange <code>OPTIONS</code> / <code>SUPPORTED</code>.</li>
+    <li>Send <code>STARTUP</code>.</li>
+    <li>If auth is enabled, complete <code>AUTHENTICATE</code> → <code>AUTH_RESPONSE</code> → <code>AUTH_SUCCESS</code>. Otherwise the server returns <code>READY</code> directly.</li>
+    <li>Only after the connection reaches <code>READY</code> or <code>AUTH_SUCCESS</code> does the driver query <code>system.local</code>, <code>system.peers</code>, and <code>system.peers_v2</code>.</li>
+    <li>The driver uses those system-table rows to discover tokens, schema version, and the peer endpoints it should dial next.</li>
+  </ol>
+  <p>This means post-auth hangs that occur while a driver is opening peer connections usually indicate bad topology metadata, not a missing bootstrap message. Ferrosa must advertise peer addresses that are reachable from the client's network.</p>
+  <p><strong>Explicitly:</strong> <code>OPTIONS</code> does not control whether the client receives public or internal peer addresses. Neither do <code>STARTUP</code>, compression settings, or any Ferrosa-specific extension flag. The server chooses which addresses to return based on the source IP of the established client connection when servicing the topology queries.</p>
+
   <!-- ── Types ── -->
   <h2 id="types">Data Types</h2>
 
@@ -461,7 +474,7 @@
   </ul>
 
   <h3>system.local</h3>
-  <p>Node metadata including <code>tokens</code> column for driver topology awareness.</p>
+  <p>Node metadata including <code>tokens</code> column for driver topology awareness. Drivers typically read this immediately after <code>READY</code> or <code>AUTH_SUCCESS</code> as part of topology discovery.</p>
 
   <h3>system_observability (Ferrosa extension)</h3>
   <p>Virtual tables backed by live in-memory state, not persisted:</p>

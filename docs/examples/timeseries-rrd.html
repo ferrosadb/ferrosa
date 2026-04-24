@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.26">
+<title>RRD Cascading Time-Series Aggregation</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>RRD Cascading Time-Series Aggregation</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_the_problem">The Problem</a>
+<ul class="sectlevel2">
+<li><a href="#_high_frequency_sensor_data">High-frequency sensor data</a></li>
+</ul>
+</li>
+<li><a href="#_how_it_works">How It Works</a>
+<ul class="sectlevel2">
+<li><a href="#_the_4_tier_cascade">The 4-tier cascade</a></li>
+<li><a href="#_consolidation_extensions">Consolidation extensions</a></li>
+</ul>
+</li>
+<li><a href="#_create_the_schema">Create the Schema</a></li>
+<li><a href="#_insert_sample_data">Insert Sample Data</a></li>
+<li><a href="#_query_each_tier">Query Each Tier</a>
+<ul class="sectlevel2">
+<li><a href="#_raw_data_1_second_resolution">Raw data (1-second resolution)</a></li>
+<li><a href="#_5_minute_aggregates">5-minute aggregates</a></li>
+<li><a href="#_15_minute_aggregates">15-minute aggregates</a></li>
+<li><a href="#_1_hour_aggregates">1-hour aggregates</a></li>
+</ul>
+</li>
+<li><a href="#_built_in_functions">Built-in Functions</a></li>
+<li><a href="#_multi_column_composite">Multi-Column Composite</a></li>
+<li><a href="#_custom_wasm_udf">Custom WASM UDF</a></li>
+<li><a href="#_late_arriving_data">Late-Arriving Data</a></li>
+<li><a href="#_observability">Observability</a></li>
+<li><a href="#_files_in_this_example">Files in This Example</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Automatic multi-tier aggregation for high-frequency time-series data.
+Write raw readings at 1-second resolution and let the database consolidate them into 5-minute, 15-minute, and 1-hour summaries using RRD-style cascading.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+Complete the <a href="cluster-setup.html">3-Node Cluster Setup</a> tutorial first, or have a running Ferrosa cluster accessible on <code>localhost:9042</code>.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_the_problem">The Problem</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_high_frequency_sensor_data">High-frequency sensor data</h3>
+<div class="paragraph">
+<p>Consider a fleet of 10,000 IoT sensors, each reporting once per second.
+That is 10,000 writes per second&#8201;&#8212;&#8201;864 million rows per day.</p>
+</div>
+<div class="paragraph">
+<p>At this scale, dashboards cannot query raw data directly.
+A chart showing 24 hours of data for a single sensor would need to scan 86,400 rows.
+For a fleet view across 100 sensors, that is 8.6 million rows per chart refresh.</p>
+</div>
+<div class="paragraph">
+<p>The standard solution is pre-aggregation: compute min, max, avg, and stddev over fixed time windows and store the results in a separate table at coarser resolution.
+Tools like RRDtool and Graphite have used this pattern for decades.</p>
+</div>
+<div class="paragraph">
+<p>Ferrosa automates this with <strong>cascading consolidation</strong>.
+You define the aggregation rules in the table&#8217;s <code>extensions</code> map at <code>CREATE TABLE</code> time, and the storage engine handles the rest.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_how_it_works">How It Works</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_the_4_tier_cascade">The 4-tier cascade</h3>
+<div class="paragraph">
+<p>The example creates a cascade with four resolution tiers:</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 25%;">
+<col style="width: 25%;">
+<col style="width: 25%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Tier</th>
+<th class="tableblock halign-left valign-top">Table</th>
+<th class="tableblock halign-left valign-top">Resolution</th>
+<th class="tableblock halign-left valign-top">Aggregation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">0</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_1s</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">1 second (raw)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">None (source)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">1</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_5m</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">5 minutes</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">min, max, avg, stddev</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">2</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_15m</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">15 minutes</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">min, max, avg, stddev</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">3</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_1h</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">1 hour</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">min, max, avg, stddev</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>Each tier consolidates data from the tier above it.
+When 5 minutes of raw data accumulates in <code>sensor_1s</code>, the aggregator computes the summary statistics and writes them to <code>sensor_5m</code>.
+When three 5-minute windows accumulate in <code>sensor_5m</code>, they are consolidated into <code>sensor_15m</code>, and so on.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_consolidation_extensions">Consolidation extensions</h3>
+<div class="paragraph">
+<p>Aggregation is configured via <code>extensions</code> on the source table:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE sensor_1s (
+    sensor_id uuid,
+    ts timestamp,
+    value double,
+    PRIMARY KEY (sensor_id, ts)
+) WITH CLUSTERING ORDER BY (ts DESC)
+  AND extensions = {
+    'consolidation.interval': '5m',
+    'consolidation.functions': 'min,max,avg,stddev',
+    'consolidation.target': 'sensor_5m',
+    'consolidation.cascade': 'true',
+    'consolidation.late_window': '10m',
+    'consolidation.columns': 'value'
+  };</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The key parameters:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>consolidation.interval</code>&#8201;&#8212;&#8201;the window size (5 minutes for Tier 0).</p>
+</li>
+<li>
+<p><code>consolidation.functions</code>&#8201;&#8212;&#8201;which aggregates to compute (min, max, avg, stddev).</p>
+</li>
+<li>
+<p><code>consolidation.target</code>&#8201;&#8212;&#8201;the downstream table to write results to.</p>
+</li>
+<li>
+<p><code>consolidation.cascade</code>&#8201;&#8212;&#8201;when <code>true</code>, downstream tables are auto-created with escalating intervals.</p>
+</li>
+<li>
+<p><code>consolidation.late_window</code>&#8201;&#8212;&#8201;how far back to accept late data for re-aggregation.</p>
+</li>
+<li>
+<p><code>consolidation.columns</code>&#8201;&#8212;&#8201;which numeric columns to aggregate.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_create_the_schema">Create the Schema</h2>
+<div class="sectionbody">
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- RRD Cascading Time-Series Aggregation: Schema
+--
+-- Creates a 4-tier cascade: 1s -&gt; 5m -&gt; 15m -&gt; 1h.
+-- Consolidation is driven by data timestamps, not wall clock.
+
+CREATE KEYSPACE IF NOT EXISTS sensors
+  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+
+USE sensors;
+
+-- Tier 0: Raw 1-second sensor readings.
+CREATE TABLE sensor_1s (
+    sensor_id uuid,
+    ts timestamp,
+    value double,
+    PRIMARY KEY (sensor_id, ts)
+) WITH CLUSTERING ORDER BY (ts DESC)
+  AND extensions = {
+    'consolidation.interval': '5m',
+    'consolidation.functions': 'min,max,avg,stddev',
+    'consolidation.target': 'sensor_5m',
+    'consolidation.cascade': 'true',
+    'consolidation.late_window': '10m',
+    'consolidation.columns': 'value'
+  };
+
+-- Tiers 1-3 are auto-created by cascade. Shown here for reference:
+--
+-- sensor_5m:  5-minute aggregates  (consolidation.interval: '15m', target: 'sensor_15m')
+-- sensor_15m: 15-minute aggregates (consolidation.interval: '1h', target: 'sensor_1h')
+-- sensor_1h:  1-hour aggregates    (terminal, no consolidation config)</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Tiers 1-3 (<code>sensor_5m</code>, <code>sensor_15m</code>, <code>sensor_1h</code>) are auto-created by the cascade engine.
+Each downstream table&#8217;s consolidation interval is derived from the cascade multipliers (default: 3x then 4x).</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_insert_sample_data">Insert Sample Data</h2>
+<div class="sectionbody">
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- RRD Cascading Time-Series Aggregation: Sample Data
+--
+-- Insert 1-second sensor readings. Consolidation triggers automatically
+-- when data timestamps cross 5-minute boundaries.
+
+USE sensors;
+
+-- Sensor 1: temperature readings every second for 10 minutes.
+-- (In production, these would come from the application layer.)
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:01', 22.1);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:02', 22.3);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:03', 22.0);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:30', 22.5);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:00', 23.1);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:30', 23.4);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:02:00', 22.8);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:02:30', 22.6);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:03:00', 22.2);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:03:30', 22.0);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:04:00', 21.8);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:04:30', 21.5);
+
+-- After 300 rows (5 minutes), the first consolidation triggers automatically:
+-- sensor_1s observer detects timestamp crossing the 5m boundary,
+-- runs min/max/avg/stddev over the window, writes result to sensor_5m.
+
+-- Second 5-minute window: 00:05:00 - 00:09:59
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:05:00', 23.0);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:05:30', 23.2);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:06:00', 23.5);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:06:30', 24.0);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:07:00', 24.2);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:07:30', 23.8);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:08:00', 23.5);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:08:30', 23.1);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:09:00', 22.9);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:09:30', 22.7);
+
+-- Sensor 2: pressure readings (different sensor, same cascade).
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:01', 1013.2);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:02', 1013.3);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:03', 1013.1);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:05:00', 1013.5);
+INSERT INTO sensor_1s (sensor_id, ts, value)
+  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:05:30', 1013.7);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>As data timestamps cross 5-minute boundaries, the consolidation observer fires automatically.
+No cron jobs, no external ETL&#8201;&#8212;&#8201;the aggregation runs inline with the write path.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_query_each_tier">Query Each Tier</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_raw_data_1_second_resolution">Raw data (1-second resolution)</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Raw 1-second data (most recent 10 readings).
+SELECT sensor_id, ts, value
+  FROM sensor_1s
+  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+  LIMIT 10;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_5_minute_aggregates">5-minute aggregates</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- 5-minute aggregates.
+SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
+  FROM sensor_5m
+  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+  LIMIT 10;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_15_minute_aggregates">15-minute aggregates</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- 15-minute aggregates.
+SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
+  FROM sensor_15m
+  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+  LIMIT 10;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_1_hour_aggregates">1-hour aggregates</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- 1-hour aggregates.
+SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
+  FROM sensor_1h
+  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+  LIMIT 10;</code></pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_built_in_functions">Built-in Functions</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Ferrosa provides seven built-in consolidation functions.
+See <code>built-in-functions.cql</code> for a complete example of each.</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Function</th>
+<th class="tableblock halign-left valign-top">Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>min</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Lowest value in the window</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>max</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Highest value in the window</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>avg</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Arithmetic mean</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>stddev</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Population standard deviation (Welford&#8217;s online algorithm)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>count</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Number of data points</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sum</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Total of all values</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>median</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Middle value (requires sort, O(n log n))</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>All functions except <code>median</code> are computed in a single pass using Welford&#8217;s online algorithm.
+Median requires a sorted copy of the window values and is computed separately.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_multi_column_composite">Multi-Column Composite</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>When a table has multiple numeric columns, all functions are applied to each column independently:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">    device_id uuid,
+    ts timestamp,
+    temperature double,
+    humidity double,
+    pressure double,
+    PRIMARY KEY (device_id, ts)
+) WITH CLUSTERING ORDER BY (ts DESC)
+  AND extensions = {
+    'consolidation.interval': '5m',
+    'consolidation.functions': 'min,max,avg',
+    'consolidation.target': 'multi_sensor_5m',
+    'consolidation.columns': 'temperature,humidity,pressure'
+  };</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This produces nine output columns (3 columns x 3 functions): <code>temperature_min</code>, <code>temperature_max</code>, <code>temperature_avg</code>, <code>humidity_min</code>, etc.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_custom_wasm_udf">Custom WASM UDF</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>For domain-specific aggregation logic, use a WASM UDF:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">    latency_ms double,
+    PRIMARY KEY (endpoint, ts)
+) WITH CLUSTERING ORDER BY (ts DESC)
+  AND extensions = {
+    'consolidation.interval': '5m',
+    'consolidation.functions': 'avg,median,wasm:sensors.percentile_95',
+    'consolidation.target': 'api_latency_5m',
+    'consolidation.columns': 'latency_ms'
+  };
+
+-- Output table api_latency_5m will have columns:
+--   latency_ms_avg              double   (built-in avg)
+--   latency_ms_median           double   (built-in median)</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The <code>wasm:keyspace.function_name</code> syntax routes the window values to the WASM executor after the built-in accumulator pass completes.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_late_arriving_data">Late-Arriving Data</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Real-world data streams are never perfectly ordered.
+Ferrosa handles late-arriving data with automatic re-aggregation:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:30', 23.5);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>When a data point falls into an already-consolidated window:</p>
+</div>
+<div class="olist arabic">
+<ol class="arabic">
+<li>
+<p>The aggregator detects that the timestamp is before the current boundary.</p>
+</li>
+<li>
+<p>A <code>LateData</code> task is sent to the async worker.</p>
+</li>
+<li>
+<p>The worker reads the full window from disk and re-runs consolidation.</p>
+</li>
+<li>
+<p>The corrected aggregate is upserted into the downstream table.</p>
+</li>
+<li>
+<p>The cascade continues: the upsert triggers the next tier&#8217;s observer.</p>
+</li>
+</ol>
+</div>
+<div class="paragraph">
+<p>Late data is only accepted within the <code>late_window</code> (default: 2x the consolidation interval).
+Multiple late arrivals for the same window are debounced to avoid redundant re-aggregation.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_observability">Observability</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Monitor consolidation health via the virtual table:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM system_observability.consolidation_status;</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This shows per-table metrics:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>windows_consolidated</code>&#8201;&#8212;&#8201;total windows processed.</p>
+</li>
+<li>
+<p><code>late_arrivals</code>&#8201;&#8212;&#8201;late data points detected.</p>
+</li>
+<li>
+<p><code>consolidation_drops</code>&#8201;&#8212;&#8201;tasks dropped due to backpressure (channel full).</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_files_in_this_example">Files in This Example</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">File</th>
+<th class="tableblock halign-left valign-top">Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>schema.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Keyspace and raw table with consolidation extensions</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>data.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sample sensor data for two sensors across two 5-minute windows</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>queries.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Queries against each tier plus observability</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>built-in-functions.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Demonstrates each built-in function individually</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>composite.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Multi-column composite aggregation</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>median.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Median-specific example with latency monitoring</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>custom-wasm-udf.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Custom WASM UDF for 95th percentile</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>late-data.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Late-arriving data and re-aggregation cascade</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+<div id="footer">
+<div id="footer-text">
+Last updated 2026-03-26 20:29:23 -0700
+</div>
+</div>
+</body>
+</html>

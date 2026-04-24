@@ -9,19 +9,59 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use ferrosa_cluster::consistency::ConsistencyLevel;
+use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_schema::{Schema, VirtualTableRegistry};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
-use ferrosa_storage::TableId;
+use ferrosa_storage::{Mutation, TableId};
 
+use crate::adjacency::observer::derive_adjacency_mutations;
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::parser::{Expr, Literal, ReturnClause, ReturnItem, SortDir};
+use crate::parser::{CompareOp, Expr, Literal, ReturnClause, ReturnItem, SortDir};
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
+
+struct MergeWriteShape {
+    key: DecoratedKey,
+    clustering: Vec<u8>,
+    create_cells: Vec<(u16, CellValue)>,
+    used_schema_layout: bool,
+}
+
+struct MatchedTableRow {
+    key: DecoratedKey,
+    clustering: Vec<u8>,
+    json: serde_json::Value,
+}
+
+fn graph_replication_strategy(
+    schema: Option<&Schema>,
+    keyspace: &str,
+) -> Result<ReplicationStrategy> {
+    let Some(schema) = schema else {
+        return Ok(ReplicationStrategy::Simple {
+            replication_factor: 1,
+        });
+    };
+
+    let snap = schema.snapshot();
+    let Some(keyspace_meta) = snap.keyspaces.get(keyspace) else {
+        return Ok(ReplicationStrategy::Simple {
+            replication_factor: 1,
+        });
+    };
+
+    ReplicationStrategy::try_from(&keyspace_meta.replication).map_err(|err| {
+        GraphError::Validation(format!(
+            "invalid replication strategy for keyspace '{keyspace}': {err}"
+        ))
+    })
+}
 
 /// Configuration for the graph query engine (T4 DoS limits).
 #[derive(Debug, Clone)]
@@ -95,7 +135,17 @@ pub async fn execute(
         PhysicalPlan::CreateNodes {
             creates,
             return_clause,
-        } => execute_create(write_path, &creates, return_clause.as_ref(), config, start).await,
+        } => {
+            execute_create(
+                write_path,
+                &creates,
+                return_clause.as_ref(),
+                config,
+                start,
+                schema,
+            )
+            .await
+        }
         PhysicalPlan::SetProperties {
             expand,
             assignments,
@@ -214,6 +264,7 @@ pub async fn execute(
                 return_clause.as_ref(),
                 config,
                 start,
+                schema,
             )
             .await
         }
@@ -233,6 +284,11 @@ async fn execute_expand(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
+    struct ExpandState {
+        current_key: DecoratedKey,
+        bindings: HashMap<String, serde_json::Value>,
+    }
+
     let mut stats = QueryStats::default();
 
     // Step 1: Anchor lookup.
@@ -255,9 +311,24 @@ async fn execute_expand(
         );
     }
 
-    // Storage path: read all partitions from the anchor table.
     let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
-    let anchor_partitions = write_path.range_read(&anchor_table_id).await?;
+    let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
+    let anchor_partitions = if let Some(meta) = anchor_meta.as_ref() {
+        if let Some((key, _clustering)) =
+            build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
+        {
+            let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
+            write_path
+                .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            write_path.range_read(&anchor_table_id).await?
+        }
+    } else {
+        write_path.range_read(&anchor_table_id).await?
+    };
     stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
 
@@ -270,26 +341,57 @@ async fn execute_expand(
     // and no live static row) — these represent deleted vertices whose
     // tombstones have not yet been purged by compaction.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-    let mut current_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
+    let mut current_states: Vec<ExpandState> = Vec::with_capacity(anchor_partitions.len());
     for partition in &anchor_partitions {
         if is_partition_dead(partition) {
             continue;
         }
 
-        let hex_id = hex::encode(partition.key.key.as_bytes());
-        let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
-        let mut bindings = HashMap::new();
-        bindings.insert(anchor_var.to_string(), row_json);
+        if let Some(meta) = anchor_meta.as_ref() {
+            for row in &partition.rows {
+                let row_json = row_to_json(meta, partition, row);
+                if !prop_map_passes(anchor_var, &anchor.props, &row_json)? {
+                    continue;
+                }
 
-        let mut passes = true;
-        for filter in &anchor.filters {
-            if !eval::filter_passes(filter, &bindings)? {
-                passes = false;
-                break;
+                let mut bindings = HashMap::new();
+                bindings.insert(anchor_var.to_string(), row_json);
+
+                let mut passes = true;
+                for filter in &anchor.filters {
+                    if !eval::filter_passes(filter, &bindings)? {
+                        passes = false;
+                        break;
+                    }
+                }
+                if passes {
+                    let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)
+                        .unwrap_or_else(|| partition.key.clone());
+                    current_states.push(ExpandState {
+                        current_key,
+                        bindings,
+                    });
+                }
             }
-        }
-        if passes {
-            current_keys.push(partition.key.clone());
+        } else {
+            let hex_id = hex::encode(partition.key.key.as_bytes());
+            let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
+            let mut bindings = HashMap::new();
+            bindings.insert(anchor_var.to_string(), row_json);
+
+            let mut passes = true;
+            for filter in &anchor.filters {
+                if !eval::filter_passes(filter, &bindings)? {
+                    passes = false;
+                    break;
+                }
+            }
+            if passes {
+                current_states.push(ExpandState {
+                    current_key: partition.key.clone(),
+                    bindings,
+                });
+            }
         }
     }
 
@@ -300,8 +402,9 @@ async fn execute_expand(
     for hop in hops {
         check_timeout(start, config.query_timeout)?;
 
-        let mut next_keys = Vec::new();
-        for vertex_key in &current_keys {
+        let mut next_states = Vec::new();
+        for state in &current_states {
+            let vertex_key = &state.current_key;
             // Read adjacency entries for this vertex.
             let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
             if let Some(partition) = adj_partition {
@@ -309,82 +412,144 @@ async fn execute_expand(
 
                 // If this hop has property filters and an edge table, read
                 // the edge partition once so we can check edge properties.
-                let edge_partition = if !hop.prop_filters.is_empty() {
-                    if let Some(ref et) = hop.edge_table {
-                        let edge_tid = TableId::new(&et.keyspace, &et.table);
-                        write_path.read(&edge_tid, vertex_key).await?
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let edge_meta = hop
+                    .edge_table
+                    .as_ref()
+                    .and_then(|et| table_metadata_for(schema, &et.keyspace, &et.table));
+                let vertex_meta = hop
+                    .vertex_table
+                    .as_ref()
+                    .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
 
                 for row in &partition.rows {
                     if let Some(neighbor_id) =
                         extract_neighbor_id(&row.clustering, hop.edge_label.as_deref())
                     {
+                        let edge_match = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
+                            if let (Some(et), Some(meta)) =
+                                (hop.edge_table.as_ref(), edge_meta.as_ref())
+                            {
+                                let edge_tid = TableId::new(&et.keyspace, &et.table);
+                                find_edge_match(
+                                    write_path,
+                                    &edge_tid,
+                                    meta,
+                                    &state.bindings,
+                                    &hop.prop_filters,
+                                    vertex_key.key.as_bytes(),
+                                    &neighbor_id,
+                                    schema,
+                                )
+                                .await?
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         // Apply property filters if present.
                         if !hop.prop_filters.is_empty()
-                            && !edge_row_passes_filters(
-                                edge_partition.as_ref(),
-                                &neighbor_id,
-                                &hop.prop_filters,
-                            )
+                            && !edge_row_passes_filters(edge_match.as_ref(), &hop.prop_filters)
                         {
                             continue;
                         }
-                        next_keys.push(DecoratedKey::new(ferrosa_common::PartitionKey::new(
-                            neighbor_id,
-                        )));
+
+                        let mut bindings = state.bindings.clone();
+                        let neighbor_key = DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                            neighbor_id.clone(),
+                        ));
+
+                        let mut target_bindings = HashMap::new();
+                        if let Some(var_name) = &hop.var {
+                            if let Some(value) = state.bindings.get(var_name) {
+                                target_bindings.insert(var_name.clone(), value.clone());
+                            }
+                        }
+
+                        let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
+                            hop.vertex_table
+                                .as_ref()
+                                .map(|vt| TableId::new(&vt.keyspace, &vt.table)),
+                            vertex_meta.as_ref(),
+                        ) {
+                            find_vertex_match(
+                                write_path,
+                                &vertex_tid,
+                                meta,
+                                &target_bindings,
+                                &neighbor_id,
+                                hop.target_props.as_slice(),
+                                hop.var.as_deref().unwrap_or("_hop"),
+                                schema,
+                            )
+                            .await?
+                            .map(|matched| matched.json)
+                        } else {
+                            None
+                        };
+
+                        if !hop.target_props.is_empty() && neighbor_json.is_none() {
+                            continue;
+                        }
+
+                        if let Some(var_name) = &hop.var {
+                            bindings.insert(
+                                var_name.clone(),
+                                neighbor_json.unwrap_or_else(|| {
+                                    serde_json::Value::String(hex::encode(&neighbor_id))
+                                }),
+                            );
+                        }
+
+                        if let Some(rel_var) = &hop.rel_var {
+                            let edge_json = edge_binding_json(
+                                row,
+                                edge_match.as_ref(),
+                                hop.edge_label.as_deref(),
+                                vertex_key,
+                                &neighbor_id,
+                            );
+                            bindings.insert(rel_var.clone(), edge_json);
+                        }
+
+                        next_states.push(ExpandState {
+                            current_key: neighbor_key,
+                            bindings,
+                        });
                     }
                 }
 
                 // T4: fan-out limit per hop.
-                if next_keys.len() > config.max_fan_out_per_hop {
+                if next_states.len() > config.max_fan_out_per_hop {
                     return Err(GraphError::ResourceLimit(format!(
                         "fan-out limit exceeded: {} neighbors (limit: {})",
-                        next_keys.len(),
+                        next_states.len(),
                         config.max_fan_out_per_hop
                     )));
                 }
             }
         }
 
-        stats.vertices_read += next_keys.len();
-        current_keys = next_keys;
+        stats.vertices_read += next_states.len();
+        current_states = next_states;
     }
 
     // Step 3: Build result from return clause, projecting property values.
     let columns = build_columns(return_clause);
-    let anchor_table_id_for_proj = TableId::new(&anchor.table.keyspace, &anchor.table.table);
 
     let mut rows = Vec::new();
-    for key in &current_keys {
+    for state in &current_states {
         if rows.len() >= config.max_result_rows {
             break;
         }
 
-        // Read the full partition from storage for property projection.
-        let partition = write_path.read(&anchor_table_id_for_proj, key).await?;
-
-        let hex_id = hex::encode(key.key.as_bytes());
-
-        // Build bindings for eval_expr: the anchor variable maps to the
-        // partition's JSON representation so that RETURN expressions
-        // (arithmetic, function calls, property lookups) all work.
-        let row_json = if let Some(ref part) = partition {
-            eval::partition_to_json(part, &hex_id, &anchor_col_names)
-        } else {
-            serde_json::Value::String(hex_id.clone())
-        };
-        let mut bindings = HashMap::new();
-        bindings.insert(anchor_var.to_string(), row_json);
-
         let row: Vec<serde_json::Value> = return_clause
             .items
             .iter()
-            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
+            .map(|item| {
+                eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
+            })
             .collect();
         rows.push(row);
     }
@@ -419,51 +584,602 @@ async fn execute_expand(
 /// Check whether an edge row passes all property filters.
 ///
 /// Looks up the edge row in the given edge partition by matching the
-/// clustering key to `neighbor_id`. Then for each `(prop_name, expected_expr)`
-/// in `prop_filters`, compares the cell byte value against the expected
-/// literal's byte encoding. Returns `true` only if ALL filters match.
-///
-/// Without schema metadata we cannot map property names to column indices.
-/// As a heuristic, we compare each filter's expected byte value against
-/// every cell in the matching row -- if any cell matches, that filter passes.
-/// A future revision should thread column metadata for exact name-based lookup.
 fn edge_row_passes_filters(
-    edge_partition: Option<&ferrosa_sstable::types::Partition>,
-    neighbor_id: &[u8],
+    edge_match: Option<&MatchedTableRow>,
     prop_filters: &[(String, Expr)],
 ) -> bool {
-    let partition = match edge_partition {
-        Some(p) => p,
-        None => return false, // No edge data available; filter fails.
+    let Some(edge_match) = edge_match else {
+        return false;
     };
+    prop_map_passes("r", prop_filters, &edge_match.json).unwrap_or(false)
+}
 
-    // Find the row whose clustering key matches the neighbor_id (target vertex).
-    let edge_row = partition.rows.iter().find(|r| r.clustering == neighbor_id);
+fn edge_binding_json(
+    adjacency_row: &Row,
+    edge_match: Option<&MatchedTableRow>,
+    edge_label: Option<&str>,
+    src_key: &DecoratedKey,
+    neighbor_id: &[u8],
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "_id".to_string(),
+        serde_json::Value::String(format!(
+            "{}:{}:{}",
+            hex::encode(src_key.key.as_bytes()),
+            edge_label.unwrap_or_default(),
+            hex::encode(neighbor_id)
+        )),
+    );
+    map.insert(
+        "_src".to_string(),
+        serde_json::Value::String(hex::encode(src_key.key.as_bytes())),
+    );
+    map.insert(
+        "_dst".to_string(),
+        serde_json::Value::String(hex::encode(neighbor_id)),
+    );
+    if let Some(label) = edge_label {
+        map.insert(
+            "_type".to_string(),
+            serde_json::Value::String(label.to_string()),
+        );
+    }
 
-    let edge_row = match edge_row {
-        Some(r) => r,
-        None => return false, // No matching edge row found.
-    };
-
-    // Check each property filter.
-    for (_prop_name, expected_expr) in prop_filters {
-        let expected_bytes = match expr_to_bytes(expected_expr) {
-            Ok(b) => b,
-            Err(_) => return false, // Can't evaluate expression; filter fails.
-        };
-
-        // Check if any cell in the row matches the expected bytes.
-        let cell_matches = edge_row
-            .cells
-            .iter()
-            .any(|(_col_idx, cell)| cell.value.as_deref() == Some(expected_bytes.as_slice()));
-
-        if !cell_matches {
-            return false;
+    if let Some(edge_match) = edge_match {
+        if let serde_json::Value::Object(obj) = &edge_match.json {
+            map.extend(obj.clone());
+        }
+    } else {
+        for (col_idx, cell) in &adjacency_row.cells {
+            let value = match &cell.value {
+                Some(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(s) => serde_json::Value::String(s.to_string()),
+                    Err(_) => serde_json::Value::String(hex::encode(bytes)),
+                },
+                None => serde_json::Value::Null,
+            };
+            map.insert(format!("col_{col_idx}"), value);
         }
     }
 
-    true
+    serde_json::Value::Object(map)
+}
+
+fn table_metadata_for(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+) -> Option<ferrosa_schema::metadata::table::TableMetadata> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    snap.tables
+        .get(&(keyspace.to_string(), table.to_string()))
+        .cloned()
+}
+
+fn row_to_json(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    partition: &ferrosa_sstable::types::Partition,
+    row: &Row,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "_id".to_string(),
+        serde_json::Value::String(hex::encode(partition.key.key.as_bytes())),
+    );
+
+    if let Some(components) =
+        decode_partition_components(partition.key.key.as_bytes(), meta.partition_key.len())
+    {
+        for (idx, name) in meta.partition_key.iter().enumerate() {
+            if let (Some(bytes), Some(column)) = (components.get(idx), meta.columns.get(name)) {
+                map.insert(
+                    name.clone(),
+                    decode_bytes_to_json(&column.column_type, bytes.as_slice()),
+                );
+            }
+        }
+    }
+
+    if let Some(components) =
+        decode_clustering_components(&row.clustering, meta.clustering_key.len())
+    {
+        for (idx, (name, _)) in meta.clustering_key.iter().enumerate() {
+            if let (Some(bytes), Some(column)) = (components.get(idx), meta.columns.get(name)) {
+                map.insert(
+                    name.clone(),
+                    decode_bytes_to_json(&column.column_type, bytes.as_slice()),
+                );
+            }
+        }
+    }
+
+    let mut cell_idx = 0u16;
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some((_, cell)) = row.cells.iter().find(|(idx, _)| *idx == cell_idx) {
+                    let value = match &cell.value {
+                        Some(bytes) => decode_bytes_to_json(&column.column_type, bytes),
+                        None => serde_json::Value::Null,
+                    };
+                    map.insert(column.name.clone(), value);
+                }
+                cell_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    serde_json::Value::Object(map)
+}
+
+fn decode_partition_components(key: &[u8], count: usize) -> Option<Vec<Vec<u8>>> {
+    if count == 0 {
+        return Some(vec![]);
+    }
+    if count == 1 {
+        return Some(vec![key.to_vec()]);
+    }
+
+    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > key.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([key[offset], key[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > key.len() {
+            return None;
+        }
+        out.push(key[offset..offset + len].to_vec());
+        offset += len;
+        if offset >= key.len() {
+            return None;
+        }
+        offset += 1;
+    }
+    Some(out)
+}
+
+fn decode_clustering_components(clustering: &[u8], count: usize) -> Option<Vec<Vec<u8>>> {
+    if count == 0 {
+        return Some(vec![]);
+    }
+    if count == 1 {
+        return Some(vec![clustering.to_vec()]);
+    }
+
+    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > clustering.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([clustering[offset], clustering[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > clustering.len() {
+            return None;
+        }
+        out.push(clustering[offset..offset + len].to_vec());
+        offset += len;
+    }
+    Some(out)
+}
+
+fn decode_bytes_to_json(column_type: &str, bytes: &[u8]) -> serde_json::Value {
+    match column_type {
+        "text" | "varchar" | "ascii" => match std::str::from_utf8(bytes) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => serde_json::Value::String(hex::encode(bytes)),
+        },
+        "uuid" => uuid::Uuid::from_slice(bytes)
+            .map(|uuid| serde_json::Value::String(uuid.to_string()))
+            .unwrap_or_else(|_| serde_json::Value::String(hex::encode(bytes))),
+        "int" if bytes.len() == 4 => {
+            serde_json::Value::Number(i32::from_be_bytes(bytes.try_into().unwrap()).into())
+        }
+        "bigint" | "counter" | "timestamp" if bytes.len() == 8 => {
+            let raw = i64::from_be_bytes(bytes.try_into().unwrap());
+            if column_type == "timestamp" {
+                let value = chrono::DateTime::from_timestamp_millis(raw)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| raw.to_string());
+                serde_json::Value::String(value)
+            } else {
+                serde_json::Value::Number(raw.into())
+            }
+        }
+        "float" if bytes.len() == 4 => {
+            serde_json::Number::from_f64(f32::from_be_bytes(bytes.try_into().unwrap()) as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        "double" if bytes.len() == 8 => {
+            serde_json::Number::from_f64(f64::from_be_bytes(bytes.try_into().unwrap()))
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        "boolean" if bytes.len() == 1 => serde_json::Value::Bool(bytes[0] != 0),
+        _ => match std::str::from_utf8(bytes) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => serde_json::Value::String(hex::encode(bytes)),
+        },
+    }
+}
+
+fn prop_map_passes(
+    var_name: &str,
+    props: &[(String, Expr)],
+    row_json: &serde_json::Value,
+) -> Result<bool> {
+    let mut bindings = HashMap::new();
+    bindings.insert(var_name.to_string(), row_json.clone());
+    for (name, expr) in props {
+        let filter = Expr::Comparison {
+            left: Box::new(Expr::Property {
+                var: var_name.to_string(),
+                name: name.clone(),
+            }),
+            op: CompareOp::Eq,
+            right: Box::new(expr.clone()),
+        };
+        if !eval::filter_passes(&filter, &bindings)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn graph_vertex_lookup_key(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    partition: &ferrosa_sstable::types::Partition,
+    row: &Row,
+    props: &[(String, Expr)],
+) -> Option<DecoratedKey> {
+    if meta.partition_key.len() == 1 && meta.clustering_key.is_empty() {
+        return Some(partition.key.clone());
+    }
+
+    if meta.clustering_key.len() == 1 {
+        let bytes = decode_clustering_components(&row.clustering, 1)?
+            .into_iter()
+            .next()?;
+        return Some(DecoratedKey::new(PartitionKey::new(bytes)));
+    }
+
+    let preferred_prop = props
+        .iter()
+        .find(|(name, _)| name == "id" || name.ends_with("_id"))
+        .or_else(|| props.first())?;
+    let column_type = meta.columns.get(&preferred_prop.0)?.column_type.as_str();
+    let bytes = encode_expr_for_column_type(&preferred_prop.1, column_type).ok()?;
+    Some(DecoratedKey::new(PartitionKey::new(bytes)))
+}
+
+fn extract_column_bytes_from_row(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    partition_key: &[u8],
+    row: &Row,
+    column_name: &str,
+) -> Option<Vec<u8>> {
+    let column = meta.columns.get(column_name)?;
+    match column.kind {
+        ferrosa_schema::metadata::column::ColumnKind::PartitionKey => {
+            let idx = meta
+                .partition_key
+                .iter()
+                .position(|name| name == column_name)?;
+            let components = decode_partition_components(partition_key, meta.partition_key.len())?;
+            components.get(idx).cloned()
+        }
+        ferrosa_schema::metadata::column::ColumnKind::Clustering => {
+            let idx = meta
+                .clustering_key
+                .iter()
+                .position(|(name, _)| name == column_name)?;
+            let components =
+                decode_clustering_components(&row.clustering, meta.clustering_key.len())?;
+            components.get(idx).cloned()
+        }
+        ferrosa_schema::metadata::column::ColumnKind::Regular
+        | ferrosa_schema::metadata::column::ColumnKind::Static => {
+            let mut regular_idx = 0u16;
+            for meta_col in meta.columns.values() {
+                match meta_col.kind {
+                    ferrosa_schema::metadata::column::ColumnKind::Regular
+                    | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                        if meta_col.name == column_name {
+                            return row
+                                .cells
+                                .iter()
+                                .find(|(idx, _)| *idx == regular_idx)
+                                .and_then(|(_, cell)| cell.value.clone());
+                        }
+                        regular_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn find_edge_match(
+    write_path: &WritePath,
+    table_id: &TableId,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    bindings: &HashMap<String, serde_json::Value>,
+    prop_filters: &[(String, Expr)],
+    source_id: &[u8],
+    target_id: &[u8],
+    schema: Option<&Schema>,
+) -> Result<Option<MatchedTableRow>> {
+    let Some(source_col) = meta.extensions.get("graph.source") else {
+        return Ok(None);
+    };
+    let Some(target_col) = meta.extensions.get("graph.target") else {
+        return Ok(None);
+    };
+
+    let mut direct_components = HashMap::new();
+    direct_components.insert(source_col.clone(), source_id.to_vec());
+    direct_components.insert(target_col.clone(), target_id.to_vec());
+
+    if let Some((key, clustering)) =
+        build_direct_lookup_shape(meta, bindings, prop_filters, &direct_components)?
+    {
+        let strategy = graph_replication_strategy(schema, &table_id.keyspace)?;
+        if let Some(partition) = write_path
+            .pk_read(table_id, &key, ConsistencyLevel::One, &strategy)
+            .await?
+        {
+            if let Some(row) = partition
+                .rows
+                .iter()
+                .find(|row| row.clustering == clustering)
+            {
+                return Ok(Some(MatchedTableRow {
+                    key: partition.key.clone(),
+                    clustering: row.clustering.clone(),
+                    json: row_to_json(meta, &partition, row),
+                }));
+            }
+        }
+        return Ok(None);
+    }
+
+    for partition in write_path.range_read(table_id).await? {
+        for row in &partition.rows {
+            let row_source =
+                extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, source_col);
+            let row_target =
+                extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, target_col);
+            if row_source.as_deref() == Some(source_id) && row_target.as_deref() == Some(target_id)
+            {
+                return Ok(Some(MatchedTableRow {
+                    key: partition.key.clone(),
+                    clustering: row.clustering.clone(),
+                    json: row_to_json(meta, &partition, row),
+                }));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn find_vertex_match(
+    write_path: &WritePath,
+    table_id: &TableId,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    bindings: &HashMap<String, serde_json::Value>,
+    neighbor_id: &[u8],
+    target_props: &[(String, Expr)],
+    var_name: &str,
+    schema: Option<&Schema>,
+) -> Result<Option<MatchedTableRow>> {
+    if let Some((key, clustering)) =
+        build_direct_lookup_shape(meta, bindings, target_props, &HashMap::new())?
+    {
+        let strategy = graph_replication_strategy(schema, &table_id.keyspace)?;
+        if let Some(partition) = write_path
+            .pk_read(table_id, &key, ConsistencyLevel::One, &strategy)
+            .await?
+        {
+            if let Some(row) = partition
+                .rows
+                .iter()
+                .find(|row| row.clustering == clustering)
+            {
+                let row_json = row_to_json(meta, &partition, row);
+                if prop_map_passes(var_name, target_props, &row_json)?
+                    && graph_vertex_lookup_key(meta, &partition, row, target_props)
+                        .is_some_and(|vertex_key| vertex_key.key.as_bytes() == neighbor_id)
+                {
+                    return Ok(Some(MatchedTableRow {
+                        key: partition.key.clone(),
+                        clustering: row.clustering.clone(),
+                        json: row_json,
+                    }));
+                }
+            }
+        }
+    }
+
+    for partition in write_path.range_read(table_id).await? {
+        if is_partition_dead(&partition) {
+            continue;
+        }
+        for row in &partition.rows {
+            let row_json = row_to_json(meta, &partition, row);
+            if !prop_map_passes(var_name, target_props, &row_json)? {
+                continue;
+            }
+            let Some(vertex_key) = graph_vertex_lookup_key(meta, &partition, row, target_props)
+            else {
+                continue;
+            };
+            if vertex_key.key.as_bytes() == neighbor_id {
+                return Ok(Some(MatchedTableRow {
+                    key: partition.key.clone(),
+                    clustering: row.clustering.clone(),
+                    json: row_json,
+                }));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn build_direct_lookup_shape(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    bindings: &HashMap<String, serde_json::Value>,
+    props: &[(String, Expr)],
+    direct_components: &HashMap<String, Vec<u8>>,
+) -> Result<Option<(DecoratedKey, Vec<u8>)>> {
+    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
+    for column_name in &meta.partition_key {
+        let Some(column) = meta.columns.get(column_name) else {
+            return Ok(None);
+        };
+        let Some(bytes) = resolve_lookup_component(column, bindings, props, direct_components)?
+        else {
+            return Ok(None);
+        };
+        partition_components.push(bytes);
+    }
+
+    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
+    for (column_name, _) in &meta.clustering_key {
+        let Some(column) = meta.columns.get(column_name) else {
+            return Ok(None);
+        };
+        let Some(bytes) = resolve_lookup_component(column, bindings, props, direct_components)?
+        else {
+            return Ok(None);
+        };
+        clustering_components.push(bytes);
+    }
+
+    Ok(Some((
+        DecoratedKey::new(PartitionKey::new(encode_partition_components(
+            &partition_components,
+        ))),
+        encode_clustering_components(&clustering_components),
+    )))
+}
+
+fn resolve_lookup_component(
+    column: &ferrosa_schema::metadata::column::ColumnMetadata,
+    bindings: &HashMap<String, serde_json::Value>,
+    props: &[(String, Expr)],
+    direct_components: &HashMap<String, Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(bytes) = direct_components.get(&column.name) {
+        return Ok(Some(bytes.clone()));
+    }
+
+    if let Some((_, expr)) = props.iter().find(|(name, _)| name == &column.name) {
+        return encode_expr_for_column_type(expr, &column.column_type).map(Some);
+    }
+
+    for value in bindings.values() {
+        let serde_json::Value::Object(map) = value else {
+            continue;
+        };
+        let Some(field) = map.get(&column.name) else {
+            continue;
+        };
+        if let Some(expr) = json_value_to_expr(field) {
+            return encode_expr_for_column_type(&expr, &column.column_type).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+async fn find_table_row_by_props(
+    write_path: &WritePath,
+    table_id: &TableId,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    props: &[(String, Expr)],
+    var_name: &str,
+) -> Result<Option<MatchedTableRow>> {
+    if let Some((key, clustering)) =
+        build_direct_lookup_shape(meta, &HashMap::new(), props, &HashMap::new())?
+    {
+        if let Some(partition) = write_path.read(table_id, &key).await? {
+            if let Some(row) = partition
+                .rows
+                .iter()
+                .find(|row| row.clustering == clustering)
+            {
+                let row_json = row_to_json(meta, &partition, row);
+                if prop_map_passes(var_name, props, &row_json)? {
+                    return Ok(Some(MatchedTableRow {
+                        key: partition.key.clone(),
+                        clustering: row.clustering.clone(),
+                        json: row_json,
+                    }));
+                }
+            }
+        }
+    }
+
+    for partition in write_path.range_read(table_id).await? {
+        if is_partition_dead(&partition) {
+            continue;
+        }
+        for row in &partition.rows {
+            let row_json = row_to_json(meta, &partition, row);
+            if !prop_map_passes(var_name, props, &row_json)? {
+                continue;
+            }
+            return Ok(Some(MatchedTableRow {
+                key: partition.key.clone(),
+                clustering: row.clustering.clone(),
+                json: row_json,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn json_value_to_expr(value: &serde_json::Value) -> Option<Expr> {
+    match value {
+        serde_json::Value::String(s) => Some(Expr::Literal(Literal::String(s.clone()))),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(|i| Expr::Literal(Literal::Integer(i)))
+            .or_else(|| n.as_f64().map(|f| Expr::Literal(Literal::Float(f)))),
+        serde_json::Value::Bool(b) => Some(Expr::Literal(Literal::Bool(*b))),
+        serde_json::Value::Null => Some(Expr::Literal(Literal::Null)),
+        _ => None,
+    }
+}
+
+fn resolve_table_by_graph_label(
+    schema: &Schema,
+    keyspace: &str,
+    label: &str,
+) -> Option<ferrosa_schema::metadata::table::TableMetadata> {
+    let snap = schema.snapshot();
+    snap.tables.values().find_map(|meta| {
+        (meta.keyspace == keyspace
+            && meta
+                .extensions
+                .get("graph.label")
+                .is_some_and(|graph_label| graph_label == label))
+        .then(|| meta.clone())
+    })
 }
 
 /// Convert a `Literal` from the AST into raw bytes for storage.
@@ -503,6 +1219,7 @@ async fn execute_create(
     return_clause: Option<&crate::parser::ReturnClause>,
     _config: &GraphEngineConfig,
     start: Instant,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
     let timestamp = now_micros();
@@ -513,6 +1230,7 @@ async fn execute_create(
 
     for op in creates {
         let table_id = TableId::new(&op.table.keyspace, &op.table.table);
+        let strategy = graph_replication_strategy(schema, &op.table.keyspace)?;
 
         // Generate a unique key for the new vertex/edge using a UUID.
         let key_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
@@ -541,13 +1259,13 @@ async fn execute_create(
             .write(
                 &table_id,
                 &key,
-                row,
+                row.clone(),
                 timestamp,
-                ferrosa_cluster::consistency::ConsistencyLevel::One,
-                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                    replication_factor: 1,
-                },
+                graph_write_consistency(),
+                &strategy,
             )
+            .await?;
+        write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
             .await?;
         stats.vertices_written += 1;
         var_keys.push((op.var.clone(), hex_key));
@@ -617,6 +1335,10 @@ fn content_addressed_key(match_props: &[(String, Expr)]) -> Vec<u8> {
     hasher.finalize().as_bytes().to_vec()
 }
 
+fn graph_write_consistency() -> ConsistencyLevel {
+    ConsistencyLevel::Quorum
+}
+
 /// Execute a MERGE plan: match-or-create with content-addressed deterministic key.
 ///
 /// For each MergeOp (in declaration order, preserving R2 binding dependency):
@@ -634,52 +1356,63 @@ async fn execute_merge(
     _return_clause: Option<&crate::parser::ReturnClause>,
     _config: &GraphEngineConfig,
     start: Instant,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
     let timestamp = now_micros();
+    let strategy = graph_replication_strategy(
+        schema,
+        merges
+            .first()
+            .map(|op| op.table.keyspace.as_str())
+            .unwrap_or_default(),
+    )?;
 
-    // var_name -> (table_id, key) so that SET can locate the written row.
-    let mut var_keys: HashMap<String, (TableId, DecoratedKey)> = HashMap::new();
+    // var_name -> (table_id, key, clustering) so that SET can update the same row
+    // that MERGE created or matched, including edge rows.
+    let mut var_keys: HashMap<String, (TableId, DecoratedKey, Vec<u8>, bool)> = HashMap::new();
+    let mut var_rows: HashMap<String, serde_json::Value> = HashMap::new();
 
     for op in merges {
         // --- Precondition: table must be identified ---
         let table_id = TableId::new(&op.table.keyspace, &op.table.table);
+        let op_set_props: Vec<(String, Expr)> = op
+            .var
+            .as_ref()
+            .map(|var_name| {
+                set_clause
+                    .iter()
+                    .filter(|(var, _, _)| var == var_name)
+                    .map(|(_, property, expr)| (property.clone(), expr.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        // Step 1: derive the partition key.
-        //
-        // For node MergeOps: content_addressed_key(match_props) — unchanged.
-        // For edge MergeOps: content_addressed_key(src_match_props) so the edge
-        // row is stored under the source vertex's partition key, matching what the
-        // hop executor and adjacency observer expect.  The edge's own match_props
-        // drive idempotency (read-before-write) but not the storage location.
-        let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
-            match &op.src_match_props {
-                Some(src_props) => content_addressed_key(src_props),
-                None => {
-                    tracing::error!(
-                        file = file!(),
-                        line = line!(),
-                        table = %op.table.table,
-                        graph_type = %op.table.graph_type,
-                        "execute_merge: edge MergeOp has no src_match_props — \
-                         cannot derive partition key for adjacency index. \
-                         The planner did not thread the source node's props \
-                         into this MergeOp. This is a planner bug."
-                    );
-                    return Err(crate::error::GraphError::Validation(format!(
-                        "execute_merge: edge MergeOp for table '{}' has no \
-                         src_match_props; cannot derive partition key \
-                         (file: {}, line: {})",
-                        op.table.table,
-                        file!(),
-                        line!()
+        let mut shape = build_merge_write_shape(op, &op_set_props, schema, timestamp)?;
+        if !shape.used_schema_layout {
+            if let Some(schema_ref) = schema {
+                if let Some(inferred) = infer_schema_aware_merge_shape(
+                    write_path,
+                    op,
+                    &op_set_props,
+                    schema_ref,
+                    timestamp,
+                    &var_rows,
+                )
+                .await?
+                {
+                    shape = inferred;
+                } else if schema_merge_requires_hidden_key_resolution(op, &op_set_props, schema_ref)
+                {
+                    return Err(GraphError::Validation(format!(
+                        "MERGE on '{}.{}' is missing required scoped key columns; match existing scoped vertices or set the missing key properties explicitly",
+                        op.table.keyspace, op.table.table
                     )));
                 }
             }
-        } else {
-            content_addressed_key(&op.match_props)
-        };
-        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+        }
+        let key = shape.key.clone();
+        let clustering = shape.clustering.clone();
 
         // Step 2: read-before-write — check for existing row.
         let existing = write_path.read(&table_id, &key).await.map_err(|e| {
@@ -692,62 +1425,27 @@ async fn execute_merge(
             );
             e
         })?;
+        let row_exists = existing.as_ref().is_some_and(|partition| {
+            partition
+                .rows
+                .iter()
+                .any(|row| row.clustering == clustering)
+        });
+        let existing_row_json = schema.and_then(|schema_ref| {
+            let meta = table_metadata_for(Some(schema_ref), &op.table.keyspace, &op.table.table)?;
+            let partition = existing.as_ref()?;
+            let row = partition
+                .rows
+                .iter()
+                .find(|row| row.clustering == clustering)?;
+            Some(row_to_json(&meta, partition, row))
+        });
 
-        if existing.is_none() {
+        if !row_exists {
             // Step 3: create arm — use write_path.write() to fire adjacency observer (R3).
-            let all_props: Vec<&(String, Expr)> = op
-                .match_props
-                .iter()
-                .chain(op.create_props.iter())
-                .collect();
-            let cells: Vec<(u16, CellValue)> = all_props
-                .iter()
-                .enumerate()
-                .map(|(idx, (_name, expr))| {
-                    let bytes = expr_to_bytes(expr).unwrap_or_default();
-                    (idx as u16, CellValue::live(bytes, timestamp))
-                })
-                .collect();
-
-            // For edge rows the clustering key must be the destination vertex's
-            // partition key bytes so that `AdjacencyIndexObserver` can read
-            // `row.clustering` as the target vertex ID.  Nodes have no clustering
-            // key (empty vec).
-            //
-            // Fail loud if we see an edge MergeOp without dst_match_props — that
-            // means the planner failed to thread the destination node's props and
-            // we would silently create an invisible edge (the original bug).
-            let clustering: Vec<u8> = if op.table.graph_type == "edge" {
-                match &op.dst_match_props {
-                    Some(dst_props) => content_addressed_key(dst_props),
-                    None => {
-                        tracing::error!(
-                            file = file!(),
-                            line = line!(),
-                            table = %op.table.table,
-                            graph_type = %op.table.graph_type,
-                            "execute_merge: edge MergeOp has no dst_match_props — \
-                             cannot derive clustering key for adjacency index. \
-                             The planner did not thread the destination node's props \
-                             into this MergeOp. This is a planner bug."
-                        );
-                        return Err(crate::error::GraphError::Validation(format!(
-                            "execute_merge: edge MergeOp for table '{}' has no \
-                             dst_match_props; cannot derive clustering key \
-                             (file: {}, line: {})",
-                            op.table.table,
-                            file!(),
-                            line!()
-                        )));
-                    }
-                }
-            } else {
-                vec![]
-            };
-
             let row = Row {
-                clustering,
-                cells,
+                clustering: clustering.clone(),
+                cells: shape.create_cells.clone(),
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
             };
@@ -756,12 +1454,10 @@ async fn execute_merge(
                 .write(
                     &table_id,
                     &key,
-                    row,
+                    row.clone(),
                     timestamp,
-                    ferrosa_cluster::consistency::ConsistencyLevel::One,
-                    &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                        replication_factor: 1,
-                    },
+                    graph_write_consistency(),
+                    &strategy,
                 )
                 .await
                 .map_err(|e| {
@@ -774,19 +1470,42 @@ async fn execute_merge(
                     );
                     e
                 })?;
+            write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
+                .await?;
             stats.vertices_written += 1;
         }
         // Existing row: no create needed, count as read.
         stats.vertices_read += 1;
 
         if let Some(var_name) = &op.var {
-            var_keys.insert(var_name.clone(), (table_id, key));
+            var_keys.insert(
+                var_name.clone(),
+                (table_id, key, clustering, shape.used_schema_layout),
+            );
+            if let Some(row_json) = existing_row_json.or_else(|| {
+                let meta = table_metadata_for(schema, &op.table.keyspace, &op.table.table)?;
+                let row = Row {
+                    clustering: shape.clustering.clone(),
+                    cells: shape.create_cells.clone(),
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+                };
+                let partition = ferrosa_sstable::types::Partition {
+                    key: shape.key.clone(),
+                    deletion: DeletionTime::LIVE,
+                    static_row: None,
+                    rows: vec![row.clone()],
+                };
+                Some(row_to_json(&meta, &partition, &row))
+            }) {
+                var_rows.insert(var_name.clone(), row_json);
+            }
         }
     }
 
     // Step 4: apply trailing SET assignments.
     for (var, property, val_expr) in set_clause {
-        let Some((table_id, key)) = var_keys.get(var) else {
+        let Some((table_id, key, clustering, used_schema_layout)) = var_keys.get(var) else {
             return Err(GraphError::Validation(format!(
                 "execute_merge: SET references variable '{}' which was not bound by any MERGE; \
                  check that the MERGE pattern declares a variable binding \
@@ -797,21 +1516,44 @@ async fn execute_merge(
             )));
         };
 
-        let bytes = expr_to_bytes(val_expr).map_err(|e| {
-            tracing::error!(
-                file = file!(),
-                line = line!(),
-                error = %e,
-                var = %var,
-                property = %property,
-                "execute_merge: SET value evaluation failed"
-            );
-            e
-        })?;
+        let Some(column_idx) = regular_column_index_for_property(
+            schema,
+            table_id.keyspace.as_str(),
+            table_id.table.as_str(),
+            property,
+        ) else {
+            if *used_schema_layout
+                && matches!(
+                    column_kind_for_property(
+                        schema,
+                        table_id.keyspace.as_str(),
+                        table_id.table.as_str(),
+                        property,
+                    ),
+                    Some(
+                        ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                            | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                    )
+                )
+            {
+                continue;
+            }
+            return Err(GraphError::Validation(format!(
+                "execute_merge: SET references unknown property '{}' on table '{}.{}'",
+                property, table_id.keyspace, table_id.table
+            )));
+        };
+        let bytes = encode_property_value_for_table(
+            schema,
+            table_id.keyspace.as_str(),
+            table_id.table.as_str(),
+            property,
+            val_expr,
+        )?;
 
         let update_row = Row {
-            clustering: vec![],
-            cells: vec![(0u16, CellValue::live(bytes, timestamp))],
+            clustering: clustering.clone(),
+            cells: vec![(column_idx, CellValue::live(bytes, timestamp))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::NONE,
         };
@@ -822,10 +1564,8 @@ async fn execute_merge(
                 key,
                 update_row,
                 timestamp,
-                ferrosa_cluster::consistency::ConsistencyLevel::One,
-                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                    replication_factor: 1,
-                },
+                graph_write_consistency(),
+                &strategy,
             )
             .await
             .map_err(|e| {
@@ -853,6 +1593,675 @@ async fn execute_merge(
         ))]],
         stats,
     })
+}
+
+async fn write_explicit_adjacency_entries(
+    write_path: &WritePath,
+    table_id: &TableId,
+    key: &DecoratedKey,
+    row: &Row,
+    timestamp: i64,
+    schema: Option<&Schema>,
+) -> Result<()> {
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+
+    let mutation = Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        key.clone(),
+        vec![row.clone()],
+        timestamp,
+    );
+
+    for derived in derive_adjacency_mutations(schema, table_id, &mutation) {
+        let adj_table_id = TableId::new(&derived.keyspace, &derived.table);
+        let strategy = graph_replication_strategy(Some(schema), &derived.keyspace)?;
+        for derived_row in derived.rows {
+            write_path
+                .write(
+                    &adj_table_id,
+                    &derived.key,
+                    derived_row,
+                    derived.timestamp,
+                    graph_write_consistency(),
+                    &strategy,
+                )
+                .await
+                .map_err(|e| {
+                    GraphError::Storage(ferrosa_common::Error::InvalidData(format!(
+                        "failed to write derived adjacency row for {}.{}: {e}",
+                        table_id.keyspace, table_id.table
+                    )))
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_merge_write_shape(
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: Option<&Schema>,
+    timestamp: i64,
+) -> Result<MergeWriteShape> {
+    if let Some(shape) = build_schema_aware_merge_shape(op, set_props, schema, timestamp)? {
+        return Ok(shape);
+    }
+
+    let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
+        match &op.src_match_props {
+            Some(src_props) => content_addressed_key(src_props),
+            None => {
+                tracing::error!(
+                    file = file!(),
+                    line = line!(),
+                    table = %op.table.table,
+                    graph_type = %op.table.graph_type,
+                    "execute_merge: edge MergeOp has no src_match_props — \
+                     cannot derive partition key for adjacency index. \
+                     The planner did not thread the source node's props \
+                     into this MergeOp. This is a planner bug."
+                );
+                return Err(crate::error::GraphError::Validation(format!(
+                    "execute_merge: edge MergeOp for table '{}' has no \
+                     src_match_props; cannot derive partition key \
+                     (file: {}, line: {})",
+                    op.table.table,
+                    file!(),
+                    line!()
+                )));
+            }
+        }
+    } else {
+        content_addressed_key(&op.match_props)
+    };
+
+    let clustering: Vec<u8> = if op.table.graph_type == "edge" {
+        match &op.dst_match_props {
+            Some(dst_props) => content_addressed_key(dst_props),
+            None => {
+                tracing::error!(
+                    file = file!(),
+                    line = line!(),
+                    table = %op.table.table,
+                    graph_type = %op.table.graph_type,
+                    "execute_merge: edge MergeOp has no dst_match_props — \
+                     cannot derive clustering key for adjacency index. \
+                     The planner did not thread the destination node's props \
+                     into this MergeOp. This is a planner bug."
+                );
+                return Err(crate::error::GraphError::Validation(format!(
+                    "execute_merge: edge MergeOp for table '{}' has no \
+                     dst_match_props; cannot derive clustering key \
+                     (file: {}, line: {})",
+                    op.table.table,
+                    file!(),
+                    line!()
+                )));
+            }
+        }
+    } else {
+        vec![]
+    };
+
+    let create_cells: Vec<(u16, CellValue)> = op
+        .match_props
+        .iter()
+        .chain(op.create_props.iter())
+        .enumerate()
+        .map(|(idx, (_name, expr))| {
+            let bytes = expr_to_bytes(expr).unwrap_or_default();
+            (idx as u16, CellValue::live(bytes, timestamp))
+        })
+        .collect();
+
+    Ok(MergeWriteShape {
+        key: DecoratedKey::new(PartitionKey::new(key_bytes)),
+        clustering,
+        create_cells,
+        used_schema_layout: false,
+    })
+}
+
+fn build_schema_aware_merge_shape(
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: Option<&Schema>,
+    timestamp: i64,
+) -> Result<Option<MergeWriteShape>> {
+    let Some(schema) = schema else {
+        return Ok(None);
+    };
+    let snap = schema.snapshot();
+    let Some(meta) = snap
+        .tables
+        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
+    else {
+        return Ok(None);
+    };
+
+    let mut property_exprs: HashMap<String, Expr> = HashMap::new();
+    for (name, expr) in op.match_props.iter().chain(op.create_props.iter()) {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+    for (name, expr) in set_props {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+
+    if op.table.graph_type == "edge" {
+        if let Some(source_col) = meta.extensions.get("graph.source") {
+            if !property_exprs.contains_key(source_col) {
+                if let Some(source_type) = meta
+                    .columns
+                    .get(source_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.src_match_props.as_deref(),
+                        source_col,
+                        source_type,
+                    ) {
+                        property_exprs.insert(source_col.clone(), expr);
+                    }
+                }
+            }
+        }
+        if let Some(target_col) = meta.extensions.get("graph.target") {
+            if !property_exprs.contains_key(target_col) {
+                if let Some(target_type) = meta
+                    .columns
+                    .get(target_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.dst_match_props.as_deref(),
+                        target_col,
+                        target_type,
+                    ) {
+                        property_exprs.insert(target_col.clone(), expr);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
+    for pk_name in &meta.partition_key {
+        let Some(expr) = property_exprs.get(pk_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(pk_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        partition_components.push(bytes);
+    }
+
+    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
+    for (ck_name, _) in &meta.clustering_key {
+        let Some(expr) = property_exprs.get(ck_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(ck_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        clustering_components.push(bytes);
+    }
+
+    let partition_key = encode_partition_components(&partition_components);
+    let clustering = encode_clustering_components(&clustering_components);
+    let mut create_cells = Vec::new();
+    let mut regular_idx = 0u16;
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some(expr) = property_exprs.get(&column.name) {
+                    let bytes = encode_expr_for_column_type(expr, &column.column_type)?;
+                    create_cells.push((regular_idx, CellValue::live(bytes, timestamp)));
+                }
+                regular_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Some(MergeWriteShape {
+        key: DecoratedKey::new(PartitionKey::new(partition_key)),
+        clustering,
+        create_cells,
+        used_schema_layout: true,
+    }))
+}
+
+async fn infer_schema_aware_merge_shape(
+    write_path: &WritePath,
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: &Schema,
+    timestamp: i64,
+    bound_rows: &HashMap<String, serde_json::Value>,
+) -> Result<Option<MergeWriteShape>> {
+    let snap = schema.snapshot();
+    let Some(meta) = snap
+        .tables
+        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+
+    let mut property_exprs: HashMap<String, Expr> = HashMap::new();
+    for (name, expr) in op.match_props.iter().chain(op.create_props.iter()) {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+    for (name, expr) in set_props {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+
+    if op.table.graph_type == "edge" {
+        if let Some(source_col) = meta.extensions.get("graph.source") {
+            if !property_exprs.contains_key(source_col) {
+                if let Some(source_type) = meta
+                    .columns
+                    .get(source_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.src_match_props.as_deref(),
+                        source_col,
+                        source_type,
+                    ) {
+                        property_exprs.insert(source_col.clone(), expr);
+                    }
+                }
+            }
+        }
+        if let Some(target_col) = meta.extensions.get("graph.target") {
+            if !property_exprs.contains_key(target_col) {
+                if let Some(target_type) = meta
+                    .columns
+                    .get(target_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.dst_match_props.as_deref(),
+                        target_col,
+                        target_type,
+                    ) {
+                        property_exprs.insert(target_col.clone(), expr);
+                    }
+                }
+            }
+        }
+
+        let mut source_json = if let Some(var_name) = op.src_var.as_ref() {
+            bound_rows.get(var_name).cloned()
+        } else {
+            None
+        };
+        if source_json.is_none() {
+            if let (Some(source_label), Some(source_props)) = (
+                meta.extensions.get("graph.source_label"),
+                op.src_match_props.as_deref(),
+            ) {
+                if let Some(source_meta) =
+                    resolve_table_by_graph_label(schema, &op.table.keyspace, source_label)
+                {
+                    let source_tid = TableId::new(&source_meta.keyspace, &source_meta.name);
+                    source_json = find_table_row_by_props(
+                        write_path,
+                        &source_tid,
+                        &source_meta,
+                        source_props,
+                        "src",
+                    )
+                    .await
+                    .map(|row| row.map(|row| row.json))?;
+                }
+            }
+        }
+        let mut target_json = if let Some(var_name) = op.dst_var.as_ref() {
+            bound_rows.get(var_name).cloned()
+        } else {
+            None
+        };
+        if target_json.is_none() {
+            if let (Some(target_label), Some(target_props)) = (
+                meta.extensions.get("graph.target_label"),
+                op.dst_match_props.as_deref(),
+            ) {
+                if let Some(target_meta) =
+                    resolve_table_by_graph_label(schema, &op.table.keyspace, target_label)
+                {
+                    let target_tid = TableId::new(&target_meta.keyspace, &target_meta.name);
+                    target_json = find_table_row_by_props(
+                        write_path,
+                        &target_tid,
+                        &target_meta,
+                        target_props,
+                        "dst",
+                    )
+                    .await
+                    .map(|row| row.map(|row| row.json))?;
+                }
+            }
+        }
+
+        for key_name in meta
+            .partition_key
+            .iter()
+            .chain(meta.clustering_key.iter().map(|(name, _)| name))
+        {
+            if property_exprs.contains_key(key_name) {
+                continue;
+            }
+
+            let source_value = source_json
+                .as_ref()
+                .and_then(|row| row.get(key_name))
+                .and_then(json_value_to_expr);
+            let target_value = target_json
+                .as_ref()
+                .and_then(|row| row.get(key_name))
+                .and_then(json_value_to_expr);
+
+            let inferred = match (source_value, target_value) {
+                (Some(src), Some(dst)) if src == dst => Some(src),
+                (Some(src), None) => Some(src),
+                (None, Some(dst)) => Some(dst),
+                _ => None,
+            };
+            if let Some(expr) = inferred {
+                property_exprs.insert(key_name.clone(), expr);
+            }
+        }
+    } else {
+        let table_tid = TableId::new(&meta.keyspace, &meta.name);
+        if let Some(existing) =
+            find_table_row_by_props(write_path, &table_tid, &meta, &op.match_props, "n").await?
+        {
+            return Ok(Some(MergeWriteShape {
+                key: existing.key,
+                clustering: existing.clustering,
+                create_cells: vec![],
+                used_schema_layout: true,
+            }));
+        }
+    }
+
+    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
+    for pk_name in &meta.partition_key {
+        let Some(expr) = property_exprs.get(pk_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(pk_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        partition_components.push(bytes);
+    }
+
+    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
+    for (ck_name, _) in &meta.clustering_key {
+        let Some(expr) = property_exprs.get(ck_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(ck_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        clustering_components.push(bytes);
+    }
+
+    let partition_key = encode_partition_components(&partition_components);
+    let clustering = encode_clustering_components(&clustering_components);
+    let mut create_cells = Vec::new();
+    let mut regular_idx = 0u16;
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some(expr) = property_exprs.get(&column.name) {
+                    let bytes = encode_expr_for_column_type(expr, &column.column_type)?;
+                    create_cells.push((regular_idx, CellValue::live(bytes, timestamp)));
+                }
+                regular_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Some(MergeWriteShape {
+        key: DecoratedKey::new(PartitionKey::new(partition_key)),
+        clustering,
+        create_cells,
+        used_schema_layout: true,
+    }))
+}
+
+fn schema_merge_requires_hidden_key_resolution(
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: &Schema,
+) -> bool {
+    let snap = schema.snapshot();
+    let Some(meta) = snap
+        .tables
+        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
+    else {
+        return false;
+    };
+
+    let mut property_names: std::collections::HashSet<String> = op
+        .match_props
+        .iter()
+        .chain(op.create_props.iter())
+        .map(|(name, _)| name.clone())
+        .collect();
+    property_names.extend(set_props.iter().map(|(name, _)| name.clone()));
+
+    if op.table.graph_type == "edge" {
+        if let Some(source_col) = meta.extensions.get("graph.source") {
+            if let Some(source_type) = meta
+                .columns
+                .get(source_col)
+                .map(|col| col.column_type.as_str())
+            {
+                if resolve_endpoint_property_expr(
+                    op.src_match_props.as_deref(),
+                    source_col,
+                    source_type,
+                )
+                .is_some()
+                {
+                    property_names.insert(source_col.clone());
+                }
+            }
+        }
+        if let Some(target_col) = meta.extensions.get("graph.target") {
+            if let Some(target_type) = meta
+                .columns
+                .get(target_col)
+                .map(|col| col.column_type.as_str())
+            {
+                if resolve_endpoint_property_expr(
+                    op.dst_match_props.as_deref(),
+                    target_col,
+                    target_type,
+                )
+                .is_some()
+                {
+                    property_names.insert(target_col.clone());
+                }
+            }
+        }
+    }
+
+    let mut saw_present = false;
+    let mut saw_missing = false;
+    for name in meta
+        .partition_key
+        .iter()
+        .chain(meta.clustering_key.iter().map(|(name, _)| name))
+    {
+        if property_names.contains(name) {
+            saw_present = true;
+        } else {
+            saw_missing = true;
+        }
+    }
+
+    saw_present && saw_missing
+}
+
+fn resolve_endpoint_property_expr(
+    endpoint_props: Option<&[(String, Expr)]>,
+    target_column: &str,
+    target_column_type: &str,
+) -> Option<Expr> {
+    let props = endpoint_props?;
+
+    if let Some((_, expr)) = props.iter().find(|(name, _)| name == target_column) {
+        return Some(expr.clone());
+    }
+
+    if props.len() == 1 && try_encode_expr_for_column_type(&props[0].1, target_column_type).is_ok()
+    {
+        return Some(props[0].1.clone());
+    }
+
+    props
+        .iter()
+        .find(|(name, expr)| {
+            name.ends_with("_id")
+                && try_encode_expr_for_column_type(expr, target_column_type).is_ok()
+        })
+        .map(|(_, expr)| expr.clone())
+}
+
+fn encode_partition_components(components: &[Vec<u8>]) -> Vec<u8> {
+    if components.len() == 1 {
+        return components[0].clone();
+    }
+
+    let mut buf = Vec::new();
+    for component in components {
+        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        buf.extend_from_slice(component);
+        buf.push(0x00);
+    }
+    buf
+}
+
+fn encode_clustering_components(components: &[Vec<u8>]) -> Vec<u8> {
+    if components.len() == 1 {
+        return components[0].clone();
+    }
+
+    let mut buf = Vec::new();
+    for component in components {
+        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        buf.extend_from_slice(component);
+    }
+    buf
+}
+
+fn encode_property_value_for_table(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+    expr: &Expr,
+) -> Result<Vec<u8>> {
+    if let Some(column_type) = column_type_for_property(schema, keyspace, table, property) {
+        return encode_expr_for_column_type(expr, &column_type);
+    }
+
+    expr_to_bytes(expr)
+}
+
+fn try_encode_expr_for_column_type(
+    expr: &Expr,
+    column_type: &str,
+) -> std::result::Result<Vec<u8>, GraphError> {
+    encode_expr_for_column_type(expr, column_type)
+}
+
+fn encode_expr_for_column_type(expr: &Expr, column_type: &str) -> Result<Vec<u8>> {
+    let lower = column_type.to_ascii_lowercase();
+    match expr {
+        Expr::Literal(Literal::String(s)) if lower == "uuid" || lower.ends_with("uuidtype") => {
+            let uuid = uuid::Uuid::parse_str(s).map_err(|e| {
+                GraphError::Validation(format!("invalid UUID literal '{s}' for {column_type}: {e}"))
+            })?;
+            Ok(uuid.as_bytes().to_vec())
+        }
+        Expr::Literal(Literal::String(s))
+            if lower == "text"
+                || lower == "varchar"
+                || lower.ends_with("utf8type")
+                || lower.ends_with("asciitype") =>
+        {
+            Ok(s.as_bytes().to_vec())
+        }
+        Expr::Literal(Literal::String(s))
+            if lower == "timestamp" || lower.ends_with("timestamptype") =>
+        {
+            let ms = chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| {
+                    GraphError::Validation(format!("invalid timestamp literal '{s}': {e}"))
+                })?
+                .timestamp_millis();
+            Ok(ms.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i))
+            if lower == "timestamp" || lower.ends_with("timestamptype") =>
+        {
+            Ok(i.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Float(f)) if lower == "double" || lower.ends_with("doubletype") => {
+            Ok(f.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i))
+            if lower == "double" || lower.ends_with("doubletype") =>
+        {
+            Ok((*i as f64).to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Float(f)) if lower == "float" || lower.ends_with("floattype") => {
+            Ok((*f as f32).to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i)) if lower == "float" || lower.ends_with("floattype") => {
+            Ok((*i as f32).to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i)) if lower == "int" || lower.ends_with("int32type") => {
+            let value = i32::try_from(*i).map_err(|_| {
+                GraphError::Validation(format!("integer literal {i} does not fit in int"))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i))
+            if lower == "bigint" || lower == "long" || lower.ends_with("longtype") =>
+        {
+            Ok(i.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Bool(b)) if lower == "boolean" || lower.ends_with("booleantype") => {
+            Ok(vec![u8::from(*b)])
+        }
+        _ => expr_to_bytes(expr),
+    }
 }
 
 /// Execute a SET plan: run the expand to find matching vertices, then write
@@ -883,6 +2292,7 @@ async fn execute_set(
     stats.edges_read = expand_result.stats.edges_read;
 
     let timestamp = now_micros();
+    let strategy = graph_replication_strategy(schema, keyspace)?;
 
     // For each matched vertex, apply the assignments.
     // The expand result rows contain vertex IDs (hex-encoded).
@@ -934,10 +2344,8 @@ async fn execute_set(
                         &key,
                         update_row,
                         timestamp,
-                        ferrosa_cluster::consistency::ConsistencyLevel::One,
-                        &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                            replication_factor: 1,
-                        },
+                        graph_write_consistency(),
+                        &strategy,
                     )
                     .await?;
                 stats.vertices_written += 1;
@@ -990,6 +2398,7 @@ async fn execute_delete(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32;
+    let strategy = graph_replication_strategy(schema, keyspace)?;
 
     // For each matched vertex in the specified variables, write a tombstone.
     for row_values in &expand_result.rows {
@@ -1038,10 +2447,8 @@ async fn execute_delete(
                         &key,
                         tombstone_row,
                         timestamp,
-                        ferrosa_cluster::consistency::ConsistencyLevel::One,
-                        &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                            replication_factor: 1,
-                        },
+                        graph_write_consistency(),
+                        &strategy,
                     )
                     .await?;
                 stats.vertices_deleted += 1;
@@ -1451,6 +2858,58 @@ pub fn column_names_for_table(schema: Option<&Schema>, keyspace: &str, table: &s
         .unwrap_or_default()
 }
 
+fn regular_column_index_for_property(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+) -> Option<u16> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    let meta = snap
+        .tables
+        .get(&(keyspace.to_string(), table.to_string()))?;
+
+    meta.columns
+        .values()
+        .filter(|col| {
+            col.kind == ferrosa_schema::metadata::column::ColumnKind::Regular
+                || col.kind == ferrosa_schema::metadata::column::ColumnKind::Static
+        })
+        .enumerate()
+        .find_map(|(idx, col)| (col.name == property).then_some(idx as u16))
+}
+
+fn column_kind_for_property(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+) -> Option<ferrosa_schema::metadata::column::ColumnKind> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    let meta = snap
+        .tables
+        .get(&(keyspace.to_string(), table.to_string()))?;
+    meta.columns.get(property).map(|col| col.kind)
+}
+
+fn column_type_for_property(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+) -> Option<String> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    let meta = snap
+        .tables
+        .get(&(keyspace.to_string(), table.to_string()))?;
+    meta.columns
+        .get(property)
+        .map(|col| col.column_type.clone())
+}
+
 /// Extract the neighbor ID from an adjacency row's clustering key.
 ///
 /// Clustering format (standard composite, per SSTable writer's multi-column
@@ -1552,13 +3011,20 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 mod tests {
     use super::*;
 
+    use crate::adjacency::observer::make_adjacency_mutation;
+    use crate::adjacency::schema::adjacency_table_metadata;
+    use indexmap::IndexMap;
     use std::sync::Arc;
 
+    use ferrosa_common::schema::TableSchema;
     use ferrosa_common::CellValue;
     use ferrosa_common::DataType;
+    use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+    use ferrosa_schema::metadata::table::{TableFlag, TableMetadata, TableParams};
     use ferrosa_schema::virtual_table::{
         RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
     };
+    use std::collections::{HashMap, HashSet};
 
     /// A test virtual table that returns a fixed set of rows.
     #[derive(Debug)]
@@ -1620,6 +3086,7 @@ mod tests {
                     graph_type: "vertex".to_string(),
                     label: "Connections".to_string(),
                 },
+                props: vec![],
                 filters: vec![],
             },
             hops: vec![],
@@ -1630,6 +3097,629 @@ mod tests {
                 limit: None,
             },
         }
+    }
+
+    fn test_column(
+        name: &str,
+        kind: ColumnKind,
+        position: i32,
+        column_type: &str,
+        clustering_order: ClusteringOrder,
+    ) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.to_string(),
+            kind,
+            position,
+            column_type: column_type.to_string(),
+            clustering_order,
+            mask: None,
+        }
+    }
+
+    fn scoped_entity_meta() -> TableMetadata {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "tenant_id".to_string(),
+            test_column(
+                "tenant_id",
+                ColumnKind::PartitionKey,
+                0,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "session_id".to_string(),
+            test_column(
+                "session_id",
+                ColumnKind::PartitionKey,
+                1,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "entity_id".to_string(),
+            test_column(
+                "entity_id",
+                ColumnKind::Clustering,
+                0,
+                "uuid",
+                ClusteringOrder::Asc,
+            ),
+        );
+        columns.insert(
+            "name".to_string(),
+            test_column(
+                "name",
+                ColumnKind::Regular,
+                0,
+                "text",
+                ClusteringOrder::None,
+            ),
+        );
+        TableMetadata {
+            keyspace: "agent_memory".to_string(),
+            name: "entity_store".to_string(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["tenant_id".to_string(), "session_id".to_string()],
+            clustering_key: vec![("entity_id".to_string(), ClusteringOrder::Asc)],
+            params: TableParams::default(),
+            flags: HashSet::from([TableFlag::Compound]),
+            extensions: HashMap::new(),
+            is_system: false,
+        }
+    }
+
+    fn scoped_typed_edge_meta() -> TableMetadata {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "tenant_id".to_string(),
+            test_column(
+                "tenant_id",
+                ColumnKind::PartitionKey,
+                0,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "session_id".to_string(),
+            test_column(
+                "session_id",
+                ColumnKind::PartitionKey,
+                1,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "src_id".to_string(),
+            test_column(
+                "src_id",
+                ColumnKind::Clustering,
+                0,
+                "uuid",
+                ClusteringOrder::Asc,
+            ),
+        );
+        columns.insert(
+            "edge_type".to_string(),
+            test_column(
+                "edge_type",
+                ColumnKind::Clustering,
+                1,
+                "text",
+                ClusteringOrder::Asc,
+            ),
+        );
+        columns.insert(
+            "dst_id".to_string(),
+            test_column(
+                "dst_id",
+                ColumnKind::Clustering,
+                2,
+                "uuid",
+                ClusteringOrder::Asc,
+            ),
+        );
+        columns.insert(
+            "weight".to_string(),
+            test_column(
+                "weight",
+                ColumnKind::Regular,
+                0,
+                "double",
+                ClusteringOrder::None,
+            ),
+        );
+        TableMetadata {
+            keyspace: "agent_memory".to_string(),
+            name: "typed_edges".to_string(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["tenant_id".to_string(), "session_id".to_string()],
+            clustering_key: vec![
+                ("src_id".to_string(), ClusteringOrder::Asc),
+                ("edge_type".to_string(), ClusteringOrder::Asc),
+                ("dst_id".to_string(), ClusteringOrder::Asc),
+            ],
+            params: TableParams::default(),
+            flags: HashSet::from([TableFlag::Compound]),
+            extensions: HashMap::from([
+                ("graph.source".to_string(), "src_id".to_string()),
+                ("graph.target".to_string(), "dst_id".to_string()),
+            ]),
+            is_system: false,
+        }
+    }
+
+    fn register_scoped_entity_storage_schema(storage: &ferrosa_storage::StorageEngine) {
+        storage
+            .register_table(TableSchema {
+                keyspace: "agent_memory".to_string(),
+                table: "entity_store".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+                extensions: HashMap::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn build_direct_lookup_shape_uses_scoped_bindings_for_vertex_rows() {
+        let meta = scoped_entity_meta();
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let entity_id = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "a".to_string(),
+            serde_json::json!({
+                "tenant_id": tenant_id.to_string(),
+                "session_id": session_id.to_string()
+            }),
+        );
+
+        let props = vec![(
+            "entity_id".to_string(),
+            Expr::Literal(Literal::String(entity_id.to_string())),
+        )];
+
+        let (key, clustering) =
+            build_direct_lookup_shape(&meta, &bindings, &props, &HashMap::new())
+                .unwrap()
+                .expect("scoped bindings should produce a direct vertex lookup");
+
+        assert_eq!(
+            key.key.as_bytes(),
+            encode_partition_components(&[
+                tenant_id.as_bytes().to_vec(),
+                session_id.as_bytes().to_vec(),
+            ])
+        );
+        assert_eq!(clustering, entity_id.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn build_direct_lookup_shape_uses_scope_and_edge_components_for_edge_rows() {
+        let meta = scoped_typed_edge_meta();
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let src_id = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let dst_id = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "a".to_string(),
+            serde_json::json!({
+                "tenant_id": tenant_id.to_string(),
+                "session_id": session_id.to_string()
+            }),
+        );
+
+        let props = vec![(
+            "edge_type".to_string(),
+            Expr::Literal(Literal::String("related_to".to_string())),
+        )];
+        let direct = HashMap::from([
+            ("src_id".to_string(), src_id.as_bytes().to_vec()),
+            ("dst_id".to_string(), dst_id.as_bytes().to_vec()),
+        ]);
+
+        let (key, clustering) = build_direct_lookup_shape(&meta, &bindings, &props, &direct)
+            .unwrap()
+            .expect("scoped bindings should produce a direct edge lookup");
+
+        assert_eq!(
+            key.key.as_bytes(),
+            encode_partition_components(&[
+                tenant_id.as_bytes().to_vec(),
+                session_id.as_bytes().to_vec(),
+            ])
+        );
+        assert_eq!(
+            clustering,
+            encode_clustering_components(&[
+                src_id.as_bytes().to_vec(),
+                b"related_to".to_vec(),
+                dst_id.as_bytes().to_vec(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn infer_schema_aware_merge_shape_uses_bound_vertex_rows_for_scoped_edge_merges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+        register_scoped_entity_storage_schema(&storage);
+
+        let schema = Arc::new(
+            Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let auth = ferrosa_schema::auth::role::AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        schema
+            .create_keyspace(
+                ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                    name: "agent_memory".to_string(),
+                    durable_writes: true,
+                    replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: HashMap::from([(
+                            "replication_factor".to_string(),
+                            "1".to_string(),
+                        )]),
+                    },
+                },
+                &auth,
+            )
+            .unwrap();
+        schema.create_table(scoped_entity_meta(), &auth).unwrap();
+        schema
+            .create_table(scoped_typed_edge_meta(), &auth)
+            .unwrap();
+
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let src_id = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let dst_id = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+        let write_path = ferrosa_cluster::write_path::WritePath::direct(storage);
+
+        let op = MergeOp {
+            var: Some("r".to_string()),
+            table: crate::planner::ResolvedTable {
+                keyspace: "agent_memory".to_string(),
+                table: "typed_edges".to_string(),
+                label: "TYPED_EDGE".to_string(),
+                graph_type: "edge".to_string(),
+            },
+            match_props: vec![(
+                "edge_type".to_string(),
+                Expr::Literal(Literal::String("related_to".to_string())),
+            )],
+            create_props: vec![],
+            src_match_props: Some(vec![(
+                "entity_id".to_string(),
+                Expr::Literal(Literal::String(src_id.to_string())),
+            )]),
+            src_var: Some("a".to_string()),
+            dst_match_props: Some(vec![(
+                "entity_id".to_string(),
+                Expr::Literal(Literal::String(dst_id.to_string())),
+            )]),
+            dst_var: Some("b".to_string()),
+        };
+
+        let bound_rows = HashMap::from([
+            (
+                "a".to_string(),
+                serde_json::json!({
+                    "tenant_id": tenant_id.to_string(),
+                    "session_id": session_id.to_string(),
+                    "entity_id": src_id.to_string(),
+                }),
+            ),
+            (
+                "b".to_string(),
+                serde_json::json!({
+                    "tenant_id": tenant_id.to_string(),
+                    "session_id": session_id.to_string(),
+                    "entity_id": dst_id.to_string(),
+                }),
+            ),
+        ]);
+
+        let shape = infer_schema_aware_merge_shape(
+            &write_path,
+            &op,
+            &[("weight".to_string(), Expr::Literal(Literal::Float(1.0)))],
+            &schema,
+            1000,
+            &bound_rows,
+        )
+        .await
+        .unwrap()
+        .expect("bound node rows should infer the scoped typed edge shape");
+
+        let partition_key = encode_partition_components(&[
+            tenant_id.as_bytes().to_vec(),
+            session_id.as_bytes().to_vec(),
+        ]);
+        assert!(
+            shape.key.key.as_bytes() == partition_key,
+            "inferred edge partition key should reuse tenant/session from bound vertices"
+        );
+        assert_eq!(
+            shape.clustering,
+            encode_clustering_components(&[
+                src_id.as_bytes().to_vec(),
+                b"related_to".to_vec(),
+                dst_id.as_bytes().to_vec(),
+            ]),
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_merge_writes_adjacency_rows_without_registered_observer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let auth = ferrosa_schema::auth::role::AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        let user_ks = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: "agent_memory".to_string(),
+            durable_writes: true,
+            replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+        schema.create_keyspace(user_ks.clone(), &auth).unwrap();
+        schema
+            .create_keyspace(
+                ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                    name: adjacency_keyspace_name("agent_memory"),
+                    ..user_ks
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let mut entity_meta = scoped_entity_meta();
+        entity_meta
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        entity_meta
+            .extensions
+            .insert("graph.label".to_string(), "Entity".to_string());
+        let mut edge_meta = scoped_typed_edge_meta();
+        edge_meta
+            .extensions
+            .insert("graph.type".to_string(), "edge".to_string());
+        edge_meta
+            .extensions
+            .insert("graph.label".to_string(), "TYPED_EDGE".to_string());
+        edge_meta
+            .extensions
+            .insert("graph.source_label".to_string(), "Entity".to_string());
+        edge_meta
+            .extensions
+            .insert("graph.target_label".to_string(), "Entity".to_string());
+        let adjacency_meta = adjacency_table_metadata("agent_memory");
+        schema.create_table(entity_meta.clone(), &auth).unwrap();
+        schema.create_table(edge_meta.clone(), &auth).unwrap();
+        schema.create_table(adjacency_meta.clone(), &auth).unwrap();
+        storage
+            .register_table(entity_meta.to_storage_schema())
+            .unwrap();
+        storage
+            .register_table(edge_meta.to_storage_schema())
+            .unwrap();
+        storage
+            .register_table(adjacency_meta.to_storage_schema())
+            .unwrap();
+
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let src_id = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let dst_id = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+        let entity_tid = TableId::new("agent_memory", "entity_store");
+        let partition_key = encode_partition_components(&[
+            tenant_id.as_bytes().to_vec(),
+            session_id.as_bytes().to_vec(),
+        ]);
+        let src_row = Row {
+            clustering: encode_clustering_components(&[src_id.as_bytes().to_vec()]),
+            cells: vec![(0, CellValue::live(b"src".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        let dst_row = Row {
+            clustering: encode_clustering_components(&[dst_id.as_bytes().to_vec()]),
+            cells: vec![(0, CellValue::live(b"dst".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        storage
+            .write(
+                &entity_tid,
+                &DecoratedKey::new(PartitionKey::new(partition_key.clone())),
+                src_row,
+                1000,
+            )
+            .unwrap();
+        storage
+            .write(
+                &entity_tid,
+                &DecoratedKey::new(PartitionKey::new(partition_key)),
+                dst_row,
+                1000,
+            )
+            .unwrap();
+
+        let merges = vec![
+            MergeOp {
+                var: Some("a".to_string()),
+                table: crate::planner::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "entity_store".to_string(),
+                    label: "Entity".to_string(),
+                    graph_type: "vertex".to_string(),
+                },
+                match_props: vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(src_id.to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: None,
+                src_var: None,
+                dst_match_props: None,
+                dst_var: None,
+            },
+            MergeOp {
+                var: Some("b".to_string()),
+                table: crate::planner::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "entity_store".to_string(),
+                    label: "Entity".to_string(),
+                    graph_type: "vertex".to_string(),
+                },
+                match_props: vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(dst_id.to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: None,
+                src_var: None,
+                dst_match_props: None,
+                dst_var: None,
+            },
+            MergeOp {
+                var: Some("r".to_string()),
+                table: crate::planner::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "typed_edges".to_string(),
+                    label: "TYPED_EDGE".to_string(),
+                    graph_type: "edge".to_string(),
+                },
+                match_props: vec![(
+                    "edge_type".to_string(),
+                    Expr::Literal(Literal::String("implements".to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(src_id.to_string())),
+                )]),
+                src_var: Some("a".to_string()),
+                dst_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(dst_id.to_string())),
+                )]),
+                dst_var: Some("b".to_string()),
+            },
+        ];
+
+        let write_path = ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage));
+        execute_merge(
+            &write_path,
+            &merges,
+            &[(
+                "r".to_string(),
+                "weight".to_string(),
+                Expr::Literal(Literal::Float(1.0)),
+            )],
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            Some(&schema),
+        )
+        .await
+        .unwrap();
+
+        let adj_tid = TableId::new(adjacency_keyspace_name("agent_memory"), "adjacency");
+        let src_adj = write_path
+            .read(
+                &adj_tid,
+                &DecoratedKey::new(PartitionKey::new(src_id.as_bytes().to_vec())),
+            )
+            .await
+            .unwrap()
+            .expect("source adjacency partition should exist immediately after merge");
+        let dst_adj = write_path
+            .read(
+                &adj_tid,
+                &DecoratedKey::new(PartitionKey::new(dst_id.as_bytes().to_vec())),
+            )
+            .await
+            .unwrap()
+            .expect("target adjacency partition should exist immediately after merge");
+
+        let expected_out = make_adjacency_mutation(
+            &adjacency_keyspace_name("agent_memory"),
+            src_id.as_bytes(),
+            crate::adjacency::schema::DIRECTION_OUT,
+            "TYPED_EDGE",
+            dst_id.as_bytes(),
+            "agent_memory.typed_edges",
+            0,
+        );
+        let expected_in = make_adjacency_mutation(
+            &adjacency_keyspace_name("agent_memory"),
+            dst_id.as_bytes(),
+            crate::adjacency::schema::DIRECTION_IN,
+            "TYPED_EDGE",
+            src_id.as_bytes(),
+            "agent_memory.typed_edges",
+            0,
+        );
+
+        assert!(
+            src_adj
+                .rows
+                .iter()
+                .any(|row| row.clustering == expected_out.rows[0].clustering),
+            "source adjacency should contain OUT entry for merged edge"
+        );
+        assert!(
+            dst_adj
+                .rows
+                .iter()
+                .any(|row| row.clustering == expected_in.rows[0].clustering),
+            "target adjacency should contain IN entry for merged edge"
+        );
     }
 
     #[tokio::test]
@@ -1960,6 +4050,61 @@ mod tests {
         Arc::new(ferrosa_storage::StorageEngine::new(config, None).unwrap())
     }
 
+    fn test_schema() -> Schema {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+            RateLimitConfig, SchemaConfig, TestAuditSink,
+        };
+
+        Schema::new(SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn graph_replication_strategy_defaults_to_rf1_without_schema() {
+        let strategy = graph_replication_strategy(None, "agent_memory").unwrap();
+        match strategy {
+            ReplicationStrategy::Simple { replication_factor } => {
+                assert_eq!(replication_factor, 1);
+            }
+            other => panic!("expected SimpleStrategy fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_replication_strategy_uses_keyspace_replication() {
+        use ferrosa_schema::metadata::keyspace::ReplicationParams;
+        use ferrosa_schema::KeyspaceMetadata;
+
+        let schema = test_schema();
+        schema
+            .create_keyspace_internal(KeyspaceMetadata {
+                name: "agent_memory".into(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), "3".into())].into(),
+                },
+            })
+            .unwrap();
+
+        let strategy = graph_replication_strategy(Some(&schema), "agent_memory").unwrap();
+        match strategy {
+            ReplicationStrategy::Simple { replication_factor } => {
+                assert_eq!(replication_factor, 3);
+            }
+            other => panic!("expected SimpleStrategy, got {other:?}"),
+        }
+    }
+
     #[test]
     fn extract_neighbor_id_basic() {
         // Build a clustering key: direction=0, label="KNOWS", neighbor_id=[1,2,3]
@@ -2240,6 +4385,7 @@ mod tests {
                     graph_type: "vertex".to_string(),
                     label: "Person".to_string(),
                 },
+                props: vec![],
                 filters: vec![],
             },
             hops: vec![],
@@ -2268,5 +4414,10 @@ mod tests {
         assert_eq!(result.columns, vec!["count(*)"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], serde_json::json!(3u64));
+    }
+
+    #[test]
+    fn graph_write_consistency_is_quorum() {
+        assert_eq!(graph_write_consistency(), ConsistencyLevel::Quorum);
     }
 }

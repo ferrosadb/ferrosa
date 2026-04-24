@@ -8,7 +8,6 @@
 <title>3-Node Cluster Setup</title>
 <link rel="stylesheet" href="./theme/ferrosa.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
-<link rel="stylesheet" href="./rouge-github.css">
 <link rel="icon" type="image/svg+xml" href="../favicon.svg">
 </head>
 <body class="article toc2 toc-left">
@@ -76,6 +75,18 @@
 </tr>
 </table>
 </div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-tip" title="Tip"></i>
+</td>
+<td class="content">
+Need one cluster to serve both host clients and in-network container clients? See <code>docker-compose.mixed-clients.yml</code> in this directory. It shows the supported split-address pattern with <code>FERROSA_CQL_BROADCAST</code>, <code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code>, and fixed internal node addresses.
+</td>
+</tr>
+</table>
+</div>
 </div>
 </div>
 <div class="sect1">
@@ -137,11 +148,11 @@
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker <span class="nt">--version</span>
-<span class="c"># Docker version 27.x.x, build xxxxxxx</span>
+<pre class="rouge highlight"><code data-lang="bash">docker --version
+# Docker version 27.x.x, build xxxxxxx
 
 docker compose version
-<span class="c"># Docker Compose version v2.x.x</span></code></pre>
+# Docker Compose version v2.x.x</code></pre>
 </div>
 </div>
 <div class="admonitionblock note">
@@ -172,7 +183,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash"><span class="nb">mkdir </span>ferrosa-cluster <span class="o">&amp;&amp;</span> <span class="nb">cd </span>ferrosa-cluster</code></pre>
+<pre class="rouge highlight"><code data-lang="bash">mkdir ferrosa-cluster &amp;&amp; cd ferrosa-cluster</code></pre>
 </div>
 </div>
 </div>
@@ -183,174 +194,174 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="yaml"><span class="c1"># docker-compose.yml — 3-node Ferrosa cluster with S3-compatible storage</span>
-<span class="c1"># Run with: docker compose up -d</span>
+<pre class="rouge highlight"><code data-lang="yaml"># docker-compose.yml — 3-node Ferrosa cluster with S3-compatible storage
+# Run with: docker compose up -d
 
-<span class="na">services</span><span class="pi">:</span>
+services:
 
-  <span class="c1"># ── Volume permissions (RustFS runs as UID 10001) ──</span>
-  <span class="na">volume-permissions</span><span class="pi">:</span>
-    <span class="na">image</span><span class="pi">:</span> <span class="s">alpine</span>
-    <span class="na">volumes</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s">rustfs-data:/data</span>
-    <span class="na">command</span><span class="pi">:</span> <span class="pi">&gt;</span>
-      <span class="s">sh -c "chown -R 10001:10001 /data &amp;&amp; echo 'permissions fixed'"</span>
-    <span class="na">restart</span><span class="pi">:</span> <span class="s2">"</span><span class="s">no"</span>
+  # ── Volume permissions (RustFS runs as UID 10001) ──
+  volume-permissions:
+    image: alpine
+    volumes:
+      - rustfs-data:/data
+    command: &gt;
+      sh -c "chown -R 10001:10001 /data &amp;&amp; echo 'permissions fixed'"
+    restart: "no"
 
-  <span class="c1"># ── S3-compatible object store (RustFS) ──</span>
-  <span class="na">rustfs</span><span class="pi">:</span>
-    <span class="na">image</span><span class="pi">:</span> <span class="s">rustfs/rustfs:latest</span>
-    <span class="na">depends_on</span><span class="pi">:</span>
-      <span class="na">volume-permissions</span><span class="pi">:</span>
-        <span class="na">condition</span><span class="pi">:</span> <span class="s">service_completed_successfully</span>
-    <span class="na">environment</span><span class="pi">:</span>
-      <span class="na">RUSTFS_VOLUMES</span><span class="pi">:</span> <span class="s">/data/rustfs0</span>
-      <span class="na">RUSTFS_ADDRESS</span><span class="pi">:</span> <span class="s2">"</span><span class="s">0.0.0.0:9000"</span>
-      <span class="na">RUSTFS_CONSOLE_ADDRESS</span><span class="pi">:</span> <span class="s2">"</span><span class="s">0.0.0.0:9001"</span>
-      <span class="na">RUSTFS_CONSOLE_ENABLE</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">RUSTFS_ACCESS_KEY</span><span class="pi">:</span> <span class="s">rustfsadmin</span>
-      <span class="na">RUSTFS_SECRET_KEY</span><span class="pi">:</span> <span class="s">rustfsadmin</span>  <span class="c1"># pragma: allowlist secret</span>
-    <span class="na">volumes</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s">rustfs-data:/data</span>
-    <span class="na">healthcheck</span><span class="pi">:</span>
-      <span class="na">test</span><span class="pi">:</span> <span class="pi">[</span><span class="s2">"</span><span class="s">CMD"</span><span class="pi">,</span> <span class="s2">"</span><span class="s">curl"</span><span class="pi">,</span> <span class="s2">"</span><span class="s">-f"</span><span class="pi">,</span> <span class="s2">"</span><span class="s">http://127.0.0.1:9000/health"</span><span class="pi">]</span>
-      <span class="na">interval</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">timeout</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">retries</span><span class="pi">:</span> <span class="m">10</span>
-      <span class="na">start_period</span><span class="pi">:</span> <span class="s">10s</span>
+  # ── S3-compatible object store (RustFS) ──
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-  <span class="c1"># ── Create the S3 bucket on first run ──</span>
-  <span class="na">rustfs-init</span><span class="pi">:</span>
-    <span class="na">image</span><span class="pi">:</span> <span class="s">minio/mc</span>
-    <span class="na">depends_on</span><span class="pi">:</span>
-      <span class="na">rustfs</span><span class="pi">:</span>
-        <span class="na">condition</span><span class="pi">:</span> <span class="s">service_healthy</span>
-    <span class="na">entrypoint</span><span class="pi">:</span> <span class="pi">&gt;</span>
-      <span class="s">sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &amp;&amp;</span>
-             <span class="s">mc mb local/ferrosa --ignore-existing &amp;&amp;</span>
-             <span class="s">echo 'bucket ferrosa ready'"</span>
-    <span class="na">restart</span><span class="pi">:</span> <span class="s2">"</span><span class="s">no"</span>
+  # ── Create the S3 bucket on first run ──
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: &gt;
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &amp;&amp;
+             mc mb local/ferrosa --ignore-existing &amp;&amp;
+             echo 'bucket ferrosa ready'"
+    restart: "no"
 
-  <span class="c1"># ── Node 1 (seed node) ──</span>
-  <span class="na">node1</span><span class="pi">:</span>
-    <span class="na">build</span><span class="pi">:</span>
-      <span class="na">context</span><span class="pi">:</span> <span class="s">../../</span>
-      <span class="na">dockerfile</span><span class="pi">:</span> <span class="s">Dockerfile</span>
-    <span class="na">depends_on</span><span class="pi">:</span>
-      <span class="na">rustfs-init</span><span class="pi">:</span>
-        <span class="na">condition</span><span class="pi">:</span> <span class="s">service_completed_successfully</span>
-    <span class="na">ports</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">9042:9042"</span>    <span class="c1"># CQL</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">9090:9090"</span>    <span class="c1"># Web console</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">7474:7474"</span>    <span class="c1"># Graph</span>
-    <span class="na">environment</span><span class="pi">:</span>
-      <span class="na">FERROSA_HOST_ID</span><span class="pi">:</span> <span class="s">11111111-1111-1111-1111-111111111111</span>
-      <span class="na">FERROSA_DATA_DIR</span><span class="pi">:</span> <span class="s">/var/lib/ferrosa</span>
-      <span class="na">FERROSA_AUTH_DISABLED</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_CQL_BIND</span><span class="pi">:</span> <span class="s">0.0.0.0:9042</span>
-      <span class="na">FERROSA_WEB_BIND</span><span class="pi">:</span> <span class="s">0.0.0.0:9090</span>
-      <span class="na">FERROSA_CLUSTER_NAME</span><span class="pi">:</span> <span class="s">ferrosa-tutorial</span>
-      <span class="na">FERROSA_CLUSTER_MODE</span><span class="pi">:</span> <span class="s">standalone</span>
-      <span class="na">FERROSA_GRAPH_ENABLED</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_S3_ENDPOINT</span><span class="pi">:</span> <span class="s">http://rustfs:9000</span>
-      <span class="na">FERROSA_S3_BUCKET</span><span class="pi">:</span> <span class="s">ferrosa</span>
-      <span class="na">FERROSA_S3_REGION</span><span class="pi">:</span> <span class="s">us-east-1</span>
-      <span class="na">FERROSA_S3_ACCESS_KEY_ID</span><span class="pi">:</span> <span class="s">rustfsadmin</span>
-      <span class="na">FERROSA_S3_SECRET_ACCESS_KEY</span><span class="pi">:</span> <span class="s">rustfsadmin</span>  <span class="c1"># pragma: allowlist secret</span>
-      <span class="na">FERROSA_S3_ALLOW_HTTP</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_S3_PREFIX</span><span class="pi">:</span> <span class="s">node1</span>
-    <span class="na">volumes</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s">node1-data:/var/lib/ferrosa</span>
-    <span class="na">healthcheck</span><span class="pi">:</span>
-      <span class="na">test</span><span class="pi">:</span> <span class="pi">[</span><span class="s2">"</span><span class="s">CMD-SHELL"</span><span class="pi">,</span> <span class="s2">"</span><span class="s">bash</span><span class="nv"> </span><span class="s">-c</span><span class="nv"> </span><span class="s">'&lt;/dev/tcp/127.0.0.1/9042'</span><span class="nv"> </span><span class="s">||</span><span class="nv"> </span><span class="s">exit</span><span class="nv"> </span><span class="s">1"</span><span class="pi">]</span>
-      <span class="na">interval</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">timeout</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">retries</span><span class="pi">:</span> <span class="m">30</span>
-      <span class="na">start_period</span><span class="pi">:</span> <span class="s">15s</span>
+  # ── Node 1 (seed node) ──
+  node1:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "9042:9042"    # CQL
+      - "9090:9090"    # Web console
+      - "7474:7474"    # Graph
+    environment:
+      FERROSA_HOST_ID: 11111111-1111-1111-1111-111111111111
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-tutorial
+      FERROSA_CLUSTER_MODE: standalone
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node1
+    volumes:
+      - node1-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '&lt;/dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 
-  <span class="c1"># ── Node 2 ──</span>
-  <span class="na">node2</span><span class="pi">:</span>
-    <span class="na">build</span><span class="pi">:</span>
-      <span class="na">context</span><span class="pi">:</span> <span class="s">../../</span>
-      <span class="na">dockerfile</span><span class="pi">:</span> <span class="s">Dockerfile</span>
-    <span class="na">depends_on</span><span class="pi">:</span>
-      <span class="na">node1</span><span class="pi">:</span>
-        <span class="na">condition</span><span class="pi">:</span> <span class="s">service_healthy</span>
-    <span class="na">ports</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">9043:9042"</span>    <span class="c1"># CQL</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">9091:9090"</span>    <span class="c1"># Web console</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">7475:7474"</span>    <span class="c1"># Graph</span>
-    <span class="na">environment</span><span class="pi">:</span>
-      <span class="na">FERROSA_HOST_ID</span><span class="pi">:</span> <span class="s">22222222-2222-2222-2222-222222222222</span>
-      <span class="na">FERROSA_DATA_DIR</span><span class="pi">:</span> <span class="s">/var/lib/ferrosa</span>
-      <span class="na">FERROSA_AUTH_DISABLED</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_CQL_BIND</span><span class="pi">:</span> <span class="s">0.0.0.0:9042</span>
-      <span class="na">FERROSA_WEB_BIND</span><span class="pi">:</span> <span class="s">0.0.0.0:9090</span>
-      <span class="na">FERROSA_CLUSTER_NAME</span><span class="pi">:</span> <span class="s">ferrosa-tutorial</span>
-      <span class="na">FERROSA_CLUSTER_MODE</span><span class="pi">:</span> <span class="s">pair</span>
-      <span class="na">FERROSA_SEED</span><span class="pi">:</span> <span class="s">node1:7000</span>
-      <span class="na">FERROSA_GRAPH_ENABLED</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_S3_ENDPOINT</span><span class="pi">:</span> <span class="s">http://rustfs:9000</span>
-      <span class="na">FERROSA_S3_BUCKET</span><span class="pi">:</span> <span class="s">ferrosa</span>
-      <span class="na">FERROSA_S3_REGION</span><span class="pi">:</span> <span class="s">us-east-1</span>
-      <span class="na">FERROSA_S3_ACCESS_KEY_ID</span><span class="pi">:</span> <span class="s">rustfsadmin</span>
-      <span class="na">FERROSA_S3_SECRET_ACCESS_KEY</span><span class="pi">:</span> <span class="s">rustfsadmin</span>  <span class="c1"># pragma: allowlist secret</span>
-      <span class="na">FERROSA_S3_ALLOW_HTTP</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_S3_PREFIX</span><span class="pi">:</span> <span class="s">node2</span>
-    <span class="na">volumes</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s">node2-data:/var/lib/ferrosa</span>
-    <span class="na">healthcheck</span><span class="pi">:</span>
-      <span class="na">test</span><span class="pi">:</span> <span class="pi">[</span><span class="s2">"</span><span class="s">CMD-SHELL"</span><span class="pi">,</span> <span class="s2">"</span><span class="s">bash</span><span class="nv"> </span><span class="s">-c</span><span class="nv"> </span><span class="s">'&lt;/dev/tcp/127.0.0.1/9042'</span><span class="nv"> </span><span class="s">||</span><span class="nv"> </span><span class="s">exit</span><span class="nv"> </span><span class="s">1"</span><span class="pi">]</span>
-      <span class="na">interval</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">timeout</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">retries</span><span class="pi">:</span> <span class="m">30</span>
-      <span class="na">start_period</span><span class="pi">:</span> <span class="s">15s</span>
+  # ── Node 2 ──
+  node2:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "9043:9042"    # CQL
+      - "9091:9090"    # Web console
+      - "7475:7474"    # Graph
+    environment:
+      FERROSA_HOST_ID: 22222222-2222-2222-2222-222222222222
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-tutorial
+      FERROSA_CLUSTER_MODE: pair
+      FERROSA_SEED: node1:7000
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node2
+    volumes:
+      - node2-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '&lt;/dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 
-  <span class="c1"># ── Node 3 ──</span>
-  <span class="na">node3</span><span class="pi">:</span>
-    <span class="na">build</span><span class="pi">:</span>
-      <span class="na">context</span><span class="pi">:</span> <span class="s">../../</span>
-      <span class="na">dockerfile</span><span class="pi">:</span> <span class="s">Dockerfile</span>
-    <span class="na">depends_on</span><span class="pi">:</span>
-      <span class="na">node1</span><span class="pi">:</span>
-        <span class="na">condition</span><span class="pi">:</span> <span class="s">service_healthy</span>
-      <span class="na">node2</span><span class="pi">:</span>
-        <span class="na">condition</span><span class="pi">:</span> <span class="s">service_healthy</span>
-    <span class="na">ports</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">9044:9042"</span>    <span class="c1"># CQL</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">9092:9090"</span>    <span class="c1"># Web console</span>
-      <span class="pi">-</span> <span class="s2">"</span><span class="s">7476:7474"</span>    <span class="c1"># Graph</span>
-    <span class="na">environment</span><span class="pi">:</span>
-      <span class="na">FERROSA_HOST_ID</span><span class="pi">:</span> <span class="s">33333333-3333-3333-3333-333333333333</span>
-      <span class="na">FERROSA_DATA_DIR</span><span class="pi">:</span> <span class="s">/var/lib/ferrosa</span>
-      <span class="na">FERROSA_AUTH_DISABLED</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_CQL_BIND</span><span class="pi">:</span> <span class="s">0.0.0.0:9042</span>
-      <span class="na">FERROSA_WEB_BIND</span><span class="pi">:</span> <span class="s">0.0.0.0:9090</span>
-      <span class="na">FERROSA_CLUSTER_NAME</span><span class="pi">:</span> <span class="s">ferrosa-tutorial</span>
-      <span class="na">FERROSA_CLUSTER_MODE</span><span class="pi">:</span> <span class="s">cluster</span>
-      <span class="na">FERROSA_SEED</span><span class="pi">:</span> <span class="s">node1:7000</span>
-      <span class="na">FERROSA_GRAPH_ENABLED</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_S3_ENDPOINT</span><span class="pi">:</span> <span class="s">http://rustfs:9000</span>
-      <span class="na">FERROSA_S3_BUCKET</span><span class="pi">:</span> <span class="s">ferrosa</span>
-      <span class="na">FERROSA_S3_REGION</span><span class="pi">:</span> <span class="s">us-east-1</span>
-      <span class="na">FERROSA_S3_ACCESS_KEY_ID</span><span class="pi">:</span> <span class="s">rustfsadmin</span>
-      <span class="na">FERROSA_S3_SECRET_ACCESS_KEY</span><span class="pi">:</span> <span class="s">rustfsadmin</span>  <span class="c1"># pragma: allowlist secret</span>
-      <span class="na">FERROSA_S3_ALLOW_HTTP</span><span class="pi">:</span> <span class="s2">"</span><span class="s">true"</span>
-      <span class="na">FERROSA_S3_PREFIX</span><span class="pi">:</span> <span class="s">node3</span>
-    <span class="na">volumes</span><span class="pi">:</span>
-      <span class="pi">-</span> <span class="s">node3-data:/var/lib/ferrosa</span>
-    <span class="na">healthcheck</span><span class="pi">:</span>
-      <span class="na">test</span><span class="pi">:</span> <span class="pi">[</span><span class="s2">"</span><span class="s">CMD-SHELL"</span><span class="pi">,</span> <span class="s2">"</span><span class="s">bash</span><span class="nv"> </span><span class="s">-c</span><span class="nv"> </span><span class="s">'&lt;/dev/tcp/127.0.0.1/9042'</span><span class="nv"> </span><span class="s">||</span><span class="nv"> </span><span class="s">exit</span><span class="nv"> </span><span class="s">1"</span><span class="pi">]</span>
-      <span class="na">interval</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">timeout</span><span class="pi">:</span> <span class="s">5s</span>
-      <span class="na">retries</span><span class="pi">:</span> <span class="m">30</span>
-      <span class="na">start_period</span><span class="pi">:</span> <span class="s">15s</span>
+  # ── Node 3 ──
+  node3:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    ports:
+      - "9044:9042"    # CQL
+      - "9092:9090"    # Web console
+      - "7476:7474"    # Graph
+    environment:
+      FERROSA_HOST_ID: 33333333-3333-3333-3333-333333333333
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-tutorial
+      FERROSA_CLUSTER_MODE: cluster
+      FERROSA_SEED: node1:7000
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node3
+    volumes:
+      - node3-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '&lt;/dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 
-<span class="na">volumes</span><span class="pi">:</span>
-  <span class="na">rustfs-data</span><span class="pi">:</span>
-  <span class="na">node1-data</span><span class="pi">:</span>
-  <span class="na">node2-data</span><span class="pi">:</span>
-  <span class="na">node3-data</span><span class="pi">:</span></code></pre>
+volumes:
+  rustfs-data:
+  node1-data:
+  node2-data:
+  node3-data:</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -374,6 +385,9 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 <p><strong>node3</strong>&#8201;&#8212;&#8201;The third node triggers the transition to full <code>cluster</code> mode with Raft consensus.</p>
 </li>
 </ul>
+</div>
+<div class="paragraph">
+<p>If your deployment needs host clients to use <code>127.0.0.1:1904x</code> while in-network clients use container addresses like <code>172.28.0.x:9042</code>, start from <code>docker-compose.mixed-clients.yml</code> instead of the simpler file above.</p>
 </div>
 <div class="admonitionblock note">
 <table>
@@ -400,7 +414,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose up <span class="nt">-d</span></code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -414,7 +428,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose logs <span class="nt">-f</span> node1 node2 node3</code></pre>
+<pre class="rouge highlight"><code data-lang="bash">docker compose logs -f node1 node2 node3</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -452,15 +466,6 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </table>
 </div>
 </div>
-<div class="sect2">
-<h3 id="_pair_mode_write_durability">Pair Mode Write Durability</h3>
-<div class="paragraph">
-<p>In pair mode, writes are confirmed to the client only after both the primary and secondary replica acknowledge the mutation. If the secondary is unreachable, the write returns an error rather than silently succeeding on only one node. This prevents data loss when the primary crashes before replicating an acknowledged write.</p>
-</div>
-<div class="paragraph">
-<p>The S3 manifest uses compare-and-swap operations to prevent concurrent flush or compaction updates from silently overwriting each other.</p>
-</div>
-</div>
 </div>
 </div>
 <div class="sect1">
@@ -476,7 +481,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">curl http://localhost:9090/api/cluster/status | python3 <span class="nt">-m</span> json.tool</code></pre>
+<pre class="rouge highlight"><code data-lang="bash">curl http://localhost:9090/api/cluster/status | python3 -m json.tool</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -584,7 +589,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">pip <span class="nb">install </span>cqlsh</code></pre>
+<pre class="rouge highlight"><code data-lang="bash">pip install cqlsh</code></pre>
 </div>
 </div>
 </div>
@@ -609,15 +614,15 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Verify cluster is responsive</span>
-<span class="k">SELECT</span> <span class="n">cluster_name</span><span class="p">,</span> <span class="n">data_center</span> <span class="k">FROM</span> <span class="k">system</span><span class="p">.</span><span class="k">local</span><span class="p">;</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="k">system</span><span class="p">.</span><span class="n">peers</span><span class="p">;</span>
+<pre class="rouge highlight"><code data-lang="sql">-- Verify cluster is responsive
+SELECT cluster_name, data_center FROM system.local;
+SELECT * FROM system.peers;
 
-<span class="c1">-- Create test keyspace and verify replication</span>
-<span class="k">CREATE</span> <span class="n">KEYSPACE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">setup_test</span> <span class="k">WITH</span> <span class="n">replication</span> <span class="o">=</span> <span class="p">{</span><span class="s1">'class'</span><span class="p">:</span> <span class="s1">'SimpleStrategy'</span><span class="p">,</span> <span class="s1">'replication_factor'</span><span class="p">:</span> <span class="mi">3</span><span class="p">};</span>
-<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">setup_test</span><span class="p">.</span><span class="n">hello</span> <span class="p">(</span><span class="n">id</span> <span class="nb">int</span> <span class="k">PRIMARY</span> <span class="k">KEY</span><span class="p">,</span> <span class="n">message</span> <span class="nb">text</span><span class="p">);</span>
-<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">setup_test</span><span class="p">.</span><span class="n">hello</span> <span class="p">(</span><span class="n">id</span><span class="p">,</span> <span class="n">message</span><span class="p">)</span> <span class="k">VALUES</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="s1">'Hello from Ferrosa!'</span><span class="p">);</span>
-<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">setup_test</span><span class="p">.</span><span class="n">hello</span><span class="p">;</span></code></pre>
+-- Create test keyspace and verify replication
+CREATE KEYSPACE IF NOT EXISTS setup_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
+CREATE TABLE IF NOT EXISTS setup_test.hello (id int PRIMARY KEY, message text);
+INSERT INTO setup_test.hello (id, message) VALUES (1, 'Hello from Ferrosa!');
+SELECT * FROM setup_test.hello;</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -648,7 +653,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql"><span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">setup_test</span><span class="p">.</span><span class="n">hello</span><span class="p">;</span></code></pre>
+<pre class="rouge highlight"><code data-lang="sql">SELECT * FROM setup_test.hello;</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -713,19 +718,19 @@ Leave this cluster running as you work through the tutorials. Each tutorial crea
 <h3 id="_useful_commands_for_managing_your_cluster">Useful commands for managing your cluster</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash"><span class="c"># Stop the cluster (preserves data)</span>
+<pre class="rouge highlight"><code data-lang="bash"># Stop the cluster (preserves data)
 docker compose stop
 
-<span class="c"># Start it again</span>
+# Start it again
 docker compose start
 
-<span class="c"># Stop and remove everything (deletes all data)</span>
-docker compose down <span class="nt">-v</span>
+# Stop and remove everything (deletes all data)
+docker compose down -v
 
-<span class="c"># View logs for a specific node</span>
-docker compose logs <span class="nt">-f</span> node2
+# View logs for a specific node
+docker compose logs -f node2
 
-<span class="c"># Restart a single node</span>
+# Restart a single node
 docker compose restart node3</code></pre>
 </div>
 </div>
@@ -735,7 +740,7 @@ docker compose restart node3</code></pre>
 </div>
 <div id="footer">
 <div id="footer-text">
-Last updated 2026-03-18 22:08:59 UTC
+Last updated 2026-04-21 09:16:42 -0700
 </div>
 </div>
 </body>

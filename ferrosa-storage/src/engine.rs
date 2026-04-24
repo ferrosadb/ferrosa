@@ -358,6 +358,9 @@ pub struct StorageEngine {
     config: StorageEngineConfig,
     tables: RwLock<HashMap<TableId, TableState>>,
     pub(crate) commit_log: CommitLog,
+    /// Commitlog mutations replayed before their table schema is registered.
+    /// These are applied lazily when the table is later registered.
+    deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
     compaction_executor: CompactionExecutor,
     upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
@@ -468,6 +471,7 @@ impl StorageEngine {
             config,
             tables: RwLock::new(HashMap::new()),
             commit_log,
+            deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
             upload_manager,
             local_cache,
@@ -607,6 +611,7 @@ impl StorageEngine {
             config,
             tables: RwLock::new(HashMap::new()),
             commit_log,
+            deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
             upload_manager,
             local_cache,
@@ -671,6 +676,7 @@ impl StorageEngine {
             config,
             tables: RwLock::new(HashMap::new()),
             commit_log,
+            deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
             upload_manager,
             local_cache,
@@ -794,19 +800,52 @@ impl StorageEngine {
                 continue;
             }
 
-            let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-            let tables = self.tables.read();
-            if let Some(state) = tables.get(&table_id) {
-                for row in &mutation.rows {
-                    // Use best-effort replay: log but don't fail on individual row errors.
-                    if let Err(e) = state.store.write(&mutation.key, row.clone()) {
-                        tracing::error!(%e, %table_id, "replay: failed to replay row");
-                    }
-                }
+            if !self.apply_replay_mutation_if_registered(&mutation) {
+                self.deferred_replay_mutations.lock().push(mutation);
             }
-            // Tables not yet registered are silently skipped.
         }
         Ok(())
+    }
+
+    fn apply_replay_mutation_if_registered(&self, mutation: &Mutation) -> bool {
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        let tables = self.tables.read();
+        let Some(state) = tables.get(&table_id) else {
+            return false;
+        };
+        for row in &mutation.rows {
+            if let Err(e) = state.store.write(&mutation.key, row.clone()) {
+                tracing::error!(%e, %table_id, "replay: failed to replay row");
+            }
+        }
+        true
+    }
+
+    fn replay_deferred_mutations_for_table(&self, table_id: &TableId) {
+        let pending = {
+            let mut deferred = self.deferred_replay_mutations.lock();
+            if deferred.is_empty() {
+                return;
+            }
+            let mut ready = Vec::new();
+            let mut remaining = Vec::with_capacity(deferred.len());
+            for mutation in deferred.drain(..) {
+                let mutation_table = TableId::new(&mutation.keyspace, &mutation.table);
+                if &mutation_table == table_id {
+                    ready.push(mutation);
+                } else {
+                    remaining.push(mutation);
+                }
+            }
+            *deferred = remaining;
+            ready
+        };
+
+        for mutation in pending {
+            if !self.apply_replay_mutation_if_registered(&mutation) {
+                self.deferred_replay_mutations.lock().push(mutation);
+            }
+        }
     }
 
     /// Registers all system table schemas (`system_schema.*` and `system_auth.*`)
@@ -946,6 +985,8 @@ impl StorageEngine {
         {
             let tables = self.tables.read();
             if tables.contains_key(&table_id) {
+                drop(tables);
+                self.replay_deferred_mutations_for_table(&table_id);
                 return Ok(());
             }
         }
@@ -1018,6 +1059,8 @@ impl StorageEngine {
                 self.maybe_compact(&table_id, state);
             }
         }
+
+        self.replay_deferred_mutations_for_table(&table_id);
 
         Ok(())
     }
@@ -3320,6 +3363,7 @@ impl StorageEngine {
             config,
             tables: RwLock::new(HashMap::new()),
             commit_log,
+            deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
             upload_manager,
             local_cache,
@@ -5781,6 +5825,184 @@ mod tests {
             // Replay should not panic — corrupted entries are silently skipped.
             engine.register_table(test_schema()).unwrap();
             engine.replay_mutations(pending).unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_mutations_defer_until_table_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let key = make_key("deferred");
+        let mutation = Mutation::new(
+            tid.keyspace.clone(),
+            tid.table.clone(),
+            key.clone(),
+            vec![make_row(b"late-schema", 1000)],
+            1000,
+        );
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.replay_mutations(vec![mutation]).unwrap();
+        assert!(
+            engine.read(&tid, &key).unwrap().is_none(),
+            "mutation must stay deferred until the table exists"
+        );
+
+        engine.register_table(test_schema()).unwrap();
+
+        let replayed = engine
+            .read(&tid, &key)
+            .unwrap()
+            .expect("deferred replay should materialize once the table is registered");
+        assert_eq!(replayed.rows.len(), 1);
+    }
+
+    #[test]
+    fn open_then_replay_before_register_table_still_recovers_pending_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let key = make_key("survive-deferred");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine
+                .write(&tid, &key, make_row(b"pending", 2000), 2000)
+                .unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let (engine, pending) = StorageEngine::open(config, None).unwrap();
+            engine
+                .replay_mutations(pending)
+                .expect("replay before registration should defer, not drop");
+            assert!(
+                engine.read(&tid, &key).unwrap().is_none(),
+                "table is still unregistered, so the deferred row should not be visible yet"
+            );
+
+            engine.register_table(test_schema()).unwrap();
+
+            let replayed = engine
+                .read(&tid, &key)
+                .unwrap()
+                .expect("deferred replay should be applied when the table is registered");
+            assert_eq!(replayed.rows.len(), 1);
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_keeps_unflushed_table_when_other_table_flushes_and_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_config = || StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 512,
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+
+        let table_a = table_id();
+        let table_b = table_id_2();
+        let survivor_key = make_key("typed-edge-survivor");
+
+        {
+            let engine = StorageEngine::new(make_config(), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_table(test_schema_2()).unwrap();
+
+            engine
+                .write(&table_a, &survivor_key, make_row(b"survive", 1000), 1000)
+                .unwrap();
+
+            for i in 0..16 {
+                let key = make_key(&format!("other-{i}"));
+                engine
+                    .write(
+                        &table_b,
+                        &key,
+                        make_row(format!("v{i}").as_bytes(), 2000 + i),
+                        2000 + i,
+                    )
+                    .unwrap();
+            }
+
+            engine.flush(&table_b).unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        {
+            let (engine, pending) = StorageEngine::open(make_config(), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_table(test_schema_2()).unwrap();
+            engine.replay_mutations(pending).unwrap();
+
+            let partition = engine
+                .read(&table_a, &survivor_key)
+                .unwrap()
+                .expect("unflushed table_a row must survive replay even after table_b flush");
+            assert_eq!(partition.rows.len(), 1);
+        }
+    }
+
+    #[test]
+    fn crash_replay_keeps_unflushed_table_when_other_table_flushes_and_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_config = || StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 512,
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+
+        let table_a = table_id();
+        let table_b = table_id_2();
+        let survivor_key = make_key("typed-edge-crash-survivor");
+
+        {
+            let engine = StorageEngine::new(make_config(), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_table(test_schema_2()).unwrap();
+
+            engine
+                .write(&table_a, &survivor_key, make_row(b"survive", 3000), 3000)
+                .unwrap();
+
+            for i in 0..16 {
+                let key = make_key(&format!("other-crash-{i}"));
+                engine
+                    .write(
+                        &table_b,
+                        &key,
+                        make_row(format!("v{i}").as_bytes(), 4000 + i),
+                        4000 + i,
+                    )
+                    .unwrap();
+            }
+
+            engine.flush(&table_b).unwrap();
+            engine.force_commit_log_sync().unwrap();
+            drop(engine);
+        }
+
+        {
+            let (engine, pending) = StorageEngine::open(make_config(), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_table(test_schema_2()).unwrap();
+            engine.replay_mutations(pending).unwrap();
+
+            let partition = engine
+                .read(&table_a, &survivor_key)
+                .unwrap()
+                .expect("crash replay must recover unflushed table_a row after table_b flush");
+            assert_eq!(partition.rows.len(), 1);
         }
     }
 

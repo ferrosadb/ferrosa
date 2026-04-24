@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -86,6 +87,58 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Returns `true` only if there is an established outbound pool for this peer.
+    pub fn has_live_peer(&self, host_id: uuid::Uuid) -> bool {
+        self.peers
+            .try_read()
+            .map(|peers| {
+                peers
+                    .get(&host_id)
+                    .map(|state| state.pool.is_some())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Return the last known socket address for `host_id`, even if this peer
+    /// currently has no active outbound pool.
+    pub async fn peer_addr(&self, host_id: uuid::Uuid) -> Option<String> {
+        let peers = self.peers.read().await;
+        peers.get(&host_id).map(|state| state.peer_id.1.to_string())
+    }
+
+    /// Ensure there is an outbound connection pool for `host_id`.
+    ///
+    /// Uses the provided address string (IP:port or resolvable hostname:port)
+    /// to establish the pool if one is not already present.
+    pub async fn ensure_peer(&self, host_id: uuid::Uuid, addr: &str) -> crate::error::Result<()> {
+        let resolved = addr
+            .to_socket_addrs()
+            .map_err(|e| {
+                crate::error::NetError::Protocol(format!("invalid peer address '{addr}': {e}"))
+            })?
+            .next()
+            .ok_or_else(|| {
+                crate::error::NetError::Protocol(format!(
+                    "peer address '{addr}' resolved to no socket addresses"
+                ))
+            })?;
+
+        {
+            let peers = self.peers.read().await;
+            if let Some(state) = peers.get(&host_id) {
+                if state.pool.is_some() && state.peer_id.1 == resolved {
+                    return Ok(());
+                }
+            }
+        }
+
+        let pool = PriorityPool::connect(self.config.clone(), self.local_host_id, addr, None, None)
+            .await?;
+        self.add_peer((host_id, resolved), pool).await;
+        Ok(())
+    }
+
     /// Add a peer entry without a connection pool (for unit testing).
     pub async fn add_peer_entry(&self, peer_id: PeerId) {
         let (host_id, _addr) = peer_id;
@@ -130,7 +183,9 @@ impl PeerManager {
                 }
             }
         };
-        pool.send(msg, lane).await
+        let resp = pool.send(msg, lane).await?;
+        self.record_activity(host_id).await;
+        Ok(resp)
     }
 
     /// Send a message to a peer on the specified lane with a custom timeout.
@@ -161,7 +216,9 @@ impl PeerManager {
                 }
             }
         };
-        pool.send_with_timeout(msg, lane, timeout).await
+        let resp = pool.send_with_timeout(msg, lane, timeout).await?;
+        self.record_activity(host_id).await;
+        Ok(resp)
     }
 
     /// Fire-and-forget a message to a peer on the specified lane.
@@ -188,7 +245,9 @@ impl PeerManager {
                 }
             }
         };
-        pool.fire(msg, lane).await
+        pool.fire(msg, lane).await?;
+        self.record_activity(host_id).await;
+        Ok(())
     }
 
     /// Heartbeat loop: sends Ping at configured interval, marks peers suspected
@@ -295,6 +354,11 @@ impl PeerManager {
 
     /// Called when Pong received -- reset heartbeat timer and missed counter.
     pub async fn record_heartbeat(&self, host_id: uuid::Uuid) {
+        self.record_activity(host_id).await;
+    }
+
+    /// Called when recent successful peer traffic proves the connection is alive.
+    pub async fn record_activity(&self, host_id: uuid::Uuid) {
         let mut peers = self.peers.write().await;
         if let Some(state) = peers.get_mut(&host_id) {
             state.last_heartbeat = tokio::time::Instant::now();
@@ -339,7 +403,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::codec::MsgType;
     use crate::config::NetConfig;
+    use crate::message::Message;
+    use crate::rpc::handler::{HandlerRegistry, RpcHandler};
+    use crate::rpc::server::RpcServer;
 
     struct TestListener {
         connected_count: AtomicUsize,
@@ -376,6 +444,22 @@ mod tests {
         }
         fn on_peer_failed(&self, _peer_id: uuid::Uuid) {
             self.failed_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct EchoPingHandler;
+
+    #[async_trait::async_trait]
+    impl RpcHandler for EchoPingHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            match msg {
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
+                _ => None,
+            }
         }
     }
 
@@ -456,6 +540,82 @@ mod tests {
         }
 
         assert_eq!(listener.suspected_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recent_peer_activity_keeps_peer_alive() {
+        let config = Arc::new(NetConfig {
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_millis(300),
+            ..NetConfig::default()
+        });
+        let listener = Arc::new(TestListener::new());
+        let pm = Arc::new(PeerManager::new(
+            config,
+            uuid::Uuid::new_v4(),
+            listener.clone(),
+        ));
+        let host_id = uuid::Uuid::new_v4();
+        let peer_id = (host_id, "127.0.0.1:7000".parse().unwrap());
+        pm.add_peer_entry(peer_id).await;
+
+        let pm_clone = pm.clone();
+        tokio::spawn(async move { pm_clone.run_heartbeat_loop().await });
+
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_millis(90)).await;
+            pm.record_activity(host_id).await;
+        }
+
+        assert_eq!(
+            listener.suspected_count.load(Ordering::Relaxed),
+            0,
+            "recent peer activity should count as liveness and avoid false dead-peer suspicion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_send_refreshes_peer_activity() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_millis(300),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            listener.clone(),
+        ));
+        pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+
+        let pm_clone = pm.clone();
+        tokio::spawn(async move { pm_clone.run_heartbeat_loop().await });
+
+        for nonce in 0..6 {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            let resp = pm
+                .send(server_id, Message::Ping { nonce, sent_at: 0 }, Lane::Data)
+                .await
+                .unwrap();
+            assert!(matches!(resp, Message::Pong { .. }));
+        }
+
+        assert_eq!(
+            listener.suspected_count.load(Ordering::Relaxed),
+            0,
+            "successful send/response traffic should refresh peer liveness"
+        );
+
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     /// Verify that suspecting a peer (with no real pool) fires on_peer_suspected
@@ -549,5 +709,175 @@ mod tests {
             )
             .await;
         assert!(result.is_err(), "fire to unknown peer should fail");
+    }
+
+    #[tokio::test]
+    async fn ensure_peer_connects_and_caches_pool() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(Arc::new(config), uuid::Uuid::new_v4(), listener.clone());
+
+        pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+
+        assert!(pm.has_peer(server_id), "ensure_peer should cache the pool");
+        assert_eq!(listener.connected_count.load(Ordering::Relaxed), 1);
+
+        let resp = pm
+            .send(
+                server_id,
+                Message::Ping {
+                    nonce: 99,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 99, .. }));
+
+        server.shutdown(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn peer_addr_returns_cached_peer_entry_address() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener);
+
+        let host_id = uuid::Uuid::new_v4();
+        let addr = "127.0.0.1:9042".parse().unwrap();
+        pm.add_peer_entry((host_id, addr)).await;
+
+        assert_eq!(
+            pm.peer_addr(host_id).await.as_deref(),
+            Some("127.0.0.1:9042")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_peer_replaces_entry_without_pool() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(Arc::new(config), uuid::Uuid::new_v4(), listener.clone());
+        pm.add_peer_entry((server_id, addr)).await;
+
+        pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+
+        let resp = pm
+            .send(
+                server_id,
+                Message::Ping {
+                    nonce: 7,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 7, .. }));
+        assert_eq!(
+            listener.connected_count.load(Ordering::Relaxed),
+            2,
+            "add_peer_entry plus ensure_peer should emit a second connected event when the pool is established"
+        );
+        assert!(
+            pm.has_live_peer(server_id),
+            "ensure_peer should upgrade placeholder peers into a live outbound pool"
+        );
+
+        server.shutdown(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn ensure_peer_reconnects_when_address_changes() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+
+        let registry1 = Arc::new(HandlerRegistry::new());
+        registry1.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server1 = Arc::new(RpcServer::new(config.clone(), server_id, registry1));
+        let addr1 = server1.start_and_get_addr().await.unwrap();
+
+        let registry2 = Arc::new(HandlerRegistry::new());
+        registry2.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server2 = Arc::new(RpcServer::new(config.clone(), server_id, registry2));
+        let addr2 = server2.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(Arc::new(config), uuid::Uuid::new_v4(), listener);
+        let addr1_str = addr1.to_string();
+        let addr2_str = addr2.to_string();
+
+        pm.ensure_peer(server_id, &addr1_str).await.unwrap();
+        assert_eq!(
+            pm.peer_addr(server_id).await.as_deref(),
+            Some(addr1_str.as_str())
+        );
+
+        server1.shutdown(Duration::from_millis(50)).await;
+
+        pm.ensure_peer(server_id, &addr2_str).await.unwrap();
+
+        assert_eq!(
+            pm.peer_addr(server_id).await.as_deref(),
+            Some(addr2_str.as_str())
+        );
+        let resp = pm
+            .send(
+                server_id,
+                Message::Ping {
+                    nonce: 11,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 11, .. }));
+
+        server2.shutdown(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn has_live_peer_is_false_for_placeholder_entries() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener);
+
+        let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        pm.add_peer_entry(peer_id).await;
+
+        assert!(
+            pm.has_peer(peer_id.0),
+            "placeholder entries are still tracked"
+        );
+        assert!(
+            !pm.has_live_peer(peer_id.0),
+            "placeholder entries must not count as live outbound pools"
+        );
     }
 }

@@ -126,6 +126,27 @@ impl PeriodicSync {
             wake: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
+
+    fn stop_inner(&self, flush_final: bool) {
+        self.stop_flag.store(true, Ordering::Release);
+
+        {
+            let (lock, cvar) = &*self.wake;
+            let mut stopped = lock.lock();
+            *stopped = true;
+            cvar.notify_one();
+        }
+
+        if let Some(handle) = self.handle.lock().take() {
+            let _ = handle.join();
+        }
+
+        if flush_final {
+            if let Err(e) = (self.flush_callback)() {
+                tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
+            }
+        }
+    }
 }
 
 impl SyncStrategy for PeriodicSync {
@@ -167,26 +188,13 @@ impl SyncStrategy for PeriodicSync {
     }
 
     fn stop(&self) {
-        // Signal the background thread to stop.
-        self.stop_flag.store(true, Ordering::Release);
+        self.stop_inner(true);
+    }
+}
 
-        // Wake it immediately so it doesn't wait for the full interval.
-        {
-            let (lock, cvar) = &*self.wake;
-            let mut stopped = lock.lock();
-            *stopped = true;
-            cvar.notify_one();
-        }
-
-        // Join the background thread.
-        if let Some(handle) = self.handle.lock().take() {
-            let _ = handle.join();
-        }
-
-        // Final flush to ensure all pending data is on disk.
-        if let Err(e) = (self.flush_callback)() {
-            tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
-        }
+impl Drop for PeriodicSync {
+    fn drop(&mut self) {
+        self.stop_inner(false);
     }
 }
 
@@ -246,6 +254,31 @@ impl GroupSync {
                 writer_signal: (Mutex::new(()), Condvar::new()),
                 flush_complete: (Mutex::new(()), Condvar::new()),
             }),
+        }
+    }
+
+    fn stop_inner(&self, flush_final: bool) {
+        self.stop_flag.store(true, Ordering::Release);
+
+        {
+            let (_lock, cvar) = &self.state.writer_signal;
+            cvar.notify_one();
+        }
+
+        if let Some(handle) = self.handle.lock().take() {
+            let _ = handle.join();
+        }
+
+        if flush_final {
+            if let Err(e) = (self.flush_callback)() {
+                tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
+            }
+        }
+
+        self.state.generation.fetch_add(1, Ordering::AcqRel);
+        {
+            let (_lock, cvar) = &self.state.flush_complete;
+            cvar.notify_all();
         }
     }
 }
@@ -341,31 +374,13 @@ impl SyncStrategy for GroupSync {
     }
 
     fn stop(&self) {
-        // Signal the background thread to stop.
-        self.stop_flag.store(true, Ordering::Release);
+        self.stop_inner(true);
+    }
+}
 
-        // Wake the flush thread so it exits its wait loop.
-        {
-            let (_lock, cvar) = &self.state.writer_signal;
-            cvar.notify_one();
-        }
-
-        // Join the background thread.
-        if let Some(handle) = self.handle.lock().take() {
-            let _ = handle.join();
-        }
-
-        // Final flush to ensure all pending data is on disk.
-        if let Err(e) = (self.flush_callback)() {
-            tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
-        }
-
-        // Wake any writers still waiting.
-        self.state.generation.fetch_add(1, Ordering::AcqRel);
-        {
-            let (_lock, cvar) = &self.state.flush_complete;
-            cvar.notify_all();
-        }
+impl Drop for GroupSync {
+    fn drop(&mut self) {
+        self.stop_inner(false);
     }
 }
 

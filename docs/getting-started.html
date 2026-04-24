@@ -348,6 +348,21 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
   <pre><span class="cm"># Standard cqlsh connects directly</span>
 <span class="kw">cqlsh</span> 127.0.0.1 9042</pre>
 
+  <h3>Client bootstrap sequence</h3>
+  <p>There is no extra Ferrosa-only client bootstrap ritual beyond normal Cassandra-compatible CQL behavior. A standard driver connects like this:</p>
+  <ol>
+    <li>Open a TCP connection to one configured contact point.</li>
+    <li>Optionally send <code>OPTIONS</code> and read <code>SUPPORTED</code>.</li>
+    <li>Send <code>STARTUP</code>, including compression preferences if the driver uses them.</li>
+    <li>If auth is enabled, complete the standard SASL flow: <code>AUTHENTICATE</code> → <code>AUTH_RESPONSE</code> → <code>AUTH_SUCCESS</code>. If auth is disabled, the server replies with <code>READY</code>.</li>
+    <li>After <code>READY</code> or <code>AUTH_SUCCESS</code>, the driver introspects <code>system.local</code>, <code>system.peers</code>, and <code>system.peers_v2</code> to learn tokens, schema version, and peer CQL endpoints.</li>
+    <li>The driver then opens or reroutes pooled connections to the advertised peer endpoints from those system tables.</li>
+  </ol>
+  <p>In other words, topology discovery happens <em>after</em> the normal CQL handshake. If a client authenticates successfully and then stalls while dialing bad peer addresses, that is a topology advertisement problem, not a missing handshake step.</p>
+  <div class="note">
+    <strong>Important:</strong> An outside client does <em>not</em> send a special <code>OPTIONS</code> payload, startup flag, or Ferrosa-only command to request public addresses. External versus internal peer addresses are chosen automatically from the server side based on the source IP of the connection that is querying <code>system.local</code> / <code>system.peers</code> / <code>system.peers_v2</code>.
+  </div>
+
   <h3>Transactions</h3>
   <p>Ferrosa supports strict serializable distributed transactions via the Accord protocol. Lightweight transactions (LWT) work with any CQL driver:</p>
 
@@ -413,9 +428,9 @@ session.execute(<span class="str">"""
     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>FERROSA_CLUSTER_NAME</code></td><td><code>ferrosa</code></td><td>Cluster name (must match across nodes)</td></tr>
-      <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses</td></tr>
+      <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses; each entry may be an IP:port or resolvable hostname:port</td></tr>
       <tr><td><code>FERROSA_INTERNODE_BIND</code></td><td><code>0.0.0.0:7000</code></td><td>Internode protocol bind address</td></tr>
-      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td><code>127.0.0.1:7000</code></td><td>Address other nodes use to reach this node; also forms the default internal topology view</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td><code>127.0.0.1:7000</code></td><td>Address other nodes use to reach this node; also forms the default internal topology view. May be an IP:port or resolvable hostname:port.</td></tr>
       <tr><td><code>FERROSA_INTERNODE_PSK</code></td><td>—</td><td>Pre-shared key for internode auth (HMAC-SHA256)</td></tr>
       <tr><td><code>FERROSA_INTERNODE_TLS_CERT</code></td><td>—</td><td>PEM certificate path for internode TLS</td></tr>
       <tr><td><code>FERROSA_INTERNODE_TLS_KEY</code></td><td>—</td><td>PEM private-key path for internode TLS</td></tr>
@@ -669,10 +684,11 @@ session.execute(<span class="str">"""
   <p>Use two address families:</p>
   <ul>
     <li><code>FERROSA_CQL_BROADCAST</code> should point at the host- or externally-reachable CQL endpoint that off-node clients should dial after topology discovery.</li>
-    <li><code>FERROSA_INTERNODE_BROADCAST</code> should point at the address other Ferrosa nodes use to reach this node. Ferrosa also uses this address family as the internal topology view.</li>
+    <li><code>FERROSA_INTERNODE_BROADCAST</code> should point at the address other Ferrosa nodes use to reach this node. Ferrosa also uses this address family as the internal topology view. Use either a stable IP:port or a hostname:port that resolves correctly from the other nodes.</li>
     <li><code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code> should list the container or pod CIDRs whose clients need the internal topology view.</li>
   </ul>
   <p>Clients whose source IP falls inside <code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code> receive internal addresses from <code>system.local</code> and <code>system.peers_v2</code>. Other clients receive the public CQL broadcast address.</p>
+  <p>There is no client-side override for this selection. If an outside client is being handed internal addresses, the fix is to correct Ferrosa's advertised public endpoint or the CIDR classification, not to change the driver's handshake messages.</p>
 
   <h3>Example: host Mac clients plus Podman-network clients</h3>
   <pre><span class="kw">FERROSA_CQL_BIND</span>=0.0.0.0:9042

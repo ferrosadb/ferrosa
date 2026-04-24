@@ -9,12 +9,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use openraft::storage::RaftStateMachine;
 use openraft::{
-    BasicNode, Entry, EntryPayload, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
+    BasicNode, Entry, EntryPayload, LogId, Membership, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
     StorageError, StorageIOError, StoredMembership,
 };
 use serde::{Deserialize, Serialize};
@@ -102,6 +103,12 @@ struct SnapshotData {
     last_membership: StoredMembership<u64, BasicNode>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    meta: SnapshotMeta<u64, BasicNode>,
+    bytes: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
 // FerrosStateMachine
 // ---------------------------------------------------------------------------
@@ -126,9 +133,49 @@ pub struct FerrosStateMachine {
     ring: Option<Arc<ArcSwap<TokenRing>>>,
     /// Optional system table writer for persisting DDL/auth mutations.
     system_writer: Option<SystemTableWriter>,
+    /// Optional on-disk snapshot file for restart recovery.
+    snapshot_path: Option<PathBuf>,
 }
 
 impl FerrosStateMachine {
+    fn refresh_current_snapshot_membership(&mut self) {
+        let Some((meta, bytes)) = self.current_snapshot.clone() else {
+            return;
+        };
+
+        let mut data: SnapshotData = match bincode::deserialize(&bytes) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(%e, "failed to deserialize cached raft snapshot for membership refresh");
+                return;
+            }
+        };
+        data.last_membership = self.last_membership.clone();
+        data.last_applied = self.last_applied;
+
+        let refreshed_bytes = match bincode::serialize(&data) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(%e, "failed to serialize refreshed raft snapshot membership");
+                return;
+            }
+        };
+
+        let refreshed_meta = SnapshotMeta {
+            last_log_id: self.last_applied,
+            last_membership: self.last_membership.clone(),
+            snapshot_id: meta.snapshot_id,
+        };
+        self.current_snapshot = Some((refreshed_meta.clone(), refreshed_bytes.clone()));
+
+        if let Some(path) = self.snapshot_path.as_ref() {
+            if let Err(e) = Self::persist_snapshot_to_disk(path, &refreshed_meta, &refreshed_bytes)
+            {
+                tracing::warn!(%e, "failed to persist refreshed raft snapshot membership");
+            }
+        }
+    }
+
     /// Create a new state machine with empty state and no side-effect targets.
     pub fn new() -> Self {
         // Default auto_join=true so initial cluster formation works without
@@ -144,6 +191,7 @@ impl FerrosStateMachine {
             engine: None,
             ring: None,
             system_writer: None,
+            snapshot_path: None,
         }
     }
 
@@ -188,8 +236,34 @@ impl FerrosStateMachine {
                     "state machine membership was empty; recovering from log"
                 );
                 self.last_membership = m;
+                self.refresh_current_snapshot_membership();
             }
         }
+    }
+
+    /// Recover membership from committed topology state when explicit openraft
+    /// membership entries are absent but `state.members` still contains the
+    /// full voter set.
+    pub fn recover_membership_from_topology_state(&mut self) -> bool {
+        let membership_empty = self
+            .last_membership
+            .membership()
+            .get_joint_config()
+            .iter()
+            .all(|c| c.is_empty());
+        if !membership_empty || self.state.members.is_empty() {
+            return false;
+        }
+
+        let voters: BTreeSet<u64> = self.state.members.keys().copied().collect();
+        if voters.is_empty() {
+            return false;
+        }
+
+        self.last_membership =
+            StoredMembership::new(self.last_applied, Membership::new(vec![voters], None));
+        self.refresh_current_snapshot_membership();
+        true
     }
 
     /// Create a new state machine wired to local `Schema` and `StorageEngine`
@@ -205,7 +279,26 @@ impl FerrosStateMachine {
             engine: Some(engine),
             ring: None,
             system_writer,
+            snapshot_path: None,
         }
+    }
+
+    /// Create a state machine with side effects and durable snapshot persistence.
+    pub fn with_side_effects_and_snapshot_path(
+        schema: Arc<Schema>,
+        engine: Arc<StorageEngine>,
+        snapshot_path: PathBuf,
+    ) -> Self {
+        let mut sm = Self::with_side_effects(schema, engine);
+        sm.snapshot_path = Some(snapshot_path);
+        sm
+    }
+
+    #[cfg(test)]
+    fn with_snapshot_path(snapshot_path: PathBuf) -> Self {
+        let mut sm = Self::new();
+        sm.snapshot_path = Some(snapshot_path);
+        sm
     }
 
     /// Wire a live token ring for topology side effects.
@@ -236,6 +329,68 @@ impl FerrosStateMachine {
         &self.state
     }
 
+    pub fn has_topology_state(&self) -> bool {
+        !self.state.members.is_empty() || !self.state.token_map.is_empty()
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn apply_snapshot_data(
+        &mut self,
+        meta: SnapshotMeta<u64, BasicNode>,
+        bytes: Vec<u8>,
+    ) -> Result<(), StorageIOError<u64>> {
+        let data: SnapshotData = bincode::deserialize(&bytes)
+            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+
+        self.state = data.state;
+        self.last_applied = meta.last_log_id;
+        self.last_membership = meta.last_membership.clone();
+        self.current_snapshot = Some((meta, bytes));
+        self.sync_ring();
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn persist_snapshot_to_disk(
+        path: &Path,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
+    ) -> Result<(), StorageIOError<u64>> {
+        let persisted = PersistedSnapshot {
+            meta: meta.clone(),
+            bytes: bytes.to_vec(),
+        };
+        let encoded = bincode::serialize(&persisted)
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, encoded)
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn recover_from_persisted_snapshot(&mut self) -> Result<bool, StorageIOError<u64>> {
+        let Some(path) = self.snapshot_path.clone() else {
+            return Ok(false);
+        };
+        if !path.exists() {
+            return Ok(false);
+        }
+
+        let bytes = std::fs::read(&path)
+            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+        let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
+            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+        self.apply_snapshot_data(persisted.meta, persisted.bytes)?;
+        Ok(true)
+    }
+
     /// Rebuild the live `TokenRing` from current `RaftState` and store it.
     ///
     /// Called after every topology-changing command so that the
@@ -256,6 +411,10 @@ impl FerrosStateMachine {
 
             ring_swap.store(Arc::new(ring));
         }
+    }
+
+    pub fn sync_live_ring_from_state(&self) {
+        self.sync_ring();
     }
 
     /// Apply a single [`RaftCommand`] to `self.state`, updating BTreeMaps
@@ -755,6 +914,23 @@ impl FerrosStateMachine {
                     }
                 }
             }
+            RaftOp::UpdateNodeInfo(node_info) => {
+                schema_changed = false;
+                let node_id = super::uuid_to_node_id(node_info.host_id);
+                if let Some(existing) = self.state.members.get_mut(&node_id) {
+                    existing.addr = node_info.addr;
+                    existing.data_center = node_info.data_center;
+                    existing.rack = node_info.rack;
+                    existing.state = node_info.state;
+                    existing.cql_broadcast = node_info.cql_broadcast;
+                    self.sync_ring();
+                } else {
+                    tracing::warn!(
+                        host_id = %node_info.host_id,
+                        "ignoring UpdateNodeInfo for unknown cluster member"
+                    );
+                }
+            }
             RaftOp::LeaveNode { node_id } => {
                 schema_changed = false;
                 self.state.members.remove(&node_id);
@@ -850,6 +1026,16 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
 
         // Cache the snapshot for get_current_snapshot.
         self.current_snapshot = Some((meta.clone(), bytes.clone()));
+        if let Some(path) = self.snapshot_path.clone() {
+            let meta_for_disk = meta.clone();
+            let bytes_for_disk = bytes.clone();
+            #[allow(clippy::result_large_err)]
+            tokio::task::spawn_blocking(move || {
+                Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
+            })
+            .await
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+        }
 
         Ok(Snapshot {
             meta,
@@ -912,6 +1098,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             engine: None,
             ring: None,          // snapshot builder doesn't need live ring
             system_writer: None, // snapshot builder doesn't need system writer
+            snapshot_path: self.snapshot_path.clone(),
         }
     }
 
@@ -927,16 +1114,16 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
         let bytes = snapshot.into_inner();
-
-        let data: SnapshotData = bincode::deserialize(&bytes)
-            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
-
-        self.state = data.state;
-        self.last_applied = meta.last_log_id;
-        self.last_membership = meta.last_membership.clone();
-
-        // Cache the installed snapshot.
-        self.current_snapshot = Some((meta.clone(), bytes));
+        self.apply_snapshot_data(meta.clone(), bytes.clone())?;
+        if let Some(path) = self.snapshot_path.clone() {
+            let meta_for_disk = meta.clone();
+            #[allow(clippy::result_large_err)]
+            tokio::task::spawn_blocking(move || {
+                Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes)
+            })
+            .await
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+        }
 
         // Propagate full state to local Schema if present.
         if let Some(schema) = &self.schema {
@@ -1047,7 +1234,9 @@ mod tests {
     use ferrosa_schema::metadata::table::TableParams;
     use ferrosa_schema::{Permission, Resource, RoleMetadata};
 
-    use crate::raft::{IndexNodeStatus, NodeInfo, NodeState, RaftCommand, RaftOp, Token};
+    use crate::raft::{
+        uuid_to_node_id, IndexNodeStatus, NodeInfo, NodeState, RaftCommand, RaftOp, Token,
+    };
 
     // -- helpers ----------------------------------------------------------
 
@@ -1331,6 +1520,247 @@ mod tests {
         let (la1, _) = sm.applied_state().await.unwrap();
         let (la2, _) = sm2.applied_state().await.unwrap();
         assert_eq!(la1, la2);
+    }
+
+    #[tokio::test]
+    async fn persisted_snapshot_roundtrip_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("state-machine.snapshot.bin");
+
+        let mut sm = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        let entries = vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks1"))),
+            make_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::nil(),
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                3,
+                RaftOp::AssignTokens {
+                    node_id: uuid_to_node_id(Uuid::nil()),
+                    tokens: vec![-50, 0, 50],
+                },
+            ),
+        ];
+        sm.apply(entries).await.unwrap();
+        let _snapshot = sm.build_snapshot().await.unwrap();
+
+        let mut restarted = FerrosStateMachine::with_snapshot_path(snapshot_path);
+        assert!(
+            restarted.recover_from_persisted_snapshot().unwrap(),
+            "persisted snapshot should be loaded after restart"
+        );
+
+        assert!(restarted.state().keyspaces.contains_key("ks1"));
+        assert_eq!(restarted.state().members.len(), 1);
+        assert_eq!(restarted.state().token_map.len(), 3);
+
+        let (la1, m1) = sm.applied_state().await.unwrap();
+        let (la2, m2) = restarted.applied_state().await.unwrap();
+        assert_eq!(la1, la2, "last_applied must survive restart");
+        assert_eq!(
+            m1.membership().get_joint_config(),
+            m2.membership().get_joint_config(),
+            "membership must survive restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_ring_populates_live_ring_from_recovered_topology_state() {
+        let mut sm = FerrosStateMachine::new();
+        let host_id = Uuid::nil();
+        let node_id = uuid_to_node_id(host_id);
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id,
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::AssignTokens {
+                    node_id,
+                    tokens: vec![-10, 10],
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let ring = Arc::new(ArcSwap::from_pointee(TokenRing::new()));
+        sm.set_ring(ring.clone());
+        sm.sync_live_ring_from_state();
+
+        let live = ring.load();
+        assert_eq!(live.get_node(node_id).unwrap().addr, "10.0.0.1:7000");
+        assert_eq!(live.replicas(-10, 1), vec![node_id]);
+    }
+
+    #[tokio::test]
+    async fn recover_membership_from_topology_state_synthesizes_voters_when_empty() {
+        let mut sm = FerrosStateMachine::new();
+        let node1 = uuid_to_node_id(Uuid::from_u128(1));
+        let node2 = uuid_to_node_id(Uuid::from_u128(2));
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(1),
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(2),
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        sm.last_membership = StoredMembership::default();
+
+        assert!(
+            sm.recover_membership_from_topology_state(),
+            "topology-backed membership recovery should fire when voters are empty"
+        );
+
+        let configs = sm.last_membership.membership().get_joint_config();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].len(), 2);
+        assert!(configs[0].contains(&node1));
+        assert!(configs[0].contains(&node2));
+        assert_eq!(sm.last_membership.log_id().clone(), sm.last_applied);
+    }
+
+    #[tokio::test]
+    async fn recover_membership_from_topology_state_is_noop_when_membership_exists() {
+        let mut sm = FerrosStateMachine::new();
+        let host_id = Uuid::from_u128(1);
+        let node_id = uuid_to_node_id(host_id);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::JoinNode(NodeInfo {
+                host_id,
+                addr: "10.0.0.1:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            }),
+        )])
+        .await
+        .unwrap();
+        let existing = StoredMembership::new(
+            sm.last_applied,
+            Membership::new(vec![BTreeSet::from([node_id])], None),
+        );
+        sm.last_membership = existing.clone();
+
+        assert!(
+            !sm.recover_membership_from_topology_state(),
+            "explicit membership should win over synthesized topology voters"
+        );
+        assert_eq!(
+            sm.last_membership.membership().get_joint_config(),
+            existing.membership().get_joint_config()
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_membership_from_topology_state_refreshes_cached_snapshot_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("state-machine.snapshot.bin");
+        let mut sm = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        let node1 = Uuid::from_u128(1);
+        let node2 = Uuid::from_u128(2);
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: node1,
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: node2,
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+        let _snapshot = sm.build_snapshot().await.unwrap();
+        sm.last_membership = StoredMembership::default();
+        if let Some((meta, bytes)) = sm.current_snapshot.as_mut() {
+            meta.last_membership = StoredMembership::default();
+            let mut data: SnapshotData = bincode::deserialize(bytes).unwrap();
+            data.last_membership = StoredMembership::default();
+            *bytes = bincode::serialize(&data).unwrap();
+        }
+
+        assert!(sm.recover_membership_from_topology_state());
+
+        let cached = sm.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(
+            cached.meta.last_membership.membership().get_joint_config()[0],
+            BTreeSet::from([uuid_to_node_id(node1), uuid_to_node_id(node2)])
+        );
+
+        let mut restarted = FerrosStateMachine::with_snapshot_path(snapshot_path);
+        assert!(restarted.recover_from_persisted_snapshot().unwrap());
+        assert_eq!(
+            restarted
+                .applied_state()
+                .await
+                .unwrap()
+                .1
+                .membership()
+                .get_joint_config()[0],
+            BTreeSet::from([uuid_to_node_id(node1), uuid_to_node_id(node2)])
+        );
     }
 
     #[tokio::test]
@@ -2345,6 +2775,64 @@ mod tests {
         assert_eq!(entry.get(&node_id), Some(&IndexNodeStatus::Building));
         // Existing node 1 should still be Ready.
         assert_eq!(entry.get(&1), Some(&IndexNodeStatus::Ready));
+    }
+
+    #[test]
+    fn update_node_info_refreshes_existing_member_metadata_without_touching_tokens() {
+        let mut sm = FerrosStateMachine::new();
+        let host_id = Uuid::new_v4();
+        let node_id = crate::raft::uuid_to_node_id(host_id);
+
+        sm.apply_command(RaftCommand {
+            op: RaftOp::JoinNode(NodeInfo {
+                host_id,
+                addr: "10.89.1.61:7000".into(),
+                data_center: "dc1".into(),
+                rack: "rack1".into(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+        sm.apply_command(RaftCommand {
+            op: RaftOp::AssignTokens {
+                node_id,
+                tokens: vec![-10, 0, 10],
+            },
+            schema_version: Uuid::new_v4(),
+        });
+
+        sm.apply_command(RaftCommand {
+            op: RaftOp::UpdateNodeInfo(NodeInfo {
+                host_id,
+                addr: "10.89.1.7:7000".into(),
+                data_center: "dc1".into(),
+                rack: "rack1".into(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".into()),
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+
+        let member = sm
+            .state()
+            .members
+            .get(&node_id)
+            .expect("member must remain present after metadata refresh");
+        assert_eq!(member.addr, "10.89.1.7:7000");
+        assert_eq!(member.cql_broadcast.as_deref(), Some("127.0.0.1:19043"));
+
+        let tokens: Vec<_> = sm
+            .state()
+            .token_map
+            .iter()
+            .filter_map(|(token, owner)| (*owner == node_id).then_some(*token))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![-10, 0, 10],
+            "metadata refresh must not reassign tokens"
+        );
     }
 
     #[test]

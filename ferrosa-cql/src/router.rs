@@ -9,6 +9,7 @@
 //! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -46,6 +47,34 @@ use crate::virtual_tables::connections::ConnectionTracker;
 
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
+const COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
+
+async fn extend_rows_from_partitions(
+    partitions: &[ferrosa_sstable::types::Partition],
+    all_rows: &mut Vec<Vec<Option<CqlValue>>>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+) {
+    for (idx, partition) in partitions.iter().enumerate() {
+        let mut prows = bridge::partition_to_rows(
+            partition,
+            all_col_names,
+            all_col_types,
+            pk_indices,
+            ck_indices,
+        );
+        all_rows.append(&mut prows);
+        if should_yield_during_partition_scan(idx + 1, COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+fn should_yield_during_partition_scan(processed_partitions: usize, yield_every: usize) -> bool {
+    yield_every > 0 && processed_partitions > 0 && processed_partitions.is_multiple_of(yield_every)
+}
 
 /// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
 const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
@@ -489,13 +518,37 @@ async fn route_select(
         (names, types, rows)
     }
 
+    fn loopback_client_ip(client_address: &str) -> Option<IpAddr> {
+        if let Ok(addr) = client_address.parse::<std::net::SocketAddr>() {
+            return addr.ip().is_loopback().then_some(addr.ip());
+        }
+        if let Ok(ip) = client_address.parse::<IpAddr>() {
+            return ip.is_loopback().then_some(ip);
+        }
+        None
+    }
+
+    fn harmonize_loopback_family(advertised: IpAddr, client_loopback_ip: Option<IpAddr>) -> IpAddr {
+        match client_loopback_ip {
+            Some(client_ip) if advertised.is_loopback() && client_ip.is_loopback() => client_ip,
+            _ => advertised,
+        }
+    }
+
     // System table dispatch — no permission check needed for system tables.
     match (ks, s.table.as_str()) {
         ("system", "local") => {
+            let local_addresses = [
+                state.node_config.internal_rpc_address,
+                state.node_config.listen_address,
+                state.node_config.broadcast_address,
+            ];
+            let client_loopback_ip = loopback_client_ip(&ctx.client_address);
             let topology_view = state
                 .topology_policy
-                .topology_view_for_client_address(&ctx.client_address);
-            let info = query_local_with_view(&state.schema, &state.node_config, topology_view);
+                .topology_view_for_client_with_locals(&ctx.client_address, &local_addresses);
+            let mut info = query_local_with_view(&state.schema, &state.node_config, topology_view);
+            info.rpc_address = harmonize_loopback_family(info.rpc_address, client_loopback_ip);
             let col_names: Vec<String> = vec![
                 "key",
                 "cluster_name",
@@ -569,14 +622,24 @@ async fn route_select(
             ))
         }
         ("system", "peers" | "peers_v2") => {
+            let local_addresses = [
+                state.node_config.internal_rpc_address,
+                state.node_config.listen_address,
+                state.node_config.broadcast_address,
+            ];
+            let client_loopback_ip = loopback_client_ip(&ctx.client_address);
             let topology_view = state
                 .topology_policy
-                .topology_view_for_client_address(&ctx.client_address);
-            let peers = query_peers_with_view(
+                .topology_view_for_client_with_locals(&ctx.client_address, &local_addresses);
+            let mut peers = query_peers_with_view(
                 &state.schema,
                 state.cluster_state.load().as_ref(),
                 topology_view,
             );
+            for peer in &mut peers {
+                peer.native_address =
+                    harmonize_loopback_family(peer.native_address, client_loopback_ip);
+            }
             let col_names: Vec<String> = vec![
                 "peer",
                 "peer_port",
@@ -1262,16 +1325,15 @@ async fn route_select_user_table(
                 // Fall through to a full scan rather than panicking.
                 let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
                 all_rows.retain(|row| {
                     evaluate_where_predicates(
                         row,
@@ -1342,16 +1404,15 @@ async fn route_select_user_table(
                 };
 
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
 
                 // Always apply post-filter as defensive measure.
                 // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
@@ -1404,16 +1465,15 @@ async fn route_select_user_table(
                 };
 
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
 
                 all_rows.retain(|row| {
                     evaluate_where_predicates(
@@ -1460,16 +1520,15 @@ async fn route_select_user_table(
                 // not before, to avoid cutting off matching rows (FRSA-BUG-003).
                 let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
-                for partition in &partitions {
-                    let mut prows = bridge::partition_to_rows(
-                        partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                    );
-                    all_rows.append(&mut prows);
-                }
+                extend_rows_from_partitions(
+                    &partitions,
+                    &mut all_rows,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                )
+                .await;
                 all_rows.retain(|row| {
                     evaluate_where_predicates(
                         row,
@@ -6598,6 +6657,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn client_that_looks_like_local_container_ip_still_gets_public_system_local_endpoint() {
+        let (mut state, _dir) = setup();
+        let mut node_config = (*state.node_config).clone();
+        node_config.rpc_address = "127.0.0.1".parse().unwrap();
+        node_config.rpc_port = 19042;
+        node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
+        node_config.internal_rpc_port = 9042;
+        node_config.listen_address = "10.89.1.48".parse().unwrap();
+        node_config.broadcast_address = "10.89.1.48".parse().unwrap();
+        state.node_config = Arc::new(node_config);
+        state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "10.89.1.48:32123".into(),
+        };
+        let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_column_names(b), vec!["rpc_address", "rpc_port"]);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19042);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_loopback_client_sees_ipv6_system_local_endpoint() {
+        let (mut state, _dir) = setup();
+        let mut node_config = (*state.node_config).clone();
+        node_config.rpc_address = "127.0.0.1".parse().unwrap();
+        node_config.rpc_port = 19042;
+        state.node_config = Arc::new(node_config);
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "[::1]:32123".into(),
+        };
+        let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_column_names(b), vec!["rpc_address", "rpc_port"]);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "::1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19042);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
     /// system.local. Without it, cqlsh prints "'local' not found in
     /// keyspace 'system'" during startup introspection.
@@ -6786,6 +6914,144 @@ mod tests {
                     "10.89.1.49".parse::<std::net::IpAddr>().unwrap()
                 );
                 assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 9042);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_that_looks_like_local_container_ip_still_gets_public_system_peers_endpoint() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+        use ferrosa_cluster::ring::TokenRing;
+
+        let (mut state, _dir) = setup();
+        state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
+        let mut node_config = (*state.node_config).clone();
+        node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
+        node_config.listen_address = "10.89.1.48".parse().unwrap();
+        node_config.broadcast_address = "10.89.1.48".parse().unwrap();
+        state.node_config = Arc::new(node_config);
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.48:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19042".to_string()),
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.49:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                ferrosa_cluster::RaftClusterState::new(
+                    Arc::new(ArcSwap::from_pointee(ring)),
+                    local_id,
+                ),
+            )));
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "10.89.1.48:32123".into(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19043);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_loopback_client_sees_ipv6_system_peers_endpoints() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+        use ferrosa_cluster::ring::TokenRing;
+
+        let (state, _dir) = setup();
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.48:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19042".to_string()),
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.49:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                ferrosa_cluster::RaftClusterState::new(
+                    Arc::new(ArcSwap::from_pointee(ring)),
+                    local_id,
+                ),
+            )));
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "[::1]:32123".into(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "::1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19043);
             }
             _ => panic!("expected Result"),
         }
@@ -8806,6 +9072,19 @@ mod tests {
     // memory.  Queries without ALLOW FILTERING on non-indexed columns
     // are still rejected.
 
+    #[test]
+    fn partition_scan_yield_policy_triggers_at_threshold() {
+        assert!(!should_yield_during_partition_scan(0, 32));
+        assert!(!should_yield_during_partition_scan(31, 32));
+        assert!(should_yield_during_partition_scan(32, 32));
+        assert!(should_yield_during_partition_scan(64, 32));
+    }
+
+    #[test]
+    fn partition_scan_yield_policy_can_be_disabled() {
+        assert!(!should_yield_during_partition_scan(32, 0));
+    }
+
     #[tokio::test]
     async fn allow_filtering_executes_full_scan() {
         let (state, _dir) = setup();
@@ -9050,6 +9329,97 @@ mod tests {
             filtered_count, 2,
             "ALLOW FILTERING on entity_type='person' should return 2 rows, got {filtered_count}"
         );
+    }
+
+    #[tokio::test]
+    async fn composite_clustering_text_predicate_matches_exact_pk_lookup() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE agent WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE agent.typed_edges (
+                    tenant_id uuid,
+                    session_id uuid,
+                    src_id uuid,
+                    edge_type text,
+                    dst_id uuid,
+                    weight double,
+                    PRIMARY KEY ((tenant_id, session_id), src_id, edge_type, dst_id)
+                )",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let tid = "6792702e-2a9c-4465-ba65-ba100b5aaafa";
+        let sid = "909e2671-aea0-534a-83bc-bb5efc544b0f";
+        let src = "41753309-7297-454e-8f2d-c6546740cf2b";
+        let dst = "f6ffe258-9194-470d-9811-5b3e23b33103";
+
+        for edge_type in ["related_to", "afteradj_1776880700"] {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO agent.typed_edges \
+                     (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                     VALUES ({tid}, {sid}, {src}, '{edge_type}', {dst}, 1.0)"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let stmt = crate::parser::parse(&format!(
+            "SELECT src_id, edge_type, dst_id, weight FROM agent.typed_edges \
+             WHERE tenant_id = {tid} AND session_id = {sid} AND src_id = {src} \
+             AND edge_type = 'afteradj_1776880700'"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, 1,
+            "exact PK lookup including text clustering column should return the matching row"
+        );
+
+        let stmt = crate::parser::parse(
+            "SELECT src_id, edge_type, dst_id, weight FROM agent.typed_edges \
+             WHERE edge_type = 'afteradj_1776880700' ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let filtered_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(filtered_count, 1);
     }
 
     // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────

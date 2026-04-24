@@ -93,10 +93,21 @@ impl CommitLog {
     /// Creates the log directory if it does not exist, allocates the first
     /// segment, and starts the sync strategy.
     pub fn new(config: Config) -> ferrosa_common::Result<Self> {
+        Self::new_with_first_segment_id(config, 1)
+    }
+
+    fn new_with_first_segment_id(
+        config: Config,
+        first_segment_id: u64,
+    ) -> ferrosa_common::Result<Self> {
         fs::create_dir_all(&config.log_dir)?;
         fs::create_dir_all(&config.checkpoint_dir)?;
 
-        let first_segment = Arc::new(Segment::new(1, config.segment_size, &config.log_dir));
+        let first_segment = Arc::new(Segment::new(
+            first_segment_id,
+            config.segment_size,
+            &config.log_dir,
+        ));
         let active = Arc::new(ArcSwap::from(first_segment));
 
         let sync_strategy = Self::create_sync_strategy(&config, Arc::clone(&active));
@@ -108,7 +119,7 @@ impl CommitLog {
             closed_segments: Mutex::new(Vec::new()),
             segment_tracker: Mutex::new(HashMap::new()),
             sync_strategy,
-            next_segment_id: AtomicU64::new(2), // first segment is 1
+            next_segment_id: AtomicU64::new(first_segment_id + 1),
             archived: Mutex::new(HashSet::new()),
             archive_tx: None,
         })
@@ -124,6 +135,7 @@ impl CommitLog {
     /// 4. Create a fresh `CommitLog` for new writes.
     pub fn open_and_replay(config: Config) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
         let checkpoint = CommitLogCheckpoint::load(&config.checkpoint_dir)?;
+        let max_checkpoint_segment_id = checkpoint.values().map(|pos| pos.segment_id).max();
 
         // Scan for segment files in log_dir.
         let mut segment_files: Vec<(u64, std::path::PathBuf)> = Vec::new();
@@ -141,6 +153,7 @@ impl CommitLog {
 
         // Sort by segment ID for deterministic replay order.
         segment_files.sort_by_key(|(id, _)| *id);
+        let max_segment_file_id = segment_files.iter().map(|(id, _)| *id).max();
 
         let mut mutations = Vec::new();
         for (_, path) in &segment_files {
@@ -164,7 +177,14 @@ impl CommitLog {
             }
         }
 
-        let commit_log = Self::new(config)?;
+        let first_segment_id = max_segment_file_id
+            .into_iter()
+            .chain(max_checkpoint_segment_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let commit_log = Self::new_with_first_segment_id(config, first_segment_id)?;
         Ok((commit_log, mutations))
     }
 
@@ -559,14 +579,13 @@ impl CommitLog {
                 let active_ref = Arc::clone(&active);
                 let flush_callback: FlushCallback = Arc::new(move || {
                     let seg = active_ref.load();
-                    seg.flush_to_disk()?;
-                    // Write an EOF sync marker after flushing. Uses plain
-                    // allocate() since this is called from the flush thread
-                    // (not a writer), and the marker is complete before return.
                     if let Some(offset) = seg.allocate(segment::SYNC_MARKER_SIZE) {
                         seg.write_sync_marker_at(offset, 0);
                     }
-                    Ok(())
+                    // Persist both the new EOF marker and the patched previous
+                    // marker. Incremental append cannot durably capture the
+                    // earlier pointer rewrite.
+                    seg.force_full_flush()
                 });
                 Box::new(PeriodicSync::new(*sync_interval, flush_callback))
             }
@@ -574,12 +593,10 @@ impl CommitLog {
                 let active_ref = Arc::clone(&active);
                 let flush_callback: FlushCallback = Arc::new(move || {
                     let seg = active_ref.load();
-                    seg.flush_to_disk()?;
-                    // Write an EOF sync marker after flushing.
                     if let Some(offset) = seg.allocate(segment::SYNC_MARKER_SIZE) {
                         seg.write_sync_marker_at(offset, 0);
                     }
-                    Ok(())
+                    seg.force_full_flush()
                 });
                 Box::new(GroupSync::new(*max_wait, flush_callback))
             }
@@ -1054,6 +1071,183 @@ mod tests {
         );
 
         cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn reopen_keeps_segment_ids_above_existing_checkpoint_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let table_id = TableId::new("test_ks", "test_table");
+
+        let cl = CommitLog::new(config.clone()).unwrap();
+
+        let mut last_pos = None;
+        for _ in 0..32 {
+            let pos = cl.append(&simple_mutation()).unwrap();
+            last_pos = Some(pos);
+            if pos.segment_id >= 3 {
+                break;
+            }
+        }
+        let last_pos = last_pos.expect("must write at least one mutation");
+        assert!(
+            last_pos.segment_id >= 3,
+            "test must advance checkpoint beyond segment 1; got {:?}",
+            last_pos
+        );
+        cl.discard_completed(&table_id, last_pos).unwrap();
+        cl.shutdown().unwrap();
+
+        let (cl2, pending) = CommitLog::open_and_replay(config.clone()).unwrap();
+        assert!(
+            pending.is_empty(),
+            "all first-generation mutations were checkpointed"
+        );
+
+        let fresh = Mutation {
+            mutation_id: [0x44; 16],
+            timestamp: 99_999,
+            ..simple_mutation()
+        };
+        let fresh_pos = cl2.append(&fresh).unwrap();
+        assert!(
+            fresh_pos.segment_id > last_pos.segment_id,
+            "new generation must continue above prior checkpoint generation: \
+             fresh={fresh_pos:?} checkpoint={last_pos:?}"
+        );
+        cl2.shutdown().unwrap();
+
+        let (_cl3, replayed) = CommitLog::open_and_replay(config).unwrap();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "fresh mutation written after reopen must survive crash replay"
+        );
+        assert_eq!(replayed[0].timestamp, fresh.timestamp);
+    }
+
+    #[test]
+    fn periodic_sync_crash_replay_keeps_recent_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: std::time::Duration::from_millis(10),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+
+        let cl = CommitLog::new(config.clone()).unwrap();
+        let fresh = Mutation {
+            mutation_id: [0x55; 16],
+            timestamp: 123_456,
+            ..simple_mutation()
+        };
+        cl.append(&fresh).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(cl);
+
+        let (_reopened, replayed) = CommitLog::open_and_replay(config).unwrap();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "periodic sync must leave the latest flushed mutation replayable after crash"
+        );
+        assert_eq!(replayed[0].timestamp, fresh.timestamp);
+    }
+
+    #[test]
+    fn periodic_sync_crash_replay_keeps_mutations_across_multiple_flush_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: std::time::Duration::from_millis(10),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+
+        let cl = CommitLog::new(config.clone()).unwrap();
+        let first = Mutation {
+            mutation_id: [0x61; 16],
+            timestamp: 111_111,
+            ..simple_mutation()
+        };
+        cl.append(&first).unwrap();
+        // CI can be heavily contended when the full workspace runs in
+        // parallel; allow several periodic intervals so this test proves the
+        // multi-flush replay behavior instead of depending on tight scheduler
+        // timing.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let second = Mutation {
+            mutation_id: [0x62; 16],
+            timestamp: 222_222,
+            ..simple_mutation()
+        };
+        cl.append(&second).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        drop(cl);
+
+        let (_reopened, replayed) = CommitLog::open_and_replay(config).unwrap();
+        let replayed_timestamps: Vec<_> = replayed.iter().map(|m| m.timestamp).collect();
+        assert!(
+            replayed_timestamps.contains(&first.timestamp),
+            "first periodic-sync mutation must replay after crash: {replayed_timestamps:?}"
+        );
+        assert!(
+            replayed_timestamps.contains(&second.timestamp),
+            "later periodic-sync mutation from a second flush cycle must replay after crash: \
+             {replayed_timestamps:?}"
+        );
+    }
+
+    #[test]
+    fn group_sync_crash_replay_keeps_mutations_across_multiple_flush_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            sync_strategy: SyncStrategyConfig::Group {
+                max_wait: std::time::Duration::from_millis(10),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+
+        let cl = CommitLog::new(config.clone()).unwrap();
+        let first = Mutation {
+            mutation_id: [0x63; 16],
+            timestamp: 333_333,
+            ..simple_mutation()
+        };
+        cl.append(&first).unwrap();
+        // Same rationale as the periodic test above: under full CI load the
+        // background group-sync worker may not complete a batch within a
+        // narrow 30ms window.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let second = Mutation {
+            mutation_id: [0x64; 16],
+            timestamp: 444_444,
+            ..simple_mutation()
+        };
+        cl.append(&second).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        drop(cl);
+
+        let (_reopened, replayed) = CommitLog::open_and_replay(config).unwrap();
+        let replayed_timestamps: Vec<_> = replayed.iter().map(|m| m.timestamp).collect();
+        assert!(
+            replayed_timestamps.contains(&first.timestamp),
+            "first group-sync mutation must replay after crash: {replayed_timestamps:?}"
+        );
+        assert!(
+            replayed_timestamps.contains(&second.timestamp),
+            "later group-sync mutation from a second flush cycle must replay after crash: \
+             {replayed_timestamps:?}"
+        );
     }
 
     #[test]

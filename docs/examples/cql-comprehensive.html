@@ -271,27 +271,6 @@ UPDATE collection_types SET scores = scores - {10} WHERE id = 1;
 -- Map put and remove</code></pre>
 </div>
 </div>
-<div class="sect2">
-<h4 id="_collection_bind_values">Collection Bind Values</h4>
-<div class="listingblock">
-<div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- Prepared statements with collection bind values
--- Map, set, and list values bound via EXECUTE are stored in
--- Cassandra-compatible wire format and survive flush + compaction.
-
--- Insert with map bind value
-PREPARE insert_with_map FROM
-  'INSERT INTO collection_types (id, props) VALUES (?, ?)';
--- EXECUTE insert_with_map USING 10, {'color': 'blue', 'size': 'large'};
-
--- Update set with bind value
-PREPARE add_to_set FROM
-  'UPDATE collection_types SET scores = scores + ? WHERE id = ?';
--- EXECUTE add_to_set USING {60, 70}, 1;
-</code></pre>
-</div>
-</div>
-</div>
 </div>
 </div>
 <div class="sect1">
@@ -344,41 +323,6 @@ SELECT * FROM composite_pk WHERE tenant = 'acme' AND region = 'us-east' LIMIT 1;
 <div class="paragraph">
 <p><code>CLUSTERING ORDER BY</code> controls the physical sort order of rows on disk.
 <code>DESC</code> on <code>event_time</code> means the most recent events are read first, which avoids reversing results at query time.</p>
-</div>
-</div>
-<div class="sect2">
-<h3 id="_compaction_strategy">Compaction strategy</h3>
-<div class="paragraph">
-<p>Per-table compaction strategy via <code>WITH compaction = {map}</code>.
-The default is Size-Tiered (STCS). Unified Compaction Strategy (UCS) uses density-based levels
-with a configurable fan factor: W=2 is LCS-like (aggressive), W=4 is balanced, W=32 is STCS-like (lazy).</p>
-</div>
-<div class="listingblock">
-<div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- Default: STCS (no compaction clause needed)
-CREATE TABLE IF NOT EXISTS stcs_table (
-    id int PRIMARY KEY,
-    data text
-);
-
--- UCS: density-based compaction with fan factor 4
-CREATE TABLE IF NOT EXISTS ucs_table (
-    id int PRIMARY KEY,
-    data text
-) WITH compaction = {
-    'class': 'UnifiedCompactionStrategy',
-    'fan_factor': '4'
-};
-
--- UCS with aggressive compaction (LCS-like)
-CREATE TABLE IF NOT EXISTS ucs_aggressive (
-    id int PRIMARY KEY,
-    data text
-) WITH compaction = {
-    'class': 'UnifiedCompactionStrategy',
-    'fan_factor': '2'
-};</code></pre>
-</div>
 </div>
 </div>
 </div>
@@ -964,7 +908,7 @@ UPDATE counters SET page_views = page_views + 100, unique_visitors = unique_visi
 </div>
 <div id="footer">
 <div id="footer-text">
-Last updated 2026-03-18 22:08:59 UTC
+Last updated 2026-03-26 20:29:23 -0700
 </div>
 </div>
 </body>

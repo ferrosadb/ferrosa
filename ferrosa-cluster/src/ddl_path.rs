@@ -316,10 +316,35 @@ pub(crate) async fn forward_ddl_to_leader(
     op: DdlOperation,
 ) -> Result<()> {
     let body = op.to_bytes()?;
-    let resp = peer_manager
-        .send(leader_uuid, Message::PairDdlForward(body), Lane::Data)
+    let resp = match peer_manager
+        .send(
+            leader_uuid,
+            Message::PairDdlForward(body.clone()),
+            Lane::Data,
+        )
         .await
-        .map_err(ClusterError::Net)?;
+    {
+        Ok(resp) => resp,
+        Err(e)
+            if e.to_string().contains("unknown peer")
+                || e.to_string().contains("no connection pool") =>
+        {
+            let addr = peer_manager.peer_addr(leader_uuid).await.ok_or_else(|| {
+                ClusterError::Internal(format!(
+                    "DDL forwarding failed: missing address for leader {leader_uuid}"
+                ))
+            })?;
+            peer_manager
+                .ensure_peer(leader_uuid, &addr)
+                .await
+                .map_err(ClusterError::Net)?;
+            peer_manager
+                .send(leader_uuid, Message::PairDdlForward(body), Lane::Data)
+                .await
+                .map_err(ClusterError::Net)?
+        }
+        Err(e) => return Err(ClusterError::Net(e)),
+    };
 
     match resp {
         Message::PairDdlAck(_) => Ok(()),
@@ -568,12 +593,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use ferrosa_net::codec::MsgType;
+    use ferrosa_net::config::NetConfig;
+    use ferrosa_net::peer::PeerEventListener;
+    use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+    use ferrosa_net::rpc::server::RpcServer;
+    use ferrosa_net::rpc::HandlerRegistry;
     use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
     use ferrosa_schema::metadata::table::{TableMetadata, TableParams};
     use ferrosa_schema::Schema;
     use ferrosa_storage::engine::StorageEngine;
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngineConfig};
 
+    use bytes::Bytes;
     use indexmap::IndexMap;
     use std::collections::HashSet;
     use uuid::Uuid;
@@ -658,6 +690,43 @@ mod tests {
             extensions: HashMap::new(),
             is_system: false,
         }
+    }
+
+    struct NoopListener;
+    impl PeerEventListener for NoopListener {
+        fn on_peer_connected(&self, _peer: PeerId) {}
+        fn on_peer_disconnected(&self, _peer: PeerId) {}
+        fn on_peer_suspected(&self, _peer: PeerId) {}
+        fn on_peer_recovered(&self, _peer_id: uuid::Uuid) {}
+        fn on_peer_failed(&self, _peer_id: uuid::Uuid) {}
+    }
+
+    struct PairDdlAckHandler;
+
+    #[async_trait::async_trait]
+    impl RpcHandler for PairDdlAckHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::PairDdlForward(_) = msg else {
+                return None;
+            };
+            Some(Message::PairDdlAck(Bytes::new()))
+        }
+    }
+
+    async fn start_rpc_server(
+        msg_type: MsgType,
+        handler: Arc<dyn RpcHandler>,
+    ) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(msg_type, handler);
+        let server = Arc::new(RpcServer::new(config, server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+        (server, addr, server_id)
     }
 
     // -- DdlPath::Direct tests --------------------------------------------
@@ -944,6 +1013,35 @@ mod tests {
             ),
             "CreateTable must survive the forwarding serialization round-trip"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_ddl_to_leader_reconnects_missing_remote_peer_pool() {
+        let (server, addr, leader_uuid) =
+            start_rpc_server(MsgType::PairDdlForward, Arc::new(PairDdlAckHandler)).await;
+
+        let peer_manager = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        peer_manager.add_peer_entry((leader_uuid, addr)).await;
+
+        forward_ddl_to_leader(
+            &peer_manager,
+            leader_uuid,
+            DdlOperation::CreateKeyspace(simple_keyspace("fwd_ks")),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            peer_manager.has_peer(leader_uuid),
+            "DDL forward path should reconnect and cache the leader peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     /// Verify that the `ClusterDdlForwardHandler` returns `None` for non-DDL

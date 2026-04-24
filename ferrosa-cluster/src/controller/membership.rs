@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use ferrosa_net::pool::PriorityPool;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -14,6 +15,22 @@ use super::ModeController;
 fn clear_pending_join(pending_joins: &Arc<Mutex<Vec<Uuid>>>, host_id: Uuid) {
     let mut pending = pending_joins.lock();
     pending.retain(|id| *id != host_id);
+}
+
+fn cluster_member_metadata_changed(
+    current: &NodeInfo,
+    addr: std::net::SocketAddr,
+    cql_broadcast: Option<&str>,
+) -> bool {
+    if current.addr != addr.to_string() {
+        return true;
+    }
+
+    match (&current.cql_broadcast, cql_broadcast) {
+        (Some(current), Some(new)) => current != new,
+        (None, Some(_)) => true,
+        _ => false,
+    }
 }
 
 impl ModeController {
@@ -245,20 +262,34 @@ impl ModeController {
     /// Checks de-duplication (via `pending_joins`), approval (via `approved_nodes`
     /// or `auto_join`), and spawns an async task to propose `JoinNode` +
     /// `AssignTokens` via Raft.
-    pub(super) fn trigger_cluster_join(&self, host_id: Uuid, addr: std::net::SocketAddr) {
+    pub(super) fn trigger_cluster_join(
+        &self,
+        host_id: Uuid,
+        addr: std::net::SocketAddr,
+        cql_broadcast: Option<String>,
+    ) {
+        let peer_manager = self.peer_manager.load().as_ref().as_ref().cloned();
+        let has_outbound_peer = peer_manager
+            .as_ref()
+            .map(|pm| pm.has_live_peer(host_id))
+            .unwrap_or(false);
         let peer_node_id = uuid_to_node_id(host_id);
-
-        // Existing ring members are part of the current topology already.
-        // Cluster formation can produce a burst of duplicate inbound/outbound
-        // peer-connected callbacks before Raft is fully initialized; don't
-        // try to re-admit nodes that are already seeded into the ring.
-        if self
+        let existing_member = self
             .token_ring()
             .as_ref()
-            .is_some_and(|ring| ring.get_node(peer_node_id).is_some())
-        {
-            tracing::debug!(peer = %host_id, node_id = peer_node_id, "peer already present in token ring, skipping join trigger");
-            return;
+            .and_then(|ring| ring.get_node(peer_node_id).cloned());
+
+        if let Some(existing) = existing_member.as_ref() {
+            if !cluster_member_metadata_changed(existing, addr, cql_broadcast.as_deref())
+                && has_outbound_peer
+            {
+                tracing::debug!(
+                    peer = %host_id,
+                    node_id = peer_node_id,
+                    "peer already present in token ring with current metadata, skipping join trigger"
+                );
+                return;
+            }
         }
 
         // Unapproved peers should be ignored without poisoning the pending set.
@@ -293,8 +324,55 @@ impl ModeController {
         // Capture state needed by the spawned task.
         let raft_instance = self.raft_instance.clone();
         let config_clone = self.config.clone();
+        let existing_member = existing_member.clone();
+        let cql_broadcast = cql_broadcast.clone();
+        let peer_manager = peer_manager.clone();
+        let net_config = self.net_config.clone();
+        let local_host_id = self.local_host_id;
+        let raft_runtime = self.raft_runtime.get().cloned();
+        let data_runtime = self.data_runtime.get().cloned();
 
         self.spawn_tracked(async move {
+            if let Some(pm) = peer_manager.as_ref() {
+                let current_addr = pm.peer_addr(host_id).await;
+                let desired_addr = addr.to_string();
+                let needs_reverse_refresh =
+                    !pm.has_live_peer(host_id) || current_addr.as_deref() != Some(&desired_addr);
+
+                if needs_reverse_refresh {
+                    match PriorityPool::connect(
+                        net_config.clone(),
+                        local_host_id,
+                        &desired_addr,
+                        raft_runtime.as_deref(),
+                        data_runtime.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(pool) => {
+                            pm.add_peer((host_id, addr), pool).await;
+                            tracing::info!(
+                                peer = %host_id,
+                                %addr,
+                                previous_addr = ?current_addr,
+                                "cluster member reverse connection established before join refresh"
+                            );
+                        }
+                        Err(e) => {
+                            clear_pending_join(&pending_joins, host_id);
+                            tracing::warn!(
+                                peer = %host_id,
+                                %addr,
+                                previous_addr = ?current_addr,
+                                %e,
+                                "failed to establish reverse connection for cluster member"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+
             let mut raft = None;
             for attempt in 0..60 {
                 if let Some(r) = &**raft_instance.load() {
@@ -333,6 +411,34 @@ impl ModeController {
                 return;
             };
 
+            if let Some(existing) = existing_member {
+                let refresh_cmd = RaftCommand {
+                    op: RaftOp::UpdateNodeInfo(NodeInfo {
+                        host_id,
+                        addr: addr.to_string(),
+                        data_center: existing.data_center,
+                        rack: existing.rack,
+                        state: existing.state,
+                        cql_broadcast: cql_broadcast.or(existing.cql_broadcast),
+                    }),
+                    schema_version: Uuid::new_v4(),
+                };
+                let refresh_result = raft.client_write(refresh_cmd).await;
+                clear_pending_join(&pending_joins, host_id);
+                if let Err(e) = refresh_result {
+                    tracing::warn!(peer = %host_id, leader, %e, "UpdateNodeInfo proposal failed");
+                    return;
+                }
+
+                tracing::info!(
+                    peer = %host_id,
+                    node_id = peer_node_id,
+                    leader,
+                    "peer metadata refreshed via on_peer_connected"
+                );
+                return;
+            }
+
             // Propose JoinNode via Raft.
             let node_info = NodeInfo {
                 host_id,
@@ -340,7 +446,7 @@ impl ModeController {
                 data_center: config_clone.data_center.clone(),
                 rack: config_clone.rack.clone(),
                 state: NodeState::Normal,
-                cql_broadcast: None,
+                cql_broadcast,
             };
 
             let join_cmd = RaftCommand {
@@ -371,6 +477,8 @@ impl ModeController {
                 tracing::warn!(peer = %host_id, leader, %e, "AssignTokens proposal failed");
                 return;
             }
+
+            clear_pending_join(&pending_joins, host_id);
 
             tracing::info!(
                 peer = %host_id,

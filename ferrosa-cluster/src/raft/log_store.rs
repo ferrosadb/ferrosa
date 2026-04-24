@@ -10,6 +10,7 @@
 //! - **`meta`** — small metadata values: `vote`, `committed`, and
 //!   `last_purged`.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::RangeBounds;
 use std::path::Path;
@@ -18,8 +19,236 @@ use openraft::storage::LogFlushed;
 use openraft::{
     AnyError, Entry, LogId, LogState, RaftLogReader, StorageError, StorageIOError, Vote,
 };
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use super::FerrosRaftConfig;
+use super::{
+    FerrosRaftConfig, IndexNodeStatus, NodeInfo, NodeState, RaftCommand, RaftOp, RaftResponse,
+    Token,
+};
+use crate::config::ClusterConfig;
+use ferrosa_common::CqlType;
+use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
+use ferrosa_schema::metadata::function::UserFunctionMetadata;
+use ferrosa_schema::metadata::index::IndexMetadata;
+use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
+use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
+use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+use ferrosa_schema::{GrantEntry, Permission, Resource, RoleMetadata, RoleUpdates};
+
+openraft::declare_raft_types!(
+    /// Legacy Raft type configuration for entries written before UpdateNodeInfo
+    /// was inserted into the middle of `RaftOp`.
+    #[allow(dead_code)]
+    LegacyFerrosRaftConfigPreUpdateNodeInfo:
+        D            = LegacyRaftCommandPreUpdateNodeInfo,
+        R            = RaftResponse,
+        NodeId       = u64,
+        Node         = openraft::BasicNode,
+        Entry        = openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>,
+        SnapshotData = std::io::Cursor<Vec<u8>>,
+        AsyncRuntime = openraft::TokioRuntime,
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyRaftCommandPreUpdateNodeInfo {
+    op: LegacyRaftOpPreUpdateNodeInfo,
+    schema_version: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyRaftOpPreUpdateNodeInfo {
+    CreateKeyspace(KeyspaceMetadata),
+    DropKeyspace(String),
+    CreateTable(Box<TableMetadata>),
+    DropTable {
+        keyspace: String,
+        table: String,
+    },
+    AlterKeyspace {
+        name: String,
+        updates: KeyspaceUpdates,
+    },
+    AlterTable {
+        keyspace: String,
+        table: String,
+        updates: Box<TableUpdates>,
+    },
+    CreateRole(RoleMetadata),
+    AlterRole {
+        name: String,
+        updates: RoleUpdates,
+    },
+    DropRole(String),
+    Grant(GrantEntry),
+    Revoke {
+        role: String,
+        resource: Resource,
+        permission: Permission,
+    },
+    CreateIndex(IndexMetadata),
+    DropIndex {
+        keyspace: String,
+        table: String,
+        index: String,
+    },
+    IndexStatus {
+        node_id: u64,
+        keyspace: String,
+        table: String,
+        index_name: String,
+        status: IndexNodeStatus,
+    },
+    CreateType(UserTypeMetadata),
+    DropType {
+        keyspace: String,
+        name: String,
+    },
+    CreateFunction(UserFunctionMetadata),
+    DropFunction {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
+    },
+    CreateAggregate(UserAggregateMetadata),
+    DropAggregate {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
+    },
+    JoinNode(NodeInfo),
+    LeaveNode {
+        node_id: u64,
+    },
+    AssignTokens {
+        node_id: u64,
+        tokens: Vec<Token>,
+    },
+    UpdateConfig(ClusterConfig),
+    ApproveNode {
+        host_id: Uuid,
+    },
+    SetNodeState {
+        node_id: u64,
+        state: NodeState,
+    },
+}
+
+impl From<LegacyRaftOpPreUpdateNodeInfo> for RaftOp {
+    fn from(value: LegacyRaftOpPreUpdateNodeInfo) -> Self {
+        match value {
+            LegacyRaftOpPreUpdateNodeInfo::CreateKeyspace(ks) => Self::CreateKeyspace(ks),
+            LegacyRaftOpPreUpdateNodeInfo::DropKeyspace(name) => Self::DropKeyspace(name),
+            LegacyRaftOpPreUpdateNodeInfo::CreateTable(table) => Self::CreateTable(table),
+            LegacyRaftOpPreUpdateNodeInfo::DropTable { keyspace, table } => {
+                Self::DropTable { keyspace, table }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::AlterKeyspace { name, updates } => {
+                Self::AlterKeyspace { name, updates }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::AlterTable {
+                keyspace,
+                table,
+                updates,
+            } => Self::AlterTable {
+                keyspace,
+                table,
+                updates,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateRole(role) => Self::CreateRole(role),
+            LegacyRaftOpPreUpdateNodeInfo::AlterRole { name, updates } => {
+                Self::AlterRole { name, updates }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::DropRole(name) => Self::DropRole(name),
+            LegacyRaftOpPreUpdateNodeInfo::Grant(entry) => Self::Grant(entry),
+            LegacyRaftOpPreUpdateNodeInfo::Revoke {
+                role,
+                resource,
+                permission,
+            } => Self::Revoke {
+                role,
+                resource,
+                permission,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateIndex(index) => Self::CreateIndex(index),
+            LegacyRaftOpPreUpdateNodeInfo::DropIndex {
+                keyspace,
+                table,
+                index,
+            } => Self::DropIndex {
+                keyspace,
+                table,
+                index,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::IndexStatus {
+                node_id,
+                keyspace,
+                table,
+                index_name,
+                status,
+            } => Self::IndexStatus {
+                node_id,
+                keyspace,
+                table,
+                index_name,
+                status,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateType(udt) => Self::CreateType(udt),
+            LegacyRaftOpPreUpdateNodeInfo::DropType { keyspace, name } => {
+                Self::DropType { keyspace, name }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::CreateFunction(func) => Self::CreateFunction(func),
+            LegacyRaftOpPreUpdateNodeInfo::DropFunction {
+                keyspace,
+                name,
+                arg_types,
+            } => Self::DropFunction {
+                keyspace,
+                name,
+                arg_types,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::CreateAggregate(agg) => Self::CreateAggregate(agg),
+            LegacyRaftOpPreUpdateNodeInfo::DropAggregate {
+                keyspace,
+                name,
+                arg_types,
+            } => Self::DropAggregate {
+                keyspace,
+                name,
+                arg_types,
+            },
+            LegacyRaftOpPreUpdateNodeInfo::JoinNode(node) => Self::JoinNode(node),
+            LegacyRaftOpPreUpdateNodeInfo::LeaveNode { node_id } => Self::LeaveNode { node_id },
+            LegacyRaftOpPreUpdateNodeInfo::AssignTokens { node_id, tokens } => {
+                Self::AssignTokens { node_id, tokens }
+            }
+            LegacyRaftOpPreUpdateNodeInfo::UpdateConfig(config) => Self::UpdateConfig(config),
+            LegacyRaftOpPreUpdateNodeInfo::ApproveNode { host_id } => Self::ApproveNode { host_id },
+            LegacyRaftOpPreUpdateNodeInfo::SetNodeState { node_id, state } => {
+                Self::SetNodeState { node_id, state }
+            }
+        }
+    }
+}
+
+fn convert_legacy_entry_pre_update_node_info(
+    entry: openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>,
+) -> Entry<FerrosRaftConfig> {
+    let payload = match entry.payload {
+        openraft::EntryPayload::Blank => openraft::EntryPayload::Blank,
+        openraft::EntryPayload::Membership(membership) => {
+            openraft::EntryPayload::Membership(membership)
+        }
+        openraft::EntryPayload::Normal(cmd) => openraft::EntryPayload::Normal(RaftCommand {
+            op: cmd.op.into(),
+            schema_version: cmd.schema_version,
+        }),
+    };
+    Entry {
+        log_id: entry.log_id,
+        payload,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Meta-tree keys
@@ -28,6 +257,12 @@ use super::FerrosRaftConfig;
 const META_VOTE: &[u8] = b"vote";
 const META_COMMITTED: &[u8] = b"committed";
 const META_LAST_PURGED: &[u8] = b"last_purged";
+
+#[derive(Debug, Default, Clone)]
+pub struct RecoveredTopology {
+    pub members: BTreeMap<u64, NodeInfo>,
+    pub token_map: BTreeMap<Token, u64>,
+}
 
 // ---------------------------------------------------------------------------
 // SledLogStore
@@ -65,7 +300,17 @@ impl SledLogStore {
     }
 
     fn deserialize_entry(bytes: &[u8]) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
-        bincode::deserialize(bytes).map_err(|e| StorageIOError::read_logs(to_any_error(e)))
+        match bincode::deserialize(bytes) {
+            Ok(entry) => Ok(entry),
+            Err(current_err) => {
+                match bincode::deserialize::<openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>>(
+                    bytes,
+                ) {
+                    Ok(entry) => Ok(convert_legacy_entry_pre_update_node_info(entry)),
+                    Err(_) => Err(StorageIOError::read_logs(to_any_error(current_err))),
+                }
+            }
+        }
     }
 
     fn save_meta<T: serde::Serialize>(
@@ -129,6 +374,50 @@ impl SledLogStore {
             }
         }
         Ok(None)
+    }
+
+    /// Reconstruct committed topology state from normal Raft log entries.
+    ///
+    /// This is the restart fallback when the state-machine snapshot is absent
+    /// or stale: we replay only topology-affecting commands from oldest to
+    /// newest and rebuild the committed member/token view.
+    pub fn recover_topology_state(&self) -> Result<RecoveredTopology, StorageIOError<u64>> {
+        use openraft::EntryPayload;
+
+        let mut members = BTreeMap::new();
+        let mut token_map = BTreeMap::new();
+
+        for item in self.log.iter() {
+            let (_k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
+            let entry = Self::deserialize_entry(&v)?;
+            let EntryPayload::Normal(cmd) = entry.payload else {
+                continue;
+            };
+
+            match cmd.op {
+                RaftOp::JoinNode(node) | RaftOp::UpdateNodeInfo(node) => {
+                    members.insert(super::uuid_to_node_id(node.host_id), node);
+                }
+                RaftOp::LeaveNode { node_id } => {
+                    members.remove(&node_id);
+                    token_map.retain(|_, owner| *owner != node_id);
+                }
+                RaftOp::AssignTokens { node_id, tokens } => {
+                    token_map.retain(|_, owner| *owner != node_id);
+                    for token in tokens {
+                        token_map.insert(token, node_id);
+                    }
+                }
+                RaftOp::SetNodeState { node_id, state } => {
+                    if let Some(node) = members.get_mut(&node_id) {
+                        node.state = state;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(RecoveredTopology { members, token_map })
     }
 
     /// Return the last entry currently present in the log tree.
@@ -347,6 +636,16 @@ mod tests {
         }
     }
 
+    fn normal_entry(term: u64, index: u64, op: RaftOp) -> Entry<FerrosRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
+            payload: EntryPayload::Normal(RaftCommand {
+                op,
+                schema_version: Uuid::new_v4(),
+            }),
+        }
+    }
+
     // -- append_and_read_back ---------------------------------------------
 
     #[tokio::test]
@@ -501,6 +800,125 @@ mod tests {
         assert_eq!(state.last_purged_log_id, None);
         assert!(state.last_log_id.is_some());
         assert_eq!(state.last_log_id.unwrap().index, 3);
+    }
+
+    #[test]
+    fn deserialize_entry_reads_pre_update_node_info_log_format() {
+        let schema_version = Uuid::new_v4();
+        let legacy_entry = openraft::Entry::<LegacyFerrosRaftConfigPreUpdateNodeInfo> {
+            log_id: LogId::new(CommittedLeaderId::new(7, 3), 42),
+            payload: EntryPayload::Normal(LegacyRaftCommandPreUpdateNodeInfo {
+                op: LegacyRaftOpPreUpdateNodeInfo::LeaveNode { node_id: 9 },
+                schema_version,
+            }),
+        };
+
+        let encoded = bincode::serialize(&legacy_entry).unwrap();
+        let decoded = SledLogStore::deserialize_entry(&encoded).unwrap();
+
+        match decoded.payload {
+            EntryPayload::Normal(RaftCommand {
+                op: RaftOp::LeaveNode { node_id },
+                schema_version: decoded_version,
+            }) => {
+                assert_eq!(node_id, 9);
+                assert_eq!(decoded_version, schema_version);
+            }
+            other => panic!("expected legacy LeaveNode to decode, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_topology_state_replays_topology_commands_from_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SledLogStore::new(dir.path()).unwrap();
+        let node1 = Uuid::from_u128(1);
+        let node2 = Uuid::from_u128(2);
+        let node1_id = super::super::uuid_to_node_id(node1);
+        let node2_id = super::super::uuid_to_node_id(node2);
+
+        let mut batch = sled::Batch::default();
+        for entry in [
+            normal_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: node1,
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Joining,
+                    cql_broadcast: Some("127.0.0.1:19042".to_string()),
+                }),
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: node2,
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Joining,
+                    cql_broadcast: Some("127.0.0.1:19043".to_string()),
+                }),
+            ),
+            normal_entry(
+                1,
+                3,
+                RaftOp::AssignTokens {
+                    node_id: node1_id,
+                    tokens: vec![-10, 10],
+                },
+            ),
+            normal_entry(
+                1,
+                4,
+                RaftOp::AssignTokens {
+                    node_id: node2_id,
+                    tokens: vec![20, 30],
+                },
+            ),
+            normal_entry(
+                1,
+                5,
+                RaftOp::SetNodeState {
+                    node_id: node1_id,
+                    state: NodeState::Normal,
+                },
+            ),
+            normal_entry(
+                1,
+                6,
+                RaftOp::UpdateNodeInfo(NodeInfo {
+                    host_id: node2,
+                    addr: "10.0.0.22:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack2".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: Some("127.0.0.1:29043".to_string()),
+                }),
+            ),
+            normal_entry(1, 7, RaftOp::LeaveNode { node_id: node1_id }),
+        ] {
+            let key = SledLogStore::index_key(entry.log_id.index);
+            let val = SledLogStore::serialize_entry(&entry).unwrap();
+            batch.insert(&key, val);
+        }
+        store.log.apply_batch(batch).unwrap();
+
+        let topology = store.recover_topology_state().unwrap();
+
+        assert_eq!(topology.members.len(), 1);
+        let node2_info = topology.members.get(&node2_id).unwrap();
+        assert_eq!(node2_info.addr, "10.0.0.22:7000");
+        assert_eq!(node2_info.rack, "rack2");
+        assert_eq!(node2_info.cql_broadcast.as_deref(), Some("127.0.0.1:29043"));
+        assert_eq!(node2_info.state, NodeState::Normal);
+        assert_eq!(topology.token_map.len(), 2);
+        assert_eq!(topology.token_map.get(&20), Some(&node2_id));
+        assert_eq!(topology.token_map.get(&30), Some(&node2_id));
+        assert!(!topology.token_map.values().any(|owner| *owner == node1_id));
     }
 
     // -- save_committed / read_committed round-trip -----------------------

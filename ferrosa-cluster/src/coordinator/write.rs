@@ -14,6 +14,8 @@ use crate::pair::coordinator::encode_mutation;
 
 use super::ClusterCoordinator;
 
+type ReplicaWriteTarget = (u64, Option<(uuid::Uuid, String)>, String);
+
 /// Result of a single replica write attempt.
 enum ReplicaResult {
     Ack,
@@ -25,6 +27,32 @@ enum ReplicaResult {
 }
 
 impl ClusterCoordinator {
+    async fn send_remote_write_with_reconnect(
+        &self,
+        host_id: uuid::Uuid,
+        addr: &str,
+        message: Message,
+    ) -> crate::error::Result<Message> {
+        match self
+            .peer_manager
+            .send(host_id, message.clone(), Lane::Data)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(e)
+                if e.to_string().contains("unknown peer")
+                    || e.to_string().contains("no connection pool") =>
+            {
+                self.peer_manager.ensure_peer(host_id, addr).await?;
+                self.peer_manager
+                    .send(host_id, message, Lane::Data)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Coordinate a write to the appropriate replicas.
     ///
     /// 1. Compute replicas from token ring.
@@ -106,11 +134,13 @@ impl ClusterCoordinator {
 
         // Collect (replica_id, Option<host_id>) before dropping the ring guard
         // so the futures we build don't hold a reference to the guard.
-        let replica_targets: Vec<(u64, Option<uuid::Uuid>)> = replicas
+        let replica_targets: Vec<(u64, Option<(uuid::Uuid, String)>)> = replicas
             .iter()
             .map(|&replica_id| {
-                let host_id = ring.get_node(replica_id).map(|info| info.host_id);
-                (replica_id, host_id)
+                let remote = ring
+                    .get_node(replica_id)
+                    .map(|info| (info.host_id, info.addr.clone()));
+                (replica_id, remote)
             })
             .collect();
         drop(ring);
@@ -118,9 +148,9 @@ impl ClusterCoordinator {
         // Build concurrent futures for each replica.
         let mut fan_out: FuturesUnordered<_> = replica_targets
             .into_iter()
-            .map(|(replica_id, host_id)| {
+            .map(|(replica_id, remote)| {
                 let storage = self.storage.clone();
-                let peer_manager = self.peer_manager.clone();
+                let coordinator = self;
                 let table_id = table_id.clone();
                 let key = key.clone();
                 let row = row.clone();
@@ -138,7 +168,7 @@ impl ClusterCoordinator {
                             }
                         }
                     } else {
-                        match host_id {
+                        match remote {
                             None => {
                                 tracing::warn!(
                                     replica_id,
@@ -146,9 +176,13 @@ impl ClusterCoordinator {
                                 );
                                 ReplicaResult::Failure { host_id: None }
                             }
-                            Some(hid) => {
-                                match peer_manager
-                                    .send(hid, Message::MutationForward(body), Lane::Data)
+                            Some((hid, addr)) => {
+                                match coordinator
+                                    .send_remote_write_with_reconnect(
+                                        hid,
+                                        &addr,
+                                        Message::MutationForward(body),
+                                    )
                                     .await
                                 {
                                     Ok(Message::MutationAck(_)) => ReplicaResult::Ack,
@@ -315,15 +349,15 @@ impl ClusterCoordinator {
         );
         let body = encode_mutation(&mutation);
 
-        let replica_targets: Vec<(u64, Option<uuid::Uuid>, String)> = replicas
+        let replica_targets: Vec<ReplicaWriteTarget> = replicas
             .iter()
             .map(|&replica_id| {
                 let node = ring.get_node(replica_id);
-                let host_id = node.map(|info| info.host_id);
+                let remote = node.map(|info| (info.host_id, info.addr.clone()));
                 let dc = node
                     .map(|info| info.data_center.clone())
                     .unwrap_or_default();
-                (replica_id, host_id, dc)
+                (replica_id, remote, dc)
             })
             .collect();
         drop(ring);
@@ -331,9 +365,9 @@ impl ClusterCoordinator {
         // Fan out.
         let mut fan_out: FuturesUnordered<_> = replica_targets
             .into_iter()
-            .map(|(replica_id, host_id, dc)| {
+            .map(|(replica_id, remote, dc)| {
                 let storage = self.storage.clone();
-                let peer_manager = self.peer_manager.clone();
+                let coordinator = self;
                 let table_id = table_id.clone();
                 let key = key.clone();
                 let row = row.clone();
@@ -347,11 +381,15 @@ impl ClusterCoordinator {
                             Err(_) => ReplicaResult::Failure { host_id: None },
                         }
                     } else {
-                        match host_id {
+                        match remote {
                             None => ReplicaResult::Failure { host_id: None },
-                            Some(hid) => {
-                                match peer_manager
-                                    .send(hid, Message::MutationForward(body), Lane::Data)
+                            Some((hid, addr)) => {
+                                match coordinator
+                                    .send_remote_write_with_reconnect(
+                                        hid,
+                                        &addr,
+                                        Message::MutationForward(body),
+                                    )
                                     .await
                                 {
                                     Ok(Message::MutationAck(_)) => ReplicaResult::Ack,
@@ -446,12 +484,16 @@ mod tests {
     use crate::error::ClusterError;
     use crate::raft::{NodeInfo, NodeState};
     use crate::ring::TokenRing;
+    use bytes::Bytes;
     use ferrosa_common::key::DecoratedKey;
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     use ferrosa_common::{CellValue, PartitionKey, Token};
+    use ferrosa_net::codec::MsgType;
     use ferrosa_net::config::NetConfig;
     use ferrosa_net::peer::{PeerEventListener, PeerManager};
     use ferrosa_net::rpc::handler::PeerId;
+    use ferrosa_net::rpc::server::RpcServer;
+    use ferrosa_net::rpc::{HandlerRegistry, RpcHandler};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig};
 
@@ -555,6 +597,34 @@ mod tests {
         ))
     }
 
+    struct MutationAckHandler;
+
+    #[async_trait::async_trait]
+    impl RpcHandler for MutationAckHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::MutationForward(_) = msg else {
+                return None;
+            };
+            Some(Message::MutationAck(Bytes::new()))
+        }
+    }
+
+    async fn start_rpc_server(
+        msg_type: MsgType,
+        handler: Arc<dyn RpcHandler>,
+    ) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(msg_type, handler);
+        let server = Arc::new(RpcServer::new(config, server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+        (server, addr, server_id)
+    }
+
     // ---------------------------------------------------------------------------
     // Existing tests (preserved)
     // ---------------------------------------------------------------------------
@@ -627,6 +697,61 @@ mod tests {
             }
             other => panic!("expected Unavailable, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn coordinate_write_reconnects_missing_remote_peer_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let (server, addr, remote_host_id) =
+            start_rpc_server(MsgType::MutationForward, Arc::new(MutationAckHandler)).await;
+
+        let local_node_id = 1u64;
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut ring = TokenRing::new();
+        let mut local = make_node("10.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage.clone(),
+            2,
+            ConsistencyLevel::All,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        coordinator
+            .coordinate_write_with(&table_id, &key, row, 1000, ConsistencyLevel::All, 2)
+            .await
+            .unwrap();
+
+        assert!(
+            pm.has_peer(remote_host_id),
+            "write path should cache the reconnected peer"
+        );
+
+        let stored = storage.read(&table_id, &key).unwrap();
+        assert!(stored.is_some(), "local replica must have written");
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     // ---------------------------------------------------------------------------
@@ -1136,6 +1261,69 @@ mod tests {
             matches!(result, Err(ClusterError::WriteTimeout { .. })),
             "expected WriteTimeout, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinate_write_nts_reconnects_missing_remote_peer_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let (server, addr, remote_host_id) =
+            start_rpc_server(MsgType::MutationForward, Arc::new(MutationAckHandler)).await;
+
+        let local_node_id = 1u64;
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut local = make_node("10.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        local.data_center = "datacenter1".to_string();
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        remote.data_center = "datacenter1".to_string();
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage.clone(),
+            2,
+            ConsistencyLevel::All,
+        );
+
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology {
+            dc_rf: std::collections::HashMap::from([("datacenter1".to_string(), 2usize)]),
+        };
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        coordinator
+            .coordinate_write_nts(&table_id, &key, row, 1000, ConsistencyLevel::All, &strategy)
+            .await
+            .unwrap();
+
+        assert!(
+            pm.has_peer(remote_host_id),
+            "NTS write path should cache the reconnected peer"
+        );
+
+        let stored = storage.read(&table_id, &key).unwrap();
+        assert!(stored.is_some(), "local replica must have written");
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     // -----------------------------------------------------------------------

@@ -16,6 +16,8 @@ use crate::planner::logical::{LogicalPlan, ResolvedTable};
 pub struct Hop {
     /// Variable binding for this hop's target node (if any).
     pub var: Option<String>,
+    /// Variable binding for this hop's relationship (if any).
+    pub rel_var: Option<String>,
     /// Edge label to filter by (if specified).
     pub edge_label: Option<String>,
     /// Direction of the edge traversal.
@@ -26,6 +28,8 @@ pub struct Hop {
     pub vertex_table: Option<ResolvedTable>,
     /// Property filter expressions from the relationship pattern.
     pub prop_filters: PropMap,
+    /// Property constraints from the destination node pattern.
+    pub target_props: PropMap,
 }
 
 /// The anchor (starting point) of a graph traversal.
@@ -35,6 +39,8 @@ pub struct Anchor {
     pub var: Option<String>,
     /// Resolved table for the anchor.
     pub table: ResolvedTable,
+    /// Property constraints from the anchor node pattern.
+    pub props: PropMap,
     /// Filter expressions that apply to the anchor.
     pub filters: Vec<Expr>,
 }
@@ -78,10 +84,16 @@ pub struct MergeOp {
     /// `src_key_bytes` (the SSTable partition key for the edge row).
     /// `None` for node MergeOps.
     pub src_match_props: Option<Vec<(String, Expr)>>,
+    /// For edge MergeOps: the source node variable name, used to reuse
+    /// the already-bound row during schema-aware hidden-key inference.
+    pub src_var: Option<String>,
     /// For edge MergeOps: the destination vertex's match properties, used to
     /// derive `dst_key_bytes` (the SSTable clustering key for the edge row).
     /// `None` for node MergeOps.
     pub dst_match_props: Option<Vec<(String, Expr)>>,
+    /// For edge MergeOps: the destination node variable name, used to reuse
+    /// the already-bound row during schema-aware hidden-key inference.
+    pub dst_var: Option<String>,
 }
 
 /// A projection in an aggregate plan.
@@ -382,7 +394,8 @@ fn plan_merge(
     return_clause: Option<&ReturnClause>,
 ) -> Result<PhysicalPlan> {
     let mut merges = Vec::new();
-    collect_merge_ops(patterns, bindings, &mut merges)?;
+    let mut merge_props_by_var = HashMap::new();
+    collect_merge_ops(patterns, bindings, &mut merge_props_by_var, &mut merges)?;
 
     if merges.is_empty() {
         return Err(GraphError::Validation(
@@ -413,6 +426,7 @@ fn plan_merge(
 fn collect_merge_ops(
     patterns: &[crate::parser::Pattern],
     bindings: &std::collections::HashMap<String, ResolvedTable>,
+    merge_props_by_var: &mut HashMap<String, Vec<(String, crate::parser::Expr)>>,
     merges: &mut Vec<MergeOp>,
 ) -> Result<()> {
     for pat in patterns {
@@ -424,13 +438,20 @@ fn collect_merge_ops(
                     None
                 };
                 if let Some(table) = resolved {
+                    if !props.is_empty() {
+                        if let Some(var_name) = var.as_ref() {
+                            merge_props_by_var.insert(var_name.clone(), props.clone());
+                        }
+                    }
                     merges.push(MergeOp {
                         var: var.clone(),
                         table,
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props: None,
+                        src_var: None,
                         dst_match_props: None,
+                        dst_var: None,
                     });
                 } else if label.is_some() {
                     return Err(GraphError::Validation(format!(
@@ -467,7 +488,9 @@ fn collect_merge_ops(
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props: None,
+                        src_var: None,
                         dst_match_props: None,
+                        dst_var: None,
                     });
                 } else if rel_type.is_some() {
                     return Err(GraphError::Validation(format!(
@@ -477,7 +500,7 @@ fn collect_merge_ops(
                 }
             }
             crate::parser::Pattern::Path(elements) => {
-                collect_merge_ops_from_path(elements, bindings, merges)?;
+                collect_merge_ops_from_path(elements, bindings, merge_props_by_var, merges)?;
             }
         }
     }
@@ -493,28 +516,41 @@ fn collect_merge_ops(
 fn collect_merge_ops_from_path(
     elements: &[crate::parser::Pattern],
     bindings: &std::collections::HashMap<String, ResolvedTable>,
+    merge_props_by_var: &mut HashMap<String, Vec<(String, crate::parser::Expr)>>,
     merges: &mut Vec<MergeOp>,
 ) -> Result<()> {
     let mut i = 0;
     while i < elements.len() {
         match &elements[i] {
             crate::parser::Pattern::Node { var, label, props } => {
-                // Emit a node MergeOp only on the first pass (i == 0) or when
-                // this node is NOT immediately preceded by a Rel we already
-                // handled (even indices in a well-formed path are always nodes).
+                let reuses_prior_binding = var.as_ref().is_some_and(|var_name| {
+                    props.is_empty() && merge_props_by_var.contains_key(var_name)
+                });
+                if reuses_prior_binding {
+                    i += 1;
+                    continue;
+                }
+
                 let resolved = if let Some(var_name) = var {
                     bindings.get(var_name).cloned()
                 } else {
                     None
                 };
                 if let Some(table) = resolved {
+                    if !props.is_empty() {
+                        if let Some(var_name) = var.as_ref() {
+                            merge_props_by_var.insert(var_name.clone(), props.clone());
+                        }
+                    }
                     merges.push(MergeOp {
                         var: var.clone(),
                         table,
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props: None,
+                        src_var: None,
                         dst_match_props: None,
+                        dst_var: None,
                     });
                 } else if label.is_some() {
                     return Err(GraphError::Validation(format!(
@@ -545,10 +581,27 @@ fn collect_merge_ops_from_path(
                 // Peek at the source node (i-1) for src_match_props.
                 let src_match_props: Option<Vec<(String, crate::parser::Expr)>> = if i > 0 {
                     if let crate::parser::Pattern::Node {
-                        props: src_props, ..
+                        var: src_var,
+                        props: src_props,
+                        ..
                     } = &elements[i - 1]
                     {
-                        Some(src_props.clone())
+                        if src_props.is_empty() {
+                            src_var
+                                .as_ref()
+                                .and_then(|name| merge_props_by_var.get(name).cloned())
+                        } else {
+                            Some(src_props.clone())
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let src_var = if i > 0 {
+                    if let crate::parser::Pattern::Node { var: src_var, .. } = &elements[i - 1] {
+                        src_var.clone()
                     } else {
                         None
                     }
@@ -560,16 +613,33 @@ fn collect_merge_ops_from_path(
                 let dst_match_props: Option<Vec<(String, crate::parser::Expr)>> =
                     if i + 1 < elements.len() {
                         if let crate::parser::Pattern::Node {
-                            props: dst_props, ..
+                            var: dst_var,
+                            props: dst_props,
+                            ..
                         } = &elements[i + 1]
                         {
-                            Some(dst_props.clone())
+                            if dst_props.is_empty() {
+                                dst_var
+                                    .as_ref()
+                                    .and_then(|name| merge_props_by_var.get(name).cloned())
+                            } else {
+                                Some(dst_props.clone())
+                            }
                         } else {
                             None
                         }
                     } else {
                         None
                     };
+                let dst_var = if i + 1 < elements.len() {
+                    if let crate::parser::Pattern::Node { var: dst_var, .. } = &elements[i + 1] {
+                        dst_var.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 if let Some(table) = resolved {
                     merges.push(MergeOp {
@@ -578,7 +648,9 @@ fn collect_merge_ops_from_path(
                         match_props: props.clone(),
                         create_props: vec![],
                         src_match_props,
+                        src_var,
                         dst_match_props,
+                        dst_var,
                     });
                 } else if rel_type.is_some() {
                     return Err(GraphError::Validation(format!(
@@ -591,7 +663,7 @@ fn collect_merge_ops_from_path(
                 i += 1;
             }
             crate::parser::Pattern::Path(inner) => {
-                collect_merge_ops_from_path(inner, bindings, merges)?;
+                collect_merge_ops_from_path(inner, bindings, merge_props_by_var, merges)?;
                 i += 1;
             }
         }
@@ -874,9 +946,14 @@ fn plan_match(
                     // Look up the binding for this node.
                     if let Some(var_name) = var {
                         if let Some(resolved) = bindings.get(var_name) {
+                            let props = match &elements[i] {
+                                Pattern::Node { props, .. } => props.clone(),
+                                _ => vec![],
+                            };
                             anchor = Some(Anchor {
                                 var: var.clone(),
                                 table: resolved.clone(),
+                                props,
                                 filters: filters.clone(),
                             });
                             i += 1;
@@ -887,9 +964,14 @@ fn plan_match(
                     if let Some(_label_str) = label {
                         if let Some(var_name) = var {
                             if let Some(resolved) = bindings.get(var_name) {
+                                let props = match &elements[i] {
+                                    Pattern::Node { props, .. } => props.clone(),
+                                    _ => vec![],
+                                };
                                 anchor = Some(Anchor {
                                     var: var.clone(),
                                     table: resolved.clone(),
+                                    props,
                                     filters: filters.clone(),
                                 });
                                 i += 1;
@@ -906,7 +988,7 @@ fn plan_match(
                 i += 1;
             }
             Pattern::Rel {
-                var: _,
+                var,
                 rel_type,
                 direction,
                 props,
@@ -927,15 +1009,15 @@ fn plan_match(
                 });
 
                 // Look for the next node.
-                let (next_var, vertex_table) = if i + 1 < elements.len() {
-                    if let Pattern::Node { var, .. } = &elements[i + 1] {
+                let (next_var, vertex_table, target_props) = if i + 1 < elements.len() {
+                    if let Pattern::Node { var, props, .. } = &elements[i + 1] {
                         let vt = var.as_ref().and_then(|v| bindings.get(v)).cloned();
-                        (var.clone(), vt)
+                        (var.clone(), vt, props.clone())
                     } else {
-                        (None, None)
+                        (None, None, vec![])
                     }
                 } else {
-                    (None, None)
+                    (None, None, vec![])
                 };
 
                 // If this is a variable-length path, we handle it specially
@@ -943,11 +1025,13 @@ fn plan_match(
                 if let Some((min, max_opt)) = length_range {
                     let hop = Hop {
                         var: next_var,
+                        rel_var: var.clone(),
                         edge_label,
                         direction: *direction,
                         edge_table,
                         vertex_table,
                         prop_filters: props.clone(),
+                        target_props,
                     };
 
                     let clamped_max = max_opt.map(|m| m.min(MAX_VAR_HOPS)).unwrap_or(MAX_VAR_HOPS);
@@ -969,11 +1053,13 @@ fn plan_match(
 
                 hops.push(Hop {
                     var: next_var,
+                    rel_var: var.clone(),
                     edge_label,
                     direction: *direction,
                     edge_table,
                     vertex_table,
                     prop_filters: props.clone(),
+                    target_props,
                 });
                 i += 2; // Skip rel + node
             }
@@ -1173,6 +1259,7 @@ mod tests {
                 assert_eq!(hops.len(), 1);
                 assert_eq!(hops[0].edge_label, Some("KNOWS".to_string()));
                 assert_eq!(hops[0].direction, Direction::Out);
+                assert_eq!(hops[0].rel_var, Some("r".to_string()));
                 assert_eq!(hops[0].var, Some("b".to_string()));
             }
             _ => panic!("expected Expand plan"),
@@ -1870,6 +1957,86 @@ mod tests {
                 assert_eq!(merges[0].match_props.len(), 1);
                 assert_eq!(merges[0].match_props[0].0, "name");
                 assert!(set_clause.is_empty());
+            }
+            other => panic!("expected MergeUpsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_merge_path_reuses_previously_bound_nodes_without_zero_prop_remerge() {
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+        bindings.insert("r".to_string(), knows_table());
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Merge {
+                patterns: vec![
+                    crate::parser::Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![(
+                            "name".into(),
+                            Expr::Literal(crate::parser::Literal::String("Alice".into())),
+                        )],
+                    },
+                    crate::parser::Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![(
+                            "name".into(),
+                            Expr::Literal(crate::parser::Literal::String("Bob".into())),
+                        )],
+                    },
+                    crate::parser::Pattern::Path(vec![
+                        crate::parser::Pattern::Node {
+                            var: Some("a".into()),
+                            label: None,
+                            props: vec![],
+                        },
+                        crate::parser::Pattern::Rel {
+                            var: Some("r".into()),
+                            rel_type: Some("KNOWS".into()),
+                            direction: Direction::Out,
+                            props: vec![],
+                            length_range: None,
+                        },
+                        crate::parser::Pattern::Node {
+                            var: Some("b".into()),
+                            label: None,
+                            props: vec![],
+                        },
+                    ]),
+                ],
+                set_clause: vec![Assignment {
+                    var: "r".into(),
+                    property: "since".into(),
+                    value: Expr::Literal(crate::parser::Literal::Integer(2026)),
+                }],
+                return_clause: None,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::MergeUpsert { merges, .. } => {
+                assert_eq!(merges.len(), 3, "expected only a, b, and r merge ops");
+                assert_eq!(merges[0].var.as_deref(), Some("a"));
+                assert_eq!(merges[1].var.as_deref(), Some("b"));
+                assert_eq!(merges[2].var.as_deref(), Some("r"));
+                assert_eq!(merges[2].table.table, "knows_e");
+                assert_eq!(
+                    merges[2].src_match_props.as_ref().map(Vec::len),
+                    Some(1),
+                    "edge merge should retain source match props from the earlier node merge"
+                );
+                assert_eq!(
+                    merges[2].dst_match_props.as_ref().map(Vec::len),
+                    Some(1),
+                    "edge merge should retain destination match props from the earlier node merge"
+                );
             }
             other => panic!("expected MergeUpsert, got {other:?}"),
         }
