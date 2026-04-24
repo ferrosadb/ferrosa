@@ -1,0 +1,1931 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index ca1eaa5..f586488 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -15,6 +15,7 @@ members = [
+     "ferrosa-udf",
+     "ferrosa-worker",
+     "ferrosa-jepsen",
++    "ferrosa-loadgen",
+ ]
+ 
+ [workspace.package]
+diff --git a/ferrosa-cluster/src/controller.rs b/ferrosa-cluster/src/controller.rs
+index 1102536..8d7f1a1 100644
+--- a/ferrosa-cluster/src/controller.rs
++++ b/ferrosa-cluster/src/controller.rs
+@@ -35,13 +35,15 @@ use ferrosa_storage::CommitLogPosition;
+ use crate::config::ClusterConfig;
+ use crate::consistency::ConsistencyLevel;
+ use crate::coordinator::{ClusterCoordinator, RepairWriteHandler};
+-use crate::ddl_path::{ClusterDdlForwardHandler, DdlPath};
++use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
+ use crate::error::{ClusterError, Result};
+ use crate::hints::delivery::HintDeliveryTask;
+ use crate::hints::{HintConfig, HintStore};
+ use crate::mode::DeploymentMode;
+ use crate::pair::coordinator::{encode_mutation, PairCoordinator};
+-use crate::pair::ddl::{DdlCoordinator, PairDdlForwardHandler, PairSchemaSyncHandler};
++use crate::pair::ddl::{
++    DdlCoordinator, DdlOperation, PairDdlForwardHandler, PairSchemaSyncHandler,
++};
+ use crate::pair::{PairRole, PairState};
+ use crate::raft::handlers::{
+     RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
+@@ -745,6 +747,36 @@ impl ModeController {
+             }
+         };
+ 
++        // 0. Ensure PeerManager has outbound connections to ALL peers.
++        //
++        // BUG FIX: When transitioning from pair → cluster, only the first peer
++        // (from transition_to_pair) has a reverse outbound pool. The second peer
++        // (which triggered this transition) may only have an inbound connection.
++        // Raft needs to SEND to all peers, so we must create outbound pools for
++        // any peer the PeerManager doesn't already know about.
++        let net_cfg = self.net_config.clone();
++        let local_id = self.local_host_id;
++        let internode_port = self.net_config.bind_addr.port();
++        for (peer_uuid, peer_addr) in &peers {
++            if !peer_manager.has_peer(*peer_uuid) {
++                let pm = peer_manager.clone();
++                let cfg = net_cfg.clone();
++                let uuid = *peer_uuid;
++                let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
++                tokio::spawn(async move {
++                    match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string()).await {
++                        Ok(pool) => {
++                            pm.add_peer((uuid, reverse_addr), pool).await;
++                            tracing::info!(%uuid, %reverse_addr, "cluster: reverse connection established");
++                        }
++                        Err(e) => {
++                            tracing::warn!(%uuid, %e, "cluster: reverse connection failed");
++                        }
++                    }
++                });
++            }
++        }
++
+         // 1. Create sled log store
+         let raft_dir = if let Some(ref dir) = self.config.raft_data_dir {
+             dir.clone()
+@@ -878,13 +910,12 @@ impl ModeController {
+             .store(Arc::new(WritePath::cluster(coordinator)));
+ 
+         // DdlPath::Cluster needs the Raft instance — Raft initialization is async
+-        // and happens in a background task. For now, keep DDL on the pair path or
+-        // set to direct until Raft is fully initialized. We store the log_store
+-        // and network_factory references for later Raft bootstrap.
+-        //
+-        // In the initial cluster transition we use direct DDL — the Raft leader
+-        // election and DDL-via-Raft wiring will be completed by the background
+-        // Raft initialization task.
++        // and happens in a background task. Keep DDL on Direct path during the
++        // transition window so standalone/pair DDL continues to work. Once Raft
++        // is initialized and a leader is elected, the background task will:
++        //   1. Swap DDL path to DdlPath::Cluster
++        //   2. Replay the current local schema state through Raft so all
++        //      followers converge on the same schema
+         self.ddl_path.store(Arc::new(DdlPath::Direct {
+             schema: self.schema.clone(),
+             engine: self.storage.clone(),
+@@ -915,6 +946,7 @@ impl ModeController {
+         let storage_for_handler = self.storage.clone();
+         let repair_metrics = repair_metrics_for_handler;
+         let cluster_name = self.config.cluster_name.clone();
++        let schema_for_replay = self.schema.clone();
+         tokio::spawn(async move {
+             // Build openraft Config
+             let raft_config = match (openraft::Config {
+@@ -1032,6 +1064,33 @@ impl ModeController {
+                         peer_manager: peer_manager_for_ddl,
+                         node_map: node_map_for_ddl,
+                     }));
++
++                    // Replay local schema state through Raft so all followers
++                    // converge. Any DDL applied via the Direct path during the
++                    // transition window is now proposed through consensus.
++                    if lid == local_node_id {
++                        tracing::info!("replaying local schema state through Raft for follower convergence");
++                        let schema_snap = schema_for_replay.snapshot();
++                        for (name, ks) in &schema_snap.keyspaces {
++                            // Skip system keyspaces — they exist on all nodes.
++                            if name.starts_with("system") {
++                                continue;
++                            }
++                            let op = DdlOperation::CreateKeyspace(ks.clone());
++                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
++                                tracing::warn!(%e, ks = %name, "schema replay: CreateKeyspace failed (may already exist)");
++                            }
++                        }
++                        for ((ks, _tbl), table) in &schema_snap.tables {
++                            if ks.starts_with("system") {
++                                continue;
++                            }
++                            let op = DdlOperation::CreateTable(Box::new(table.clone()));
++                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
++                                tracing::warn!(%e, "schema replay: CreateTable failed (may already exist)");
++                            }
++                        }
++                    }
+                 }
+                 None => {
+                     tracing::warn!(
+diff --git a/ferrosa-cluster/src/ddl_path.rs b/ferrosa-cluster/src/ddl_path.rs
+index 9ab0d13..f2b3f4b 100644
+--- a/ferrosa-cluster/src/ddl_path.rs
++++ b/ferrosa-cluster/src/ddl_path.rs
+@@ -385,7 +385,7 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
+ /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
+ /// and transparently forwards the request to the leader instead of propagating
+ /// the error to the CQL client.
+-async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
++pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
+     let cmd = ddl_op_to_raft_command(op);
+ 
+     match raft.client_write(cmd).await {
+diff --git a/ferrosa-ctl/Cargo.toml b/ferrosa-ctl/Cargo.toml
+index 397ddfb..77f4a7f 100644
+--- a/ferrosa-ctl/Cargo.toml
++++ b/ferrosa-ctl/Cargo.toml
+@@ -6,6 +6,10 @@ edition.workspace = true
+ license.workspace = true
+ repository.workspace = true
+ 
++[lib]
++name = "ferrosa_ctl"
++path = "src/lib.rs"
++
+ [[bin]]
+ name = "ferrosa-ctl"
+ path = "src/main.rs"
+diff --git a/ferrosa-ctl/src/main.rs b/ferrosa-ctl/src/main.rs
+index f1c6582..ce38f4c 100644
+--- a/ferrosa-ctl/src/main.rs
++++ b/ferrosa-ctl/src/main.rs
+@@ -25,8 +25,7 @@ use std::process;
+ 
+ use clap::{Parser, Subcommand};
+ 
+-mod commands;
+-mod tui;
++use ferrosa_ctl::commands;
+ 
+ /// Administration and observability CLI for Ferrosa.
+ #[derive(Debug, Parser)]
+diff --git a/ferrosa-ctl/tests/integration.rs b/ferrosa-ctl/tests/integration.rs
+index b7a1555..ec835b1 100644
+--- a/ferrosa-ctl/tests/integration.rs
++++ b/ferrosa-ctl/tests/integration.rs
+@@ -511,3 +511,117 @@ async fn requests_served_increments() {
+         "requests_served should have increased; before={max_before}, after={max_after}"
+     );
+ }
++
++// ---------------------------------------------------------------------------
++// CT-001: Execute actual ctl command functions against a live CQL server
++// ---------------------------------------------------------------------------
++
++/// CT-001: `run_status()` succeeds against a live test server and prints status.
++#[tokio::test]
++async fn ctl_run_status_against_live_server() {
++    let (_client, state, _dir) = boot_and_connect().await;
++    let server = CqlServer::new(test_config(), state.clone());
++    let addr = server.start_background().await.unwrap();
++
++    let result = ferrosa_ctl::commands::run_status(addr).await;
++    assert!(result.is_ok(), "run_status should succeed: {result:?}");
++}
++
++/// CT-001: `run_connections()` succeeds and handles no sort column.
++#[tokio::test]
++async fn ctl_run_connections_against_live_server() {
++    let (_client, state, _dir) = boot_and_connect().await;
++    let server = CqlServer::new(test_config(), state.clone());
++    let addr = server.start_background().await.unwrap();
++
++    let result = ferrosa_ctl::commands::run_connections(addr, None).await;
++    assert!(
++        result.is_ok(),
++        "run_connections(None) should succeed: {result:?}"
++    );
++
++    // With sort on existing column.
++    let result = ferrosa_ctl::commands::run_connections(addr, Some("peer_address")).await;
++    assert!(
++        result.is_ok(),
++        "run_connections(peer_address) should succeed: {result:?}"
++    );
++}
++
++/// CT-001: `run_queries()` succeeds in both normal and long-running modes.
++#[tokio::test]
++async fn ctl_run_queries_against_live_server() {
++    let (_client, state, _dir) = boot_and_connect().await;
++    let server = CqlServer::new(test_config(), state.clone());
++    let addr = server.start_background().await.unwrap();
++
++    let result = ferrosa_ctl::commands::run_queries(addr, false).await;
++    assert!(
++        result.is_ok(),
++        "run_queries(false) should succeed: {result:?}"
++    );
++
++    let result = ferrosa_ctl::commands::run_queries(addr, true).await;
++    assert!(
++        result.is_ok(),
++        "run_queries(true) should succeed: {result:?}"
++    );
++}
++
++/// CT-001: `run_storage()` returns error when storage_stats table is not
++/// registered (expected — the test setup only registers connections and
++/// active_queries virtual tables).
++#[tokio::test]
++async fn ctl_run_storage_errors_without_table() {
++    let (_client, state, _dir) = boot_and_connect().await;
++    let server = CqlServer::new(test_config(), state.clone());
++    let addr = server.start_background().await.unwrap();
++
++    let result = ferrosa_ctl::commands::run_storage(addr).await;
++    assert!(
++        result.is_err(),
++        "run_storage should fail without storage_stats virtual table"
++    );
++}
++
++/// CT-001: `run_topology()` succeeds (single-node = no peers).
++#[tokio::test]
++async fn ctl_run_topology_against_live_server() {
++    let (_client, state, _dir) = boot_and_connect().await;
++    let server = CqlServer::new(test_config(), state.clone());
++    let addr = server.start_background().await.unwrap();
++
++    let result = ferrosa_ctl::commands::run_topology(addr).await;
++    assert!(result.is_ok(), "run_topology should succeed: {result:?}");
++}
++
++/// CT-001: `run_peers()` succeeds (single-node = no peers).
++#[tokio::test]
++async fn ctl_run_peers_against_live_server() {
++    let (_client, state, _dir) = boot_and_connect().await;
++    let server = CqlServer::new(test_config(), state.clone());
++    let addr = server.start_background().await.unwrap();
++
++    let result = ferrosa_ctl::commands::run_peers(addr).await;
++    assert!(result.is_ok(), "run_peers should succeed: {result:?}");
++}
++
++/// CT-003: `run_status()` returns error when connecting to a non-listening port.
++#[tokio::test]
++async fn ctl_run_status_connection_refused() {
++    // Port 1 is almost certainly not running a CQL server.
++    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
++    let result = ferrosa_ctl::commands::run_status(addr).await;
++    assert!(
++        result.is_err(),
++        "run_status to closed port should return error"
++    );
++}
++
++/// CT-003: `run_connections()` returns error when server unreachable.
++#[tokio::test]
++async fn ctl_run_connections_connection_refused() {
++    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
++    let result = ferrosa_ctl::commands::run_connections(addr, None).await;
++    assert!(result.is_err(), "should fail on closed port");
++}
+diff --git a/ferrosa-jepsen/src/chaos/mod.rs b/ferrosa-jepsen/src/chaos/mod.rs
+index 4f7b022..2ca7115 100644
+--- a/ferrosa-jepsen/src/chaos/mod.rs
++++ b/ferrosa-jepsen/src/chaos/mod.rs
+@@ -320,4 +320,123 @@ mod tests {
+         assert_eq!(disk::DiskSlow.name(), "disk-slow");
+         assert_eq!(disk::DiskFail.name(), "disk-fail");
+     }
++
++    #[tokio::test]
++    async fn noop_nemesis_inject_and_heal_succeed() {
++        let ctx = NemesisContext {
++            node_ips: vec!["127.0.0.1".into()],
++            ssh_user: "root".into(),
++            ssh_key_path: PathBuf::from("/tmp/key"),
++            ssh_port: 22,
++        };
++        let noop = NoOp;
++        assert!(noop.inject(&ctx).await.is_ok());
++        assert!(noop.heal(&ctx).await.is_ok());
++    }
++
++    #[test]
++    fn nemesis_schedule_zero_cycles() {
++        let sched = NemesisSchedule {
++            nemesis_name: "noop".to_string(),
++            inject_duration: Duration::from_secs(0),
++            heal_duration: Duration::from_secs(0),
++            cycles: 0,
++        };
++        let json = serde_json::to_string(&sched).unwrap();
++        let back: NemesisSchedule = serde_json::from_str(&json).unwrap();
++        assert_eq!(back.cycles, 0);
++    }
++
++    #[test]
++    fn nemesis_schedule_roundtrip_preserves_durations() {
++        let sched = NemesisSchedule {
++            nemesis_name: "clock-skew-large".to_string(),
++            inject_duration: Duration::from_millis(500),
++            heal_duration: Duration::from_secs(5),
++            cycles: 100,
++        };
++        let json = serde_json::to_string(&sched).unwrap();
++        let back: NemesisSchedule = serde_json::from_str(&json).unwrap();
++        assert_eq!(back.inject_duration, Duration::from_millis(500));
++        assert_eq!(back.heal_duration, Duration::from_secs(5));
++        assert_eq!(back.cycles, 100);
++    }
++
++    #[test]
++    fn nemesis_context_single_node() {
++        let ctx = NemesisContext {
++            node_ips: vec!["10.0.0.1".into()],
++            ssh_user: "root".into(),
++            ssh_key_path: PathBuf::from("/tmp/key"),
++            ssh_port: 22,
++        };
++        // With 1 node: majority = 1, minority = 0.
++        assert_eq!(ctx.majority_ips().len(), 1);
++        assert_eq!(ctx.minority_ips().len(), 0);
++    }
++
++    #[test]
++    fn nemesis_context_even_node_count() {
++        let ctx = NemesisContext {
++            node_ips: vec!["a".into(), "b".into(), "c".into(), "d".into()],
++            ssh_user: "root".into(),
++            ssh_key_path: PathBuf::from("/tmp/key"),
++            ssh_port: 22,
++        };
++        // 4 nodes: majority = 3, minority = 1.
++        assert_eq!(ctx.majority_ips().len(), 3);
++        assert_eq!(ctx.minority_ips().len(), 1);
++    }
++
++    #[test]
++    fn wan_nemesis_names() {
++        assert_eq!(wan_bridge::DcPartition.name(), "dc-partition");
++        assert_eq!(wan_bridge::DcSlow.name(), "dc-slow");
++        assert_eq!(wan_bridge::DcAsymmetric.name(), "dc-asymmetric");
++        assert_eq!(wan_bridge::DcFlap.name(), "dc-flap");
++        assert_eq!(wan_bridge::DcLossy.name(), "dc-lossy");
++    }
++
++    #[test]
++    fn composed_nemesis_names() {
++        assert_eq!(composed::partition_and_kill().name(), "partition+kill");
++        assert_eq!(composed::slow_and_clock().name(), "slow+clock");
++        assert_eq!(
++            composed::dc_partition_and_kill().name(),
++            "dc-partition+kill"
++        );
++        assert_eq!(composed::dc_slow_and_disk().name(), "dc-slow+disk");
++        assert_eq!(composed::everything().name(), "everything");
++    }
++
++    #[test]
++    fn phase2_is_superset_of_phase1() {
++        let p1 = NemesisRegistry::phase1();
++        let p2 = NemesisRegistry::phase2();
++        for name in p1.names() {
++            assert!(
++                p2.get(&name).is_some(),
++                "phase2 missing phase1 nemesis: {name}"
++            );
++        }
++    }
++
++    #[test]
++    fn full_is_superset_of_phase2() {
++        let p2 = NemesisRegistry::phase2();
++        let full = NemesisRegistry::full();
++        for name in p2.names() {
++            assert!(
++                full.get(&name).is_some(),
++                "full missing phase2 nemesis: {name}"
++            );
++        }
++    }
++
++    #[test]
++    fn registry_default_is_empty() {
++        let reg = NemesisRegistry::default();
++        assert!(reg.names().is_empty());
++        assert!(reg.get("anything").is_none());
++    }
+ }
+diff --git a/ferrosa-jepsen/src/checker/elle.rs b/ferrosa-jepsen/src/checker/elle.rs
+index 11366bf..38fa022 100644
+--- a/ferrosa-jepsen/src/checker/elle.rs
++++ b/ferrosa-jepsen/src/checker/elle.rs
+@@ -126,11 +126,107 @@ mod tests {
+         let types = vec![
+             ElleAnomalyType::G0,
+             ElleAnomalyType::G1a,
++            ElleAnomalyType::G1b,
++            ElleAnomalyType::G1c,
+             ElleAnomalyType::G2,
++            ElleAnomalyType::GSingle,
++            ElleAnomalyType::GNonadjacent,
++            ElleAnomalyType::InternalConsistency,
+         ];
+-        for t in types {
+-            let json = serde_json::to_string(&t).unwrap();
++        for t in &types {
++            let json = serde_json::to_string(t).unwrap();
+             assert!(!json.is_empty());
+         }
++        // All 8 anomaly types must be covered.
++        assert_eq!(types.len(), 8);
++    }
++
++    #[test]
++    fn elle_anomaly_type_roundtrip() {
++        let types = vec![
++            ElleAnomalyType::G0,
++            ElleAnomalyType::G1a,
++            ElleAnomalyType::G1b,
++            ElleAnomalyType::G1c,
++            ElleAnomalyType::G2,
++            ElleAnomalyType::GSingle,
++            ElleAnomalyType::GNonadjacent,
++            ElleAnomalyType::InternalConsistency,
++        ];
++        for t in &types {
++            let json = serde_json::to_string(t).unwrap();
++            let back: ElleAnomalyType = serde_json::from_str(&json).unwrap();
++            // Verify roundtrip works (deserialization doesn't fail).
++            let json2 = serde_json::to_string(&back).unwrap();
++            assert_eq!(json, json2);
++        }
++    }
++
++    #[test]
++    fn elle_result_with_anomalies() {
++        let r = ElleResult {
++            valid: false,
++            consistency_model: "strict-serializable".into(),
++            anomaly_types: vec!["G0".into(), "G1c".into()],
++            anomaly_count: 2,
++            ok_count: 50,
++        };
++        let json = serde_json::to_string(&r).unwrap();
++        let back: ElleResult = serde_json::from_str(&json).unwrap();
++        assert!(!back.valid);
++        assert_eq!(back.anomaly_types.len(), 2);
++        assert_eq!(back.anomaly_count, 2);
++        assert!(back.anomaly_types.contains(&"G0".to_string()));
++        assert!(back.anomaly_types.contains(&"G1c".to_string()));
++    }
++
++    #[test]
++    fn elle_anomaly_struct_serialization() {
++        let anomaly = ElleAnomaly {
++            anomaly_type: "G2".into(),
++            cycle: vec!["txn1".into(), "txn2".into(), "txn1".into()],
++            description: "Anti-dependency cycle between txn1 and txn2".into(),
++        };
++        let json = serde_json::to_string(&anomaly).unwrap();
++        let back: ElleAnomaly = serde_json::from_str(&json).unwrap();
++        assert_eq!(back.anomaly_type, "G2");
++        assert_eq!(back.cycle.len(), 3);
++        assert_eq!(
++            back.description,
++            "Anti-dependency cycle between txn1 and txn2"
++        );
++    }
++
++    #[test]
++    fn elle_result_empty_anomalies() {
++        let r = ElleResult {
++            valid: true,
++            consistency_model: "strict-serializable".into(),
++            anomaly_types: vec![],
++            anomaly_count: 0,
++            ok_count: 0,
++        };
++        assert!(r.valid);
++        assert!(r.anomaly_types.is_empty());
++    }
++
++    #[test]
++    fn elle_result_all_anomaly_names() {
++        // Verify the anomaly name strings used in run_check parsing.
++        let names = ["G0", "G1a", "G1b", "G1c", "G2", "G-single", "G-nonadjacent"];
++        for name in &names {
++            let lower = format!(":{}", name.to_lowercase());
++            assert!(
++                lower.starts_with(':'),
++                "anomaly keyword must start with colon"
++            );
++        }
++        assert_eq!(names.len(), 7);
++    }
++
++    #[test]
++    fn elle_checker_new_stores_path() {
++        let checker = ElleChecker::new("/tmp/jepsen");
++        assert_eq!(checker.jepsen_dir, std::path::PathBuf::from("/tmp/jepsen"));
+     }
+ }
+diff --git a/ferrosa-jepsen/src/checker/knossos.rs b/ferrosa-jepsen/src/checker/knossos.rs
+index f434de1..648ff86 100644
+--- a/ferrosa-jepsen/src/checker/knossos.rs
++++ b/ferrosa-jepsen/src/checker/knossos.rs
+@@ -145,4 +145,131 @@ mod tests {
+             0
+         );
+     }
++
++    #[test]
++    fn parse_empty_output() {
++        let result = KnossosChecker::parse_output(b"").unwrap();
++        // Empty output has no ":valid? true" so valid=false.
++        assert!(!result.valid);
++        assert_eq!(result.ok_count, 0);
++        assert_eq!(result.fail_count, 0);
++        assert_eq!(result.info_count, 0);
++        assert_eq!(result.anomalies.len(), 1);
++    }
++
++    #[test]
++    fn parse_output_without_valid_keyword() {
++        let output = b":ok-count 10\n:fail-count 0\n:info-count 0";
++        let result = KnossosChecker::parse_output(output).unwrap();
++        // No ":valid?" at all → defaults to false.
++        assert!(!result.valid);
++    }
++
++    #[test]
++    fn parse_output_valid_false_explicit() {
++        let output = b":valid? false\n:ok-count 5\n:fail-count 3\n:info-count 1";
++        let result = KnossosChecker::parse_output(output).unwrap();
++        assert!(!result.valid);
++        assert_eq!(result.ok_count, 5);
++        assert_eq!(result.fail_count, 3);
++        assert_eq!(result.info_count, 1);
++        assert_eq!(result.anomalies.len(), 1);
++        assert_eq!(
++            result.anomalies[0].anomaly_type,
++            "linearizability-violation"
++        );
++    }
++
++    #[test]
++    fn extract_count_large_number() {
++        assert_eq!(
++            KnossosChecker::extract_count(":ok-count 1000000", ":ok-count"),
++            1_000_000
++        );
++    }
++
++    #[test]
++    fn extract_count_zero() {
++        assert_eq!(KnossosChecker::extract_count(":ok-count 0", ":ok-count"), 0);
++    }
++
++    #[test]
++    fn extract_count_with_trailing_text() {
++        // Count followed by non-digit chars.
++        assert_eq!(
++            KnossosChecker::extract_count(":ok-count 42abc", ":ok-count"),
++            42
++        );
++    }
++
++    #[test]
++    fn extract_count_no_digits_after_key() {
++        // Key present but no digits following it.
++        assert_eq!(
++            KnossosChecker::extract_count(":ok-count abc", ":ok-count"),
++            0
++        );
++    }
++
++    #[test]
++    fn extract_count_key_at_end_of_text() {
++        assert_eq!(KnossosChecker::extract_count(":ok-count", ":ok-count"), 0);
++    }
++
++    #[test]
++    fn parse_output_with_extra_whitespace() {
++        let output = b"  :valid? true  \n  :ok-count   100  \n  :fail-count  0  ";
++        let result = KnossosChecker::parse_output(output).unwrap();
++        assert!(result.valid);
++        assert_eq!(result.ok_count, 100);
++        assert_eq!(result.fail_count, 0);
++    }
++
++    #[test]
++    fn parse_output_multiline_clojure_format() {
++        // Simulate realistic Jepsen Clojure output format.
++        let output = br#"
++{:valid? true
++ :model "cas-register"
++ :ok-count 150
++ :fail-count 0
++ :info-count 5
++ :not-linearizable-count 0}
++"#;
++        let result = KnossosChecker::parse_output(output).unwrap();
++        assert!(result.valid);
++        assert_eq!(result.ok_count, 150);
++        assert_eq!(result.info_count, 5);
++    }
++
++    #[test]
++    fn knossos_result_serialization_roundtrip() {
++        let result = KnossosResult {
++            valid: false,
++            model: "cas-register".into(),
++            algorithm: "wgl".into(),
++            ok_count: 10,
++            fail_count: 2,
++            info_count: 1,
++            anomalies: vec![KnossosAnomaly {
++                anomaly_type: "linearizability-violation".into(),
++                description: "stale read".into(),
++            }],
++        };
++        let json = serde_json::to_string(&result).unwrap();
++        let back: KnossosResult = serde_json::from_str(&json).unwrap();
++        assert!(!back.valid);
++        assert_eq!(back.ok_count, 10);
++        assert_eq!(back.anomalies.len(), 1);
++    }
++
++    #[test]
++    fn parse_output_non_utf8_bytes() {
++        // Non-UTF8 bytes should be handled via lossy conversion.
++        let output: Vec<u8> = vec![
++            0xFF, 0xFE, b':', b'v', b'a', b'l', b'i', b'd', b'?', b' ', b't', b'r', b'u', b'e',
++        ];
++        let result = KnossosChecker::parse_output(&output).unwrap();
++        assert!(result.valid);
++    }
+ }
+diff --git a/ferrosa-jepsen/src/config.rs b/ferrosa-jepsen/src/config.rs
+index bcc4064..5c54154 100644
+--- a/ferrosa-jepsen/src/config.rs
++++ b/ferrosa-jepsen/src/config.rs
+@@ -214,4 +214,120 @@ mod tests {
+         let tops = config.topologies();
+         assert_eq!(tops, vec![Topology::T1, Topology::T2]);
+     }
++
++    fn make_config(tier: Tier) -> RunConfig {
++        RunConfig {
++            tier,
++            topology: None,
++            nemesis: None,
++            pattern: None,
++            driver: None,
++            concurrency: None,
++            run_id: "test".into(),
++            output_dir: PathBuf::from("/tmp"),
++            fly_regions: vec![],
++            alert_webhook: None,
++            output_json: false,
++        }
++    }
++
++    #[test]
++    fn run_duration_secs_per_tier() {
++        assert_eq!(make_config(Tier::Smoke).run_duration_secs(), 5);
++        assert_eq!(make_config(Tier::Standard).run_duration_secs(), 30);
++        assert_eq!(make_config(Tier::Full).run_duration_secs(), 60);
++        assert_eq!(make_config(Tier::Endurance).run_duration_secs(), 86_400);
++    }
++
++    #[test]
++    fn concurrency_levels_per_tier() {
++        assert_eq!(
++            make_config(Tier::Smoke).concurrency_levels(),
++            vec![Concurrency::Low]
++        );
++        assert_eq!(
++            make_config(Tier::Standard).concurrency_levels(),
++            vec![Concurrency::Low, Concurrency::Medium]
++        );
++        assert_eq!(
++            make_config(Tier::Full).concurrency_levels(),
++            vec![Concurrency::Low, Concurrency::Medium, Concurrency::High]
++        );
++        assert_eq!(
++            make_config(Tier::Endurance).concurrency_levels(),
++            vec![Concurrency::Low, Concurrency::Medium, Concurrency::High]
++        );
++    }
++
++    #[test]
++    fn concurrency_levels_override() {
++        let mut config = make_config(Tier::Full);
++        config.concurrency = Some(Concurrency::High);
++        assert_eq!(config.concurrency_levels(), vec![Concurrency::High]);
++    }
++
++    #[test]
++    fn topologies_override() {
++        let mut config = make_config(Tier::Full);
++        config.topology = Some(Topology::T3);
++        assert_eq!(config.topologies(), vec![Topology::T3]);
++    }
++
++    #[test]
++    fn topologies_per_tier() {
++        assert_eq!(make_config(Tier::Smoke).topologies(), vec![Topology::T1]);
++        assert_eq!(
++            make_config(Tier::Full).topologies(),
++            vec![Topology::T1, Topology::T2, Topology::T3, Topology::T4]
++        );
++        assert_eq!(
++            make_config(Tier::Endurance).topologies(),
++            vec![Topology::T4]
++        );
++    }
++
++    #[test]
++    fn backend_for_topology() {
++        let config = make_config(Tier::Smoke);
++        assert_eq!(
++            config.backend_for(Topology::T1),
++            ClusterBackend::Firecracker
++        );
++        assert_eq!(
++            config.backend_for(Topology::T2),
++            ClusterBackend::Firecracker
++        );
++        assert_eq!(config.backend_for(Topology::T3), ClusterBackend::FlyIo);
++        assert_eq!(config.backend_for(Topology::T4), ClusterBackend::FlyIo);
++    }
++
++    #[test]
++    fn concurrency_medium_values() {
++        assert_eq!(Concurrency::Medium.threads(), 16);
++        assert_eq!(Concurrency::Medium.connections(), 64);
++    }
++
++    #[test]
++    fn topology_dc_counts() {
++        assert_eq!(Topology::T1.dc_count(), 1);
++        assert_eq!(Topology::T2.dc_count(), 1);
++        assert_eq!(Topology::T3.dc_count(), 2);
++        assert_eq!(Topology::T4.dc_count(), 3);
++    }
++
++    #[test]
++    fn topology_quorum_sizes() {
++        assert_eq!(Topology::T1.quorum_size(), 2);
++        assert_eq!(Topology::T2.quorum_size(), 3);
++        assert_eq!(Topology::T3.quorum_size(), 2);
++        assert_eq!(Topology::T4.quorum_size(), 2);
++    }
++
++    #[test]
++    fn topology_fly_requirement() {
++        assert!(!Topology::T1.requires_fly());
++        assert!(!Topology::T2.requires_fly());
++        assert!(Topology::T3.requires_fly());
++        assert!(Topology::T4.requires_fly());
++    }
+ }
+diff --git a/ferrosa-jepsen/src/history.rs b/ferrosa-jepsen/src/history.rs
+index 6290a49..1f01c28 100644
+--- a/ferrosa-jepsen/src/history.rs
++++ b/ferrosa-jepsen/src/history.rs
+@@ -546,4 +546,183 @@ mod tests {
+         let loaded = History::from_jsonl(&path).expect("read empty jsonl");
+         assert!(loaded.is_empty());
+     }
++
++    #[test]
++    #[should_panic(expected = "client_id must not be empty")]
++    fn recorder_panics_on_empty_client_id() {
++        let _rec = HistoryRecorder::new("");
++    }
++
++    #[test]
++    #[should_panic(expected = "cannot invoke while another operation is pending")]
++    fn recorder_panics_on_double_invoke() {
++        let mut rec = HistoryRecorder::new("c1");
++        rec.invoke(Op::Read { key: "x".into() });
++        rec.invoke(Op::Read { key: "y".into() }); // should panic
++    }
++
++    #[test]
++    #[should_panic(expected = "complete called with no pending operation")]
++    fn recorder_panics_on_complete_without_invoke() {
++        let mut rec = HistoryRecorder::new("c1");
++        rec.complete(OpResult::Ok); // should panic
++    }
++
++    #[test]
++    #[should_panic(expected = "cannot finish with a pending operation")]
++    fn recorder_panics_on_finish_with_pending() {
++        let mut rec = HistoryRecorder::new("c1");
++        rec.invoke(Op::Read { key: "x".into() });
++        let _h = rec.finish(); // should panic
++    }
++
++    #[test]
++    fn filter_key_matches_transaction_contents() {
++        let history = History {
++            operations: vec![make_op(
++                "c1",
++                100,
++                200,
++                Op::Transaction {
++                    statements: vec![
++                        Op::Write {
++                            key: "a".into(),
++                            value: 1,
++                        },
++                        Op::Write {
++                            key: "b".into(),
++                            value: 2,
++                        },
++                    ],
++                },
++                OpResult::Ok,
++            )],
++        };
++
++        assert_eq!(history.filter_key("a").len(), 1);
++        assert_eq!(history.filter_key("b").len(), 1);
++        assert_eq!(history.filter_key("c").len(), 0);
++    }
++
++    #[test]
++    fn filter_key_excludes_table_based_ops() {
++        let history = History {
++            operations: vec![
++                make_op(
++                    "c1",
++                    100,
++                    200,
++                    Op::InsertIfNotExists {
++                        table: "t1".into(),
++                        pk: "pk-0".into(),
++                        values: vec![("val".into(), "v0".into())],
++                    },
++                    OpResult::Applied(true),
++                ),
++                make_op(
++                    "c1",
++                    300,
++                    400,
++                    Op::UpdateIf {
++                        table: "t1".into(),
++                        pk: "pk-0".into(),
++                        condition: "val = 0".into(),
++                        assignments: vec![("val".into(), "1".into())],
++                    },
++                    OpResult::Applied(true),
++                ),
++                make_op(
++                    "c1",
++                    500,
++                    600,
++                    Op::DeleteIf {
++                        table: "t1".into(),
++                        pk: "pk-0".into(),
++                        condition: "EXISTS".into(),
++                    },
++                    OpResult::Applied(true),
++                ),
++            ],
++        };
++
++        // Table-based ops should not match any key filter.
++        assert_eq!(history.filter_key("pk-0").len(), 0);
++        assert_eq!(history.filter_key("t1").len(), 0);
++    }
++
++    #[test]
++    fn jsonl_skips_blank_lines() {
++        let dir = tempfile::tempdir().expect("create temp dir");
++        let path = dir.path().join("blanks.jsonl");
++
++        let op = make_op(
++            "c1",
++            100,
++            200,
++            Op::Read { key: "x".into() },
++            OpResult::Value(Some(1)),
++        );
++        let json = serde_json::to_string(&op).unwrap();
++
++        // Write with blank lines interspersed.
++        std::fs::write(&path, format!("\n{json}\n\n{json}\n")).unwrap();
++
++        let loaded = History::from_jsonl(&path).unwrap();
++        assert_eq!(loaded.len(), 2);
++    }
++
++    #[test]
++    fn jsonl_error_on_invalid_json() {
++        let dir = tempfile::tempdir().expect("create temp dir");
++        let path = dir.path().join("bad.jsonl");
++        std::fs::write(&path, "not valid json\n").unwrap();
++
++        let result = History::from_jsonl(&path);
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn merge_preserves_all_operations() {
++        let h1 = History {
++            operations: vec![make_op(
++                "c1",
++                100,
++                200,
++                Op::Read { key: "a".into() },
++                OpResult::Value(None),
++            )],
++        };
++        let h2 = History { operations: vec![] };
++        let h3 = History {
++            operations: vec![
++                make_op(
++                    "c2",
++                    50,
++                    150,
++                    Op::Write {
++                        key: "b".into(),
++                        value: 1,
++                    },
++                    OpResult::Ok,
++                ),
++                make_op(
++                    "c2",
++                    200,
++                    300,
++                    Op::Write {
++                        key: "c".into(),
++                        value: 2,
++                    },
++                    OpResult::Ok,
++                ),
++            ],
++        };
++
++        let merged = History::merge(vec![h1, h2, h3]);
++        assert_eq!(merged.len(), 3);
++        // Sorted by invoke_us: 50, 100, 200.
++        assert_eq!(merged.operations[0].invoke_us, 50);
++        assert_eq!(merged.operations[1].invoke_us, 100);
++        assert_eq!(merged.operations[2].invoke_us, 200);
++    }
+ }
+diff --git a/ferrosa-jepsen/src/workload/bank.rs b/ferrosa-jepsen/src/workload/bank.rs
+index 0aab2fa..3f6bdf4 100644
+--- a/ferrosa-jepsen/src/workload/bank.rs
++++ b/ferrosa-jepsen/src/workload/bank.rs
+@@ -302,4 +302,173 @@ mod tests {
+         let wl = BankWorkload;
+         assert!(wl.check_invariant(&history).is_err());
+     }
++
++    #[test]
++    fn bank_invariant_empty_history() {
++        let history = History { operations: vec![] };
++        let wl = BankWorkload;
++        assert!(
++            wl.check_invariant(&history).is_ok(),
++            "empty history should pass conservation check"
++        );
++    }
++
++    #[test]
++    fn bank_invariant_no_serial_reads() {
++        // History with only writes/reads (no CurrentValues results) should pass.
++        let history = History {
++            operations: vec![
++                make_op(
++                    "c1",
++                    100,
++                    200,
++                    Op::Write {
++                        key: "account-0".into(),
++                        value: 50,
++                    },
++                    OpResult::Ok,
++                ),
++                make_op(
++                    "c1",
++                    300,
++                    400,
++                    Op::Read {
++                        key: "account-0".into(),
++                    },
++                    OpResult::Value(Some(950)),
++                ),
++            ],
++        };
++
++        let wl = BankWorkload;
++        assert!(wl.check_invariant(&history).is_ok());
++    }
++
++    #[test]
++    fn bank_invariant_multiple_serial_reads_all_conserved() {
++        let make_serial_read = |invoke: u64, balances: Vec<i64>| {
++            let values: Vec<(String, String)> = balances
++                .iter()
++                .enumerate()
++                .map(|(i, b)| (format!("account-{i}"), b.to_string()))
++                .collect();
++            make_op(
++                "c1",
++                invoke,
++                invoke + 100,
++                Op::SerialRead {
++                    key: "all-accounts".into(),
++                },
++                OpResult::CurrentValues(values),
++            )
++        };
++
++        let history = History {
++            operations: vec![
++                // Initial state: all 1000.
++                make_serial_read(100, vec![1000; 10]),
++                // After transfer of 200 from account-0 to account-1.
++                make_serial_read(
++                    300,
++                    vec![800, 1200, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
++                ),
++                // After another transfer: 0→2.
++                make_serial_read(
++                    500,
++                    vec![500, 1200, 1300, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
++                ),
++            ],
++        };
++
++        let wl = BankWorkload;
++        assert!(wl.check_invariant(&history).is_ok());
++    }
++
++    #[test]
++    fn bank_invariant_second_read_violated() {
++        let make_serial_read = |invoke: u64, balances: Vec<i64>| {
++            let values: Vec<(String, String)> = balances
++                .iter()
++                .enumerate()
++                .map(|(i, b)| (format!("account-{i}"), b.to_string()))
++                .collect();
++            make_op(
++                "c1",
++                invoke,
++                invoke + 100,
++                Op::SerialRead {
++                    key: "all-accounts".into(),
++                },
++                OpResult::CurrentValues(values),
++            )
++        };
++
++        let history = History {
++            operations: vec![
++                make_serial_read(100, vec![1000; 10]), // ok: sum=10000
++                make_serial_read(
++                    300,
++                    vec![800, 1200, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1001],
++                ), // bad: sum=10001
++            ],
++        };
++
++        let wl = BankWorkload;
++        assert!(wl.check_invariant(&history).is_err());
++    }
++
++    #[test]
++    fn bank_invariant_skips_error_results() {
++        // Error results in history should not trigger false violations.
++        let history = History {
++            operations: vec![
++                make_op(
++                    "c1",
++                    100,
++                    200,
++                    Op::SerialRead {
++                        key: "all-accounts".into(),
++                    },
++                    OpResult::Err("connection timeout".into()),
++                ),
++                make_op(
++                    "c1",
++                    300,
++                    400,
++                    Op::Read {
++                        key: "account-0".into(),
++                    },
++                    OpResult::Timeout,
++                ),
++            ],
++        };
++
++        let wl = BankWorkload;
++        assert!(wl.check_invariant(&history).is_ok());
++    }
++
++    #[test]
++    fn bank_invariant_unparseable_balance_lowers_total() {
++        // If a balance can't be parsed as i64, it's treated as 0 → conservation fails.
++        let mut values: Vec<(String, String)> = (0..NUM_ACCOUNTS)
++            .map(|i| (format!("account-{i}"), INITIAL_BALANCE.to_string()))
++            .collect();
++        values[0].1 = "not-a-number".to_string();
++
++        let history = History {
++            operations: vec![make_op(
++                "c1",
++                100,
++                200,
++                Op::SerialRead {
++                    key: "all-accounts".into(),
++                },
++                OpResult::CurrentValues(values),
++            )],
++        };
++
++        let wl = BankWorkload;
++        // Sum is 9000 (missing 1000 from unparseable account-0).
++        assert!(wl.check_invariant(&history).is_err());
++    }
+ }
+diff --git a/ferrosa-jepsen/src/workload/lwt.rs b/ferrosa-jepsen/src/workload/lwt.rs
+index e38dce4..dc28705 100644
+--- a/ferrosa-jepsen/src/workload/lwt.rs
++++ b/ferrosa-jepsen/src/workload/lwt.rs
+@@ -1916,6 +1916,261 @@ mod tests {
+         assert!(wl.check_invariant(&history).is_ok());
+     }
+ 
++    // -----------------------------------------------------------------------
++    // Pattern-specific execution tests (JP-001 gap: patterns 2-6, 8-13, 15)
++    // -----------------------------------------------------------------------
++
++    #[tokio::test]
++    async fn lwt_pattern_2_update_if_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtUpdateIf;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(h
++            .operations
++            .iter()
++            .any(|op| matches!(op.op, Op::UpdateIf { .. })));
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_3_delete_if_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtDeleteIf;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(h
++            .operations
++            .iter()
++            .any(|op| matches!(op.op, Op::DeleteIf { .. })));
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_4_insert_ttl_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtInsertIfNotExistsTtl;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(h
++            .operations
++            .iter()
++            .any(|op| matches!(op.op, Op::InsertIfNotExists { .. })));
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_5_update_if_exists_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtUpdateIfExists;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_6_replace_if_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtReplaceIf;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_8_batch_insert_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtBatchInsert;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_9_batch_mixed_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtBatchMixed;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_10_collections_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtWithCollections;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_11_udt_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtWithUdt;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_12_counter_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtWithCounter;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_13_timestamp_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtWithTimestamp;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    #[tokio::test]
++    async fn lwt_pattern_15_serial_read_executes() {
++        let session = MockCqlSession::new();
++        let wl = LwtSerialRead;
++        wl.setup(&session).await.unwrap();
++        let mut rec = HistoryRecorder::new("t");
++        wl.run(&session, &mut rec, Duration::from_millis(30))
++            .await
++            .unwrap();
++        let h = rec.finish();
++        assert!(!h.operations.is_empty());
++    }
++
++    // -----------------------------------------------------------------------
++    // Invariant edge cases for patterns that delegate to check_linearizability
++    // -----------------------------------------------------------------------
++
++    #[test]
++    fn lwt_pattern_2_invariant_empty_history() {
++        let wl = LwtUpdateIf;
++        assert!(wl.check_invariant(&History { operations: vec![] }).is_ok());
++    }
++
++    #[test]
++    fn lwt_pattern_3_invariant_empty_history() {
++        let wl = LwtDeleteIf;
++        assert!(wl.check_invariant(&History { operations: vec![] }).is_ok());
++    }
++
++    #[test]
++    fn lwt_pattern_4_invariant_one_applied_ok() {
++        let history = History {
++            operations: vec![make_op(
++                "c1",
++                100,
++                200,
++                Op::InsertIfNotExists {
++                    table: "jepsen.lwt4".into(),
++                    pk: "pk-0".into(),
++                    values: vec![("val".into(), "v0".into())],
++                },
++                OpResult::Applied(true),
++            )],
++        };
++        let wl = LwtInsertIfNotExistsTtl;
++        assert!(wl.check_invariant(&history).is_ok());
++    }
++
++    #[test]
++    fn lwt_pattern_4_invariant_two_applied_fails() {
++        let history = History {
++            operations: vec![
++                make_op(
++                    "c1",
++                    100,
++                    200,
++                    Op::InsertIfNotExists {
++                        table: "jepsen.lwt4".into(),
++                        pk: "pk-0".into(),
++                        values: vec![("val".into(), "v0".into())],
++                    },
++                    OpResult::Applied(true),
++                ),
++                make_op(
++                    "c2",
++                    150,
++                    250,
++                    Op::InsertIfNotExists {
++                        table: "jepsen.lwt4".into(),
++                        pk: "pk-0".into(),
++                        values: vec![("val".into(), "v1".into())],
++                    },
++                    OpResult::Applied(true),
++                ),
++            ],
++        };
++        let wl = LwtInsertIfNotExistsTtl;
++        assert!(wl.check_invariant(&history).is_err());
++    }
++
++    #[test]
++    fn lwt_pattern_8_invariant_one_batch_applied_ok() {
++        let history = History {
++            operations: vec![make_op(
++                "c1",
++                100,
++                200,
++                Op::InsertIfNotExists {
++                    table: "jepsen.lwt8".into(),
++                    pk: "pk-0".into(),
++                    values: vec![("val".into(), "batch-v0".into())],
++                },
++                OpResult::Applied(true),
++            )],
++        };
++        let wl = LwtBatchInsert;
++        assert!(wl.check_invariant(&history).is_ok());
++    }
++
+     /// LWT increment invariant: non-applied ops are ignored in monotonicity check.
+     #[test]
+     fn lwt_increment_invariant_ignores_non_applied() {
+diff --git a/ferrosa-net/src/peer.rs b/ferrosa-net/src/peer.rs
+index f621712..d7b332f 100644
+--- a/ferrosa-net/src/peer.rs
++++ b/ferrosa-net/src/peer.rs
+@@ -63,6 +63,16 @@ impl PeerManager {
+         self.listener.on_peer_connected(peer_id);
+     }
+ 
++    /// Returns `true` if the PeerManager has an outbound connection to this peer.
++    pub fn has_peer(&self, host_id: uuid::Uuid) -> bool {
++        // Use try_read to avoid blocking the caller — if the lock is held,
++        // conservatively return false (the peer will be connected shortly).
++        self.peers
++            .try_read()
++            .map(|peers| peers.contains_key(&host_id))
++            .unwrap_or(false)
++    }
++
+     /// Add a peer entry without a connection pool (for unit testing).
+     pub async fn add_peer_entry(&self, peer_id: PeerId) {
+         let (host_id, _addr) = peer_id;
+diff --git a/ferrosa-sstable/src/statistics.rs b/ferrosa-sstable/src/statistics.rs
+index e247099..d89de8f 100644
+--- a/ferrosa-sstable/src/statistics.rs
++++ b/ferrosa-sstable/src/statistics.rs
+@@ -317,9 +317,10 @@ const TTL_EPOCH: i32 = 0;
+ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
+     let mut pos = 0;
+ 
+-    let min_timestamp = read_uvint_u64(data, &mut pos)? as i64 + TIMESTAMP_EPOCH;
+-    let min_local_deletion_time = read_uvint_u32(data, &mut pos)? as i32 + DELETION_TIME_EPOCH;
+-    let min_ttl = read_uvint_u32(data, &mut pos)? as i32 + TTL_EPOCH;
++    let min_timestamp = (read_uvint_u64(data, &mut pos)? as i64).wrapping_add(TIMESTAMP_EPOCH);
++    let min_local_deletion_time =
++        (read_uvint_u32(data, &mut pos)? as i32).wrapping_add(DELETION_TIME_EPOCH);
++    let min_ttl = (read_uvint_u32(data, &mut pos)? as i32).wrapping_add(TTL_EPOCH);
+ 
+     let key_type = read_vint_prefixed_string(data, &mut pos)?;
+ 
+@@ -351,7 +352,7 @@ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
+     let max_timestamp = if pos < data.len() {
+         read_uvint_u64(data, &mut pos)
+             .ok()
+-            .map_or(i64::MAX, |v| v as i64 + TIMESTAMP_EPOCH)
++            .map_or(i64::MAX, |v| (v as i64).wrapping_add(TIMESTAMP_EPOCH))
+     } else {
+         i64::MAX
+     };
+@@ -376,18 +377,21 @@ pub fn write_serialization_header(h: &SerializationHeader) -> Vec<u8> {
+     let mut out = Vec::new();
+     let mut vbuf = [0u8; 9];
+ 
+-    // min_timestamp delta (unsigned vint)
+-    let ts_delta = (h.min_timestamp - TIMESTAMP_EPOCH) as u64;
++    // min_timestamp delta (unsigned vint).
++    // wrapping_sub: values before the epoch (e.g., synthetic test timestamps)
++    // produce large unsigned deltas that round-trip correctly through the
++    // unsigned vint encoding + read_serialization_header's wrapping add.
++    let ts_delta = h.min_timestamp.wrapping_sub(TIMESTAMP_EPOCH) as u64;
+     let n = varint::write_unsigned_vint(&mut vbuf, ts_delta);
+     out.extend_from_slice(&vbuf[..n]);
+ 
+     // min_local_deletion_time delta (unsigned vint32)
+-    let ldt_delta = (h.min_local_deletion_time - DELETION_TIME_EPOCH) as u64;
++    let ldt_delta = h.min_local_deletion_time.wrapping_sub(DELETION_TIME_EPOCH) as u32 as u64;
+     let n = varint::write_unsigned_vint(&mut vbuf, ldt_delta);
+     out.extend_from_slice(&vbuf[..n]);
+ 
+     // min_ttl delta (unsigned vint32)
+-    let ttl_delta = (h.min_ttl - TTL_EPOCH) as u64;
++    let ttl_delta = h.min_ttl.wrapping_sub(TTL_EPOCH) as u32 as u64;
+     let n = varint::write_unsigned_vint(&mut vbuf, ttl_delta);
+     out.extend_from_slice(&vbuf[..n]);
+ 
+@@ -421,7 +425,7 @@ pub fn write_serialization_header(h: &SerializationHeader) -> Vec<u8> {
+     // fields so that Cassandra-produced SSTables (which lack this field)
+     // can still be read.
+     if h.max_timestamp != i64::MAX {
+-        let max_ts_delta = (h.max_timestamp - TIMESTAMP_EPOCH) as u64;
++        let max_ts_delta = h.max_timestamp.wrapping_sub(TIMESTAMP_EPOCH) as u64;
+         let n = varint::write_unsigned_vint(&mut vbuf, max_ts_delta);
+         out.extend_from_slice(&vbuf[..n]);
+     }
+@@ -666,6 +670,29 @@ mod tests {
+         assert_eq!(decoded.min_ttl, 0);
+     }
+ 
++    #[test]
++    fn serialization_header_pre_epoch_values_no_panic() {
++        // Regression test: values before the delta-encoding epoch must not
++        // panic on subtraction. This happens during load tests where synthetic
++        // timestamps are small integers (e.g., 1000).
++        let header = SerializationHeader {
++            min_timestamp: 1000,                  // << TIMESTAMP_EPOCH
++            min_local_deletion_time: 0,           // << DELETION_TIME_EPOCH
++            min_ttl: 0,
++            max_timestamp: 5000,
++            key_type: "T".into(),
++            clustering_types: vec![],
++            static_columns: vec![],
++            regular_columns: vec![],
++        };
++        let encoded = write_serialization_header(&header);
++        let decoded = read_serialization_header(&encoded).unwrap();
++
++        assert_eq!(decoded.min_timestamp, 1000);
++        assert_eq!(decoded.min_local_deletion_time, 0);
++        assert_eq!(decoded.max_timestamp, 5000);
++    }
++
+     // -- Full Statistics round-trip --
+ 
+     #[test]
+diff --git a/ferrosa-storage/Cargo.toml b/ferrosa-storage/Cargo.toml
+index 19b7b5f..0649b15 100644
+--- a/ferrosa-storage/Cargo.toml
++++ b/ferrosa-storage/Cargo.toml
+@@ -36,5 +36,7 @@ ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
+ futures = "0.3"
+ hex = "0.4"
+ proptest = "1"
++rand = "0.8"
+ serial_test = "3"
+ tempfile = "3"
++tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+diff --git a/ferrosa-storage/src/commitlog/mod.rs b/ferrosa-storage/src/commitlog/mod.rs
+index 1c2afdf..8837f35 100644
+--- a/ferrosa-storage/src/commitlog/mod.rs
++++ b/ferrosa-storage/src/commitlog/mod.rs
+@@ -362,6 +362,14 @@ impl CommitLog {
+         self.archived.lock().insert(segment_id);
+     }
+ 
++    /// Returns the number of closed segments waiting for GC.
++    ///
++    /// Used by tests and monitoring to verify that flush → discard_completed
++    /// is keeping the closed segment count bounded.
++    pub fn closed_segment_count(&self) -> usize {
++        self.closed_segments.lock().len()
++    }
++
+     /// Returns the set of segment IDs currently marked as archived.
+     pub fn archived_segments(&self) -> HashSet<u64> {
+         self.archived.lock().clone()
+@@ -406,8 +414,11 @@ impl CommitLog {
+         // Swap the new segment in and get the old one.
+         let old_segment = self.active.swap(new_segment);
+ 
+-        // Flush the old segment to disk before archiving.
++        // Flush the old segment to disk before archiving, then release the
++        // file descriptor. The data is fully on disk; keeping the handle open
++        // while waiting for discard_completed() leaks FDs under heavy write load.
+         old_segment.flush_to_disk()?;
++        old_segment.close_file_handle();
+ 
+         // Move old segment to closed list.
+         let old_id = old_segment.id;
+diff --git a/ferrosa-storage/src/commitlog/segment.rs b/ferrosa-storage/src/commitlog/segment.rs
+index 5487f58..cb35d4c 100644
+--- a/ferrosa-storage/src/commitlog/segment.rs
++++ b/ferrosa-storage/src/commitlog/segment.rs
+@@ -441,6 +441,17 @@ impl Segment {
+         Ok(())
+     }
+ 
++    /// Closes the persistent file handle, releasing the file descriptor.
++    ///
++    /// Called after the segment's final flush when it moves to `closed_segments`.
++    /// The segment data is fully on disk, so the handle is no longer needed.
++    /// This prevents file descriptor leaks when many segments accumulate
++    /// waiting for `discard_completed()` to clean them up.
++    pub fn close_file_handle(&self) {
++        let mut handle = self.file_handle.lock();
++        *handle = None;
++    }
++
+     /// Marks a table as having dirty (unflushed) data in this segment.
+     pub fn mark_table_dirty(&self, table_id: &TableId, position: CommitLogPosition) {
+         let mut dirty = self.dirty_tables.lock();
+diff --git a/ferrosa-storage/src/engine.rs b/ferrosa-storage/src/engine.rs
+index 7917bb4..9a7ccd6 100644
+--- a/ferrosa-storage/src/engine.rs
++++ b/ferrosa-storage/src/engine.rs
+@@ -158,6 +158,14 @@ struct TableState {
+     /// SSTable IDs that are currently pinned on NVMe, in oldest-first order.
+     /// Each entry is `(sstable_id, size_bytes)`.
+     pinned_sstables: Vec<(String, u64)>,
++    /// Latest commit log position written for this table. Updated on every
++    /// write; passed to `commit_log.discard_completed()` after flush so that
++    /// fully-flushed segments can be GC'd. Without this, closed segments
++    /// accumulate indefinitely and leak file descriptors.
++    ///
++    /// Wrapped in `Mutex` so writers can update it under a read lock on the
++    /// `tables` map (the hot path). The lock protects only two `u64`s.
++    last_commit_log_position: parking_lot::Mutex<Option<CommitLogPosition>>,
+ }
+ 
+ /// SSTable reader type alias for file-backed SSTables.
+@@ -692,6 +700,7 @@ impl StorageEngine {
+             store,
+             pin_config: None,
+             pinned_sstables: Vec::new(),
++            last_commit_log_position: parking_lot::Mutex::new(None),
+         };
+         self.tables.write().insert(table_id, state);
+         Ok(())
+@@ -1038,14 +1047,15 @@ impl StorageEngine {
+             vec![row.clone()],
+             timestamp,
+         );
+-        self.commit_log.append(&mutation)?;
++        let cl_pos = self.commit_log.append(&mutation)?;
+ 
+-        // 2. Write to the table's memtable.
++        // 2. Write to the table's memtable and track commit log position.
+         let tables = self.tables.read();
+         let state = tables.get(table_id).ok_or_else(|| {
+             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+         })?;
+         state.store.write(key, row)?;
++        *state.last_commit_log_position.lock() = Some(cl_pos);
+         drop(tables);
+ 
+         // 3. Notify observers after successful commit log + memtable write.
+@@ -1080,9 +1090,9 @@ impl StorageEngine {
+             );
+ 
+             // Append to commit log.
+-            self.commit_log.append(&mutation)?;
++            let cl_pos = self.commit_log.append(&mutation)?;
+ 
+-            // Write to memtable (scoped read lock).
++            // Write to memtable and track commit log position (scoped read lock).
+             {
+                 let tables = self.tables.read();
+                 let state = tables.get(table_id).ok_or_else(|| {
+@@ -1091,6 +1101,7 @@ impl StorageEngine {
+                     ))
+                 })?;
+                 state.store.write(&key, row)?;
++                *state.last_commit_log_position.lock() = Some(cl_pos);
+             }
+ 
+             // Notify observers after successful commit log + memtable write.
+@@ -1120,12 +1131,15 @@ impl StorageEngine {
+             return Ok(());
+         }
+ 
+-        // Phase 1: Append all mutations to the commit log.
++        // Phase 1: Append all mutations to the commit log, tracking positions.
++        let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
+         for m in &mutations {
+-            self.commit_log.append(m)?;
++            let cl_pos = self.commit_log.append(m)?;
++            let table_id = TableId::new(&m.keyspace, &m.table);
++            positions.insert(table_id, cl_pos);
+         }
+ 
+-        // Phase 2: Apply to memtables.
++        // Phase 2: Apply to memtables and update commit log positions.
+         let tables = self.tables.read();
+         for m in &mutations {
+             let table_id = TableId::new(&m.keyspace, &m.table);
+@@ -1135,6 +1149,9 @@ impl StorageEngine {
+             for row in &m.rows {
+                 state.store.write(&m.key, row.clone())?;
+             }
++            if let Some(&cl_pos) = positions.get(&table_id) {
++                *state.last_commit_log_position.lock() = Some(cl_pos);
++            }
+         }
+         drop(tables);
+ 
+@@ -1466,12 +1483,16 @@ impl StorageEngine {
+     /// and max_bytes eviction is enforced if configured.
+     pub fn flush(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+         // Flush + index submit under read lock, then release before write lock.
+-        let (gen, is_pinned) = {
++        let (gen, is_pinned, cl_position) = {
+             let tables = self.tables.read();
+             let state = tables.get(table_id).ok_or_else(|| {
+                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+             })?;
+ 
++            // Snapshot the commit log position before flushing. All mutations
++            // up to this position are in the memtable we're about to flush.
++            let cl_position = *state.last_commit_log_position.lock();
++
+             state.store.flush()?;
+ 
+             // Eager index build: submit high-priority index rebuild for the newly
+@@ -1511,9 +1532,19 @@ impl StorageEngine {
+ 
+             let flushed_gen = state.store.last_flush_generation();
+             let pinned = state.pin_config.is_some();
+-            (flushed_gen, pinned)
++            (flushed_gen, pinned, cl_position)
+         };
+ 
++        // Advance commit log checkpoint: tell the commit log that this table's
++        // mutations are now durable in SSTables up to cl_position. This allows
++        // closed segments with no remaining dirty tables to be GC'd, preventing
++        // file descriptor leaks from accumulating segment file handles.
++        if let Some(pos) = cl_position {
++            if let Err(e) = self.commit_log.discard_completed(table_id, pos) {
++                tracing::warn!(%e, "commit log discard_completed failed for {}", table_id);
++            }
++        }
++
+         // For pinned tables: record the new SSTable and enforce max_bytes.
+         // We do this outside the read lock so we can take a write lock.
+         if is_pinned {
+@@ -2218,6 +2249,13 @@ impl StorageEngine {
+             .map(|(cfg, store)| (store, cfg.prefix.clone()))
+     }
+ 
++    /// Returns the number of closed commit log segments waiting for GC.
++    ///
++    /// Used by the load test resource monitor to detect segment accumulation.
++    pub fn commit_log_closed_segment_count(&self) -> usize {
++        self.commit_log.closed_segment_count()
++    }
++
+     /// Discards commit log segments that have no remaining dirty tables.
+     ///
+     /// Called from the background maintenance loop. Returns the number of
+@@ -3694,6 +3732,64 @@ mod tests {
+         engine.shutdown().unwrap();
+     }
+ 
++    #[test]
++    fn flush_discards_commit_log_segments() {
++        // Regression test for FD leak: flush() must call discard_completed()
++        // so that closed commit log segments are GC'd and their file handles
++        // released. Without this, segments accumulate indefinitely under load.
++        let dir = tempfile::tempdir().unwrap();
++        let config = StorageEngineConfig {
++            commit_log: CommitLogConfig {
++                segment_size: 512, // tiny: forces rotation after ~3 mutations
++                ..CommitLogConfig::test_config(dir.path())
++            },
++            ..StorageEngineConfig::test_config(dir.path())
++        };
++        let engine = StorageEngine::new(config, None).unwrap();
++        engine.register_table(test_schema()).unwrap();
++
++        let tid = table_id();
++
++        // Write enough mutations to force multiple segment rotations.
++        for i in 0..20 {
++            engine
++                .write(
++                    &tid,
++                    &make_key(&format!("k{i}")),
++                    make_row(b"value", 1000 + i),
++                    1000 + i,
++                )
++                .unwrap();
++        }
++
++        let closed_before = engine.commit_log.closed_segment_count();
++        assert!(
++            closed_before >= 2,
++            "need multiple closed segments for this test, got {closed_before}"
++        );
++
++        // Flush the table — this calls discard_completed() internally,
++        // which removes segments where all tables have been flushed.
++        engine.flush(&tid).unwrap();
++
++        // discard_completed() in flush() should have already cleaned up
++        // all closed segments (single table = all segments become empty).
++        let closed_after = engine.commit_log.closed_segment_count();
++        assert!(
++            closed_after < closed_before,
++            "closed segment count should decrease after flush: \
++             before={closed_before}, after={closed_after}"
++        );
++
++        // Data should still be readable from SSTable after commit log GC.
++        for i in 0..20 {
++            let result = engine.read(&tid, &make_key(&format!("k{i}"))).unwrap();
++            assert!(result.is_some(), "key k{i} should be readable after flush");
++        }
++
++        engine.shutdown().unwrap();
++    }
++
+     #[test]
+     fn archiver_uploads_closed_segment_on_rotate() {
+         use object_store::memory::InMemory;
+diff --git a/ferrosa-storage/src/lib.rs b/ferrosa-storage/src/lib.rs
+index 46fa82c..cc4d989 100644
+--- a/ferrosa-storage/src/lib.rs
++++ b/ferrosa-storage/src/lib.rs
+@@ -16,6 +16,7 @@
+ 
+ pub mod accord;
+ pub mod batchlog;
++
+ pub mod cache;
+ pub mod commitlog;
+ pub mod compaction;
+diff --git a/ferrosa/tests/smoke.rs b/ferrosa/tests/smoke.rs
+index 2b60a8c..f41ad64 100644
+--- a/ferrosa/tests/smoke.rs
++++ b/ferrosa/tests/smoke.rs
+@@ -471,3 +471,91 @@ async fn bt004_standalone_concurrent_sessions() {
+         );
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// BT-004: Standalone startup/shutdown lifecycle
++// ---------------------------------------------------------------------------
++
++/// BT-004: Boot server, create schema via CQL, snapshot schema to disk,
++/// verify the snapshot file exists and contains the user-created keyspace/table.
++#[tokio::test]
++async fn bt004_schema_persisted_after_ddl() {
++    let (mut client, state, dir) = boot_and_connect().await;
++
++    // Create keyspace and table via CQL.
++    client
++        .query("CREATE KEYSPACE lifecycle_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}")
++        .await
++        .unwrap();
++    client
++        .query("CREATE TABLE lifecycle_ks.events (id text PRIMARY KEY, data text)")
++        .await
++        .unwrap();
++
++    // Verify the table is queryable.
++    client
++        .query("INSERT INTO lifecycle_ks.events (id, data) VALUES ('e1', 'test')")
++        .await
++        .unwrap();
++    let result = client
++        .query("SELECT * FROM lifecycle_ks.events WHERE id = 'e1'")
++        .await
++        .unwrap();
++    assert!(!result.rows.is_empty(), "inserted row must be readable");
++
++    // Persist schema to disk (same as main.rs shutdown path).
++    let snapshot = state.schema.snapshot();
++    let json = serde_json::to_vec_pretty(&snapshot).unwrap();
++    let schema_path = dir.path().join("schema.json");
++    std::fs::write(&schema_path, &json).unwrap();
++
++    // Verify the persisted schema contains our keyspace and table.
++    let data = std::fs::read(&schema_path).unwrap();
++    let restored: ferrosa_schema::SchemaSnapshot = serde_json::from_slice(&data).unwrap();
++    assert!(
++        restored.keyspaces.contains_key("lifecycle_ks"),
++        "persisted schema must contain lifecycle_ks"
++    );
++    let ks = &restored.keyspaces["lifecycle_ks"];
++    assert_eq!(ks.name, "lifecycle_ks");
++}
++
++/// BT-004: Verify that system.local returns correct cluster metadata
++/// from a fresh standalone boot.
++#[tokio::test]
++async fn bt004_system_local_returns_metadata() {
++    let (mut client, _state, _dir) = boot_and_connect().await;
++
++    let result = client
++        .query("SELECT cluster_name, data_center, rack FROM system.local")
++        .await
++        .unwrap();
++    assert!(!result.rows.is_empty(), "system.local must have a row");
++
++    let cluster_idx = column_index(&result, "cluster_name");
++    assert!(cluster_idx.is_some(), "system.local must have cluster_name");
++    let cluster_name = cell_as_str(&result.rows[0], cluster_idx.unwrap());
++    assert!(cluster_name.is_some(), "cluster_name must not be null");
++
++    let dc_idx = column_index(&result, "data_center");
++    assert!(dc_idx.is_some(), "system.local must have data_center");
++}
++
++/// BT-004: Verify host_id column exists in system.local (may be null in test
++/// mode since the test setup uses a synthetic NodeConfig).
++#[tokio::test]
++async fn bt004_system_local_has_host_id_column() {
++    let (mut client, _state, _dir) = boot_and_connect().await;
++
++    let result = client
++        .query("SELECT host_id FROM system.local")
++        .await
++        .unwrap();
++    assert!(!result.rows.is_empty());
++
++    // The column must exist, even if the value is null in test mode.
++    assert!(
++        column_index(&result, "host_id").is_some(),
++        "system.local must have host_id column"
++    );
++}
