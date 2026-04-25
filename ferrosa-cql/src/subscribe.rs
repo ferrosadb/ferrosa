@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ast::Statement;
 use crate::router::{RequestContext, RouteResult, SharedState};
+use crate::types::CqlValue;
 
 use ferrosa_schema::AuthContext;
 
@@ -138,11 +139,34 @@ impl SubscriptionState {
     }
 }
 
+/// Compute the rows that differ between `previous` and `current`.
+///
+/// A row is included in the delta if its full content does not appear anywhere
+/// in the `previous` snapshot (new row or in-place value change).
+///
+/// Uses `O(n × m)` comparison — acceptable for the typically small result sets
+/// produced by subscription queries (hundreds of rows, not millions).
+fn compute_delta<'a>(
+    current: &'a [Vec<Option<CqlValue>>],
+    previous: &[Vec<Option<CqlValue>>],
+) -> Vec<&'a Vec<Option<CqlValue>>> {
+    current
+        .iter()
+        .filter(|row| !previous.contains(row))
+        .collect()
+}
+
 /// Spawn a polling subscription task.
 ///
 /// Re-executes the inner SELECT every `interval` and sends result frames
 /// through `push_tx`. Runs until the `cancel` token fires or the channel
 /// closes (connection dropped).
+///
+/// When `delta = true`, each tick delivers only rows whose values differ from
+/// the previous delivery (row-level diff). The first tick always delivers all
+/// matching rows. Subsequent ticks deliver only rows that are new or changed.
+///
+/// When `delta = false`, the full result set is delivered on every tick.
 ///
 /// # Cancel Safety
 ///
@@ -161,12 +185,18 @@ pub fn spawn_subscription_poll(
     inner: Statement,
     push_tx: mpsc::Sender<SubscriptionPush>,
     cancel: CancellationToken,
+    delta: bool,
 ) {
     tokio::spawn(async move {
         // SUBSCRIBE no longer sets allow_filtering — queries must use
         // partition keys or indexes, consistent with the ALLOW FILTERING
         // rejection policy.
         let inner = inner;
+
+        // Delta mode: track rows delivered in the previous tick so we can
+        // compute a diff. `None` means "no previous delivery yet" (first tick
+        // always delivers everything).
+        let mut previous_snapshot: Option<Vec<Vec<Option<CqlValue>>>> = None;
 
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // Skip the immediate first tick — first result at t+interval.
@@ -181,24 +211,92 @@ pub fn spawn_subscription_poll(
                         paging: crate::paging::PagingParams::default(),
                         client_address: String::new(),
                     };
-                    match crate::router::route(&state, &ctx, inner.clone()).await {
-                        Ok(RouteResult::Result(body)) => {
-                            let push = SubscriptionPush {
-                                stream_id,
-                                body: body.freeze(),
-                            };
-                            let permit = tokio::select! {
-                                p = push_tx.reserve() => match p {
-                                    Ok(permit) => permit,
-                                    Err(_) => break, // channel closed
-                                },
-                                _ = cancel.cancelled() => break,
-                            };
-                            permit.send(push);
+
+                    if delta {
+                        // Delta path: fetch raw rows, diff, encode only changed.
+                        let select_stmt = match inner.as_select() {
+                            Some(s) => s,
+                            None => {
+                                tracing::warn!(
+                                    stream_id,
+                                    "delta subscription inner statement is not a SELECT; \
+                                     skipping tick"
+                                );
+                                continue;
+                            }
+                        };
+                        match crate::router::route_select_raw(&state, &ctx, select_stmt).await {
+                            Ok(raw) => {
+                                let delta_rows: Vec<Vec<Option<CqlValue>>> =
+                                    match &previous_snapshot {
+                                        // First tick: deliver all rows.
+                                        None => raw.rows.clone(),
+                                        // Subsequent ticks: deliver only rows not in the
+                                        // previous snapshot (new or changed rows).
+                                        Some(prev) => {
+                                            compute_delta(&raw.rows, prev)
+                                                .into_iter()
+                                                .cloned()
+                                                .collect()
+                                        }
+                                    };
+                                previous_snapshot = Some(raw.rows.clone());
+
+                                // Only push a frame when there are rows to deliver.
+                                // An empty delta (no changes) produces no frame.
+                                if delta_rows.is_empty() {
+                                    continue;
+                                }
+
+                                let body = crate::result::encode_rows(
+                                    &raw.column_names,
+                                    &raw.column_types,
+                                    &raw.keyspace,
+                                    &raw.table,
+                                    &delta_rows,
+                                );
+                                let push = SubscriptionPush {
+                                    stream_id,
+                                    body: body.freeze(),
+                                };
+                                let permit = tokio::select! {
+                                    p = push_tx.reserve() => match p {
+                                        Ok(permit) => permit,
+                                        Err(_) => break, // channel closed
+                                    },
+                                    _ = cancel.cancelled() => break,
+                                };
+                                permit.send(push);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    stream_id,
+                                    error = %e,
+                                    "delta subscription query error"
+                                );
+                            }
                         }
-                        Ok(_) => {} // Unexpected result type; skip
-                        Err(e) => {
-                            tracing::debug!(stream_id, error = %e, "subscription query error");
+                    } else {
+                        // Full-delivery path (original behavior).
+                        match crate::router::route(&state, &ctx, inner.clone()).await {
+                            Ok(RouteResult::Result(body)) => {
+                                let push = SubscriptionPush {
+                                    stream_id,
+                                    body: body.freeze(),
+                                };
+                                let permit = tokio::select! {
+                                    p = push_tx.reserve() => match p {
+                                        Ok(permit) => permit,
+                                        Err(_) => break, // channel closed
+                                    },
+                                    _ = cancel.cancelled() => break,
+                                };
+                                permit.send(push);
+                            }
+                            Ok(_) => {} // Unexpected result type; skip
+                            Err(e) => {
+                                tracing::debug!(stream_id, error = %e, "subscription query error");
+                            }
                         }
                     }
                 }
@@ -348,6 +446,7 @@ mod tests {
             inner,
             tx,
             cancel,
+            false, // delta=false: full delivery (regression guard)
         );
 
         // Wait up to 2 seconds for a frame to arrive.
@@ -388,6 +487,7 @@ mod tests {
             inner,
             tx,
             cancel.clone(),
+            false, // delta=false: full delivery
         );
 
         // Receive at least one frame to confirm the task is running.
@@ -427,6 +527,7 @@ mod tests {
             inner,
             tx,
             cancel,
+            false, // delta=false: full delivery
         );
 
         // Drop the receiver — next send will fail and the task should exit.
@@ -562,5 +663,267 @@ mod tests {
         assert_eq!(events[0].body, Bytes::from_static(b"early-apply"));
         assert_eq!(events[1].body, Bytes::from_static(b"mid-apply"));
         assert_eq!(events[2].body, Bytes::from_static(b"late-apply"));
+    }
+
+    // ===================================================================
+    // P0-02 — SUBSCRIBE DELTA row-level diff (acceptance criterion #3)
+    // ===================================================================
+
+    /// Helper: parse and route a statement, asserting success.
+    async fn exec(state: &Arc<crate::router::SharedState>, cql: &str) {
+        use crate::router::{route, RequestContext};
+        use ferrosa_cluster::consistency::ConsistencyLevel;
+        let ctx = RequestContext {
+            auth: &superuser_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt =
+            crate::parser::parse(cql).unwrap_or_else(|e| panic!("parse failed for {cql:?}: {e}"));
+        route(state, &ctx, stmt)
+            .await
+            .unwrap_or_else(|e| panic!("route failed for {cql:?}: {e}"));
+    }
+
+    /// Extract the row count from a Rows RESULT frame body.
+    ///
+    /// The CQL native protocol Rows result layout (Global_tables_spec flag set):
+    ///   [4] kind (0x0002)
+    ///   [4] flags
+    ///   [4] column_count
+    ///   if Has_more_pages (0x0002): [4+N] paging state
+    ///   [4] keyspace name length + bytes
+    ///   [4] table name length + bytes
+    ///   [4] N column specs (name length + bytes, type code, ...)
+    ///   [4] rows_count  ← what we want
+    ///
+    /// Instead of parsing the full frame, we decode row count via a minimal
+    /// walk: skip kind, flags, col_count, then the global table spec, then
+    /// the column specs, and finally read the row count.
+    fn decode_row_count(body: &[u8]) -> i32 {
+        // Use the encode_rows output format: kind(4), then rows_metadata, then
+        // rows_count(4). The metadata layout with Global_tables_spec:
+        //   flags(4) + columns_count(4) + ks[u16+bytes] + tbl[u16+bytes] +
+        //   N * (col_name[u16+bytes] + col_type[2+])
+        // Rather than re-implement the full decoder, we rely on the fact that
+        // our tests use a known schema (id int, v text) so column_count = 2.
+        // We parse flags to handle that generically.
+
+        assert!(body.len() >= 4, "body too short for kind code");
+        let kind = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+        assert_eq!(kind, 0x0002, "expected Rows kind");
+
+        let mut pos = 4usize; // skip kind
+
+        // flags
+        assert!(pos + 4 <= body.len());
+        let flags = i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        pos += 4;
+
+        // columns_count
+        assert!(pos + 4 <= body.len());
+        let col_count =
+            i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
+        pos += 4;
+
+        let has_more_pages = (flags & 0x0002) != 0;
+        if has_more_pages {
+            // paging_state: [int length][bytes]
+            assert!(pos + 4 <= body.len());
+            let ps_len =
+                i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]])
+                    as usize;
+            pos += 4 + ps_len;
+        }
+
+        let global_tables_spec = (flags & 0x0001) != 0;
+        if global_tables_spec {
+            // keyspace name: [u16 length][bytes]
+            assert!(pos + 2 <= body.len());
+            let ks_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+            pos += 2 + ks_len;
+            // table name: [u16 length][bytes]
+            assert!(pos + 2 <= body.len());
+            let tbl_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+            pos += 2 + tbl_len;
+        }
+
+        // Skip col_count column specs.
+        for _ in 0..col_count {
+            // col_name: [u16 length][bytes]
+            assert!(pos + 2 <= body.len(), "ran out of bytes reading col name");
+            let col_name_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+            pos += 2 + col_name_len;
+            // col_type: [u16 option code] — simple types are just 2 bytes.
+            // Complex types (list, set, map, tuple, udt) have additional bytes.
+            // Our test table uses int (0x0009) and varchar (0x000D): both simple.
+            assert!(pos + 2 <= body.len(), "ran out of bytes reading col type");
+            let type_code = u16::from_be_bytes([body[pos], body[pos + 1]]);
+            pos += 2;
+            // Skip type parameter bytes for known complex types.
+            // (Our test schema only uses simple types, so this is fine.)
+            let _ = type_code;
+        }
+
+        // rows_count
+        assert!(pos + 4 <= body.len(), "ran out of bytes reading rows_count");
+        i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]])
+    }
+
+    /// Acceptance criterion #3 (P0-02):
+    ///
+    /// SUBSCRIBE DELTA on a table with 10 rows:
+    /// - First tick delivers all 10 rows.
+    /// - Modify 2 rows → second tick delivers exactly 2 rows.
+    /// - No changes → third tick delivers 0 rows (no frame within deadline).
+    ///
+    /// Also verifies that non-DELTA subscriptions are unaffected (regression).
+    #[tokio::test]
+    async fn delta_delivers_only_changed_rows() {
+        let (state, _dir) = test_shared_state();
+
+        // Schema setup: keyspace + table (id int PRIMARY KEY, v text).
+        exec(
+            &state,
+            "CREATE KEYSPACE delta_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .await;
+        exec(
+            &state,
+            "CREATE TABLE delta_ks.items (id int PRIMARY KEY, v text)",
+        )
+        .await;
+
+        // Insert 10 rows.
+        for i in 0..10 {
+            exec(
+                &state,
+                &format!("INSERT INTO delta_ks.items (id, v) VALUES ({i}, 'original-{i}')"),
+            )
+            .await;
+        }
+
+        // Start a DELTA subscription with a 50 ms interval.
+        let (tx, mut rx) = mpsc::channel::<SubscriptionPush>(32);
+        let cancel = CancellationToken::new();
+        let inner = crate::parser::parse("SELECT * FROM delta_ks.items ALLOW FILTERING").unwrap();
+
+        spawn_subscription_poll(
+            99,
+            Duration::from_millis(50),
+            state.clone(),
+            superuser_auth(),
+            Some("delta_ks".into()),
+            inner,
+            tx,
+            cancel.clone(),
+            true, // delta=true: row-level diff
+        );
+
+        // ── Tick 1: all 10 rows must be delivered ─────────────────────────
+        let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for first delta tick")
+            .expect("channel closed before first tick");
+
+        assert_eq!(first.stream_id, 99);
+        let first_count = decode_row_count(&first.body);
+        assert_eq!(
+            first_count, 10,
+            "first delta tick must deliver all 10 rows; got {first_count}"
+        );
+
+        // ── Modify rows 0 and 1 ───────────────────────────────────────────
+        exec(
+            &state,
+            "INSERT INTO delta_ks.items (id, v) VALUES (0, 'changed-0')",
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO delta_ks.items (id, v) VALUES (1, 'changed-1')",
+        )
+        .await;
+
+        // ── Tick 2: exactly 2 changed rows must be delivered ──────────────
+        let second = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for second delta tick")
+            .expect("channel closed before second tick");
+
+        let second_count = decode_row_count(&second.body);
+        assert_eq!(
+            second_count, 2,
+            "second delta tick must deliver exactly 2 changed rows; got {second_count}"
+        );
+
+        // ── Tick 3: no changes → no frame within 200 ms ───────────────────
+        let no_frame = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            no_frame.is_err(),
+            "third tick must produce no frame when there are no changes \
+             (delta subscription must not deliver empty results)"
+        );
+
+        cancel.cancel();
+    }
+
+    /// Regression: non-DELTA subscription still delivers full result on every tick.
+    #[tokio::test]
+    async fn non_delta_delivers_full_result_every_tick() {
+        let (state, _dir) = test_shared_state();
+
+        exec(
+            &state,
+            "CREATE KEYSPACE ndelta_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .await;
+        exec(
+            &state,
+            "CREATE TABLE ndelta_ks.items (id int PRIMARY KEY, v text)",
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO ndelta_ks.items (id, v) VALUES (1, 'row-one')",
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel::<SubscriptionPush>(8);
+        let cancel = CancellationToken::new();
+        let inner = crate::parser::parse("SELECT * FROM ndelta_ks.items ALLOW FILTERING").unwrap();
+
+        spawn_subscription_poll(
+            77,
+            Duration::from_millis(50),
+            state.clone(),
+            superuser_auth(),
+            Some("ndelta_ks".into()),
+            inner,
+            tx,
+            cancel.clone(),
+            false, // delta=false: full delivery on every tick
+        );
+
+        // First tick.
+        let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for first tick")
+            .expect("channel closed before first tick");
+        assert_eq!(decode_row_count(&first.body), 1);
+
+        // Second tick — no changes, but full delivery still expected.
+        let second = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for second tick")
+            .expect("channel closed before second tick");
+        assert_eq!(decode_row_count(&second.body), 1);
+
+        cancel.cancel();
     }
 }

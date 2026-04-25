@@ -97,6 +97,19 @@ pub enum Statement {
 }
 
 impl Statement {
+    /// If this statement is a `SELECT`, return a reference to its inner
+    /// [`SelectStatement`]. Returns `None` for all other variants.
+    ///
+    /// Used by delta subscriptions to call `route_select_raw` directly
+    /// without re-parsing or cloning the full statement.
+    pub fn as_select(&self) -> Option<&SelectStatement> {
+        if let Statement::Select(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
     /// Returns true if this is a DDL statement (schema-modifying).
     /// DDL is not permitted inside Accord transactions.
     pub fn is_ddl(&self) -> bool {

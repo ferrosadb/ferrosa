@@ -318,7 +318,7 @@ pub async fn handle_connection<S>(
                     HandleResult::StartSubscription {
                         inner,
                         interval,
-                        delta: _,
+                        delta,
                     } => {
                         let interval = match interval {
                             Some(d) => d,
@@ -404,6 +404,7 @@ pub async fn handle_connection<S>(
                             *inner,
                             sub_tx.clone(),
                             cancel,
+                            delta,
                         );
 
                         debug!(
@@ -476,7 +477,6 @@ pub(crate) enum HandleResult {
     StartSubscription {
         inner: Box<crate::ast::Statement>,
         interval: Option<Duration>,
-        #[allow(dead_code)] // delta mode deferred
         delta: bool,
     },
     /// Unsubscribe — cancel one or all subscriptions.
