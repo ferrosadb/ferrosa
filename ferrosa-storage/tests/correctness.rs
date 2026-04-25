@@ -209,6 +209,7 @@ fn commitlog_legacy_zero_id_always_replayed() {
 ///
 /// Requires a live Accord cluster. Set FERROSA_TEST_CLUSTER_NODES to run.
 #[tokio::test]
+#[ignore = "requires live Accord cluster (FERROSA_TEST_CLUSTER_NODES)"]
 async fn dep_wait_ordering_under_partition() {
     if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
         && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
@@ -231,6 +232,7 @@ async fn dep_wait_ordering_under_partition() {
 ///
 /// Requires a live Accord cluster. Set FERROSA_TEST_CLUSTER_NODES to run.
 #[tokio::test]
+#[ignore = "requires live Accord cluster (FERROSA_TEST_CLUSTER_NODES)"]
 async fn batch_atomicity_kill_coordinator() {
     if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
         && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()

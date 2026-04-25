@@ -23,6 +23,7 @@ fn should_skip() -> bool {
 ///
 /// Full test: `ferrosa-jepsen/tests/nemesis_correctness.rs::disk_fail_no_phantom_commits`
 #[tokio::test]
+#[ignore = "Accord nemesis test — requires live cluster (FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER)"]
 async fn disk_fail_no_phantom_commits() {
     if should_skip() {
         eprintln!(
@@ -40,6 +41,7 @@ async fn disk_fail_no_phantom_commits() {
 ///
 /// Full test: `ferrosa-jepsen/tests/nemesis_correctness.rs::packet_reorder_linearizability`
 #[tokio::test]
+#[ignore = "Accord nemesis test — requires live cluster (FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER)"]
 async fn packet_reorder_linearizability() {
     if should_skip() {
         eprintln!(
@@ -55,6 +57,7 @@ async fn packet_reorder_linearizability() {
 ///
 /// Full test: `ferrosa-jepsen/tests/nemesis_correctness.rs::lwt_batch_atomicity_all_nemeses`
 #[tokio::test]
+#[ignore = "Accord nemesis test — requires live cluster (FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER)"]
 async fn lwt_batch_atomicity_all_nemeses() {
     if should_skip() {
         eprintln!(

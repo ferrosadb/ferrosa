@@ -1495,9 +1495,8 @@ mod tests {
     }
 
     /// BT-005f: WebConfig::from_env parses the FERROSA_WEB_BIND env var.
-    /// This test and bt005g run sequentially via a shared mutex to avoid
-    /// env var interference with parallel tests.
     #[test]
+    #[serial_test::serial(env)]
     fn bt005_web_config_env_var_parsing() {
         // Test 1: valid address.
         std::env::set_var("FERROSA_WEB_BIND", "127.0.0.1:8080");
@@ -1539,6 +1538,7 @@ mod tests {
 
     /// BT-005i: load_or_generate_host_id generates a valid UUID and persists it.
     #[test]
+    #[serial_test::serial(env)]
     fn bt005_host_id_generation_and_persistence() {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("FERROSA_HOST_ID");

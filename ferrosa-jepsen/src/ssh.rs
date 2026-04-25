@@ -233,6 +233,7 @@ mod tests {
     /// Requires a pre-provisioned VM with SSH running and the test key.
     /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
+    #[ignore = "requires a Firecracker VM via scripts/lima-fc-setup.sh"]
     async fn ssh_execute_command() {
         if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
             && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
@@ -255,6 +256,7 @@ mod tests {
     /// Requires a pre-provisioned VM with SSH running and the test key.
     /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
+    #[ignore = "requires a Firecracker VM via scripts/lima-fc-setup.sh"]
     async fn ssh_upload_file() {
         if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
             && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()

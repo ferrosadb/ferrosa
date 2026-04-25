@@ -270,6 +270,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn unauthenticated_returns_401() {
         let (router, _) = test_router(false);
         let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
@@ -279,6 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn superuser_cassandra_returns_200() {
         let (router, _) = test_router(false);
         let req = Request::builder()
@@ -294,6 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn bad_credentials_returns_401() {
         let (router, _) = test_router(false);
         let req = Request::builder()
@@ -309,6 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn auth_disabled_passes_through() {
         let (router, _) = test_router(true);
         let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
@@ -317,6 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn non_privileged_role_returns_403() {
         let (router, schema) = test_router(false);
 
@@ -350,6 +355,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn operator_role_via_member_of_returns_200() {
         let (router, schema) = test_router(false);
 

@@ -274,12 +274,15 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn archive_config_from_env_defaults() {
         // No env vars set — should return default (disabled).
         // Clear any stale env to be safe.
-        std::env::remove_var("FERROSA_ARCHIVE_ENABLED");
-        std::env::remove_var("FERROSA_ARCHIVE_POLL_INTERVAL_SECS");
-        std::env::remove_var("FERROSA_ARCHIVE_RETENTION_DAYS");
+        unsafe {
+            std::env::remove_var("FERROSA_ARCHIVE_ENABLED");
+            std::env::remove_var("FERROSA_ARCHIVE_POLL_INTERVAL_SECS");
+            std::env::remove_var("FERROSA_ARCHIVE_RETENTION_DAYS");
+        }
         let config = ArchiveConfig::from_env();
         assert!(!config.enabled);
         assert_eq!(config.poll_interval, Duration::from_secs(5));

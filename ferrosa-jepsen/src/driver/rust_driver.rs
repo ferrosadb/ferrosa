@@ -176,6 +176,7 @@ mod tests {
     ///
     /// Requires FERROSA_TEST_CONTAINERS=1 and a cluster on port 19042.
     #[tokio::test]
+    #[ignore = "requires FERROSA_TEST_CONTAINERS=1 and a 19042-cluster"]
     async fn rust_driver_connects_to_cluster() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
             panic!(

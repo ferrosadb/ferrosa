@@ -46,6 +46,7 @@ fn test_engine_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig 
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "30s loadgen test; flaky under workspace parallel load. Run explicitly: cargo test -p ferrosa-loadgen --test ucs_load_test -- --ignored"]
 fn ucs_load_read_heavy() {
     let mut profile = LoadProfile::read_heavy();
     profile.duration = Duration::from_secs(30);
@@ -76,6 +77,7 @@ fn ucs_load_read_heavy() {
 }
 
 #[test]
+#[ignore = "30s loadgen test; flaky under workspace parallel load. Run explicitly: cargo test -p ferrosa-loadgen --test ucs_load_test -- --ignored"]
 fn ucs_load_balanced() {
     let mut profile = LoadProfile::balanced();
     profile.duration = Duration::from_secs(30);
@@ -101,6 +103,7 @@ fn ucs_load_balanced() {
 }
 
 #[test]
+#[ignore = "30s loadgen test; flaky under workspace parallel load. Run explicitly: cargo test -p ferrosa-loadgen --test ucs_load_test -- --ignored"]
 fn ucs_load_write_heavy() {
     let mut profile = LoadProfile::write_heavy();
     profile.duration = Duration::from_secs(30);

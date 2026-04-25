@@ -60,6 +60,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
 }
 
 #[test]
+#[ignore = "requires FERROSA_TEST_CONTAINERS=1; podman compose -f tests/docker-compose.compaction-test.yml up -d"]
 fn ucs_load_s3_write_heavy() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(
@@ -101,6 +102,7 @@ fn ucs_load_s3_write_heavy() {
 }
 
 #[test]
+#[ignore = "requires FERROSA_TEST_CONTAINERS=1; podman compose -f tests/docker-compose.compaction-test.yml up -d"]
 fn ucs_load_s3_balanced() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(
@@ -134,6 +136,7 @@ fn ucs_load_s3_balanced() {
 }
 
 #[test]
+#[ignore = "requires FERROSA_TEST_CONTAINERS=1; podman compose -f tests/docker-compose.compaction-test.yml up -d"]
 fn ucs_load_s3_read_heavy() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(
