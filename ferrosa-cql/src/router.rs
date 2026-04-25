@@ -210,6 +210,42 @@ pub struct RequestContext<'a> {
     pub client_address: String,
 }
 
+/// Raw (un-encoded) result of a user-table SELECT, used by delta subscriptions.
+///
+/// Carries the projected column metadata and row data so the subscription
+/// delivery layer can compute a row-level diff against the previous delivery
+/// without re-parsing encoded CQL RESULT frames.
+///
+/// The `paging_state` field carries the opaque continuation token when the
+/// original query was paginated. Pass it through when encoding for normal
+/// SELECT responses; ignore it in subscription/delta contexts.
+pub struct SelectRawResult {
+    pub column_names: Vec<String>,
+    pub column_types: Vec<CqlType>,
+    pub rows: Vec<Vec<Option<CqlValue>>>,
+    pub keyspace: String,
+    pub table: String,
+    /// Opaque paging continuation token, `None` when no more pages.
+    pub paging_state: Option<Vec<u8>>,
+}
+
+impl SelectRawResult {
+    /// Encode this result into a CQL RESULT frame body (Rows kind = 0x0002).
+    ///
+    /// Includes the paging continuation token when present so normal SELECT
+    /// responses are indistinguishable from the previous implementation.
+    pub fn encode(self) -> BytesMut {
+        result::encode_rows_paged(
+            &self.column_names,
+            &self.column_types,
+            &self.keyspace,
+            &self.table,
+            &self.rows,
+            self.paging_state.as_deref(),
+        )
+    }
+}
+
 /// Result of routing a statement.
 pub enum RouteResult {
     /// A CQL RESULT frame body.
@@ -1072,7 +1108,8 @@ async fn route_select(
             }
 
             // User table: permission check + bridge + storage
-            route_select_user_table(state, ctx, ks, &s).await
+            let raw = route_select_user_table(state, ctx, ks, &s).await?;
+            Ok(raw.encode())
         }
     }
 }
@@ -1082,7 +1119,7 @@ async fn route_select_user_table(
     ctx: &RequestContext<'_>,
     ks: &str,
     s: &SelectStatement,
-) -> Result<BytesMut, CqlError> {
+) -> Result<SelectRawResult, CqlError> {
     validate_keyspace_exists(&state.schema, ks)?;
 
     // Permission check (M8)
@@ -1226,8 +1263,14 @@ async fn route_select_user_table(
             };
         // Project to selected columns.
         let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
-        let result = result::encode_rows(&col_names, &col_types, ks, &s.table, &selected_rows);
-        return Ok(result);
+        return Ok(SelectRawResult {
+            column_names: col_names.to_vec(),
+            column_types: col_types.to_vec(),
+            rows: selected_rows,
+            keyspace: ks.to_string(),
+            table: s.table.clone(),
+            paging_state: None,
+        });
     }
 
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
@@ -1704,9 +1747,14 @@ async fn route_select_user_table(
             }
         }
         let agg_rows = vec![agg_row];
-        return Ok(result::encode_rows(
-            &col_names, &col_types, ks, &s.table, &agg_rows,
-        ));
+        return Ok(SelectRawResult {
+            column_names: col_names.to_vec(),
+            column_types: col_types.to_vec(),
+            rows: agg_rows,
+            keyspace: ks.to_string(),
+            table: s.table.clone(),
+            paging_state: None,
+        });
     }
 
     // Apply column selection if not Star
@@ -1779,14 +1827,33 @@ async fn route_select_user_table(
 
     let page_rows = &limited[paged.start..paged.end];
 
-    Ok(result::encode_rows_paged(
-        &col_names,
-        &col_types,
-        ks,
-        &s.table,
-        page_rows,
-        paged.next_paging_state.as_deref(),
-    ))
+    // Return raw result; callers that need an encoded frame call .encode()
+    // or result::encode_rows_paged directly. Delta subscriptions use the raw rows.
+    Ok(SelectRawResult {
+        column_names: col_names.to_vec(),
+        column_types: col_types.to_vec(),
+        rows: page_rows.to_vec(),
+        keyspace: ks.to_string(),
+        table: s.table.clone(),
+        paging_state: paged.next_paging_state,
+    })
+}
+
+/// Execute a SELECT against a user table and return raw (un-encoded) rows.
+///
+/// Used by delta subscriptions to compute a row-level diff. Only supports
+/// user tables; system table subscriptions are not expected to use delta mode.
+pub async fn route_select_raw(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &SelectStatement,
+) -> Result<SelectRawResult, CqlError> {
+    let ks = s
+        .keyspace
+        .as_deref()
+        .or(ctx.current_keyspace.as_deref())
+        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+    route_select_user_table(state, ctx, ks, s).await
 }
 
 // ── Virtual table helpers ────────────────────────────────────────────────
