@@ -57,21 +57,36 @@ pub struct ColumnRow {
 /// alongside user-created keyspaces. CQL drivers and cqlsh expect these to appear
 /// in `system_schema.keyspaces` for introspection.
 pub fn query_keyspaces(snap: &SchemaSnapshot) -> Vec<KeyspaceRow> {
-    let mut rows: Vec<KeyspaceRow> = vec![
-        system_keyspace_row("system"),
-        system_keyspace_row("system_schema"),
-        system_keyspace_row("system_auth"),
-        system_keyspace_row("system_observability"),
-    ];
-    rows.extend(snap.keyspaces.values().map(|ks| {
-        let mut replication = ks.replication.options.clone();
-        replication.insert("class".to_string(), ks.replication.strategy.clone());
-        KeyspaceRow {
-            keyspace_name: ks.name.clone(),
-            durable_writes: ks.durable_writes,
-            replication,
+    // Snapshot is the source of truth. `Schema::new()` seeds the four
+    // system keyspaces, so for production callers the snapshot already
+    // contains them. Bare `SchemaSnapshot::new()` callers (tests) don't,
+    // so we fall back to hardcoded LocalStrategy rows only for the ones
+    // the snapshot is missing. Emitting both was a latent bug: after the
+    // `system_auth` default moved to NTS, duplicated rows caused cqlsh
+    // to see the LocalStrategy version and mask the fix.
+    let mut rows: Vec<KeyspaceRow> = snap
+        .keyspaces
+        .values()
+        .map(|ks| {
+            let mut replication = ks.replication.options.clone();
+            replication.insert("class".to_string(), ks.replication.strategy.clone());
+            KeyspaceRow {
+                keyspace_name: ks.name.clone(),
+                durable_writes: ks.durable_writes,
+                replication,
+            }
+        })
+        .collect();
+    for name in [
+        "system",
+        "system_schema",
+        "system_auth",
+        "system_observability",
+    ] {
+        if !snap.keyspaces.contains_key(name) {
+            rows.push(system_keyspace_row(name));
         }
-    }));
+    }
     rows
 }
 

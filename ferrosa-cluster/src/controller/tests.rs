@@ -1155,8 +1155,10 @@ fn is_cql_ready_pair_secondary_returns_false() {
     let schema = test_schema();
     let config = Arc::new(ClusterConfig::default());
     let net_config = Arc::new(NetConfig::default());
-    let local_id = Uuid::new_v4();
-    let peer_id = Uuid::new_v4();
+    // local > peer so local takes the Secondary role (primary-by-lower-id).
+    // Uuid::new_v4() made this flaky at ~50% pass.
+    let local_id = Uuid::from_u128(2);
+    let peer_id = Uuid::from_u128(1);
 
     let registry = Arc::new(HandlerRegistry::new());
     let (controller, _handles) = ModeController::new(

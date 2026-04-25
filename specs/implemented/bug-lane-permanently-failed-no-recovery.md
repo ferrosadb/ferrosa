@@ -5,10 +5,22 @@ reported-by: ferrosa-memory production cluster
 implemented-by: ""
 verified-by: ""
 created: 2026-04-17
-updated: 2026-04-17
+updated: 2026-04-18
 ---
 
 # Data lane permanently fails after max reconnection attempts — no recovery without restart
+
+## Implementation Notes
+
+Fix landed in `ferrosa-net/src/lane_actor.rs` (commit 30a00e7). The
+`LaneCommand::MarkFailed` handler no longer transitions to the terminal
+`Failed` state; instead it resets state to `Reconnecting { attempt: 0,
+backoff: 5s..30s }` and spawns a delayed reconnect 10s later. Unit test
+`MarkFailed should reset to Reconnecting, not terminal Failed` (see
+`ferrosa-net/src/lane_actor.rs:607`) guards against regression. The
+`LaneState::Failed` variant is retained for the `QueryStatus` reporting
+path but is no longer reachable during normal operation.
+
 
 ## Observed
 

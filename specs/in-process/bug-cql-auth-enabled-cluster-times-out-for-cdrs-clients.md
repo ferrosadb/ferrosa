@@ -28,7 +28,7 @@ path.
 
 - Ferrosa commit: `fe11d50` (re-verified), previously `2faab48`, `3f868db`, and `6fce814`
 - Cluster: local 3-node podman cluster from
-  `/Users/bkearns/src/ferrosa-memory/docker-compose.yml`
+  `/Users/bkearns/src/ferrosa-suite/ferrosa-memory/docker-compose.yml`
 - Auth: enabled
 - Client: `ferrosa-memory` via `cdrs-tokio`
 - Credentials used by the failing client:
@@ -39,7 +39,7 @@ path.
 
 1. Build Ferrosa from `6fce814`.
 2. Start the auth-enabled 3-node cluster from
-   `/Users/bkearns/src/ferrosa-memory/docker-compose.yml`.
+   `/Users/bkearns/src/ferrosa-suite/ferrosa-memory/docker-compose.yml`.
 3. Start `ferrosa-memory-mcp` with:
 
 ```bash
@@ -203,7 +203,7 @@ They do **not** reproduce the actual `ferrosa-memory` failure shape.
 ### Stronger repro now added in `ferrosa-memory`
 
 Two live tests in
-`/Users/bkearns/src/ferrosa-memory/crates/ferrosa-memory-core/tests/cql_live.rs`
+`/Users/bkearns/src/ferrosa-suite/ferrosa-memory/crates/ferrosa-memory-core/tests/cql_live.rs`
 match the real failing path much more closely:
 
 1. `auth_enabled_multipoint_cdrs_session_build_succeeds`

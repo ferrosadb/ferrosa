@@ -29,7 +29,7 @@ bug is invisible until someone reaches for cqlsh.
 
 - Ferrosa commit: `c47bfa8` (branch `fix/mixed-client-topology-and-typed-edge-bugs`)
 - Cluster: local 3-node podman cluster from
-  `/Users/bkearns/src/ferrosa-memory/docker-compose.yml`, auth enabled
+  `/Users/bkearns/src/ferrosa-suite/ferrosa-memory/docker-compose.yml`, auth enabled
 - Client: official `docker.io/library/cassandra:4.1` image,
   `cqlsh` (Python cassandra-driver)
 

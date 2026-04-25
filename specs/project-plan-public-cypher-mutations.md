@@ -8,8 +8,8 @@ for: specs/todo/todo-implement-public-cypher-mutations-for-client-graph-writes.m
 related:
   - specs/todo/todo-enable-cql-role-auth-for-graph-table-isolation.md
   - specs/decisions/design-cql-role-auth-rollout.md
-  - /Users/bkearns/src/ferrosa-memory/specs/todo/bug-ferrosa-memory-bypasses-graph-api-for-writes.md
-  - /Users/bkearns/src/ferrosa-memory/specs/todo/todo-extend-ferrosa-memory-graph-client-with-cypher-writes.md
+  - /Users/bkearns/src/ferrosa-suite/ferrosa-memory/specs/todo/bug-ferrosa-memory-bypasses-graph-api-for-writes.md
+  - /Users/bkearns/src/ferrosa-suite/ferrosa-memory/specs/todo/todo-extend-ferrosa-memory-graph-client-with-cypher-writes.md
   - specs/coverage/multimodel-coverage.md
 ---
 
