@@ -282,12 +282,22 @@ pub async fn route(
             _ => RoutingMode::Cluster,
         };
         if route_decision(mode, &stmt, ctx.serial_consistency) == RouteDecision::Accord {
-            // TODO(S3): Execute through AccordCoordinator instead of WritePath.
-            // For now, fall through to the existing CL-based path and log.
-            tracing::info!(
-                ?opcode,
-                "LWT statement detected — Accord consensus required (falling through to CL path)"
-            );
+            // Accord routing for LWT (IF NOT EXISTS / IF <condition>) is not yet
+            // implemented. The Accord coordinator state machine exists in
+            // ferrosa-cluster but has no network transport layer — there is no
+            // component that dispatches PreAccept/Accept messages to real remote
+            // nodes. Silently falling through to the CL path would return success
+            // with weaker-than-requested semantics, violating linearizability.
+            //
+            // Per spec p0-03 acceptance criterion #3 and the fail-loud policy:
+            // return a hard error so the client knows the guarantee was not met.
+            // See ferrosa_docs/specs/todo/p0-03b-accord-implementation-gap.md
+            // for the enumerated gap list.
+            return Err(CqlError::ServerError(
+                "LWT routing to Accord is not yet implemented; \
+                 see ferrosa_docs/specs/todo/p0-03b-accord-implementation-gap.md"
+                    .into(),
+            ));
         }
     }
 
@@ -12268,5 +12278,120 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // p0-03: LWT must return ServerError, not silently fall through to CL path
+    // -----------------------------------------------------------------------
+
+    /// Build a SharedState with ClusterStateHolder::Cluster so that
+    /// route_decision() returns RouteDecision::Accord for LWT statements.
+    fn setup_cluster_mode() -> (SharedState, TempDir) {
+        let (state, dir) = setup();
+
+        // Replace the Standalone cluster state with Cluster mode.
+        // RaftClusterState with an empty ring is sufficient — the LWT guard
+        // fires before any routing into the ring happens.
+        let ring = Arc::new(ArcSwap::from_pointee(
+            ferrosa_cluster::ring::TokenRing::new(),
+        ));
+        let raft_state = ferrosa_cluster::RaftClusterState::new(ring, 1);
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                raft_state,
+            )));
+        (state, dir)
+    }
+
+    /// LWT INSERT IF NOT EXISTS in cluster mode must return ServerError with
+    /// the gap-spec reference, not silently fall through to the CL path.
+    ///
+    /// This test exercises the fix for p0-03 (Outcome B): the server returns
+    /// an explicit error rather than pretending to honour linearizability with
+    /// a process-local substitute.
+    #[tokio::test]
+    async fn lwt_insert_if_not_exists_cluster_mode_returns_server_error() {
+        let (state, _dir) = setup_cluster_mode();
+        let dev = dev_auth();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO system.local (key) VALUES ('test') IF NOT EXISTS")
+                .unwrap();
+
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                // serial_consistency = Some triggers the LWT routing guard.
+                serial_consistency: Some(ConsistencyLevel::Serial),
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("LWT in cluster mode must return an error, not silently succeed"),
+        };
+
+        match err {
+            CqlError::ServerError(msg) => {
+                assert!(
+                    msg.contains("p0-03b-accord-implementation-gap.md"),
+                    "error must reference the gap spec, got: {msg:?}"
+                );
+                assert!(
+                    msg.contains("LWT routing to Accord is not yet implemented"),
+                    "error must name the unimplemented feature, got: {msg:?}"
+                );
+            }
+            other => panic!("expected CqlError::ServerError, got {:?}", other),
+        }
+    }
+
+    /// LWT in standalone mode must NOT return an error — standalone bypasses
+    /// Accord entirely and falls through to the local storage path normally.
+    ///
+    /// This confirms the routing guard is scoped to cluster mode only, so
+    /// development and single-node deployments are unaffected.
+    #[tokio::test]
+    async fn lwt_insert_if_not_exists_standalone_mode_does_not_error() {
+        let (state, _dir) = setup(); // Standalone mode
+        let dev = dev_auth();
+
+        // We just need to confirm no ServerError fires; the insert itself
+        // may fail for unrelated reasons (table not found, etc.) — those
+        // are not the p0-03 error.
+        let stmt =
+            crate::parser::parse("INSERT INTO system.local (key) VALUES ('test') IF NOT EXISTS")
+                .unwrap();
+
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: Some(ConsistencyLevel::Serial),
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await;
+
+        // Must not be the p0-03 ServerError.
+        if let Err(CqlError::ServerError(ref msg)) = result {
+            assert!(
+                !msg.contains("p0-03b-accord-implementation-gap"),
+                "standalone mode must not trigger the LWT Accord gap error, got: {msg:?}"
+            );
+        }
+        // Any other outcome (Ok or a different error) is acceptable.
     }
 }
