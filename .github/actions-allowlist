@@ -1,0 +1,14 @@
+# GitHub Actions allowlist — entries that the SHA-pin guard accepts as exceptions.
+#
+# Format: one entry per line, `owner/repo@ref  # justification`.
+# Blank lines and comment-only lines (starting #) are ignored.
+#
+# Add an entry ONLY when the upstream action does not publish SHA-pinnable
+# releases or when there is a documented operational reason. Each entry
+# must include a human-readable justification on the same line.
+#
+# This file is consulted by `.github/scripts/check-actions-pinned.sh` (run
+# by the `actions-pin-guard.yml` workflow). A guard regression — i.e. an
+# unpinned `uses:` that does not match an entry here — fails CI loudly.
+#
+# Currently empty: ferrosa pins every action to a 40-char SHA.
