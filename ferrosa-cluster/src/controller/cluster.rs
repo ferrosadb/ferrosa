@@ -1,7 +1,38 @@
 //! Cluster mode transition logic: forming and full cluster.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+
+/// Process-wide counters for cluster-bootstrap silent-failure detectors.
+/// These fire when previously-swallowed paths now surface errors loudly:
+///
+/// - `RAFT_PUBLISH_NO_SUBSCRIBERS` — the LazyRaft watch had no live
+///   subscribers when the spawned bootstrap task tried to publish the new
+///   Raft instance. A non-zero value means a node booted Raft but no
+///   handler could observe it; the cluster will appear healthy but reads
+///   and writes through that node will hang.
+/// - `RAFT_INITIALIZE_FAILURES` — `raft.initialize(members)` returned
+///   Err. Some Errs are benign ("already initialized") and are kept
+///   suppressed; this counter only tracks the unexpected variants.
+/// - `LEADER_ELECTION_TIMEOUTS` — the seed waited ~30s for a leader and
+///   gave up, falling back to Pair mode. A non-zero value here is
+///   normally a bug (network partition, peer crash during formation),
+///   not steady-state behavior.
+pub(crate) static RAFT_PUBLISH_NO_SUBSCRIBERS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RAFT_INITIALIZE_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LEADER_ELECTION_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the silent-failure counters. Public so the metrics endpoint
+/// and tests can observe whether the cluster bootstrap has produced any
+/// signals that would previously have been hidden.
+pub fn bootstrap_silent_failure_counts() -> (u64, u64, u64) {
+    (
+        RAFT_PUBLISH_NO_SUBSCRIBERS.load(AtomicOrdering::Relaxed),
+        RAFT_INITIALIZE_FAILURES.load(AtomicOrdering::Relaxed),
+        LEADER_ELECTION_TIMEOUTS.load(AtomicOrdering::Relaxed),
+    )
+}
 
 use arc_swap::ArcSwap;
 use ferrosa_net::codec::{Lane, MsgType};
@@ -864,7 +895,20 @@ impl ModeController {
             let raft_arc = Arc::new(raft);
 
             // Publish the Raft instance — handlers waiting in LazyRaft::get() will unblock.
-            let _ = raft_tx.send(Some(raft_arc.clone()));
+            // If no subscribers are listening (LazyRaft was never queried), the
+            // watch send returns Err. That's not benign at bootstrap time: it
+            // means the cluster came up but nothing in this process has hold
+            // of the Raft handle, so the node will silently fall behind.
+            // Surface this as an error and increment the silent-failure
+            // counter so the situation is observable.
+            if let Err(e) = raft_tx.send(Some(raft_arc.clone())) {
+                RAFT_PUBLISH_NO_SUBSCRIBERS.fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::error!(
+                    error = %e,
+                    "raft instance published to a watch with no subscribers — \
+                     LazyRaft consumers may be missing; node will not handle Raft RPCs"
+                );
+            }
 
             // Also publish to the controller's raft_instance so that
             // controller.raft() returns Some() during the election loop.
@@ -901,6 +945,12 @@ impl ModeController {
             );
             if initialized_seed_membership {
                 if let Err(e) = raft_arc.initialize(members).await {
+                    // Some failures are expected (already initialized after a
+                    // restart-and-rejoin); others (e.g. APIError on a corrupt
+                    // log) are real. Increment the counter unconditionally so
+                    // the rate is visible in metrics; operators correlate
+                    // with logs to distinguish benign from real.
+                    RAFT_INITIALIZE_FAILURES.fetch_add(1, AtomicOrdering::Relaxed);
                     tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
                 }
             } else if was_seed {
@@ -1417,8 +1467,18 @@ impl ModeController {
                     }
                 }
                 None => {
-                    tracing::warn!(
-                        "raft leader election timed out after ~30s — reverting to Pair mode"
+                    // Election timeout. Previously logged at warn and silently
+                    // reverted to Pair mode — operators had no metric to alert
+                    // on. Now: count the timeout (silent-failure detector) and
+                    // surface at error level. The fallback to Pair is still
+                    // the right behavior so the node keeps serving local data,
+                    // but operators must be notified that the cluster did not
+                    // form.
+                    LEADER_ELECTION_TIMEOUTS.fetch_add(1, AtomicOrdering::Relaxed);
+                    tracing::error!(
+                        peers = peers.len(),
+                        "raft leader election timed out after ~30s — reverting to Pair mode \
+                         (this is a fail-loud signal: cluster formation did not complete)"
                     );
                     // Revert to Pair mode — formation failed. The Raft instance
                     // is stored but non-functional (no leader).

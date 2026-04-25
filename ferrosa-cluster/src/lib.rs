@@ -22,7 +22,9 @@ pub mod write_path;
 
 pub use config::ClusterConfig;
 pub use consistency::ConsistencyLevel;
-pub use controller::{ClusterStateHolder, ModeController, ModeControllerHandles};
+pub use controller::{
+    bootstrap_silent_failure_counts, ClusterStateHolder, ModeController, ModeControllerHandles,
+};
 pub use coordinator::batch::{
     BatchlogDeleteHandler, BatchlogReplayHandler, BatchlogReplayTask, BatchlogWriteHandler,
 };

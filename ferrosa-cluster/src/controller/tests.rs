@@ -1871,3 +1871,19 @@ fn schema_snapshot_includes_user_tables_for_bootstrap() {
         &("user_ks".to_string(), "my_table".to_string())
     );
 }
+
+/// P0-08: the bootstrap silent-failure counters must be exposed and
+/// readable. This is the public contract of the silent-failure detector;
+/// metrics scrape relies on it. The counters can only legitimately be
+/// incremented from the bootstrap path (which the unit test environment
+/// does not exercise end-to-end), so this test asserts the surface and
+/// monotonicity rather than absolute values.
+#[test]
+fn bootstrap_silent_failure_counts_exposes_three_counters() {
+    let (publish, init, election) = super::cluster::bootstrap_silent_failure_counts();
+    // Read again — must be monotonic non-decreasing across calls.
+    let (publish2, init2, election2) = super::cluster::bootstrap_silent_failure_counts();
+    assert!(publish2 >= publish);
+    assert!(init2 >= init);
+    assert!(election2 >= election);
+}
