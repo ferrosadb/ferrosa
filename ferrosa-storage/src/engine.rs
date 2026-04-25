@@ -6953,151 +6953,85 @@ mod tests {
     // PITR E2E: Commit-log replay to a point in time (p0-06)
     // =========================================================================
 
-    /// E4: Commit-log replay PITR — write 1 000 rows, snapshot, write 1 000
-    /// more rows with a later timestamp, then restore to a point-in-time that
-    /// falls between the two batches.
+    /// Helper: run the PITR commit-log replay E2E test with a caller-supplied
+    /// batch size.
     ///
-    /// After restore:
-    ///   - All 1 000 rows from the first batch MUST be present.
-    ///   - All 1 000 rows from the second batch MUST be absent.
+    /// Writes `batch_size` rows (batch 1), takes a snapshot, writes another
+    /// `batch_size` rows (batch 2) with later timestamps, then restores to a
+    /// point-in-time between the two batches.  Asserts that every batch-1 row
+    /// is present and every batch-2 row is absent.
     ///
-    /// This test proves that `open_from_snapshot_with_store` replays archived
-    /// commit-log segments up to a caller-specified timestamp cutoff.
-    #[test]
-    fn e4_pitr_commit_log_replay_to_point_in_time() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    /// Used by both the fast (100-row) default test and the spec-mandated slow
+    /// (1 000-row) test so both share the same code path.
+    async fn run_pitr_replay_e2e(batch_size: usize) {
+        // ── Phase 1: create engine with archiving enabled ────────────
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "pitr-replay-test";
+
+        // Initialise live manifest + schema in S3.
+        let init_manifest = crate::manifest::Manifest::new();
+        init_manifest
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+            .await
             .unwrap();
 
-        rt.block_on(async {
-            // ── Phase 1: create engine with archiving enabled ────────────
-            let dir = tempfile::tempdir().unwrap();
-            let store: Arc<dyn object_store::ObjectStore> =
-                Arc::new(object_store::memory::InMemory::new());
-            let prefix = "pitr-replay-test";
+        // Small segment size (256 bytes) forces rotation after each write,
+        // ensuring every mutation reaches a closed segment that gets archived.
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 256,
+                archive: Some(crate::commitlog::config::ArchiveConfig {
+                    enabled: true,
+                    poll_interval: std::time::Duration::from_millis(20),
+                    ..crate::commitlog::config::ArchiveConfig::default()
+                }),
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
 
-            // Initialise live manifest + schema in S3.
-            let init_manifest = crate::manifest::Manifest::new();
-            init_manifest
-                .save_with_retry(store.as_ref(), prefix)
-                .await
-                .unwrap();
-            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
-                .await
-                .unwrap();
+        let engine = StorageEngine::new_with_archive_store(
+            config,
+            Some(&tokio::runtime::Handle::current()),
+            Some(Arc::clone(&store)),
+            prefix.to_string(),
+        )
+        .unwrap();
 
-            // Small segment size (256 bytes) forces rotation after each write,
-            // ensuring every mutation reaches a closed segment that gets archived.
-            let config = StorageEngineConfig {
-                commit_log: CommitLogConfig {
-                    segment_size: 256,
-                    archive: Some(crate::commitlog::config::ArchiveConfig {
-                        enabled: true,
-                        poll_interval: std::time::Duration::from_millis(20),
-                        ..crate::commitlog::config::ArchiveConfig::default()
-                    }),
-                    ..CommitLogConfig::test_config(dir.path())
-                },
-                ..StorageEngineConfig::test_config(dir.path())
-            };
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
 
-            let engine = StorageEngine::new_with_archive_store(
-                config,
-                Some(&tokio::runtime::Handle::current()),
-                Some(Arc::clone(&store)),
-                prefix.to_string(),
-            )
-            .unwrap();
-
-            engine.register_table(test_schema()).unwrap();
-            let tid = table_id();
-
-            // ── Phase 2: write batch 1 — timestamps 1_000 … 1_999 ────────
-            // These rows MUST survive PITR restore.
-            const BATCH_SIZE: usize = 100; // reduced from 1000 for test speed
-            for i in 0..BATCH_SIZE {
-                let key_str = format!("batch1-{i:04}");
-                engine
-                    .write(
-                        &tid,
-                        &make_key(&key_str),
-                        make_row(b"batch1", (1_000 + i as i64) * 1_000),
-                        (1_000 + i as i64) * 1_000,
-                    )
-                    .unwrap();
-            }
-
-            // Flush batch 1 to SSTables so the snapshot captures it.
-            engine.flush(&tid).unwrap();
+        // ── Phase 2: write batch 1 — timestamps 1_000 … (1_000 + batch_size - 1) ──
+        // These rows MUST survive PITR restore.
+        for i in 0..batch_size {
+            let key_str = format!("batch1-{i:04}");
             engine
-                .upload_manifest_for_test(Arc::clone(&store), prefix)
-                .await;
-
-            // ── Phase 3: create snapshot (records commit_log_position) ───
-            let snap_meta = engine
-                .create_snapshot_with_store(
-                    "pitr-snap",
-                    "node-1",
-                    None,
-                    false,
-                    Arc::clone(&store),
-                    prefix,
+                .write(
+                    &tid,
+                    &make_key(&key_str),
+                    make_row(b"batch1", (1_000 + i as i64) * 1_000),
+                    (1_000 + i as i64) * 1_000,
                 )
-                .await
                 .unwrap();
+        }
 
-            assert_eq!(snap_meta.name, "pitr-snap");
+        // Flush batch 1 to SSTables so the snapshot captures it.
+        engine.flush(&tid).unwrap();
+        engine
+            .upload_manifest_for_test(Arc::clone(&store), prefix)
+            .await;
 
-            // point_in_time sits between the two batches (microseconds).
-            // batch 1 max timestamp: (1_000 + BATCH_SIZE - 1) * 1_000
-            // batch 2 min timestamp: 2_000_000
-            // We set cutoff at 1_999_999 — includes all of batch 1, excludes batch 2.
-            let point_in_time: i64 = 1_999_999;
-
-            // ── Phase 4: write batch 2 — timestamps 2_000_000 … ──────────
-            // These rows MUST be absent after PITR restore.
-            for i in 0..BATCH_SIZE {
-                let key_str = format!("batch2-{i:04}");
-                engine
-                    .write(
-                        &tid,
-                        &make_key(&key_str),
-                        make_row(b"batch2", 2_000_000 + i as i64),
-                        2_000_000 + i as i64,
-                    )
-                    .unwrap();
-            }
-
-            // Wait long enough for the archiver to upload all closed segments.
-            // The small (256-byte) segment size guarantees batch-2 mutations
-            // rotate into closed segments that the archiver will pick up.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            // Verify at least some segments were archived before proceeding.
-            let arch_manifest =
-                crate::commitlog::manifest::ArchiveManifest::load(store.as_ref(), prefix)
-                    .await
-                    .unwrap();
-            assert!(
-                !arch_manifest.segments.is_empty(),
-                "archiver must have uploaded at least one segment before restore"
-            );
-
-            engine.shutdown().unwrap();
-
-            // ── Phase 5: restore with PITR cutoff ───────────────────────
-            let restore_dir = tempfile::tempdir().unwrap();
-            let restore_config = StorageEngineConfig {
-                commit_log: CommitLogConfig::test_config(restore_dir.path()),
-                ..StorageEngineConfig::test_config(restore_dir.path())
-            };
-
-            let restored = StorageEngine::open_from_snapshot_with_store(
-                restore_config,
+        // ── Phase 3: create snapshot (records commit_log_position) ───
+        let snap_meta = engine
+            .create_snapshot_with_store(
                 "pitr-snap",
-                Some(point_in_time),
                 "node-1",
+                None,
                 false,
                 Arc::clone(&store),
                 prefix,
@@ -7105,37 +7039,132 @@ mod tests {
             .await
             .unwrap();
 
-            // Register table so deferred replay mutations are applied.
-            restored.register_table(test_schema()).unwrap();
+        assert_eq!(snap_meta.name, "pitr-snap");
 
-            // ── Phase 6: assertions ──────────────────────────────────────
-            // Batch 1 rows: all must be present.
-            for i in 0..BATCH_SIZE {
-                let key_str = format!("batch1-{i:04}");
-                let result = restored.read(&tid, &make_key(&key_str)).unwrap();
-                assert!(
-                    result.is_some(),
-                    "batch1 row '{key_str}' must be present after PITR restore"
-                );
-                assert_eq!(
-                    result.unwrap().rows[0].cells[0].1.value.as_deref(),
-                    Some(b"batch1".as_slice()),
-                    "batch1 row '{key_str}' must have correct value"
-                );
-            }
+        // point_in_time sits between the two batches (microseconds).
+        // batch 1 max timestamp: (1_000 + batch_size - 1) * 1_000
+        // batch 2 min timestamp: 2_000_000_000
+        // We set cutoff at 1_999_999_999 — includes all of batch 1, excludes batch 2.
+        let point_in_time: i64 = 1_999_999_999;
 
-            // Batch 2 rows: all must be absent (timestamp > point_in_time).
-            for i in 0..BATCH_SIZE {
-                let key_str = format!("batch2-{i:04}");
-                let result = restored.read(&tid, &make_key(&key_str)).unwrap();
-                assert!(
-                    result.is_none(),
-                    "batch2 row '{key_str}' must NOT be present after PITR restore to {point_in_time}"
-                );
-            }
+        // ── Phase 4: write batch 2 — timestamps 2_000_000_000 … ─────
+        // These rows MUST be absent after PITR restore.
+        for i in 0..batch_size {
+            let key_str = format!("batch2-{i:04}");
+            engine
+                .write(
+                    &tid,
+                    &make_key(&key_str),
+                    make_row(b"batch2", 2_000_000_000 + i as i64),
+                    2_000_000_000 + i as i64,
+                )
+                .unwrap();
+        }
 
-            restored.shutdown().unwrap();
-        });
+        // Wait long enough for the archiver to upload all closed segments.
+        // The small (256-byte) segment size guarantees batch-2 mutations
+        // rotate into closed segments that the archiver will pick up.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Verify at least some segments were archived before proceeding.
+        let arch_manifest =
+            crate::commitlog::manifest::ArchiveManifest::load(store.as_ref(), prefix)
+                .await
+                .unwrap();
+        assert!(
+            !arch_manifest.segments.is_empty(),
+            "archiver must have uploaded at least one segment before restore"
+        );
+
+        engine.shutdown().unwrap();
+
+        // ── Phase 5: restore with PITR cutoff ───────────────────────
+        let restore_dir = tempfile::tempdir().unwrap();
+        let restore_config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(restore_dir.path()),
+            ..StorageEngineConfig::test_config(restore_dir.path())
+        };
+
+        let restored = StorageEngine::open_from_snapshot_with_store(
+            restore_config,
+            "pitr-snap",
+            Some(point_in_time),
+            "node-1",
+            false,
+            Arc::clone(&store),
+            prefix,
+        )
+        .await
+        .unwrap();
+
+        // Register table so deferred replay mutations are applied.
+        restored.register_table(test_schema()).unwrap();
+
+        // ── Phase 6: assertions ──────────────────────────────────────
+        // Batch 1 rows: all must be present.
+        for i in 0..batch_size {
+            let key_str = format!("batch1-{i:04}");
+            let result = restored.read(&tid, &make_key(&key_str)).unwrap();
+            assert!(
+                result.is_some(),
+                "batch1 row '{key_str}' must be present after PITR restore"
+            );
+            assert_eq!(
+                result.unwrap().rows[0].cells[0].1.value.as_deref(),
+                Some(b"batch1".as_slice()),
+                "batch1 row '{key_str}' must have correct value"
+            );
+        }
+
+        // Batch 2 rows: all must be absent (timestamp > point_in_time).
+        for i in 0..batch_size {
+            let key_str = format!("batch2-{i:04}");
+            let result = restored.read(&tid, &make_key(&key_str)).unwrap();
+            assert!(
+                result.is_none(),
+                "batch2 row '{key_str}' must NOT be present after PITR restore to {point_in_time}"
+            );
+        }
+
+        restored.shutdown().unwrap();
+    }
+
+    /// E4 (fast): Commit-log replay PITR — 100 rows pre-snapshot + 100 rows
+    /// post-snapshot.  Runs in default CI.  Validates the replay code path
+    /// without the runtime overhead of the full 1 000+1 000 spec requirement.
+    ///
+    /// For the spec-mandated 1 000+1 000 test see
+    /// [`e4_slow_pitr_commit_log_replay_1k_plus_1k`].
+    #[test]
+    fn e4_pitr_commit_log_replay_to_point_in_time() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_pitr_replay_e2e(100));
+    }
+
+    /// E4 (slow): Commit-log replay PITR — spec acceptance criterion #2
+    /// mandates exactly 1 000 pre-snapshot rows and 1 000 post-snapshot rows.
+    ///
+    /// Gated with `#[ignore]` because the archiver poll loop and 2 000
+    /// individual commit-log writes with a 256-byte segment size take ~60–90 s
+    /// on a typical CI runner.  Run explicitly with:
+    ///
+    /// ```sh
+    /// cargo test -p ferrosa-storage -- --ignored e4_slow_pitr_commit_log_replay_1k_plus_1k
+    /// ```
+    ///
+    /// Uses the identical code path as the fast 100-row variant; only the row
+    /// count differs.
+    #[test]
+    #[ignore = "slow: 2 000 commit-log writes + archiver poll; run explicitly to satisfy spec criterion #2"]
+    fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_pitr_replay_e2e(1_000));
     }
 
     /// FM1/FM8: Archiver SHA-256 verification — archived segment data in S3
