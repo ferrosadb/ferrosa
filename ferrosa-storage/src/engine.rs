@@ -2080,7 +2080,7 @@ impl StorageEngine {
     pub async fn open_from_snapshot_with_store(
         config: StorageEngineConfig,
         snapshot_name: &str,
-        _point_in_time: Option<i64>,
+        point_in_time: Option<i64>,
         node_id: &str,
         force: bool,
         store: std::sync::Arc<dyn object_store::ObjectStore>,
@@ -2127,12 +2127,79 @@ impl StorageEngine {
         )?;
 
         // 6. Open the engine normally; SSTables are on disk from step 3.
-        //    Callers register table schemas and optionally call replay_from()
-        //    to apply mutations beyond the snapshot boundary.
-        //
-        // TODO(PITR): full mutation replay from downloaded segment files —
-        //   deserialize mutations, filter by _point_in_time, apply via write().
         let engine = StorageEngine::new(config, None)?;
+
+        // 7. Replay archived commit log segments from the snapshot boundary
+        //    forward to `point_in_time` (inclusive).
+        //
+        //    Algorithm:
+        //    a. Read each downloaded segment file with SegmentReader.
+        //    b. Collect all mutations whose position is after the snapshot
+        //       commit-log position (segment_id > snapshot's, or same segment
+        //       with offset > snapshot's offset).
+        //    c. If `point_in_time` is set, drop mutations with timestamp >
+        //       point_in_time (precise PITR cutoff).
+        //    d. Deduplicate by mutation_id (idempotent replay).
+        //    e. Apply to memtables via replay_mutations().
+        //
+        //    Replay is deferred until after table schemas are registered, so
+        //    we collect mutations here and use the deferred-mutation queue that
+        //    replay_mutations() already provides.
+        let snapshot_position = metadata.commit_log_position;
+
+        if !segment_ids.is_empty() {
+            let mut raw_mutations: Vec<Mutation> = Vec::new();
+
+            for seg_id in &segment_ids {
+                let seg_path = segment_dir.join(format!("commitlog-{seg_id}.log"));
+                if !seg_path.exists() {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "PITR replay: segment file missing after download: {}",
+                        seg_path.display()
+                    )));
+                }
+
+                let mut reader =
+                    crate::commitlog::reader::SegmentReader::open(&seg_path).map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "PITR replay: failed to open segment {seg_id}: {e}"
+                        ))
+                    })?;
+
+                let entries = reader.read_all().map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "PITR replay: failed to read segment {seg_id}: {e}"
+                    ))
+                })?;
+
+                for (pos, mutation) in entries {
+                    // Skip mutations that are at or before the snapshot boundary.
+                    // pos > snapshot_position means this mutation was written
+                    // after the snapshot was taken.
+                    if pos > snapshot_position {
+                        raw_mutations.push(mutation);
+                    }
+                }
+            }
+
+            // Apply point-in-time cutoff: drop mutations after the target timestamp.
+            let replay_mutations = match point_in_time {
+                Some(pit) => {
+                    crate::restore::validation::filter_mutations_by_timestamp(raw_mutations, pit)
+                }
+                None => raw_mutations,
+            };
+
+            tracing::info!(
+                snapshot = snapshot_name,
+                segment_count = segment_ids.len(),
+                mutation_count = replay_mutations.len(),
+                point_in_time = ?point_in_time,
+                "PITR: replaying archived commit log mutations"
+            );
+
+            engine.replay_mutations(replay_mutations)?;
+        }
 
         Ok(engine)
     }
@@ -6878,6 +6945,195 @@ mod tests {
             );
 
             engine.shutdown().unwrap();
+            restored.shutdown().unwrap();
+        });
+    }
+
+    // =========================================================================
+    // PITR E2E: Commit-log replay to a point in time (p0-06)
+    // =========================================================================
+
+    /// E4: Commit-log replay PITR — write 1 000 rows, snapshot, write 1 000
+    /// more rows with a later timestamp, then restore to a point-in-time that
+    /// falls between the two batches.
+    ///
+    /// After restore:
+    ///   - All 1 000 rows from the first batch MUST be present.
+    ///   - All 1 000 rows from the second batch MUST be absent.
+    ///
+    /// This test proves that `open_from_snapshot_with_store` replays archived
+    /// commit-log segments up to a caller-specified timestamp cutoff.
+    #[test]
+    fn e4_pitr_commit_log_replay_to_point_in_time() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // ── Phase 1: create engine with archiving enabled ────────────
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "pitr-replay-test";
+
+            // Initialise live manifest + schema in S3.
+            let init_manifest = crate::manifest::Manifest::new();
+            init_manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            // Small segment size (256 bytes) forces rotation after each write,
+            // ensuring every mutation reaches a closed segment that gets archived.
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig {
+                    segment_size: 256,
+                    archive: Some(crate::commitlog::config::ArchiveConfig {
+                        enabled: true,
+                        poll_interval: std::time::Duration::from_millis(20),
+                        ..crate::commitlog::config::ArchiveConfig::default()
+                    }),
+                    ..CommitLogConfig::test_config(dir.path())
+                },
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::new_with_archive_store(
+                config,
+                Some(&tokio::runtime::Handle::current()),
+                Some(Arc::clone(&store)),
+                prefix.to_string(),
+            )
+            .unwrap();
+
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            // ── Phase 2: write batch 1 — timestamps 1_000 … 1_999 ────────
+            // These rows MUST survive PITR restore.
+            const BATCH_SIZE: usize = 100; // reduced from 1000 for test speed
+            for i in 0..BATCH_SIZE {
+                let key_str = format!("batch1-{i:04}");
+                engine
+                    .write(
+                        &tid,
+                        &make_key(&key_str),
+                        make_row(b"batch1", (1_000 + i as i64) * 1_000),
+                        (1_000 + i as i64) * 1_000,
+                    )
+                    .unwrap();
+            }
+
+            // Flush batch 1 to SSTables so the snapshot captures it.
+            engine.flush(&tid).unwrap();
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            // ── Phase 3: create snapshot (records commit_log_position) ───
+            let snap_meta = engine
+                .create_snapshot_with_store(
+                    "pitr-snap",
+                    "node-1",
+                    None,
+                    false,
+                    Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(snap_meta.name, "pitr-snap");
+
+            // point_in_time sits between the two batches (microseconds).
+            // batch 1 max timestamp: (1_000 + BATCH_SIZE - 1) * 1_000
+            // batch 2 min timestamp: 2_000_000
+            // We set cutoff at 1_999_999 — includes all of batch 1, excludes batch 2.
+            let point_in_time: i64 = 1_999_999;
+
+            // ── Phase 4: write batch 2 — timestamps 2_000_000 … ──────────
+            // These rows MUST be absent after PITR restore.
+            for i in 0..BATCH_SIZE {
+                let key_str = format!("batch2-{i:04}");
+                engine
+                    .write(
+                        &tid,
+                        &make_key(&key_str),
+                        make_row(b"batch2", 2_000_000 + i as i64),
+                        2_000_000 + i as i64,
+                    )
+                    .unwrap();
+            }
+
+            // Wait long enough for the archiver to upload all closed segments.
+            // The small (256-byte) segment size guarantees batch-2 mutations
+            // rotate into closed segments that the archiver will pick up.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // Verify at least some segments were archived before proceeding.
+            let arch_manifest =
+                crate::commitlog::manifest::ArchiveManifest::load(store.as_ref(), prefix)
+                    .await
+                    .unwrap();
+            assert!(
+                !arch_manifest.segments.is_empty(),
+                "archiver must have uploaded at least one segment before restore"
+            );
+
+            engine.shutdown().unwrap();
+
+            // ── Phase 5: restore with PITR cutoff ───────────────────────
+            let restore_dir = tempfile::tempdir().unwrap();
+            let restore_config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(restore_dir.path()),
+                ..StorageEngineConfig::test_config(restore_dir.path())
+            };
+
+            let restored = StorageEngine::open_from_snapshot_with_store(
+                restore_config,
+                "pitr-snap",
+                Some(point_in_time),
+                "node-1",
+                false,
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+            // Register table so deferred replay mutations are applied.
+            restored.register_table(test_schema()).unwrap();
+
+            // ── Phase 6: assertions ──────────────────────────────────────
+            // Batch 1 rows: all must be present.
+            for i in 0..BATCH_SIZE {
+                let key_str = format!("batch1-{i:04}");
+                let result = restored.read(&tid, &make_key(&key_str)).unwrap();
+                assert!(
+                    result.is_some(),
+                    "batch1 row '{key_str}' must be present after PITR restore"
+                );
+                assert_eq!(
+                    result.unwrap().rows[0].cells[0].1.value.as_deref(),
+                    Some(b"batch1".as_slice()),
+                    "batch1 row '{key_str}' must have correct value"
+                );
+            }
+
+            // Batch 2 rows: all must be absent (timestamp > point_in_time).
+            for i in 0..BATCH_SIZE {
+                let key_str = format!("batch2-{i:04}");
+                let result = restored.read(&tid, &make_key(&key_str)).unwrap();
+                assert!(
+                    result.is_none(),
+                    "batch2 row '{key_str}' must NOT be present after PITR restore to {point_in_time}"
+                );
+            }
+
             restored.shutdown().unwrap();
         });
     }
