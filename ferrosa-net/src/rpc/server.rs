@@ -113,27 +113,72 @@ impl RpcServer {
             data_rt.spawn(async move {
                 match TcpListener::bind(bind_addr).await {
                     Ok(listener) => {
-                        let addr = listener.local_addr().unwrap();
-                        let _ = bound_addr_tx.send(Some(addr));
+                        let addr = match listener.local_addr() {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                tracing::error!(%e, "failed to read local_addr after bind");
+                                // Best-effort signal — the parent's rx.changed()
+                                // will return Err and surface as StartupFailed.
+                                if bound_addr_tx.send(None).is_err() {
+                                    tracing::error!(
+                                        "bound_addr receiver dropped before failure could be reported"
+                                    );
+                                }
+                                return;
+                            }
+                        };
+                        if let Err(e) = bound_addr_tx.send(Some(addr)) {
+                            // Receiver gone — parent gave up before bind completed.
+                            // Continue serving anyway (some other peer may still
+                            // connect), but loudly record the lost notification
+                            // so a confused parent caller is observable.
+                            tracing::error!(
+                                %addr,
+                                error = %e,
+                                "bound_addr receiver dropped; caller will see StartupFailed"
+                            );
+                        }
                         tracing::info!(%addr, "internode server listening (data runtime)");
                         server.accept_loop(listener, tls_acceptor).await;
                     }
                     Err(e) => {
                         tracing::error!(%e, "failed to bind internode server");
+                        // Notify the waiting caller so it doesn't hang forever.
+                        if bound_addr_tx.send(None).is_err() {
+                            tracing::error!(
+                                "bound_addr receiver dropped before bind error could be reported"
+                            );
+                        }
                     }
                 }
             });
-            // Wait for the bind to complete
+            // Wait for the bind to complete (either Some(addr) or None on failure).
             let mut rx = self.bound_addr_rx.clone();
-            rx.changed()
-                .await
-                .map_err(|_| NetError::Protocol("bound_addr channel closed".into()))?;
-            let addr = *rx.borrow_and_update();
-            Ok(addr.unwrap())
+            rx.changed().await.map_err(|_| {
+                NetError::StartupFailed("bound_addr channel closed before bind completed".into())
+            })?;
+            let bound = *rx.borrow_and_update();
+            match bound {
+                Some(addr) => Ok(addr),
+                None => Err(NetError::StartupFailed(
+                    "internode server failed to bind (see logs)".into(),
+                )),
+            }
         } else {
             let listener = TcpListener::bind(bind_addr).await?;
             let addr = listener.local_addr()?;
-            let _ = self.bound_addr.send(Some(addr));
+            // No external waiter on this branch — bound_addr is updated for any
+            // future subscribers and to keep the watch state coherent. If the
+            // send fails it means no subscribers existed yet, which is benign
+            // here (Ok(addr) is returned synchronously below). Log so the
+            // event is still observable.
+            if let Err(e) = self.bound_addr.send(Some(addr)) {
+                tracing::debug!(
+                    %addr,
+                    error = %e,
+                    "bound_addr update had no subscribers (synchronous start path)"
+                );
+            }
             tracing::info!(%addr, "internode server listening");
             tokio::spawn(async move { server.accept_loop(listener, tls_acceptor).await });
             Ok(addr)
@@ -681,5 +726,111 @@ mod tests {
             server_recv > 0,
             "server bytes_received should be > 0, got {server_recv}"
         );
+    }
+
+    /// P0-07: bind on an unavailable port returns NetError::StartupFailed,
+    /// not a hang or a Protocol error. The synchronous start branch
+    /// (no data_runtime) surfaces the I/O error directly via `?`.
+    #[tokio::test]
+    async fn bind_failure_returns_startup_or_io_error_sync_path() {
+        // Hold a listener on a real port, then try to bind to the same port.
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked_addr = blocker.local_addr().unwrap();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let config = NetConfig {
+            bind_addr: blocked_addr,
+            ..NetConfig::default()
+        };
+        let server = Arc::new(RpcServer::new(config, uuid::Uuid::new_v4(), registry));
+
+        let res = server.start_and_get_addr().await;
+        assert!(
+            res.is_err(),
+            "binding to an in-use port should fail, got: {res:?}"
+        );
+        // Sync path: I/O error from TcpListener::bind propagates as NetError::Io.
+        match res {
+            Err(NetError::Io(_)) | Err(NetError::StartupFailed(_)) => {}
+            other => panic!("expected Io or StartupFailed, got {other:?}"),
+        }
+        drop(blocker);
+    }
+
+    /// P0-07: end-to-end check that two nodes can connect over the new code
+    /// path — minimum multinode (pair) coverage so the bind-notification +
+    /// alive-channel changes are exercised against a live peer.
+    #[tokio::test]
+    async fn pair_nodes_handshake_and_round_trip() {
+        struct EchoPing;
+        #[async_trait::async_trait]
+        impl RpcHandler for EchoPing {
+            async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+                match msg {
+                    Message::Ping { nonce, .. } => Some(Message::Pong {
+                        nonce,
+                        ping_recv_at: 0,
+                        sent_at: 0,
+                    }),
+                    _ => None,
+                }
+            }
+        }
+
+        // Node A and Node B both run the new bind path.
+        let node_a_id = uuid::Uuid::new_v4();
+        let node_b_id = uuid::Uuid::new_v4();
+
+        let mk_server = |node_id| {
+            let registry = Arc::new(HandlerRegistry::new());
+            registry.register(MsgType::Ping, Arc::new(EchoPing));
+            let config = NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                ..NetConfig::default()
+            };
+            (
+                Arc::new(RpcServer::new(config.clone(), node_id, registry)),
+                Arc::new(config),
+            )
+        };
+
+        let (server_a, config_a) = mk_server(node_a_id);
+        let (server_b, _config_b) = mk_server(node_b_id);
+
+        let addr_a = server_a.start_and_get_addr().await.unwrap();
+        let addr_b = server_b.start_and_get_addr().await.unwrap();
+        assert_ne!(addr_a, addr_b);
+
+        // A → B
+        let client_ab = crate::rpc::client::RpcClient::connect(config_a.clone(), node_a_id, addr_b)
+            .await
+            .unwrap();
+        let resp = client_ab
+            .send(
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                crate::codec::Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 1, .. }));
+
+        // B → A (proves the bind-notification path on both sides delivered).
+        let client_ba = crate::rpc::client::RpcClient::connect(config_a, node_b_id, addr_a)
+            .await
+            .unwrap();
+        let resp = client_ba
+            .send(
+                Message::Ping {
+                    nonce: 2,
+                    sent_at: 0,
+                },
+                crate::codec::Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 2, .. }));
     }
 }

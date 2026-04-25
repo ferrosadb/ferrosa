@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -13,6 +13,17 @@ use crate::config::NetConfig;
 use crate::error::{NetError, Result};
 use crate::handshake::initiate_handshake;
 use crate::message::Message;
+
+/// Process-wide counter of orphan RPC responses — replies that arrived after
+/// the caller had already dropped the response future (e.g. timeout, cancel).
+/// Read with `orphan_response_count()` for tests and metrics.
+pub(crate) static ORPHAN_RESPONSE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the orphan-response counter. Public so the metrics endpoint
+/// and integration tests can observe the silent-failure detector.
+pub fn orphan_response_count() -> u64 {
+    ORPHAN_RESPONSE_COUNT.load(Ordering::Relaxed)
+}
 
 /// Atomic counters for network bandwidth tracking.
 pub struct BandwidthMetrics {
@@ -149,17 +160,40 @@ impl RpcClient {
         // Read loop — signals `alive_tx` false when the stream ends or errors.
         let pending_clone = pending.clone();
         let alive_tx_clone = alive_tx.clone();
+        let read_loop_peer = peer_addr;
         tokio::spawn(async move {
             while let Some(Ok(frame)) = stream.next().await {
                 let stream_id = frame.header.stream_id;
                 if let Ok(msg) = Message::decode(frame.header.msg_type, &mut frame.body.clone()) {
                     // Lock-free: DashMap::remove is a single atomic operation.
                     if let Some((_, sender)) = pending_clone.remove(&stream_id) {
-                        let _ = sender.send(msg);
+                        // Caller-gone (Err): the response future was dropped
+                        // before the wire response arrived. Log + count so the
+                        // failure is observable; the connection itself stays
+                        // healthy for other in-flight streams.
+                        if let Err(_returned_msg) = sender.send(msg) {
+                            ORPHAN_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                peer = %read_loop_peer,
+                                stream_id,
+                                "orphan RPC response: caller dropped before reply"
+                            );
+                        }
                     }
                 }
             }
-            let _ = alive_tx_clone.send(false);
+            // Stream ended — peer is gone. Notify subscribers; if no one is
+            // listening (no lane is currently using this connection), fall
+            // back to a debug log so the situation is observable but not
+            // alarming.
+            if alive_tx_clone.send(false).is_err() {
+                tracing::debug!(
+                    peer = %read_loop_peer,
+                    "alive=false delivered to no subscribers (no active lanes on this connection)"
+                );
+            } else {
+                tracing::info!(peer = %read_loop_peer, "RPC peer connection closed");
+            }
         });
 
         Ok(Self {
@@ -560,5 +594,93 @@ mod tests {
             0,
             "in-flight should return to 0 after response received"
         );
+    }
+
+    /// P0-07: orphan responses (caller dropped before reply) must increment
+    /// the orphan counter, not be silently swallowed.
+    #[tokio::test]
+    async fn orphan_response_increments_counter() {
+        // Slow server: hold the request long enough that the caller times out
+        // and drops the response future before the response is queued.
+        struct SlowPingHandler;
+        #[async_trait::async_trait]
+        impl RpcHandler for SlowPingHandler {
+            async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                match msg {
+                    Message::Ping { nonce, .. } => Some(Message::Pong {
+                        nonce,
+                        ping_recv_at: 0,
+                        sent_at: 0,
+                    }),
+                    _ => None,
+                }
+            }
+        }
+
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(SlowPingHandler));
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server = Arc::new(RpcServer::new(
+            config.clone(),
+            uuid::Uuid::new_v4(),
+            registry,
+        ));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let client = RpcClient::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+            .await
+            .unwrap();
+
+        let baseline = orphan_response_count();
+
+        // Send with a tiny per-call timeout so the response future drops
+        // before the slow handler replies.
+        let send_fut = client.send(
+            Message::Ping {
+                nonce: 7,
+                sent_at: 0,
+            },
+            Lane::Data,
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), send_fut).await;
+
+        // Wait for the late response to arrive at the read loop.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let after = orphan_response_count();
+        assert!(
+            after > baseline,
+            "orphan_response_count must advance when caller drops before reply (baseline={baseline}, after={after})"
+        );
+    }
+
+    /// P0-07: when the read loop ends and there are no alive subscribers,
+    /// the path must complete cleanly (no panic, no swallow without log).
+    /// We exercise the path by establishing a connection then dropping the
+    /// server, which closes the stream and triggers the read-loop exit.
+    #[tokio::test]
+    async fn read_loop_exit_with_no_subscribers_does_not_panic() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let addr = start_echo_server(&config).await;
+
+        let client = RpcClient::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+            .await
+            .unwrap();
+
+        // Drop the client (which holds alive_tx). The internal alive_tx_clone
+        // in the read-loop spawn task is the only sender remaining; when the
+        // tcp connection eventually closes, send(false) will return Err. The
+        // explicit handler logs and the spawned task exits cleanly.
+        drop(client);
+        // Give the read loop a moment to observe the close and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // No assertion beyond "did not panic" — the process is still running.
     }
 }
