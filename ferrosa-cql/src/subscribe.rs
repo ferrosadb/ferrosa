@@ -414,7 +414,6 @@ mod tests {
             topology_policy: crate::topology::ClientTopologyPolicy::default(),
             auth_warn: false,
             peer_manager: None,
-            accord_replica_ids: vec![],
             accord_clock: None,
         };
 
