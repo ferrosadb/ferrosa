@@ -412,15 +412,36 @@ fn test_raft_config() -> Arc<Config> {
     )
 }
 
-/// Spin up 3 in-process openraft nodes sharing `router`.
+/// Production-cadence config — matches the post-bulk-write-fix deployment.
+///
+/// election_timeout_min = 3000 ms mirrors `bug-bulk-write-raft-starvation.md`
+/// P2 fix.  heartbeat_interval is scaled proportionally.
+fn prod_cadence_raft_config() -> Arc<Config> {
+    Arc::new(
+        Config {
+            heartbeat_interval: 500,
+            election_timeout_min: 3_000,
+            election_timeout_max: 6_000,
+            snapshot_policy: SnapshotPolicy::LogsSinceLast(10),
+            ..Config::default()
+        }
+        .validate()
+        .expect("prod cadence raft config"),
+    )
+}
+
+/// Spin up 3 in-process openraft nodes sharing `router` using `cfg`.
 ///
 /// Returns `(node1, node2, node3)`.  node1 is the seed and calls
 /// `initialize()`; the cluster elects a leader before returning.
-async fn build_3_node_cluster(
+///
+/// The `leader_wait_secs` parameter controls how long to wait for an initial
+/// leader — use a longer value when `election_timeout_min` is large.
+async fn build_3_node_cluster_with_config(
     router: InProcessRouter,
+    cfg: Arc<Config>,
+    leader_wait_secs: u64,
 ) -> (Arc<TestRaft>, Arc<TestRaft>, Arc<TestRaft>) {
-    let cfg = test_raft_config();
-
     macro_rules! make_node {
         ($id:expr) => {{
             let id: u64 = $id;
@@ -465,20 +486,29 @@ async fn build_3_node_cluster(
     );
     n1.initialize(members).await.expect("cluster init failed");
 
-    // Wait for leader (up to 15 s).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Wait for leader.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(leader_wait_secs);
     loop {
         if n1.current_leader().await.is_some() {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no leader within 15s"
+            "no leader within {leader_wait_secs}s"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     (n1, n2, n3)
+}
+
+/// Spin up 3 in-process openraft nodes using the fast test config.
+///
+/// Thin wrapper around [`build_3_node_cluster_with_config`].
+async fn build_3_node_cluster(
+    router: InProcessRouter,
+) -> (Arc<TestRaft>, Arc<TestRaft>, Arc<TestRaft>) {
+    build_3_node_cluster_with_config(router, test_raft_config(), 15).await
 }
 
 /// Wait for a leader to emerge among node1/node2 only (not node3).
@@ -815,6 +845,183 @@ async fn election_storm_recovery_metric_increments() {
         node3_final_term <= leader_final_term + 2,
         "after guard: node3 term ({node3_final_term}) still far above leader \
          ({leader_final_term}) — guard suppression did not hold"
+    );
+
+    n1.shutdown().await.ok();
+    n2.shutdown().await.ok();
+    n3.shutdown().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — P0-19: production-cadence storm (election_timeout_min = 3000 ms)
+// ---------------------------------------------------------------------------
+
+/// The rolling-window detector must fire on a storm driven at production
+/// cadence (`election_timeout_min = 3000 ms`), where per-poll term delta is
+/// 0 or 1 — well below the burst detector's threshold of > 1.
+///
+/// ## Why the existing tests don't cover this
+///
+/// Tests 1 and 2 use `election_timeout_min = 200 ms` and start the guard
+/// AFTER 2.5 s of accumulated storm, so the guard's seed `prev_term=0`
+/// produces a huge first-poll delta that trips the burst path immediately.
+/// In production, the guard is started at node startup (before any storm),
+/// so each 1-second poll window sees only the incremental term delta — 0 or
+/// 1 per window, never ≥ 2.
+///
+/// ## Test strategy
+///
+/// 1. Build the cluster with `prod_cadence_raft_config` (election_timeout_min
+///    = 3000 ms, heartbeat = 500 ms).
+/// 2. Create a log gap and trigger a storm on node3.
+/// 3. Start the guard IMMEDIATELY (before the storm runs), seeding it from
+///    the current term so it observes real incremental per-poll deltas.
+/// 4. Assert the guard fires within 60 s.
+///
+/// ## Pre-fix behavior (proves the bug)
+///
+/// Against the original `term_delta > TERM_JUMP_THRESHOLD` (burst-only)
+/// implementation, this test FAILS because per-poll delta at 3000 ms cadence
+/// is at most 1, never > 1, so `ELECTION_STORM_TERM_JUMPS_TOTAL` stays 0.
+///
+/// ## Post-fix behavior
+///
+/// The rolling-window detector accumulates ≥ 2 term jumps over 30 s and
+/// fires suppression.  `ELECTION_STORM_TERM_JUMPS_TOTAL` reaches ≥ 1 within
+/// 60 s of storm onset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn election_storm_guard_fires_at_production_cadence() {
+    ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);
+
+    let router = InProcessRouter::new();
+
+    // Use production-cadence config: election_timeout_min = 3000 ms.
+    // leader_wait_secs = 30 to allow the first election to complete.
+    let (n1, n2, n3) =
+        build_3_node_cluster_with_config(router.clone(), prod_cadence_raft_config(), 30).await;
+
+    // Ensure a non-node3 leader.
+    let leader = ensure_non_node3_leader(&n1, &n2, &n3).await;
+    write_entries(&leader, 20).await;
+
+    // Wait for initial convergence on node3 (generous timeout for slow cadence).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let applied = n3
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        if applied >= 10 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial convergence timeout (prod cadence)"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let baseline_term = n3.metrics().borrow().current_term;
+
+    // Build log gap: suppress node3 elections while advancing node1+node2.
+    n3.runtime_config().elect(false);
+    router.block_node3_append.store(true, Ordering::Relaxed);
+    write_entries(&leader, 50).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let leader_log = leader.metrics().borrow().last_log_index.unwrap_or(0);
+    let node3_log_before = n3.metrics().borrow().last_log_index.unwrap_or(0);
+    assert!(
+        node3_log_before < leader_log,
+        "setup: node3 log ({node3_log_before}) should lag leader ({leader_log})"
+    );
+
+    // Start the guard NOW — BEFORE the storm begins.
+    //
+    // This is the key difference from tests 1 and 2.  The guard seeds
+    // prev_term = baseline_term (from current metrics), so each subsequent
+    // 1-second poll window sees only the real incremental per-poll delta
+    // (0 or 1).  The burst detector's `term_delta > 1` path will never fire.
+    // Only the rolling-window detector can catch this storm.
+    let guard_cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let guard_raft = n3.clone();
+        let guard_cancel2 = guard_cancel.clone();
+        tokio::spawn(async move {
+            run_election_guard(guard_raft, guard_cancel2, 3_000).await;
+        });
+    }
+
+    // Trigger the storm: re-enable node3 elections with stale log.
+    // Block outgoing votes so node1/node2 are isolated from node3's term.
+    router
+        .block_node3_outgoing_votes
+        .store(true, Ordering::Relaxed);
+    n3.runtime_config().elect(true);
+
+    // Wait for the rolling-window detector to fire.
+    //
+    // At election_timeout_min=3000ms, one election per ~3–6 s.
+    // Two elections (ROLLING_WINDOW_MIN_JUMPS=2) take ≤ 12 s.
+    // Add ROLLING_WINDOW_MS (30 s) for the window to accumulate.
+    // Total expected: ≤ 42 s.  Budget: 60 s.
+    //
+    // P0-19: without the rolling-window fix this assertion FAILS because
+    // ELECTION_STORM_TERM_JUMPS_TOTAL stays 0 for the full 60 s.
+    let storm_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let jumps = election_storm_term_jumps_total();
+        if jumps >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < storm_deadline,
+            "P0-19: rolling-window detector did not fire within 60 s at \
+             election_timeout_min=3000ms — ELECTION_STORM_TERM_JUMPS_TOTAL still 0; \
+             baseline_term={baseline_term} node3_term={}",
+            n3.metrics().borrow().current_term,
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Unblock replication so node3 can converge.
+    router
+        .block_node3_outgoing_votes
+        .store(false, Ordering::Relaxed);
+    router.block_node3_append.store(false, Ordering::Relaxed);
+
+    // Wait for node3 to catch up (generous: snapshot transfer at slow cadence).
+    let converge_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let node3_log = n3.metrics().borrow().last_log_index.unwrap_or(0);
+        if node3_log >= leader_log {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < converge_deadline,
+            "node3 did not converge within 90 s: node3_log={node3_log} target={leader_log}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    guard_cancel.cancel();
+
+    let node3_final_term = n3.metrics().borrow().current_term;
+    let leader_final_term = leader.metrics().borrow().current_term;
+
+    // After suppression + convergence, node3's term must be close to the cluster.
+    assert!(
+        node3_final_term <= leader_final_term + 3,
+        "P0-19: node3 term ({node3_final_term}) still far above leader \
+         ({leader_final_term}) — rolling-window suppression did not hold"
+    );
+
+    let final_jumps = election_storm_term_jumps_total();
+    assert!(
+        final_jumps >= 1,
+        "P0-19: expected ELECTION_STORM_TERM_JUMPS_TOTAL >= 1, got {final_jumps}"
     );
 
     n1.shutdown().await.ok();
