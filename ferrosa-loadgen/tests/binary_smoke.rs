@@ -24,7 +24,6 @@ fn cargo_bin() -> Command {
 }
 
 #[test]
-#[ignore = "requires FERROSA_TEST_LOADGEN=1; spawns cargo run subprocess (takes minutes)"]
 fn binary_list_profiles() {
     require_loadgen_binary();
     let output = cargo_bin()
@@ -44,7 +43,6 @@ fn binary_list_profiles() {
 }
 
 #[test]
-#[ignore = "requires FERROSA_TEST_LOADGEN=1; spawns cargo run subprocess (takes minutes)"]
 fn binary_help() {
     require_loadgen_binary();
     let output = cargo_bin()
@@ -66,7 +64,6 @@ fn binary_help() {
 }
 
 #[test]
-#[ignore = "requires FERROSA_TEST_LOADGEN=1; spawns cargo run subprocess (takes minutes)"]
 fn binary_short_load_test() {
     require_loadgen_binary();
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -140,7 +137,6 @@ fn binary_short_load_test() {
 }
 
 #[test]
-#[ignore = "requires FERROSA_TEST_LOADGEN=1; spawns cargo run subprocess (takes minutes)"]
 fn binary_write_heavy_no_resource_abort() {
     require_loadgen_binary();
     let dir = tempfile::tempdir().expect("create temp dir");

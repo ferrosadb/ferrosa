@@ -194,7 +194,6 @@ fn ensure_cluster_ready() {
 
 /// Test 1: Write entity, rolling restart, verify entity survives.
 #[test]
-#[ignore = "requires Docker daemon + docker-compose for Jepsen-style mini-cluster (run via scripts/test-cluster-up.sh)"]
 fn write_survives_rolling_restart() {
     require_container_cluster();
     ensure_cluster_ready();
@@ -219,7 +218,6 @@ fn write_survives_rolling_restart() {
 /// Test 2: Write entity, kill node1 (SIGKILL — no graceful shutdown),
 /// restart, verify entity is lost (expected with SIGKILL).
 #[test]
-#[ignore = "requires Docker daemon + docker-compose for Jepsen-style mini-cluster (run via scripts/test-cluster-up.sh)"]
 fn write_lost_on_sigkill() {
     require_container_cluster();
     ensure_cluster_ready();
@@ -252,7 +250,6 @@ fn write_lost_on_sigkill() {
 
 /// Test 3: Write entity, pause node1 (network partition), unpause, verify consistency.
 #[test]
-#[ignore = "requires Docker daemon + docker-compose for Jepsen-style mini-cluster (run via scripts/test-cluster-up.sh)"]
 fn pause_unpause_preserves_data() {
     require_container_cluster();
     ensure_cluster_ready();
@@ -281,7 +278,6 @@ fn pause_unpause_preserves_data() {
 /// Test 4: Write multiple entities rapidly, rolling restart mid-write,
 /// verify all acknowledged writes are present after restart.
 #[test]
-#[ignore = "requires Docker daemon + docker-compose for Jepsen-style mini-cluster (run via scripts/test-cluster-up.sh)"]
 fn rapid_writes_during_rolling_restart() {
     require_container_cluster();
     ensure_cluster_ready();
@@ -324,7 +320,6 @@ fn rapid_writes_during_rolling_restart() {
 
 /// Test 5: Verify S3 has manifest and SSTables after a flush cycle.
 #[test]
-#[ignore = "requires Docker daemon + docker-compose for Jepsen-style mini-cluster (run via scripts/test-cluster-up.sh)"]
 fn s3_contains_manifest_and_sstables() {
     require_container_cluster();
 

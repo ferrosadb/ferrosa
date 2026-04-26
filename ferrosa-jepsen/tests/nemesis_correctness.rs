@@ -31,7 +31,6 @@ fn require_cluster_env() -> TestClusterEnv {
 }
 
 #[tokio::test]
-#[ignore = "container-gated nemesis test — requires Docker daemon + cluster"]
 async fn disk_fail_no_phantom_commits() {
     let env = require_cluster_env();
 
@@ -80,7 +79,6 @@ async fn disk_fail_no_phantom_commits() {
 }
 
 #[tokio::test]
-#[ignore = "container-gated nemesis test — requires Docker daemon + cluster"]
 async fn packet_reorder_linearizability() {
     let env = require_cluster_env();
 
@@ -126,7 +124,6 @@ async fn packet_reorder_linearizability() {
 }
 
 #[tokio::test]
-#[ignore = "container-gated nemesis test — requires Docker daemon + cluster"]
 async fn lwt_batch_atomicity_all_nemeses() {
     let env = require_cluster_env();
 
@@ -198,7 +195,6 @@ fn mock_ctx_3_nodes() -> NemesisContext {
 /// the Phase 1 registry, inject/heal complete (or fail gracefully on a mock
 /// context), and the nemesis name matches the expected value.
 #[tokio::test]
-#[ignore = "container-gated nemesis test — requires Docker daemon"]
 async fn nemesis_partition_halves_docker() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(
@@ -269,7 +265,6 @@ async fn nemesis_partition_halves_docker() {
 /// Container-gated: verify that the `kill-minority` nemesis is registered in
 /// the Phase 1 registry, and that inject/heal complete without panicking.
 #[tokio::test]
-#[ignore = "container-gated nemesis test — requires Docker daemon"]
 async fn nemesis_kill_minority_docker() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(
@@ -316,7 +311,6 @@ async fn nemesis_kill_minority_docker() {
 /// Container-gated: verify that the `clock-skew-small` nemesis is registered in
 /// the Phase 1 registry, and that inject/heal complete without panicking.
 #[tokio::test]
-#[ignore = "container-gated nemesis test — requires Docker daemon"]
 async fn nemesis_clock_skew_docker() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(

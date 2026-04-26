@@ -4304,7 +4304,6 @@ mod tests {
     /// A flush thread triggers flushes periodically. After all writers stop,
     /// every key must have the value from the highest-timestamp write.
     #[test]
-    #[ignore = "stress test: 8 writer threads + flusher; flaky under workspace parallel load"]
     fn concurrent_writers_with_flushes_preserve_lww() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -7226,7 +7225,6 @@ mod tests {
     /// Uses the identical code path as the fast 100-row variant; only the row
     /// count differs.
     #[test]
-    #[ignore = "slow: 2 000 commit-log writes + archiver poll; run explicitly to satisfy spec criterion #2"]
     fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8565,7 +8563,6 @@ mod tests {
     /// Requires MinIO + Cassandra 5 containers (Docker or Podman).
     /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
-    #[ignore = "requires FERROSA_TEST_CONTAINERS=1; MinIO + Cassandra-5 stack"]
     async fn cassandra_reads_compacted_sstable_from_s3() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
             panic!(
@@ -8868,7 +8865,6 @@ mod tests {
     /// Requires MinIO + Cassandra 5 containers (Docker or Podman).
     /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
-    #[ignore = "requires FERROSA_TEST_CONTAINERS=1; MinIO + Cassandra-5 stack"]
     async fn compaction_end_to_end_pipeline() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
             panic!(
@@ -9983,7 +9979,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "data-loss regression test; requires container stack via scripts/test-cluster-up.sh"]
     async fn write_flush_compact_no_data_loss() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
@@ -10038,7 +10033,6 @@ mod tests {
 
     /// Concurrent writes + flushes + compaction — reproduces the loadgen data loss.
     #[tokio::test]
-    #[ignore = "data-loss regression test; requires container stack via scripts/test-cluster-up.sh"]
     async fn concurrent_write_flush_compact_no_data_loss() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

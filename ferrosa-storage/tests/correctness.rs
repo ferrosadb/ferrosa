@@ -212,7 +212,6 @@ fn commitlog_legacy_zero_id_always_replayed() {
 /// Without a live cluster this test prints a skip notice and returns cleanly.
 /// It does NOT panic — only the actual ordering assertion requires the cluster.
 #[tokio::test]
-#[ignore = "requires live Accord cluster (FERROSA_TEST_CLUSTER_NODES)"]
 async fn dep_wait_ordering_under_partition() {
     if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
         && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()

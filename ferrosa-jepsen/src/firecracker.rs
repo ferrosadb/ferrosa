@@ -323,7 +323,6 @@ mod tests {
     /// Requires Firecracker binary, root privileges, and a built rootfs.
     /// Set FERROSA_TEST_FIRECRACKER=1 to run (see scripts/lima-fc-setup.sh).
     #[tokio::test]
-    #[ignore = "requires FERROSA_TEST_FIRECRACKER=1 and firecracker binary (Linux/Lima)"]
     async fn provision_single_vm() {
         if std::env::var("FERROSA_TEST_FIRECRACKER").is_err() {
             panic!(

@@ -1,0 +1,32 @@
+# Wave 3 compose override: use pre-built image for all nodes.
+# Avoids 3x parallel build consuming disk space.
+#
+# Usage (with base + podman overrides):
+#   podman compose \
+#     -f tests/docker-compose.cluster.yml \
+#     -f tests/docker-compose.cluster.podman.yml \
+#     -f tests/docker-compose.cluster.w3.yml \
+#     --project-name ferrosa-test-w3 \
+#     --profile trio \
+#     up -d
+
+services:
+  node1:
+    image: localhost/ferrosa-node-w3:latest
+    build: !reset null
+
+  node2:
+    image: localhost/ferrosa-node-w3:latest
+    build: !reset null
+
+  node3:
+    image: localhost/ferrosa-node-w3:latest
+    build: !reset null
+
+  node4:
+    image: localhost/ferrosa-node-w3:latest
+    build: !reset null
+
+  node5:
+    image: localhost/ferrosa-node-w3:latest
+    build: !reset null

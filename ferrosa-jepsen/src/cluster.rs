@@ -218,7 +218,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER"]
     async fn provision_t1_cluster() {
         if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
             && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()

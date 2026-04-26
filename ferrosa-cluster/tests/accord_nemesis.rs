@@ -496,7 +496,6 @@ async fn run_batch_atomicity_round(nemesis_name: &str) {
 /// returns a configurable error rate. Tracked in:
 ///   `ferrosa_docs/specs/todo/p0-09-jepsen-tests-todo.md` (disk_fail residual).
 #[tokio::test]
-#[ignore = "disk-fail nemesis requires live cluster (FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER)"]
 async fn disk_fail_no_phantom_commits() {
     let cluster_nodes = std::env::var("FERROSA_TEST_CLUSTER_NODES").ok();
     let firecracker = std::env::var("FERROSA_TEST_FIRECRACKER").ok();

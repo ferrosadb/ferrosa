@@ -89,7 +89,6 @@ fn smoke_tier_config_produces_combinations() {
 /// Run with:
 ///   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test smoke_tier smoke_tier_end_to_end -- --nocapture
 #[tokio::test]
-#[ignore = "requires FERROSA_TEST_CONTAINERS=1 + Docker daemon"]
 async fn smoke_tier_end_to_end() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(
