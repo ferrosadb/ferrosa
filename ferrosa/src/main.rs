@@ -698,6 +698,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         topology_policy,
         auth_warn: storage_auth_warn,
+        // Gap 6: PeerManager + replica list wired in production startup.
+        // Until the cluster bootstrap provides these (post Gap 4/5),
+        // LWT falls through to the fail-loud ServerError path.
+        peer_manager: None,
+        accord_replica_ids: vec![],
+        accord_clock: None,
     });
     let auth_disabled = cql_config.auth_disabled;
 

@@ -31,13 +31,15 @@ pub mod state_machine;
 pub mod test_cluster;
 pub mod two_phase_ddl;
 pub mod uda_integration;
+pub(crate) mod wire;
 
 pub use clock::{ClockError, ClockValidator};
 pub use clock_validation::{
     validate_timestamp_drift, ClockDriftRejection, DEFAULT_MAX_CLOCK_DRIFT_NS,
 };
 pub use coordinator::{
-    fast_quorum_size, slow_quorum_size, AccordCoordinator, CoordinatorDecision, CoordinatorPhase,
+    fast_quorum_size, slow_quorum_size, AccordCoordinator, AccordCoordinatorDriver,
+    AccordDriverError, CoordinatorDecision, CoordinatorPhase,
 };
 pub use cross_shard::{CrossShardCoordinator, CrossShardOutcome, ShardId, ShardResult};
 pub use ddl_drain::{DdlDrainGuard, DrainError};

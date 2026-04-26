@@ -26,8 +26,14 @@
 //! it acts as a "leaseholder" — it counts as an implicit PreAccept vote,
 //! reducing the number of remote round-trips needed.
 
-use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use ferrosa_common::accord::{BallotNumber, HybridLogicalClock, Timestamp, TxnId};
+use ferrosa_net::codec::Lane;
+use ferrosa_net::message::Message;
+use ferrosa_net::peer::PeerManager;
 
 // ---------------------------------------------------------------------------
 // Quorum computation
@@ -346,6 +352,299 @@ impl AccordCoordinator {
         let first_deps: HashSet<TxnId> = self.preaccept_responses[0].deps.iter().copied().collect();
         let this_deps: HashSet<TxnId> = deps.iter().copied().collect();
         first_deps == this_deps
+    }
+}
+
+// ===========================================================================
+// AccordCoordinatorDriver — network-aware wrapper for AccordCoordinator
+// ===========================================================================
+
+/// Error from `AccordCoordinatorDriver::run_transaction`.
+#[derive(Debug)]
+pub enum AccordDriverError {
+    /// Too few replicas responded to reach a quorum.
+    QuorumUnavailable,
+    /// Network I/O error communicating with a replica.
+    Network(String),
+    /// Serialization/deserialization failure.
+    Codec(String),
+}
+
+impl std::fmt::Display for AccordDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QuorumUnavailable => write!(f, "Accord quorum unavailable"),
+            Self::Network(e) => write!(f, "Accord network error: {e}"),
+            Self::Codec(e) => write!(f, "Accord codec error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AccordDriverError {}
+
+/// A driver that connects the pure `AccordCoordinator` state machine to real
+/// network I/O via `PeerManager`.
+///
+/// # Protocol
+///
+/// 1. **PreAccept** — fanout to all `replica_ids`, collect `PreAcceptOK`.
+/// 2. Decision: fast path (`FastPathCommit`) or slow path (`NeedAccept`).
+/// 3. **Accept** (slow path only) — fanout to all `replica_ids`, collect `AcceptOK`.
+/// 4. **Commit** — fire-and-forget to all `replica_ids`.
+///
+/// The driver is single-use: one instance per transaction.
+pub struct AccordCoordinatorDriver {
+    coordinator: AccordCoordinator,
+    peers: Arc<PeerManager>,
+    /// IDs of the replicas for this transaction's token range.
+    replica_ids: Vec<uuid::Uuid>,
+}
+
+impl AccordCoordinatorDriver {
+    /// Build a driver for a new transaction.
+    ///
+    /// # Parameters
+    ///
+    /// - `node_id`: this coordinator's node ID.
+    /// - `replica_ids`: UUIDs of all replicas (including self if leaseholder).
+    /// - `peers`: the peer connection manager for RPC fanout.
+    /// - `is_leaseholder`: whether this node is the token-range leaseholder.
+    /// - `clock`: HLC for generating the coordinator timestamp `t0`.
+    /// - `key`: raw partition key bytes.
+    pub fn new(
+        node_id: u64,
+        replica_ids: Vec<uuid::Uuid>,
+        peers: Arc<PeerManager>,
+        is_leaseholder: bool,
+        clock: &HybridLogicalClock,
+        key: Vec<u8>,
+    ) -> Self {
+        let rf = replica_ids.len();
+        assert!(rf > 0, "replica_ids must be non-empty");
+
+        let t0 = clock.now();
+        let txn_id = TxnId::new(node_id, t0);
+
+        let coordinator = AccordCoordinator::new(txn_id, t0, key, node_id, rf, is_leaseholder);
+
+        Self {
+            coordinator,
+            peers,
+            replica_ids,
+        }
+    }
+
+    /// Run the full Accord protocol for this transaction.
+    ///
+    /// Returns the committed `(t, deps)` on success.
+    ///
+    /// # Phase 1 — PreAccept
+    ///
+    /// Send `PreAccept` to all remote replicas in parallel, collect responses,
+    /// feed each to `AccordCoordinator::handle_preaccept_ok`.  Stop as soon as
+    /// a quorum decision (`FastPathCommit` or `NeedAccept`) is reached.
+    ///
+    /// # Phase 2 — Accept (slow path only)
+    ///
+    /// If phase 1 decides `NeedAccept`, send `Accept` to all remote replicas,
+    /// collect `AcceptOK` responses, stop on `SlowPathCommit`.
+    ///
+    /// # Phase 3 — Commit
+    ///
+    /// Broadcast `Commit` to all replicas (fire-and-forget, best-effort).
+    pub async fn run_transaction(
+        &mut self,
+    ) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
+        use crate::accord::wire::{
+            AcceptOkPayload, AcceptPayload, CommitPayload, PreAcceptOkPayload, PreAcceptPayload,
+        };
+
+        let txn_id = self.coordinator.txn_id;
+        let t0 = self.coordinator.t0;
+        let key = self.coordinator.key.clone();
+        let _rf = self.coordinator.rf; // available for future quorum checks
+
+        // ------------------------------------------------------------------
+        // Phase 1: PreAccept fanout
+        // ------------------------------------------------------------------
+
+        let pa_payload = PreAcceptPayload {
+            txn_id,
+            t0,
+            key: key.clone(),
+            ballot: BallotNumber(0),
+            epoch: 0,
+        };
+        let pa_bytes =
+            bincode::serialize(&pa_payload).map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+        let pa_msg = Message::AccordPreAccept(Bytes::from(pa_bytes));
+
+        // Fanout to all replicas in parallel.
+        let futs: Vec<_> = self
+            .replica_ids
+            .iter()
+            .map(|&peer_id| {
+                let peers = Arc::clone(&self.peers);
+                let msg = pa_msg.clone();
+                async move {
+                    peers
+                        .send(peer_id, msg, Lane::Data)
+                        .await
+                        .map(|resp| (peer_id, resp))
+                }
+            })
+            .collect();
+
+        let responses = futures::future::join_all(futs).await;
+
+        let mut decision = CoordinatorDecision::Pending;
+        for result in &responses {
+            match result {
+                Ok((_peer_id, Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
+                    let ok: PreAcceptOkPayload = bincode::deserialize(b)
+                        .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                    let resp = PreAcceptResponse {
+                        from: ok.from,
+                        t: ok.t,
+                        deps: ok.deps,
+                    };
+                    decision = self.coordinator.handle_preaccept_ok(resp);
+                    if decision != CoordinatorDecision::Pending {
+                        break;
+                    }
+                }
+                Ok(_) => {
+                    // Empty or unexpected response — treat as non-vote (skip).
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        txn_id = ?txn_id,
+                        error = %e,
+                        "accord: PreAccept RPC failed (non-fatal, continuing)"
+                    );
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Phase 2: Accept fanout (slow path only)
+        // ------------------------------------------------------------------
+
+        let (commit_t, commit_deps) = match decision {
+            CoordinatorDecision::FastPathCommit { t, ref deps } => (t, deps.clone()),
+            CoordinatorDecision::NeedAccept { t, ref deps } => {
+                // Run the Accept phase with the merged (t, deps).
+                let accept_payload = AcceptPayload {
+                    txn_id,
+                    t0,
+                    t,
+                    deps: deps.iter().copied().collect(),
+                    ballot: BallotNumber(1),
+                };
+                let ac_bytes = bincode::serialize(&accept_payload)
+                    .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                let ac_msg = Message::AccordAccept(Bytes::from(ac_bytes));
+
+                let ac_futs: Vec<_> = self
+                    .replica_ids
+                    .iter()
+                    .map(|&peer_id| {
+                        let peers = Arc::clone(&self.peers);
+                        let msg = ac_msg.clone();
+                        async move { peers.send(peer_id, msg, Lane::Data).await }
+                    })
+                    .collect();
+
+                let ac_responses = futures::future::join_all(ac_futs).await;
+
+                let mut ac_decision = CoordinatorDecision::Pending;
+                for result in &ac_responses {
+                    match result {
+                        Ok(Message::AccordAcceptOK(b)) if !b.is_empty() => {
+                            let ok: AcceptOkPayload = bincode::deserialize(b)
+                                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                            let resp = AcceptResponse {
+                                from: ok.txn_id.0.node, // node ID embedded in txn_id
+                                ballot: BallotNumber(1),
+                                deps: deps.iter().copied().collect(),
+                            };
+                            ac_decision = self.coordinator.handle_accept_ok(resp);
+                            if ac_decision != CoordinatorDecision::Pending {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                txn_id = ?txn_id,
+                                error = %e,
+                                "accord: Accept RPC failed"
+                            );
+                        }
+                    }
+                }
+
+                match ac_decision {
+                    CoordinatorDecision::SlowPathCommit { t: ct, deps: cd } => (ct, cd),
+                    _ => {
+                        // Could not reach Accept quorum.
+                        return Err(AccordDriverError::QuorumUnavailable);
+                    }
+                }
+            }
+            _ => {
+                // Phase 1 never reached a decision — quorum unavailable.
+                return Err(AccordDriverError::QuorumUnavailable);
+            }
+        };
+
+        // ------------------------------------------------------------------
+        // Phase 3: Commit broadcast (fire-and-forget)
+        // ------------------------------------------------------------------
+
+        let commit_payload = CommitPayload {
+            txn_id,
+            t0,
+            t: commit_t,
+            deps: commit_deps.iter().copied().collect(),
+        };
+        if let Ok(commit_bytes) = bincode::serialize(&commit_payload) {
+            let commit_msg = Message::AccordCommit(Bytes::from(commit_bytes));
+            for &peer_id in &self.replica_ids {
+                let peers = Arc::clone(&self.peers);
+                let msg = commit_msg.clone();
+                // Best-effort fire-and-forget: don't block on commit responses.
+                tokio::spawn(async move {
+                    if let Err(e) = peers.fire(peer_id, msg, Lane::Data).await {
+                        tracing::debug!(
+                            ?peer_id,
+                            error = %e,
+                            "accord: Commit fire-and-forget failed (non-fatal)"
+                        );
+                    }
+                });
+            }
+        }
+
+        tracing::info!(
+            txn_id = ?txn_id,
+            t = ?commit_t,
+            deps = ?commit_deps.len(),
+            rtt = self.coordinator.rtt_count(),
+            "accord: transaction committed"
+        );
+
+        Ok((commit_t, commit_deps))
+    }
+
+    /// The transaction ID assigned to this coordinator's transaction.
+    pub fn txn_id(&self) -> TxnId {
+        self.coordinator.txn_id
+    }
+
+    /// Number of round-trips completed (1 for fast path, 2 for slow path).
+    pub fn rtt_count(&self) -> u32 {
+        self.coordinator.rtt_count()
     }
 }
 
