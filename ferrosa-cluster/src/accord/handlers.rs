@@ -16,7 +16,10 @@ use ferrosa_net::message::Message;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 
 use super::state_machine::{AccordStateMachine, SmResponse};
-use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
+use super::wire::{
+    AcceptOkPayload, AcceptPayload, ApplyPayload, CommitPayload, PreAcceptOkPayload,
+    PreAcceptPayload, RecoverPayload,
+};
 
 /// Shared mutable access to the Accord state machine.
 ///
@@ -24,61 +27,6 @@ use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
 /// (Accord's per-shard model). In production this would be sharded
 /// by token range; for now a single lock suffices.
 pub type AccordState = Arc<parking_lot::Mutex<AccordStateMachine>>;
-
-// ---------------------------------------------------------------------------
-// Wire types (bincode-serialized payloads)
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PreAcceptPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    key: Vec<u8>,
-    ballot: BallotNumber,
-    epoch: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PreAcceptOkPayload {
-    from: u64,
-    t: Timestamp,
-    deps: Vec<TxnId>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct AcceptPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    t: Timestamp,
-    deps: Vec<TxnId>,
-    ballot: BallotNumber,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct AcceptOkPayload {
-    txn_id: TxnId,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CommitPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    t: Timestamp,
-    deps: Vec<TxnId>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ApplyPayload {
-    txn_id: TxnId,
-    result_data: Vec<u8>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RecoverPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    ballot: BallotNumber,
-}
 
 // ---------------------------------------------------------------------------
 // AccordHandler — single handler for all 6 inbound Accord message types

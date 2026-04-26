@@ -318,20 +318,24 @@ pub async fn route(
             _ => RoutingMode::Cluster,
         };
         if route_decision(mode, &stmt, ctx.serial_consistency) == RouteDecision::Accord {
-            // Accord routing for LWT (IF NOT EXISTS / IF <condition>) is not yet
-            // implemented. The Accord coordinator state machine exists in
-            // ferrosa-cluster but has no network transport layer — there is no
-            // component that dispatches PreAccept/Accept messages to real remote
-            // nodes. Silently falling through to the CL path would return success
-            // with weaker-than-requested semantics, violating linearizability.
+            // LWT routing to Accord is not yet implemented for CQL-level dispatch.
             //
-            // Per spec p0-03 acceptance criterion #3 and the fail-loud policy:
-            // return a hard error so the client knows the guarantee was not met.
-            // See ferrosa_docs/specs/todo/p0-03b-accord-implementation-gap.md
-            // for the enumerated gap list.
+            // The AccordCoordinatorDriver (p0-03b) is now implemented in
+            // ferrosa-cluster and verified over real RPC in
+            // ferrosa-cluster/tests/accord_lwt_concurrent.rs.
+            //
+            // Remaining work to close Gap 6
+            // (see p0-03b-accord-implementation-gap.md):
+            // - Wire PeerManager + TokenRing into SharedState so the CQL
+            //   layer can construct AccordCoordinatorDriver for LWT dispatch.
+            // - Implement the linearizable read phase (Gap 4) so the IF
+            //   condition is evaluated within the Accord epoch.
+            //
+            // Failing loud per p0-03 policy until fully wired.
             return Err(CqlError::ServerError(
-                "LWT routing to Accord is not yet implemented; \
-                 see ferrosa_docs/specs/todo/p0-03b-accord-implementation-gap.md"
+                "LWT routing to Accord is not yet implemented at the CQL layer; \
+                 see ferrosa_docs/specs/todo/p0-03b-accord-implementation-gap.md \
+                 — coordinator driver (Gaps 1–3, 7) implemented on fix/p0-03b-accord-network"
                     .into(),
             ));
         }
