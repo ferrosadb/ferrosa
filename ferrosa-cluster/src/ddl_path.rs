@@ -567,6 +567,22 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
                     new_members.insert(rejoin_node_id);
                     let raft = self.raft.clone();
                     let host_id = node_info.host_id;
+
+                    // Register the rejoining node in the shared node_map so
+                    // FerrosRaftNetworkFactory can resolve its UUID when openraft
+                    // calls new_client() for the add_learner / AppendEntries RPCs.
+                    // Without this, new_client returns Uuid::nil() and all
+                    // replication to the rejoining node silently fails.
+                    {
+                        let mut map = self.node_map.write().unwrap_or_else(|e| e.into_inner());
+                        map.insert(rejoin_node_id, host_id);
+                    }
+                    tracing::info!(
+                        node_id = rejoin_node_id,
+                        host_id = %host_id,
+                        "cluster_rejoin: registered node in network factory node_map"
+                    );
+
                     tokio::spawn(async move {
                         // openraft 0.9 requires two steps to promote a node to voter:
                         // 1. add_learner — registers the node in openraft's node map
