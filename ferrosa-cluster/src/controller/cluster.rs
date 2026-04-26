@@ -937,6 +937,29 @@ impl ModeController {
                 });
             }
 
+            // Spawn the leader-side snapshot-push sweep (P0-20 fix, path b).
+            //
+            // When this node is the leader, the sweep periodically detects
+            // followers whose matched log is far behind the committed index and
+            // calls trigger().snapshot() + trigger().heartbeat() to push the
+            // snapshot.  This closes the gap left by P0-17/P0-19: the election
+            // guard suppresses the storm, but the leader still needs to be
+            // nudged to actually deliver the snapshot.
+            {
+                use crate::raft::snapshot_pusher::run_snapshot_pusher;
+                let pusher_raft = raft_arc.clone();
+                let pusher_cancel = election_guard_cancel.clone();
+                tokio::spawn(async move {
+                    run_snapshot_pusher(
+                        pusher_raft,
+                        pusher_cancel,
+                        5_000, // sweep every 5 s
+                        10,    // lag_threshold: 10 entries
+                    )
+                    .await;
+                });
+            }
+
             // Build initial membership: all known nodes including self
             let mut members = std::collections::BTreeMap::new();
             members.insert(

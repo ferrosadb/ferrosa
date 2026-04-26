@@ -9,6 +9,7 @@ pub mod election_guard;
 pub mod handlers;
 pub mod log_store;
 pub mod network;
+pub mod snapshot_pusher;
 pub mod state_machine;
 
 use std::io::Cursor;
