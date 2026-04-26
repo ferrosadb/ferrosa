@@ -394,6 +394,24 @@ impl PeerManager {
             .ok()
             .and_then(|guard| guard.get(&host_id).cloned())
     }
+
+    /// Return the UUIDs of all currently live peers (those with an active pool).
+    ///
+    /// Used by the Accord coordinator to build the replica set for an LWT
+    /// transaction. Non-blocking: if the lock is contended, returns an empty
+    /// vec and the caller should retry or fail loud.
+    pub fn live_peer_ids(&self) -> Vec<uuid::Uuid> {
+        self.peers
+            .try_read()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter(|(_, state)| state.pool.is_some())
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

@@ -199,10 +199,6 @@ pub struct SharedState {
     /// statements in cluster mode return a fail-loud `ServerError` instead
     /// of routing through Accord.
     pub peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
-    /// UUIDs of the Accord replica set for LWT transactions.
-    ///
-    /// Empty when `peer_manager` is `None`.
-    pub accord_replica_ids: Vec<uuid::Uuid>,
     /// Hybrid logical clock used to generate monotone transaction timestamps.
     ///
     /// `None` when `peer_manager` is `None`.
@@ -284,47 +280,54 @@ pub enum RouteResult {
 /// Constructs an `AccordCoordinatorDriver`, runs the full PreAccept → Commit
 /// protocol over real TCP, and returns a CQL `[applied]` result set.
 ///
-/// # Gap 4 note
-///
-/// The linearizable read phase (IF condition evaluation within the Accord
-/// epoch) is not yet wired.  Until Gap 4 is closed, this function always
-/// returns `[applied]=true` once consensus commits — the IF condition is
-/// evaluated by the local storage write in the Apply phase, not here.
+/// The replica set is built dynamically from `PeerManager::live_peer_ids()`
+/// plus the local node's `host_id`. This ensures newly joined peers are
+/// included without requiring a restart.
 ///
 /// # Errors
 ///
 /// Returns `CqlError::ServerError` when:
-/// - The replica set is empty.
+/// - The replica set has fewer than 1 member (no peers connected).
 /// - The Accord quorum cannot be reached (network failure / too few replicas).
 async fn route_lwt_via_accord(
     state: &SharedState,
     _ctx: &RequestContext<'_>,
     _stmt: &Statement,
     peers: Arc<ferrosa_net::peer::PeerManager>,
-    replica_ids: &[uuid::Uuid],
     clock: Arc<ferrosa_common::accord::HybridLogicalClock>,
 ) -> Result<RouteResult, CqlError> {
     use ferrosa_cluster::accord::{AccordCoordinatorDriver, AccordDriverError};
 
+    // Build the replica set from the live peer map plus this node itself.
+    // Ordering is deterministic: local node first, then peers sorted by UUID.
+    let host_id = state.node_config.host_id;
+    let mut replica_ids: Vec<uuid::Uuid> = peers.live_peer_ids();
+    // Include local node if not already in the list.
+    if !replica_ids.contains(&host_id) {
+        replica_ids.push(host_id);
+    }
+    replica_ids.sort_unstable();
+
     if replica_ids.is_empty() {
         return Err(CqlError::ServerError(
-            "Accord replica set is empty — cannot run LWT consensus".into(),
+            "Accord replica set is empty — no peers connected for LWT consensus".into(),
         ));
     }
 
     // Derive a stable u64 node_id from the host UUID (first 8 bytes big-endian).
-    let host_bytes = state.node_config.host_id.as_bytes();
+    let host_bytes = host_id.as_bytes();
     let node_id = u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
 
     // Use a simple key derived from the statement type for now.
-    // Gap 4 will replace this with the actual partition key bytes.
+    // Full partition key bytes will replace this once the CQL planner is
+    // integrated with the Accord execution path.
     let key = b"lwt-placeholder-key".to_vec();
 
     let mut driver = AccordCoordinatorDriver::new(
         node_id,
-        replica_ids.to_vec(),
+        replica_ids,
         peers,
-        false, // not leaseholder (Gap 4: derive from TokenRing)
+        false, // not leaseholder (derive from TokenRing in future)
         &clock,
         key,
     );
@@ -436,15 +439,8 @@ pub async fn route(
             // silently falling through to a non-linearizable local path.
             match (&state.peer_manager, &state.accord_clock) {
                 (Some(peers), Some(clock)) => {
-                    return route_lwt_via_accord(
-                        state,
-                        ctx,
-                        &stmt,
-                        peers.clone(),
-                        &state.accord_replica_ids,
-                        clock.clone(),
-                    )
-                    .await;
+                    return route_lwt_via_accord(state, ctx, &stmt, peers.clone(), clock.clone())
+                        .await;
                 }
                 _ => {
                     return Err(CqlError::ServerError(
@@ -6628,7 +6624,6 @@ mod tests {
             topology_policy: ClientTopologyPolicy::default(),
             auth_warn: false,
             peer_manager: None,
-            accord_replica_ids: vec![],
             accord_clock: None,
         };
         (state, dir)
