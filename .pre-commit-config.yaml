@@ -47,7 +47,6 @@ repos:
         stages: [pre-push]
         entry: cargo test --workspace
         language: system
-        types: [rust]
         pass_filenames: false
 
       - id: cargo-fmt-prepush
