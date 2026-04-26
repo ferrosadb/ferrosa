@@ -568,6 +568,53 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
                     let raft = self.raft.clone();
                     let host_id = node_info.host_id;
                     tokio::spawn(async move {
+                        // openraft 0.9 requires two steps to promote a node to voter:
+                        // 1. add_learner — registers the node in openraft's node map
+                        //    so the leader knows its address and can replicate to it.
+                        // 2. change_membership(AddVoterIds) — promotes the learner to
+                        //    a full voting member.
+                        //
+                        // Skipping step 1 results in:
+                        //   "Learner <id> not found: add it as learner before adding it as a voter"
+                        tracing::info!(
+                            node_id = rejoin_node_id,
+                            host_id = %host_id,
+                            "cluster_rejoin: step 1 — add_learner so leader can replicate to node"
+                        );
+                        match raft
+                            .add_learner(
+                                rejoin_node_id,
+                                openraft::BasicNode {
+                                    addr: String::new(),
+                                },
+                                false,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::info!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    "cluster_rejoin: step 1 done — node registered as learner; \
+                                     promoting to voter"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    error = %e,
+                                    "cluster_rejoin: add_learner failed — aborting voter promotion"
+                                );
+                                return;
+                            }
+                        }
+
+                        tracing::info!(
+                            node_id = rejoin_node_id,
+                            host_id = %host_id,
+                            "cluster_rejoin: step 2 — change_membership AddVoterIds"
+                        );
                         match raft
                             .change_membership(
                                 openraft::ChangeMembers::AddVoterIds(new_members),
