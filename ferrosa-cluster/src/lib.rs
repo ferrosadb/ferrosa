@@ -23,7 +23,9 @@ pub mod write_path;
 pub use config::ClusterConfig;
 pub use consistency::ConsistencyLevel;
 pub use controller::{
-    bootstrap_silent_failure_counts, ClusterStateHolder, ModeController, ModeControllerHandles,
+    bootstrap_silent_failure_counts, cluster_rejoin_attempts_total, cluster_rejoin_failures_total,
+    ClusterStateHolder, ModeController, ModeControllerHandles, CLUSTER_REJOIN_ATTEMPTS_TOTAL,
+    CLUSTER_REJOIN_FAILURES_TOTAL,
 };
 pub use coordinator::batch::{
     BatchlogDeleteHandler, BatchlogReplayHandler, BatchlogReplayTask, BatchlogWriteHandler,

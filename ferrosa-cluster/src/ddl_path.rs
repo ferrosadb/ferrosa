@@ -294,6 +294,13 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
                 .drop_aggregate_internal(keyspace, name, arg_types)
                 .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
         }
+        DdlOperation::JoinNode(_) => {
+            // Topology-only operation — not applied to local schema directly.
+            // The leader handles this via client_write(RaftOp::JoinNode(..));
+            // apply_direct is only called in standalone mode where there is
+            // no cluster membership to update.
+            return Ok(());
+        }
     }
     schema.set_schema_version(Uuid::new_v4());
     Ok(())
@@ -424,6 +431,7 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
             name,
             arg_types,
         },
+        DdlOperation::JoinNode(node_info) => RaftOp::JoinNode(node_info),
     };
     RaftCommand {
         op: raft_op,

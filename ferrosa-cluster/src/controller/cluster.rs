@@ -1534,6 +1534,59 @@ impl ModeController {
                         engine: storage_for_bootstrap.clone(),
                     }));
                     tracing::info!("DDL path restored to Direct after formation timeout");
+
+                    // P0-21 FIX: Spawn a background rejoin task that contacts
+                    // the existing cluster's leader and asks it to add this node
+                    // as a voter via JoinNode.  This closes the gap where the
+                    // node is stuck in election-storm limbo with no path to
+                    // converge (P0-17/P0-19 suppress elections, P0-20 pusher
+                    // stays silent because this node isn't in the voter set).
+                    {
+                        use crate::controller::cluster_rejoin::attempt_rejoin;
+                        let rejoin_self_id = local_host_id_for_refresh;
+                        let rejoin_self_addr = local_addr_for_refresh.clone();
+                        let rejoin_dc = config_for_promotion.data_center.clone();
+                        let rejoin_rack = config_for_promotion.rack.clone();
+                        let rejoin_cql_broadcast = local_cql_broadcast_for_refresh.clone();
+                        let rejoin_peers = peers.clone();
+                        let rejoin_pm = peer_manager_for_bootstrap.clone();
+                        tokio::spawn(async move {
+                            tracing::info!(
+                                self_id = %rejoin_self_id,
+                                peer_count = rejoin_peers.len(),
+                                "cluster_rejoin: formation timed out — attempting to add self \
+                                 to existing cluster voter set (P0-21)"
+                            );
+                            match attempt_rejoin(
+                                rejoin_self_id,
+                                rejoin_self_addr,
+                                rejoin_dc,
+                                rejoin_rack,
+                                rejoin_cql_broadcast,
+                                rejoin_peers,
+                                rejoin_pm,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        self_id = %rejoin_self_id,
+                                        "cluster_rejoin: JoinNode accepted by leader — \
+                                         awaiting snapshot + replication convergence"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        self_id = %rejoin_self_id,
+                                        error = %e,
+                                        "cluster_rejoin: EXHAUSTED — node is NOT a voter. \
+                                         Operator intervention required. \
+                                         (CLUSTER_REJOIN_FAILURES_TOTAL incremented, P0-21)"
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
             }
 
