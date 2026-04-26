@@ -550,7 +550,53 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
         };
 
         match execute_via_raft(&self.raft, op.clone()).await {
-            Ok(()) => Some(Message::PairDdlAck(Bytes::new())),
+            Ok(()) => {
+                // P0-21: after a successful JoinNode commit, promote the new
+                // node to openraft voter via change_membership so the leader
+                // will replicate / send InstallSnapshot to it.
+                //
+                // RaftOp::JoinNode updates the ferrosa state machine's topology
+                // map but does NOT update openraft's voter set.  Without this
+                // call, openraft won't send AppendEntries/InstallSnapshot to
+                // the new member — the node stays stuck at T0-N0-0 forever.
+                if let DdlOperation::JoinNode(ref node_info) = op {
+                    use crate::raft::uuid_to_node_id;
+                    use std::collections::BTreeSet;
+                    let rejoin_node_id = uuid_to_node_id(node_info.host_id);
+                    let mut new_members = BTreeSet::new();
+                    new_members.insert(rejoin_node_id);
+                    let raft = self.raft.clone();
+                    let host_id = node_info.host_id;
+                    tokio::spawn(async move {
+                        match raft
+                            .change_membership(
+                                openraft::ChangeMembers::AddVoterIds(new_members),
+                                true,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::info!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    "cluster_rejoin: change_membership AddVoterIds committed — \
+                                     openraft will now replicate to rejoined node"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    error = %e,
+                                    "cluster_rejoin: change_membership AddVoterIds failed \
+                                     (node may still converge via snapshot on next heartbeat)"
+                                );
+                            }
+                        }
+                    });
+                }
+                Some(Message::PairDdlAck(Bytes::new()))
+            }
             Err(ClusterError::NotLeader {
                 leader_id: Some(leader_node_id),
             }) => {
