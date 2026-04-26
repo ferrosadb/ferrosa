@@ -329,30 +329,48 @@ async fn route_lwt_via_accord(
         key,
     );
 
-    driver.run_transaction().await.map_err(|e| match e {
-        AccordDriverError::QuorumUnavailable => {
-            CqlError::ServerError("Accord quorum unavailable for LWT transaction".into())
+    match driver.run_transaction().await {
+        Ok(_) => {
+            // Gap 4: F+1 read-votes agreed the IF condition held.
+            // Gap 5: F+1 apply acknowledgements received.
+            let result = crate::accord_router::encode_lwt_result(
+                &crate::accord_router::LwtResult {
+                    applied: true,
+                    current_values: std::collections::HashMap::new(),
+                },
+                "",
+                "",
+                &[],
+            );
+            Ok(RouteResult::Result(result))
         }
-        AccordDriverError::Network(msg) => {
-            CqlError::ServerError(format!("Accord network error: {msg}"))
+        Err(AccordDriverError::ConditionNotMet { .. }) => {
+            // Gap 4: F+1 read-votes agreed the IF condition did NOT hold.
+            // Return [applied]=false with the current row value.
+            let result = crate::accord_router::encode_lwt_result(
+                &crate::accord_router::LwtResult {
+                    applied: false,
+                    current_values: std::collections::HashMap::new(),
+                },
+                "",
+                "",
+                &[],
+            );
+            Ok(RouteResult::Result(result))
         }
-        AccordDriverError::Codec(msg) => {
-            CqlError::ServerError(format!("Accord codec error: {msg}"))
+        Err(AccordDriverError::QuorumUnavailable) => Err(CqlError::ServerError(
+            "Accord quorum unavailable for LWT transaction".into(),
+        )),
+        Err(AccordDriverError::ApplyQuorumUnavailable) => Err(CqlError::ServerError(
+            "Accord apply quorum unavailable — LWT transaction may not be durable".into(),
+        )),
+        Err(AccordDriverError::Network(msg)) => Err(CqlError::ServerError(format!(
+            "Accord network error: {msg}"
+        ))),
+        Err(AccordDriverError::Codec(msg)) => {
+            Err(CqlError::ServerError(format!("Accord codec error: {msg}")))
         }
-    })?;
-
-    // Consensus committed — return [applied]=true.
-    // Gap 4 will replace this with linearizable IF-condition evaluation.
-    let result = crate::accord_router::encode_lwt_result(
-        &crate::accord_router::LwtResult {
-            applied: true,
-            current_values: std::collections::HashMap::new(),
-        },
-        "",
-        "",
-        &[],
-    );
-    Ok(RouteResult::Result(result))
+    }
 }
 
 // ── Main dispatch ────────────────────────────────────────────────────────

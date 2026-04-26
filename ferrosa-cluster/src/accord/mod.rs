@@ -3,6 +3,7 @@
 //! This module contains the deterministic test harness ([`TestCluster`]) for
 //! protocol-level testing of the Accord (EPaxos-family) consensus protocol.
 
+pub mod apply;
 pub mod chaos_minority_kill;
 pub mod clock;
 pub mod clock_validation;
@@ -33,6 +34,7 @@ pub mod two_phase_ddl;
 pub mod uda_integration;
 pub(crate) mod wire;
 
+pub use apply::{ApplyError, ApplyMutation, DepWaitApplier, NoopStorageApplier, StorageApplier};
 pub use clock::{ClockError, ClockValidator};
 pub use clock_validation::{
     validate_timestamp_drift, ClockDriftRejection, DEFAULT_MAX_CLOCK_DRIFT_NS,
