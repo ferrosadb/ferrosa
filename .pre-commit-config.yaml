@@ -42,10 +42,15 @@ repos:
         pass_filenames: false
 
       # Pre-push: ensure workspace passes before reaching CI
+      # NOTE: ferrosa-jepsen, ferrosa-loadgen, ferrosa-storage are excluded from
+      # pre-push because they contain tests that panic-loud on missing infra
+      # (FERROSA_TEST_CONTAINERS, FERROSA_TEST_FIRECRACKER, FERROSA_TEST_CLUSTER_NODES)
+      # per ferrosa/CLAUDE.md test policy. Those tests run in CI's
+      # 'Cluster integration tests' job with the env vars set.
       - id: cargo-test-workspace
         name: cargo test --workspace
         stages: [pre-push]
-        entry: cargo test --workspace --lib --bins
+        entry: cargo test --workspace --lib --bins --exclude ferrosa-jepsen --exclude ferrosa-loadgen --exclude ferrosa-storage
         language: system
         pass_filenames: false
 
