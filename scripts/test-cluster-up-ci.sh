@@ -25,7 +25,20 @@ fi
 # ── Compose file ──────────────────────────────────────────────────────────────
 COMPOSE_BASE="${REPO_ROOT}/tests/docker-compose.cluster.yml"
 
-# ── Bring up cluster ──────────────────────────────────────────────────────────
+# ── Pre-build the node image ONCE (avoids BuildKit per-target context race) ──
+# Building inside `compose up --build` parallelizes per-service builds. When
+# all 5 nodeN services share the same `build: { context: .., dockerfile:
+# Dockerfile }`, BuildKit's per-target context-snapshot reads race and one
+# target (typically node2) reports `failed to compute cache key:
+# "/Cargo.lock": not found`. Pre-building the image with a single
+# `docker build` invocation is the canonical way around this — see p1-32 spec.
+echo "Building ferrosa-test-node:latest (single docker build, avoids BuildKit race)..." >&2
+docker build \
+    -t ferrosa-test-node:latest \
+    -f "${REPO_ROOT}/Dockerfile" \
+    "${REPO_ROOT}"
+
+# ── Bring up cluster (no --build; uses the pre-built image via image: tag) ──
 echo "Starting Ferrosa CI test cluster (profile: ${PROFILE}, project: ${PROJECT_NAME})..." >&2
 echo "Ports: CQL 9042/9043/9044, RustFS 9000/9001" >&2
 
@@ -33,7 +46,7 @@ docker compose \
     -f "${COMPOSE_BASE}" \
     --project-name "${PROJECT_NAME}" \
     --profile "${PROFILE}" \
-    up -d --build
+    up -d
 
 # ── Wait for health ───────────────────────────────────────────────────────────
 echo "Waiting for all 3 nodes to become healthy (timeout: 180s)..." >&2
