@@ -115,10 +115,16 @@ impl RestoreManager {
                 let hex = crate::upload::manager::hex_prefix_for(&entry.id);
 
                 for component in &components {
-                    let s3_path = ObjectPath::from(format!(
-                        "{}/{hex}/{table_id_str}/{}/{component}",
-                        self.prefix, entry.id
-                    ));
+                    // Use the shared key constructor — guarantees upload and
+                    // download always agree on the path format.  The key
+                    // format is: {prefix}/{hex}/{table}/{sstable}/{sstable}-{component}
+                    let s3_path = crate::upload::manager::sstable_object_key(
+                        &self.prefix,
+                        &hex,
+                        table_id_str,
+                        &entry.id,
+                        component,
+                    );
                     let local_path = table_dir.join(format!("{}-{component}", entry.id));
 
                     // Skip if already present.
@@ -350,11 +356,15 @@ mod tests {
         let prefix = "test";
         let dir = tempfile::tempdir().unwrap();
 
-        // Place a fake SSTable file in S3.
+        // Place a fake SSTable file in S3 at the canonical path.
         let table_id = "ks.users";
         let sstable_id = "0001";
         let hex = crate::upload::manager::hex_prefix_for(sstable_id);
-        let s3_path = ObjectPath::from(format!("{prefix}/{hex}/{table_id}/{sstable_id}/Data.db"));
+        // Use sstable_object_key so this test always stays in sync with the
+        // upload path.  The file must be at {prefix}/{hex}/{table}/{id}/{id}-Data.db.
+        let s3_path = crate::upload::manager::sstable_object_key(
+            prefix, &hex, table_id, sstable_id, "Data.db",
+        );
         store
             .put(
                 &s3_path,

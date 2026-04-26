@@ -3277,8 +3277,12 @@ impl StorageEngine {
         table_id: &TableId,
         manifest: &crate::manifest::Manifest,
     ) -> ferrosa_common::Result<usize> {
-        let (os_config, store) = self.object_store_and_config()?;
-        let prefix = &os_config.prefix;
+        // In test builds, `resolve_store_and_prefix` checks the injected
+        // `upload_store_override` before falling back to the real S3 config.
+        // In production this is equivalent to `object_store_and_config`.
+        let (store, prefix) = self
+            .resolve_store_and_prefix()
+            .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
 
         let entries = match manifest.sstables.get(&table_id.to_string()) {
             Some(e) => e,
@@ -3295,8 +3299,12 @@ impl StorageEngine {
         })?;
 
         let mut downloaded = 0;
-        let components = [
-            "Data.db",
+        // Data.db is the only required component; the rest are optional.
+        // Missing optional components produce a warning but do not fail the
+        // download.  Missing Data.db is a hard error — the SSTable cannot be
+        // read without it.
+        let required_components = ["Data.db"];
+        let optional_components = [
             "Partitions.db",
             "Rows.db",
             "Filter.db",
@@ -3306,15 +3314,63 @@ impl StorageEngine {
 
         for entry in entries {
             let hex = crate::upload::manager::hex_prefix_for(&entry.id);
+            let mut wrote_any = false;
 
-            for component in &components {
-                let s3_path = object_store::path::Path::from(format!(
-                    "{prefix}/{hex}/{table_id}/{}/{component}",
-                    entry.id
-                ));
+            // Required components: return an error on NotFound.
+            for component in &required_components {
+                let s3_path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id.to_string(),
+                    &entry.id,
+                    component,
+                );
                 let local_path = table_dir.join(format!("{}-{component}", entry.id));
 
-                // Skip if already downloaded.
+                if local_path.exists() {
+                    wrote_any = true;
+                    continue;
+                }
+
+                match store.get(&s3_path).await {
+                    Ok(result) => {
+                        let data = result.bytes().await.map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to read {s3_path}: {e}"
+                            ))
+                        })?;
+                        std::fs::write(&local_path, &data).map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to write {}: {e}",
+                                local_path.display()
+                            ))
+                        })?;
+                        wrote_any = true;
+                    }
+                    Err(object_store::Error::NotFound { .. }) => {
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "required SSTable component not found in S3: {s3_path}"
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "S3 download failed for {s3_path}: {e}"
+                        )));
+                    }
+                }
+            }
+
+            // Optional components: log a warning on NotFound, continue.
+            for component in &optional_components {
+                let s3_path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id.to_string(),
+                    &entry.id,
+                    component,
+                );
+                let local_path = table_dir.join(format!("{}-{component}", entry.id));
+
                 if local_path.exists() {
                     continue;
                 }
@@ -3334,8 +3390,11 @@ impl StorageEngine {
                         })?;
                     }
                     Err(object_store::Error::NotFound { .. }) => {
-                        // Component might not exist (e.g., CompressionInfo.db is optional)
-                        continue;
+                        tracing::debug!(
+                            sstable = entry.id,
+                            component,
+                            "optional SSTable component absent in S3 — skipping"
+                        );
                     }
                     Err(e) => {
                         return Err(ferrosa_common::Error::InvalidFormat(format!(
@@ -3344,7 +3403,13 @@ impl StorageEngine {
                     }
                 }
             }
-            downloaded += 1;
+
+            // Only count this SSTable as downloaded after at least one file
+            // landed on disk.  This ensures `downloaded_total` reflects
+            // bytes-on-disk reality rather than manifest-entry count.
+            if wrote_any {
+                downloaded += 1;
+            }
         }
 
         Ok(downloaded)
@@ -3463,8 +3528,6 @@ impl StorageEngine {
         store: Arc<dyn object_store::ObjectStore>,
         prefix: &str,
     ) {
-        use object_store::path::Path as ObjectPath;
-
         let mut manifest = match crate::manifest::Manifest::load(store.as_ref(), prefix).await {
             Ok((m, _)) => m,
             Err(_) => crate::manifest::Manifest::new(),
@@ -3535,9 +3598,13 @@ impl StorageEngine {
                     let local_path = table_dir.join(format!("{gen}-{component}"));
                     if local_path.exists() {
                         let data = std::fs::read(&local_path).unwrap();
-                        let s3_path = ObjectPath::from(format!(
-                            "{prefix}/{hex}/{table_id_str}/{gen}/{component}"
-                        ));
+                        let s3_path = crate::upload::manager::sstable_object_key(
+                            prefix,
+                            &hex,
+                            table_id_str,
+                            &gen_str,
+                            component,
+                        );
                         store
                             .put(&s3_path, bytes::Bytes::from(data).into())
                             .await
@@ -8234,6 +8301,7 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new());
 
         // Pre-populate input SSTable objects in S3 so deletion is meaningful.
+        // Use the shared key constructor so paths match what DeleteSSTable issues.
         let prefix = "test-node";
         let table_id_str = "test_ks.test_table";
         let input_id = "input_sst_1";
@@ -8245,9 +8313,13 @@ mod tests {
             "Statistics.db",
             "TOC.txt",
         ] {
-            let path = object_store::path::Path::from(format!(
-                "{prefix}/{hex}/{table_id_str}/{input_id}/{component}"
-            ));
+            let path = crate::upload::manager::sstable_object_key(
+                prefix,
+                &hex,
+                table_id_str,
+                input_id,
+                component,
+            );
             store
                 .put(&path, bytes::Bytes::from_static(b"data").into())
                 .await
@@ -8286,9 +8358,13 @@ mod tests {
             "Statistics.db",
             "TOC.txt",
         ] {
-            let path = object_store::path::Path::from(format!(
-                "{prefix}/{hex}/{table_id_str}/{input_id}/{component}"
-            ));
+            let path = crate::upload::manager::sstable_object_key(
+                prefix,
+                &hex,
+                table_id_str,
+                input_id,
+                component,
+            );
             let get_result = store.get(&path).await;
             assert!(
                 get_result.is_err(),
@@ -10078,6 +10154,190 @@ mod tests {
             "expected 'storage.read' span, got: {recorded:?}",
         );
     }
+
+    // =========================================================================
+    // P0-13: SSTable upload→S3→download round-trip
+    // =========================================================================
+
+    /// Round-trip test: write rows → flush SSTables → upload to mock S3 →
+    /// delete local SSTable files → call download_sstables_from_s3 →
+    /// verify files are back on disk and rows are readable.
+    ///
+    /// This test would have caught the upload/download key format mismatch
+    /// (p0-13) because download_sstables_from_s3 would have returned an error
+    /// (required component not found) instead of silently writing zero files.
+    #[test]
+    fn p0_13_sstable_upload_download_round_trip() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-p0-13";
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::new_with_upload_store(
+                config,
+                Arc::clone(&store),
+                prefix.to_string(),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+
+            let schema = test_schema();
+            let tid = table_id();
+            engine.register_table(schema.clone()).unwrap();
+
+            // Write rows so they end up in the memtable.
+            let rows_to_write: Vec<(&str, &[u8])> = vec![
+                ("alpha", b"value-alpha"),
+                ("beta", b"value-beta"),
+                ("gamma", b"value-gamma"),
+            ];
+            for (k, v) in &rows_to_write {
+                engine
+                    .write(&tid, &make_key(k), make_row(v, 1000), 1000)
+                    .unwrap();
+            }
+
+            // Flush to disk: creates {gen}-Data.db and related component files.
+            engine.flush(&tid).unwrap();
+
+            // Verify the rows are readable from the flushed SSTable.
+            for (k, _) in &rows_to_write {
+                let result = engine.read(&tid, &make_key(k)).unwrap();
+                assert!(result.is_some(), "row '{k}' should be readable after flush");
+            }
+
+            // Upload SSTables + manifest to the mock S3 store.
+            // This uses upload_manifest_for_test which goes through
+            // sstable_object_key — the same path that download uses.
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            // Load the manifest so we know what to download.
+            let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), prefix)
+                .await
+                .unwrap();
+
+            // Confirm manifest has our table's SSTable entries.
+            let sstable_entries = manifest
+                .sstables
+                .get(&tid.to_string())
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !sstable_entries.is_empty(),
+                "manifest must contain at least one SSTable entry for table '{tid}'"
+            );
+
+            // ── Drop local SSTable files ──────────────────────────────────────
+            let table_dir = dir.path().join("sstables").join(tid.to_string());
+            for entry in std::fs::read_dir(&table_dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_str().unwrap().to_string();
+                if name.ends_with(".db") || name.ends_with(".txt") {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+
+            // Confirm the table dir is now empty of .db files.
+            let remaining_db_files: Vec<_> = std::fs::read_dir(&table_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.ends_with(".db"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                remaining_db_files.is_empty(),
+                "no .db files should remain before download, found: {remaining_db_files:?}"
+            );
+
+            // ── Download SSTables from mock S3 ───────────────────────────────
+            let downloaded = engine
+                .download_sstables_from_s3(&tid, &manifest)
+                .await
+                .expect("download_sstables_from_s3 must not return an error");
+
+            assert!(
+                downloaded > 0,
+                "download_sstables_from_s3 must report at least one downloaded SSTable, \
+                 got {downloaded} (p0-13: counter must reflect bytes-on-disk reality)"
+            );
+            assert_eq!(
+                downloaded,
+                sstable_entries.len(),
+                "downloaded count ({downloaded}) must equal manifest entry count ({})",
+                sstable_entries.len()
+            );
+
+            // ── Verify files are on disk ──────────────────────────────────────
+            for entry in &sstable_entries {
+                let data_file = table_dir.join(format!("{}-Data.db", entry.id));
+                assert!(
+                    data_file.exists(),
+                    "Data.db for SSTable '{}' must exist on disk after download: {}",
+                    entry.id,
+                    data_file.display()
+                );
+                let meta = std::fs::metadata(&data_file).unwrap();
+                assert!(
+                    meta.len() > 0,
+                    "Data.db for SSTable '{}' must not be zero bytes",
+                    entry.id
+                );
+            }
+
+            // ── Verify rows are readable after re-registering the table ───────
+            // Re-register triggers SSTable discovery from disk (the downloaded files).
+            engine.shutdown().unwrap();
+
+            let restore_dir = tempfile::tempdir().unwrap();
+            let restore_config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(restore_dir.path()),
+                data_dir: dir.path().to_path_buf(),
+                ..StorageEngineConfig::test_config(restore_dir.path())
+            };
+            let restored = StorageEngine::new(restore_config, None).unwrap();
+            restored.register_table(schema).unwrap();
+
+            for (k, v) in &rows_to_write {
+                let result = restored
+                    .read(&tid, &make_key(k))
+                    .expect("read after download must not error");
+                assert!(
+                    result.is_some(),
+                    "row '{k}' must be readable after S3 round-trip download"
+                );
+                // Verify cell value matches what was written.
+                // read() returns a Partition; rows hold the actual cells.
+                let partition = result.unwrap();
+                let cell_bytes = partition
+                    .rows
+                    .first()
+                    .and_then(|row| row.cells.first())
+                    .and_then(|(_, cell)| cell.value.as_deref())
+                    .expect("partition must have at least one row with a cell value");
+                assert_eq!(
+                    cell_bytes, *v,
+                    "cell value for key '{k}' must match original after round-trip"
+                );
+            }
+
+            restored.shutdown().unwrap();
+        });
+    }
 }
-// This test is added to the end of the test module by append.
-// It will be placed before the closing `}` of the module.

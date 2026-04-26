@@ -107,9 +107,20 @@ impl UploadManager {
                         let hex_prefix = hex_prefix_for(&sstable_id);
                         let mut upload_err: Option<String> = None;
                         for (name, data) in files {
-                            let path = ObjectPath::from(format!(
-                                "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{name}"
-                            ));
+                            // `name` is already in `{sstable_id}-{component}` form
+                            // (e.g. "1-Data.db"). Strip the id prefix to get the bare
+                            // component name so we can route through the shared key
+                            // constructor and guarantee upload/download alignment.
+                            let component = name
+                                .strip_prefix(&format!("{sstable_id}-"))
+                                .unwrap_or(&name);
+                            let path = sstable_object_key(
+                                &prefix,
+                                &hex_prefix,
+                                &table_id,
+                                &sstable_id,
+                                component,
+                            );
                             if let Err(e) =
                                 Self::put_with_retry(&store, &path, data.clone(), 5).await
                             {
@@ -152,9 +163,13 @@ impl UploadManager {
                         ];
                         let mut delete_err: Option<String> = None;
                         for component in &components {
-                            let path = ObjectPath::from(format!(
-                                "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{component}"
-                            ));
+                            let path = sstable_object_key(
+                                &prefix,
+                                &hex_prefix,
+                                &table_id,
+                                &sstable_id,
+                                component,
+                            );
                             match store.delete(&path).await {
                                 Ok(_) => {}
                                 Err(object_store::Error::NotFound { .. }) => {
@@ -275,6 +290,30 @@ pub fn hex_prefix_for(sstable_id: &str) -> String {
     format!("{hash:02x}")
 }
 
+/// Build the canonical S3 object key for a single SSTable component file.
+///
+/// This is the **single source of truth** for the path format used by both
+/// upload and download.  The key format is:
+///
+/// ```text
+/// {prefix}/{hex}/{table_id}/{sstable_id}/{sstable_id}-{component}
+/// ```
+///
+/// The `{sstable_id}-` prefix on the filename mirrors how the component files
+/// are stored locally (e.g. `1-Data.db`), ensuring upload and download
+/// paths are always identical.
+pub fn sstable_object_key(
+    prefix: &str,
+    hex: &str,
+    table_id: &str,
+    sstable_id: &str,
+    component: &str,
+) -> ObjectPath {
+    ObjectPath::from(format!(
+        "{prefix}/{hex}/{table_id}/{sstable_id}/{sstable_id}-{component}"
+    ))
+}
+
 /// Returns true for transient errors that should be retried.
 fn is_transient(err: &object_store::Error) -> bool {
     matches!(
@@ -351,9 +390,12 @@ mod tests {
 
             manager.shutdown().await;
 
-            // Verify the file is in the store.
+            // Verify the file is in the store at the canonical path.
+            // The upload manager strips the sstable_id prefix from the filename
+            // and routes through sstable_object_key, so the S3 key is:
+            //   {prefix}/{hex}/{table_id}/{sstable_id}/{sstable_id}-{component}
             let hex = hex_prefix_for("abc123");
-            let path = ObjectPath::from(format!("test/{hex}/ks.table/abc123/Data.db"));
+            let path = sstable_object_key("test", &hex, "ks.table", "abc123", "Data.db");
             let result = store.get(&path).await.unwrap();
             let bytes = result.bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), b"hello sstable data");
@@ -389,8 +431,10 @@ mod tests {
             manager.shutdown().await;
 
             let hex = hex_prefix_for("001");
+            // Files submitted as "Data.db" etc. (without sstable_id prefix) are
+            // stored via sstable_object_key, producing {id}-{component} in S3.
             for component in ["Data.db", "Index.db", "Filter.db"] {
-                let path = ObjectPath::from(format!("pfx/{hex}/ks.t/001/{component}"));
+                let path = sstable_object_key("pfx", &hex, "ks.t", "001", component);
                 let result = store.get(&path).await.unwrap();
                 assert!(!result.bytes().await.unwrap().is_empty());
             }
