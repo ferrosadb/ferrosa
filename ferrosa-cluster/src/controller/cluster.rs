@@ -518,6 +518,9 @@ impl ModeController {
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
         let raft_runtime: Option<Arc<tokio::runtime::Runtime>> = self.raft_runtime.get().cloned();
+        // Cancel token forwarded into the bootstrap spawn so that the election
+        // guard watchdog respects graceful shutdown.
+        let election_guard_cancel = self.cancel.clone();
         // Register Raft RPC handlers BEFORE spawning the init task.
         // Handlers use LazyRaft to wait for the instance to be ready.
         // This eliminates the race where vote requests arrive before
@@ -915,6 +918,24 @@ impl ModeController {
             // Without this, external callers (tests, DDL) cannot observe
             // the leader until the entire background task completes.
             raft_instance_swap.store(Arc::new(Some(raft_arc.clone())));
+
+            // Spawn the election-storm watchdog (P0-17 fix, path c).
+            //
+            // The watchdog monitors term deltas on this node.  When a node
+            // whose log has fallen behind the cluster repeatedly fires
+            // elections (storm), the watchdog suppresses elections via
+            // `enable_elect(false)` so the leader can deliver an
+            // InstallSnapshot without contention.  Elections are
+            // automatically re-enabled after STORM_SUPPRESS_MS.
+            {
+                use crate::raft::election_guard::run_election_guard;
+                let guard_raft = raft_arc.clone();
+                let guard_cancel = election_guard_cancel.clone();
+                let guard_timeout_min = raft_election_min_ms;
+                tokio::spawn(async move {
+                    run_election_guard(guard_raft, guard_cancel, guard_timeout_min).await;
+                });
+            }
 
             // Build initial membership: all known nodes including self
             let mut members = std::collections::BTreeMap::new();
