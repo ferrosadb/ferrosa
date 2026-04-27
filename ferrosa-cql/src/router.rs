@@ -27,7 +27,7 @@ use ferrosa_schema::{
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
-    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualColumnDef, VirtualRow,
+    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -803,50 +803,106 @@ async fn route_select(
                 peer.native_address =
                     harmonize_loopback_family(peer.native_address, client_loopback_ip);
             }
-            let col_names: Vec<String> = vec![
-                "peer",
-                "peer_port",
-                "data_center",
-                "rack",
-                "host_id",
-                "native_address",
-                "native_port",
-                "schema_version",
-                "release_version",
-                "tokens",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect();
-            let col_types = vec![
-                CqlType::Inet,
-                CqlType::Int,
-                CqlType::Varchar,
-                CqlType::Varchar,
-                CqlType::Uuid,
-                CqlType::Inet,
-                CqlType::Int,
-                CqlType::Uuid,
-                CqlType::Varchar,
-                CqlType::Set(Box::new(CqlType::Varchar)),
-            ];
+            // p1-37: legacy `system.peers` exposes `rpc_address` (the
+            // pre-peers_v2 column drivers like scylla 0.15 type-check on
+            // metadata fetch). `peers_v2` replaces it with `native_address`.
+            let is_v2 = s.table == "peers_v2";
+            let (col_names, col_types): (Vec<String>, Vec<CqlType>) = if is_v2 {
+                (
+                    vec![
+                        "peer",
+                        "peer_port",
+                        "data_center",
+                        "rack",
+                        "host_id",
+                        "native_address",
+                        "native_port",
+                        "schema_version",
+                        "release_version",
+                        "tokens",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                    vec![
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Varchar,
+                        CqlType::Varchar,
+                        CqlType::Uuid,
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Uuid,
+                        CqlType::Varchar,
+                        CqlType::Set(Box::new(CqlType::Varchar)),
+                    ],
+                )
+            } else {
+                (
+                    vec![
+                        "peer",
+                        "peer_port",
+                        "data_center",
+                        "rack",
+                        "host_id",
+                        "native_address",
+                        "native_port",
+                        "rpc_address",
+                        "schema_version",
+                        "release_version",
+                        "tokens",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                    vec![
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Varchar,
+                        CqlType::Varchar,
+                        CqlType::Uuid,
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Inet,
+                        CqlType::Uuid,
+                        CqlType::Varchar,
+                        CqlType::Set(Box::new(CqlType::Varchar)),
+                    ],
+                )
+            };
             let rows: Vec<Vec<Option<CqlValue>>> = peers
                 .iter()
                 .map(|p| {
                     let tokens_set: Vec<CqlValue> =
                         p.tokens.iter().map(|t| CqlValue::Text(t.clone())).collect();
-                    vec![
-                        Some(CqlValue::Inet(p.peer)),
-                        Some(CqlValue::Int(p.peer_port as i32)),
-                        Some(CqlValue::Text(p.data_center.clone())),
-                        Some(CqlValue::Text(p.rack.clone())),
-                        Some(CqlValue::Uuid(p.host_id)),
-                        Some(CqlValue::Inet(p.native_address)),
-                        Some(CqlValue::Int(p.native_port as i32)),
-                        Some(CqlValue::Uuid(p.schema_version)),
-                        Some(CqlValue::Text(p.release_version.clone())),
-                        Some(CqlValue::Set(tokens_set)),
-                    ]
+                    if is_v2 {
+                        vec![
+                            Some(CqlValue::Inet(p.peer)),
+                            Some(CqlValue::Int(p.peer_port as i32)),
+                            Some(CqlValue::Text(p.data_center.clone())),
+                            Some(CqlValue::Text(p.rack.clone())),
+                            Some(CqlValue::Uuid(p.host_id)),
+                            Some(CqlValue::Inet(p.native_address)),
+                            Some(CqlValue::Int(p.native_port as i32)),
+                            Some(CqlValue::Uuid(p.schema_version)),
+                            Some(CqlValue::Text(p.release_version.clone())),
+                            Some(CqlValue::Set(tokens_set)),
+                        ]
+                    } else {
+                        vec![
+                            Some(CqlValue::Inet(p.peer)),
+                            Some(CqlValue::Int(p.peer_port as i32)),
+                            Some(CqlValue::Text(p.data_center.clone())),
+                            Some(CqlValue::Text(p.rack.clone())),
+                            Some(CqlValue::Uuid(p.host_id)),
+                            Some(CqlValue::Inet(p.native_address)),
+                            Some(CqlValue::Int(p.native_port as i32)),
+                            Some(CqlValue::Inet(p.native_address)),
+                            Some(CqlValue::Uuid(p.schema_version)),
+                            Some(CqlValue::Text(p.release_version.clone())),
+                            Some(CqlValue::Set(tokens_set)),
+                        ]
+                    }
                 })
                 .collect();
             let (filt_names, filt_types, filt_rows) =
@@ -950,12 +1006,19 @@ async fn route_select(
                     ]
                 })
                 .collect();
+            // p1-37: honor the SELECT projection — scylla 0.15 issues
+            // `SELECT keyspace_name, table_name FROM system_schema.tables`
+            // and type-checks the result against a 2-tuple. Without
+            // projection we'd return 3 cols and trip a column-count
+            // mismatch.
+            let (filt_names, filt_types, filt_rows) =
+                filter_system_columns(&s.columns, &col_names, &col_types, &rows);
             Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+                &filt_names,
+                &filt_types,
                 "system_schema",
                 "tables",
-                &rows,
+                &filt_rows,
             ))
         }
         ("system_schema", "columns") => {
@@ -1093,6 +1156,11 @@ async fn route_select(
             ))
         }
         ("system_schema", "types") => {
+            // p1-37: field_names/field_types MUST be `frozen<list<text>>`
+            // per Cassandra. scylla 0.15's metadata fetch type-checks
+            // these columns and refuses to cache the schema if they're
+            // declared as `text` — which then blocks every DDL through
+            // the driver.
             let snap = state.schema.snapshot();
             let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
@@ -1103,28 +1171,28 @@ async fn route_select(
             let col_types = vec![
                 CqlType::Varchar,
                 CqlType::Varchar,
-                CqlType::Varchar,
-                CqlType::Varchar,
+                CqlType::List(Box::new(CqlType::Varchar)),
+                CqlType::List(Box::new(CqlType::Varchar)),
             ];
             let rows: Vec<Vec<Option<CqlValue>>> = snap
                 .types
                 .values()
                 .map(|udt| {
-                    let field_names: Vec<String> = udt
+                    let field_names: Vec<CqlValue> = udt
                         .fields
                         .iter()
-                        .map(|(n, _)| format!("\"{}\"", n))
+                        .map(|(n, _)| CqlValue::Text(n.clone()))
                         .collect();
-                    let field_types: Vec<String> = udt
+                    let field_types: Vec<CqlValue> = udt
                         .fields
                         .iter()
-                        .map(|(_, t)| format!("\"{}\"", bridge::cql_type_display_name(t)))
+                        .map(|(_, t)| CqlValue::Text(bridge::cql_type_display_name(t).to_string()))
                         .collect();
                     vec![
                         Some(CqlValue::Text(udt.keyspace.clone())),
                         Some(CqlValue::Text(udt.name.clone())),
-                        Some(CqlValue::Text(format!("[{}]", field_names.join(", ")))),
-                        Some(CqlValue::Text(format!("[{}]", field_types.join(", ")))),
+                        Some(CqlValue::List(field_names)),
+                        Some(CqlValue::List(field_types)),
                     ]
                 })
                 .collect();
@@ -1218,9 +1286,30 @@ async fn route_select(
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
         ("system_schema", "functions" | "aggregates" | "triggers" | "views") => {
+            // p1-37: Stub these tables until they have first-class
+            // implementations. Honor the SELECT projection so col_specs
+            // match driver-requested shape — every column is advertised
+            // as `text` in the empty result set, which is good enough
+            // when there are no rows to type-check.
+            let col_names: Vec<String> = if s.columns.is_empty()
+                || s.columns
+                    .iter()
+                    .any(|c| matches!(c, crate::ast::SelectColumn::Star))
+            {
+                vec!["keyspace_name".into()]
+            } else {
+                s.columns
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::ast::SelectColumn::Column(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let col_types: Vec<CqlType> = col_names.iter().map(|_| CqlType::Varchar).collect();
             Ok(result::encode_rows(
-                &["keyspace_name".into(), "type_name".into()],
-                &[CqlType::Varchar, CqlType::Varchar],
+                &col_names,
+                &col_types,
                 "system_schema",
                 s.table.as_str(),
                 &[],
@@ -1230,8 +1319,7 @@ async fn route_select(
             // Virtual table: check registry before storage lookup.
             if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
                 let rows = vtable.read(None);
-                let columns = vtable.columns();
-                return encode_virtual_rows(ks, &s.table, columns, &rows);
+                return encode_virtual_rows(ks, &s.table, vtable.as_ref(), &rows);
             }
 
             // User table: permission check + bridge + storage
@@ -2036,6 +2124,41 @@ fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<
     })
 }
 
+/// Decode a `list<text>` virtual cell. The bytes were produced by
+/// `VirtualColumnDef::encode_list_text` (4-byte BE count, then per
+/// element 4-byte BE length + UTF-8 bytes).
+fn decode_list_text_cell(cell: &ferrosa_common::CellValue) -> Option<CqlValue> {
+    let bytes = cell.value.as_ref()?;
+    if bytes.len() < 4 {
+        return None;
+    }
+    let count = i32::from_be_bytes(bytes[0..4].try_into().ok()?);
+    if count < 0 {
+        return None;
+    }
+    let mut items: Vec<CqlValue> = Vec::with_capacity(count as usize);
+    let mut off = 4usize;
+    for _ in 0..count {
+        if off + 4 > bytes.len() {
+            return None;
+        }
+        let len = i32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+        off += 4;
+        if len < 0 {
+            items.push(CqlValue::Text(String::new()));
+            continue;
+        }
+        let len = len as usize;
+        if off + len > bytes.len() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&bytes[off..off + len]).into_owned();
+        off += len;
+        items.push(CqlValue::Text(s));
+    }
+    Some(CqlValue::List(items))
+}
+
 /// Encode virtual table rows as a CQL ROWS result body.
 ///
 /// Converts `VirtualRow` cells (raw `CellValue` bytes) into typed `CqlValue`s
@@ -2043,13 +2166,20 @@ fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<
 fn encode_virtual_rows(
     keyspace: &str,
     table: &str,
-    columns: &[VirtualColumnDef],
+    vtable: &dyn ferrosa_schema::VirtualTable,
     rows: &[VirtualRow],
 ) -> Result<BytesMut, CqlError> {
+    let columns = vtable.columns();
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
     let col_types: Vec<CqlType> = columns
         .iter()
-        .map(|c| data_type_to_cql_type(&c.data_type))
+        .enumerate()
+        .map(|(idx, c)| match vtable.wire_type_for(idx) {
+            // p1-37: virtual columns whose CQL type is a collection
+            // bypass the scalar `DataType` mapping.
+            Some(ferrosa_schema::WireType::ListText) => CqlType::List(Box::new(CqlType::Varchar)),
+            None => data_type_to_cql_type(&c.data_type),
+        })
         .collect();
 
     let cql_rows: Vec<Vec<Option<CqlValue>>> = rows
@@ -2057,8 +2187,14 @@ fn encode_virtual_rows(
         .map(|row| {
             row.cells
                 .iter()
-                .zip(columns.iter())
-                .map(|(cell, col)| cell_to_cql_value(cell, &col.data_type))
+                .zip(columns.iter().enumerate())
+                .map(|(cell, (idx, col))| match vtable.wire_type_for(idx) {
+                    // p1-37: cell already holds CQL-list-encoded bytes;
+                    // decode them into a typed `CqlValue::List` for the
+                    // result encoder.
+                    Some(ferrosa_schema::WireType::ListText) => decode_list_text_cell(cell),
+                    None => cell_to_cql_value(cell, &col.data_type),
+                })
                 .collect()
         })
         .collect();

@@ -131,7 +131,12 @@ pub fn query_columns(snap: &SchemaSnapshot) -> Vec<ColumnRow> {
                 ColumnKind::Static => "static".to_string(),
             },
             position: c.position,
-            column_type: c.column_type.clone(),
+            // p1-37: scylla 0.15 driver's CQL type parser doesn't recognize
+            // `vector<...>` types and rejects the whole metadata fetch.
+            // Advertise vectors as `blob` to drivers — the on-disk
+            // representation is bytes anyway, and DML still works because
+            // INSERT/SELECT serialize vectors as blob bytes.
+            column_type: rewrite_unsupported_types(&c.column_type),
             clustering_order: match c.clustering_order {
                 crate::metadata::column::ClusteringOrder::Asc => "asc".to_string(),
                 crate::metadata::column::ClusteringOrder::Desc => "desc".to_string(),
@@ -140,6 +145,15 @@ pub fn query_columns(snap: &SchemaSnapshot) -> Vec<ColumnRow> {
         })
     }));
     rows
+}
+
+/// Rewrite types that drivers may not parse to a compatible alternative.
+/// Currently: `vector<...>` → `blob`. Other types pass through unchanged.
+fn rewrite_unsupported_types(ty: &str) -> String {
+    if ty.starts_with("vector<") {
+        return "blob".to_string();
+    }
+    ty.to_string()
 }
 
 /// Virtual system table entries for `system_schema.tables`.
@@ -216,8 +230,11 @@ fn system_column_rows() -> Vec<ColumnRow> {
         });
     }
 
-    // system.peers / peers_v2 columns
-    let peer_cols: &[(&str, &str, &str, i32)] = &[
+    // system.peers / peers_v2 columns. p1-37: legacy `system.peers` MUST
+    // include `rpc_address inet` (Cassandra 3.x legacy column) — drivers
+    // like scylla 0.15 fail metadata fetch otherwise. `peers_v2` does
+    // NOT include it (it uses native_address instead).
+    let peers_v2_cols: &[(&str, &str, &str, i32)] = &[
         ("peer", "partition_key", "inet", 0),
         ("peer_port", "regular", "int", -1),
         ("data_center", "regular", "text", -1),
@@ -229,8 +246,25 @@ fn system_column_rows() -> Vec<ColumnRow> {
         ("release_version", "regular", "text", -1),
         ("tokens", "regular", "set<varchar>", -1),
     ];
-    for table in &["peers", "peers_v2"] {
-        for (name, kind, cql_type, pos) in peer_cols {
+    // p1-37: legacy `system.peers` is the union of peers_v2's columns
+    // PLUS `rpc_address` (the original Cassandra 3.x column drivers
+    // type-check on). Cassandra 4+'s system.peers includes both, so
+    // keeping both maximizes driver compatibility.
+    let peers_v1_cols: &[(&str, &str, &str, i32)] = &[
+        ("peer", "partition_key", "inet", 0),
+        ("peer_port", "regular", "int", -1),
+        ("data_center", "regular", "text", -1),
+        ("rack", "regular", "text", -1),
+        ("host_id", "regular", "uuid", -1),
+        ("native_address", "regular", "inet", -1),
+        ("native_port", "regular", "int", -1),
+        ("rpc_address", "regular", "inet", -1),
+        ("schema_version", "regular", "uuid", -1),
+        ("release_version", "regular", "text", -1),
+        ("tokens", "regular", "set<varchar>", -1),
+    ];
+    for (table, cols) in [("peers", peers_v1_cols), ("peers_v2", peers_v2_cols)] {
+        for (name, kind, cql_type, pos) in cols {
             rows.push(ColumnRow {
                 keyspace_name: "system".to_string(),
                 table_name: table.to_string(),

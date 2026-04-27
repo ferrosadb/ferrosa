@@ -44,6 +44,17 @@ pub trait VirtualTable: Send + Sync {
 
     /// How the table should be kept fresh when watched by a subscriber.
     fn subscription_mode(&self) -> SubscriptionMode;
+
+    /// Optional richer wire-type for the column at `col_idx`. Default
+    /// returns `None` — the column's wire type derives from
+    /// `columns()[col_idx].data_type`. Tables whose columns map to
+    /// CQL collection types (e.g. `system_schema.types.field_names` is
+    /// `frozen<list<text>>`) override this to return `Some(WireType)`.
+    /// Cell bytes for such columns MUST be already CQL-encoded per the
+    /// variant — see `VirtualColumnDef::encode_list_text`.
+    fn wire_type_for(&self, _col_idx: usize) -> Option<WireType> {
+        None
+    }
 }
 
 /// A single row returned by a virtual table.
@@ -60,6 +71,30 @@ pub struct VirtualColumnDef {
     pub name: String,
     /// Scalar CQL type of this column.
     pub data_type: DataType,
+}
+
+/// Wire-type families needed for virtual columns whose protocol shape is
+/// richer than `DataType`. Returned per-column-index by
+/// `VirtualTable::wire_type_for`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireType {
+    /// `list<text>` — frame-encoded as: 4-byte BE element count, then
+    /// for each element 4-byte BE length + UTF-8 bytes.
+    ListText,
+}
+
+impl VirtualColumnDef {
+    /// Encode a slice of strings as native CQL `list<text>` bytes.
+    pub fn encode_list_text(items: &[String]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + items.iter().map(|s| 4 + s.len()).sum::<usize>());
+        buf.extend_from_slice(&(items.len() as i32).to_be_bytes());
+        for s in items {
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        buf
+    }
 }
 
 /// A conjunction of column filters applied to a virtual table scan.
