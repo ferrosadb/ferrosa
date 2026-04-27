@@ -1,7 +1,7 @@
 //! Actor-based lane management for cancel-safe internode RPC.
 //!
 //! Each network lane (Raft, Data, Bulk) is owned by a single spawned task that
-//! processes [`LaneCommand`]s sequentially via an mpsc channel.  Callers
+//! processes `LaneCommand`s sequentially via an mpsc channel.  Callers
 //! interact through [`LaneHandle`], a thin Clone wrapper around the sender.
 //!
 //! This design eliminates the cancel-safety hazard of holding a `tokio::Mutex`
