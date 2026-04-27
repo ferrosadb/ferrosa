@@ -2167,6 +2167,243 @@ async fn v5_startup_and_query_over_framed_transport() {
     );
 }
 
+// ── P0-22 regression: PREPARE response must carry bind-marker column metadata ──
+//
+// The CQL native protocol PREPARE response (RESULT/Prepared body) includes a
+// "bind-variable metadata" section that reports how many `?` placeholders the
+// statement has and what type each one maps to.  This metadata is:
+//
+//   [i32 flags] [i32 col_count] [i32 pk_count] [pk_indexes...] [ks] [tbl]
+//   [for each bind col: col_name_str + type_id_u16]
+//
+// Strict CQL drivers (scylla Rust driver, DataStax Java/C#, gocql, Python
+// cassandra-driver) read `col_count` and reject execute_unpaged when the
+// caller supplies a different number of values (WrongColumnCount).  The
+// cdrs-tokio fork used by fmem pre-p1-22 was lenient and ignored this.
+//
+// These tests assert the col_count from the raw PREPARE response body so that
+// any future regression is caught before it reaches a strict external driver.
+
+/// Parse the bind-variable `col_count` from a RESULT/Prepared body.
+///
+/// Body layout starting at byte 0:
+///   [0..4]   i32 kind = 0x0004
+///   [4..6]   u16 id_len = 16
+///   [6..22]  16 bytes id
+///   [22..26] i32 bind_flags
+///   [26..30] i32 bind_col_count  ← returned by this function
+fn extract_bind_col_count_from_prepared_response(body: &[u8]) -> i32 {
+    assert!(
+        body.len() >= 30,
+        "PREPARED response body too short to contain bind_col_count; \
+         body len = {}, expected >= 30",
+        body.len()
+    );
+    let kind = i32::from_be_bytes(body[0..4].try_into().unwrap());
+    assert_eq!(
+        kind, 0x0004,
+        "expected Prepared kind (0x0004), got 0x{kind:04X}"
+    );
+    let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+    assert_eq!(id_len, 16, "prepared ID length must be 16");
+    // bind_flags at offset 22, bind_col_count at offset 26
+    i32::from_be_bytes(body[26..30].try_into().unwrap())
+}
+
+/// P0-22 regression: INSERT with 3 `?` bind markers must report col_count = 3.
+///
+/// This is the canonical external-driver compatibility test.  A strict driver
+/// (scylla, gocql, DataStax) reads col_count from the PREPARE response and
+/// rejects execute_unpaged when the Rust tuple length != col_count.  Returning
+/// col_count = 0 causes:
+///   WrongColumnCount { rust_cols: 3, cql_cols: 0 }
+#[tokio::test]
+async fn prepare_insert_bind_col_count_matches_placeholder_count() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // DDL: keyspace + table
+    let body = encode_query_body(
+        "CREATE KEYSPACE p0_22_ins WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let body = encode_query_body("CREATE TABLE p0_22_ins.t (a uuid PRIMARY KEY, b text, c int)");
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    // PREPARE an INSERT with 3 bind markers
+    let prep_body = encode_prepare_body("INSERT INTO p0_22_ins.t (a, b, c) VALUES (?, ?, ?)");
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let col_count = extract_bind_col_count_from_prepared_response(&resp.body);
+    assert_eq!(
+        col_count, 3,
+        "PREPARE INSERT with 3 bind markers must report bind col_count = 3; \
+         got {col_count}. A strict CQL driver (scylla, gocql, DataStax) would \
+         reject execute_unpaged with WrongColumnCount {{ rust_cols: 3, cql_cols: {col_count} }}"
+    );
+}
+
+/// P0-22 regression: INSERT with 8 `?` bind markers (the fmem entity_store case).
+///
+/// This exercises the exact statement that failed in ferrosa-memory PR #10 CI:
+///   WrongColumnCount { rust_cols: 8, cql_cols: 0 }
+#[tokio::test]
+async fn prepare_insert_eight_bind_markers_reports_col_count_eight() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body(
+        "CREATE KEYSPACE agent_memory_p0_22 WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    // Mirrors the fmem entity_store schema (minus vector column, which is not
+    // part of the failing INSERT).
+    let body = encode_query_body(
+        "CREATE TABLE agent_memory_p0_22.entity_store (\
+         tenant_id uuid, session_id uuid, entity_id uuid, \
+         entity_name text, entity_type text, context_snippet text, \
+         confidence float, created_at timestamp, \
+         PRIMARY KEY ((tenant_id, session_id), entity_id))",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    // This is the exact PREPARE statement from ferrosa_bugs.rs:100-104
+    let prep_body = encode_prepare_body(
+        "INSERT INTO agent_memory_p0_22.entity_store \
+         (tenant_id, session_id, entity_id, entity_name, entity_type, \
+          context_snippet, confidence, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let col_count = extract_bind_col_count_from_prepared_response(&resp.body);
+    assert_eq!(
+        col_count, 8,
+        "PREPARE INSERT (entity_store, 8 bind markers) must report bind col_count = 8; \
+         got {col_count}. This is the fmem p0-22 failure: \
+         WrongColumnCount {{ rust_cols: 8, cql_cols: {col_count} }}"
+    );
+}
+
+/// P0-22 regression: SELECT with 1 WHERE bind marker must report col_count = 1.
+#[tokio::test]
+async fn prepare_select_with_one_where_bind_marker_reports_col_count_one() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body(
+        "CREATE KEYSPACE p0_22_sel WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let body = encode_query_body("CREATE TABLE p0_22_sel.t (a uuid PRIMARY KEY, b text)");
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let prep_body = encode_prepare_body("SELECT * FROM p0_22_sel.t WHERE a = ?");
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let col_count = extract_bind_col_count_from_prepared_response(&resp.body);
+    assert_eq!(
+        col_count, 1,
+        "PREPARE SELECT with 1 WHERE bind marker must report bind col_count = 1; \
+         got {col_count}"
+    );
+}
+
+/// P0-22 regression: PREPARE for a table that is not yet in the local schema
+/// (simulates Raft schema-replication lag) must return an error, NOT a
+/// PREPARED response with col_count = 0.
+///
+/// Background: In a multi-node ferrosa cluster the CREATE TABLE DDL goes
+/// through Raft.  After the leader commits the entry, a follower node may
+/// receive a PREPARE on the same connection before its state machine has
+/// applied the log entry.  Before this fix, handle_prepare() returned a
+/// valid-looking PREPARED result with bind col_count = 0, which caused
+/// strict CQL drivers to reject every subsequent execute_unpaged call:
+///   WrongColumnCount { rust_cols: N, cql_cols: 0 }
+///
+/// After the fix, handle_prepare() returns an ERROR (Invalid) when the
+/// bound-column count from schema lookup does not match the bind-marker count
+/// from the AST, so the driver retries and hits a node with current schema.
+#[tokio::test]
+async fn prepare_against_missing_table_returns_error_not_col_count_zero() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Intentionally do NOT create the keyspace or table — the table does not
+    // exist in the schema on this node (simulates Raft schema lag).
+    let prep_body =
+        encode_prepare_body("INSERT INTO ghost_ks.ghost_table (a, b, c) VALUES (?, ?, ?)");
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+
+    // Must be ERROR, NOT RESULT
+    assert_eq!(
+        resp.opcode,
+        Opcode::Error,
+        "PREPARE against a table not in local schema must return ERROR (not PREPARED \
+         with col_count=0). Before p0-22 fix this returned PREPARED with col_count=0, \
+         causing WrongColumnCount in strict CQL drivers."
+    );
+}
+
+/// P0-22 control case: SELECT with no `?` markers must report col_count = 0.
+#[tokio::test]
+async fn prepare_no_bind_markers_reports_col_count_zero() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body(
+        "CREATE KEYSPACE p0_22_ctrl WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let body = encode_query_body("CREATE TABLE p0_22_ctrl.t (a uuid PRIMARY KEY, b text)");
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let prep_body = encode_prepare_body("SELECT * FROM p0_22_ctrl.t");
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let col_count = extract_bind_col_count_from_prepared_response(&resp.body);
+    assert_eq!(
+        col_count, 0,
+        "PREPARE SELECT with no bind markers must report col_count = 0; \
+         got {col_count} (control case)"
+    );
+}
+
 /// Test that v4 connections still work alongside v5.
 #[tokio::test]
 async fn v4_and_v5_coexist_on_same_server() {
