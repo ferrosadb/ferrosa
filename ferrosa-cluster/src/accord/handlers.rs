@@ -16,7 +16,10 @@ use ferrosa_net::message::Message;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 
 use super::state_machine::{AccordStateMachine, SmResponse};
-use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
+use super::wire::{
+    AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, CommitPayload,
+    PreAcceptOkPayload, PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload, RecoverPayload,
+};
 
 /// Shared mutable access to the Accord state machine.
 ///
@@ -24,61 +27,6 @@ use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
 /// (Accord's per-shard model). In production this would be sharded
 /// by token range; for now a single lock suffices.
 pub type AccordState = Arc<parking_lot::Mutex<AccordStateMachine>>;
-
-// ---------------------------------------------------------------------------
-// Wire types (bincode-serialized payloads)
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PreAcceptPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    key: Vec<u8>,
-    ballot: BallotNumber,
-    epoch: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PreAcceptOkPayload {
-    from: u64,
-    t: Timestamp,
-    deps: Vec<TxnId>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct AcceptPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    t: Timestamp,
-    deps: Vec<TxnId>,
-    ballot: BallotNumber,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct AcceptOkPayload {
-    txn_id: TxnId,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CommitPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    t: Timestamp,
-    deps: Vec<TxnId>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ApplyPayload {
-    txn_id: TxnId,
-    result_data: Vec<u8>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RecoverPayload {
-    txn_id: TxnId,
-    t0: Timestamp,
-    ballot: BallotNumber,
-}
 
 // ---------------------------------------------------------------------------
 // AccordHandler — single handler for all 6 inbound Accord message types
@@ -171,10 +119,18 @@ impl RpcHandler for AccordHandler {
                 let payload: ApplyPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordApply: deserialize failed: {e}"))
                     .ok()?;
+                let txn_id = payload.txn_id;
                 let mut sm = self.state.lock();
-                sm.handle_apply(payload.txn_id, payload.result_data);
+                sm.handle_apply(txn_id, payload.result_data);
                 drop(sm);
-                Some(Message::AccordApplyOK(Bytes::new()))
+                // Gap 5: return a structured ApplyOK so the coordinator can
+                // count F+1 acknowledged applies before returning to the client.
+                let ok = ApplyOkPayload {
+                    txn_id,
+                    from: self.local_node_id,
+                };
+                let bytes = bincode::serialize(&ok).ok()?;
+                Some(Message::AccordApplyOK(Bytes::from(bytes)))
             }
 
             Message::AccordRecover(b) => {
@@ -189,9 +145,43 @@ impl RpcHandler for AccordHandler {
             }
 
             Message::AccordRead(b) => {
-                // Read is dispatched to the state machine for conflict tracking.
-                // For now, echo the request back as ReadOK.
-                Some(Message::AccordReadOK(b))
+                // Gap 4: Linearizable read-vote.
+                //
+                // Decode the ReadVotePayload and evaluate the IF condition by
+                // checking whether the row at the agreed timestamp `t` exists.
+                //
+                // For `INSERT IF NOT EXISTS`, the condition holds iff the row
+                // does NOT exist (i.e., the state machine has not yet applied
+                // a write for this key).
+                //
+                // This implementation evaluates the condition using the state
+                // machine's committed/applied tracking:
+                // - If a transaction for this key is in Applied state → row exists
+                //   → condition does NOT hold (INSERT IF NOT EXISTS fails).
+                // - Otherwise → row does not exist → condition holds.
+                //
+                // A full production implementation would read actual storage.
+                if let Ok(vote_req) = bincode::deserialize::<ReadVotePayload>(&b) {
+                    let sm = self.state.lock();
+                    // Check if any transaction for this key was already applied.
+                    // We use txn_count as a proxy: if no transactions have been
+                    // applied (Applied phase) for this key's epoch, condition holds.
+                    // More precisely: check if there's an Applied txn with a
+                    // commit timestamp <= vote_req.t.
+                    let condition_holds = sm.read_condition_holds_at(&vote_req.key, &vote_req.t);
+                    drop(sm);
+                    let ok = ReadVoteOkPayload {
+                        txn_id: vote_req.txn_id,
+                        from: self.local_node_id,
+                        condition_holds,
+                        current_row: vec![],
+                    };
+                    let resp_bytes = bincode::serialize(&ok).ok()?;
+                    Some(Message::AccordReadOK(Bytes::from(resp_bytes)))
+                } else {
+                    // Fallback: echo request bytes (backward compat).
+                    Some(Message::AccordReadOK(b))
+                }
             }
 
             _ => None,

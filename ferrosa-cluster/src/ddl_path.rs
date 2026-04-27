@@ -294,6 +294,13 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
                 .drop_aggregate_internal(keyspace, name, arg_types)
                 .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
         }
+        DdlOperation::JoinNode(_) => {
+            // Topology-only operation — not applied to local schema directly.
+            // The leader handles this via client_write(RaftOp::JoinNode(..));
+            // apply_direct is only called in standalone mode where there is
+            // no cluster membership to update.
+            return Ok(());
+        }
     }
     schema.set_schema_version(Uuid::new_v4());
     Ok(())
@@ -424,6 +431,7 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
             name,
             arg_types,
         },
+        DdlOperation::JoinNode(node_info) => RaftOp::JoinNode(node_info),
     };
     RaftCommand {
         op: raft_op,
@@ -542,7 +550,116 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
         };
 
         match execute_via_raft(&self.raft, op.clone()).await {
-            Ok(()) => Some(Message::PairDdlAck(Bytes::new())),
+            Ok(()) => {
+                // P0-21: after a successful JoinNode commit, promote the new
+                // node to openraft voter via change_membership so the leader
+                // will replicate / send InstallSnapshot to it.
+                //
+                // RaftOp::JoinNode updates the ferrosa state machine's topology
+                // map but does NOT update openraft's voter set.  Without this
+                // call, openraft won't send AppendEntries/InstallSnapshot to
+                // the new member — the node stays stuck at T0-N0-0 forever.
+                if let DdlOperation::JoinNode(ref node_info) = op {
+                    use crate::raft::uuid_to_node_id;
+                    use std::collections::BTreeSet;
+                    let rejoin_node_id = uuid_to_node_id(node_info.host_id);
+                    let mut new_members = BTreeSet::new();
+                    new_members.insert(rejoin_node_id);
+                    let raft = self.raft.clone();
+                    let host_id = node_info.host_id;
+
+                    // Register the rejoining node in the shared node_map so
+                    // FerrosRaftNetworkFactory can resolve its UUID when openraft
+                    // calls new_client() for the add_learner / AppendEntries RPCs.
+                    // Without this, new_client returns Uuid::nil() and all
+                    // replication to the rejoining node silently fails.
+                    {
+                        let mut map = self.node_map.write().unwrap_or_else(|e| e.into_inner());
+                        map.insert(rejoin_node_id, host_id);
+                    }
+                    tracing::info!(
+                        node_id = rejoin_node_id,
+                        host_id = %host_id,
+                        "cluster_rejoin: registered node in network factory node_map"
+                    );
+
+                    tokio::spawn(async move {
+                        // openraft 0.9 requires two steps to promote a node to voter:
+                        // 1. add_learner — registers the node in openraft's node map
+                        //    so the leader knows its address and can replicate to it.
+                        // 2. change_membership(AddVoterIds) — promotes the learner to
+                        //    a full voting member.
+                        //
+                        // Skipping step 1 results in:
+                        //   "Learner <id> not found: add it as learner before adding it as a voter"
+                        tracing::info!(
+                            node_id = rejoin_node_id,
+                            host_id = %host_id,
+                            "cluster_rejoin: step 1 — add_learner so leader can replicate to node"
+                        );
+                        match raft
+                            .add_learner(
+                                rejoin_node_id,
+                                openraft::BasicNode {
+                                    addr: String::new(),
+                                },
+                                false,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::info!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    "cluster_rejoin: step 1 done — node registered as learner; \
+                                     promoting to voter"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    error = %e,
+                                    "cluster_rejoin: add_learner failed — aborting voter promotion"
+                                );
+                                return;
+                            }
+                        }
+
+                        tracing::info!(
+                            node_id = rejoin_node_id,
+                            host_id = %host_id,
+                            "cluster_rejoin: step 2 — change_membership AddVoterIds"
+                        );
+                        match raft
+                            .change_membership(
+                                openraft::ChangeMembers::AddVoterIds(new_members),
+                                true,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::info!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    "cluster_rejoin: change_membership AddVoterIds committed — \
+                                     openraft will now replicate to rejoined node"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id = rejoin_node_id,
+                                    host_id = %host_id,
+                                    error = %e,
+                                    "cluster_rejoin: change_membership AddVoterIds failed \
+                                     (node may still converge via snapshot on next heartbeat)"
+                                );
+                            }
+                        }
+                    });
+                }
+                Some(Message::PairDdlAck(Bytes::new()))
+            }
             Err(ClusterError::NotLeader {
                 leader_id: Some(leader_node_id),
             }) => {

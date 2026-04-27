@@ -698,6 +698,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         topology_policy,
         auth_warn: storage_auth_warn,
+        // p0-03c: wire the real PeerManager and a process-wide HLC into
+        // SharedState so LWT statements in cluster mode route through
+        // AccordCoordinatorDriver over TCP instead of returning ServerError.
+        // The PeerManager was constructed above (step 6) and is already used
+        // for heartbeats and DDL forwarding — reuse the same Arc so there is
+        // exactly one peer map per process.
+        peer_manager: Some(peer_manager.clone()),
+        // Derive a stable u64 node identifier from the first 8 bytes of
+        // host_id (big-endian). The HLC is created once per process; all
+        // Accord transactions on this node share it to guarantee monotone
+        // timestamp ordering across concurrent LWT coordinators.
+        accord_clock: {
+            let host_bytes = host_id.as_bytes();
+            let node_id =
+                u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
+            Some(Arc::new(ferrosa_common::accord::HybridLogicalClock::new(
+                node_id, 0, // use default 500 ms max drift
+            )))
+        },
     });
     let auth_disabled = cql_config.auth_disabled;
 
@@ -1495,9 +1514,8 @@ mod tests {
     }
 
     /// BT-005f: WebConfig::from_env parses the FERROSA_WEB_BIND env var.
-    /// This test and bt005g run sequentially via a shared mutex to avoid
-    /// env var interference with parallel tests.
     #[test]
+    #[serial_test::serial(env)]
     fn bt005_web_config_env_var_parsing() {
         // Test 1: valid address.
         std::env::set_var("FERROSA_WEB_BIND", "127.0.0.1:8080");
@@ -1539,6 +1557,7 @@ mod tests {
 
     /// BT-005i: load_or_generate_host_id generates a valid UUID and persists it.
     #[test]
+    #[serial_test::serial(env)]
     fn bt005_host_id_generation_and_persistence() {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("FERROSA_HOST_ID");

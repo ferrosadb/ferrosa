@@ -120,6 +120,8 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         topology_policy: ClientTopologyPolicy::default(),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         auth_warn: false,
+        peer_manager: None,
+        accord_clock: None,
     });
     (state, dir)
 }

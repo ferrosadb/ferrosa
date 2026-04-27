@@ -12,6 +12,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::raft::NodeInfo;
 use ferrosa_common::CqlType;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
@@ -93,6 +94,14 @@ pub enum DdlOperation {
         name: String,
         arg_types: Vec<CqlType>,
     },
+    /// Topology operation: add this node to the cluster voter set.
+    ///
+    /// Forwarded by a rejoining node to the existing Raft leader so the
+    /// leader can call `client_write(RaftOp::JoinNode(..))` on behalf of
+    /// the rejoiner.  Not used in pair-mode DDL coordination; present here
+    /// so the `PairDdlForward` RPC path (which `ClusterDdlForwardHandler`
+    /// already handles) can carry it without a new message type.
+    JoinNode(NodeInfo),
 }
 
 impl DdlOperation {
@@ -345,6 +354,11 @@ impl DdlCoordinator {
                 self.schema
                     .drop_aggregate_internal(keyspace, name, arg_types)
                     .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
+            }
+            DdlOperation::JoinNode(_) => {
+                // Topology-only operation — not applied locally in pair mode.
+                // In cluster mode this is forwarded to the leader and executed
+                // via client_write(RaftOp::JoinNode(..)).
             }
         }
         Ok(())

@@ -52,5 +52,5 @@ pub use system::TopologyView;
 pub use virtual_registry::VirtualTableRegistry;
 pub use virtual_table::{
     ColumnFilter, PredicateOp, RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow,
-    VirtualTable,
+    VirtualTable, WireType,
 };

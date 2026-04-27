@@ -2080,7 +2080,7 @@ impl StorageEngine {
     pub async fn open_from_snapshot_with_store(
         config: StorageEngineConfig,
         snapshot_name: &str,
-        _point_in_time: Option<i64>,
+        point_in_time: Option<i64>,
         node_id: &str,
         force: bool,
         store: std::sync::Arc<dyn object_store::ObjectStore>,
@@ -2127,12 +2127,79 @@ impl StorageEngine {
         )?;
 
         // 6. Open the engine normally; SSTables are on disk from step 3.
-        //    Callers register table schemas and optionally call replay_from()
-        //    to apply mutations beyond the snapshot boundary.
-        //
-        // TODO(PITR): full mutation replay from downloaded segment files —
-        //   deserialize mutations, filter by _point_in_time, apply via write().
         let engine = StorageEngine::new(config, None)?;
+
+        // 7. Replay archived commit log segments from the snapshot boundary
+        //    forward to `point_in_time` (inclusive).
+        //
+        //    Algorithm:
+        //    a. Read each downloaded segment file with SegmentReader.
+        //    b. Collect all mutations whose position is after the snapshot
+        //       commit-log position (segment_id > snapshot's, or same segment
+        //       with offset > snapshot's offset).
+        //    c. If `point_in_time` is set, drop mutations with timestamp >
+        //       point_in_time (precise PITR cutoff).
+        //    d. Deduplicate by mutation_id (idempotent replay).
+        //    e. Apply to memtables via replay_mutations().
+        //
+        //    Replay is deferred until after table schemas are registered, so
+        //    we collect mutations here and use the deferred-mutation queue that
+        //    replay_mutations() already provides.
+        let snapshot_position = metadata.commit_log_position;
+
+        if !segment_ids.is_empty() {
+            let mut raw_mutations: Vec<Mutation> = Vec::new();
+
+            for seg_id in &segment_ids {
+                let seg_path = segment_dir.join(format!("commitlog-{seg_id}.log"));
+                if !seg_path.exists() {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "PITR replay: segment file missing after download: {}",
+                        seg_path.display()
+                    )));
+                }
+
+                let mut reader =
+                    crate::commitlog::reader::SegmentReader::open(&seg_path).map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "PITR replay: failed to open segment {seg_id}: {e}"
+                        ))
+                    })?;
+
+                let entries = reader.read_all().map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "PITR replay: failed to read segment {seg_id}: {e}"
+                    ))
+                })?;
+
+                for (pos, mutation) in entries {
+                    // Skip mutations that are at or before the snapshot boundary.
+                    // pos > snapshot_position means this mutation was written
+                    // after the snapshot was taken.
+                    if pos > snapshot_position {
+                        raw_mutations.push(mutation);
+                    }
+                }
+            }
+
+            // Apply point-in-time cutoff: drop mutations after the target timestamp.
+            let replay_mutations = match point_in_time {
+                Some(pit) => {
+                    crate::restore::validation::filter_mutations_by_timestamp(raw_mutations, pit)
+                }
+                None => raw_mutations,
+            };
+
+            tracing::info!(
+                snapshot = snapshot_name,
+                segment_count = segment_ids.len(),
+                mutation_count = replay_mutations.len(),
+                point_in_time = ?point_in_time,
+                "PITR: replaying archived commit log mutations"
+            );
+
+            engine.replay_mutations(replay_mutations)?;
+        }
 
         Ok(engine)
     }
@@ -3210,8 +3277,12 @@ impl StorageEngine {
         table_id: &TableId,
         manifest: &crate::manifest::Manifest,
     ) -> ferrosa_common::Result<usize> {
-        let (os_config, store) = self.object_store_and_config()?;
-        let prefix = &os_config.prefix;
+        // In test builds, `resolve_store_and_prefix` checks the injected
+        // `upload_store_override` before falling back to the real S3 config.
+        // In production this is equivalent to `object_store_and_config`.
+        let (store, prefix) = self
+            .resolve_store_and_prefix()
+            .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
 
         let entries = match manifest.sstables.get(&table_id.to_string()) {
             Some(e) => e,
@@ -3228,8 +3299,12 @@ impl StorageEngine {
         })?;
 
         let mut downloaded = 0;
-        let components = [
-            "Data.db",
+        // Data.db is the only required component; the rest are optional.
+        // Missing optional components produce a warning but do not fail the
+        // download.  Missing Data.db is a hard error — the SSTable cannot be
+        // read without it.
+        let required_components = ["Data.db"];
+        let optional_components = [
             "Partitions.db",
             "Rows.db",
             "Filter.db",
@@ -3239,15 +3314,63 @@ impl StorageEngine {
 
         for entry in entries {
             let hex = crate::upload::manager::hex_prefix_for(&entry.id);
+            let mut wrote_any = false;
 
-            for component in &components {
-                let s3_path = object_store::path::Path::from(format!(
-                    "{prefix}/{hex}/{table_id}/{}/{component}",
-                    entry.id
-                ));
+            // Required components: return an error on NotFound.
+            for component in &required_components {
+                let s3_path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id.to_string(),
+                    &entry.id,
+                    component,
+                );
                 let local_path = table_dir.join(format!("{}-{component}", entry.id));
 
-                // Skip if already downloaded.
+                if local_path.exists() {
+                    wrote_any = true;
+                    continue;
+                }
+
+                match store.get(&s3_path).await {
+                    Ok(result) => {
+                        let data = result.bytes().await.map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to read {s3_path}: {e}"
+                            ))
+                        })?;
+                        std::fs::write(&local_path, &data).map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to write {}: {e}",
+                                local_path.display()
+                            ))
+                        })?;
+                        wrote_any = true;
+                    }
+                    Err(object_store::Error::NotFound { .. }) => {
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "required SSTable component not found in S3: {s3_path}"
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "S3 download failed for {s3_path}: {e}"
+                        )));
+                    }
+                }
+            }
+
+            // Optional components: log a warning on NotFound, continue.
+            for component in &optional_components {
+                let s3_path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id.to_string(),
+                    &entry.id,
+                    component,
+                );
+                let local_path = table_dir.join(format!("{}-{component}", entry.id));
+
                 if local_path.exists() {
                     continue;
                 }
@@ -3267,8 +3390,11 @@ impl StorageEngine {
                         })?;
                     }
                     Err(object_store::Error::NotFound { .. }) => {
-                        // Component might not exist (e.g., CompressionInfo.db is optional)
-                        continue;
+                        tracing::debug!(
+                            sstable = entry.id,
+                            component,
+                            "optional SSTable component absent in S3 — skipping"
+                        );
                     }
                     Err(e) => {
                         return Err(ferrosa_common::Error::InvalidFormat(format!(
@@ -3277,7 +3403,13 @@ impl StorageEngine {
                     }
                 }
             }
-            downloaded += 1;
+
+            // Only count this SSTable as downloaded after at least one file
+            // landed on disk.  This ensures `downloaded_total` reflects
+            // bytes-on-disk reality rather than manifest-entry count.
+            if wrote_any {
+                downloaded += 1;
+            }
         }
 
         Ok(downloaded)
@@ -3396,8 +3528,6 @@ impl StorageEngine {
         store: Arc<dyn object_store::ObjectStore>,
         prefix: &str,
     ) {
-        use object_store::path::Path as ObjectPath;
-
         let mut manifest = match crate::manifest::Manifest::load(store.as_ref(), prefix).await {
             Ok((m, _)) => m,
             Err(_) => crate::manifest::Manifest::new(),
@@ -3468,9 +3598,13 @@ impl StorageEngine {
                     let local_path = table_dir.join(format!("{gen}-{component}"));
                     if local_path.exists() {
                         let data = std::fs::read(&local_path).unwrap();
-                        let s3_path = ObjectPath::from(format!(
-                            "{prefix}/{hex}/{table_id_str}/{gen}/{component}"
-                        ));
+                        let s3_path = crate::upload::manager::sstable_object_key(
+                            prefix,
+                            &hex,
+                            table_id_str,
+                            &gen_str,
+                            component,
+                        );
                         store
                             .put(&s3_path, bytes::Bytes::from(data).into())
                             .await
@@ -6882,6 +7016,223 @@ mod tests {
         });
     }
 
+    // =========================================================================
+    // PITR E2E: Commit-log replay to a point in time (p0-06)
+    // =========================================================================
+
+    /// Helper: run the PITR commit-log replay E2E test with a caller-supplied
+    /// batch size.
+    ///
+    /// Writes `batch_size` rows (batch 1), takes a snapshot, writes another
+    /// `batch_size` rows (batch 2) with later timestamps, then restores to a
+    /// point-in-time between the two batches.  Asserts that every batch-1 row
+    /// is present and every batch-2 row is absent.
+    ///
+    /// Used by both the fast (100-row) default test and the spec-mandated slow
+    /// (1 000-row) test so both share the same code path.
+    async fn run_pitr_replay_e2e(batch_size: usize) {
+        // ── Phase 1: create engine with archiving enabled ────────────
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "pitr-replay-test";
+
+        // Initialise live manifest + schema in S3.
+        let init_manifest = crate::manifest::Manifest::new();
+        init_manifest
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+            .await
+            .unwrap();
+
+        // Small segment size (256 bytes) forces rotation after each write,
+        // ensuring every mutation reaches a closed segment that gets archived.
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 256,
+                archive: Some(crate::commitlog::config::ArchiveConfig {
+                    enabled: true,
+                    poll_interval: std::time::Duration::from_millis(20),
+                    ..crate::commitlog::config::ArchiveConfig::default()
+                }),
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+
+        let engine = StorageEngine::new_with_archive_store(
+            config,
+            Some(&tokio::runtime::Handle::current()),
+            Some(Arc::clone(&store)),
+            prefix.to_string(),
+        )
+        .unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // ── Phase 2: write batch 1 — timestamps 1_000 … (1_000 + batch_size - 1) ──
+        // These rows MUST survive PITR restore.
+        for i in 0..batch_size {
+            let key_str = format!("batch1-{i:04}");
+            engine
+                .write(
+                    &tid,
+                    &make_key(&key_str),
+                    make_row(b"batch1", (1_000 + i as i64) * 1_000),
+                    (1_000 + i as i64) * 1_000,
+                )
+                .unwrap();
+        }
+
+        // Flush batch 1 to SSTables so the snapshot captures it.
+        engine.flush(&tid).unwrap();
+        engine
+            .upload_manifest_for_test(Arc::clone(&store), prefix)
+            .await;
+
+        // ── Phase 3: create snapshot (records commit_log_position) ───
+        let snap_meta = engine
+            .create_snapshot_with_store(
+                "pitr-snap",
+                "node-1",
+                None,
+                false,
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(snap_meta.name, "pitr-snap");
+
+        // point_in_time sits between the two batches (microseconds).
+        // batch 1 max timestamp: (1_000 + batch_size - 1) * 1_000
+        // batch 2 min timestamp: 2_000_000_000
+        // We set cutoff at 1_999_999_999 — includes all of batch 1, excludes batch 2.
+        let point_in_time: i64 = 1_999_999_999;
+
+        // ── Phase 4: write batch 2 — timestamps 2_000_000_000 … ─────
+        // These rows MUST be absent after PITR restore.
+        for i in 0..batch_size {
+            let key_str = format!("batch2-{i:04}");
+            engine
+                .write(
+                    &tid,
+                    &make_key(&key_str),
+                    make_row(b"batch2", 2_000_000_000 + i as i64),
+                    2_000_000_000 + i as i64,
+                )
+                .unwrap();
+        }
+
+        // Wait long enough for the archiver to upload all closed segments.
+        // The small (256-byte) segment size guarantees batch-2 mutations
+        // rotate into closed segments that the archiver will pick up.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Verify at least some segments were archived before proceeding.
+        let arch_manifest =
+            crate::commitlog::manifest::ArchiveManifest::load(store.as_ref(), prefix)
+                .await
+                .unwrap();
+        assert!(
+            !arch_manifest.segments.is_empty(),
+            "archiver must have uploaded at least one segment before restore"
+        );
+
+        engine.shutdown().unwrap();
+
+        // ── Phase 5: restore with PITR cutoff ───────────────────────
+        let restore_dir = tempfile::tempdir().unwrap();
+        let restore_config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(restore_dir.path()),
+            ..StorageEngineConfig::test_config(restore_dir.path())
+        };
+
+        let restored = StorageEngine::open_from_snapshot_with_store(
+            restore_config,
+            "pitr-snap",
+            Some(point_in_time),
+            "node-1",
+            false,
+            Arc::clone(&store),
+            prefix,
+        )
+        .await
+        .unwrap();
+
+        // Register table so deferred replay mutations are applied.
+        restored.register_table(test_schema()).unwrap();
+
+        // ── Phase 6: assertions ──────────────────────────────────────
+        // Batch 1 rows: all must be present.
+        for i in 0..batch_size {
+            let key_str = format!("batch1-{i:04}");
+            let result = restored.read(&tid, &make_key(&key_str)).unwrap();
+            assert!(
+                result.is_some(),
+                "batch1 row '{key_str}' must be present after PITR restore"
+            );
+            assert_eq!(
+                result.unwrap().rows[0].cells[0].1.value.as_deref(),
+                Some(b"batch1".as_slice()),
+                "batch1 row '{key_str}' must have correct value"
+            );
+        }
+
+        // Batch 2 rows: all must be absent (timestamp > point_in_time).
+        for i in 0..batch_size {
+            let key_str = format!("batch2-{i:04}");
+            let result = restored.read(&tid, &make_key(&key_str)).unwrap();
+            assert!(
+                result.is_none(),
+                "batch2 row '{key_str}' must NOT be present after PITR restore to {point_in_time}"
+            );
+        }
+
+        restored.shutdown().unwrap();
+    }
+
+    /// E4 (fast): Commit-log replay PITR — 100 rows pre-snapshot + 100 rows
+    /// post-snapshot.  Runs in default CI.  Validates the replay code path
+    /// without the runtime overhead of the full 1 000+1 000 spec requirement.
+    ///
+    /// For the spec-mandated 1 000+1 000 test see
+    /// [`e4_slow_pitr_commit_log_replay_1k_plus_1k`].
+    #[test]
+    fn e4_pitr_commit_log_replay_to_point_in_time() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_pitr_replay_e2e(100));
+    }
+
+    /// E4 (slow): Commit-log replay PITR — spec acceptance criterion #2
+    /// mandates exactly 1 000 pre-snapshot rows and 1 000 post-snapshot rows.
+    ///
+    /// Gated with `#[ignore]` because the archiver poll loop and 2 000
+    /// individual commit-log writes with a 256-byte segment size take ~60–90 s
+    /// on a typical CI runner.  Run explicitly with:
+    ///
+    /// ```sh
+    /// cargo test -p ferrosa-storage -- --ignored e4_slow_pitr_commit_log_replay_1k_plus_1k
+    /// ```
+    ///
+    /// Uses the identical code path as the fast 100-row variant; only the row
+    /// count differs.
+    #[test]
+    fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_pitr_replay_e2e(1_000));
+    }
+
     /// FM1/FM8: Archiver SHA-256 verification — archived segment data in S3
     /// must match the original segment on disk, bit-for-bit.
     #[test]
@@ -7948,6 +8299,7 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new());
 
         // Pre-populate input SSTable objects in S3 so deletion is meaningful.
+        // Use the shared key constructor so paths match what DeleteSSTable issues.
         let prefix = "test-node";
         let table_id_str = "test_ks.test_table";
         let input_id = "input_sst_1";
@@ -7959,9 +8311,13 @@ mod tests {
             "Statistics.db",
             "TOC.txt",
         ] {
-            let path = object_store::path::Path::from(format!(
-                "{prefix}/{hex}/{table_id_str}/{input_id}/{component}"
-            ));
+            let path = crate::upload::manager::sstable_object_key(
+                prefix,
+                &hex,
+                table_id_str,
+                input_id,
+                component,
+            );
             store
                 .put(&path, bytes::Bytes::from_static(b"data").into())
                 .await
@@ -8000,9 +8356,13 @@ mod tests {
             "Statistics.db",
             "TOC.txt",
         ] {
-            let path = object_store::path::Path::from(format!(
-                "{prefix}/{hex}/{table_id_str}/{input_id}/{component}"
-            ));
+            let path = crate::upload::manager::sstable_object_key(
+                prefix,
+                &hex,
+                table_id_str,
+                input_id,
+                component,
+            );
             let get_result = store.get(&path).await;
             assert!(
                 get_result.is_err(),
@@ -9788,6 +10148,190 @@ mod tests {
             "expected 'storage.read' span, got: {recorded:?}",
         );
     }
+
+    // =========================================================================
+    // P0-13: SSTable upload→S3→download round-trip
+    // =========================================================================
+
+    /// Round-trip test: write rows → flush SSTables → upload to mock S3 →
+    /// delete local SSTable files → call download_sstables_from_s3 →
+    /// verify files are back on disk and rows are readable.
+    ///
+    /// This test would have caught the upload/download key format mismatch
+    /// (p0-13) because download_sstables_from_s3 would have returned an error
+    /// (required component not found) instead of silently writing zero files.
+    #[test]
+    fn p0_13_sstable_upload_download_round_trip() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-p0-13";
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::new_with_upload_store(
+                config,
+                Arc::clone(&store),
+                prefix.to_string(),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+
+            let schema = test_schema();
+            let tid = table_id();
+            engine.register_table(schema.clone()).unwrap();
+
+            // Write rows so they end up in the memtable.
+            let rows_to_write: Vec<(&str, &[u8])> = vec![
+                ("alpha", b"value-alpha"),
+                ("beta", b"value-beta"),
+                ("gamma", b"value-gamma"),
+            ];
+            for (k, v) in &rows_to_write {
+                engine
+                    .write(&tid, &make_key(k), make_row(v, 1000), 1000)
+                    .unwrap();
+            }
+
+            // Flush to disk: creates {gen}-Data.db and related component files.
+            engine.flush(&tid).unwrap();
+
+            // Verify the rows are readable from the flushed SSTable.
+            for (k, _) in &rows_to_write {
+                let result = engine.read(&tid, &make_key(k)).unwrap();
+                assert!(result.is_some(), "row '{k}' should be readable after flush");
+            }
+
+            // Upload SSTables + manifest to the mock S3 store.
+            // This uses upload_manifest_for_test which goes through
+            // sstable_object_key — the same path that download uses.
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            // Load the manifest so we know what to download.
+            let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), prefix)
+                .await
+                .unwrap();
+
+            // Confirm manifest has our table's SSTable entries.
+            let sstable_entries = manifest
+                .sstables
+                .get(&tid.to_string())
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !sstable_entries.is_empty(),
+                "manifest must contain at least one SSTable entry for table '{tid}'"
+            );
+
+            // ── Drop local SSTable files ──────────────────────────────────────
+            let table_dir = dir.path().join("sstables").join(tid.to_string());
+            for entry in std::fs::read_dir(&table_dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_str().unwrap().to_string();
+                if name.ends_with(".db") || name.ends_with(".txt") {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+
+            // Confirm the table dir is now empty of .db files.
+            let remaining_db_files: Vec<_> = std::fs::read_dir(&table_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.ends_with(".db"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                remaining_db_files.is_empty(),
+                "no .db files should remain before download, found: {remaining_db_files:?}"
+            );
+
+            // ── Download SSTables from mock S3 ───────────────────────────────
+            let downloaded = engine
+                .download_sstables_from_s3(&tid, &manifest)
+                .await
+                .expect("download_sstables_from_s3 must not return an error");
+
+            assert!(
+                downloaded > 0,
+                "download_sstables_from_s3 must report at least one downloaded SSTable, \
+                 got {downloaded} (p0-13: counter must reflect bytes-on-disk reality)"
+            );
+            assert_eq!(
+                downloaded,
+                sstable_entries.len(),
+                "downloaded count ({downloaded}) must equal manifest entry count ({})",
+                sstable_entries.len()
+            );
+
+            // ── Verify files are on disk ──────────────────────────────────────
+            for entry in &sstable_entries {
+                let data_file = table_dir.join(format!("{}-Data.db", entry.id));
+                assert!(
+                    data_file.exists(),
+                    "Data.db for SSTable '{}' must exist on disk after download: {}",
+                    entry.id,
+                    data_file.display()
+                );
+                let meta = std::fs::metadata(&data_file).unwrap();
+                assert!(
+                    meta.len() > 0,
+                    "Data.db for SSTable '{}' must not be zero bytes",
+                    entry.id
+                );
+            }
+
+            // ── Verify rows are readable after re-registering the table ───────
+            // Re-register triggers SSTable discovery from disk (the downloaded files).
+            engine.shutdown().unwrap();
+
+            let restore_dir = tempfile::tempdir().unwrap();
+            let restore_config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(restore_dir.path()),
+                data_dir: dir.path().to_path_buf(),
+                ..StorageEngineConfig::test_config(restore_dir.path())
+            };
+            let restored = StorageEngine::new(restore_config, None).unwrap();
+            restored.register_table(schema).unwrap();
+
+            for (k, v) in &rows_to_write {
+                let result = restored
+                    .read(&tid, &make_key(k))
+                    .expect("read after download must not error");
+                assert!(
+                    result.is_some(),
+                    "row '{k}' must be readable after S3 round-trip download"
+                );
+                // Verify cell value matches what was written.
+                // read() returns a Partition; rows hold the actual cells.
+                let partition = result.unwrap();
+                let cell_bytes = partition
+                    .rows
+                    .first()
+                    .and_then(|row| row.cells.first())
+                    .and_then(|(_, cell)| cell.value.as_deref())
+                    .expect("partition must have at least one row with a cell value");
+                assert_eq!(
+                    cell_bytes, *v,
+                    "cell value for key '{k}' must match original after round-trip"
+                );
+            }
+
+            restored.shutdown().unwrap();
+        });
+    }
 }
-// This test is added to the end of the test module by append.
-// It will be placed before the closing `}` of the module.

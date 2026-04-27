@@ -130,6 +130,7 @@ fn normal_ctx(role: &str) -> AuthContext {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[test]
+#[serial_test::serial(env)]
 fn auth_warn_permits_but_logs_on_denial() {
     let _guard = auth_warn_test_guard();
     __clear_warn_denial_counters_for_tests();
@@ -185,6 +186,7 @@ fn auth_warn_permits_but_logs_on_denial() {
 }
 
 #[test]
+#[serial_test::serial(env)]
 fn auth_warn_false_returns_err_on_denial() {
     let _guard = auth_warn_test_guard();
     __clear_warn_denial_counters_for_tests();
@@ -218,6 +220,7 @@ fn auth_warn_false_returns_err_on_denial() {
 }
 
 #[test]
+#[serial_test::serial(env)]
 fn auth_warn_does_not_fire_when_permitted() {
     let _guard = auth_warn_test_guard();
     __clear_warn_denial_counters_for_tests();
@@ -255,6 +258,7 @@ fn auth_warn_does_not_fire_when_permitted() {
 }
 
 #[test]
+#[serial_test::serial(env)]
 fn contradictory_config_logs_error_at_startup() {
     let _guard = auth_warn_test_guard();
     // `auth_enabled=false, auth_warn=true` is nonsensical: auth isn't

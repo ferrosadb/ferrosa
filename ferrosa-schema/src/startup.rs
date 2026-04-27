@@ -165,6 +165,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn production_mode_from_env() {
         unsafe {
             std::env::set_var("FERROSA_MODE", "production");

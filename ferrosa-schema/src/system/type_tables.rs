@@ -37,13 +37,18 @@ impl SystemSchemaTypesTable {
                 name: "type_name".to_string(),
                 data_type: DataType::Text,
             },
+            // p1-37: Cassandra declares both as `frozen<list<text>>`; we
+            // declare them as `Blob` here and override the wire type via
+            // `VirtualTable::wire_type_for` so the col_spec advertised
+            // to clients is `list<text>`. Cell bytes are CQL-list-encoded
+            // (see `VirtualColumnDef::encode_list_text`).
             VirtualColumnDef {
                 name: "field_names".to_string(),
-                data_type: DataType::Text, // list<text> serialized
+                data_type: DataType::Blob,
             },
             VirtualColumnDef {
                 name: "field_types".to_string(),
-                data_type: DataType::Text, // list<text> serialized
+                data_type: DataType::Blob,
             },
         ];
         Self { snapshot, columns }
@@ -92,14 +97,10 @@ fn cql_type_to_string(ty: &CqlType) -> String {
     }
 }
 
-/// Serialize a list of strings into a JSON array representation.
-///
-/// Produces `["a", "b", "c"]` format matching how Cassandra exposes
-/// list<text> columns in system tables.
-fn serialize_string_list(items: &[String]) -> String {
-    let escaped: Vec<String> = items.iter().map(|s| format!("\"{}\"", s)).collect();
-    format!("[{}]", escaped.join(", "))
-}
+// p1-37: Removed `serialize_string_list`. The columns now use
+// `VirtualColumnDef::list_text` and `encode_list_text`, producing native
+// CQL `list<text>` bytes (length-prefixed) that the wire encoder can
+// pass through directly. Driver type-checking now succeeds.
 
 impl VirtualTable for SystemSchemaTypesTable {
     fn name(&self) -> &str {
@@ -131,15 +132,15 @@ impl VirtualTable for SystemSchemaTypesTable {
                 .map(|(_, t)| cql_type_to_string(t))
                 .collect();
 
-            let field_names_str = serialize_string_list(&field_names);
-            let field_types_str = serialize_string_list(&field_types);
+            let field_names_bytes = VirtualColumnDef::encode_list_text(&field_names);
+            let field_types_bytes = VirtualColumnDef::encode_list_text(&field_types);
 
             rows.push(VirtualRow {
                 cells: vec![
                     CellValue::live(udt.keyspace.as_bytes().to_vec(), 0),
                     CellValue::live(udt.name.as_bytes().to_vec(), 0),
-                    CellValue::live(field_names_str.into_bytes(), 0),
-                    CellValue::live(field_types_str.into_bytes(), 0),
+                    CellValue::live(field_names_bytes, 0),
+                    CellValue::live(field_types_bytes, 0),
                 ],
             });
         }
@@ -149,6 +150,15 @@ impl VirtualTable for SystemSchemaTypesTable {
 
     fn subscription_mode(&self) -> SubscriptionMode {
         SubscriptionMode::None
+    }
+
+    fn wire_type_for(&self, col_idx: usize) -> Option<crate::WireType> {
+        // p1-37: field_names (idx 2) and field_types (idx 3) are
+        // `frozen<list<text>>` on the wire.
+        match col_idx {
+            2 | 3 => Some(crate::WireType::ListText),
+            _ => None,
+        }
     }
 }
 
@@ -221,12 +231,21 @@ mod tests {
         assert_eq!(row.cells[0].value.as_deref(), Some(b"ks1".as_slice()));
         // type_name
         assert_eq!(row.cells[1].value.as_deref(), Some(b"address".as_slice()));
-        // field_names — JSON list
-        let field_names = std::str::from_utf8(row.cells[2].value.as_deref().unwrap()).unwrap();
-        assert_eq!(field_names, r#"["street", "city", "zip"]"#);
-        // field_types — JSON list
-        let field_types = std::str::from_utf8(row.cells[3].value.as_deref().unwrap()).unwrap();
-        assert_eq!(field_types, r#"["text", "text", "int"]"#);
+        // p1-37: cells now hold CQL-list-encoded bytes (4-byte count + per
+        // element 4-byte length + UTF-8). Round-trip through the same
+        // encoder for assertion.
+        let expected_names = VirtualColumnDef::encode_list_text(&[
+            "street".to_string(),
+            "city".to_string(),
+            "zip".to_string(),
+        ]);
+        assert_eq!(row.cells[2].value.as_deref().unwrap(), expected_names);
+        let expected_types = VirtualColumnDef::encode_list_text(&[
+            "text".to_string(),
+            "text".to_string(),
+            "int".to_string(),
+        ]);
+        assert_eq!(row.cells[3].value.as_deref().unwrap(), expected_types);
     }
 
     #[test]
@@ -279,11 +298,12 @@ mod tests {
         let rows = table.read(None);
         assert_eq!(rows.len(), 1);
 
-        let field_types = std::str::from_utf8(rows[0].cells[3].value.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            field_types,
-            r#"["list<text>", "map<text, int>", "set<uuid>"]"#
-        );
+        let expected = VirtualColumnDef::encode_list_text(&[
+            "list<text>".to_string(),
+            "map<text, int>".to_string(),
+            "set<uuid>".to_string(),
+        ]);
+        assert_eq!(rows[0].cells[3].value.as_deref().unwrap(), expected);
     }
 
     #[test]

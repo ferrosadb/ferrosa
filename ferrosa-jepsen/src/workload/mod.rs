@@ -303,7 +303,12 @@ mod tests {
                 .unwrap_or_else(|e| panic!("setup failed for workload '{name}': {e}"));
 
             let mut recorder = crate::history::HistoryRecorder::new("test");
-            wl.run(&session, &mut recorder, Duration::from_millis(20))
+            // 200ms (was 20ms): under workspace-wide parallel test load, a
+            // 20ms slot is too tight on slower runners and the workload's
+            // run loop occasionally returns Err("deadline exceeded") on
+            // setup queries. 200ms preserves the test's "short run" intent
+            // while removing the timing race.
+            wl.run(&session, &mut recorder, Duration::from_millis(200))
                 .await
                 .unwrap_or_else(|e| panic!("run failed for workload '{name}': {e}"));
 

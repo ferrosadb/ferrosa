@@ -1,0 +1,43 @@
+# Port-override for local Podman test cluster (30000–30099 range).
+#
+# Use alongside tests/docker-compose.cluster.yml so the test cluster
+# does not conflict with the live ferrosa-memory cluster on ports 19000-19092.
+#
+# Usage (via scripts/test-cluster-up.sh):
+#   podman compose \
+#     -f tests/docker-compose.cluster.yml \
+#     -f tests/docker-compose.cluster.podman.yml \
+#     --profile trio \
+#     --project-name ferrosa-test-w1 \
+#     up -d
+
+services:
+  rustfs:
+    ports:
+      - "${HOST_RUSTFS_PORT:-30000}:9000"
+      - "${HOST_RUSTFS_CONSOLE_PORT:-30001}:9001"
+
+  node1:
+    ports:
+      - "${HOST_CQL_PORT_BASE:-30042}:9042"
+      - "${HOST_WEB_PORT_BASE:-30090}:9090"
+
+  node2:
+    ports:
+      - "${HOST_CQL_PORT_NODE2:-30043}:9042"
+      - "${HOST_WEB_PORT_NODE2:-30091}:9090"
+
+  node3:
+    ports:
+      - "${HOST_CQL_PORT_NODE3:-30044}:9042"
+      - "${HOST_WEB_PORT_NODE3:-30092}:9090"
+
+  node4:
+    ports:
+      - "${HOST_CQL_PORT_NODE4:-30045}:9042"
+      - "${HOST_WEB_PORT_NODE4:-30093}:9090"
+
+  node5:
+    ports:
+      - "${HOST_CQL_PORT_NODE5:-30046}:9042"
+      - "${HOST_WEB_PORT_NODE5:-30094}:9090"

@@ -13,6 +13,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 dashmap = "6"
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
@@ -39,6 +40,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 proptest = "1"
 rcgen = "0.13"
+serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

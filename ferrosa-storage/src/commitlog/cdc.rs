@@ -75,7 +75,7 @@ struct CdcPosition {
 ///
 /// # Usage
 ///
-/// ```ignore
+/// ```text
 /// let mut reader = CdcReader::new(log_dir, checkpoint_dir, None)?;
 /// while let Some((mutation, pos)) = reader.next_mutation()? {
 ///     process(mutation);

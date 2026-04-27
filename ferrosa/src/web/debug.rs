@@ -265,6 +265,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(env)]
     fn flamechart_endpoint_requires_auth() {
         // Verify check_auth rejects requests when no token is set.
         // Safety: test-only env var manipulation.
@@ -317,6 +318,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn ip_whitelist_allows_when_not_set() {
         unsafe {
             std::env::remove_var("FERROSA_DEBUG_IP_WHITELIST");
@@ -426,6 +428,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[serial_test::serial(env)]
     fn check_auth_rejects_empty_bearer_token() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "nonempty");
@@ -443,6 +446,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn check_auth_rejects_missing_authorization_header() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "secret");
@@ -459,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn check_auth_rejects_non_bearer_scheme() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "secret");
@@ -476,6 +481,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn check_auth_rejects_empty_env_token() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "");
@@ -500,6 +506,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[serial_test::serial(env)]
     fn ip_whitelist_allows_listed_ip() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "10.0.0.1,192.168.1.1");
@@ -512,6 +519,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn ip_whitelist_rejects_unlisted_ip() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "10.0.0.1");
@@ -524,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn ip_whitelist_rejects_none_remote_when_configured() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "10.0.0.1");
@@ -540,6 +549,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn ip_whitelist_allows_all_when_empty_string() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "");
@@ -555,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn ip_whitelist_handles_whitespace_in_entries() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", " 10.0.0.1 , 10.0.0.2 ");
@@ -570,6 +581,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn ip_whitelist_allows_when_only_invalid_entries() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "not-an-ip,also-bad");
@@ -669,6 +681,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn flamechart_rejects_without_auth_token() {
         let state = make_state();
         let router = crate::web::build_router(state);

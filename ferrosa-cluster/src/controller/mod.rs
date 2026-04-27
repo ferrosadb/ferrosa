@@ -12,11 +12,18 @@
 //!   5. Operator can `switchover()` to swap roles
 
 mod cluster;
+pub mod cluster_rejoin;
 mod membership;
 mod operator;
 mod pair;
 mod peer_events;
 mod token;
+
+pub use cluster::bootstrap_silent_failure_counts;
+pub use cluster_rejoin::{
+    cluster_rejoin_attempts_total, cluster_rejoin_failures_total, CLUSTER_REJOIN_ATTEMPTS_TOTAL,
+    CLUSTER_REJOIN_FAILURES_TOTAL,
+};
 
 pub(crate) use token::deterministic_tokens_for_node;
 #[cfg(test)]

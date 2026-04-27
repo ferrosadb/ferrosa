@@ -1,0 +1,179 @@
+# Wave 3 standalone compose — isolated test cluster on ports 30000-30099.
+# Uses pre-built localhost/ferrosa-node-w3:latest image.
+# Does NOT inherit the base compose port bindings that conflict with live cluster.
+#
+# Usage:
+#   podman compose \
+#     -f tests/docker-compose.cluster.w3-standalone.yml \
+#     --project-name ferrosa-test-w3 \
+#     up -d
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Volume permissions — RustFS runs as UID 10001
+  # ---------------------------------------------------------------------------
+  volume-permissions:
+    image: alpine
+    volumes:
+      - rustfs-data:/data
+    command: >
+      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # S3-compatible object store
+  # ---------------------------------------------------------------------------
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    ports:
+      - "30000:9000"
+      - "30001:9001"
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Bucket bootstrap
+  # ---------------------------------------------------------------------------
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa-test --ignore-existing &&
+             echo 'bucket ferrosa-test ready'"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Node 1 — seed node
+  # ---------------------------------------------------------------------------
+  node1:
+    image: localhost/ferrosa-node-w3:latest
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "30042:9042"
+      - "30090:9090"
+    environment:
+      FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node1:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-test-w3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-test"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_S3_PREFIX: "node1"
+      FERROSA_CLUSTER_MODE: "standalone"
+    volumes:
+      - node1-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 && echo ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Node 2
+  # ---------------------------------------------------------------------------
+  node2:
+    image: localhost/ferrosa-node-w3:latest
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "30043:9042"
+      - "30091:9090"
+    environment:
+      FERROSA_HOST_ID: "22222222-2222-2222-2222-222222222222"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node2:7000"
+      FERROSA_SEED: "node1:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-test-w3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-test"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_S3_PREFIX: "node1"
+      FERROSA_CLUSTER_MODE: "standalone"
+    volumes:
+      - node2-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 && echo ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Node 3
+  # ---------------------------------------------------------------------------
+  node3:
+    image: localhost/ferrosa-node-w3:latest
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "30044:9042"
+      - "30092:9090"
+    environment:
+      FERROSA_HOST_ID: "33333333-3333-3333-3333-333333333333"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node3:7000"
+      FERROSA_SEED: "node1:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-test-w3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-test"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_S3_PREFIX: "node1"
+      FERROSA_CLUSTER_MODE: "standalone"
+    volumes:
+      - node3-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 && echo ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+volumes:
+  rustfs-data:
+  node1-data:
+  node2-data:
+  node3-data:

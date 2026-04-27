@@ -318,7 +318,7 @@ pub async fn handle_connection<S>(
                     HandleResult::StartSubscription {
                         inner,
                         interval,
-                        delta: _,
+                        delta,
                     } => {
                         let interval = match interval {
                             Some(d) => d,
@@ -404,6 +404,7 @@ pub async fn handle_connection<S>(
                             *inner,
                             sub_tx.clone(),
                             cancel,
+                            delta,
                         );
 
                         debug!(
@@ -476,7 +477,6 @@ pub(crate) enum HandleResult {
     StartSubscription {
         inner: Box<crate::ast::Statement>,
         interval: Option<Duration>,
-        #[allow(dead_code)] // delta mode deferred
         delta: bool,
     },
     /// Unsubscribe — cancel one or all subscriptions.
@@ -857,9 +857,44 @@ pub(crate) fn handle_prepare(
     // Determine keyspace and table from the statement for the prepared metadata.
     let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
 
+    // Count bind markers in the AST before touching the schema.  This count is
+    // the ground truth for how many col_specs the PREPARE response must carry.
+    // Strict external CQL drivers (scylla, gocql, DataStax Java/C#) reject
+    // `execute_unpaged` when the driver's cached col_count from the PREPARE
+    // response does not match the number of Rust values in the call:
+    //   WrongColumnCount { rust_cols: N, cql_cols: <what we reported> }
+    let expected_bind_count = count_bind_markers(&stmt);
+
     // Build bound_columns and result_columns from the statement + schema metadata.
     let (bound_columns, result_columns) =
         analyze_prepared_columns(&stmt, &table_ks, &table_name, state);
+
+    // Guard: if the schema lookup returned fewer bound columns than the
+    // statement has bind markers, something is wrong with this node's local
+    // schema snapshot.  The most common cause is Raft replication lag: the
+    // CREATE TABLE entry has been committed on the leader and returned to the
+    // client, but has not yet been applied to this follower's state machine.
+    //
+    // Returning a PREPARED response with col_count=0 (or any count ≠ N) would
+    // be a silent protocol violation that only strict drivers catch — and they
+    // catch it as a non-retriable execute error, not as a PREPARE error.
+    //
+    // The correct behavior is to return an error here so the driver retries
+    // PREPARE (potentially on a different node where the schema is current).
+    // Per the CQL native protocol spec, an `Invalid` error on PREPARE is
+    // retriable.  Real Cassandra returns 0x2200 (Invalid) when the table is
+    // not found during PREPARE.
+    if bound_columns.len() != expected_bind_count {
+        let err = CqlError::Invalid(format!(
+            "PREPARE failed for '{query}': \
+             expected {expected_bind_count} bind-marker column spec(s) \
+             but resolved only {}. \
+             Table '{table_ks}.{table_name}' may not yet be visible on this node \
+             (schema replication lag). Retry in a moment.",
+            bound_columns.len()
+        ));
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
 
     let plan = PreparedPlan {
         id,
@@ -1255,6 +1290,71 @@ fn analyze_prepared_columns(
     }
 
     (bound_columns, Vec::new())
+}
+
+/// Count the number of `?` (positional) and `:name` (named) bind markers in
+/// a parsed statement, purely from the AST — no schema lookup needed.
+///
+/// This count is used as a guard in `handle_prepare`: if the schema lookup
+/// succeeds but `bound_columns.len()` is less than the bind-marker count, it
+/// indicates that one or more columns could not be resolved (e.g., because the
+/// table schema has not yet propagated to this node via Raft replication).
+/// Returning `col_count = 0` (or a partial count) in the PREPARE response
+/// causes strict CQL drivers (scylla, gocql, DataStax) to reject every
+/// subsequent execute call with:
+///   WrongColumnCount { rust_cols: N, cql_cols: 0 }
+///
+/// When the counts diverge, `handle_prepare` returns an `Invalid` error so
+/// the driver retries on a different node where the schema is current.
+fn count_bind_markers(stmt: &Statement) -> usize {
+    let is_bind = |t: &Term| matches!(t, Term::BindMarker(_));
+
+    match stmt {
+        Statement::Select(s) => {
+            let where_count = s
+                .where_clauses
+                .iter()
+                .filter(|wc| is_bind(&wc.value))
+                .count();
+            let ann_count = s
+                .ann_of
+                .as_ref()
+                .filter(|(_, t)| is_bind(t))
+                .map_or(0, |_| 1);
+            let limit_count = match &s.limit {
+                Some(crate::ast::Limit::BindMarker)
+                | Some(crate::ast::Limit::NamedBindMarker(_)) => 1,
+                _ => 0,
+            };
+            where_count + ann_count + limit_count
+        }
+        Statement::Insert(i) => i.values.iter().filter(|v| is_bind(v)).count(),
+        Statement::Update(u) => {
+            let set_count = u
+                .assignments
+                .iter()
+                .filter(|a| match a {
+                    Assignment::Simple { value, .. }
+                    | Assignment::Add { value, .. }
+                    | Assignment::Sub { value, .. } => is_bind(value),
+                    Assignment::Element { key, value, .. } => is_bind(key) || is_bind(value),
+                })
+                .count();
+            let where_count = u
+                .where_clauses
+                .iter()
+                .filter(|wc| is_bind(&wc.value))
+                .count();
+            let if_count = u.if_conditions.iter().filter(|c| is_bind(&c.value)).count();
+            set_count + where_count + if_count
+        }
+        Statement::Delete(d) => d
+            .where_clauses
+            .iter()
+            .filter(|wc| is_bind(&wc.value))
+            .count(),
+        _ => 0,
+    }
 }
 
 /// Build result column metadata for SELECT statements.
@@ -2276,5 +2376,95 @@ mod tests {
                 other
             ),
         }
+    }
+
+    // ── P0-22: count_bind_markers unit tests ─────────────────────────────────
+    //
+    // Pure AST tests — no schema, no network.  Verify that count_bind_markers
+    // returns the exact number of `?` placeholders in each statement type.
+
+    #[test]
+    fn count_bind_markers_insert_three_placeholders() {
+        let stmt = crate::parser::parse("INSERT INTO ks.t (a, b, c) VALUES (?, ?, ?)").unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            3,
+            "INSERT with 3 ? placeholders must count as 3"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_insert_eight_placeholders() {
+        // Mirrors the fmem entity_store INSERT that triggered p0-22.
+        let stmt = crate::parser::parse(
+            "INSERT INTO agent_memory.entity_store \
+             (tenant_id, session_id, entity_id, entity_name, entity_type, \
+              context_snippet, confidence, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            8,
+            "INSERT with 8 ? placeholders must count as 8"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_select_one_where_placeholder() {
+        let stmt = crate::parser::parse("SELECT * FROM ks.t WHERE a = ?").unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            1,
+            "SELECT with 1 WHERE ? must count as 1"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_select_no_placeholders() {
+        let stmt = crate::parser::parse("SELECT * FROM ks.t").unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            0,
+            "SELECT with no ? must count as 0"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_update_set_and_where() {
+        // 2 SET + 3 WHERE = 5 total
+        let stmt =
+            crate::parser::parse("UPDATE ks.t SET a = ?, b = ? WHERE c = ? AND d = ? AND e = ?")
+                .unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            5,
+            "UPDATE with 2 SET + 3 WHERE ? must count as 5"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_update_with_if_condition() {
+        // 2 SET + 2 WHERE + 1 IF = 5 total
+        let stmt = crate::parser::parse(
+            "UPDATE ks.meta SET data = ?, version = ? \
+             WHERE p = ? AND name = ? IF version = ?",
+        )
+        .unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            5,
+            "UPDATE...IF with 5 total ? must count as 5"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_delete_where() {
+        let stmt = crate::parser::parse("DELETE FROM ks.t WHERE a = ? AND b = ?").unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            2,
+            "DELETE with 2 WHERE ? must count as 2"
+        );
     }
 }

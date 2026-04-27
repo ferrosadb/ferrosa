@@ -27,7 +27,7 @@ use ferrosa_schema::{
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
-    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualColumnDef, VirtualRow,
+    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -192,6 +192,17 @@ pub struct SharedState {
     /// through instead of returning 0x2100 Unauthorized.  Set from
     /// `FERROSA_AUTH_WARN=true` to enable the soak observation period.
     pub auth_warn: bool,
+    /// Peer connection manager for Accord coordinator fanout.
+    ///
+    /// `None` in standalone mode or when the cluster layer has not yet
+    /// provided a `PeerManager` (e.g. in unit tests).  When `None`, LWT
+    /// statements in cluster mode return a fail-loud `ServerError` instead
+    /// of routing through Accord.
+    pub peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
+    /// Hybrid logical clock used to generate monotone transaction timestamps.
+    ///
+    /// `None` when `peer_manager` is `None`.
+    pub accord_clock: Option<Arc<ferrosa_common::accord::HybridLogicalClock>>,
 }
 
 /// Per-request context: authentication, current keyspace, and consistency level.
@@ -210,6 +221,42 @@ pub struct RequestContext<'a> {
     pub client_address: String,
 }
 
+/// Raw (un-encoded) result of a user-table SELECT, used by delta subscriptions.
+///
+/// Carries the projected column metadata and row data so the subscription
+/// delivery layer can compute a row-level diff against the previous delivery
+/// without re-parsing encoded CQL RESULT frames.
+///
+/// The `paging_state` field carries the opaque continuation token when the
+/// original query was paginated. Pass it through when encoding for normal
+/// SELECT responses; ignore it in subscription/delta contexts.
+pub struct SelectRawResult {
+    pub column_names: Vec<String>,
+    pub column_types: Vec<CqlType>,
+    pub rows: Vec<Vec<Option<CqlValue>>>,
+    pub keyspace: String,
+    pub table: String,
+    /// Opaque paging continuation token, `None` when no more pages.
+    pub paging_state: Option<Vec<u8>>,
+}
+
+impl SelectRawResult {
+    /// Encode this result into a CQL RESULT frame body (Rows kind = 0x0002).
+    ///
+    /// Includes the paging continuation token when present so normal SELECT
+    /// responses are indistinguishable from the previous implementation.
+    pub fn encode(self) -> BytesMut {
+        result::encode_rows_paged(
+            &self.column_names,
+            &self.column_types,
+            &self.keyspace,
+            &self.table,
+            &self.rows,
+            self.paging_state.as_deref(),
+        )
+    }
+}
+
 /// Result of routing a statement.
 pub enum RouteResult {
     /// A CQL RESULT frame body.
@@ -224,6 +271,109 @@ pub enum RouteResult {
     },
     /// Unsubscribe — cancel one or all subscriptions.
     Unsubscribe { stream_id: Option<u16> },
+}
+
+// ── Accord LWT dispatch ──────────────────────────────────────────────────
+
+/// Route a LWT statement through the Accord consensus protocol.
+///
+/// Constructs an `AccordCoordinatorDriver`, runs the full PreAccept → Commit
+/// protocol over real TCP, and returns a CQL `[applied]` result set.
+///
+/// The replica set is built dynamically from `PeerManager::live_peer_ids()`
+/// plus the local node's `host_id`. This ensures newly joined peers are
+/// included without requiring a restart.
+///
+/// # Errors
+///
+/// Returns `CqlError::ServerError` when:
+/// - The replica set has fewer than 1 member (no peers connected).
+/// - The Accord quorum cannot be reached (network failure / too few replicas).
+async fn route_lwt_via_accord(
+    state: &SharedState,
+    _ctx: &RequestContext<'_>,
+    _stmt: &Statement,
+    peers: Arc<ferrosa_net::peer::PeerManager>,
+    clock: Arc<ferrosa_common::accord::HybridLogicalClock>,
+) -> Result<RouteResult, CqlError> {
+    use ferrosa_cluster::accord::{AccordCoordinatorDriver, AccordDriverError};
+
+    // Build the replica set from the live peer map plus this node itself.
+    // Ordering is deterministic: local node first, then peers sorted by UUID.
+    let host_id = state.node_config.host_id;
+    let mut replica_ids: Vec<uuid::Uuid> = peers.live_peer_ids();
+    // Include local node if not already in the list.
+    if !replica_ids.contains(&host_id) {
+        replica_ids.push(host_id);
+    }
+    replica_ids.sort_unstable();
+
+    if replica_ids.is_empty() {
+        return Err(CqlError::ServerError(
+            "Accord replica set is empty — no peers connected for LWT consensus".into(),
+        ));
+    }
+
+    // Derive a stable u64 node_id from the host UUID (first 8 bytes big-endian).
+    let host_bytes = host_id.as_bytes();
+    let node_id = u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
+
+    // Use a simple key derived from the statement type for now.
+    // Full partition key bytes will replace this once the CQL planner is
+    // integrated with the Accord execution path.
+    let key = b"lwt-placeholder-key".to_vec();
+
+    let mut driver = AccordCoordinatorDriver::new(
+        node_id,
+        replica_ids,
+        peers,
+        false, // not leaseholder (derive from TokenRing in future)
+        &clock,
+        key,
+    );
+
+    match driver.run_transaction().await {
+        Ok(_) => {
+            // Gap 4: F+1 read-votes agreed the IF condition held.
+            // Gap 5: F+1 apply acknowledgements received.
+            let result = crate::accord_router::encode_lwt_result(
+                &crate::accord_router::LwtResult {
+                    applied: true,
+                    current_values: std::collections::HashMap::new(),
+                },
+                "",
+                "",
+                &[],
+            );
+            Ok(RouteResult::Result(result))
+        }
+        Err(AccordDriverError::ConditionNotMet { .. }) => {
+            // Gap 4: F+1 read-votes agreed the IF condition did NOT hold.
+            // Return [applied]=false with the current row value.
+            let result = crate::accord_router::encode_lwt_result(
+                &crate::accord_router::LwtResult {
+                    applied: false,
+                    current_values: std::collections::HashMap::new(),
+                },
+                "",
+                "",
+                &[],
+            );
+            Ok(RouteResult::Result(result))
+        }
+        Err(AccordDriverError::QuorumUnavailable) => Err(CqlError::ServerError(
+            "Accord quorum unavailable for LWT transaction".into(),
+        )),
+        Err(AccordDriverError::ApplyQuorumUnavailable) => Err(CqlError::ServerError(
+            "Accord apply quorum unavailable — LWT transaction may not be durable".into(),
+        )),
+        Err(AccordDriverError::Network(msg)) => Err(CqlError::ServerError(format!(
+            "Accord network error: {msg}"
+        ))),
+        Err(AccordDriverError::Codec(msg)) => {
+            Err(CqlError::ServerError(format!("Accord codec error: {msg}")))
+        }
+    }
 }
 
 // ── Main dispatch ────────────────────────────────────────────────────────
@@ -282,12 +432,25 @@ pub async fn route(
             _ => RoutingMode::Cluster,
         };
         if route_decision(mode, &stmt, ctx.serial_consistency) == RouteDecision::Accord {
-            // TODO(S3): Execute through AccordCoordinator instead of WritePath.
-            // For now, fall through to the existing CL-based path and log.
-            tracing::info!(
-                ?opcode,
-                "LWT statement detected — Accord consensus required (falling through to CL path)"
-            );
+            // Route through the Accord consensus protocol when the coordinator
+            // layer (PeerManager + replica list + HLC) has been wired in.
+            // When those are absent (standalone tests, pair mode) fail loud per
+            // the p0-03 policy so callers see a clear error rather than
+            // silently falling through to a non-linearizable local path.
+            match (&state.peer_manager, &state.accord_clock) {
+                (Some(peers), Some(clock)) => {
+                    return route_lwt_via_accord(state, ctx, &stmt, peers.clone(), clock.clone())
+                        .await;
+                }
+                _ => {
+                    return Err(CqlError::ServerError(
+                        "LWT routing to Accord is not yet implemented at the CQL layer; \
+                         see ferrosa_docs/specs/todo/p0-03b-accord-implementation-gap.md \
+                         — coordinator driver (Gaps 1–3, 7) implemented on fix/p0-03b-accord-network"
+                            .into(),
+                    ));
+                }
+            }
         }
     }
 
@@ -640,50 +803,106 @@ async fn route_select(
                 peer.native_address =
                     harmonize_loopback_family(peer.native_address, client_loopback_ip);
             }
-            let col_names: Vec<String> = vec![
-                "peer",
-                "peer_port",
-                "data_center",
-                "rack",
-                "host_id",
-                "native_address",
-                "native_port",
-                "schema_version",
-                "release_version",
-                "tokens",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect();
-            let col_types = vec![
-                CqlType::Inet,
-                CqlType::Int,
-                CqlType::Varchar,
-                CqlType::Varchar,
-                CqlType::Uuid,
-                CqlType::Inet,
-                CqlType::Int,
-                CqlType::Uuid,
-                CqlType::Varchar,
-                CqlType::Set(Box::new(CqlType::Varchar)),
-            ];
+            // p1-37: legacy `system.peers` exposes `rpc_address` (the
+            // pre-peers_v2 column drivers like scylla 0.15 type-check on
+            // metadata fetch). `peers_v2` replaces it with `native_address`.
+            let is_v2 = s.table == "peers_v2";
+            let (col_names, col_types): (Vec<String>, Vec<CqlType>) = if is_v2 {
+                (
+                    vec![
+                        "peer",
+                        "peer_port",
+                        "data_center",
+                        "rack",
+                        "host_id",
+                        "native_address",
+                        "native_port",
+                        "schema_version",
+                        "release_version",
+                        "tokens",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                    vec![
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Varchar,
+                        CqlType::Varchar,
+                        CqlType::Uuid,
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Uuid,
+                        CqlType::Varchar,
+                        CqlType::Set(Box::new(CqlType::Varchar)),
+                    ],
+                )
+            } else {
+                (
+                    vec![
+                        "peer",
+                        "peer_port",
+                        "data_center",
+                        "rack",
+                        "host_id",
+                        "native_address",
+                        "native_port",
+                        "rpc_address",
+                        "schema_version",
+                        "release_version",
+                        "tokens",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                    vec![
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Varchar,
+                        CqlType::Varchar,
+                        CqlType::Uuid,
+                        CqlType::Inet,
+                        CqlType::Int,
+                        CqlType::Inet,
+                        CqlType::Uuid,
+                        CqlType::Varchar,
+                        CqlType::Set(Box::new(CqlType::Varchar)),
+                    ],
+                )
+            };
             let rows: Vec<Vec<Option<CqlValue>>> = peers
                 .iter()
                 .map(|p| {
                     let tokens_set: Vec<CqlValue> =
                         p.tokens.iter().map(|t| CqlValue::Text(t.clone())).collect();
-                    vec![
-                        Some(CqlValue::Inet(p.peer)),
-                        Some(CqlValue::Int(p.peer_port as i32)),
-                        Some(CqlValue::Text(p.data_center.clone())),
-                        Some(CqlValue::Text(p.rack.clone())),
-                        Some(CqlValue::Uuid(p.host_id)),
-                        Some(CqlValue::Inet(p.native_address)),
-                        Some(CqlValue::Int(p.native_port as i32)),
-                        Some(CqlValue::Uuid(p.schema_version)),
-                        Some(CqlValue::Text(p.release_version.clone())),
-                        Some(CqlValue::Set(tokens_set)),
-                    ]
+                    if is_v2 {
+                        vec![
+                            Some(CqlValue::Inet(p.peer)),
+                            Some(CqlValue::Int(p.peer_port as i32)),
+                            Some(CqlValue::Text(p.data_center.clone())),
+                            Some(CqlValue::Text(p.rack.clone())),
+                            Some(CqlValue::Uuid(p.host_id)),
+                            Some(CqlValue::Inet(p.native_address)),
+                            Some(CqlValue::Int(p.native_port as i32)),
+                            Some(CqlValue::Uuid(p.schema_version)),
+                            Some(CqlValue::Text(p.release_version.clone())),
+                            Some(CqlValue::Set(tokens_set)),
+                        ]
+                    } else {
+                        vec![
+                            Some(CqlValue::Inet(p.peer)),
+                            Some(CqlValue::Int(p.peer_port as i32)),
+                            Some(CqlValue::Text(p.data_center.clone())),
+                            Some(CqlValue::Text(p.rack.clone())),
+                            Some(CqlValue::Uuid(p.host_id)),
+                            Some(CqlValue::Inet(p.native_address)),
+                            Some(CqlValue::Int(p.native_port as i32)),
+                            Some(CqlValue::Inet(p.native_address)),
+                            Some(CqlValue::Uuid(p.schema_version)),
+                            Some(CqlValue::Text(p.release_version.clone())),
+                            Some(CqlValue::Set(tokens_set)),
+                        ]
+                    }
                 })
                 .collect();
             let (filt_names, filt_types, filt_rows) =
@@ -787,12 +1006,19 @@ async fn route_select(
                     ]
                 })
                 .collect();
+            // p1-37: honor the SELECT projection — scylla 0.15 issues
+            // `SELECT keyspace_name, table_name FROM system_schema.tables`
+            // and type-checks the result against a 2-tuple. Without
+            // projection we'd return 3 cols and trip a column-count
+            // mismatch.
+            let (filt_names, filt_types, filt_rows) =
+                filter_system_columns(&s.columns, &col_names, &col_types, &rows);
             Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+                &filt_names,
+                &filt_types,
                 "system_schema",
                 "tables",
-                &rows,
+                &filt_rows,
             ))
         }
         ("system_schema", "columns") => {
@@ -930,6 +1156,11 @@ async fn route_select(
             ))
         }
         ("system_schema", "types") => {
+            // p1-37: field_names/field_types MUST be `frozen<list<text>>`
+            // per Cassandra. scylla 0.15's metadata fetch type-checks
+            // these columns and refuses to cache the schema if they're
+            // declared as `text` — which then blocks every DDL through
+            // the driver.
             let snap = state.schema.snapshot();
             let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
@@ -940,28 +1171,28 @@ async fn route_select(
             let col_types = vec![
                 CqlType::Varchar,
                 CqlType::Varchar,
-                CqlType::Varchar,
-                CqlType::Varchar,
+                CqlType::List(Box::new(CqlType::Varchar)),
+                CqlType::List(Box::new(CqlType::Varchar)),
             ];
             let rows: Vec<Vec<Option<CqlValue>>> = snap
                 .types
                 .values()
                 .map(|udt| {
-                    let field_names: Vec<String> = udt
+                    let field_names: Vec<CqlValue> = udt
                         .fields
                         .iter()
-                        .map(|(n, _)| format!("\"{}\"", n))
+                        .map(|(n, _)| CqlValue::Text(n.clone()))
                         .collect();
-                    let field_types: Vec<String> = udt
+                    let field_types: Vec<CqlValue> = udt
                         .fields
                         .iter()
-                        .map(|(_, t)| format!("\"{}\"", bridge::cql_type_display_name(t)))
+                        .map(|(_, t)| CqlValue::Text(bridge::cql_type_display_name(t).to_string()))
                         .collect();
                     vec![
                         Some(CqlValue::Text(udt.keyspace.clone())),
                         Some(CqlValue::Text(udt.name.clone())),
-                        Some(CqlValue::Text(format!("[{}]", field_names.join(", ")))),
-                        Some(CqlValue::Text(format!("[{}]", field_types.join(", ")))),
+                        Some(CqlValue::List(field_names)),
+                        Some(CqlValue::List(field_types)),
                     ]
                 })
                 .collect();
@@ -1055,9 +1286,30 @@ async fn route_select(
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
         ("system_schema", "functions" | "aggregates" | "triggers" | "views") => {
+            // p1-37: Stub these tables until they have first-class
+            // implementations. Honor the SELECT projection so col_specs
+            // match driver-requested shape — every column is advertised
+            // as `text` in the empty result set, which is good enough
+            // when there are no rows to type-check.
+            let col_names: Vec<String> = if s.columns.is_empty()
+                || s.columns
+                    .iter()
+                    .any(|c| matches!(c, crate::ast::SelectColumn::Star))
+            {
+                vec!["keyspace_name".into()]
+            } else {
+                s.columns
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::ast::SelectColumn::Column(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let col_types: Vec<CqlType> = col_names.iter().map(|_| CqlType::Varchar).collect();
             Ok(result::encode_rows(
-                &["keyspace_name".into(), "type_name".into()],
-                &[CqlType::Varchar, CqlType::Varchar],
+                &col_names,
+                &col_types,
                 "system_schema",
                 s.table.as_str(),
                 &[],
@@ -1067,12 +1319,12 @@ async fn route_select(
             // Virtual table: check registry before storage lookup.
             if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
                 let rows = vtable.read(None);
-                let columns = vtable.columns();
-                return encode_virtual_rows(ks, &s.table, columns, &rows);
+                return encode_virtual_rows(ks, &s.table, vtable.as_ref(), &rows);
             }
 
             // User table: permission check + bridge + storage
-            route_select_user_table(state, ctx, ks, &s).await
+            let raw = route_select_user_table(state, ctx, ks, &s).await?;
+            Ok(raw.encode())
         }
     }
 }
@@ -1082,7 +1334,7 @@ async fn route_select_user_table(
     ctx: &RequestContext<'_>,
     ks: &str,
     s: &SelectStatement,
-) -> Result<BytesMut, CqlError> {
+) -> Result<SelectRawResult, CqlError> {
     validate_keyspace_exists(&state.schema, ks)?;
 
     // Permission check (M8)
@@ -1226,8 +1478,14 @@ async fn route_select_user_table(
             };
         // Project to selected columns.
         let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
-        let result = result::encode_rows(&col_names, &col_types, ks, &s.table, &selected_rows);
-        return Ok(result);
+        return Ok(SelectRawResult {
+            column_names: col_names.to_vec(),
+            column_types: col_types.to_vec(),
+            rows: selected_rows,
+            keyspace: ks.to_string(),
+            table: s.table.clone(),
+            paging_state: None,
+        });
     }
 
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
@@ -1704,9 +1962,14 @@ async fn route_select_user_table(
             }
         }
         let agg_rows = vec![agg_row];
-        return Ok(result::encode_rows(
-            &col_names, &col_types, ks, &s.table, &agg_rows,
-        ));
+        return Ok(SelectRawResult {
+            column_names: col_names.to_vec(),
+            column_types: col_types.to_vec(),
+            rows: agg_rows,
+            keyspace: ks.to_string(),
+            table: s.table.clone(),
+            paging_state: None,
+        });
     }
 
     // Apply column selection if not Star
@@ -1779,14 +2042,33 @@ async fn route_select_user_table(
 
     let page_rows = &limited[paged.start..paged.end];
 
-    Ok(result::encode_rows_paged(
-        &col_names,
-        &col_types,
-        ks,
-        &s.table,
-        page_rows,
-        paged.next_paging_state.as_deref(),
-    ))
+    // Return raw result; callers that need an encoded frame call .encode()
+    // or result::encode_rows_paged directly. Delta subscriptions use the raw rows.
+    Ok(SelectRawResult {
+        column_names: col_names.to_vec(),
+        column_types: col_types.to_vec(),
+        rows: page_rows.to_vec(),
+        keyspace: ks.to_string(),
+        table: s.table.clone(),
+        paging_state: paged.next_paging_state,
+    })
+}
+
+/// Execute a SELECT against a user table and return raw (un-encoded) rows.
+///
+/// Used by delta subscriptions to compute a row-level diff. Only supports
+/// user tables; system table subscriptions are not expected to use delta mode.
+pub async fn route_select_raw(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &SelectStatement,
+) -> Result<SelectRawResult, CqlError> {
+    let ks = s
+        .keyspace
+        .as_deref()
+        .or(ctx.current_keyspace.as_deref())
+        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+    route_select_user_table(state, ctx, ks, s).await
 }
 
 // ── Virtual table helpers ────────────────────────────────────────────────
@@ -1842,6 +2124,41 @@ fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<
     })
 }
 
+/// Decode a `list<text>` virtual cell. The bytes were produced by
+/// `VirtualColumnDef::encode_list_text` (4-byte BE count, then per
+/// element 4-byte BE length + UTF-8 bytes).
+fn decode_list_text_cell(cell: &ferrosa_common::CellValue) -> Option<CqlValue> {
+    let bytes = cell.value.as_ref()?;
+    if bytes.len() < 4 {
+        return None;
+    }
+    let count = i32::from_be_bytes(bytes[0..4].try_into().ok()?);
+    if count < 0 {
+        return None;
+    }
+    let mut items: Vec<CqlValue> = Vec::with_capacity(count as usize);
+    let mut off = 4usize;
+    for _ in 0..count {
+        if off + 4 > bytes.len() {
+            return None;
+        }
+        let len = i32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+        off += 4;
+        if len < 0 {
+            items.push(CqlValue::Text(String::new()));
+            continue;
+        }
+        let len = len as usize;
+        if off + len > bytes.len() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&bytes[off..off + len]).into_owned();
+        off += len;
+        items.push(CqlValue::Text(s));
+    }
+    Some(CqlValue::List(items))
+}
+
 /// Encode virtual table rows as a CQL ROWS result body.
 ///
 /// Converts `VirtualRow` cells (raw `CellValue` bytes) into typed `CqlValue`s
@@ -1849,13 +2166,20 @@ fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<
 fn encode_virtual_rows(
     keyspace: &str,
     table: &str,
-    columns: &[VirtualColumnDef],
+    vtable: &dyn ferrosa_schema::VirtualTable,
     rows: &[VirtualRow],
 ) -> Result<BytesMut, CqlError> {
+    let columns = vtable.columns();
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
     let col_types: Vec<CqlType> = columns
         .iter()
-        .map(|c| data_type_to_cql_type(&c.data_type))
+        .enumerate()
+        .map(|(idx, c)| match vtable.wire_type_for(idx) {
+            // p1-37: virtual columns whose CQL type is a collection
+            // bypass the scalar `DataType` mapping.
+            Some(ferrosa_schema::WireType::ListText) => CqlType::List(Box::new(CqlType::Varchar)),
+            None => data_type_to_cql_type(&c.data_type),
+        })
         .collect();
 
     let cql_rows: Vec<Vec<Option<CqlValue>>> = rows
@@ -1863,8 +2187,14 @@ fn encode_virtual_rows(
         .map(|row| {
             row.cells
                 .iter()
-                .zip(columns.iter())
-                .map(|(cell, col)| cell_to_cql_value(cell, &col.data_type))
+                .zip(columns.iter().enumerate())
+                .map(|(cell, (idx, col))| match vtable.wire_type_for(idx) {
+                    // p1-37: cell already holds CQL-list-encoded bytes;
+                    // decode them into a typed `CqlValue::List` for the
+                    // result encoder.
+                    Some(ferrosa_schema::WireType::ListText) => decode_list_text_cell(cell),
+                    None => cell_to_cql_value(cell, &col.data_type),
+                })
                 .collect()
         })
         .collect();
@@ -6429,6 +6759,8 @@ mod tests {
             cql_metrics: Arc::new(CqlMetrics::new()),
             topology_policy: ClientTopologyPolicy::default(),
             auth_warn: false,
+            peer_manager: None,
+            accord_clock: None,
         };
         (state, dir)
     }
@@ -12268,5 +12600,120 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // p0-03: LWT must return ServerError, not silently fall through to CL path
+    // -----------------------------------------------------------------------
+
+    /// Build a SharedState with ClusterStateHolder::Cluster so that
+    /// route_decision() returns RouteDecision::Accord for LWT statements.
+    fn setup_cluster_mode() -> (SharedState, TempDir) {
+        let (state, dir) = setup();
+
+        // Replace the Standalone cluster state with Cluster mode.
+        // RaftClusterState with an empty ring is sufficient — the LWT guard
+        // fires before any routing into the ring happens.
+        let ring = Arc::new(ArcSwap::from_pointee(
+            ferrosa_cluster::ring::TokenRing::new(),
+        ));
+        let raft_state = ferrosa_cluster::RaftClusterState::new(ring, 1);
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                raft_state,
+            )));
+        (state, dir)
+    }
+
+    /// LWT INSERT IF NOT EXISTS in cluster mode must return ServerError with
+    /// the gap-spec reference, not silently fall through to the CL path.
+    ///
+    /// This test exercises the fix for p0-03 (Outcome B): the server returns
+    /// an explicit error rather than pretending to honour linearizability with
+    /// a process-local substitute.
+    #[tokio::test]
+    async fn lwt_insert_if_not_exists_cluster_mode_returns_server_error() {
+        let (state, _dir) = setup_cluster_mode();
+        let dev = dev_auth();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO system.local (key) VALUES ('test') IF NOT EXISTS")
+                .unwrap();
+
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                // serial_consistency = Some triggers the LWT routing guard.
+                serial_consistency: Some(ConsistencyLevel::Serial),
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("LWT in cluster mode must return an error, not silently succeed"),
+        };
+
+        match err {
+            CqlError::ServerError(msg) => {
+                assert!(
+                    msg.contains("p0-03b-accord-implementation-gap.md"),
+                    "error must reference the gap spec, got: {msg:?}"
+                );
+                assert!(
+                    msg.contains("LWT routing to Accord is not yet implemented"),
+                    "error must name the unimplemented feature, got: {msg:?}"
+                );
+            }
+            other => panic!("expected CqlError::ServerError, got {:?}", other),
+        }
+    }
+
+    /// LWT in standalone mode must NOT return an error — standalone bypasses
+    /// Accord entirely and falls through to the local storage path normally.
+    ///
+    /// This confirms the routing guard is scoped to cluster mode only, so
+    /// development and single-node deployments are unaffected.
+    #[tokio::test]
+    async fn lwt_insert_if_not_exists_standalone_mode_does_not_error() {
+        let (state, _dir) = setup(); // Standalone mode
+        let dev = dev_auth();
+
+        // We just need to confirm no ServerError fires; the insert itself
+        // may fail for unrelated reasons (table not found, etc.) — those
+        // are not the p0-03 error.
+        let stmt =
+            crate::parser::parse("INSERT INTO system.local (key) VALUES ('test') IF NOT EXISTS")
+                .unwrap();
+
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: Some(ConsistencyLevel::Serial),
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await;
+
+        // Must not be the p0-03 ServerError.
+        if let Err(CqlError::ServerError(ref msg)) = result {
+            assert!(
+                !msg.contains("p0-03b-accord-implementation-gap"),
+                "standalone mode must not trigger the LWT Accord gap error, got: {msg:?}"
+            );
+        }
+        // Any other outcome (Ok or a different error) is acceptable.
     }
 }

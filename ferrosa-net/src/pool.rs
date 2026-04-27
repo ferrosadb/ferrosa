@@ -254,7 +254,9 @@ impl PriorityPool {
         let mut any_reconnecting = false;
         for handle in [&self.raft, &self.data, &self.bulk] {
             match handle.query_status().await {
-                Ok(LaneStatusReport::Failed) | Err(_) => return LaneOutcome::AnyFailed,
+                Ok(LaneStatusReport::Failed) | Ok(LaneStatusReport::Dormant) | Err(_) => {
+                    return LaneOutcome::AnyFailed
+                }
                 Ok(LaneStatusReport::Reconnecting) => any_reconnecting = true,
                 Ok(LaneStatusReport::Connected) => {}
             }
@@ -275,7 +277,7 @@ mod tests {
     use crate::error::NetError;
     use crate::lane_actor::{spawn_lane_actor, ActorReconnectContext};
     use crate::message::Message;
-    use crate::reconnect::{ExponentialBackoff, LaneState};
+    use crate::reconnect::LaneState;
     use crate::rpc::handler::{HandlerRegistry, PeerId, RpcHandler};
     use crate::rpc::server::RpcServer;
     use std::sync::Arc;
@@ -415,10 +417,7 @@ mod tests {
             Lane::Raft,
             LaneState::Reconnecting {
                 attempt: 1,
-                backoff: ExponentialBackoff::new(
-                    Duration::from_millis(100),
-                    Duration::from_secs(10),
-                ),
+                exhaustion_count: 0,
             },
             |h| ActorReconnectContext {
                 lane: Lane::Raft,
@@ -446,7 +445,7 @@ mod tests {
         );
 
         // Mark the lane as failed — should auto-recover to Reconnecting.
-        handle.mark_failed();
+        handle.mark_failed(0);
         // Give the actor a moment to process the command.
         tokio::task::yield_now().await;
 

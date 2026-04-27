@@ -26,6 +26,10 @@ pub enum NetError {
     Reconnecting,
     /// Lane has exhausted all reconnection attempts and is permanently failed.
     LaneFailed,
+    /// Server failed during startup (e.g. bind notification could not be
+    /// delivered to the caller because the receiver was dropped before the
+    /// listener bound). Carries a human-readable cause for the operator.
+    StartupFailed(String),
 }
 
 impl fmt::Display for NetError {
@@ -46,6 +50,7 @@ impl fmt::Display for NetError {
             Self::LaneFailed => {
                 write!(f, "lane permanently failed after max reconnection attempts")
             }
+            Self::StartupFailed(msg) => write!(f, "startup failed: {msg}"),
         }
     }
 }

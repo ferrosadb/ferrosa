@@ -413,6 +413,70 @@ impl AccordStateMachine {
         &self.conflict_index
     }
 
+    /// Evaluate whether the LWT IF condition holds for `INSERT IF NOT EXISTS`
+    /// on `key` at the agreed execution timestamp `t`.
+    ///
+    /// Returns `true` if the row does NOT exist at `t` (the condition holds —
+    /// the write should proceed). Returns `false` if a prior transaction has
+    /// already been Applied for this key with a commit timestamp `<= t`.
+    ///
+    /// This is the linearizable read that makes Gap 4 correct: called by the
+    /// `AccordHandler` when processing a `ReadVote` message, after the
+    /// transaction has committed (so `t` is the agreed execution timestamp).
+    ///
+    /// # Note on correctness
+    ///
+    /// The condition is evaluated by inspecting the `txn_states` map for any
+    /// transaction in `Applied` phase whose conflict-index entry covers this
+    /// `key`. This is correct because:
+    /// 1. The caller waits until Commit before sending ReadVote.
+    /// 2. All deps (earlier transactions on this key) must have Applied before
+    ///    this transaction's commit timestamp `t` was chosen.
+    /// 3. Therefore, any Applied transaction visible here happened before `t`.
+    ///
+    /// A full storage-backed implementation would read the actual row from the
+    /// `StorageEngine` at timestamp `t`.
+    pub fn read_condition_holds_at(&self, key: &[u8], t: &Timestamp) -> bool {
+        // Check if any Applied transaction in the conflict index covers this key
+        // with a commit timestamp <= t. If so, the row exists and the INSERT IF
+        // NOT EXISTS condition does NOT hold.
+        //
+        // We use the conflict_index to find in-flight transactions on this key,
+        // then check if any have reached Applied state in txn_states.
+        //
+        // For transactions that have already been pruned from txn_states (via
+        // prune_applied), we conservatively assume they were Applied and thus
+        // the row exists — INSERT IF NOT EXISTS condition does not hold.
+        let conflicting = self.conflict_index.deps_before_t0(key, t);
+        if conflicting.is_empty() {
+            // No conflicting transactions before `t` on this key — row does not
+            // exist yet — INSERT IF NOT EXISTS condition holds.
+            return true;
+        }
+
+        // Check if any conflicting transaction has reached Applied state.
+        for dep_id in &conflicting {
+            if let Some(state) = self.txn_states.get(dep_id) {
+                if state.phase == TxnPhase::Applied {
+                    // A prior transaction wrote to this key and has been applied.
+                    // The row exists — INSERT IF NOT EXISTS condition does NOT hold.
+                    return false;
+                }
+            } else {
+                // Transaction not in txn_states — it was either pruned (meaning
+                // it was Applied and then GC'd) or it never reached this replica.
+                // If it's in the conflict index but not in txn_states, it was
+                // pruned after Apply — the row exists.
+                return false;
+            }
+        }
+
+        // All conflicting transactions exist in txn_states but none are Applied
+        // yet (they may be Committed but awaiting dep-wait). The row does not
+        // yet exist in storage — condition holds.
+        true
+    }
+
     /// Remove transactions that have reached the Applied phase.
     ///
     /// Applied transactions are fully committed and their mutations have been
