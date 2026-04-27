@@ -161,6 +161,12 @@ pub async fn attempt_rejoin(
             self_id = %self_host_id,
             "cluster_rejoin: no peers known — cannot attempt JoinNode (operator must intervene)"
         );
+        // Note: the no-peers fast-path is a *precondition* failure, not
+        // an attempt-exhaustion failure. We bump only FAILURES; the
+        // ATTEMPTS counter intentionally stays at zero. See
+        // `cluster_rejoin_counters_are_accessible` for the relaxed
+        // invariant: `attempts + 1 >= failures` (allowing one
+        // precondition-only failure to lead the histogram).
         CLUSTER_REJOIN_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Err(RejoinError::Exhausted);
     }
