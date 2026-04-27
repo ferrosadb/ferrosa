@@ -544,7 +544,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, certified.cert.pem()).unwrap();
-        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
 
         let (state, _dir2) = setup_state();
         let mut config = test_config(10, 64);
