@@ -370,10 +370,22 @@ impl Segment {
         let buf = unsafe { &*self.buffer.get() };
 
         // File I/O happens under the file_handle mutex to prevent concurrent
-        // flushers from writing duplicate bytes.
+        // flushers from writing duplicate bytes. `release_buffer()` also
+        // takes this lock, so once we hold it the buffer's (ptr, len, cap)
+        // is stable for the duration of this flush.
         let mut handle = self.file_handle.lock();
         let last_flushed = self.last_flushed.load(Ordering::Acquire) as usize;
         let current_pos = snapshot_pos;
+
+        // If `release_buffer()` ran before us, the data is already on disk
+        // (force_rotate calls flush_to_disk first) and the buffer is empty.
+        // Don't try to slice into a zero-length Vec — short-circuit. Without
+        // this guard the test
+        // `concurrent_writers_with_flushes_preserve_lww` flakes with
+        // `range end index N out of range for slice of length 0`.
+        if buf.len() < current_pos {
+            return Ok(());
+        }
 
         match handle.as_mut() {
             None => {
@@ -517,12 +529,30 @@ impl Segment {
     /// Writing to or re-flushing the segment after this call is safe — the
     /// position has not advanced, so incremental flush finds nothing new to write.
     pub fn release_buffer(&self) {
-        // SAFETY: The caller guarantees this segment is no longer active.
-        // No concurrent writers can reach it via ArcSwap after force_rotate()
-        // swaps in the new segment.  We replace the Vec, not a slice, so no
-        // concurrent read of a byte range is possible.
+        // Lock against concurrent `flush_to_disk()`. A periodic flush thread
+        // can have captured `snapshot_pos` and a `&Vec<u8>` reference
+        // BEFORE this method runs; if we replace the Vec without
+        // serialising on the same lock, that thread reads a torn (ptr, len,
+        // cap) tuple — observed in production as
+        // `range end index N out of range for slice of length 0` at the
+        // file.write_all(&buf[..current_pos]) site (see
+        // tests::concurrent_writers_with_flushes_preserve_lww flake).
+        //
+        // SAFETY: With the lock held, no other thread is inside
+        // `flush_to_disk()` (which also acquires `file_handle`). Writers
+        // cannot reach this segment via `ArcSwap` once `force_rotate()` has
+        // swapped in the new active segment, so no append path will read
+        // the buffer either.
+        let _handle = self.file_handle.lock();
         let buf = unsafe { &mut *self.buffer.get() };
         *buf = Vec::new();
+        // Make any post-release flush a no-op: by setting last_flushed to
+        // the current position, the `Some(_)` "nothing new" arm of
+        // `flush_to_disk` is taken even if the file handle gets re-opened
+        // somehow. The `None` arm is additionally guarded by a buffer
+        // bounds check below.
+        let pos = self.position.load(Ordering::Acquire);
+        self.last_flushed.store(pos, Ordering::Release);
     }
 }
 
@@ -853,5 +883,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let segment = Segment::new(1, 8192, dir.path());
         assert_eq!(segment.buffer_bytes(), 8192);
+    }
+
+    /// Regression: a `flush_to_disk()` racing with `release_buffer()`
+    /// must not panic on `&buf[..current_pos]` when the buffer has been
+    /// emptied. Pre-fix the periodic flusher would observe a torn
+    /// `(ptr, len, cap)` tuple — `len = 0` while the captured
+    /// `current_pos` was still > 0 — and panic with
+    /// `range end index N out of range for slice of length 0`.
+    /// The fix serialises `release_buffer` against the file_handle
+    /// lock and adds a `buf.len() < current_pos` short-circuit at the
+    /// top of `flush_to_disk`.
+    #[test]
+    fn flush_after_release_buffer_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(1, 4096, dir.path());
+        let m = simple_mutation();
+        let total_size = Segment::entry_total_size(&m);
+        let offset = segment
+            .allocate(total_size)
+            .expect("allocate within capacity");
+        segment.write_entry(offset, &m);
+
+        // Mimic the force_rotate ordering: flush, close, release.
+        segment.flush_to_disk().expect("first flush ok");
+        segment.close_file_handle();
+        segment.release_buffer();
+
+        // A late periodic flush firing now must not panic; it is a no-op.
+        segment
+            .flush_to_disk()
+            .expect("post-release flush must succeed (no-op)");
+    }
+
+    /// Stress variant of the above: many concurrent flushes hammering
+    /// a segment that gets `release_buffer`'d mid-stream. Without the
+    /// lock fix this panics within the first few iterations on macOS
+    /// arm64 in debug.
+    #[test]
+    fn flush_to_disk_race_with_release_buffer_does_not_panic() {
+        for _ in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let segment = Arc::new(Segment::new(1, 8192, dir.path()));
+            let m = simple_mutation();
+            let total_size = Segment::entry_total_size(&m);
+            for _ in 0..32 {
+                if let Some(off) = segment.allocate(total_size) {
+                    segment.write_entry(off, &m);
+                } else {
+                    break;
+                }
+            }
+
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let s = Arc::clone(&segment);
+                handles.push(std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let _ = s.flush_to_disk();
+                    }
+                }));
+            }
+            // Mimic force_rotate: flush, close, release, while the
+            // periodic-flush threads above may still be in flight.
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            segment.flush_to_disk().expect("rotate flush ok");
+            segment.close_file_handle();
+            segment.release_buffer();
+
+            for h in handles {
+                h.join().expect("flush thread must not panic");
+            }
+        }
     }
 }
