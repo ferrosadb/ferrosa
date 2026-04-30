@@ -308,8 +308,12 @@ mod tests {
             token: Token(42),
             key: PartitionKey::new(vec![1, 2, 3]),
         };
+        // The test schema below registers test_ks.test_tbl with an Int32
+        // clustering column. The fail-loud per-cell-and-clustering
+        // validator (Layer 1 of the timeuuid-flush-wedge fix) rejects
+        // anything other than 4 raw bytes here.
         let row = Row {
-            clustering: vec![10, 20],
+            clustering: 10i32.to_be_bytes().to_vec(),
             cells: vec![(0, CellValue::live(vec![100], 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),

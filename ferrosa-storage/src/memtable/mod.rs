@@ -14,8 +14,59 @@ pub mod skiplist;
 use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
-use ferrosa_common::{Result, TableSchema};
+use ferrosa_common::schema::{validate_cell_bytes, validate_clustering_shape};
+use ferrosa_common::{Error, Result, TableSchema};
 use ferrosa_sstable::types::{Partition, Row};
+
+/// Fail-loud guard: validate every cell in `row` against the column's
+/// declared fixed-width type. Returns `Err(Error::InvalidData(_))` on
+/// the first mismatch.
+///
+/// Static columns are indexed first (`0..static_columns.len()`), then
+/// regular columns (`static_columns.len()..`). Cells whose `col_idx` is
+/// out of range are tolerated (they may be system-internal columns)
+/// rather than rejected at this layer.
+///
+/// Empty / `None` cell values bypass the check (NULL markers and
+/// tombstones do not carry length-bound payloads).
+///
+/// See specs/in-process/bug-memtable-flush-wedge-truncated-timeuuid-
+/// from-now-function.md for the bug this guards against.
+pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Result<()> {
+    // Clustering shape: production wedge was an 8-byte clustering on a
+    // TimeUUID-clustered table. Catching this at the memtable boundary
+    // prevents the row from reaching the commit log and the SSTable
+    // writer's Gate A.
+    if let Err(reason) = validate_clustering_shape(&schema.clustering_columns, &row.clustering) {
+        return Err(Error::InvalidData(format!(
+            "{}.{} (clustering): {}",
+            schema.keyspace, schema.table, reason
+        )));
+    }
+
+    let static_count = schema.static_columns.len();
+    for (col_idx, cell) in &row.cells {
+        let bytes = match &cell.value {
+            Some(v) => v,
+            None => continue,
+        };
+        let idx = *col_idx as usize;
+        let column = if idx < static_count {
+            &schema.static_columns[idx]
+        } else if idx - static_count < schema.regular_columns.len() {
+            &schema.regular_columns[idx - static_count]
+        } else {
+            continue;
+        };
+        if let Err(reason) = validate_cell_bytes(&column.type_name, bytes) {
+            return Err(Error::InvalidData(format!(
+                "{}.{} (column \"{}\", index {}): {}",
+                schema.keyspace, schema.table, column.name, col_idx, reason
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// In-memory write buffer for a single table.
 ///

@@ -100,7 +100,12 @@ impl ShardedBTreeMemtable {
 }
 
 impl Memtable for ShardedBTreeMemtable {
-    fn put(&self, key: &DecoratedKey, row: Row, _schema: &TableSchema) -> Result<()> {
+    fn put(&self, key: &DecoratedKey, row: Row, schema: &TableSchema) -> Result<()> {
+        // Fail-loud guard: reject mis-sized cells before they reach the
+        // memtable. Without this check the `now()`-into-TimeUUID bug
+        // would land an 8-byte cell in a 16-byte column, wedging every
+        // subsequent flush attempt.
+        super::validate_row_against_schema(&row, schema)?;
         let idx = self.shard_index(key);
         let mut shard = match self.shards[idx].try_write() {
             Some(guard) => guard,
@@ -323,6 +328,98 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
         }
+    }
+
+    /// Schema with a TimeUUID column at index 0. Used for the fail-loud
+    /// guard regression — see specs/in-process/bug-memtable-flush-wedge-
+    /// truncated-timeuuid-from-now-function.md.
+    fn timeuuid_schema() -> TableSchema {
+        TableSchema {
+            keyspace: "ks".to_string(),
+            table: "t".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "call_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.TimeUUIDType".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// Regression for the memtable-flush wedge: an 8-byte cell whose
+    /// declared column type is TimeUUID must be rejected at `put` time
+    /// (fail-loud), not silently inserted only to fail at flush time.
+    /// Before the fix the row would be accepted, durable in the commit
+    /// log, and would wedge every subsequent flush.
+    #[test]
+    fn put_rejects_8_byte_value_in_timeuuid_column() {
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = timeuuid_schema();
+        let key = make_key("pk1");
+        // 8-byte payload — exactly the buggy `now()` Timestamp shape.
+        let row = make_row(0, &[0u8; 8], 1000);
+        let result = mem.put(&key, row, &schema);
+        assert!(
+            result.is_err(),
+            "memtable must reject 8-byte cell in TimeUUID column"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("16") && err.contains("8"),
+            "error must cite expected vs actual length, got: {err}"
+        );
+    }
+
+    /// Production-observed wedge variant: the malformed bytes are in
+    /// `row.clustering` (8 bytes) on a TimeUUID-clustered table. The
+    /// fail-loud guard must reject this at `put` time as well — the
+    /// per-cell validator alone misses clustering bytes.
+    #[test]
+    fn put_rejects_8_byte_clustering_in_timeuuid_clustered_table() {
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "tool_usage_log".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "call_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.TimeUUIDType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![],
+            extensions: Default::default(),
+        };
+        let key = make_key("pk1");
+        let row = Row {
+            clustering: vec![0u8; 8], // wrong: TimeUUID needs 16
+            cells: vec![],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        let result = mem.put(&key, row, &schema);
+        assert!(
+            result.is_err(),
+            "memtable must reject 8-byte clustering on TimeUUID column"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("16") && err.contains("8"),
+            "error must cite expected vs actual length, got: {err}"
+        );
+    }
+
+    /// 16-byte TimeUUID cell must be accepted (control case for the
+    /// fail-loud guard above).
+    #[test]
+    fn put_accepts_16_byte_timeuuid_value() {
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = timeuuid_schema();
+        let key = make_key("pk1");
+        let row = make_row(0, &[0u8; 16], 1000);
+        mem.put(&key, row, &schema).unwrap();
     }
 
     #[test]

@@ -20,6 +20,51 @@ use crate::types::{decode_value, encode_value, CqlType, CqlValue};
 use ferrosa_schema::Schema;
 
 // ---------------------------------------------------------------------------
+// Server-side function evaluation
+// ---------------------------------------------------------------------------
+
+/// 100-nanosecond intervals between the UUID epoch (1582-10-15) and the
+/// Unix epoch (1970-01-01). Shared between `eval_now` (mints v1 TimeUUIDs)
+/// and `eval_to_timestamp` (extracts unix-millis from a v1 TimeUUID).
+pub(crate) const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
+
+/// Generate a v1 TimeUUID containing the current timestamp.
+///
+/// Returns `CqlValue::Timeuuid` with a version-1 UUID built from the
+/// current system clock. Uses a v4 UUID as entropy source for the clock
+/// sequence and node fields (avoids pulling in `rand` directly).
+///
+/// **Correctness invariant:** the returned `Uuid` is exactly 16 bytes when
+/// encoded — anything shorter wedges TimeUUID-clustered tables at flush
+/// time. See specs/in-process/bug-memtable-flush-wedge-truncated-timeuuid-
+/// from-now-function.md for the bug this guards against.
+pub(crate) fn eval_now() -> CqlValue {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let uuid_ts = now.as_nanos() as u64 / 100 + UUID_EPOCH_OFFSET;
+    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
+    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
+    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
+
+    let entropy = uuid::Uuid::new_v4();
+    let ebytes = entropy.as_bytes();
+    let clock_seq: u16 = u16::from_be_bytes([ebytes[0], ebytes[1]]) & 0x3FFF | 0x8000; // variant 1
+    let node: [u8; 6] = [
+        ebytes[2], ebytes[3], ebytes[4], ebytes[5], ebytes[6], ebytes[7],
+    ];
+
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&time_low.to_be_bytes());
+    bytes[4..6].copy_from_slice(&time_mid.to_be_bytes());
+    bytes[6..8].copy_from_slice(&time_hi.to_be_bytes());
+    bytes[8..10].copy_from_slice(&clock_seq.to_be_bytes());
+    bytes[10..16].copy_from_slice(&node);
+
+    CqlValue::Timeuuid(uuid::Uuid::from_bytes(bytes))
+}
+
+// ---------------------------------------------------------------------------
 // Function 1: term_to_cql_value
 // ---------------------------------------------------------------------------
 
@@ -358,10 +403,30 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
         Term::FunctionCall { name, args, .. } => {
             match name.to_lowercase().as_str() {
                 "uuid" if args.is_empty() => Ok(CqlValue::Uuid(uuid::Uuid::new_v4())),
-                "now" if args.is_empty() => {
-                    // timeuuid-like: use current timestamp
-                    Ok(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
-                }
+                "now" if args.is_empty() => match target {
+                    // CQL spec: `now()` always produces a v1 TimeUUID. Before
+                    // the fix this arm returned `CqlValue::Timestamp(i64)` —
+                    // an 8-byte millisecond timestamp — which would land in a
+                    // TimeUUID column slot as 8 raw bytes. The SSTable writer
+                    // rejects 8-byte cells in TimeUUID columns at flush time,
+                    // wedging every subsequent flush. See
+                    // specs/in-process/bug-memtable-flush-wedge-truncated-
+                    // timeuuid-from-now-function.md.
+                    CqlType::Timeuuid => Ok(eval_now()),
+                    _ => Err(CqlError::Invalid(format!(
+                        "type mismatch: now() returns timeuuid, but column expects {}",
+                        cql_type_name(target)
+                    ))),
+                },
+                "currenttimestamp" if args.is_empty() => match target {
+                    CqlType::Timestamp => {
+                        Ok(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
+                    }
+                    _ => Err(CqlError::Invalid(format!(
+                        "type mismatch: currenttimestamp() returns timestamp, but column expects {}",
+                        cql_type_name(target)
+                    ))),
+                },
                 "totimestamp" if args.len() == 1 => {
                     // Convert argument to timestamp
                     let inner = term_to_cql_value(&args[0], &CqlType::Timestamp)?;
@@ -1595,6 +1660,58 @@ mod tests {
         let u = uuid::Uuid::new_v4();
         let val = term_to_cql_value(&Term::UuidLiteral(u), &CqlType::Timeuuid).unwrap();
         assert_eq!(val, CqlValue::Timeuuid(u));
+    }
+
+    /// Regression for the memtable-flush wedge: `now()` bound into a
+    /// `timeuuid` column slot must produce a 16-byte v1 TimeUUID, not an
+    /// 8-byte millisecond Timestamp. Before the fix, the function returned
+    /// `CqlValue::Timestamp(i64)` regardless of the target type, and the
+    /// 8-byte cell would land in the memtable and wedge every subsequent
+    /// flush. See specs/in-process/bug-memtable-flush-wedge-truncated-
+    /// timeuuid-from-now-function.md.
+    #[test]
+    fn now_into_timeuuid_column_produces_v1_timeuuid() {
+        let term = Term::FunctionCall {
+            keyspace: None,
+            name: "now".into(),
+            args: vec![],
+        };
+        let val = term_to_cql_value(&term, &CqlType::Timeuuid).unwrap();
+        match val {
+            CqlValue::Timeuuid(u) => {
+                let bytes = u.as_bytes();
+                assert_eq!(bytes.len(), 16, "TimeUUID must be 16 raw bytes");
+                // Version-1 UUID: high 4 bits of byte 6 == 0x10.
+                assert_eq!(
+                    bytes[6] & 0xF0,
+                    0x10,
+                    "now() must produce a version-1 UUID, got version {}",
+                    bytes[6] >> 4
+                );
+            }
+            other => panic!("expected CqlValue::Timeuuid, got {other:?}"),
+        }
+    }
+
+    /// `now()` encodes to exactly 16 bytes when bound into a TimeUUID
+    /// column. This is the byte-for-byte invariant the memtable+SSTable
+    /// writer relies on (TimeUUIDType is fixed-width 16).
+    #[test]
+    fn now_into_timeuuid_encodes_to_16_bytes() {
+        let term = Term::FunctionCall {
+            keyspace: None,
+            name: "now".into(),
+            args: vec![],
+        };
+        let val = term_to_cql_value(&term, &CqlType::Timeuuid).unwrap();
+        let bytes = encode_value(&val);
+        assert_eq!(
+            bytes.len(),
+            16,
+            "now() into a timeuuid column must encode to 16 bytes, \
+             got {} bytes (this is the memtable-flush wedge)",
+            bytes.len()
+        );
     }
 
     #[test]

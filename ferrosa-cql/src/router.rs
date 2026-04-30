@@ -76,41 +76,6 @@ fn should_yield_during_partition_scan(processed_partitions: usize, yield_every: 
     yield_every > 0 && processed_partitions > 0 && processed_partitions.is_multiple_of(yield_every)
 }
 
-/// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
-const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
-
-/// Generate a v1 Timeuuid containing the current timestamp.
-///
-/// Returns `CqlValue::Timeuuid` with a version-1 UUID built from the
-/// current system clock. Uses a v4 UUID as entropy source for the
-/// clock sequence and node fields (avoids pulling in `rand` directly).
-fn eval_now() -> CqlValue {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let uuid_ts = now.as_nanos() as u64 / 100 + UUID_EPOCH_OFFSET;
-    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
-    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
-    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
-
-    // Use a v4 UUID as entropy source for clock_seq and node bytes.
-    let entropy = uuid::Uuid::new_v4();
-    let ebytes = entropy.as_bytes();
-    let clock_seq: u16 = u16::from_be_bytes([ebytes[0], ebytes[1]]) & 0x3FFF | 0x8000; // variant 1
-    let node: [u8; 6] = [
-        ebytes[2], ebytes[3], ebytes[4], ebytes[5], ebytes[6], ebytes[7],
-    ];
-
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&time_low.to_be_bytes());
-    bytes[4..6].copy_from_slice(&time_mid.to_be_bytes());
-    bytes[6..8].copy_from_slice(&time_hi.to_be_bytes());
-    bytes[8..10].copy_from_slice(&clock_seq.to_be_bytes());
-    bytes[10..16].copy_from_slice(&node);
-
-    CqlValue::Timeuuid(uuid::Uuid::from_bytes(bytes))
-}
-
 /// Extract the Unix-epoch millisecond timestamp from a Timeuuid.
 ///
 /// Converts from 100-nanosecond intervals since 1582-10-15 (UUID epoch) to
@@ -123,7 +88,7 @@ fn eval_to_timestamp(timeuuid: &CqlValue) -> Result<CqlValue, CqlError> {
             let time_mid = u16::from_be_bytes([bytes[4], bytes[5]]) as u64;
             let time_hi = (u16::from_be_bytes([bytes[6], bytes[7]]) & 0x0FFF) as u64;
             let uuid_ts = time_low | (time_mid << 32) | (time_hi << 48);
-            let millis = (uuid_ts - UUID_EPOCH_OFFSET) / 10_000;
+            let millis = (uuid_ts - crate::bridge::UUID_EPOCH_OFFSET) / 10_000;
             Ok(CqlValue::Timestamp(millis as i64))
         }
         _ => Err(CqlError::Invalid(
@@ -5067,10 +5032,10 @@ fn apply_system_select(
                 let (src_idx, apply_tojson) = proj_ops[i];
                 if src_idx == usize::MAX - 1 {
                     // now()
-                    agg_row.push(Some(eval_now()));
+                    agg_row.push(Some(crate::bridge::eval_now()));
                 } else if src_idx == usize::MAX - 2 {
                     // toTimestamp(now())
-                    let timeuuid = eval_now();
+                    let timeuuid = crate::bridge::eval_now();
                     agg_row.push(eval_to_timestamp(&timeuuid).ok());
                 } else if src_idx < all_col_names.len() {
                     let val = all_rows
@@ -5108,10 +5073,10 @@ fn apply_system_select(
                 .map(|&(src_idx, apply_tojson)| {
                     if src_idx == usize::MAX - 1 {
                         // now()
-                        Some(eval_now())
+                        Some(crate::bridge::eval_now())
                     } else if src_idx == usize::MAX - 2 {
                         // toTimestamp(now())
-                        let timeuuid = eval_now();
+                        let timeuuid = crate::bridge::eval_now();
                         eval_to_timestamp(&timeuuid).ok()
                     } else {
                         let val = row.get(src_idx).cloned().flatten();
@@ -5348,11 +5313,11 @@ fn apply_builtin_functions(
         for (proj_idx, op) in &ops {
             match op {
                 BuiltinOp::Now => {
-                    proj_row[*proj_idx] = Some(eval_now());
+                    proj_row[*proj_idx] = Some(crate::bridge::eval_now());
                 }
                 BuiltinOp::ToTimestamp => {
                     // toTimestamp(now()) -- generate a timeuuid and convert
-                    let timeuuid = eval_now();
+                    let timeuuid = crate::bridge::eval_now();
                     proj_row[*proj_idx] = eval_to_timestamp(&timeuuid).ok();
                 }
                 BuiltinOp::Writetime(src_idx) => {
@@ -10755,8 +10720,8 @@ mod tests {
 
     #[tokio::test]
     async fn cql_function_now() {
-        // Test eval_now() directly: should produce a v1 UUID.
-        let timeuuid = super::eval_now();
+        // Test crate::bridge::eval_now() directly: should produce a v1 UUID.
+        let timeuuid = crate::bridge::eval_now();
         match timeuuid {
             CqlValue::Timeuuid(uuid) => {
                 let bytes = uuid.as_bytes();
@@ -10769,8 +10734,8 @@ mod tests {
 
     #[tokio::test]
     async fn cql_function_to_timestamp() {
-        // Test eval_now() + eval_to_timestamp() directly.
-        let timeuuid = super::eval_now();
+        // Test crate::bridge::eval_now() + eval_to_timestamp() directly.
+        let timeuuid = crate::bridge::eval_now();
         let ts = super::eval_to_timestamp(&timeuuid).expect("toTimestamp should succeed");
 
         let now_millis = std::time::SystemTime::now()
