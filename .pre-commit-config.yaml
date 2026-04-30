@@ -3,10 +3,14 @@
 # Install:  pre-commit install --hook-type pre-commit --hook-type pre-push
 # Bypass:   FERROSA_SKIP_PREPUSH=1 git push    (or git push --no-verify)
 #
-# Pre-push will refuse to push code that would fail CI's fast checks
-# (fmt, clippy, workspace test).  The integration test step is gated
-# behind FERROSA_PRE_PUSH_INTEGRATION=1 because it builds an image
-# and brings up a 3-node Docker cluster (5-10 min total).
+# Speed budget:
+#   - pre-commit must stay under ~5 seconds (developer commits frequently).
+#     fmt is the only thing fast enough — clippy/test moved to pre-push.
+#   - pre-push runs the full CI gate: fmt, workspace clippy, workspace
+#     tests via cargo-nextest (parallel by binary AND by test, ~30-50%
+#     faster than `cargo test`). The integration test step is gated
+#     behind FERROSA_PRE_PUSH_INTEGRATION=1 because it builds an image
+#     and brings up a 3-node Docker cluster (5-10 min total).
 
 default_install_hook_types:
   - pre-commit
@@ -26,7 +30,7 @@ repos:
 
   - repo: local
     hooks:
-      # Pre-commit: fast formatting + lint
+      # Pre-commit: format check only. Anything slower belongs on pre-push.
       - id: cargo-fmt
         name: cargo fmt --check
         entry: cargo fmt --check
@@ -34,23 +38,25 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      - id: cargo-clippy
-        name: cargo clippy --all-targets -- -D warnings
-        entry: cargo clippy --workspace --all-targets -- -D warnings
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-      # Pre-push: ensure workspace passes before reaching CI
-      # NOTE: ferrosa-jepsen, ferrosa-loadgen, ferrosa-storage are excluded from
-      # pre-push because they contain tests that panic-loud on missing infra
-      # (FERROSA_TEST_CONTAINERS, FERROSA_TEST_FIRECRACKER, FERROSA_TEST_CLUSTER_NODES)
-      # per ferrosa/CLAUDE.md test policy. Those tests run in CI's
-      # 'Cluster integration tests' job with the env vars set.
+      # Pre-push: run the FULL workspace test suite — same shape as CI.
+      # Never push something that will immediately fail CI.
+      #
+      # Per ferrosa/CLAUDE.md test policy, infrastructure-gated tests
+      # panic-loud when their env vars are missing
+      # (FERROSA_TEST_CONTAINERS, FERROSA_TEST_FIRECRACKER,
+      # FERROSA_TEST_CLUSTER_NODES). Set those before pushing if your
+      # changes touch the affected paths; otherwise spin the cluster:
+      #   docker compose -f compose.test.yml up -d
+      #   FERROSA_TEST_CONTAINERS=1 git push
+      # Bypass with FERROSA_SKIP_PREPUSH=1 git push if you genuinely
+      # know the failure is unrelated.
+      #
+      # Tests run via cargo-nextest. Falls back to `cargo test` if nextest
+      # isn't installed — install with `cargo install cargo-nextest --locked`.
       - id: cargo-test-workspace
-        name: cargo test --workspace
+        name: cargo nextest run --workspace (pre-push, full suite)
         stages: [pre-push]
-        entry: cargo test --workspace --lib --bins --exclude ferrosa-jepsen --exclude ferrosa-loadgen --exclude ferrosa-storage
+        entry: bash -c 'if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run --workspace --all-targets --no-fail-fast; else echo "cargo-nextest not installed (cargo install cargo-nextest --locked); falling back to cargo test"; cargo test --workspace --all-targets --no-fail-fast; fi'
         language: system
         pass_filenames: false
 
