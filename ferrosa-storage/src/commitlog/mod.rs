@@ -146,7 +146,46 @@ impl CommitLog {
     /// 2. Scan the log directory for segment files, sorted by segment ID.
     /// 3. For each segment, read all entries and filter those after checkpoint positions.
     /// 4. Create a fresh `CommitLog` for new writes.
+    ///
+    /// **Memory note:** this method buffers every undominated mutation in a
+    /// single `Vec<Mutation>` and is therefore unsuitable for production
+    /// recovery of logs larger than available RAM. Prefer
+    /// [`open_and_replay_streaming`](Self::open_and_replay_streaming), which
+    /// caps peak memory at one segment's worth of decoded entries.
     pub fn open_and_replay(config: Config) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        let mut mutations = Vec::new();
+        let commit_log = Self::open_and_replay_streaming(config, |mutation| {
+            mutations.push(mutation);
+            Ok(())
+        })?;
+        Ok((commit_log, mutations))
+    }
+
+    /// Opens an existing commit log directory and streams undominated
+    /// mutations to `on_mutation`, one segment at a time.
+    ///
+    /// This is the memory-bounded crash-recovery primitive. Peak memory is
+    /// `O(segment_size)` regardless of total log size — the caller's
+    /// `on_mutation` closure is invoked for each entry as it is decoded, and
+    /// each segment's bytes are dropped before the next segment is opened.
+    /// A segment file is deleted only after every entry it contains has been
+    /// successfully delivered to the callback. If the callback returns `Err`,
+    /// replay stops immediately and the remaining segments stay on disk so a
+    /// subsequent retry can re-process them.
+    ///
+    /// Mutations whose `(segment_id, offset)` is `<=` the table's flushed
+    /// checkpoint are dropped before the callback fires. Order across
+    /// segments matches segment-id order; order within a segment matches
+    /// append order.
+    ///
+    /// See `specs/todo/bug-commitlog-replay-oom-on-large-log.md`.
+    pub fn open_and_replay_streaming<F>(
+        config: Config,
+        mut on_mutation: F,
+    ) -> ferrosa_common::Result<Self>
+    where
+        F: FnMut(Mutation) -> ferrosa_common::Result<()>,
+    {
         let checkpoint = CommitLogCheckpoint::load(&config.checkpoint_dir)?;
         let max_checkpoint_segment_id = checkpoint.values().map(|pos| pos.segment_id).max();
 
@@ -168,7 +207,12 @@ impl CommitLog {
         segment_files.sort_by_key(|(id, _)| *id);
         let max_segment_file_id = segment_files.iter().map(|(id, _)| *id).max();
 
-        let mut mutations = Vec::new();
+        // Stream segment by segment. The reader's `data` buffer (~segment_size)
+        // and the per-segment entries Vec are dropped before the next iteration,
+        // so peak memory is bounded by one segment regardless of how many
+        // segments exist on disk. Each fully-replayed segment file is deleted
+        // before moving on; on callback error, remaining segments are left
+        // intact for retry.
         for (id, path) in &segment_files {
             // A 0-byte segment is the torn-create state: the writer
             // rolled to a new segment file, but was killed (OOM, kill -9,
@@ -189,6 +233,9 @@ impl CommitLog {
                         "commitlog: skipping zero-byte segment on replay (torn-create from previous crash); \
                          file will be cleaned up below"
                     );
+                    if let Err(e) = fs::remove_file(path) {
+                        tracing::warn!(%e, "commitlog: failed to remove zero-byte segment file");
+                    }
                     continue;
                 }
                 Ok(_) => {}
@@ -197,21 +244,19 @@ impl CommitLog {
                 }
             }
 
-            let mut reader = SegmentReader::open(path)?;
-            let entries = reader.read_all()?;
+            {
+                let mut reader = SegmentReader::open(path)?;
+                let entries = reader.read_all()?;
 
-            for (pos, mutation) in entries {
-                let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-                // Keep entries that are after the checkpoint position for this table.
-                let dominated = checkpoint.get(&table_id).is_some_and(|cp| pos <= *cp);
-                if !dominated {
-                    mutations.push(mutation);
+                for (pos, mutation) in entries {
+                    let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+                    let dominated = checkpoint.get(&table_id).is_some_and(|cp| pos <= *cp);
+                    if !dominated {
+                        on_mutation(mutation)?;
+                    }
                 }
             }
-        }
 
-        // Clean up old segment files before creating new CommitLog.
-        for (_, path) in &segment_files {
             if let Err(e) = fs::remove_file(path) {
                 tracing::warn!(%e, "commitlog: failed to remove segment file");
             }
@@ -224,8 +269,7 @@ impl CommitLog {
             .unwrap_or(0)
             + 1;
 
-        let commit_log = Self::new_with_first_segment_id(config, first_segment_id)?;
-        Ok((commit_log, mutations))
+        Self::new_with_first_segment_id(config, first_segment_id)
     }
 
     /// Appends a mutation to the commit log.
