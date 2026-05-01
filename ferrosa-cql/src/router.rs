@@ -23,7 +23,7 @@ use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
-    query_role_members, query_role_permissions, query_roles, query_tables, AuthContext,
+    query_role_members, query_role_permissions, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
@@ -1062,16 +1062,64 @@ async fn route_select(
         }
         ("system_auth", "roles") => {
             let snap = state.schema.snapshot();
-            let role_rows = query_roles(&snap, ctx.auth);
-            let col_names = vec!["role".into(), "is_superuser".into(), "can_login".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Boolean, CqlType::Boolean];
-            let rows: Vec<Vec<Option<CqlValue>>> = role_rows
+
+            // Apply the WHERE clause. `role` is the partition key on
+            // system_auth.roles, but pre-fix the handler returned every
+            // role unconditionally — `WHERE role = 'cassandra'` matched
+            // every row. Filter eq predicates here.
+            let mut sorted_roles: Vec<&ferrosa_schema::auth::role::RoleMetadata> = snap
+                .roles
+                .values()
+                .filter(|r| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true;
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(v) => v.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "role" => r.name == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            sorted_roles.sort_by(|a, b| a.name.cmp(&b.name));
+
+            // Project `salted_hash` as a column. Non-superuser callers
+            // see a fixed redaction marker (the column exists but the
+            // hash isn't disclosed); superusers see the real hash.
+            // Pre-fix the column was omitted entirely, which (a) hid
+            // the existence of any hash and (b) made the silent
+            // hash-not-stored bug undetectable from a SELECT *.
+            let col_names = vec![
+                "role".into(),
+                "is_superuser".into(),
+                "can_login".into(),
+                "salted_hash".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Varchar,
+            ];
+            let is_superuser_caller = ctx.auth.is_superuser;
+            let rows: Vec<Vec<Option<CqlValue>>> = sorted_roles
                 .iter()
                 .map(|r| {
+                    let salted_hash_cell = match (&r.salted_hash, is_superuser_caller) {
+                        (Some(hash), true) => Some(CqlValue::Text(hash.clone())),
+                        (Some(_), false) => Some(CqlValue::Text("[REDACTED]".to_string())),
+                        (None, _) => None,
+                    };
                     vec![
-                        Some(CqlValue::Text(r.role.clone())),
+                        Some(CqlValue::Text(r.name.clone())),
                         Some(CqlValue::Boolean(r.is_superuser)),
                         Some(CqlValue::Boolean(r.can_login)),
+                        salted_hash_cell,
                     ]
                 })
                 .collect();
@@ -11979,6 +12027,141 @@ mod tests {
                 hash
             )
             .unwrap()
+        );
+    }
+
+    /// Regression: `SELECT * FROM system_auth.roles WHERE role = 'X'`
+    /// returned every row instead of just the matching one — the
+    /// handler's WHERE clause was ignored. Test pins the eq filter.
+    #[tokio::test]
+    async fn select_system_auth_roles_filters_by_partition_key() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for name in ["alpha", "beta", "gamma"] {
+            let stmt = crate::parser::parse(&format!(
+                "CREATE ROLE {name} WITH PASSWORD = 'p' AND LOGIN = true" // pragma: allowlist secret
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_auth.roles WHERE role = 'beta'").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let body = match result {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+        // The response must contain "beta" exactly once.
+        let beta_hits = body
+            .windows(b"beta".len())
+            .filter(|w| *w == b"beta")
+            .count();
+        assert_eq!(
+            beta_hits, 1,
+            "WHERE role = 'beta' must filter to exactly the beta row"
+        );
+        // And must NOT contain alpha or gamma.
+        assert!(
+            !body.windows(b"alpha".len()).any(|w| w == b"alpha"),
+            "alpha must be filtered out"
+        );
+        assert!(
+            !body.windows(b"gamma".len()).any(|w| w == b"gamma"),
+            "gamma must be filtered out"
+        );
+    }
+
+    /// Regression: `SELECT *` against system_auth.roles silently
+    /// dropped the salted_hash column. With #1 (CREATE ROLE
+    /// password-not-stored) that omission masked the silent failure.
+    /// The fix exposes the column with `[REDACTED]` for non-superusers
+    /// and the real hash for superusers — the column existence is now
+    /// observable.
+    #[tokio::test]
+    async fn select_system_auth_roles_redacts_salted_hash_for_nonsuperuser() {
+        let (state, _dir) = setup();
+        let admin_ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Create a role with a password under the superuser context.
+        let stmt = crate::parser::parse(
+            "CREATE ROLE redact_test WITH PASSWORD = 'mypwd123' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .unwrap();
+        route(&state, &admin_ctx, stmt).await.unwrap();
+
+        // Superuser SELECT *: response must contain the actual hash
+        // bytes (or at least the bcrypt prefix `$2`) somewhere.
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_auth.roles WHERE role = 'redact_test'")
+                .unwrap();
+        let body = match route(&state, &admin_ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+        assert!(
+            body.windows(2).any(|w| w == b"$2"),
+            "superuser SELECT must include the real bcrypt hash"
+        );
+        assert!(
+            !body
+                .windows(b"[REDACTED]".len())
+                .any(|w| w == b"[REDACTED]"),
+            "superuser SELECT must NOT redact"
+        );
+
+        // Non-superuser SELECT *: response must contain `[REDACTED]`
+        // (column visible, hash hidden). The column name `salted_hash`
+        // is also included in the metadata so the column exists in
+        // the response schema.
+        let nonsuper = ferrosa_schema::AuthContext {
+            role: "nobody".into(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        let user_ctx = RequestContext {
+            auth: &nonsuper,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_auth.roles WHERE role = 'redact_test'")
+                .unwrap();
+        let body = match route(&state, &user_ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+        assert!(
+            body.windows(b"[REDACTED]".len())
+                .any(|w| w == b"[REDACTED]"),
+            "non-superuser SELECT must include the [REDACTED] marker"
+        );
+        assert!(
+            body.windows(b"salted_hash".len())
+                .any(|w| w == b"salted_hash"),
+            "salted_hash column metadata must be present"
+        );
+        assert!(
+            !body.windows(2).any(|w| w == b"$2"),
+            "non-superuser SELECT must NOT leak the bcrypt hash"
         );
     }
 
