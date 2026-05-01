@@ -71,7 +71,7 @@ fn kmeans(
     let dim = vectors[0].len();
 
     // Random initialization: pick k distinct vectors as initial centroids
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut indices: Vec<usize> = (0..vectors.len()).collect();
     indices.shuffle(&mut rng);
     let mut centroids: Vec<Vec<f32>> = indices[..k].iter().map(|&i| vectors[i].clone()).collect();

@@ -120,12 +120,12 @@ fn run_load_test_inner(
             let delete_ratio = profile.delete_ratio;
 
             s.spawn(move || {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut local_ts = (worker_id as i64) * 1_000_000_000;
 
                 while !st.load(Ordering::Relaxed) {
                     let op = choose_op(&mut rng, read_ratio, update_ratio, delete_ratio);
-                    let key_idx = rand::Rng::gen_range(&mut rng, 0..key_space);
+                    let key_idx = rand::RngExt::random_range(&mut rng, 0..key_space);
                     let key_str = make_key_string(key_idx);
 
                     match op {

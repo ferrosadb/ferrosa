@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 
 use super::{NemesisAction, NemesisContext};
 
@@ -95,7 +95,7 @@ impl NemesisAction for PauseNode {
     async fn inject(&self, ctx: &NemesisContext) -> Result<()> {
         // Pre-compute the random choice before any await.
         let target = {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             ctx.node_ips.choose(&mut rng).cloned()
         };
         let target = target.expect("cluster must have at least one node");
