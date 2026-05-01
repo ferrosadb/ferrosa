@@ -21,6 +21,13 @@
 
 set -euo pipefail
 
+# Bypass when explicitly requested. Use sparingly — the whole point of
+# this hook is "don't push something that will fail CI".
+if [ "${FERROSA_SKIP_PREPUSH:-0}" = "1" ]; then
+  echo "FERROSA_SKIP_PREPUSH=1 — skipping pre-push test gate"
+  exit 0
+fi
+
 # Skip list — must match `.github/workflows/ci.yml` step "Run tests".
 # Tests gated by FERROSA_TEST_CONTAINERS / FERROSA_TEST_FIRECRACKER /
 # FERROSA_TEST_CLUSTER_NODES per CLAUDE.md test policy.
