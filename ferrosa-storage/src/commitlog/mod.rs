@@ -46,6 +46,19 @@ use reader::SegmentReader;
 use segment::Segment;
 use sync::{BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
 
+/// Process-wide counter of zero-byte commit-log segment files skipped during
+/// crash recovery. A non-zero value means the writer rolled to a new segment
+/// and was killed before any bytes (not even the header) were durably synced
+/// — recovery treats the file as empty and continues. Operators should alert
+/// if this rises rapidly (indicates pathological roll-then-crash behaviour);
+/// a small steady-state count is expected on hard kills (OOM, host reboot).
+pub static EMPTY_SEGMENT_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Reads the `EMPTY_SEGMENT_SKIPPED_TOTAL` counter.
+pub fn empty_segment_skipped_total() -> u64 {
+    EMPTY_SEGMENT_SKIPPED_TOTAL.load(Ordering::Relaxed)
+}
+
 /// The commit log: write-ahead log for mutation durability.
 ///
 /// Writers call [`append()`](Self::append) to record a mutation. The commit log
@@ -156,7 +169,34 @@ impl CommitLog {
         let max_segment_file_id = segment_files.iter().map(|(id, _)| *id).max();
 
         let mut mutations = Vec::new();
-        for (_, path) in &segment_files {
+        for (id, path) in &segment_files {
+            // A 0-byte segment is the torn-create state: the writer
+            // rolled to a new segment file, but was killed (OOM, kill -9,
+            // host reboot) before the header was durably written. By
+            // construction it carries no records, so it is safe — and
+            // mandatory — to skip it on replay rather than refuse to
+            // start. (See specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.)
+            //
+            // We deliberately do NOT extend tolerance to `0 < n < HEADER_SIZE`:
+            // that case means the writer wrote bytes but didn't finish
+            // the header, which is real corruption and must surface loudly.
+            match fs::metadata(path) {
+                Ok(meta) if meta.len() == 0 => {
+                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        segment_id = id,
+                        path = %path.display(),
+                        "commitlog: skipping zero-byte segment on replay (torn-create from previous crash); \
+                         file will be cleaned up below"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(ferrosa_common::Error::from(e));
+                }
+            }
+
             let mut reader = SegmentReader::open(path)?;
             let entries = reader.read_all()?;
 
@@ -524,9 +564,26 @@ impl CommitLog {
         // Sort by segment ID for replay order.
         segment_paths.sort_by_key(|(id, _)| *id);
 
-        for (_, path) in &segment_paths {
+        for (id, path) in &segment_paths {
             if !path.exists() {
                 continue;
+            }
+            // Same torn-create tolerance as open_and_replay: 0-byte segments
+            // are skipped (see specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md).
+            match fs::metadata(path) {
+                Ok(meta) if meta.len() == 0 => {
+                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        segment_id = id,
+                        path = %path.display(),
+                        "commitlog: skipping zero-byte segment on catch-up replay"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(ferrosa_common::Error::from(e));
+                }
             }
             let mut reader = SegmentReader::open(path)?;
             let entries = reader.read_all()?;
@@ -1331,5 +1388,66 @@ mod tests {
         );
 
         cl.shutdown().unwrap();
+    }
+
+    /// Regression: a 0-byte commit-log segment file (torn-create from a
+    /// previous crash) must not block startup. The file is skipped, the
+    /// `EMPTY_SEGMENT_SKIPPED_TOTAL` counter increments, and replay continues.
+    /// See specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.
+    #[test]
+    fn open_and_replay_tolerates_zero_byte_segment() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Pre-seed an empty segment file as if a previous run was killed
+        // mid-roll. Use the same naming pattern as production.
+        let bad_path = dir.path().join("commitlog-7.log");
+        std::fs::File::create(&bad_path).unwrap();
+        assert_eq!(std::fs::metadata(&bad_path).unwrap().len(), 0);
+
+        let before = empty_segment_skipped_total();
+        let config = CommitLogConfig::test_config(dir.path());
+        let (cl, mutations) = CommitLog::open_and_replay(config).expect(
+            "open_and_replay must succeed when a 0-byte segment is present \
+             (P0 data-availability invariant)",
+        );
+
+        assert!(
+            mutations.is_empty(),
+            "0-byte segment carries no records; replay must yield none"
+        );
+        assert_eq!(
+            empty_segment_skipped_total(),
+            before + 1,
+            "EMPTY_SEGMENT_SKIPPED_TOTAL must increment exactly once"
+        );
+        assert!(
+            !bad_path.exists(),
+            "the 0-byte segment must be cleaned up by the replay tail"
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    /// Negative case: a partial-header (>0 but < HEADER_SIZE bytes) segment is
+    /// real corruption — the writer wrote bytes but did not finish the header.
+    /// Replay must still hard-fail in this case. We do NOT extend torn-create
+    /// tolerance into the partial-header window.
+    #[test]
+    fn open_and_replay_still_fails_on_partial_header_segment() {
+        use super::descriptor::HEADER_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a few bytes, but fewer than HEADER_SIZE.
+        let bad_path = dir.path().join("commitlog-3.log");
+        std::fs::write(&bad_path, vec![0u8; HEADER_SIZE - 1]).unwrap();
+
+        let config = CommitLogConfig::test_config(dir.path());
+        let result = CommitLog::open_and_replay(config);
+        assert!(
+            result.is_err(),
+            "partial-header segment must NOT be silently tolerated — that \
+             would mask real corruption. Got: {:?}",
+            result.as_ref().map(|_| "Ok")
+        );
     }
 }
