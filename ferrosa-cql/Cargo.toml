@@ -22,11 +22,11 @@ ferrosa-udf = { path = "../ferrosa-udf" }
 futures = "0.3"
 indexmap = "2"
 lz4_flex = "0.11"
-md-5 = "0.10"
+md-5 = "0.11"
 moka = { version = "0.12", features = ["sync"] }
 num-bigint = "0.4"
 parking_lot = "0.12"
-phf = { version = "0.11", features = ["macros"] }
+phf = { version = "0.13", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 rustls = { version = "0.23", features = ["ring"] }
@@ -39,7 +39,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"
-rcgen = "0.13"
+rcgen = "0.14"
 serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
