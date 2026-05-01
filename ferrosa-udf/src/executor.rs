@@ -347,7 +347,11 @@ impl UdfExecutor {
         // Propagate call errors without returning the instance to the pool.
         call_result?;
 
-        // Post-call cleanup required by wasmtime component model
+        // wasmtime ≥44 no longer requires (and deprecates) the explicit
+        // post_return call — the component runtime now handles teardown
+        // implicitly. Keep the call site here so the original sequencing
+        // is documented, but allow the deprecation under -D warnings.
+        #[allow(deprecated)]
         invoke_func
             .post_return(&mut store)
             .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
@@ -421,6 +425,8 @@ impl UdfExecutor {
                 }
             })?;
 
+        // See note above on wasmtime ≥44 deprecating post_return.
+        #[allow(deprecated)]
         invoke_func
             .post_return(&mut store)
             .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;

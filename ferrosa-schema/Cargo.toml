@@ -11,7 +11,7 @@ ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 arc-swap = "1.7"
-bcrypt = "0.16"
+bcrypt = "0.19"
 argon2 = "0.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
