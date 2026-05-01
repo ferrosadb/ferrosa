@@ -16,7 +16,7 @@ use std::sync::Arc;
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::{validate_cell_bytes, validate_clustering_shape};
 use ferrosa_common::{Error, Result, TableSchema};
-use ferrosa_sstable::types::{Partition, Row};
+use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 
 /// Fail-loud guard: validate every cell in `row` against the column's
 /// declared fixed-width type. Returns `Err(Error::InvalidData(_))` on
@@ -37,11 +37,23 @@ pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Re
     // TimeUUID-clustered table. Catching this at the memtable boundary
     // prevents the row from reaching the commit log and the SSTable
     // writer's Gate A.
-    if let Err(reason) = validate_clustering_shape(&schema.clustering_columns, &row.clustering) {
-        return Err(Error::InvalidData(format!(
-            "{}.{} (clustering): {}",
-            schema.keyspace, schema.table, reason
-        )));
+    //
+    // Exception: a pure tombstone Row (empty clustering, no cells,
+    // non-LIVE deletion) is the in-memory representation of a
+    // partition-level DELETE (`DELETE FROM t WHERE pk = ?`). Such a
+    // marker has no clustering by construction and must be allowed
+    // through even on a clustered table — it carries no payload that
+    // the strict-shape check is protecting.
+    let is_partition_tombstone =
+        row.clustering.is_empty() && row.cells.is_empty() && row.deletion != DeletionTime::LIVE;
+    if !is_partition_tombstone {
+        if let Err(reason) = validate_clustering_shape(&schema.clustering_columns, &row.clustering)
+        {
+            return Err(Error::InvalidData(format!(
+                "{}.{} (clustering): {}",
+                schema.keyspace, schema.table, reason
+            )));
+        }
     }
 
     let static_count = schema.static_columns.len();

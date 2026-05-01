@@ -411,6 +411,42 @@ mod tests {
         );
     }
 
+    /// Partition-level DELETE produces a Row with empty clustering, no
+    /// cells, and a non-LIVE deletion marker. The strict clustering-shape
+    /// guard above must let this through — a partition tombstone has no
+    /// clustering by construction.
+    ///
+    /// Regression for the integration-PR follow-up where the timeuuid
+    /// guard was over-broad and rejected `DELETE FROM t WHERE pk = ?` on
+    /// any clustered table (CI: Example CQL Scripts /
+    /// examples/cql-comprehensive/queries.cql:90).
+    #[test]
+    fn put_accepts_partition_tombstone_on_clustered_table() {
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "delete_test".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![],
+            extensions: Default::default(),
+        };
+        let key = make_key("pk1");
+        let row = Row {
+            clustering: vec![],
+            cells: vec![],
+            deletion: DeletionTime::new(2000, 100),
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        mem.put(&key, row, &schema)
+            .expect("partition tombstone must be accepted on clustered table");
+    }
+
     /// 16-byte TimeUUID cell must be accepted (control case for the
     /// fail-loud guard above).
     #[test]

@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrosa_common::schema::{validate_cell_bytes, validate_clustering_shape, TableSchema};
 use ferrosa_common::{Error, Result};
-use ferrosa_sstable::types::{Partition, Row};
+use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 use serde::Serialize;
 
 /// Process-wide counter of rows written to the quarantine path. Incremented
@@ -228,13 +228,20 @@ where
         let mut bad: Option<String> = None;
 
         // Clustering check first — production wedge is in clustering
-        // bytes, not cells.
-        if let Err(reason) = validate_clustering_shape(&schema.clustering_columns, &row.clustering)
-        {
-            bad = Some(format!(
-                "{}.{} (clustering): {}",
-                schema.keyspace, schema.table, reason
-            ));
+        // bytes, not cells. A pure tombstone Row (empty clustering, no
+        // cells, non-LIVE deletion) is the in-memory marker for a
+        // partition-level DELETE; let it through.
+        let is_partition_tombstone =
+            row.clustering.is_empty() && row.cells.is_empty() && row.deletion != DeletionTime::LIVE;
+        if !is_partition_tombstone {
+            if let Err(reason) =
+                validate_clustering_shape(&schema.clustering_columns, &row.clustering)
+            {
+                bad = Some(format!(
+                    "{}.{} (clustering): {}",
+                    schema.keyspace, schema.table, reason
+                ));
+            }
         }
 
         if bad.is_none() {
