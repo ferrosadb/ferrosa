@@ -38,25 +38,26 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      # Pre-push: run the FULL workspace test suite — same shape as CI.
-      # Never push something that will immediately fail CI.
+      # Pre-push: mirror CI's `cargo test` invocation exactly (see
+      # .github/workflows/ci.yml "Run tests" step). Same workspace,
+      # same exclusions, same --skip list — running a broader suite
+      # locally either deadlocks (integration tests that block on a
+      # CI-only docker cluster) or fails on infrastructure tests CI
+      # explicitly skips, neither of which catches a real bug. The
+      # CI integration job runs the skipped tests separately under
+      # FERROSA_TEST_CONTAINERS=1 with the cluster already up; that
+      # is gated locally behind FERROSA_PRE_PUSH_INTEGRATION=1.
       #
-      # Per ferrosa/CLAUDE.md test policy, infrastructure-gated tests
-      # panic-loud when their env vars are missing
-      # (FERROSA_TEST_CONTAINERS, FERROSA_TEST_FIRECRACKER,
-      # FERROSA_TEST_CLUSTER_NODES). Set those before pushing if your
-      # changes touch the affected paths; otherwise spin the cluster:
-      #   docker compose -f compose.test.yml up -d
-      #   FERROSA_TEST_CONTAINERS=1 git push
       # Bypass with FERROSA_SKIP_PREPUSH=1 git push if you genuinely
       # know the failure is unrelated.
       #
-      # Tests run via cargo-nextest. Falls back to `cargo test` if nextest
-      # isn't installed — install with `cargo install cargo-nextest --locked`.
+      # Tests run via cargo-nextest when installed (parallel by
+      # binary AND by test). Falls back to `cargo test` otherwise —
+      # install via `cargo install cargo-nextest --locked`.
       - id: cargo-test-workspace
-        name: cargo nextest run --workspace (pre-push, full suite)
+        name: cargo test/nextest --workspace (pre-push, mirrors CI)
         stages: [pre-push]
-        entry: bash -c 'if command -v cargo-nextest >/dev/null 2>&1; then cargo nextest run --workspace --all-targets --no-fail-fast; else echo "cargo-nextest not installed (cargo install cargo-nextest --locked); falling back to cargo test"; cargo test --workspace --all-targets --no-fail-fast; fi'
+        entry: bash scripts/pre-push-mirror-ci.sh
         language: system
         pass_filenames: false
 
