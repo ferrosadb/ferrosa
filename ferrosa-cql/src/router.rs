@@ -452,6 +452,13 @@ pub async fn route(
         Statement::DropRole(dr) => route_drop_role(state, ctx, dr)
             .await
             .map(RouteResult::Result),
+        Statement::ListRoles {
+            of,
+            no_recursive,
+            users_alias,
+        } => route_list_roles(state, ctx, of, no_recursive, users_alias)
+            .await
+            .map(RouteResult::Result),
         Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
         Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
         Statement::Use(u) => {
@@ -4115,11 +4122,11 @@ async fn route_create_role(
         .schema
         .check_permission(ctx.auth, Permission::Create, &Resource::AllRoles)?;
 
-    let role = RoleMetadata {
+    let base_role = RoleMetadata {
         name: s.name.clone(),
         is_superuser: s.superuser.unwrap_or(false),
         can_login: s.login.unwrap_or(false),
-        salted_hash: None, // schema layer handles hashing
+        salted_hash: None,
         member_of: HashSet::new(),
     };
 
@@ -4127,17 +4134,42 @@ async fn route_create_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            // Direct path: pass the cleartext through; `Schema::create_role`
+            // validates the policy, hashes it under the schema's
+            // write-lock, and emits the audit event.
             state
                 .schema
-                .create_role(role, s.password.as_deref(), ctx.auth)?;
+                .create_role(base_role, s.password.as_deref(), ctx.auth)?;
         }
-        DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateRole(role);
-            coordinator.coordinate_ddl(op).await?;
-        }
-        DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateRole(role);
-            ddl.execute(op).await.map_err(CqlError::from)?;
+        DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
+            // Pair/Cluster paths: serialise `DdlOperation::CreateRole(role)`
+            // over the wire and apply via `create_role_internal(role)`,
+            // which writes the role verbatim. We MUST hash the password
+            // on the coordinator and embed the hash in the role —
+            // otherwise the role persists with `salted_hash = None` and
+            // login returns `Bad credentials` for an apparently-existing
+            // role (the pre-fix bug).
+            //
+            // Hashing on the coordinator also keeps the cleartext
+            // password off the wire and out of the Raft log.
+            let mut role = base_role;
+            if let Some(ref pw) = s.password {
+                state.schema.password_policy().validate(pw, &s.name)?;
+                role.salted_hash = Some(state.schema.password_hasher().hash_password(pw)?);
+            }
+            match ddl {
+                DdlPath::Pair(coordinator) => {
+                    coordinator
+                        .coordinate_ddl(DdlOperation::CreateRole(role))
+                        .await?;
+                }
+                DdlPath::Cluster { .. } => {
+                    ddl.execute(DdlOperation::CreateRole(role))
+                        .await
+                        .map_err(CqlError::from)?;
+                }
+                _ => unreachable!("matched in outer match"),
+            }
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -4159,32 +4191,60 @@ async fn route_alter_role(
         .schema
         .check_permission(ctx.auth, Permission::Alter, &Resource::Role(s.name.clone()))?;
 
-    let updates = RoleUpdates {
-        is_superuser: s.superuser,
-        can_login: s.login,
-        password: s.password.clone(),
-        member_of: None,
-    };
-
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            // Direct path: pass the cleartext through; `Schema::alter_role`
+            // hashes inside the lock and emits the audit event.
+            let updates = RoleUpdates {
+                is_superuser: s.superuser,
+                can_login: s.login,
+                password: s.password.clone(),
+                member_of: None,
+            };
             state.schema.alter_role(&s.name, updates, ctx.auth)?;
         }
-        DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::AlterRole {
-                name: s.name.clone(),
-                updates,
+        DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
+            // Pair/Cluster paths: `alter_role_internal` (registry.rs:481)
+            // stores `updates.password` directly into `salted_hash`
+            // without re-hashing — it expects a pre-hashed value as part
+            // of the "replication carries the hash" contract. Pre-fix,
+            // the router was sending cleartext into that field, so the
+            // role's salted_hash became the literal cleartext password
+            // (which then never validated against bcrypt). Hash on the
+            // coordinator, then ship the hash via the DDL operation.
+            let hashed_password = if let Some(ref pw) = s.password {
+                state.schema.password_policy().validate(pw, &s.name)?;
+                Some(state.schema.password_hasher().hash_password(pw)?)
+            } else {
+                None
             };
-            coordinator.coordinate_ddl(op).await?;
-        }
-        DdlPath::Cluster { .. } => {
-            let op = DdlOperation::AlterRole {
-                name: s.name.clone(),
-                updates,
+            let updates = RoleUpdates {
+                is_superuser: s.superuser,
+                can_login: s.login,
+                password: hashed_password,
+                member_of: None,
             };
-            ddl.execute(op).await.map_err(CqlError::from)?;
+            match ddl {
+                DdlPath::Pair(coordinator) => {
+                    coordinator
+                        .coordinate_ddl(DdlOperation::AlterRole {
+                            name: s.name.clone(),
+                            updates,
+                        })
+                        .await?;
+                }
+                DdlPath::Cluster { .. } => {
+                    ddl.execute(DdlOperation::AlterRole {
+                        name: s.name.clone(),
+                        updates,
+                    })
+                    .await
+                    .map_err(CqlError::from)?;
+                }
+                _ => unreachable!("matched in outer match"),
+            }
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -4228,6 +4288,89 @@ async fn route_drop_role(
     }
 
     Ok(result::encode_void())
+}
+
+/// Handle `LIST ROLES [OF role] [NORECURSIVE]`. Mirrors Cassandra's
+/// `system_auth.roles` virtual view: returns one row per known role
+/// with `role`, `super`, `login`, and `member_of` columns. Cleartext
+/// salted_hash is NEVER projected — the login path reads it directly
+/// from the schema snapshot. (See SELECT * redaction for how reads
+/// against `system_auth.roles` should expose a masked column instead.)
+async fn route_list_roles(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    of: Option<String>,
+    no_recursive: bool,
+    _users_alias: bool,
+) -> Result<BytesMut, CqlError> {
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Describe, &Resource::AllRoles)?;
+
+    let snap = state.schema.snapshot();
+
+    // Build the visible role set. Without `OF`, list everything; with
+    // `OF role`, walk that role's `member_of` graph (recursively unless
+    // `NORECURSIVE` was specified).
+    let mut visible: Vec<&ferrosa_schema::auth::role::RoleMetadata> = if let Some(ref start) = of {
+        let mut acc: Vec<&ferrosa_schema::auth::role::RoleMetadata> = Vec::new();
+        let mut stack: Vec<String> = vec![start.clone()];
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(role) = snap.roles.get(&name) {
+                acc.push(role);
+                if !no_recursive {
+                    for parent in &role.member_of {
+                        stack.push(parent.clone());
+                    }
+                }
+            }
+        }
+        acc
+    } else {
+        snap.roles.values().collect()
+    };
+    visible.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let column_names = vec![
+        "role".to_string(),
+        "super".to_string(),
+        "login".to_string(),
+        "member_of".to_string(),
+    ];
+    let column_types = vec![
+        CqlType::Varchar,
+        CqlType::Boolean,
+        CqlType::Boolean,
+        CqlType::Set(Box::new(CqlType::Varchar)),
+    ];
+
+    let rows: Vec<Vec<Option<CqlValue>>> = visible
+        .into_iter()
+        .map(|r| {
+            let mut members: Vec<String> = r.member_of.iter().cloned().collect();
+            members.sort();
+            vec![
+                Some(CqlValue::Text(r.name.clone())),
+                Some(CqlValue::Boolean(r.is_superuser)),
+                Some(CqlValue::Boolean(r.can_login)),
+                Some(CqlValue::Set(
+                    members.into_iter().map(CqlValue::Text).collect(),
+                )),
+            ]
+        })
+        .collect();
+
+    Ok(result::encode_rows(
+        &column_names,
+        &column_types,
+        "system_auth",
+        "roles",
+        &rows,
+    ))
 }
 
 // ── GRANT / REVOKE ───────────────────────────────────────────────────────
@@ -11743,6 +11886,142 @@ mod tests {
             snap.roles.contains_key("test_role"),
             "role should be in schema"
         );
+    }
+
+    /// Regression for the auth-defects bug: CREATE ROLE WITH PASSWORD
+    /// returned success but never persisted the salted_hash, so login
+    /// returned `Bad credentials` for an apparently-existing role. The
+    /// fix hashes on the coordinator before sending through the DDL
+    /// path, so this test pins that the role's `salted_hash` is set
+    /// AND that re-hashing the cleartext does NOT match (verifying the
+    /// stored value is actually a salted bcrypt hash, not the literal).
+    #[tokio::test]
+    async fn create_role_persists_password_hash() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE ROLE pwd_test WITH PASSWORD = 'mypassword123' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        let role = snap
+            .roles
+            .get("pwd_test")
+            .expect("role must exist after CREATE ROLE");
+        let hash = role
+            .salted_hash
+            .as_deref()
+            .expect("salted_hash must be persisted, not None — was the regression");
+        assert!(!hash.is_empty(), "salted_hash must not be an empty string");
+        assert_ne!(
+            hash, "mypassword123",
+            "salted_hash must be the hash, not the cleartext"
+        );
+        // bcrypt-format hashes start with `$2`. We don't lock the
+        // exact format here so the hasher can be swapped in future.
+        assert!(
+            hash.starts_with("$2") || hash.len() >= 32,
+            "salted_hash must look like a real hash, got: {hash}"
+        );
+
+        // Verify the hash actually validates the original cleartext —
+        // the canonical "auth path works" check.
+        assert!(
+            ferrosa_schema::auth::password::PasswordHasher::verify_password_any(
+                "mypassword123",
+                hash
+            )
+            .unwrap(),
+            "stored hash must verify against the original cleartext"
+        );
+    }
+
+    /// Regression for the auth-defects bug: `CREATE USER` (deprecated
+    /// alias for `CREATE ROLE WITH LOGIN = true`) was rejected by the
+    /// parser, then once it parsed, suffered the same password-hash
+    /// drop as CREATE ROLE.
+    #[tokio::test]
+    async fn create_user_persists_password_hash_and_login() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse("CREATE USER alice WITH PASSWORD = 'a-password-123'") // pragma: allowlist secret
+            .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        let role = snap.roles.get("alice").expect("USER must persist as role");
+        assert!(role.can_login, "CREATE USER must default LOGIN = true");
+        let hash = role
+            .salted_hash
+            .as_deref()
+            .expect("CREATE USER must persist salted_hash");
+        assert!(
+            ferrosa_schema::auth::password::PasswordHasher::verify_password_any(
+                "a-password-123",
+                hash
+            )
+            .unwrap()
+        );
+    }
+
+    /// Regression: `LIST ROLES` returned `SyntaxException: unexpected
+    /// token Keyword(List)`. This test pins the new parser + router
+    /// path returns a row per known role with the expected columns.
+    #[tokio::test]
+    async fn list_roles_returns_known_roles() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let create = crate::parser::parse(
+            "CREATE ROLE list_test WITH PASSWORD = 'p' AND LOGIN = true AND SUPERUSER = false", // pragma: allowlist secret
+        )
+        .unwrap();
+        route(&state, &ctx, create).await.unwrap();
+
+        let stmt = crate::parser::parse("LIST ROLES").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "LIST ROLES should succeed (was SyntaxException): {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                // Result kind 0x0002 = Rows.
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+                // Body must contain the role name we just created.
+                assert!(
+                    b.windows(b"list_test".len()).any(|w| w == b"list_test"),
+                    "LIST ROLES output must include the new role"
+                );
+            }
+            _ => panic!("expected Result (rows) from LIST ROLES"),
+        }
     }
 
     #[tokio::test]

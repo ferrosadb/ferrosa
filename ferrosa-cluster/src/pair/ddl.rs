@@ -696,6 +696,41 @@ mod tests {
         }
     }
 
+    /// Regression: `DdlOperation::CreateRole` must serialise the
+    /// salted_hash field. The pair/cluster CREATE ROLE bug was that
+    /// the coordinator sent a role with `salted_hash: None` and the
+    /// applier persisted that None — so login failed for every role
+    /// created via a multi-node DDL. The fix hashes on the
+    /// coordinator and embeds the hash in the role; this test pins
+    /// that the serialisation round-trips that hash unchanged.
+    #[test]
+    fn ddl_operation_create_role_preserves_salted_hash() {
+        use ferrosa_schema::auth::role::RoleMetadata;
+        use std::collections::HashSet;
+        let role = RoleMetadata {
+            name: "test_role".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: Some("$2a$10$abcdef".into()),
+            member_of: HashSet::new(),
+        };
+        let op = DdlOperation::CreateRole(role);
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::CreateRole(r) => {
+                assert_eq!(r.name, "test_role");
+                assert!(r.can_login);
+                assert_eq!(
+                    r.salted_hash.as_deref(),
+                    Some("$2a$10$abcdef"),
+                    "salted_hash must round-trip — was None pre-fix"
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn ddl_operation_create_keyspace_roundtrip() {
         let op = DdlOperation::CreateKeyspace(test_keyspace());
