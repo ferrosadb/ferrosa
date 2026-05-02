@@ -1,5 +1,7 @@
 //! Proptest strategies for load test operation generation.
 
+use rand::RngExt;
+
 /// Type of operation in a load test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpType {
@@ -32,12 +34,12 @@ pub fn choose_op(
     update_ratio: f64,
     delete_ratio: f64,
 ) -> OpType {
-    let r: f64 = rng.gen();
+    let r: f64 = rng.random();
     if r < read_ratio {
         OpType::Read
     } else {
         // Within the write portion, pick update/delete/insert.
-        let write_r: f64 = rng.gen();
+        let write_r: f64 = rng.random();
         if write_r < delete_ratio {
             OpType::Delete
         } else if write_r < delete_ratio + update_ratio {
@@ -82,7 +84,7 @@ pub fn choose_value_len(rng: &mut impl rand::Rng, min: usize, max: usize) -> usi
     if min == max {
         min
     } else {
-        rng.gen_range(min..=max)
+        rng.random_range(min..=max)
     }
 }
 
@@ -111,14 +113,14 @@ mod tests {
 
         #[test]
         fn random_value_correct_length(len in 64usize..=4096) {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let val = make_random_value(&mut rng, len);
             prop_assert_eq!(val.len(), len);
         }
 
         #[test]
         fn choose_op_respects_distribution(read_ratio in 0.0f64..=1.0) {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let ops: Vec<OpType> = (0..1000).map(|_| choose_op(&mut rng, read_ratio, 0.0, 0.0)).collect();
             let reads = ops.iter().filter(|o| **o == OpType::Read).count();
             let expected = (read_ratio * 1000.0) as usize;
@@ -136,7 +138,7 @@ mod tests {
 
     #[test]
     fn choose_value_len_in_range() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..100 {
             let len = choose_value_len(&mut rng, 100, 200);
             assert!((100..=200).contains(&len));
@@ -145,7 +147,7 @@ mod tests {
 
     #[test]
     fn choose_value_len_equal_bounds() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         assert_eq!(choose_value_len(&mut rng, 42, 42), 42);
     }
 }

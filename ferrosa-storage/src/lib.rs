@@ -29,6 +29,7 @@ pub mod merge;
 pub mod metrics;
 pub mod observer;
 pub mod pin_config;
+pub mod quarantine;
 pub mod restore;
 pub mod snapshot;
 pub mod store;

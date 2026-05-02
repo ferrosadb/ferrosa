@@ -23,13 +23,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json"] }
-russh = "0.60.1"
+russh = "0.60.2"
 # russh 0.60.1 still depends on pre-release crypto crates (pkcs8 0.11.0-rc.11) that
 # call pbes2::Parameters::recommended, renamed to generate_recommended in stable
 # pkcs5 0.8.0. Cargo resolves `^0.8.0-rc.13` to 0.8.0, breaking the build.
 # Pin pkcs5 to rc.13 until russh ships against stable crypto deps.
 pkcs5 = "=0.8.0-rc.13"
-rand = "0.8"
+rand = "0.10"
 dirs-next = "2"
 scylla = "1.5.0"
 

@@ -56,6 +56,14 @@ impl PeerEventListener for ModeController {
                     .as_ref()
                     .and_then(|pm| pm.get_peer_cql_broadcast_sync(host_id));
                 self.trigger_cluster_join(host_id, addr, cql_broadcast);
+                // Re-broadcast ClusterInvite to the new peer. The pair →
+                // forming → cluster transition delivered an invite once,
+                // but a peer that crashed or was recreated *after* that
+                // transition would never receive it — leaving it stuck
+                // in pair mode with no Raft handler registered. Without
+                // this, recreating any single node breaks Raft quorum
+                // forever. Match the connect path used by `transition_to_*`.
+                self.send_cluster_invite_to(host_id);
             }
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "peer connected during formation");
@@ -234,6 +242,11 @@ impl InboundPeerCallback for ModeController {
             DeploymentMode::Cluster => {
                 tracing::info!(peer = %host_id, "new inbound peer in cluster mode, triggering join");
                 self.trigger_cluster_join(host_id, reverse_addr, cql_broadcast);
+                // See on_peer_connected for the full rationale: a recreated
+                // peer would otherwise miss the one-shot ClusterInvite from
+                // the original pair → forming → cluster transition and
+                // stay stuck in pair mode (no Raft handler → no quorum).
+                self.send_cluster_invite_to(host_id);
             }
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "inbound peer during formation");

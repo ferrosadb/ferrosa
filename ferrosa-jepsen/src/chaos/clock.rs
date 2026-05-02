@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use rand::Rng;
+use rand::RngExt;
 
 use super::{NemesisAction, NemesisContext};
 
@@ -16,10 +16,10 @@ impl NemesisAction for ClockSkewSmall {
     async fn inject(&self, ctx: &NemesisContext) -> Result<()> {
         // Pre-compute skews so the non-Send ThreadRng doesn't live across awaits.
         let skews: Vec<i64> = {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             ctx.node_ips
                 .iter()
-                .map(|_| rng.gen_range(-500..=500))
+                .map(|_| rng.random_range(-500..=500))
                 .collect()
         };
 
@@ -71,12 +71,12 @@ impl NemesisAction for ClockSkewLarge {
     async fn inject(&self, ctx: &NemesisContext) -> Result<()> {
         // Pre-compute skews so the non-Send ThreadRng doesn't live across awaits.
         let skews: Vec<f64> = {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             ctx.node_ips
                 .iter()
                 .map(|_| {
-                    let magnitude: f64 = rng.gen_range(1.0..=5.0);
-                    if rng.gen_bool(0.5) {
+                    let magnitude: f64 = rng.random_range(1.0..=5.0);
+                    if rng.random_bool(0.5) {
                         magnitude
                     } else {
                         -magnitude

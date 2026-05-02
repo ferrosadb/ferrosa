@@ -301,7 +301,22 @@ mod tests {
         Arc::new(StorageEngine::new(config, None).unwrap())
     }
 
-    fn make_table_schema(keyspace: &str, table: &str) -> TableSchema {
+    fn make_vertex_schema(keyspace: &str, table: &str) -> TableSchema {
+        // Vertex partitions have no clustering columns: the test's
+        // `write_vertex` writes a partition-only row (clustering: vec![]).
+        TableSchema {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![],
+            extensions: Default::default(),
+        }
+    }
+
+    fn make_adjacency_schema(keyspace: &str, table: &str) -> TableSchema {
+        // Adjacency rows carry composite clustering: see `adjacency_clustering`.
         TableSchema {
             keyspace: keyspace.to_string(),
             table: table.to_string(),
@@ -321,12 +336,12 @@ mod tests {
         let storage = test_storage(dir);
         // Register vertex table.
         storage
-            .register_table(make_table_schema("test_ks", "person_v"))
+            .register_table(make_vertex_schema("test_ks", "person_v"))
             .unwrap();
         // Register adjacency table.
         let adj_ks = adjacency_keyspace_name("test_ks");
         storage
-            .register_table(make_table_schema(&adj_ks, "adjacency"))
+            .register_table(make_adjacency_schema(&adj_ks, "adjacency"))
             .unwrap();
         storage
     }

@@ -522,3 +522,195 @@ fn batch_sync_strategy() {
 
     cl.shutdown().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Streaming replay (`open_and_replay_streaming`)
+//
+// These tests cover the streaming replay path that bounds peak memory
+// during crash recovery to ~one segment regardless of total log size. See
+// specs/todo/bug-commitlog-replay-oom-on-large-log.md.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn open_and_replay_streaming_calls_callback_per_undominated_entry() {
+    let dir = TempDir::new().unwrap();
+    // Small segments to force rotation across multiple files. We want the
+    // streaming path to traverse several segments so the test would catch
+    // an implementation that only handled a single segment.
+    let config = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+    let cl = CommitLog::new(config).unwrap();
+
+    let n: i64 = 30;
+    for i in 0..n {
+        let m = make_mutation(
+            "stream_ks",
+            "stream_table",
+            format!("pk_{i}").as_bytes(),
+            format!("val_{i}").as_bytes(),
+            1000 + i,
+        );
+        cl.append(&m).unwrap();
+    }
+    cl.shutdown().unwrap();
+
+    let config2 = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+
+    let mut seen = Vec::new();
+    let cl2 = CommitLog::open_and_replay_streaming(config2, |mutation| {
+        seen.push(mutation);
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen.len(),
+        n as usize,
+        "streaming replay should deliver every undominated mutation, got {}",
+        seen.len()
+    );
+    for (idx, m) in seen.iter().enumerate() {
+        assert_eq!(m.keyspace, "stream_ks");
+        assert_eq!(m.table, "stream_table");
+        // Mutations are appended in order; with no rotation reordering between
+        // segments (sorted by id) and in-segment append order preserved, the
+        // callback order must match the write order.
+        let expected_pk = format!("pk_{idx}");
+        assert_eq!(m.key.key.as_bytes(), expected_pk.as_bytes());
+    }
+
+    cl2.shutdown().unwrap();
+}
+
+#[test]
+fn open_and_replay_streaming_continues_segment_id() {
+    let dir = TempDir::new().unwrap();
+    let config = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+    let cl = CommitLog::new(config).unwrap();
+
+    // Force at least one rotation so the next segment id will be > 1.
+    for i in 0..20 {
+        let m = make_mutation("ks", "tbl", b"pk", b"val", 1000 + i);
+        cl.append(&m).unwrap();
+    }
+    cl.force_rotate().unwrap();
+    cl.shutdown().unwrap();
+
+    let config2 = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+    let cl2 = CommitLog::open_and_replay_streaming(config2, |_m| Ok(())).unwrap();
+
+    // Append one more mutation; its segment id must be greater than every
+    // segment id that existed on disk before replay.
+    let pos = cl2
+        .append(&make_mutation("ks", "tbl", b"pk_after", b"val", 9999))
+        .unwrap();
+    assert!(
+        pos.segment_id >= 2,
+        "post-replay append should land on a fresh segment id, got {}",
+        pos.segment_id
+    );
+
+    cl2.shutdown().unwrap();
+}
+
+#[test]
+fn open_and_replay_streaming_deletes_segments_after_callback() {
+    let dir = TempDir::new().unwrap();
+    let config = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+    let cl = CommitLog::new(config).unwrap();
+
+    for i in 0..20 {
+        let m = make_mutation("ks", "tbl", b"pk", b"val", 1000 + i);
+        cl.append(&m).unwrap();
+    }
+    cl.force_rotate().unwrap();
+    cl.shutdown().unwrap();
+
+    let before = count_segment_files(dir.path());
+    assert!(before >= 2, "need at least 2 segment files; got {before}");
+
+    let config2 = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+    let mut callback_count = 0usize;
+    let cl2 = CommitLog::open_and_replay_streaming(config2, |_m| {
+        callback_count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert!(callback_count > 0, "callback was never invoked");
+
+    // After streaming replay, only the freshly-allocated active segment of
+    // cl2 may remain; all replayed segments must be deleted.
+    let after_replay_files: HashSet<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|n| n.starts_with("commitlog-") && n.ends_with(".log"))
+        .collect();
+    assert!(
+        after_replay_files.len() <= 1,
+        "replayed segments must be deleted; remaining: {after_replay_files:?}"
+    );
+
+    cl2.shutdown().unwrap();
+}
+
+#[test]
+fn open_and_replay_streaming_propagates_callback_error() {
+    let dir = TempDir::new().unwrap();
+    let config = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+    let cl = CommitLog::new(config).unwrap();
+    for i in 0..5 {
+        let m = make_mutation("ks", "tbl", b"pk", b"val", 1000 + i);
+        cl.append(&m).unwrap();
+    }
+    cl.shutdown().unwrap();
+
+    let config2 = CommitLogConfig {
+        segment_size: 512,
+        ..test_config(dir.path())
+    };
+    let mut calls = 0usize;
+    let result = CommitLog::open_and_replay_streaming(config2, |_m| {
+        calls += 1;
+        if calls == 2 {
+            Err(ferrosa_common::Error::InvalidData("boom".into()))
+        } else {
+            Ok(())
+        }
+    });
+
+    assert!(result.is_err(), "callback error must propagate");
+    assert_eq!(calls, 2, "replay should stop on first callback error");
+
+    // Segment files must still be on disk so a retry can re-process them.
+    let remaining = count_segment_files(dir.path());
+    assert!(
+        remaining >= 1,
+        "failed replay must not delete segments mid-stream; remaining={remaining}"
+    );
+}

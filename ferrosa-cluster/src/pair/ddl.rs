@@ -696,6 +696,114 @@ mod tests {
         }
     }
 
+    /// End-to-end pair-mode replication for CREATE ROLE. Replays the
+    /// secondary-side path: receive a serialized `DdlEnvelope`,
+    /// `from_bytes`, then `create_role_internal` on the receiver's
+    /// schema (the same call `apply_ddl_locally` makes for
+    /// `DdlOperation::CreateRole`). Asserts the salted_hash arrives
+    /// intact on the secondary — pre-fix the coordinator put None
+    /// there and login on the secondary returned `Bad credentials`.
+    #[test]
+    fn pair_replication_propagates_role_with_salted_hash() {
+        use ferrosa_schema::auth::role::RoleMetadata;
+
+        // Coordinator-side: hash is already populated (per the auth
+        // commit's coordinator-side hashing). Build the envelope
+        // exactly as `DdlCoordinator::coordinate_ddl` would.
+        let role = RoleMetadata {
+            name: "pair_replicated".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: Some("$2a$10$primary-side-hash".to_string()),
+            member_of: HashSet::new(),
+        };
+        let envelope = DdlEnvelope {
+            op: DdlOperation::CreateRole(role),
+            schema_version: Uuid::new_v4(),
+        };
+
+        // On the wire: serialise + deserialise.
+        let bytes = envelope.to_bytes().unwrap();
+        let received = DdlEnvelope::from_bytes(&bytes).unwrap();
+
+        // Secondary-side apply: this is exactly what
+        // `apply_ddl_locally` for `DdlOperation::CreateRole` does.
+        let secondary_schema = test_replication_schema();
+        match received.op {
+            DdlOperation::CreateRole(r) => {
+                secondary_schema.create_role_internal(r).unwrap();
+            }
+            _ => panic!("expected CreateRole envelope"),
+        }
+
+        // The secondary must have the role with the hash intact.
+        let replicated = secondary_schema
+            .snapshot()
+            .roles
+            .get("pair_replicated")
+            .cloned()
+            .expect("role must replicate to secondary");
+        assert_eq!(
+            replicated.salted_hash.as_deref(),
+            Some("$2a$10$primary-side-hash"),
+            "secondary's salted_hash must match the primary's — was None pre-fix"
+        );
+        assert!(replicated.can_login);
+        assert!(!replicated.is_superuser);
+    }
+
+    fn test_replication_schema() -> Arc<ferrosa_schema::Schema> {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode as SchemaDeploymentMode, LogAuditSink, PasswordHasher,
+            PasswordPolicy, RateLimitConfig, SchemaConfig,
+        };
+        let config = SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(LogAuditSink),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: SchemaDeploymentMode::Development,
+        };
+        Arc::new(ferrosa_schema::Schema::new(config).unwrap())
+    }
+
+    /// Regression: `DdlOperation::CreateRole` must serialise the
+    /// salted_hash field. The pair/cluster CREATE ROLE bug was that
+    /// the coordinator sent a role with `salted_hash: None` and the
+    /// applier persisted that None — so login failed for every role
+    /// created via a multi-node DDL. The fix hashes on the
+    /// coordinator and embeds the hash in the role; this test pins
+    /// that the serialisation round-trips that hash unchanged.
+    #[test]
+    fn ddl_operation_create_role_preserves_salted_hash() {
+        use ferrosa_schema::auth::role::RoleMetadata;
+        use std::collections::HashSet;
+        let role = RoleMetadata {
+            name: "test_role".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: Some("$2a$10$abcdef".into()),
+            member_of: HashSet::new(),
+        };
+        let op = DdlOperation::CreateRole(role);
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::CreateRole(r) => {
+                assert_eq!(r.name, "test_role");
+                assert!(r.can_login);
+                assert_eq!(
+                    r.salted_hash.as_deref(),
+                    Some("$2a$10$abcdef"),
+                    "salted_hash must round-trip — was None pre-fix"
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn ddl_operation_create_keyspace_roundtrip() {
         let op = DdlOperation::CreateKeyspace(test_keyspace());

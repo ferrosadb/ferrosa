@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ferrosa_cql::client::CqlClient;
 use rand::SeedableRng;
+
+use ferrosa_cql::client::CqlClient;
 
 use crate::ground_truth::GroundTruth;
 use crate::profile::LoadProfile;
@@ -237,11 +238,11 @@ async fn run_cluster_load_test_async(
                 return;
             }
 
-            let mut rng = rand::rngs::StdRng::from_entropy();
+            let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
             let mut local_ts = (worker_id as i64) * 1_000_000_000;
 
             while !st.load(Ordering::Relaxed) {
-                let key_idx = rand::Rng::gen_range(&mut rng, 0..key_space);
+                let key_idx = rand::RngExt::random_range(&mut rng, 0..key_space);
                 let key_str = crate::generator::make_key_string(key_idx);
 
                 if is_reader {

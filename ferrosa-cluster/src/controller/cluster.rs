@@ -118,6 +118,76 @@ impl ModeController {
         SocketAddr::new(addr.ip(), self.net_config.bind_addr.port())
     }
 
+    /// Send a `ClusterInvite` to a single peer with the current cluster's
+    /// known peer list (everyone except the recipient). Used when a peer
+    /// connects (or reconnects) after this node has already finished its
+    /// pair → forming → cluster transition: the original one-shot invite
+    /// from `transition_to_cluster` is long gone, but the new peer still
+    /// needs to learn about the cluster so it can transition out of pair
+    /// mode and register its Raft handlers.
+    ///
+    /// Without this, recreating any single node post-cluster-formation
+    /// silently breaks Raft quorum forever — the recreated node stays
+    /// in pair mode, the leader's elections fail (no votes), and reads
+    /// at LOCAL_QUORUM time out.
+    pub(crate) fn send_cluster_invite_to(&self, recipient: Uuid) {
+        let pm_guard = self.peer_manager.load();
+        let Some(pm) = pm_guard.as_ref().as_ref().cloned() else {
+            return;
+        };
+        let local_host_id = self.local_host_id;
+        // Build the peer list from our `connected_peers` plus self. The
+        // recipient is excluded — the receiver doesn't need its own
+        // address back, only those of the other cluster members.
+        let mut peers: Vec<(Uuid, SocketAddr)> = self
+            .connected_peers
+            .lock()
+            .iter()
+            .filter(|(id, _)| *id != recipient && *id != local_host_id)
+            .copied()
+            .collect();
+        // Include self so the recipient can establish a reverse connection.
+        let local_addr = self.net_config.broadcast_addr;
+        if !peers.iter().any(|(id, _)| *id == local_host_id) {
+            peers.push((local_host_id, local_addr));
+        }
+        if peers.is_empty() {
+            return;
+        }
+        let invite = Message::ClusterInvite {
+            initiator: local_host_id,
+            peers,
+        };
+        let pm_clone = pm.clone();
+        self.spawn_tracked(async move {
+            for attempt in 0..10 {
+                match pm_clone.send(recipient, invite.clone(), Lane::Data).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            peer = %recipient,
+                            "ClusterInvite delivered (cluster-mode reconnect)"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        if attempt < 9 {
+                            tracing::debug!(
+                                peer = %recipient, attempt, %e,
+                                "ClusterInvite delivery retry (cluster-mode reconnect)"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        } else {
+                            tracing::warn!(
+                                peer = %recipient,
+                                "ClusterInvite delivery failed after 10 attempts (cluster-mode reconnect)"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Transition from Pair to Forming: broadcast ClusterInvite and prepare
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
@@ -1645,14 +1715,37 @@ impl RpcHandler for ClusterInviteHandler {
             "received ClusterInvite"
         );
 
-        // Find peers we don't already know about.
+        // Find peers we don't already know about, plus peers whose
+        // address has changed since we last connected. The address-
+        // change case is critical for recovery: when a node is recreated
+        // (eg `podman compose up -d` after a stop+rm), it comes up with
+        // a fresh container IP. The old peer entry in peer_manager
+        // points at the dead address and `has_live_peer` returns true
+        // (the entry exists, even if the underlying TCP pool is broken).
+        // Without refreshing on address change, every peer keeps trying
+        // to reach the recreated node at its dead address forever
+        // ("No route to host"), Raft replication times out, and reads
+        // at LOCAL_QUORUM fail.
+        let internode_port = self.net_config.bind_addr.port();
         let mut new_peers = Vec::new();
         for (peer_id, peer_addr) in &peers {
             if *peer_id == self.local_host_id {
-                continue; // skip self
+                continue;
             }
-            if self.peer_manager.has_live_peer(*peer_id) {
-                continue; // peer_manager already knows this peer
+            let expected_addr = SocketAddr::new(peer_addr.ip(), internode_port).to_string();
+            let known_addr = self.peer_manager.peer_addr(*peer_id).await;
+            let live = self.peer_manager.has_live_peer(*peer_id);
+            let addr_changed = known_addr.as_deref() != Some(expected_addr.as_str());
+            if live && !addr_changed {
+                continue;
+            }
+            if addr_changed {
+                tracing::info!(
+                    peer = %peer_id,
+                    old_addr = ?known_addr,
+                    new_addr = %expected_addr,
+                    "cluster invite: peer address changed, refreshing reverse connection"
+                );
             }
             new_peers.push((*peer_id, *peer_addr));
         }

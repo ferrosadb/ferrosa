@@ -16,7 +16,7 @@
 use std::collections::BinaryHeap;
 use std::path::Path;
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 use super::distance;
@@ -83,9 +83,9 @@ impl HnswGraph {
 
     /// Assign a random layer for a new node.
     fn random_layer(&self) -> usize {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let ml = 1.0 / (self.m as f64).ln();
-        let r: f64 = rng.gen();
+        let r: f64 = rng.random();
         // Avoid -ln(0) by clamping
         let r = r.max(1e-15);
         (-r.ln() * ml).floor() as usize

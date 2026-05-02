@@ -1806,6 +1806,44 @@ mod tests {
         assert!(!sm.state().roles.contains_key("analyst"));
     }
 
+    /// Cluster (Raft) replication test: a `RaftOp::CreateRole(role)`
+    /// committed via the leader and applied on a follower's state
+    /// machine must persist the role's `salted_hash` byte-for-byte.
+    /// Pre-fix the router was sending roles with `salted_hash: None`,
+    /// so even with replication working perfectly, every follower
+    /// (and the leader's own state machine) ended up with `None` —
+    /// login at any node returned `Bad credentials`.
+    #[tokio::test]
+    async fn apply_create_role_replicates_salted_hash() {
+        let mut sm = FerrosStateMachine::new();
+
+        let role = RoleMetadata {
+            name: "raft_replicated".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: Some("$2a$10$leader-side-hash".to_string()),
+            member_of: HashSet::new(),
+        };
+
+        sm.apply(vec![make_entry(1, 1, RaftOp::CreateRole(role))])
+            .await
+            .unwrap();
+
+        let stored = sm
+            .state()
+            .roles
+            .get("raft_replicated")
+            .cloned()
+            .expect("role must persist after Raft apply");
+        assert_eq!(
+            stored.salted_hash.as_deref(),
+            Some("$2a$10$leader-side-hash"),
+            "follower must replicate the salted_hash exactly — was None pre-fix"
+        );
+        assert!(stored.can_login);
+        assert!(!stored.is_superuser);
+    }
+
     #[tokio::test]
     async fn apply_grant_and_revoke() {
         let mut sm = FerrosStateMachine::new();

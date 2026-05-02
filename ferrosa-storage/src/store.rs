@@ -378,6 +378,14 @@ impl<F: FlushTarget> TableStore<F> {
         self.schema.load()
     }
 
+    /// Directory under which this store's SSTable components and
+    /// quarantine files live. Used by the engine's replay path to open a
+    /// `QuarantineWriter` for malformed rows that the per-cell validator
+    /// rejects (Layer 3 of the timeuuid-flush-wedge fix).
+    pub fn flush_dir(&self) -> &std::path::Path {
+        self.flush_target.base_dir()
+    }
+
     /// Write a row into the active memtable and update secondary indexes.
     ///
     /// Loads the current view atomically, then delegates to the memtable's
@@ -640,6 +648,52 @@ impl<F: FlushTarget> TableStore<F> {
         options.compression = None;
 
         let schema = self.schema.load();
+
+        // Step 5a: Quarantine-on-flush guard (Layer 2 of the timeuuid-flush-
+        // wedge fix). Filter every partition's rows through the per-cell
+        // length validator. Rows that fail are written as JSON lines to
+        // `<flush_dir>/quarantine/<ks>.<table>.<ts>.jsonl` and removed from
+        // the partition before serialisation. Layer 1 (`Memtable::put`)
+        // rejects new bad writes fail-loud; Layer 2 here is the salvage
+        // path for memtables that were populated before Layer 1 landed
+        // (e.g., on the wedged ferrosa-memory cluster recovery). The
+        // `QuarantineWriter` is constructed lazily on the first bad row
+        // so a flush with zero quarantined rows leaves no trace on disk
+        // — important because the engine restart-scan also uses
+        // `<table_dir>/quarantine/` for SSTable corruption forensics.
+        // See specs/in-process/bug-memtable-flush-wedge-truncated-
+        // timeuuid-from-now-function.md.
+        let quarantine_dir = self.flush_target.base_dir().to_path_buf();
+        let mut quarantine_writer: Option<crate::quarantine::QuarantineWriter> = None;
+        let mut total_quarantined = 0usize;
+        for p in partitions.iter_mut() {
+            if p.rows.is_empty() {
+                continue;
+            }
+            let ks = schema.keyspace.clone();
+            let tbl = schema.table.clone();
+            let dir = quarantine_dir.clone();
+            let n = crate::quarantine::filter_partition_rows(
+                p,
+                &schema,
+                &mut quarantine_writer,
+                || crate::quarantine::QuarantineWriter::new(&dir, &ks, &tbl),
+            )?;
+            total_quarantined += n;
+        }
+        // Drop partitions that lost all their rows to quarantine.
+        partitions.retain(|p| !p.rows.is_empty() || p.static_row.is_some());
+
+        if total_quarantined > 0 {
+            tracing::error!(
+                keyspace = %schema.keyspace,
+                table = %schema.table,
+                quarantined_rows = total_quarantined,
+                quarantine_file = ?quarantine_writer.as_ref().map(|w| w.path().display().to_string()),
+                "flush: quarantined malformed rows — see quarantine file for forensic record"
+            );
+        }
+
         let header = flush::build_serialization_header(&schema, &partitions);
         let mut writer = SSTableWriter::new(options, header);
         for p in &partitions {

@@ -260,6 +260,14 @@ impl Schema {
         &self.hasher_config
     }
 
+    /// Reference to the password policy validator. Mirror of
+    /// `password_hasher` for callers (eg the CQL router) that need to
+    /// validate a candidate password before hashing it on the
+    /// coordinator side and shipping the hash via Raft.
+    pub fn password_policy(&self) -> &crate::auth::password::PasswordPolicy {
+        &self.password_policy
+    }
+
     /// Bulk-load schema from a snapshot. Bypasses auth and audit.
     /// Used for pair mode catch-up. Idempotent — silently skips
     /// keyspaces/tables that already exist.
