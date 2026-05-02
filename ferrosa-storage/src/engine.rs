@@ -813,10 +813,58 @@ impl StorageEngine {
         let Some(state) = tables.get(&table_id) else {
             return false;
         };
+        // Layer 3 of the timeuuid-flush-wedge fix: when the per-cell
+        // length validator (run inside `Memtable::put`) rejects a row at
+        // replay time, salvage the row to a quarantine JSONL file rather
+        // than letting it ride the commit log into a fresh memtable on
+        // the next restart and re-wedge the cluster. See
+        // specs/in-process/bug-memtable-flush-wedge-truncated-timeuuid-
+        // from-now-function.md.
+        let mut quarantine_writer: Option<crate::quarantine::QuarantineWriter> = None;
+        let mut quarantined_in_partition = 0usize;
         for row in &mutation.rows {
-            if let Err(e) = state.store.write(&mutation.key, row.clone()) {
-                tracing::error!(%e, %table_id, "replay: failed to replay row");
+            match state.store.write(&mutation.key, row.clone()) {
+                Ok(()) => {}
+                Err(ferrosa_common::Error::InvalidData(reason)) => {
+                    if quarantine_writer.is_none() {
+                        let schema = state.store.schema();
+                        match crate::quarantine::QuarantineWriter::new(
+                            state.store.flush_dir(),
+                            &schema.keyspace,
+                            &schema.table,
+                        ) {
+                            Ok(qw) => quarantine_writer = Some(qw),
+                            Err(e) => {
+                                tracing::error!(%e, %table_id, "replay: failed to open quarantine writer; row dropped");
+                                continue;
+                            }
+                        }
+                    }
+                    let qw = quarantine_writer.as_ref().expect("just constructed");
+                    let schema = state.store.schema();
+                    if let Err(qe) =
+                        qw.write_row(mutation.key.key.as_bytes(), row, &schema, &reason)
+                    {
+                        tracing::error!(%qe, %table_id, "replay: failed to write quarantine row");
+                    } else {
+                        quarantined_in_partition += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%e, %table_id, "replay: failed to replay row");
+                }
             }
+        }
+        if quarantined_in_partition > 0 {
+            // Log-budget aware: one ERROR per partition, not per row. A
+            // wedged table can contain hundreds of bad rows; emitting a
+            // line per row would flood the log.
+            tracing::error!(
+                %table_id,
+                quarantined_rows = quarantined_in_partition,
+                quarantine_file = ?quarantine_writer.as_ref().map(|w| w.path().display().to_string()),
+                "replay: quarantined malformed rows — see quarantine file for forensic record"
+            );
         }
         true
     }
@@ -6140,6 +6188,171 @@ mod tests {
         }
     }
 
+    /// Layer 3 of the timeuuid-flush-wedge fix: a malformed mutation
+    /// already durable in the commit log (e.g. from a pre-fix node that
+    /// got a buggy `now()` row through the write path) must be
+    /// quarantined on replay rather than re-wedging the memtable. Before
+    /// the fix, restarting a wedged node would re-materialise the bad row
+    /// in a fresh memtable and re-wedge every flush forever.
+    ///
+    /// See specs/in-process/bug-memtable-flush-wedge-truncated-timeuuid-
+    /// from-now-function.md.
+    #[test]
+    fn replay_quarantines_malformed_row_and_node_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_config = || StorageEngineConfig::test_config(dir.path());
+
+        // Schema mirroring `tool_usage_log`: TimeUUID-clustered.
+        let timeuuid_schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "tool_usage_log".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "call_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.TimeUUIDType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "tool_name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("ks", "tool_usage_log");
+        let bad_key = make_key("tenant#day");
+        let good_key = make_key("tenant#day-good");
+
+        // Phase 1: open engine, register table, append a malformed
+        // mutation directly to the commit log (bypassing Layer 1's
+        // memtable-put validator the way a pre-fix node would have).
+        let bad_mutation = {
+            let engine = StorageEngine::new(make_config(), None).unwrap();
+            engine.register_table(timeuuid_schema.clone()).unwrap();
+
+            // A "good" mutation goes through the public write API, so the
+            // commit log carries both shapes — guarantees replay
+            // continues past the bad row and applies the good ones.
+            let good_clustering = vec![0u8; 16];
+            let good_row = Row {
+                clustering: good_clustering,
+                cells: vec![(0, CellValue::live(b"good_tool".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine.write(&tid, &good_key, good_row, 1000).unwrap();
+
+            // Now build a malformed mutation: 8-byte cell where the
+            // schema declares UTF8 (variable, fine), but clustering is
+            // a 16-byte TimeUUID — we use a malformed clustering shape
+            // to trip the per-cell validator on the regular cell of an
+            // hypothetical second column. Actually, the cleanest
+            // failure mode is a regular cell whose declared column
+            // is fixed-width and whose payload is the wrong width.
+            // We bind a fake column with TimeUUIDType and an 8-byte
+            // value. To do that we add a regular column to the
+            // schema below at index 0 of regular_columns.
+            let bad_row = Row {
+                clustering: vec![0u8; 16],
+                // Cell at column index 0 (regular: tool_name = UTF8) is OK,
+                // so we instead inject the bad cell at a TimeUUID-typed
+                // column. Add an extra fake column for the bad cell.
+                cells: vec![(0, CellValue::live(vec![0u8; 8], 2000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(2000),
+            };
+            // Construct a Mutation with a TimeUUIDType column at index 0.
+            // We *re-register* the table with a different schema so the
+            // bad cell is at a TimeUUID-typed column. Use a different
+            // table to keep schemas independent.
+            let bad_table_schema = TableSchema {
+                table: "tool_usage_log_bad".to_string(),
+                regular_columns: vec![ColumnDefinition {
+                    name: "call_id_cell".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.TimeUUIDType".to_string(),
+                }],
+                ..timeuuid_schema.clone()
+            };
+            engine.register_table(bad_table_schema.clone()).unwrap();
+            let bad_tid = TableId::new(&bad_table_schema.keyspace, &bad_table_schema.table);
+            let mutation = Mutation::new(
+                bad_table_schema.keyspace.clone(),
+                bad_table_schema.table.clone(),
+                bad_key.clone(),
+                vec![bad_row],
+                2000,
+            );
+            // Bypass Layer 1: append directly to the commit log without
+            // going through the memtable.
+            engine.commit_log.append(&mutation).unwrap();
+            engine.commit_log.shutdown().unwrap();
+            (mutation, bad_tid, bad_table_schema)
+        };
+        let (_, bad_tid, bad_table_schema) = bad_mutation;
+
+        // Phase 2: reopen the engine. Replay must:
+        //  - apply the good row to the good table,
+        //  - quarantine the bad row from the bad table without panicking,
+        //  - leave the engine readable.
+        let before = crate::quarantine::flush_quarantined_rows_total();
+        {
+            let (engine, pending) = StorageEngine::open(make_config(), None).unwrap();
+            engine.register_table(timeuuid_schema).unwrap();
+            engine.register_table(bad_table_schema.clone()).unwrap();
+            engine.replay_mutations(pending).unwrap();
+
+            // Good row replayed cleanly.
+            let good = engine
+                .read(&tid, &good_key)
+                .unwrap()
+                .expect("good row must replay into the memtable");
+            assert_eq!(good.rows.len(), 1);
+
+            // Bad row is NOT in the memtable.
+            let bad = engine.read(&bad_tid, &bad_key).unwrap();
+            assert!(
+                bad.is_none() || bad.unwrap().rows.is_empty(),
+                "bad row must be quarantined, not materialised"
+            );
+
+            engine.commit_log.shutdown().unwrap();
+        }
+        let after = crate::quarantine::flush_quarantined_rows_total();
+        assert!(
+            after > before,
+            "FLUSH_QUARANTINED_ROWS_TOTAL must increment on replay (was {before} → {after})"
+        );
+
+        // Quarantine file exists under the bad table's flush dir.
+        // Layout: <data_dir>/sstables/<keyspace>.<table>/quarantine/.
+        let bad_table_dir = dir.path().join("sstables").join(format!("{}", bad_tid));
+        let quarantine_dir = bad_table_dir.join("quarantine");
+        assert!(
+            quarantine_dir.exists(),
+            "quarantine directory must exist at {}",
+            quarantine_dir.display()
+        );
+        let entries: Vec<_> = std::fs::read_dir(&quarantine_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".jsonl"))
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one quarantine JSONL must exist; got {} entries",
+            entries.len()
+        );
+        let body = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(
+            body.contains("TimeUUIDType") && body.contains("\"value_hex\":\"0000000000000000\""),
+            "quarantine line must capture the malformed cell; got: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_read_during_compaction() {
         use std::sync::Arc;
@@ -7622,7 +7835,13 @@ mod tests {
 
         engine.register_system_tables().unwrap();
 
-        // Verify all 6 system tables are registered by attempting writes.
+        // Each system table has a distinct schema shape (different
+        // clustering columns, fixed-width column types) — Layer 1's
+        // per-cell-length and clustering-shape validators reject any
+        // generic placeholder row that doesn't match. Reads, however,
+        // are schema-agnostic: a missing partition is `Ok(None)`, an
+        // unregistered table errors. Use that to verify registration
+        // succeeded for every system table.
         let system_tables = [
             ("system_schema", "keyspaces"),
             ("system_schema", "tables"),
@@ -7635,11 +7854,10 @@ mod tests {
         for (ks, tbl) in &system_tables {
             let tid = TableId::new(*ks, *tbl);
             let key = make_key("test");
-            let row = make_row(b"v", 1);
-            let result = engine.write(&tid, &key, row, 1);
+            let result = engine.read(&tid, &key);
             assert!(
                 result.is_ok(),
-                "system table {ks}.{tbl} should be registered"
+                "system table {ks}.{tbl} should be registered, got err: {result:?}"
             );
         }
     }
@@ -9989,8 +10207,12 @@ mod tests {
         // Write 100 keys, flush every 25 to create 4+ SSTables and trigger compaction.
         for i in 0..100u64 {
             let key = make_key(&format!("key_{i:04}"));
+            // `test_schema()` declares an Int32Type clustering column, so the
+            // clustering bytes must be exactly 4. The SSTable writer's
+            // Gate A rejects empty clustering on a schema that declares a
+            // fixed-length clustering column.
             let row = Row {
-                clustering: vec![],
+                clustering: (i as i32).to_be_bytes().to_vec(),
                 cells: vec![(
                     0,
                     CellValue::live(format!("val_{i}").into_bytes(), i as i64),

@@ -131,6 +131,8 @@ pub enum Keyword {
     Rollback,
     Sounds,
     Like,
+    /// CQL `USER` — deprecated alias for `ROLE WITH LOGIN = true`.
+    User,
 }
 
 /// Compile-time keyword map. Case-insensitive lookup is done by
@@ -252,6 +254,11 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "ROLLBACK" => Keyword::Rollback,
     "SOUNDS" => Keyword::Sounds,
     "LIKE" => Keyword::Like,
+    "USER" => Keyword::User,
+    // `USERS`/`ROLES` are NOT reserved keywords — `SELECT * FROM users`
+    // is a legal Cassandra query against a user-defined table named
+    // `users`. The `LIST USERS`/`LIST ROLES` parser handles them via
+    // case-insensitive ident matching after the `LIST` keyword.
 };
 
 /// Token kind produced by the lexer.

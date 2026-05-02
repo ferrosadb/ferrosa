@@ -165,7 +165,17 @@ impl SSTableWriter {
         // a schema declaring fixed-length clustering columns was silently
         // serialized and later tripped `read_exact_at: wanted N got M` on
         // read — skipping the entire partition.
+        //
+        // Exception: a pure tombstone Row (empty clustering, no cells, non-LIVE
+        // deletion) is the in-memory representation of a partition-level
+        // DELETE and carries no payload to validate. Let it through.
         for (row_idx, row) in partition.rows.iter().enumerate() {
+            let is_partition_tombstone = row.clustering.is_empty()
+                && row.cells.is_empty()
+                && row.deletion != crate::types::DeletionTime::LIVE;
+            if is_partition_tombstone {
+                continue;
+            }
             Self::validate_clustering_shape(&self.header, row_idx, &row.clustering).map_err(
                 |msg| {
                     ferrosa_common::Error::InvalidData(format!(

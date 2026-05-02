@@ -217,10 +217,21 @@ pub fn table_to_rows(table: &TableMetadata) -> TableMutationRows {
         .columns
         .values()
         .map(|col| {
-            // Composite clustering: table_name + column_name
+            // Composite clustering: [u16 len][table_name][u16 len][column_name].
+            // Pre-fix the second length prefix was missing — `col.name`
+            // bytes were appended directly. The reader treated the first
+            // bytes of `col.name` as a u16 length and consumed garbage,
+            // which is the same malformed shape that was already
+            // persisted to production system_schema.columns SSTables and
+            // fired the writer's clustering-shape validator on flush
+            // (see the timeuuid-flush-wedge recovery quarantine
+            // records). With this fix, every NEW write is well-formed;
+            // bad rows that already exist on disk are routed to the
+            // quarantine path on read/replay (Layer 2/3).
             let mut clustering = Vec::new();
             clustering.extend_from_slice(&(table.name.len() as u16).to_be_bytes());
             clustering.extend_from_slice(table.name.as_bytes());
+            clustering.extend_from_slice(&(col.name.len() as u16).to_be_bytes());
             clustering.extend_from_slice(col.name.as_bytes());
 
             let kind_str = match col.kind {

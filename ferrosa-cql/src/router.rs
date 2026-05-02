@@ -23,7 +23,7 @@ use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
-    query_role_members, query_role_permissions, query_roles, query_tables, AuthContext,
+    query_role_members, query_role_permissions, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
@@ -76,41 +76,6 @@ fn should_yield_during_partition_scan(processed_partitions: usize, yield_every: 
     yield_every > 0 && processed_partitions > 0 && processed_partitions.is_multiple_of(yield_every)
 }
 
-/// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
-const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
-
-/// Generate a v1 Timeuuid containing the current timestamp.
-///
-/// Returns `CqlValue::Timeuuid` with a version-1 UUID built from the
-/// current system clock. Uses a v4 UUID as entropy source for the
-/// clock sequence and node fields (avoids pulling in `rand` directly).
-fn eval_now() -> CqlValue {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let uuid_ts = now.as_nanos() as u64 / 100 + UUID_EPOCH_OFFSET;
-    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
-    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
-    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
-
-    // Use a v4 UUID as entropy source for clock_seq and node bytes.
-    let entropy = uuid::Uuid::new_v4();
-    let ebytes = entropy.as_bytes();
-    let clock_seq: u16 = u16::from_be_bytes([ebytes[0], ebytes[1]]) & 0x3FFF | 0x8000; // variant 1
-    let node: [u8; 6] = [
-        ebytes[2], ebytes[3], ebytes[4], ebytes[5], ebytes[6], ebytes[7],
-    ];
-
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&time_low.to_be_bytes());
-    bytes[4..6].copy_from_slice(&time_mid.to_be_bytes());
-    bytes[6..8].copy_from_slice(&time_hi.to_be_bytes());
-    bytes[8..10].copy_from_slice(&clock_seq.to_be_bytes());
-    bytes[10..16].copy_from_slice(&node);
-
-    CqlValue::Timeuuid(uuid::Uuid::from_bytes(bytes))
-}
-
 /// Extract the Unix-epoch millisecond timestamp from a Timeuuid.
 ///
 /// Converts from 100-nanosecond intervals since 1582-10-15 (UUID epoch) to
@@ -123,7 +88,7 @@ fn eval_to_timestamp(timeuuid: &CqlValue) -> Result<CqlValue, CqlError> {
             let time_mid = u16::from_be_bytes([bytes[4], bytes[5]]) as u64;
             let time_hi = (u16::from_be_bytes([bytes[6], bytes[7]]) & 0x0FFF) as u64;
             let uuid_ts = time_low | (time_mid << 32) | (time_hi << 48);
-            let millis = (uuid_ts - UUID_EPOCH_OFFSET) / 10_000;
+            let millis = (uuid_ts - crate::bridge::UUID_EPOCH_OFFSET) / 10_000;
             Ok(CqlValue::Timestamp(millis as i64))
         }
         _ => Err(CqlError::Invalid(
@@ -485,6 +450,13 @@ pub async fn route(
             .await
             .map(RouteResult::Result),
         Statement::DropRole(dr) => route_drop_role(state, ctx, dr)
+            .await
+            .map(RouteResult::Result),
+        Statement::ListRoles {
+            of,
+            no_recursive,
+            users_alias,
+        } => route_list_roles(state, ctx, of, no_recursive, users_alias)
             .await
             .map(RouteResult::Result),
         Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
@@ -1090,16 +1062,64 @@ async fn route_select(
         }
         ("system_auth", "roles") => {
             let snap = state.schema.snapshot();
-            let role_rows = query_roles(&snap, ctx.auth);
-            let col_names = vec!["role".into(), "is_superuser".into(), "can_login".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Boolean, CqlType::Boolean];
-            let rows: Vec<Vec<Option<CqlValue>>> = role_rows
+
+            // Apply the WHERE clause. `role` is the partition key on
+            // system_auth.roles, but pre-fix the handler returned every
+            // role unconditionally — `WHERE role = 'cassandra'` matched
+            // every row. Filter eq predicates here.
+            let mut sorted_roles: Vec<&ferrosa_schema::auth::role::RoleMetadata> = snap
+                .roles
+                .values()
+                .filter(|r| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true;
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(v) => v.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "role" => r.name == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            sorted_roles.sort_by(|a, b| a.name.cmp(&b.name));
+
+            // Project `salted_hash` as a column. Non-superuser callers
+            // see a fixed redaction marker (the column exists but the
+            // hash isn't disclosed); superusers see the real hash.
+            // Pre-fix the column was omitted entirely, which (a) hid
+            // the existence of any hash and (b) made the silent
+            // hash-not-stored bug undetectable from a SELECT *.
+            let col_names = vec![
+                "role".into(),
+                "is_superuser".into(),
+                "can_login".into(),
+                "salted_hash".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Varchar,
+            ];
+            let is_superuser_caller = ctx.auth.is_superuser;
+            let rows: Vec<Vec<Option<CqlValue>>> = sorted_roles
                 .iter()
                 .map(|r| {
+                    let salted_hash_cell = match (&r.salted_hash, is_superuser_caller) {
+                        (Some(hash), true) => Some(CqlValue::Text(hash.clone())),
+                        (Some(_), false) => Some(CqlValue::Text("[REDACTED]".to_string())),
+                        (None, _) => None,
+                    };
                     vec![
-                        Some(CqlValue::Text(r.role.clone())),
+                        Some(CqlValue::Text(r.name.clone())),
                         Some(CqlValue::Boolean(r.is_superuser)),
                         Some(CqlValue::Boolean(r.can_login)),
+                        salted_hash_cell,
                     ]
                 })
                 .collect();
@@ -4150,11 +4170,11 @@ async fn route_create_role(
         .schema
         .check_permission(ctx.auth, Permission::Create, &Resource::AllRoles)?;
 
-    let role = RoleMetadata {
+    let base_role = RoleMetadata {
         name: s.name.clone(),
         is_superuser: s.superuser.unwrap_or(false),
         can_login: s.login.unwrap_or(false),
-        salted_hash: None, // schema layer handles hashing
+        salted_hash: None,
         member_of: HashSet::new(),
     };
 
@@ -4162,17 +4182,42 @@ async fn route_create_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            // Direct path: pass the cleartext through; `Schema::create_role`
+            // validates the policy, hashes it under the schema's
+            // write-lock, and emits the audit event.
             state
                 .schema
-                .create_role(role, s.password.as_deref(), ctx.auth)?;
+                .create_role(base_role, s.password.as_deref(), ctx.auth)?;
         }
-        DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateRole(role);
-            coordinator.coordinate_ddl(op).await?;
-        }
-        DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateRole(role);
-            ddl.execute(op).await.map_err(CqlError::from)?;
+        DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
+            // Pair/Cluster paths: serialise `DdlOperation::CreateRole(role)`
+            // over the wire and apply via `create_role_internal(role)`,
+            // which writes the role verbatim. We MUST hash the password
+            // on the coordinator and embed the hash in the role —
+            // otherwise the role persists with `salted_hash = None` and
+            // login returns `Bad credentials` for an apparently-existing
+            // role (the pre-fix bug).
+            //
+            // Hashing on the coordinator also keeps the cleartext
+            // password off the wire and out of the Raft log.
+            let mut role = base_role;
+            if let Some(ref pw) = s.password {
+                state.schema.password_policy().validate(pw, &s.name)?;
+                role.salted_hash = Some(state.schema.password_hasher().hash_password(pw)?);
+            }
+            match ddl {
+                DdlPath::Pair(coordinator) => {
+                    coordinator
+                        .coordinate_ddl(DdlOperation::CreateRole(role))
+                        .await?;
+                }
+                DdlPath::Cluster { .. } => {
+                    ddl.execute(DdlOperation::CreateRole(role))
+                        .await
+                        .map_err(CqlError::from)?;
+                }
+                _ => unreachable!("matched in outer match"),
+            }
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -4194,32 +4239,60 @@ async fn route_alter_role(
         .schema
         .check_permission(ctx.auth, Permission::Alter, &Resource::Role(s.name.clone()))?;
 
-    let updates = RoleUpdates {
-        is_superuser: s.superuser,
-        can_login: s.login,
-        password: s.password.clone(),
-        member_of: None,
-    };
-
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            // Direct path: pass the cleartext through; `Schema::alter_role`
+            // hashes inside the lock and emits the audit event.
+            let updates = RoleUpdates {
+                is_superuser: s.superuser,
+                can_login: s.login,
+                password: s.password.clone(),
+                member_of: None,
+            };
             state.schema.alter_role(&s.name, updates, ctx.auth)?;
         }
-        DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::AlterRole {
-                name: s.name.clone(),
-                updates,
+        DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
+            // Pair/Cluster paths: `alter_role_internal` (registry.rs:481)
+            // stores `updates.password` directly into `salted_hash`
+            // without re-hashing — it expects a pre-hashed value as part
+            // of the "replication carries the hash" contract. Pre-fix,
+            // the router was sending cleartext into that field, so the
+            // role's salted_hash became the literal cleartext password
+            // (which then never validated against bcrypt). Hash on the
+            // coordinator, then ship the hash via the DDL operation.
+            let hashed_password = if let Some(ref pw) = s.password {
+                state.schema.password_policy().validate(pw, &s.name)?;
+                Some(state.schema.password_hasher().hash_password(pw)?)
+            } else {
+                None
             };
-            coordinator.coordinate_ddl(op).await?;
-        }
-        DdlPath::Cluster { .. } => {
-            let op = DdlOperation::AlterRole {
-                name: s.name.clone(),
-                updates,
+            let updates = RoleUpdates {
+                is_superuser: s.superuser,
+                can_login: s.login,
+                password: hashed_password,
+                member_of: None,
             };
-            ddl.execute(op).await.map_err(CqlError::from)?;
+            match ddl {
+                DdlPath::Pair(coordinator) => {
+                    coordinator
+                        .coordinate_ddl(DdlOperation::AlterRole {
+                            name: s.name.clone(),
+                            updates,
+                        })
+                        .await?;
+                }
+                DdlPath::Cluster { .. } => {
+                    ddl.execute(DdlOperation::AlterRole {
+                        name: s.name.clone(),
+                        updates,
+                    })
+                    .await
+                    .map_err(CqlError::from)?;
+                }
+                _ => unreachable!("matched in outer match"),
+            }
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -4263,6 +4336,89 @@ async fn route_drop_role(
     }
 
     Ok(result::encode_void())
+}
+
+/// Handle `LIST ROLES [OF role] [NORECURSIVE]`. Mirrors Cassandra's
+/// `system_auth.roles` virtual view: returns one row per known role
+/// with `role`, `super`, `login`, and `member_of` columns. Cleartext
+/// salted_hash is NEVER projected — the login path reads it directly
+/// from the schema snapshot. (See SELECT * redaction for how reads
+/// against `system_auth.roles` should expose a masked column instead.)
+async fn route_list_roles(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    of: Option<String>,
+    no_recursive: bool,
+    _users_alias: bool,
+) -> Result<BytesMut, CqlError> {
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Describe, &Resource::AllRoles)?;
+
+    let snap = state.schema.snapshot();
+
+    // Build the visible role set. Without `OF`, list everything; with
+    // `OF role`, walk that role's `member_of` graph (recursively unless
+    // `NORECURSIVE` was specified).
+    let mut visible: Vec<&ferrosa_schema::auth::role::RoleMetadata> = if let Some(ref start) = of {
+        let mut acc: Vec<&ferrosa_schema::auth::role::RoleMetadata> = Vec::new();
+        let mut stack: Vec<String> = vec![start.clone()];
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(role) = snap.roles.get(&name) {
+                acc.push(role);
+                if !no_recursive {
+                    for parent in &role.member_of {
+                        stack.push(parent.clone());
+                    }
+                }
+            }
+        }
+        acc
+    } else {
+        snap.roles.values().collect()
+    };
+    visible.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let column_names = vec![
+        "role".to_string(),
+        "super".to_string(),
+        "login".to_string(),
+        "member_of".to_string(),
+    ];
+    let column_types = vec![
+        CqlType::Varchar,
+        CqlType::Boolean,
+        CqlType::Boolean,
+        CqlType::Set(Box::new(CqlType::Varchar)),
+    ];
+
+    let rows: Vec<Vec<Option<CqlValue>>> = visible
+        .into_iter()
+        .map(|r| {
+            let mut members: Vec<String> = r.member_of.iter().cloned().collect();
+            members.sort();
+            vec![
+                Some(CqlValue::Text(r.name.clone())),
+                Some(CqlValue::Boolean(r.is_superuser)),
+                Some(CqlValue::Boolean(r.can_login)),
+                Some(CqlValue::Set(
+                    members.into_iter().map(CqlValue::Text).collect(),
+                )),
+            ]
+        })
+        .collect();
+
+    Ok(result::encode_rows(
+        &column_names,
+        &column_types,
+        "system_auth",
+        "roles",
+        &rows,
+    ))
 }
 
 // ── GRANT / REVOKE ───────────────────────────────────────────────────────
@@ -5067,10 +5223,10 @@ fn apply_system_select(
                 let (src_idx, apply_tojson) = proj_ops[i];
                 if src_idx == usize::MAX - 1 {
                     // now()
-                    agg_row.push(Some(eval_now()));
+                    agg_row.push(Some(crate::bridge::eval_now()));
                 } else if src_idx == usize::MAX - 2 {
                     // toTimestamp(now())
-                    let timeuuid = eval_now();
+                    let timeuuid = crate::bridge::eval_now();
                     agg_row.push(eval_to_timestamp(&timeuuid).ok());
                 } else if src_idx < all_col_names.len() {
                     let val = all_rows
@@ -5108,10 +5264,10 @@ fn apply_system_select(
                 .map(|&(src_idx, apply_tojson)| {
                     if src_idx == usize::MAX - 1 {
                         // now()
-                        Some(eval_now())
+                        Some(crate::bridge::eval_now())
                     } else if src_idx == usize::MAX - 2 {
                         // toTimestamp(now())
-                        let timeuuid = eval_now();
+                        let timeuuid = crate::bridge::eval_now();
                         eval_to_timestamp(&timeuuid).ok()
                     } else {
                         let val = row.get(src_idx).cloned().flatten();
@@ -5348,11 +5504,11 @@ fn apply_builtin_functions(
         for (proj_idx, op) in &ops {
             match op {
                 BuiltinOp::Now => {
-                    proj_row[*proj_idx] = Some(eval_now());
+                    proj_row[*proj_idx] = Some(crate::bridge::eval_now());
                 }
                 BuiltinOp::ToTimestamp => {
                     // toTimestamp(now()) -- generate a timeuuid and convert
-                    let timeuuid = eval_now();
+                    let timeuuid = crate::bridge::eval_now();
                     proj_row[*proj_idx] = eval_to_timestamp(&timeuuid).ok();
                 }
                 BuiltinOp::Writetime(src_idx) => {
@@ -10755,8 +10911,8 @@ mod tests {
 
     #[tokio::test]
     async fn cql_function_now() {
-        // Test eval_now() directly: should produce a v1 UUID.
-        let timeuuid = super::eval_now();
+        // Test crate::bridge::eval_now() directly: should produce a v1 UUID.
+        let timeuuid = crate::bridge::eval_now();
         match timeuuid {
             CqlValue::Timeuuid(uuid) => {
                 let bytes = uuid.as_bytes();
@@ -10769,8 +10925,8 @@ mod tests {
 
     #[tokio::test]
     async fn cql_function_to_timestamp() {
-        // Test eval_now() + eval_to_timestamp() directly.
-        let timeuuid = super::eval_now();
+        // Test crate::bridge::eval_now() + eval_to_timestamp() directly.
+        let timeuuid = crate::bridge::eval_now();
         let ts = super::eval_to_timestamp(&timeuuid).expect("toTimestamp should succeed");
 
         let now_millis = std::time::SystemTime::now()
@@ -11778,6 +11934,277 @@ mod tests {
             snap.roles.contains_key("test_role"),
             "role should be in schema"
         );
+    }
+
+    /// Regression for the auth-defects bug: CREATE ROLE WITH PASSWORD
+    /// returned success but never persisted the salted_hash, so login
+    /// returned `Bad credentials` for an apparently-existing role. The
+    /// fix hashes on the coordinator before sending through the DDL
+    /// path, so this test pins that the role's `salted_hash` is set
+    /// AND that re-hashing the cleartext does NOT match (verifying the
+    /// stored value is actually a salted bcrypt hash, not the literal).
+    #[tokio::test]
+    async fn create_role_persists_password_hash() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE ROLE pwd_test WITH PASSWORD = 'mypassword123' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        let role = snap
+            .roles
+            .get("pwd_test")
+            .expect("role must exist after CREATE ROLE");
+        let hash = role
+            .salted_hash
+            .as_deref()
+            .expect("salted_hash must be persisted, not None — was the regression");
+        assert!(!hash.is_empty(), "salted_hash must not be an empty string");
+        assert_ne!(
+            hash, "mypassword123",
+            "salted_hash must be the hash, not the cleartext"
+        );
+        // bcrypt-format hashes start with `$2`. We don't lock the
+        // exact format here so the hasher can be swapped in future.
+        assert!(
+            hash.starts_with("$2") || hash.len() >= 32,
+            "salted_hash must look like a real hash, got: {hash}"
+        );
+
+        // Verify the hash actually validates the original cleartext —
+        // the canonical "auth path works" check.
+        assert!(
+            ferrosa_schema::auth::password::PasswordHasher::verify_password_any(
+                "mypassword123",
+                hash
+            )
+            .unwrap(),
+            "stored hash must verify against the original cleartext"
+        );
+    }
+
+    /// Regression for the auth-defects bug: `CREATE USER` (deprecated
+    /// alias for `CREATE ROLE WITH LOGIN = true`) was rejected by the
+    /// parser, then once it parsed, suffered the same password-hash
+    /// drop as CREATE ROLE.
+    #[tokio::test]
+    async fn create_user_persists_password_hash_and_login() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse("CREATE USER alice WITH PASSWORD = 'a-password-123'") // pragma: allowlist secret
+            .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        let role = snap.roles.get("alice").expect("USER must persist as role");
+        assert!(role.can_login, "CREATE USER must default LOGIN = true");
+        let hash = role
+            .salted_hash
+            .as_deref()
+            .expect("CREATE USER must persist salted_hash");
+        assert!(
+            ferrosa_schema::auth::password::PasswordHasher::verify_password_any(
+                "a-password-123",
+                hash
+            )
+            .unwrap()
+        );
+    }
+
+    /// Regression: `SELECT * FROM system_auth.roles WHERE role = 'X'`
+    /// returned every row instead of just the matching one — the
+    /// handler's WHERE clause was ignored. Test pins the eq filter.
+    #[tokio::test]
+    async fn select_system_auth_roles_filters_by_partition_key() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for name in ["alpha", "beta", "gamma"] {
+            let stmt = crate::parser::parse(&format!(
+                "CREATE ROLE {name} WITH PASSWORD = 'p' AND LOGIN = true" // pragma: allowlist secret
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_auth.roles WHERE role = 'beta'").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let body = match result {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+        // The response must contain "beta" exactly once.
+        let beta_hits = body
+            .windows(b"beta".len())
+            .filter(|w| *w == b"beta")
+            .count();
+        assert_eq!(
+            beta_hits, 1,
+            "WHERE role = 'beta' must filter to exactly the beta row"
+        );
+        // And must NOT contain alpha or gamma.
+        assert!(
+            !body.windows(b"alpha".len()).any(|w| w == b"alpha"),
+            "alpha must be filtered out"
+        );
+        assert!(
+            !body.windows(b"gamma".len()).any(|w| w == b"gamma"),
+            "gamma must be filtered out"
+        );
+    }
+
+    /// Regression: `SELECT *` against system_auth.roles silently
+    /// dropped the salted_hash column. With #1 (CREATE ROLE
+    /// password-not-stored) that omission masked the silent failure.
+    /// The fix exposes the column with `[REDACTED]` for non-superusers
+    /// and the real hash for superusers — the column existence is now
+    /// observable.
+    #[tokio::test]
+    async fn select_system_auth_roles_redacts_salted_hash_for_nonsuperuser() {
+        let (state, _dir) = setup();
+        let admin_ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Create a role with a password under the superuser context.
+        let stmt = crate::parser::parse(
+            "CREATE ROLE redact_test WITH PASSWORD = 'mypwd123' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .unwrap();
+        route(&state, &admin_ctx, stmt).await.unwrap();
+
+        // Superuser SELECT *: response must contain the actual hash
+        // bytes (or at least the bcrypt prefix `$2`) somewhere.
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_auth.roles WHERE role = 'redact_test'")
+                .unwrap();
+        let body = match route(&state, &admin_ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+        assert!(
+            body.windows(2).any(|w| w == b"$2"),
+            "superuser SELECT must include the real bcrypt hash"
+        );
+        assert!(
+            !body
+                .windows(b"[REDACTED]".len())
+                .any(|w| w == b"[REDACTED]"),
+            "superuser SELECT must NOT redact"
+        );
+
+        // Non-superuser SELECT *: response must contain `[REDACTED]`
+        // (column visible, hash hidden). The column name `salted_hash`
+        // is also included in the metadata so the column exists in
+        // the response schema.
+        let nonsuper = ferrosa_schema::AuthContext {
+            role: "nobody".into(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        let user_ctx = RequestContext {
+            auth: &nonsuper,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_auth.roles WHERE role = 'redact_test'")
+                .unwrap();
+        let body = match route(&state, &user_ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+        assert!(
+            body.windows(b"[REDACTED]".len())
+                .any(|w| w == b"[REDACTED]"),
+            "non-superuser SELECT must include the [REDACTED] marker"
+        );
+        assert!(
+            body.windows(b"salted_hash".len())
+                .any(|w| w == b"salted_hash"),
+            "salted_hash column metadata must be present"
+        );
+        assert!(
+            !body.windows(2).any(|w| w == b"$2"),
+            "non-superuser SELECT must NOT leak the bcrypt hash"
+        );
+    }
+
+    /// Regression: `LIST ROLES` returned `SyntaxException: unexpected
+    /// token Keyword(List)`. This test pins the new parser + router
+    /// path returns a row per known role with the expected columns.
+    #[tokio::test]
+    async fn list_roles_returns_known_roles() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let create = crate::parser::parse(
+            "CREATE ROLE list_test WITH PASSWORD = 'p' AND LOGIN = true AND SUPERUSER = false", // pragma: allowlist secret
+        )
+        .unwrap();
+        route(&state, &ctx, create).await.unwrap();
+
+        let stmt = crate::parser::parse("LIST ROLES").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "LIST ROLES should succeed (was SyntaxException): {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                // Result kind 0x0002 = Rows.
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+                // Body must contain the role name we just created.
+                assert!(
+                    b.windows(b"list_test".len()).any(|w| w == b"list_test"),
+                    "LIST ROLES output must include the new role"
+                );
+            }
+            _ => panic!("expected Result (rows) from LIST ROLES"),
+        }
     }
 
     #[tokio::test]

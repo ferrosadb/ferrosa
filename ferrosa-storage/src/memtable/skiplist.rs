@@ -49,7 +49,10 @@ impl Default for SkipListMemtable {
 }
 
 impl Memtable for SkipListMemtable {
-    fn put(&self, key: &DecoratedKey, row: Row, _schema: &TableSchema) -> Result<()> {
+    fn put(&self, key: &DecoratedKey, row: Row, schema: &TableSchema) -> Result<()> {
+        // Fail-loud guard: reject mis-sized cells before they reach the
+        // memtable (mirrors the check in `ShardedBTreeMemtable::put`).
+        super::validate_row_against_schema(&row, schema)?;
         // Atomically insert an empty partition if the key is new.
         // No side effects in the closure — count is tracked via was_empty
         // inside the CAS loop, which serializes concurrent writers.

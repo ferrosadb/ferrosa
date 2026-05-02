@@ -142,7 +142,7 @@ impl FerrosCluster {
 
     /// Get a random CQL contact point (`ip:port`).
     pub fn random_contact_point(&self) -> String {
-        let idx = rand::random::<usize>() % self.nodes.len();
+        let idx = rand::RngExt::random_range(&mut rand::rng(), 0..self.nodes.len());
         self.nodes[idx].cql_address()
     }
 

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -114,7 +114,7 @@ impl ExponentialBackoff {
         // Add 0-25% random jitter to prevent synchronized retries
         let jitter_range = base.as_millis() as u64 / 4;
         if jitter_range > 0 {
-            let jitter = rand::thread_rng().gen_range(0..=jitter_range);
+            let jitter = rand::rng().random_range(0..=jitter_range);
             base.saturating_add(Duration::from_millis(jitter))
         } else {
             base

@@ -127,6 +127,7 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
             TokenKind::Keyword(Keyword::Subscribe) => self.parse_subscribe(),
             TokenKind::Keyword(Keyword::Unsubscribe) => self.parse_unsubscribe(),
+            TokenKind::Keyword(Keyword::List) => self.parse_list(),
             TokenKind::Keyword(Keyword::Explain) => self.parse_explain(),
             TokenKind::Eof => Err(CqlError::SyntaxError("empty query".to_string())),
             _ => Err(CqlError::SyntaxError(format!(
@@ -596,6 +597,12 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Role) => {
                 self.parse_create_role().map(Statement::CreateRole)
             }
+            // CREATE USER is a deprecated alias for
+            // `CREATE ROLE WITH LOGIN = true`.  Same syntax body
+            // as CREATE ROLE; we just default `login` to true.
+            TokenKind::Keyword(Keyword::User) => {
+                self.parse_create_user_as_role().map(Statement::CreateRole)
+            }
             TokenKind::Keyword(Keyword::Index) => {
                 self.parse_create_index().map(Statement::CreateIndex)
             }
@@ -893,6 +900,53 @@ impl<'input> Parser<'input> {
         }
     }
 
+    /// Parse `CREATE USER <name> WITH PASSWORD = '...' [SUPERUSER]` —
+    /// the legacy alias for `CREATE ROLE ... WITH LOGIN = true`.
+    /// Cassandra's grammar is permissive about ordering; we accept a
+    /// trailing `SUPERUSER`/`NOSUPERUSER` keyword as a shorthand for
+    /// `WITH SUPERUSER = true/false`.
+    fn parse_create_user_as_role(&mut self) -> Result<CreateRoleStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::User))?;
+
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.parse_ident()?;
+
+        let mut password = None;
+        let mut superuser = None;
+
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            let tok = self.lexer.peek()?;
+            if matches!(&tok.kind, TokenKind::Keyword(Keyword::Password)) {
+                self.lexer.next_token()?;
+                self.lexer.expect(&TokenKind::Eq)?;
+                password = Some(self.expect_string_literal()?);
+            }
+        }
+
+        // Trailing SUPERUSER / NOSUPERUSER shorthand.
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Superuser) => {
+                self.lexer.next_token()?;
+                superuser = Some(true);
+            }
+            TokenKind::Keyword(Keyword::Nosuperuser) => {
+                self.lexer.next_token()?;
+                superuser = Some(false);
+            }
+            _ => {}
+        }
+
+        Ok(CreateRoleStatement {
+            name,
+            if_not_exists,
+            password,
+            superuser,
+            // CREATE USER is the alias that defaults LOGIN = true.
+            login: Some(true),
+        })
+    }
+
     fn parse_create_role(&mut self) -> Result<CreateRoleStatement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Role))?;
 
@@ -948,6 +1002,51 @@ impl<'input> Parser<'input> {
     // ALTER
     // ---------------------------------------------------------------
 
+    /// Parse `LIST ROLES [OF role] [NORECURSIVE]` and the `LIST USERS`
+    /// alias. Cassandra also has `LIST PERMISSIONS`, `LIST ALL
+    /// PERMISSIONS` — those are deferred (return SyntaxError) until
+    /// the permissions reporting pipeline catches up.
+    fn parse_list(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::List))?;
+        let tok = self.lexer.next_token()?;
+        // ROLES / USERS are matched as case-insensitive identifiers
+        // rather than reserved keywords so user tables named `users`
+        // continue to lex as `Ident("users")` in non-LIST contexts.
+        let users_alias = match &tok.kind {
+            TokenKind::Ident(name) if name.eq_ignore_ascii_case("roles") => false,
+            TokenKind::Ident(name) if name.eq_ignore_ascii_case("users") => true,
+            _ => {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected ROLES or USERS after LIST, got {:?} at position {}",
+                    tok.kind, tok.pos
+                )))
+            }
+        };
+
+        let mut of = None;
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::Of))? {
+            of = Some(self.parse_ident()?);
+        }
+
+        // Cassandra spells the recursion suppressor as `NORECURSIVE`
+        // — a single token. We accept the bare ident form so existing
+        // tooling that parses LIST output can interoperate.
+        let mut no_recursive = false;
+        let tok = self.lexer.peek()?;
+        if let TokenKind::Ident(name) = &tok.kind {
+            if name.eq_ignore_ascii_case("norecursive") {
+                self.lexer.next_token()?;
+                no_recursive = true;
+            }
+        }
+
+        Ok(Statement::ListRoles {
+            of,
+            no_recursive,
+            users_alias,
+        })
+    }
+
     fn parse_alter(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Alter))?;
         let tok = self.lexer.peek()?;
@@ -956,11 +1055,70 @@ impl<'input> Parser<'input> {
                 self.parse_alter_table().map(Statement::AlterTable)
             }
             TokenKind::Keyword(Keyword::Type) => self.parse_alter_type(),
+            // ALTER ROLE / ALTER USER share the same options as CREATE.
+            // Both forms accepted — `USER` is the deprecated alias.
+            TokenKind::Keyword(Keyword::Role) | TokenKind::Keyword(Keyword::User) => {
+                self.parse_alter_role().map(Statement::AlterRole)
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "ALTER {:?} not yet supported at position {}",
                 tok.kind, tok.pos
             ))),
         }
+    }
+
+    fn parse_alter_role(&mut self) -> Result<AlterRoleStatement, CqlError> {
+        // Caller has already peeked Keyword::Role or Keyword::User; consume it.
+        let kw = self.lexer.next_token()?;
+        debug_assert!(matches!(
+            &kw.kind,
+            TokenKind::Keyword(Keyword::Role) | TokenKind::Keyword(Keyword::User)
+        ));
+
+        let name = self.parse_ident()?;
+
+        let mut password = None;
+        let mut superuser = None;
+        let mut login = None;
+
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            loop {
+                let tok = self.lexer.peek()?;
+                match &tok.kind {
+                    TokenKind::Keyword(Keyword::Password) => {
+                        self.lexer.next_token()?;
+                        self.lexer.expect(&TokenKind::Eq)?;
+                        password = Some(self.expect_string_literal()?);
+                    }
+                    TokenKind::Keyword(Keyword::Superuser) => {
+                        self.lexer.next_token()?;
+                        self.lexer.expect(&TokenKind::Eq)?;
+                        superuser = Some(self.parse_bool()?);
+                    }
+                    TokenKind::Keyword(Keyword::Login) => {
+                        self.lexer.next_token()?;
+                        self.lexer.expect(&TokenKind::Eq)?;
+                        login = Some(self.parse_bool()?);
+                    }
+                    _ => {
+                        return Err(CqlError::SyntaxError(format!(
+                            "unexpected token {:?} in ALTER ROLE options at position {}",
+                            tok.kind, tok.pos
+                        )))
+                    }
+                }
+                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                    break;
+                }
+            }
+        }
+
+        Ok(AlterRoleStatement {
+            name,
+            password,
+            superuser,
+            login,
+        })
     }
 
     fn parse_alter_table(&mut self) -> Result<AlterTableStatement, CqlError> {
@@ -2335,6 +2493,7 @@ impl<'input> Parser<'input> {
             Keyword::Rollback => "rollback",
             Keyword::Sounds => "sounds",
             Keyword::Like => "like",
+            Keyword::User => "user",
         }
         .to_string()
     }
@@ -3010,6 +3169,159 @@ mod tests {
                 assert_eq!(s.login, Some(true));
             }
             other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    /// Regression: `LIST ROLES` was rejected with
+    /// `SyntaxException: unexpected token Keyword(List) at position 0`.
+    #[test]
+    fn parse_list_roles_bare() {
+        let stmt = parse("LIST ROLES").unwrap();
+        match stmt {
+            Statement::ListRoles {
+                of,
+                no_recursive,
+                users_alias,
+            } => {
+                assert_eq!(of, None);
+                assert!(!no_recursive);
+                assert!(!users_alias);
+            }
+            other => panic!("expected ListRoles, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_roles_of_role() {
+        let stmt = parse("LIST ROLES OF admin").unwrap();
+        match stmt {
+            Statement::ListRoles {
+                of,
+                no_recursive,
+                users_alias,
+            } => {
+                assert_eq!(of.as_deref(), Some("admin"));
+                assert!(!no_recursive);
+                assert!(!users_alias);
+            }
+            other => panic!("expected ListRoles, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_roles_norecursive() {
+        let stmt = parse("LIST ROLES OF admin NORECURSIVE").unwrap();
+        match stmt {
+            Statement::ListRoles {
+                of, no_recursive, ..
+            } => {
+                assert_eq!(of.as_deref(), Some("admin"));
+                assert!(no_recursive);
+            }
+            other => panic!("expected ListRoles, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_users_alias() {
+        let stmt = parse("LIST USERS").unwrap();
+        match stmt {
+            Statement::ListRoles { users_alias, .. } => {
+                assert!(users_alias, "USERS variant must be flagged for the alias");
+            }
+            other => panic!("expected ListRoles, got {:?}", other),
+        }
+    }
+
+    /// `CREATE USER` is a deprecated alias for
+    /// `CREATE ROLE WITH LOGIN = true`. Reported as failing alongside
+    /// CREATE ROLE in the auth-defects bug list.
+    #[test]
+    fn parse_create_user_with_password() {
+        let stmt = parse("CREATE USER alice WITH PASSWORD = 'secret'").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.name, "alice");
+                assert_eq!(s.password, Some("secret".into()));
+                assert_eq!(s.login, Some(true), "USER implies LOGIN = true");
+                assert_eq!(s.superuser, None);
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_user_superuser() {
+        let stmt = parse("CREATE USER bob WITH PASSWORD = 'p' SUPERUSER").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.name, "bob");
+                assert_eq!(s.superuser, Some(true));
+                assert_eq!(s.login, Some(true));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_user_if_not_exists() {
+        let stmt = parse("CREATE USER IF NOT EXISTS carol WITH PASSWORD = 'p'").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.name, "carol");
+                assert!(s.if_not_exists);
+                assert_eq!(s.login, Some(true));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    /// Regression: `ALTER ROLE x WITH PASSWORD = '...'` was rejected
+    /// with `SyntaxException: ALTER Keyword(Role) not yet supported`,
+    /// leaving roles whose password never persisted (see CREATE ROLE
+    /// password-not-stored bug) with no recovery path. Test reported
+    /// by the auth-defects bug list.
+    #[test]
+    fn parse_alter_role_with_password() {
+        let stmt = parse("ALTER ROLE admin WITH PASSWORD = 'newsecret'").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "admin");
+                assert_eq!(s.password, Some("newsecret".into()));
+                assert_eq!(s.superuser, None);
+                assert_eq!(s.login, None);
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_role_with_login() {
+        let stmt = parse("ALTER ROLE admin WITH LOGIN = false").unwrap();
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "admin");
+                assert_eq!(s.login, Some(false));
+                assert_eq!(s.password, None);
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_role_combined_options() {
+        let stmt = parse(
+            "ALTER ROLE admin WITH PASSWORD = 'p' AND SUPERUSER = true AND LOGIN = true", // pragma: allowlist secret
+        )
+        .unwrap();
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "admin");
+                assert_eq!(s.password, Some("p".into()));
+                assert_eq!(s.superuser, Some(true));
+                assert_eq!(s.login, Some(true));
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
         }
     }
 

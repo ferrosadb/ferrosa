@@ -23,6 +23,15 @@ pub enum Statement {
     CreateRole(CreateRoleStatement),
     AlterRole(AlterRoleStatement),
     DropRole(DropRoleStatement),
+    /// `LIST ROLES [OF role] [NORECURSIVE]`. `LIST USERS` is the
+    /// deprecated alias and parses to the same variant with
+    /// `users_alias = true` so the result schema can match Cassandra's
+    /// `system_auth.users` view.
+    ListRoles {
+        of: Option<String>,
+        no_recursive: bool,
+        users_alias: bool,
+    },
     Grant(GrantStatement),
     Revoke(RevokeStatement),
     Use(UseStatement),

@@ -1058,6 +1058,58 @@ async fn cqlsh_full_workflow() {
     );
 }
 
+/// Regression: partition-level DELETE on a clustered table must succeed
+/// end-to-end (memtable accept → SELECT after).
+///
+/// Reproduces examples/cql-comprehensive/queries.cql:90 — `DELETE FROM
+/// delete_test WHERE pk = 2;` followed by `SELECT * FROM delete_test
+/// WHERE pk = 2;`. Pre-fix, the strict clustering-shape guard added in
+/// the timeuuid flush-wedge fix rejected the row that the bridge builds
+/// for the partition delete (empty clustering on a clustered table) at
+/// memtable boundary, surfacing as `NoHostAvailable: server error:
+/// storage error: invalid data: ks.delete_test (clustering): clustering
+/// bytes are empty but schema declares 1 clustering column(s)` on the
+/// next SELECT.
+#[tokio::test]
+async fn partition_delete_on_clustered_table_does_not_wedge_validator() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let setup = [
+        "CREATE KEYSPACE part_del_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        "USE part_del_ks",
+        "CREATE TABLE delete_test (pk int, ck int, v text, PRIMARY KEY (pk, ck))",
+        "INSERT INTO delete_test (pk, ck, v) VALUES (1, 1, 'a')",
+        "INSERT INTO delete_test (pk, ck, v) VALUES (1, 2, 'b')",
+        "INSERT INTO delete_test (pk, ck, v) VALUES (2, 1, 'c')",
+        "INSERT INTO delete_test (pk, ck, v) VALUES (2, 2, 'd')",
+        // Row-level delete (control case — already worked pre-fix).
+        "DELETE FROM delete_test WHERE pk = 1 AND ck = 2",
+        // Partition-level delete — the regression case.
+        "DELETE FROM delete_test WHERE pk = 2",
+    ];
+    for cql in &setup {
+        let query = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &query).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // The follow-up SELECT must succeed — pre-fix this returned a server
+    // error because the partition-tombstone Row got rejected on flush.
+    let query = encode_query_body("SELECT * FROM delete_test WHERE pk = 2");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+    assert_eq!(
+        kind, 0x0002,
+        "SELECT after partition delete should return Rows"
+    );
+}
+
 /// M7 / T5: QUERY before STARTUP must be rejected with ERROR(Protocol).
 /// Regression test for Critical-rated auth bypass threat (T5, risk 9).
 #[tokio::test]
