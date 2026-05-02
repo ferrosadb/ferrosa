@@ -54,9 +54,14 @@ SKIPS=(
 # arm64 (no progress for 30+ min after `Finished` compile). cargo
 # test does not exhibit the hang. See task #15. Until the nextest
 # hang is fixed, force the cargo-test path.
+#
+# Use the default thread pool (one per core) — CI does the same. The
+# previous `--test-threads=1` here turned a ~10–15 min mirror into a
+# ~3 h sequential run with no documented justification, and CI itself
+# never passed that flag (see .github/workflows/ci.yml).
 echo "=== cargo test --workspace --lib --tests (mirrors CI) ==="
 exec cargo test \
   --all-features \
   --workspace --lib --tests \
   --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-  -- --test-threads=1 "${SKIPS[@]}"
+  -- "${SKIPS[@]}"
