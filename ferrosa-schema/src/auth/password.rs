@@ -1,8 +1,6 @@
 //! Password hashing and policy types.
 
 use argon2::Argon2;
-use password_hash::rand_core::OsRng;
-use password_hash::SaltString;
 use serde::{Deserialize, Serialize};
 
 use crate::error::SchemaError;
@@ -37,7 +35,7 @@ impl PasswordHasher {
                 iterations,
                 parallelism,
             } => {
-                use password_hash::PasswordHasher as _;
+                use argon2::password_hash::PasswordHasher as _;
 
                 let params = argon2::Params::new(*memory_kib, *iterations, *parallelism, None)
                     .map_err(|e| {
@@ -45,9 +43,10 @@ impl PasswordHasher {
                     })?;
                 let argon2 =
                     Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-                let salt = SaltString::generate(&mut OsRng);
+                // In argon2 0.6 + password-hash 0.6, hash_password generates its own
+                // random salt internally and returns a PHC string directly.
                 let hash = argon2
-                    .hash_password(password.as_bytes(), &salt)
+                    .hash_password(password.as_bytes())
                     .map_err(|e| SchemaError::InvalidSchema(format!("argon2 hash failed: {e}")))?;
                 Ok(hash.to_string())
             }
@@ -63,16 +62,17 @@ impl PasswordHasher {
                 .map_err(|e| SchemaError::InvalidSchema(format!("bcrypt verify failed: {e}")))
         } else if hash.starts_with("$argon2id$") {
             // Argon2id hash
-            use password_hash::PasswordVerifier;
+            use argon2::password_hash::phc::PasswordHash;
+            use argon2::password_hash::PasswordVerifier;
 
-            let parsed = password_hash::PasswordHash::new(hash).map_err(|e| {
+            let parsed = PasswordHash::new(hash).map_err(|e| {
                 SchemaError::InvalidSchema(format!("argon2 hash parse failed: {e}"))
             })?;
             // Use default Argon2 — params are embedded in the hash
             let argon2 = Argon2::default();
             match argon2.verify_password(password.as_bytes(), &parsed) {
                 Ok(()) => Ok(true),
-                Err(password_hash::Error::Password) => Ok(false),
+                Err(argon2::password_hash::Error::PasswordInvalid) => Ok(false),
                 Err(e) => Err(SchemaError::InvalidSchema(format!(
                     "argon2 verify failed: {e}"
                 ))),
