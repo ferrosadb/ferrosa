@@ -1,5 +1,6 @@
 //! Upload manager: async task that uploads SSTables to S3-compatible storage.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,29 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+
+/// Local SSTable component file scheduled for upload.
+#[derive(Debug, Clone)]
+pub struct SstableComponentFile {
+    /// Component filename, e.g. `1-Data.db`.
+    pub name: String,
+    /// Local path to read when the upload worker processes the task.
+    pub path: PathBuf,
+    /// Component size captured while scanning, used for manifest accounting.
+    pub size_bytes: u64,
+}
+
+impl SstableComponentFile {
+    pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            name: name.into(),
+            path,
+            size_bytes,
+        }
+    }
+}
 
 /// A task to upload SSTable component files to object storage.
 #[derive(Debug)]
@@ -18,8 +42,8 @@ pub enum UploadTask {
         table_id: String,
         /// SSTable identifier.
         sstable_id: String,
-        /// Component files: (component_name, data).
-        files: Vec<(String, Bytes)>,
+        /// Component files to read from disk when this task is processed.
+        files: Vec<SstableComponentFile>,
         /// Notified when all component files have been uploaded successfully.
         ///
         /// `Some(tx)` causes the upload loop to send `Ok(())` after all files
@@ -106,14 +130,15 @@ impl UploadManager {
                         // and avoids the 3,500 PUT/s per-prefix limit.
                         let hex_prefix = hex_prefix_for(&sstable_id);
                         let mut upload_err: Option<String> = None;
-                        for (name, data) in files {
+                        for file in files {
                             // `name` is already in `{sstable_id}-{component}` form
                             // (e.g. "1-Data.db"). Strip the id prefix to get the bare
                             // component name so we can route through the shared key
                             // constructor and guarantee upload/download alignment.
-                            let component = name
+                            let component = file
+                                .name
                                 .strip_prefix(&format!("{sstable_id}-"))
-                                .unwrap_or(&name);
+                                .unwrap_or(&file.name);
                             let path = sstable_object_key(
                                 &prefix,
                                 &hex_prefix,
@@ -121,9 +146,21 @@ impl UploadManager {
                                 &sstable_id,
                                 component,
                             );
-                            if let Err(e) =
-                                Self::put_with_retry(&store, &path, data.clone(), 5).await
-                            {
+                            let data = match std::fs::read(&file.path) {
+                                Ok(data) => Bytes::from(data),
+                                Err(e) => {
+                                    let msg = format!(
+                                        "upload failed for {path}: failed to read {}: {e}",
+                                        file.path.display()
+                                    );
+                                    tracing_or_eprintln(msg.clone());
+                                    if upload_err.is_none() {
+                                        upload_err = Some(msg);
+                                    }
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = Self::put_with_retry(&store, &path, data, 5).await {
                                 let msg = format!("upload failed for {path}: {e}");
                                 tracing_or_eprintln(msg.clone());
                                 // Record first error; continue so all files are attempted.
@@ -331,6 +368,8 @@ fn tracing_or_eprintln(msg: String) {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     fn make_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -369,6 +408,9 @@ mod tests {
     fn upload_round_trip() {
         let rt = make_runtime();
         rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let component_path = dir.path().join("abc123-Data.db");
+            std::fs::write(&component_path, b"hello sstable data").unwrap();
             let store = Arc::new(InMemory::new());
             let manager = UploadManager::new(
                 Arc::clone(&store) as Arc<dyn ObjectStore>,
@@ -377,12 +419,11 @@ mod tests {
                 &tokio::runtime::Handle::current(),
             );
 
-            let data = Bytes::from_static(b"hello sstable data");
             manager
                 .submit(UploadTask::SSTable {
                     table_id: "ks.table".into(),
                     sstable_id: "abc123".into(),
-                    files: vec![("Data.db".into(), data.clone())],
+                    files: vec![SstableComponentFile::new("abc123-Data.db", component_path)],
                     on_complete: None,
                 })
                 .await
@@ -406,6 +447,15 @@ mod tests {
     fn multiple_components_uploaded() {
         let rt = make_runtime();
         rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let components = [
+                ("001-Data.db", b"data".as_slice()),
+                ("001-Index.db", b"index".as_slice()),
+                ("001-Filter.db", b"filter".as_slice()),
+            ];
+            for (name, data) in components {
+                std::fs::write(dir.path().join(name), data).unwrap();
+            }
             let store = Arc::new(InMemory::new());
             let manager = UploadManager::new(
                 Arc::clone(&store) as Arc<dyn ObjectStore>,
@@ -419,9 +469,12 @@ mod tests {
                     table_id: "ks.t".into(),
                     sstable_id: "001".into(),
                     files: vec![
-                        ("Data.db".into(), Bytes::from_static(b"data")),
-                        ("Index.db".into(), Bytes::from_static(b"index")),
-                        ("Filter.db".into(), Bytes::from_static(b"filter")),
+                        SstableComponentFile::new("001-Data.db", dir.path().join("001-Data.db")),
+                        SstableComponentFile::new("001-Index.db", dir.path().join("001-Index.db")),
+                        SstableComponentFile::new(
+                            "001-Filter.db",
+                            dir.path().join("001-Filter.db"),
+                        ),
                     ],
                     on_complete: None,
                 })
@@ -438,6 +491,113 @@ mod tests {
                 let result = store.get(&path).await.unwrap();
                 assert!(!result.bytes().await.unwrap().is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn queued_sstable_upload_reads_component_from_disk_when_processed() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let first_path = dir.path().join("1-Data.db");
+            let second_path = dir.path().join("2-Data.db");
+            std::fs::write(&first_path, b"first").unwrap();
+            std::fs::write(&second_path, b"original").unwrap();
+
+            let inner = Arc::new(InMemory::new());
+            let store = Arc::new(BlockingFirstPutStore::new(
+                Arc::clone(&inner) as Arc<dyn ObjectStore>
+            ));
+            let first_put_started = Arc::clone(&store.first_put_started);
+            let release_first_put = Arc::clone(&store.release_first_put);
+            let manager = UploadManager::new(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "pfx".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.t".into(),
+                    sstable_id: "1".into(),
+                    files: vec![SstableComponentFile::new("1-Data.db", first_path)],
+                    on_complete: None,
+                })
+                .await
+                .unwrap();
+
+            first_put_started.notified().await;
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.t".into(),
+                    sstable_id: "2".into(),
+                    files: vec![SstableComponentFile::new("2-Data.db", second_path.clone())],
+                    on_complete: Some(tx),
+                })
+                .await
+                .unwrap();
+
+            std::fs::write(&second_path, b"updated").unwrap();
+            release_first_put.notify_one();
+            rx.await.unwrap().unwrap();
+            manager.shutdown().await;
+
+            let hex = hex_prefix_for("2");
+            let path = sstable_object_key("pfx", &hex, "ks.t", "2", "Data.db");
+            let result = inner.get(&path).await.unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(
+                bytes.as_ref(),
+                b"updated",
+                "queued SSTable tasks must not retain pre-read component bytes"
+            );
+        });
+    }
+
+    #[test]
+    fn missing_sstable_component_reports_upload_failure() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let missing_path = dir.path().join("3-Data.db");
+            std::fs::write(&missing_path, b"will be removed").unwrap();
+            let file = SstableComponentFile::new("3-Data.db", &missing_path);
+            std::fs::remove_file(&missing_path).unwrap();
+
+            let store = Arc::new(InMemory::new());
+            let manager = UploadManager::new(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "pfx".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.t".into(),
+                    sstable_id: "3".into(),
+                    files: vec![file],
+                    on_complete: Some(tx),
+                })
+                .await
+                .unwrap();
+
+            let err = rx.await.unwrap().unwrap_err();
+            assert!(
+                err.contains("failed to read"),
+                "missing component should report a read failure, got: {err}"
+            );
+            manager.shutdown().await;
+
+            let hex = hex_prefix_for("3");
+            let path = sstable_object_key("pfx", &hex, "ks.t", "3", "Data.db");
+            assert!(
+                store.get(&path).await.is_err(),
+                "missing component must not create an object"
+            );
         });
     }
 
@@ -472,5 +632,102 @@ mod tests {
             let bytes = result.bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), b"commit-log-segment-bytes");
         });
+    }
+
+    struct BlockingFirstPutStore {
+        inner: Arc<dyn ObjectStore>,
+        put_count: AtomicUsize,
+        first_put_started: Arc<Notify>,
+        release_first_put: Arc<Notify>,
+    }
+
+    impl BlockingFirstPutStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                put_count: AtomicUsize::new(0),
+                first_put_started: Arc::new(Notify::new()),
+                release_first_put: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    impl std::fmt::Display for BlockingFirstPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BlockingFirstPutStore")
+        }
+    }
+
+    impl std::fmt::Debug for BlockingFirstPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BlockingFirstPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for BlockingFirstPutStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.put_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_put_started.notify_one();
+                self.release_first_put.notified().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
     }
 }

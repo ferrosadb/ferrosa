@@ -9,5 +9,7 @@ pub mod manager;
 pub mod pending_log;
 
 pub use config::{validate_s3_bucket, ObjectStoreConfig};
-pub use manager::{hex_prefix_for, sstable_object_key, UploadManager, UploadTask};
+pub use manager::{
+    hex_prefix_for, sstable_object_key, SstableComponentFile, UploadManager, UploadTask,
+};
 pub use pending_log::PendingUploadsLog;

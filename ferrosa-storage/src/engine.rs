@@ -2650,7 +2650,7 @@ impl StorageEngine {
                 continue;
             }
 
-            let total_size: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
+            let total_size: u64 = files.iter().map(|file| file.size_bytes).sum();
 
             // Step 1: record the pending upload (best-effort).
             let pending_log_path = self.config.data_dir.join("pending-uploads.log");
@@ -3255,7 +3255,7 @@ impl StorageEngine {
                     continue;
                 }
 
-                let total_size: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
+                let total_size: u64 = files.iter().map(|file| file.size_bytes).sum();
 
                 // Wait for S3 upload confirmation before adding to manifest.
                 // Previously, manifest was updated immediately after submit
@@ -3480,8 +3480,11 @@ impl StorageEngine {
             .collect()
     }
 
-    /// Collect all component files for an SSTable generation.
-    fn collect_sstable_files(table_dir: &std::path::Path, gen: u64) -> Vec<(String, bytes::Bytes)> {
+    /// Collect local component file paths for an SSTable generation.
+    fn collect_sstable_files(
+        table_dir: &std::path::Path,
+        gen: u64,
+    ) -> Vec<crate::upload::manager::SstableComponentFile> {
         let gen_str = gen.to_string();
         std::fs::read_dir(table_dir)
             .into_iter()
@@ -3490,8 +3493,10 @@ impl StorageEngine {
             .filter_map(|e| {
                 let name = e.file_name().to_str()?.to_string();
                 if name.starts_with(&format!("{gen_str}-")) {
-                    let data = std::fs::read(e.path()).ok()?;
-                    Some((name, bytes::Bytes::from(data)))
+                    Some(crate::upload::manager::SstableComponentFile::new(
+                        name,
+                        e.path(),
+                    ))
                 } else {
                     None
                 }
