@@ -20,7 +20,7 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn, Instrument};
 
-use crate::ast::{Assignment, SelectColumn, Statement, Term};
+use crate::ast::{Assignment, SelectColumn, SelectStatement, Statement, Term};
 use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
@@ -1203,12 +1203,11 @@ fn analyze_prepared_columns(
 
     match stmt {
         Statement::Select(s) => {
-            // Bind markers in WHERE clauses
-            for wc in &s.where_clauses {
-                if matches!(wc.value, Term::BindMarker(_)) {
-                    if let Some(cql_type) = resolve(&wc.column) {
-                        bound_columns.push((wc.column.clone(), cql_type));
-                    }
+            // Bind markers in SELECT clauses, preserving statement bind order:
+            // WHERE predicates first, then ANN vector term if `ANN OF ?` is used.
+            for col_name in select_bind_marker_columns(s) {
+                if let Some(cql_type) = resolve(col_name) {
+                    bound_columns.push((col_name.to_string(), cql_type));
                 }
             }
 
@@ -1290,6 +1289,30 @@ fn analyze_prepared_columns(
     }
 
     (bound_columns, Vec::new())
+}
+
+/// Return SELECT column names whose terms are bind markers, in the same order
+/// drivers bind values for PREPARE/EXECUTE metadata.
+///
+/// `ORDER BY <vector_col> ANN OF ?` binds a query vector against the vector
+/// column, so PREPARE metadata must include `<vector_col>` after ordinary
+/// WHERE bind markers. Without this, `count_bind_markers()` sees the ANN
+/// placeholder but `analyze_prepared_columns()` resolves one fewer column spec,
+/// causing strict drivers to reject the prepared statement.
+fn select_bind_marker_columns(s: &SelectStatement) -> Vec<&str> {
+    let mut columns = Vec::new();
+
+    for wc in &s.where_clauses {
+        if matches!(wc.value, Term::BindMarker(_)) {
+            columns.push(wc.column.as_str());
+        }
+    }
+
+    if let Some((ann_column, Term::BindMarker(_))) = &s.ann_of {
+        columns.push(ann_column.as_str());
+    }
+
+    columns
 }
 
 /// Count the number of `?` (positional) and `:name` (named) bind markers in
@@ -2417,6 +2440,41 @@ mod tests {
             count_bind_markers(&stmt),
             1,
             "SELECT with 1 WHERE ? must count as 1"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_select_ann_of_placeholder() {
+        let stmt = crate::parser::parse(
+            "SELECT fold_id FROM agent_memory.trajectory_folds \
+             WHERE session_id = ? AND tenant_id = ? \
+             ORDER BY fold_embedding ANN OF ? LIMIT 5",
+        )
+        .unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            3,
+            "SELECT with 2 WHERE ? plus ANN OF ? must count as 3"
+        );
+    }
+
+    #[test]
+    fn select_bind_marker_columns_includes_ann_of_bind_marker() {
+        let stmt = crate::parser::parse(
+            "SELECT fold_id FROM agent_memory.trajectory_folds \
+             WHERE session_id = ? AND tenant_id = ? \
+             ORDER BY fold_embedding ANN OF ? LIMIT 5",
+        )
+        .unwrap();
+
+        let Statement::Select(select) = &stmt else {
+            panic!("expected SELECT statement");
+        };
+
+        assert_eq!(
+            select_bind_marker_columns(select),
+            vec!["session_id", "tenant_id", "fold_embedding"],
+            "PREPARE metadata must include the ANN OF bind marker column after WHERE bind markers"
         );
     }
 
