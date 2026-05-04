@@ -2385,6 +2385,52 @@ async fn prepare_select_with_one_where_bind_marker_reports_col_count_one() {
     );
 }
 
+/// FRSA-BUG-025 regression: SELECT with WHERE bind markers plus `ANN OF ?`
+/// must report all bind marker columns in PREPARE metadata. The ANN query
+/// vector is bound against the vector column (`fold_embedding`) and strict
+/// drivers reject the prepared statement if this third col_spec is missing.
+#[tokio::test]
+async fn prepare_select_ann_of_bind_marker_reports_col_count_three() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body(
+        "CREATE KEYSPACE ann_prepare WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let body = encode_query_body(
+        "CREATE TABLE ann_prepare.trajectory_folds (\
+         session_id uuid, tenant_id uuid, fold_id uuid, \
+         fold_embedding vector<float, 3>, fold_summary text, \
+         PRIMARY KEY ((session_id, tenant_id), fold_id))",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let prep_body = encode_prepare_body(
+        "SELECT fold_id, fold_summary \
+         FROM ann_prepare.trajectory_folds \
+         WHERE session_id = ? AND tenant_id = ? \
+         ORDER BY fold_embedding ANN OF ? LIMIT 5",
+    );
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let col_count = extract_bind_col_count_from_prepared_response(&resp.body);
+    assert_eq!(
+        col_count, 3,
+        "PREPARE SELECT with 2 WHERE bind markers plus ANN OF ? must report \
+         bind col_count = 3; got {col_count}. Missing the ANN vector col_spec \
+         reproduces FRSA-BUG-025 / strict-driver WrongColumnCount."
+    );
+}
+
 /// P0-22 regression: PREPARE for a table that is not yet in the local schema
 /// (simulates Raft schema-replication lag) must return an error, NOT a
 /// PREPARED response with col_count = 0.
