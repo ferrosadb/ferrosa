@@ -2138,6 +2138,20 @@ fn resolve_endpoint_property_expr(
         return Some(expr.clone());
     }
 
+    let preferred_endpoint_ids: &[&str] = match target_column {
+        "entity_a" | "entity_b" | "src_id" | "dst_id" => &["entity_id"],
+        "source_fold_id" | "target_fold_id" | "fold_id" => &["fold_id"],
+        "new_event_id" | "old_event_id" | "event_id" => &["event_id"],
+        _ => &[],
+    };
+    for preferred in preferred_endpoint_ids {
+        if let Some((_, expr)) = props.iter().find(|(name, expr)| {
+            name == preferred && try_encode_expr_for_column_type(expr, target_column_type).is_ok()
+        }) {
+            return Some(expr.clone());
+        }
+    }
+
     if props.len() == 1 && try_encode_expr_for_column_type(&props[0].1, target_column_type).is_ok()
     {
         return Some(props[0].1.clone());
@@ -2147,6 +2161,8 @@ fn resolve_endpoint_property_expr(
         .iter()
         .find(|(name, expr)| {
             name.ends_with("_id")
+                && name.as_str() != "tenant_id"
+                && name.as_str() != "session_id"
                 && try_encode_expr_for_column_type(expr, target_column_type).is_ok()
         })
         .map(|(_, expr)| expr.clone())
@@ -3054,6 +3070,33 @@ mod tests {
         fn subscription_mode(&self) -> SubscriptionMode {
             SubscriptionMode::Pollable
         }
+    }
+
+    #[test]
+    fn endpoint_resolution_prefers_entity_id_over_scope_ids_for_entity_edges() {
+        let tenant = Expr::Literal(Literal::String(
+            "11111111-1111-1111-1111-111111111111".to_string(),
+        ));
+        let session = Expr::Literal(Literal::String(
+            "22222222-2222-2222-2222-222222222222".to_string(),
+        ));
+        let entity = Expr::Literal(Literal::String(
+            "33333333-3333-3333-3333-333333333333".to_string(),
+        ));
+        let endpoint_props = vec![
+            ("tenant_id".to_string(), tenant),
+            ("session_id".to_string(), session),
+            ("entity_id".to_string(), entity.clone()),
+        ];
+
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "entity_a", "uuid"),
+            Some(entity.clone())
+        );
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "src_id", "uuid"),
+            Some(entity)
+        );
     }
 
     /// Build a plan whose anchor points at the given keyspace/table.
