@@ -264,6 +264,52 @@ impl GraphEngine {
         }
     }
 
+    fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<()> {
+        let snap = self.schema.snapshot();
+        let has_edge_table = snap.tables.iter().any(|((ks, _), meta)| {
+            ks == keyspace && meta.extensions.get("graph.type") == Some(&"edge".to_string())
+        });
+        if !has_edge_table {
+            return Ok(());
+        }
+
+        let adj_ks = adjacency_keyspace_name(keyspace);
+        let adj_meta = adjacency_keyspace_metadata(&snap, keyspace);
+        if !snap.keyspaces.contains_key(&adj_ks) {
+            self.schema
+                .create_keyspace_internal(adj_meta)
+                .map_err(|e| {
+                    GraphError::Validation(format!(
+                        "failed to register graph adjacency keyspace {adj_ks}: {e}"
+                    ))
+                })?;
+        }
+
+        let snap = self.schema.snapshot();
+        if !snap
+            .tables
+            .contains_key(&(adj_ks.clone(), "adjacency".to_string()))
+        {
+            self.schema
+                .create_table_internal(adjacency_table_metadata(keyspace))
+                .map_err(|e| {
+                    GraphError::Validation(format!(
+                        "failed to register graph adjacency table {adj_ks}.adjacency: {e}"
+                    ))
+                })?;
+        }
+
+        let adj_schema = adjacency_table_metadata(keyspace).to_storage_schema();
+        if let Err(e) = self.storage.register_table(adj_schema) {
+            let msg = e.to_string();
+            let already = msg.contains("already registered") || msg.contains("already exists");
+            if !already {
+                return Err(GraphError::Storage(e));
+            }
+        }
+        Ok(())
+    }
+
     /// Execute a Cypher query: parse -> validate -> plan -> execute.
     pub async fn execute(
         &self,
@@ -271,6 +317,7 @@ impl GraphEngine {
         keyspace: &str,
         auth: &AuthContext,
     ) -> Result<GraphResult> {
+        self.ensure_adjacency_storage_for_keyspace(keyspace)?;
         let statement = parse(query)?;
         let snap = self.schema.snapshot();
         let logical = validate(&snap, auth, keyspace, statement)?;

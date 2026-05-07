@@ -2672,6 +2672,52 @@ const MIGRATION_SUPERSEDES: &str = "MERGE (a:Entity {entity_id: 'super-src'}) \
      RETURN r";
 
 #[tokio::test]
+async fn graph_engine_constructed_before_fmem_ddl_registers_adjacency_for_first_edge_write() {
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    seed_agent_memory_entity(&storage, tenant_id, session_id, src_id, "src");
+    seed_agent_memory_entity(&storage, tenant_id, session_id, dst_id, "dst");
+
+    let merge_query = format!(
+        "MERGE (a:Entity {{tenant_id: '{tenant_id}', session_id: '{session_id}', entity_id: '{src_id}'}})\
+         MERGE (b:Entity {{tenant_id: '{tenant_id}', session_id: '{session_id}', entity_id: '{dst_id}'}})\
+         MERGE (a)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}', session_id: '{session_id}'}}]->(b) \
+         SET r.strength = 0.5, \
+             r.created_at = '2026-05-07T00:00:00Z', \
+             r.first_seen = '2026-05-07T00:00:00Z', \
+             r.last_reinforced = '2026-05-07T00:00:00Z' \
+         RETURN r"
+    );
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": merge_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("first tiny fmem CO_OCCURS MERGE after DDL must not hang")
+        .unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "post-DDL first MERGE response body: {body:#}"
+    );
+}
+
+#[tokio::test]
 async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
     let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
     let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();

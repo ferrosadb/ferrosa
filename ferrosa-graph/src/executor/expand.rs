@@ -3099,6 +3099,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn endpoint_resolution_prefers_fold_and_event_aliases_over_scope_ids() {
+        let tenant = Expr::Literal(Literal::String(
+            "11111111-1111-1111-1111-111111111111".to_string(),
+        ));
+        let session = Expr::Literal(Literal::String(
+            "22222222-2222-2222-2222-222222222222".to_string(),
+        ));
+        let entity = Expr::Literal(Literal::String(
+            "33333333-3333-3333-3333-333333333333".to_string(),
+        ));
+        let fold = Expr::Literal(Literal::String(
+            "44444444-4444-4444-4444-444444444444".to_string(),
+        ));
+        let event = Expr::Literal(Literal::String(
+            "55555555-5555-5555-5555-555555555555".to_string(),
+        ));
+        let endpoint_props = vec![
+            ("tenant_id".to_string(), tenant),
+            ("session_id".to_string(), session),
+            ("entity_id".to_string(), entity.clone()),
+            ("fold_id".to_string(), fold.clone()),
+            ("event_id".to_string(), event.clone()),
+        ];
+
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "source_fold_id", "uuid"),
+            Some(fold.clone())
+        );
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "target_fold_id", "uuid"),
+            Some(fold)
+        );
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "new_event_id", "uuid"),
+            Some(event.clone())
+        );
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "old_event_id", "uuid"),
+            Some(event)
+        );
+    }
+
+    #[test]
+    fn endpoint_resolution_rejects_scope_ids_and_invalid_generic_ids() {
+        let tenant = Expr::Literal(Literal::String(
+            "11111111-1111-1111-1111-111111111111".to_string(),
+        ));
+        let session = Expr::Literal(Literal::String(
+            "22222222-2222-2222-2222-222222222222".to_string(),
+        ));
+        let invalid = Expr::Literal(Literal::String("not-a-uuid".to_string()));
+        let endpoint_props = vec![
+            ("tenant_id".to_string(), tenant),
+            ("session_id".to_string(), session),
+            ("foo_id".to_string(), invalid),
+        ];
+
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "src_id", "uuid"),
+            None
+        );
+        assert_eq!(
+            resolve_endpoint_property_expr(Some(&endpoint_props), "entity_a", "uuid"),
+            None
+        );
+    }
+
     /// Build a plan whose anchor points at the given keyspace/table.
     fn virtual_anchor_plan(
         keyspace: &str,
