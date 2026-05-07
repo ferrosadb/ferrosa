@@ -2031,12 +2031,128 @@ fn create_agent_memory_real_graph_schema(schema: &Schema) {
             &auth,
         )
         .unwrap();
+
+    let mut co_cols = IndexMap::new();
+    co_cols.insert(
+        "entity_a".to_string(),
+        ColumnMetadata {
+            name: "entity_a".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    co_cols.insert(
+        "entity_b".to_string(),
+        ColumnMetadata {
+            name: "entity_b".to_string(),
+            kind: ColumnKind::Clustering,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::Asc,
+            mask: None,
+        },
+    );
+    co_cols.insert(
+        "session_id".to_string(),
+        ColumnMetadata {
+            name: "session_id".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    co_cols.insert(
+        "tenant_id".to_string(),
+        ColumnMetadata {
+            name: "tenant_id".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    co_cols.insert(
+        "strength".to_string(),
+        ColumnMetadata {
+            name: "strength".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "float".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    co_cols.insert(
+        "first_seen".to_string(),
+        ColumnMetadata {
+            name: "first_seen".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "timestamp".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    co_cols.insert(
+        "last_reinforced".to_string(),
+        ColumnMetadata {
+            name: "last_reinforced".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "timestamp".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    co_cols.insert(
+        "created_at".to_string(),
+        ColumnMetadata {
+            name: "created_at".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "timestamp".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+
+    schema
+        .create_table(
+            TableMetadata {
+                keyspace: "agent_memory".to_string(),
+                name: "co_occurs_with".to_string(),
+                id: Uuid::new_v4(),
+                columns: co_cols,
+                partition_key: vec!["entity_a".to_string()],
+                clustering_key: vec![("entity_b".to_string(), ClusteringOrder::Asc)],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: HashMap::from([
+                    ("graph.type".to_string(), "edge".to_string()),
+                    ("graph.label".to_string(), "CO_OCCURS_WITH".to_string()),
+                    ("graph.source".to_string(), "entity_a".to_string()),
+                    ("graph.target".to_string(), "entity_b".to_string()),
+                    ("graph.source_label".to_string(), "Entity".to_string()),
+                    ("graph.target_label".to_string(), "Entity".to_string()),
+                ]),
+                is_system: false,
+            },
+            &auth,
+        )
+        .unwrap();
 }
 
 fn register_agent_memory_real_tables_with_storage(storage: &StorageEngine) {
     for (keyspace, table) in [
         ("agent_memory", "entity_store"),
         ("agent_memory", "typed_edges"),
+        ("agent_memory", "co_occurs_with"),
     ] {
         let schema = TableSchema {
             keyspace: keyspace.to_string(),
@@ -2554,6 +2670,73 @@ const MIGRATION_SUPERSEDES: &str = "MERGE (a:Entity {entity_id: 'super-src'}) \
      MERGE (b:Entity {entity_id: 'super-dst'}) \
      MERGE (a)-[r:TYPED_EDGE {edge_type: 'supersedes'}]->(b) \
      RETURN r";
+
+#[tokio::test]
+async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    seed_agent_memory_entity(&storage, tenant_id, session_id, src_id, "src");
+    seed_agent_memory_entity(&storage, tenant_id, session_id, dst_id, "dst");
+
+    let merge_query = format!(
+        "MERGE (a:Entity {{tenant_id: '{tenant_id}', session_id: '{session_id}', entity_id: '{src_id}'}})\
+         MERGE (b:Entity {{tenant_id: '{tenant_id}', session_id: '{session_id}', entity_id: '{dst_id}'}})\
+         MERGE (a)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}', session_id: '{session_id}'}}]->(b) \
+         SET r.strength = 0.5, \
+             r.created_at = '2026-05-07T00:00:00Z', \
+             r.first_seen = '2026-05-07T00:00:00Z', \
+             r.last_reinforced = '2026-05-07T00:00:00Z' \
+         RETURN r"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": merge_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("tiny fmem CO_OCCURS MERGE must not hang")
+        .unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "MERGE response body: {body:#}");
+
+    let match_query = format!(
+        "MATCH (a:Entity)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}'}}]->(b:Entity) \
+         RETURN a.entity_id AS src_id, b.entity_id AS dst_id, r.strength AS strength"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": match_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("tiny fmem CO_OCCURS list MATCH must return immediately")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"]
+        .as_array()
+        .expect("MATCH response must include rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_str(), Some(src_id.to_string().as_str()));
+    assert_eq!(rows[0][1].as_str(), Some(dst_id.to_string().as_str()));
+}
 
 #[tokio::test]
 async fn migration_proof_typed_edge_upsert_no_direct_table_ref() {
