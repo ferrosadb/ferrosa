@@ -4,6 +4,7 @@
 //! minimal axum router directly from the underlying crate dependencies,
 //! wiring just the WebSocket route path needed for testing.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -51,6 +52,39 @@ impl VirtualTable for StubConnectionsTable {
 
     fn subscription_mode(&self) -> SubscriptionMode {
         SubscriptionMode::Pollable
+    }
+}
+
+struct CountingDemandTable {
+    reads: Arc<AtomicUsize>,
+}
+
+impl VirtualTable for CountingDemandTable {
+    fn name(&self) -> &str {
+        "counting"
+    }
+
+    fn keyspace(&self) -> &str {
+        "system_observability"
+    }
+
+    fn columns(&self) -> &[VirtualColumnDef] {
+        &[]
+    }
+
+    fn primary_key_columns(&self) -> &[usize] {
+        &[]
+    }
+
+    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        vec![VirtualRow { cells: vec![] }]
+    }
+
+    fn subscription_mode(&self) -> SubscriptionMode {
+        SubscriptionMode::DemandDriven {
+            default_interval: std::time::Duration::from_millis(10),
+        }
     }
 }
 
@@ -300,6 +334,98 @@ async fn ws_subscribe_receives_data() {
         .send(tungstenite::Message::Text(unsub_msg.into()))
         .await
         .expect("send unsubscribe");
+    sender
+        .send(tungstenite::Message::Close(None))
+        .await
+        .expect("send close");
+}
+
+#[tokio::test]
+async fn ws_unsubscribe_then_resubscribe_replays_without_old_task_duplicates() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let registry = Arc::new(VirtualTableRegistry::new());
+    registry.register(Arc::new(CountingDemandTable {
+        reads: reads.clone(),
+    }));
+
+    let (mut sender, mut receiver) = connect_ws(registry).await;
+    let subscribe_msg = json!({"type": "subscribe", "table": "counting"}).to_string();
+    let unsubscribe_msg = json!({"type": "unsubscribe", "table": "counting"}).to_string();
+
+    sender
+        .send(tungstenite::Message::Text(subscribe_msg.clone().into()))
+        .await
+        .expect("send first subscribe");
+    let first = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.next())
+        .await
+        .expect("first subscription replay should be prompt")
+        .expect("stream ended")
+        .expect("ws error");
+    assert!(matches!(first, tungstenite::Message::Text(_)));
+    assert!(reads.load(Ordering::SeqCst) >= 1);
+
+    sender
+        .send(tungstenite::Message::Text(unsubscribe_msg.into()))
+        .await
+        .expect("send unsubscribe");
+    let after_unsubscribe = reads.load(Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        after_unsubscribe,
+        "unsubscribed polling task must stop and not keep replaying"
+    );
+
+    sender
+        .send(tungstenite::Message::Text(subscribe_msg.into()))
+        .await
+        .expect("send second subscribe");
+    let second = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.next())
+        .await
+        .expect("resubscription replay should be prompt")
+        .expect("stream ended")
+        .expect("ws error");
+    assert!(matches!(second, tungstenite::Message::Text(_)));
+    assert!(reads.load(Ordering::SeqCst) > after_unsubscribe);
+
+    sender
+        .send(tungstenite::Message::Close(None))
+        .await
+        .expect("send close");
+}
+
+#[tokio::test]
+async fn ws_demand_subscription_delivers_notifications_in_poll_order() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let registry = Arc::new(VirtualTableRegistry::new());
+    registry.register(Arc::new(CountingDemandTable {
+        reads: reads.clone(),
+    }));
+
+    let (mut sender, mut receiver) = connect_ws(registry).await;
+    let subscribe_msg = json!({"type": "subscribe", "table": "counting"}).to_string();
+    sender
+        .send(tungstenite::Message::Text(subscribe_msg.into()))
+        .await
+        .expect("send subscribe");
+
+    let mut observed_reads = Vec::new();
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.next())
+            .await
+            .expect("subscription notification should be prompt")
+            .expect("stream ended")
+            .expect("ws error");
+        assert!(matches!(msg, tungstenite::Message::Text(_)));
+        observed_reads.push(reads.load(Ordering::SeqCst));
+    }
+
+    assert!(
+        observed_reads.windows(2).all(|pair| pair[0] <= pair[1]),
+        "subscription notifications should follow non-decreasing read order: {observed_reads:?}"
+    );
+    assert!(observed_reads.last().copied().unwrap_or_default() >= 3);
+
     sender
         .send(tungstenite::Message::Close(None))
         .await

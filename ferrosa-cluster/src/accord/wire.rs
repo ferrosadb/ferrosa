@@ -11,7 +11,7 @@ use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
 // ---------------------------------------------------------------------------
 
 /// PreAccept request sent from coordinator to each replica.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PreAcceptPayload {
     pub(crate) txn_id: TxnId,
     pub(crate) t0: Timestamp,
@@ -21,7 +21,7 @@ pub(crate) struct PreAcceptPayload {
 }
 
 /// Accept request sent from coordinator to each replica (slow path).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AcceptPayload {
     pub(crate) txn_id: TxnId,
     pub(crate) t0: Timestamp,
@@ -31,7 +31,7 @@ pub(crate) struct AcceptPayload {
 }
 
 /// Commit broadcast from coordinator to all replicas.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CommitPayload {
     pub(crate) txn_id: TxnId,
     pub(crate) t0: Timestamp,
@@ -40,14 +40,14 @@ pub(crate) struct CommitPayload {
 }
 
 /// Apply request broadcast from coordinator to all replicas.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ApplyPayload {
     pub(crate) txn_id: TxnId,
     pub(crate) result_data: Vec<u8>,
 }
 
 /// Recovery probe from a recovery coordinator.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RecoverPayload {
     pub(crate) txn_id: TxnId,
     pub(crate) t0: Timestamp,
@@ -59,7 +59,7 @@ pub(crate) struct RecoverPayload {
 // ---------------------------------------------------------------------------
 
 /// PreAcceptOK response from a replica.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PreAcceptOkPayload {
     /// The replica's node ID, so the coordinator knows who responded.
     pub(crate) from: u64,
@@ -70,7 +70,7 @@ pub(crate) struct PreAcceptOkPayload {
 }
 
 /// AcceptOK response from a replica (slow path).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AcceptOkPayload {
     pub(crate) txn_id: TxnId,
 }
@@ -85,7 +85,7 @@ pub(crate) struct AcceptOkPayload {
 ///
 /// Sent from coordinator to each replica after consensus (Commit phase) but
 /// before the LWT result is returned to the client.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ReadVotePayload {
     pub(crate) txn_id: TxnId,
     /// Agreed execution timestamp (from Commit).
@@ -101,7 +101,7 @@ pub(crate) struct ReadVotePayload {
 ///
 /// For `INSERT IF NOT EXISTS`, `condition_holds` is true iff the row did NOT
 /// exist at timestamp `t` (i.e., the write should apply).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ReadVoteOkPayload {
     pub(crate) txn_id: TxnId,
     /// The replica that sent this response.
@@ -119,9 +119,102 @@ pub(crate) struct ReadVoteOkPayload {
 
 /// ApplyOK response from a replica (used by coordinator to wait for F+1
 /// apply acknowledgements before returning the LWT result to the client).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ApplyOkPayload {
     pub(crate) txn_id: TxnId,
     /// The replica that sent this acknowledgement.
     pub(crate) from: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(epoch: u64, time: u64, seq: u32, node: u64) -> Timestamp {
+        Timestamp {
+            epoch,
+            time,
+            seq,
+            node,
+        }
+    }
+
+    fn txn(epoch: u64, time: u64, seq: u32, node: u64) -> TxnId {
+        TxnId(ts(epoch, time, seq, node))
+    }
+
+    fn assert_bincode_roundtrip<T>(value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+    {
+        let encoded = bincode::serialize(value).expect("payload should serialize");
+        let decoded: T = bincode::deserialize(&encoded).expect("payload should deserialize");
+        assert_eq!(decoded, *value);
+    }
+
+    #[test]
+    fn coordinator_to_replica_payloads_preserve_identity_ordering_and_payload_bytes() {
+        let t0 = ts(7, 1_000, 2, 11);
+        let t = ts(7, 1_250, 4, 22);
+        let txn_id = txn(7, 1_000, 2, 11);
+        let dep_a = txn(7, 900, 1, 33);
+        let dep_b = txn(7, 950, 3, 44);
+
+        assert_bincode_roundtrip(&PreAcceptPayload {
+            txn_id,
+            t0,
+            key: b"partition-key\0with-bytes".to_vec(),
+            ballot: BallotNumber(42),
+            epoch: 7,
+        });
+        assert_bincode_roundtrip(&AcceptPayload {
+            txn_id,
+            t0,
+            t,
+            deps: vec![dep_a, dep_b],
+            ballot: BallotNumber(43),
+        });
+        assert_bincode_roundtrip(&CommitPayload {
+            txn_id,
+            t0,
+            t,
+            deps: vec![dep_a, dep_b],
+        });
+        assert_bincode_roundtrip(&ApplyPayload {
+            txn_id,
+            result_data: b"[applied]=true\nrow=value".to_vec(),
+        });
+        assert_bincode_roundtrip(&RecoverPayload {
+            txn_id,
+            t0,
+            ballot: BallotNumber(44),
+        });
+        assert_bincode_roundtrip(&ReadVotePayload {
+            txn_id,
+            t,
+            key: b"read-vote-key".to_vec(),
+        });
+    }
+
+    #[test]
+    fn replica_to_coordinator_payloads_preserve_sender_condition_and_current_row() {
+        let txn_id = txn(9, 2_000, 5, 55);
+        let t = ts(9, 2_010, 6, 66);
+        let dep_a = txn(9, 1_900, 1, 77);
+        let dep_b = txn(9, 1_950, 2, 88);
+
+        assert_bincode_roundtrip(&PreAcceptOkPayload {
+            from: 2,
+            t,
+            deps: vec![dep_a, dep_b],
+        });
+        assert_bincode_roundtrip(&AcceptOkPayload { txn_id });
+        assert_bincode_roundtrip(&ReadVoteOkPayload {
+            txn_id,
+            from: 3,
+            condition_holds: false,
+            current_row: b"existing-row-bytes".to_vec(),
+        });
+        assert_bincode_roundtrip(&ApplyOkPayload { txn_id, from: 4 });
+    }
 }
