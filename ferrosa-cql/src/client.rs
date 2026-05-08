@@ -37,7 +37,30 @@ pub struct CqlClient {
 
 impl CqlClient {
     /// Connect to a CQL server and complete the STARTUP handshake.
+    ///
+    /// If the server requires authentication, this returns
+    /// `CqlError::BadCredentials` — use [`CqlClient::connect_with_credentials`]
+    /// to log in with a username and password.
     pub async fn connect(addr: SocketAddr) -> Result<Self, CqlError> {
+        Self::connect_inner(addr, None).await
+    }
+
+    /// Connect to a CQL server and authenticate with the given credentials.
+    ///
+    /// Performs the STARTUP handshake; on AUTHENTICATE replies with a SASL
+    /// PLAIN AUTH_RESPONSE frame containing `\0username\0password`.
+    pub async fn connect_with_credentials(
+        addr: SocketAddr,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, CqlError> {
+        Self::connect_inner(addr, Some((username, password))).await
+    }
+
+    async fn connect_inner(
+        addr: SocketAddr,
+        credentials: Option<(&str, &str)>,
+    ) -> Result<Self, CqlError> {
         let stream = TcpStream::connect(addr).await?;
         let codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         let mut framed = Framed::new(stream, codec);
@@ -72,7 +95,7 @@ impl CqlClient {
             .ok_or_else(|| CqlError::Protocol("connection closed during startup".into()))?
             .map_err(|e| CqlError::Protocol(format!("startup response error: {e}")))?;
 
-        let ready = resp.header.opcode == Opcode::Ready;
+        let mut ready = resp.header.opcode == Opcode::Ready;
 
         if !ready && resp.header.opcode != Opcode::Authenticate {
             return Err(CqlError::Protocol(format!(
@@ -81,9 +104,65 @@ impl CqlClient {
             )));
         }
 
-        // The server enables v5 framing after READY when the client sends
-        // VERSION_REQUEST (0x05). The client must also switch to v5 framed
-        // mode so subsequent messages are wrapped in CRC-protected frames.
+        // If the server demanded auth and we have credentials, send an
+        // AUTH_RESPONSE frame containing a SASL PLAIN payload.
+        if !ready {
+            let (user, pass) = credentials.ok_or(CqlError::BadCredentials)?;
+
+            let mut sasl = Vec::with_capacity(2 + user.len() + pass.len());
+            sasl.push(0); // empty authzid
+            sasl.extend_from_slice(user.as_bytes());
+            sasl.push(0);
+            sasl.extend_from_slice(pass.as_bytes());
+
+            let mut auth_body = BytesMut::with_capacity(4 + sasl.len());
+            auth_body.put_i32(sasl.len() as i32);
+            auth_body.put_slice(&sasl);
+
+            let auth_frame = CqlFrame {
+                header: FrameHeader {
+                    version: VERSION_REQUEST,
+                    flags: 0,
+                    stream_id: 0,
+                    opcode: Opcode::AuthResponse,
+                    length: auth_body.len() as u32,
+                },
+                body: auth_body.freeze(),
+            };
+            framed.send(auth_frame).await?;
+
+            let auth_resp = framed
+                .next()
+                .await
+                .ok_or_else(|| CqlError::Protocol("connection closed during auth".into()))?
+                .map_err(|e| CqlError::Protocol(format!("auth response error: {e}")))?;
+
+            match auth_resp.header.opcode {
+                Opcode::AuthSuccess => {
+                    ready = true;
+                }
+                Opcode::Error => {
+                    let msg = parse_error(&auth_resp.body)?;
+                    if msg.to_lowercase().contains("credential")
+                        || msg.to_lowercase().contains("auth")
+                    {
+                        return Err(CqlError::BadCredentials);
+                    }
+                    return Err(CqlError::ServerError(msg));
+                }
+                other => {
+                    return Err(CqlError::Protocol(format!(
+                        "unexpected auth response: {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+
+        // The server enables v5 framing after READY/AUTH_SUCCESS when the
+        // client sends VERSION_REQUEST (0x05). The client must also switch
+        // to v5 framed mode so subsequent messages are wrapped in
+        // CRC-protected frames.
         if ready {
             framed.codec_mut().enable_v5_framing();
         }

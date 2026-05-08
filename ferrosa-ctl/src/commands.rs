@@ -199,6 +199,81 @@ pub async fn run_monitor(addr: SocketAddr, panel: Option<&str>) -> Result<(), Cq
     Ok(())
 }
 
+// ── Auth ─────────────────────────────────────────────────────────────────────
+
+/// Dispatch for `ferrosa-ctl auth set-password`.
+///
+/// 1. Read NEW password (twice, no echo unless `--no-confirm`); validate.
+/// 2. Connect to `addr` as `admin_user` with the password from
+///    `--admin-password-env` (or seed default → prompt fallback).
+/// 3. Issue `ALTER ROLE "<user>" WITH PASSWORD = '<new>'`.
+///
+/// Returns a [`crate::auth::SetPasswordError`] carrying both the message
+/// to print and the desired exit code.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_auth_set_password(
+    addr: SocketAddr,
+    user: &str,
+    admin_user: &str,
+    admin_password_env: Option<&str>,
+    ssl: bool,
+    force: bool,
+    no_confirm: bool,
+) -> Result<(), crate::auth::SetPasswordError> {
+    use crate::auth;
+
+    if ssl {
+        return Err(auth::SetPasswordError::Operation(
+            "--ssl is not yet supported by ferrosa-ctl; use a localhost connection".to_string(),
+        ));
+    }
+
+    if !force {
+        let stdin = std::io::stdin();
+        let mut locked = stdin.lock();
+        let mut stderr = std::io::stderr();
+        auth::confirm_superuser_change(user, &mut locked, &mut stderr)?;
+    }
+
+    let new_password = auth::read_new_password_interactive(!no_confirm)?;
+
+    let admin_choice = auth::resolve_admin_password(admin_password_env, |k| std::env::var(k).ok())
+        .map_err(|e| auth::SetPasswordError::BadInput(e.to_string()))?;
+
+    // Try the supplied/seed admin password first; on auth failure, prompt
+    // once if we're allowed to (no env var was given).
+    let mut executor =
+        match auth::LiveCqlExecutor::connect(addr, admin_user, &admin_choice.password).await {
+            Ok(e) => e,
+            Err(ferrosa_cql::error::CqlError::BadCredentials)
+                if admin_choice.may_retry_with_prompt =>
+            {
+                let pw = auth::prompt_password("Admin password").map_err(|e| {
+                    auth::SetPasswordError::BadInput(format!("could not read admin password: {e}"))
+                })?;
+                auth::LiveCqlExecutor::connect(addr, admin_user, &pw)
+                    .await
+                    .map_err(|e| {
+                        auth::SetPasswordError::Operation(auth::format_cql_error(
+                            &e.to_string(),
+                            addr,
+                        ))
+                    })?
+            }
+            Err(e) => {
+                return Err(auth::SetPasswordError::Operation(auth::format_cql_error(
+                    &e.to_string(),
+                    addr,
+                )));
+            }
+        };
+
+    auth::run_set_password(&mut executor, user, &new_password, addr).await?;
+
+    eprintln!("Password updated for role {user}");
+    Ok(())
+}
+
 // ── Cluster web-API commands ──────────────────────────────────────────────────
 //
 // These commands make HTTP requests to the Ferrosa web admin API (port 9090 by
