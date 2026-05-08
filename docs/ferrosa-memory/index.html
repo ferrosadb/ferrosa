@@ -873,18 +873,25 @@ Viz snapshot API:  http://localhost:18766/viz/snapshot</code></pre></div>
   <h2>Inspired by memory systems, graph retrieval, compression, and logic.</h2>
   <p style="color:var(--text-secondary); max-width:820px;">Ferrosa Memory is product engineering, not a paper implementation, but the design is informed by recent and classic work on agent memory, virtual context, retrieval, Datalog-style inference, and memory evaluation.</p>
   <div class="doc-grid">
-    <div class="doc-card"><h3>Long-context memory</h3><p>MemGPT-style virtual context management, Generative Agents, and training-free context-memory work motivate persistent, queryable memory beyond the prompt.</p></div>
-    <div class="doc-card"><h3>Graph and Datalog reasoning</h3><p>GraphRAG-style retrieval and classic Datalog foundations inform linked memory and rule-derived facts. Ferrosa Memory borrows concepts; it is not a direct implementation of any one paper.</p></div>
-    <div class="doc-card"><h3>Compression and evaluation</h3><p>LLMLingua-family prompt compression and long-memory evaluation work shape how retrieval, summarization, and memory quality should be tested during preview.</p></div>
-    <div class="doc-card"><h3>Security and privacy</h3><p>Persistent memory expands the security surface. Preview deployments should keep memory tooling local or explicitly protected with TLS, auth, tenant isolation, and operator review.</p></div>
+    <div class="doc-card"><h3>Agent memory systems</h3><p>The local research corpus includes papers on very-long-term conversational memory, episodic memory, cross-domain user memory, and multi-session agent tasks. These motivate temporal facts, context windows, and explicit update history.</p></div>
+    <div class="doc-card"><h3>Graph retrieval</h3><p>Graph-recall and GraphRAG work motivate making links inspectable instead of relying only on vector similarity. Ferrosa Memory borrows these ideas; it is not a direct implementation of any one paper.</p></div>
+    <div class="doc-card"><h3>Compression and evaluation</h3><p>LLMLingua-family prompt compression, long-memory benchmarks, and memory-system surveys shape how retrieval, summarization, and memory quality should be evaluated during preview.</p></div>
+    <div class="doc-card"><h3>Logic and safety</h3><p>Datalog-style derived facts and neuro-symbolic rule-evaluation work inform explainable memory operations. Preview deployments should keep memory tooling local or explicitly protected with TLS, auth, tenant isolation, and operator review.</p></div>
   </div>
   <div class="reference-list">
-    <a href="https://arxiv.org/abs/2310.08560">MemGPT: Towards LLMs as Operating Systems</a>
-    <a href="https://arxiv.org/abs/2304.03442">Generative Agents: Interactive Simulacra of Human Behavior</a>
+    <a href="https://arxiv.org/abs/2402.17753">LoCoMo: Evaluating Very Long-Term Conversational Memory of LLM Agents</a>
+    <a href="https://arxiv.org/abs/2410.10813">LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory</a>
+    <a href="https://arxiv.org/abs/2509.18868">Memory in Large Language Models: Mechanisms, Evaluation and Evolution</a>
+    <a href="https://arxiv.org/abs/2603.25973">MemoryCD: Benchmarking Long-Context User Memory for Lifelong Cross-Domain Personalization</a>
+    <a href="https://arxiv.org/abs/2502.06975">Episodic Memory is the Missing Piece for Long-Term LLM Agents</a>
+    <a href="https://arxiv.org/abs/2602.16313">Benchmarking Agent Memory in Interdependent Multi-Session Agentic Tasks</a>
+    <a href="https://arxiv.org/abs/2402.11821">Microstructures and Accuracy of Graph Recall by Large Language Models</a>
     <a href="https://arxiv.org/abs/2404.16130">From Local to Global: A Graph RAG Approach to Query-Focused Summarization</a>
     <a href="https://arxiv.org/abs/2310.05736">LLMLingua: Compressing Prompts for Accelerated Inference of Large Language Models</a>
     <a href="https://arxiv.org/abs/2310.06839">LongLLMLingua: Accelerating and Enhancing LLMs in Long Context Scenarios via Prompt Compression</a>
     <a href="https://arxiv.org/abs/2402.04617">InfLLM: Training-Free Long-Context Extrapolation for LLMs with an Efficient Context Memory</a>
+    <a href="https://arxiv.org/abs/2604.28087">Towards Neuro-symbolic Causal Rule Synthesis, Verification, and Evaluation Grounded in Legal and Safety Principles</a>
+    <a href="https://arxiv.org/abs/2605.04018">Rethinking Reasoning-Intensive Retrieval: Evaluating and Advancing Retrievers in Agentic Search Systems</a>
   </div>
 </section>
 <section id="get-started" class="cta-section">
