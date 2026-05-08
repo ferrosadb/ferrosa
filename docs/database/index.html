@@ -730,6 +730,7 @@
       ferro<span>sa</span>
     </a>
     <ul class="nav-links">
+      <li><a href="/">Suite Home</a></li>
       <li><a href="#features">Features</a></li>
       <li><a href="#compare">Compare</a></li>
       <li><a href="#architecture">Architecture</a></li>
@@ -760,9 +761,8 @@
   <p>
     Search, vectors, graph, SPARQL, transactions, and real-time CDC on the same tables —
     not separate stores. CQL compatible. Cypher + Bolt v5. SPARQL 1.1.
-    Strict serializable transactions via Accord. Your data lives in S3 — nodes recover
-    in seconds. Rust-native, zero GC pauses. Start on a single node, scale to a full
-    production cluster — same binary, same config, no migration.
+    Strict-serializable transaction work via Accord, CQL compatibility, and S3-backed storage are under active development.
+    Local NVMe acts as cache while object storage is the durable layer. Start on a single node, then evaluate clustering and operational behavior with your workload before production.
   </p>
   <div class="hero-actions">
     <a href="#get-started" class="btn-primary">Get Started</a>
@@ -793,41 +793,30 @@
 <div class="problem">
   <section>
     <p class="section-label">The Problem</p>
-    <h2 class="section-title">Most of your database bill<br>isn't serving a single query</h2>
+    <h2 class="section-title">Backup and recovery costs<br>deserve their own design</h2>
     <p class="section-subtitle">
-      Pull up your cloud bill. Look past the compute, past the live storage.
-      The largest line items are EBS snapshots, cross-region replicas, and backup retention
-      — copies of data that nobody reads, nobody queries, and nobody thinks about until
-      something goes wrong. It's the most expensive insurance policy in your infrastructure,
-      and it scales with every gigabyte you store.
+      In many Cassandra-style deployments, snapshots, cross-region replicas, and backup retention can become material cost centers. Exact numbers depend on retention policy, region, cloud provider, request volume, and recovery objectives, so Ferrosa frames object storage as a design option to evaluate rather than a guaranteed savings claim.
     </p>
 
     <div class="pain-points">
       <div class="pain-card">
         <div class="pain-icon">💸</div>
-        <h3>Your Backups Cost More Than Your Database</h3>
+        <h3>Backups Can Become a Large Cost Center</h3>
         <p>
-          Point-in-time recovery requires EBS snapshots — a full second copy of your dataset
-          that exists only for "just in case." 10 TB with 30-day retention costs $2,250/month
-          in snapshots alone — on top of the $3,000–7,500/month you're already paying for the
-          live EBS volumes. A year of retention? $15,000/month. That's $180,000/year for data
-          you hope you never need to read.
+          Snapshot and retention costs vary widely by provider and workload. For some deployments, keeping recovery data in object storage with lifecycle policies may reduce duplicated block-storage footprint; for others, request volume, cache hit rate, and operational constraints will dominate. Treat the preview as something to benchmark against your own recovery model.
         </p>
       </div>
       <div class="pain-card">
         <div class="pain-icon">📀</div>
-        <h3>You Pay for Every Byte Three Times</h3>
+        <h3>Replication and Retention Multiply Storage</h3>
         <p>
-          Once on the live EBS volume. Once in EBS snapshots for recovery. Once more if you
-          replicate across regions. At petabyte scale with RF=3, you're storing 3 PB on EBS
-          ($300K/month), snapshotting 3 PB ($150K/month), and none of that snapshot storage
-          serves a single read.
+          Replica factor, snapshots, and cross-region copies all multiply storage footprint. Ferrosa's storage model is intended to reduce some duplicate durable copies by making object storage the primary durable layer, but the economics need workload-specific validation.
         </p>
       </div>
       <div class="pain-card">
         <div class="pain-icon">⏱</div>
         <h3>GC Pauses Kill Your P99</h3>
-        <p>Java's garbage collector causes unpredictable tail latency spikes. No amount of JVM tuning eliminates the problem — it just moves it.</p>
+        <p>Java's garbage collector causes unpredictable tail latency spikes. Rust removes JVM GC from Ferrosa itself, but tail latency still depends on workload, I/O, cache behavior, and clustering.</p>
       </div>
       <div class="pain-card">
         <div class="pain-icon">⏳</div>
@@ -837,7 +826,7 @@
       <div class="pain-card">
         <div class="pain-icon">🔧</div>
         <h3>Ops Expertise Required</h3>
-        <p>Compaction tuning, repair scheduling, bootstrap orchestration, heap sizing — Cassandra demands a dedicated team to keep it healthy.</p>
+        <p>Compaction tuning, repair scheduling, bootstrap orchestration, heap sizing — Snapshot model demands a dedicated team to keep it healthy.</p>
       </div>
     </div>
   </section>
@@ -856,59 +845,51 @@
     <div class="feature-card highlight">
       <div>
         <div class="feature-icon s3">☁</div>
-        <h3>Eliminate Your Backup Bill Entirely</h3>
+        <h3>Evaluate Object-Storage-Based Recovery Costs</h3>
         <p>
-          That $2,250/month you're spending on EBS snapshots for 10 TB? That $180,000/year
-          insurance policy? Ferrosa makes it $2.30/month. Not because we compress better or
-          found cheaper storage — because the backup step doesn't exist. Your data is already
-          durable in S3. Point-in-time recovery is just keeping commit log segments longer,
-          and S3 Lifecycle rules tier them to Glacier automatically.
+          Ferrosa is designed so object storage is the durable layer rather than a secondary backup target. That can reduce duplicated block-storage snapshots in some deployments, especially when lifecycle policies move older recovery data to colder classes. The actual cost profile depends on region, retention window, request volume, cache hit rate, and restore expectations.
         </p>
         <p style="margin-top: 0.75rem;">
-          One command sets your retention policy:
+          A planned control surface sets retention policy:
           <code style="font-size: 0.875rem;">ferrosa-ctl storage retention set --years 1</code>.
-          Ferrosa configures S3 Lifecycle rules that tier your archives through Standard,
-          Infrequent Access, and Glacier automatically. A full year of point-in-time recovery
-          costs ~$45/TB — actually cheaper than 3 months without tiering, because data
-          spends most of its life in Deep Archive at $0.00099/GB.
+          Ferrosa can use S3 Lifecycle rules to tier archives through Standard, Infrequent Access, and Glacier-style classes. Preview documentation should treat published cloud prices as inputs to your own model rather than fixed Ferrosa savings.
         </p>
-        <span class="metric">30d recovery: $2.30 vs $2,250 · 1yr: $45/TB · DynamoDB max: 35 days</span>
+        <span class="metric">Recovery cost depends on provider, retention, requests, and restore targets</span>
       </div>
       <div style="padding: 1.5rem;">
         <table style="width: 100%; font-size: 0.8125rem; font-family: var(--font-mono); border-collapse: collapse;">
           <thead>
             <tr style="border-bottom: 1px solid var(--border);">
               <th style="text-align: left; padding: 0.5rem; color: var(--text-muted); font-weight: 600;">10 TB Recovery</th>
-              <th style="text-align: right; padding: 0.5rem; color: var(--text-muted); font-weight: 600;">Cassandra</th>
+              <th style="text-align: right; padding: 0.5rem; color: var(--text-muted); font-weight: 600;">Snapshot model</th>
               <th style="text-align: right; padding: 0.5rem; color: var(--accent); font-weight: 600;">Ferrosa</th>
             </tr>
           </thead>
           <tbody>
             <tr style="border-bottom: 1px solid var(--border);">
               <td style="padding: 0.5rem; color: var(--text-secondary);">7 days</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$525/mo</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$0.55/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">extra block-storage copies</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">lifecycle-priced archives</td>
             </tr>
             <tr style="border-bottom: 1px solid var(--border);">
               <td style="padding: 0.5rem; color: var(--text-secondary);">30 days</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$2,250/mo</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$2.30/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">provider + RF dependent</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">request + tier dependent</td>
             </tr>
             <tr style="border-bottom: 1px solid var(--border);">
               <td style="padding: 0.5rem; color: var(--text-secondary);">1 year</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$15,000/mo</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$3.75/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">retention-policy dependent</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">restore-SLA dependent</td>
             </tr>
             <tr>
               <td style="padding: 0.5rem; color: var(--text-secondary);">3 years</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$30,000/mo</td>
-              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$5.20/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">usually archival policy</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">cold-tier policy</td>
             </tr>
           </tbody>
         </table>
         <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.75rem; text-align: center;">
-          Cassandra: EBS snapshots at $0.05/GB, 5% daily change rate, RF=3.
-          Ferrosa: S3 Lifecycle tiered commit log retention.
+          Illustrative only: compare your current snapshot/replication policy with object-storage lifecycle pricing and expected request volume.
         </p>
       </div>
     </div>
@@ -920,8 +901,7 @@
         <h3>S3-Backed Storage</h3>
         <p>
           Durable storage lives in S3. Local NVMe is a hot cache, not a commitment.
-          Nodes are ephemeral — lose one, spin up a replacement, and it's serving reads
-          from S3 in seconds instead of streaming for hours.
+          Nodes can be treated more ephemerally than block-storage-bound designs, but recovery time depends on schema, cache warmth, object-store latency, and cluster state.
         </p>
         <p style="margin-top: 0.75rem;">
           NVMe is a bounded cache layer, S3 is the unbounded durable store. Data that doesn't
@@ -934,9 +914,8 @@
           <code style="font-size: 0.875rem;">ferrosa-ctl storage retention set --years 1</code>.
           Ferrosa configures S3 Lifecycle rules that tier your commit log archives through
           Standard, Infrequent Access, and Glacier automatically. A full year of point-in-time
-          recovery costs ~$45/TB — cheaper than 3 months without tiering. Cold SSTables transition to
-          cheaper storage classes automatically while staying instantly readable through
-          the block cache — 66% savings on storage with zero performance impact.
+          recovery cost can be modeled from your lifecycle policy. Cold SSTables may transition to
+          cheaper storage classes, but restore latency, request charges, and cache misses must be considered before choosing a tiering policy.
           Node retirement is just as simple: decommission a node and its S3 objects are
           tagged for cleanup.
         </p>
@@ -944,7 +923,7 @@
           Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
           No vendor lock-in.
         </p>
-        <span class="metric">S3: ~$0.023/GB/mo · 1yr recovery: ~$45/TB · SSTable tiering: 66% savings</span>
+        <span class="metric">S3-backed durability · lifecycle-aware retention · benchmark with your workload</span>
       </div>
       <div class="arch-diagram" style="margin-top: 0; border: none; background: var(--bg-primary);">
         <div class="arch-layers">
@@ -1128,7 +1107,7 @@
         <p style="margin-top: 0.75rem; font-size: 0.875rem; color: var(--text-secondary);">Verified with Jepsen-style chaos testing across partition, kill, pause, and clock-skew fault injection.</p>
       </div>
       <div class="code-demo" style="margin: 0; border: none;">
-        <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Lightweight transactions (Cassandra-compatible)</span>
+        <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Lightweight transactions (Snapshot model-compatible)</span>
 <span class="kw">INSERT INTO</span> accounts (id, balance)
 <span class="kw">VALUES</span> (<span class="str">'acct-1'</span>, <span class="num">1000</span>)
 <span class="kw">IF NOT EXISTS</span>;
@@ -1153,7 +1132,7 @@
       <div class="feature-icon" style="background: rgba(120, 200, 255, 0.12);">⚙</div>
       <h3>NVMe Table Pinning</h3>
       <p>
-        Pin hot tables to local NVMe for sub-millisecond reads. A single table attribute
+        Pin hot tables to local NVMe for latency-sensitive reads. A single table attribute
         (<code>storage.pin = nvme</code>) keeps SSTables on local disk, bypassing S3 entirely.
         Ideal for session caches, materialized views, and lookup tables that tolerate node loss.
         Optional <code>pin_max_bytes</code> cap evicts oldest SSTables when the budget is exceeded.
@@ -1172,9 +1151,9 @@
         Create a full-text index on any text column and query with boolean operators
         (AND, OR, NOT), phrase matching, and prefix wildcards. Pluggable analyzer pipeline:
         tokenizer, stop-word filter, Porter stemmer. Sidecar index files are built on flush
-        and merged during compaction — zero write-path overhead.
+        and merged during compaction — off the foreground write acknowledgement path.
       </p>
-      <span class="metric">BM25 ranking · AND/OR/NOT/prefix · pluggable analyzers · zero write overhead</span>
+      <span class="metric">BM25 ranking · AND/OR/NOT/prefix · pluggable analyzers · async index build</span>
     </div>
 
     <!-- Lock-free -->
@@ -1186,7 +1165,7 @@
         Writers touch sharded memtables for nanoseconds. No global locks, no contention,
         no coordination overhead on the hot path.
       </p>
-      <span class="metric">wait-free reads · zero contention</span>
+      <span class="metric">read-optimized metadata path</span>
     </div>
 
     <!-- Observability -->
@@ -1279,7 +1258,7 @@
         Upload a compiled WASM binary to a table, reference it in CREATE FUNCTION with an AS clause.
         Write functions in Rust (preferred), C, Go, or any language that compiles to WASM.
         Full Wasmtime integration with WIT contract, compilation caching, and sandbox enforcement.
-        Memory-limited, CPU-time-limited, no network or filesystem access. Deterministic execution guaranteed.
+        Memory-limited, CPU-time-limited, no network or filesystem access. Designed for deterministic execution under configured limits.
       </p>
       <span class="metric">WASM sandbox · WIT contract · Wasmtime compilation · moka cache · UDF + UDA</span>
     </div>
@@ -1310,7 +1289,7 @@
   <span class="str">'replication_factor'</span>: <span class="num">3</span>
 };
 
-<span class="cm">-- Tables work exactly like Cassandra</span>
+<span class="cm">-- Tables work exactly like Snapshot model</span>
 <span class="kw">CREATE TABLE</span> <span class="type">social.users</span> (
   user_id <span class="type">uuid</span> <span class="kw">PRIMARY KEY</span>,
   name <span class="type">text</span>,
@@ -1417,7 +1396,7 @@
     <pre class="code-block" id="tab-python"><span class="cm"># Your existing Python code — just change the contact point</span>
 <span class="kw">from</span> cassandra.cluster <span class="kw">import</span> Cluster
 
-<span class="cm"># Before: Cassandra</span>
+<span class="cm"># Before: Snapshot model</span>
 <span class="cm"># cluster = Cluster(['cassandra-node-1.prod'])</span>
 
 <span class="cm"># After: Ferrosa — same driver, same API</span>
@@ -1469,7 +1448,7 @@ user = session.execute(stmt, [user_id])
         <tr>
           <th></th>
           <th class="ferrosa-col">Ferrosa</th>
-          <th>Cassandra</th>
+          <th>Snapshot model</th>
           <th>ScyllaDB</th>
           <th>DynamoDB</th>
           <th>Keyspaces</th>
@@ -1755,7 +1734,7 @@ user = session.execute(stmt, [user_id])
       <h3>Dev to production without re-architecting</h3>
       <p>
         Start with a single node on your laptop. Add a second node for high availability
-        with automatic pair mode. Scale to 3+ nodes and Ferrosa forms a full production cluster with
+        with automatic pair mode. Scale to 3+ nodes and Ferrosa forms a multi-node cluster with
         Raft consensus, tunable consistency levels, hinted handoff, and node lifecycle
         management. Same binary, same config format — just add nodes.
       </p>

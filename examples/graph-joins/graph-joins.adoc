@@ -227,7 +227,7 @@ curl -X POST http://localhost:7474/graph/query \
 === Shortest path between two people
 
 Find the shortest follow chain between Alice and Hank.
-This is entirely impossible in CQL -- it requires a breadth-first search that Cypher handles natively:
+This is awkward to express in plain CQL because it requires graph traversal; the supported Cypher path expresses it directly:
 
 [source,bash]
 ----
