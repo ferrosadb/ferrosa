@@ -481,7 +481,7 @@ WHERE sensor_id = 'sensor-001';</code></pre>
 </div>
 <div class="paragraph">
 <p>Ferrosa calls <code>to_celsius(temperature)</code> for every row before returning the result set.
-This is identical to calling a scalar function in a relational database&#8201;&#8212;&#8201;one invocation per row, zero additional network round-trips.</p>
+This follows the same shape as calling a scalar function in a relational database&#8201;&#8212;&#8201;one invocation per row without a separate client round trip.</p>
 </div>
 <div class="paragraph">
 <p>Expected output (rows ordered newest-first due to <code>ts DESC</code>):</p>

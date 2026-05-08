@@ -48,13 +48,13 @@
 <div id="preamble">
 <div class="sectionbody">
 <div class="paragraph">
-<p>Ferrosa scales from a single development node to a production cluster without downtime.
+<p>Ferrosa is designed to grow from a single development node toward clustered deployments without changing APIs.
 Most databases force you to choose your deployment topology up front&#8201;&#8212;&#8201;a single-node install that you later throw away and replace with a cluster, or a heavyweight multi-node setup that&#8217;s overkill for development.
-Ferrosa eliminates that tradeoff: start with one node on your laptop, add a hot standby when you&#8217;re ready for production, then grow into a full Raft consensus cluster when your traffic demands it.</p>
+Ferrosa aims to reduce that tradeoff: start with one node on your laptop, evaluate pair mode for standby behavior, then test Raft-backed clustering as your operational requirements grow.</p>
 </div>
 <div class="paragraph">
-<p>This tutorial walks through three stages of that journey: <strong>standalone</strong> (development), <strong>pair mode</strong> (low-volume production with a hot standby), and <strong>Raft cluster</strong> (full production with consensus).
-At each transition, writes and schema changes continue uninterrupted.
+<p>This tutorial walks through three stages of that journey: <strong>standalone</strong> (development), <strong>pair mode</strong> (standby evaluation), and <strong>Raft cluster</strong> (multi-node consensus evaluation).
+At each transition, the demo exercises writes and schema changes so you can observe behavior during topology changes.
 The data you inserted on a single node is still there after you&#8217;ve scaled to three&#8201;&#8212;&#8201;no migrations, no re-bootstrapping, no downtime windows.</p>
 </div>
 </div>
@@ -65,7 +65,7 @@ The data you inserted on a single node is still there after you&#8217;ve scaled 
 <div class="ulist">
 <ul>
 <li>
-<p><strong>Docker and Docker Compose</strong>&#8201;&#8212;&#8201;see the <a href="../cluster-setup/cluster-setup.html">Cluster Setup Guide</a> if you need to install Docker</p>
+<p><strong>Docker and Docker Compose</strong>&#8201;&#8212;&#8201;see the <a href="cluster-setup.html">Cluster Setup Guide</a> if you need to install Docker</p>
 </li>
 <li>
 <p><strong>cqlsh</strong>&#8201;&#8212;&#8201;<code>pip install cqlsh</code></p>
@@ -477,7 +477,7 @@ SELECT * FROM tenants;</code></pre>
 <i class="fa icon-tip" title="Tip"></i>
 </td>
 <td class="content">
-In cluster mode, DDL statements are linearizable. A <code>CREATE TABLE</code> that succeeds is guaranteed to be visible on every node immediately&#8201;&#8212;&#8201;no schema agreement delays.
+In cluster mode, DDL statements are intended to be linearizable. A <code>CREATE TABLE</code> that succeeds should become visible through the replicated schema path without Cassandra-style schema agreement polling.
 </td>
 </tr>
 </table>
@@ -547,7 +547,7 @@ SELECT peer, data_center FROM system.peers;</code></pre>
 <h2 id="_running_the_demo">Running the Demo</h2>
 <div class="sectionbody">
 <div class="paragraph">
-<p>The <code>run-demo.sh</code> script automates the entire sequence above&#8201;&#8212;&#8201;starting each phase, running CQL scripts, maintaining a background writer to prove zero-downtime transitions, and asserting correctness at each stage.</p>
+<p>The <code>run-demo.sh</code> script automates the sequence above&#8201;&#8212;&#8201;starting each phase, running CQL scripts, maintaining a background writer during transitions, and asserting correctness at each stage.</p>
 </div>
 <div class="listingblock">
 <div class="content">

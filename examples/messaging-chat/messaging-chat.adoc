@@ -3,7 +3,7 @@
 :toclevels: 3
 :stylesheet: ../theme/ferrosa.css
 
-Build a real-time messaging backend that stores billions of messages, retrieves conversation history instantly, and scales horizontally.
+Build a real-time messaging backend that stores large conversation histories, retrieves recent messages with low-latency access patterns, and scales horizontally.
 
 NOTE: This tutorial assumes you have a running Ferrosa cluster. If you haven't set one up yet, follow the <<cluster-setup.adoc#,3-Node Cluster Setup>> guide first. You should be able to connect with `cqlsh` before continuing.
 

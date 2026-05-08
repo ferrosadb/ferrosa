@@ -208,10 +208,10 @@
 
 <div class="container">
 
-  <a href="index.html" class="back-link">&larr; Back to homepage</a>
+  <a href="/" class="back-link">&larr; Ferrosa Suite home</a> · <a href="/database/" class="back-link">Database home</a>
 
   <h1>CQL <span>Reference</span></h1>
-  <p class="subtitle">Ferrosa implements CQL native protocol v4 and v5 with full driver compatibility (including cdrs-tokio). This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
+  <p class="subtitle">Ferrosa implements CQL native protocol v4 and v5 compatibility work, including tested driver paths such as cdrs-tokio. This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
 
   <div class="note">
     <strong>Beta:</strong> Ferrosa is currently in beta. CQL compatibility is under active development.
@@ -500,7 +500,7 @@
   <div class="extension">
     <strong>Beyond Cassandra:</strong> Ferrosa's secondary index framework goes far beyond Cassandra's SAI
     or legacy 2i indexes. Eight pluggable index types cover traditional queries, full-text phonetic
-    search, and AI/ML vector similarity — all built into the database with zero external dependencies.
+    search, and AI/ML vector similarity — all built into the database without requiring a separate search service for the preview path.
   </div>
 
   <h3>Index types</h3>
@@ -609,7 +609,7 @@
   <p>Results are ranked by BM25 relevance score. The default analyzer lowercases, removes English stop words, and applies Porter stemming. Custom stop words can be configured via index options.</p>
 
   <h3>NVMe table pinning</h3>
-  <p>Pin hot tables to local NVMe storage for sub-millisecond reads, bypassing S3 entirely:</p>
+  <p>Pin hot tables to local NVMe storage for latency-sensitive reads, avoiding object-store fetches on the hot path:</p>
 
   <pre><span class="cm">-- Create a pinned table</span>
 <span class="kw">CREATE TABLE</span> <span class="type">session_cache</span> (
@@ -643,9 +643,9 @@
   </table>
 
   <h3>How indexes work</h3>
-  <p>Ferrosa indexes are <strong>storage-attached</strong> — built as companion files alongside SSTables. Indexes are built <strong>asynchronously</strong> after memtable flush, with zero impact on the write path. This means:</p>
+  <p>Ferrosa indexes are <strong>storage-attached</strong> — built as companion files alongside SSTables. Indexes are built <strong>asynchronously</strong> after memtable flush, off the foreground write acknowledgement path. This means:</p>
   <ul>
-    <li><strong>Writes are never blocked</strong> by index maintenance</li>
+    <li><strong>Foreground write acknowledgements are not blocked</strong> by index maintenance</li>
     <li><strong>Indexes are eventually consistent</strong> — there's a brief window between write and index availability</li>
     <li><strong>Per-index staleness tracking</strong> via <code>system_views.secondary_indexes</code> lets you monitor how far behind each index is</li>
     <li><strong>Best-effort queries</strong> — queries union indexed SSTable results with scans of not-yet-indexed SSTables, so results are always complete</li>

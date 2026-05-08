@@ -7,7 +7,7 @@ Build a multiplayer game backend.
 Track player stats, maintain real-time leaderboards, record match history, and manage in-game inventories.
 
 NOTE: This tutorial assumes you have a running 3-node Ferrosa cluster.
-If you haven't set one up yet, follow the link:../cluster-setup.html[3-Node Cluster Setup] guide first -- it only takes about 5 minutes.
+If you haven't set one up yet, follow the link:cluster-setup.html[3-Node Cluster Setup] guide first -- it only takes about 5 minutes.
 
 == Create the Keyspace
 
@@ -107,7 +107,7 @@ Here are the queries that power the different screens in your game client.
 === Player Profile
 
 The first thing a player sees when they open the game.
-One partition read, sub-millisecond response.
+One partition read, optimized for low-latency profile loading.
 
 === Match History
 
@@ -149,9 +149,9 @@ include::queries.cql[]
 
 You just built the data layer for a multiplayer game. Here is what you accomplished:
 
-* Designed a *player profile* table for sub-millisecond identity lookups
+* Designed a *player profile* table for low-latency identity lookups
 * Built a *match history* table with per-player performance tracking using descending time order
-* Created a *pre-ranked leaderboard* partitioned by game mode for instant top-10 queries
+* Created a *pre-ranked leaderboard* partitioned by game mode for efficient top-10 queries
 * Used *CQL collection types* (lists) to store variable-length player rosters in match records
 * Modeled *denormalized data* across tables to serve each game screen with a single partition read
 * Wrote *update queries* that a game server would run after each match to keep stats current

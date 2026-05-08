@@ -1,12 +1,18 @@
-# Ferrosa Documentation
+# Ferrosa Suite Documentation
 
-User-facing documentation for Ferrosa — a distributed database that speaks CQL, backed by S3.
+User-facing documentation for Ferrosa Database and Ferrosa Memory.
 
-## Contents
+## Products
 
-- [Getting Started](getting-started.html) — installation and first cluster
-- [Migration](migration.html) — migrating from Apache Cassandra
-- [CQL Compatibility](cql-compatibility.html) — supported CQL features and driver compatibility
+- [Ferrosa Database](database/) — distributed database docs, examples, CQL, Cypher, SPARQL, and migration guides.
+- [Ferrosa Memory](ferrosa-memory/) — developer-preview long-context linked memory for agents.
+
+## Database Docs
+
+- [Getting Started](database/getting-started.html) — installation and first cluster
+- [Migration](database/migration.html) — migrating from Apache Cassandra
+- [CQL Compatibility](database/cql-compatibility.html) — supported CQL features and driver compatibility
+- [Examples](database/examples/) — generated database examples
 
 ## For Developers
 

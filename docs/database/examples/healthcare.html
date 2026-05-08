@@ -450,7 +450,7 @@ SELECT name, dob, blood_type, allergies, emergency_contact</code></pre>
 </div>
 </div>
 <div class="paragraph">
-<p>This returns instantly because <code>patient_id</code> is the partition key. No matter how many millions of patients your system holds, this lookup hits exactly one partition on one node.</p>
+<p>This is a bounded lookup because <code>patient_id</code> is the partition key. No matter how many patients your system holds, this query targets exactly one partition on one node.</p>
 </div>
 </div>
 <div class="sect2">
@@ -512,7 +512,7 @@ SELECT medication, dosage, frequency, prescriber, active, prescribed_at</code></
 <p>Created a <strong>replicated keyspace</strong> with RF=3 for data durability critical to healthcare</p>
 </li>
 <li>
-<p>Designed a <strong>temporal schema</strong> with descending clustering order for instant access to the most recent events</p>
+<p>Designed a <strong>temporal schema</strong> with descending clustering order for efficient access to the most recent events</p>
 </li>
 <li>
 <p>Used <strong>CQL collection types</strong> (sets) to model multi-valued fields like allergies</p>

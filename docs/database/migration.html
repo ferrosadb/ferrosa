@@ -239,13 +239,13 @@
 
 <div class="container">
 
-  <a href="index.html" class="back-link">&larr; Back to homepage</a>
+  <a href="/" class="back-link">&larr; Ferrosa Suite home</a> · <a href="/database/" class="back-link">Database home</a>
 
   <h1>Migration <span>Guide</span></h1>
   <p class="subtitle">Move from Apache Cassandra to Ferrosa without rewriting application code. Same CQL protocol, same drivers, same consistency model, same LWT semantics.</p>
 
   <div class="note">
-    <strong>Beta:</strong> Ferrosa is currently in beta. We recommend thorough testing with representative workloads before migrating production traffic.
+    <strong>Developer Preview:</strong> Ferrosa is in active development. Run representative dual-read and failure-recovery tests before migrating production traffic.
   </div>
 
   <div class="toc">
@@ -266,13 +266,13 @@
   <!-- ── Overview ── -->
   <h2 id="overview">Migration Overview</h2>
 
-  <p>Ferrosa is designed as a drop-in replacement for Apache Cassandra at the protocol level. The migration strategy is incremental:</p>
+  <p>Ferrosa is designed for Cassandra-compatible protocol access where supported, with migrations validated incrementally against your schema, drivers, and workload. The migration strategy is incremental:</p>
 
   <ol>
     <li>Start a Ferrosa node alongside your existing Cassandra cluster</li>
     <li>Point a test workload at Ferrosa to validate compatibility</li>
     <li>Import existing SSTables directly (Ferrosa reads Cassandra BTI format)</li>
-    <li>Migrate production keyspaces one at a time with dual-read verification</li>
+    <li>For migration evaluations, move keyspaces one at a time with dual-read verification</li>
     <li>Decommission Cassandra nodes as Ferrosa proves stable</li>
   </ol>
 
@@ -303,7 +303,7 @@
       <tr><td>Node lifecycle</td><td><span class="check">Compatible</span></td><td>Join and decommission via <code>ferrosa-ctl</code></td></tr>
       <tr><td>Token rebalancing</td><td><span class="check">Compatible</span></td><td>Operator-triggered via <code>ferrosa-ctl rebalance</code></td></tr>
       <tr><td>Secondary indexes</td><td><span class="check">Compatible</span></td><td>8 index types including vector (HNSW, IVFFlat)</td></tr>
-      <tr><td>UDTs</td><td><span class="check">Supported</span></td><td>CREATE/ALTER/DROP TYPE fully implemented</td></tr>
+      <tr><td>UDTs</td><td><span class="check">Supported</span></td><td>CREATE/ALTER/DROP TYPE implemented</td></tr>
       <tr><td>Materialized views</td><td><span class="cross">Not yet</span></td><td>Planned</td></tr>
       <tr><td>LWT</td><td><span class="check">Compatible</span></td><td>IF NOT EXISTS, IF conditions, batch CAS — Accord protocol (strict serializable)</td></tr>
       <tr><td>Transactions</td><td><span class="check">Supported</span></td><td>BEGIN TRANSACTION / COMMIT / ROLLBACK — multi-partition atomic operations</td></tr>
@@ -430,7 +430,7 @@ cluster = Cluster([<span class="str">'ferrosa-node-1.prod'</span>])</pre>
   <!-- ── Dual Read ── -->
   <h2 id="dual-read">Dual-Read Verification</h2>
 
-  <p>Before cutting over production traffic, run dual reads against both databases and compare results:</p>
+  <p>Before considering any production cutover, run dual reads against both databases and compare results:</p>
 
   <pre><span class="kw">from</span> cassandra.cluster <span class="kw">import</span> Cluster
 
@@ -448,7 +448,7 @@ stmt_f = ferro.prepare(query)
     row_f = ferro.execute(stmt_f, [uid]).one()
     <span class="kw">assert</span> row_c == row_f, f<span class="str">"Mismatch for {uid}"</span></pre>
 
-  <p>Run this against a representative sample of your production queries. Cover:</p>
+  <p>Run this against a representative sample of your real queries. Cover:</p>
   <ul>
     <li>Point reads by partition key</li>
     <li>Range scans on clustering columns</li>
@@ -461,7 +461,7 @@ stmt_f = ferro.prepare(query)
   <!-- ── S3 ── -->
   <h2 id="s3">S3 Storage Setup</h2>
 
-  <p>For production, configure S3 as the durable storage backend. Local disk acts as a hot cache.</p>
+  <p>For production-style evaluations, configure S3 or an S3-compatible service as the durable storage backend. Local disk acts as a hot cache.</p>
 
   <pre><span class="cm"># AWS S3 with IAM instance profile (no explicit keys needed)</span>
 <span class="kw">FERROSA_S3_ENDPOINT</span>=https://s3.amazonaws.com \
@@ -493,19 +493,19 @@ stmt_f = ferro.prepare(query)
   </table>
 
   <h3>Storage cost comparison</h3>
-  <p>With S3-backed storage, you trade local disk costs for object storage costs — typically a 4-10x reduction:</p>
+  <p>With S3-backed storage, you trade some local disk and snapshot costs for object storage, request costs, lifecycle policy, and restore behavior. The table below is illustrative only; benchmark and price your own workload before making migration decisions:</p>
 
   <table>
     <thead><tr><th>Scale</th><th>EBS (gp3, 3 replicas)</th><th>S3 Standard</th><th>Savings</th></tr></thead>
     <tbody>
-      <tr><td>1 TB</td><td>~$240/mo</td><td>~$23/mo</td><td>~10x</td></tr>
-      <tr><td>10 TB</td><td>~$2,400/mo</td><td>~$230/mo</td><td>~10x</td></tr>
-      <tr><td>100 TB</td><td>~$24,000/mo</td><td>~$2,300/mo</td><td>~10x</td></tr>
-      <tr><td>1 PB</td><td>~$240,000/mo</td><td>~$23,000/mo</td><td>~10x</td></tr>
+      <tr><td>1 TB</td><td>varies by provider</td><td>model from S3 + requests</td><td>workload-dependent</td></tr>
+      <tr><td>10 TB</td><td>depends on RF + snapshots</td><td>depends on lifecycle policy</td><td>benchmark required</td></tr>
+      <tr><td>100 TB</td><td>depends on retention</td><td>depends on cache misses</td><td>benchmark required</td></tr>
+      <tr><td>1 PB</td><td>depends on topology</td><td>depends on restore SLA</td><td>benchmark required</td></tr>
     </tbody>
   </table>
 
-  <p>S3 request costs (GET/PUT) add overhead for high-throughput workloads, but the local NVMe cache absorbs most read traffic. Write-behind uploads batch SSTables to amortize PUT costs.</p>
+  <p>S3 request costs (GET/PUT), restore latency, and cache misses matter for high-throughput workloads. The local NVMe cache is intended to absorb hot reads, and write-behind uploads batch SSTables to amortize PUT costs, but the preview docs should be treated as a model to validate rather than a guaranteed cost outcome.</p>
 
   <!-- ── Differences ── -->
   <h2 id="differences">Key Differences from Cassandra</h2>
@@ -592,11 +592,11 @@ stmt_f = ferro.prepare(query)
     via leaseholder, compared to Paxos's minimum 2-RTT.</p>
 
   <div class="success">
-    <strong>Temporal compatibility:</strong> All LWT patterns used by
-    <a href="https://temporal.io">Temporal</a> are fully implemented. If you run Temporal
-    on Cassandra with LWT-based persistence, Ferrosa is a drop-in replacement — same
-    INSERT IF NOT EXISTS, same conditional UPDATE IF, same batch CAS semantics. No Temporal
-    configuration changes required beyond updating the Cassandra contact points.
+    <strong>Temporal compatibility:</strong> Ferrosa implements the LWT patterns used by
+    <a href="https://temporal.io">Temporal</a>'s Cassandra persistence path. If you run Temporal
+    on Cassandra with LWT-based persistence, evaluate Ferrosa against the same
+    INSERT IF NOT EXISTS, conditional UPDATE IF, and batch CAS semantics, with expected
+    configuration changes limited to the Cassandra contact points.
   </div>
 
   <h3>Beyond LWT: multi-statement transactions</h3>

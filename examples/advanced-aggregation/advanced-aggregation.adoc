@@ -216,7 +216,7 @@ include::queries.cql[lines=4..6]
 ----
 
 Ferrosa calls `to_celsius(temperature)` for every row before returning the result set.
-This is identical to calling a scalar function in a relational database -- one invocation per row, zero additional network round-trips.
+This follows the same shape as calling a scalar function in a relational database -- one invocation per row without a separate client round trip.
 
 Expected output (rows ordered newest-first due to `ts DESC`):
 

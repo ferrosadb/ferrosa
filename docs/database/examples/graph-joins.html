@@ -85,7 +85,7 @@ This tutorial shows relationship queries that are impossible in vanilla Cassandr
 <div class="title">Note</div>
 </td>
 <td class="content">
-Complete the <a href="../cluster-setup.html">3-Node Cluster Setup</a> tutorial first.
+Complete the <a href="cluster-setup.html">3-Node Cluster Setup</a> tutorial first.
 Your cluster must have <code>FERROSA_GRAPH_ENABLED=true</code> set (which our cluster-setup tutorial includes).
 </td>
 </tr>
@@ -684,7 +684,7 @@ This is the query that CQL cannot express in a single statement:</p>
 <div class="paragraph">
 <p>Bidirectional traversal is where the graph engine truly shines.
 In vanilla Cassandra, this requires <code>ALLOW FILTERING</code> (full-table scan).
-In Ferrosa, the graph engine&#8217;s reverse adjacency index makes it instant:</p>
+In Ferrosa, the graph engine&#8217;s reverse adjacency index makes it a direct indexed lookup:</p>
 </div>
 <div class="listingblock">
 <div class="content">
@@ -726,7 +726,7 @@ This combines social graph data with content interaction data in one query:</p>
 <h3 id="_shortest_path_between_two_people">Shortest path between two people</h3>
 <div class="paragraph">
 <p>Find the shortest follow chain between Alice and Hank.
-This is entirely impossible in CQL&#8201;&#8212;&#8201;it requires a breadth-first search that Cypher handles natively:</p>
+This is awkward to express in plain CQL because it requires graph traversal; the supported Cypher path expresses it directly:</p>
 </div>
 <div class="listingblock">
 <div class="content">

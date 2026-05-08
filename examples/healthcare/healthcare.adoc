@@ -166,7 +166,7 @@ Sometimes the simplest query is the most important one. When a patient arrives, 
 include::queries.cql[lines=36..39]
 ----
 
-This returns instantly because `patient_id` is the partition key. No matter how many millions of patients your system holds, this lookup hits exactly one partition on one node.
+This is a bounded lookup because `patient_id` is the partition key. No matter how many patients your system holds, this query targets exactly one partition on one node.
 
 === Time-Bounded Event Search
 
@@ -195,7 +195,7 @@ TIP: *Schema design insight:* Notice how each table serves a different audience.
 You just built the foundation of an electronic medical records system. Here is what you accomplished:
 
 * Created a *replicated keyspace* with RF=3 for data durability critical to healthcare
-* Designed a *temporal schema* with descending clustering order for instant access to the most recent events
+* Designed a *temporal schema* with descending clustering order for efficient access to the most recent events
 * Used *CQL collection types* (sets) to model multi-valued fields like allergies
 * Built a *patient timeline* that returns events in reverse chronological order without sorting
 * Wrote *analytical queries* to filter abnormal lab results and active medications

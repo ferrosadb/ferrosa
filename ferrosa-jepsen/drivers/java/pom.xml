@@ -6,7 +6,7 @@
 
   <groupId>com.ferrosa</groupId>
   <artifactId>ferrosa-jepsen</artifactId>
-  <version>1.0</version>
+  <version>0.8.8.8</version>
   <packaging>jar</packaging>
 
   <properties>
@@ -37,7 +37,7 @@
               <classpathPrefix>lib/</classpathPrefix>
             </manifest>
           </archive>
-          <finalName>ferrosa-jepsen-1.0</finalName>
+          <finalName>ferrosa-jepsen-0.8.8.8</finalName>
         </configuration>
       </plugin>
       <plugin>

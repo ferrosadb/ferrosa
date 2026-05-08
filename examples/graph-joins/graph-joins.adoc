@@ -7,7 +7,7 @@ Traditional Cassandra warns against join-heavy workloads.
 Ferrosa doesn't -- it has a built-in graph engine with bidirectional traversals and secondary indexes.
 This tutorial shows relationship queries that are impossible in vanilla Cassandra.
 
-NOTE: Complete the link:../cluster-setup.html[3-Node Cluster Setup] tutorial first.
+NOTE: Complete the link:cluster-setup.html[3-Node Cluster Setup] tutorial first.
 Your cluster must have `FERROSA_GRAPH_ENABLED=true` set (which our cluster-setup tutorial includes).
 
 == Why Graph + CQL?
@@ -191,7 +191,7 @@ curl -X POST http://localhost:7474/graph/query \
 
 Bidirectional traversal is where the graph engine truly shines.
 In vanilla Cassandra, this requires `ALLOW FILTERING` (full-table scan).
-In Ferrosa, the graph engine's reverse adjacency index makes it instant:
+In Ferrosa, the graph engine's reverse adjacency index makes it a direct indexed lookup:
 
 [source,bash]
 ----
@@ -227,7 +227,7 @@ curl -X POST http://localhost:7474/graph/query \
 === Shortest path between two people
 
 Find the shortest follow chain between Alice and Hank.
-This is entirely impossible in CQL -- it requires a breadth-first search that Cypher handles natively:
+This is awkward to express in plain CQL because it requires graph traversal; the supported Cypher path expresses it directly:
 
 [source,bash]
 ----

@@ -484,8 +484,8 @@ jepsen         ██████   █████░  ████░░   █
 | ~~Hardening sprint~~ | — | Merged (PR #55) |
 | ~~Observability wiring~~ | — | Merged (PR #53) |
 | ~~Production cluster (Phase 3)~~ | — | Merged (PR #57) |
-| ~~Beta release v1.0.0-beta.1~~ | — | Released (PR #58, #59) |
-| ~~Beta release v1.0.0-beta.3~~ | — | Released |
+| ~~Preview release 0.8.8.8~~ | — | Released (PR #58, #59) |
+| ~~Preview release 0.8.8.8~~ | — | Released |
 | ~~Secondary index pipeline (Sprints I-1 to I-4)~~ | — | Done (feature branch) |
 | ~~PITR (Sprints P-1 to P-5)~~ | — | Done (feature branch) |
 | ~~Accord Transactions (Sprints A1-A7)~~ | — | Done (merged PR #77, 2,808 tests) |
@@ -495,7 +495,7 @@ jepsen         ██████   █████░  ████░░   █
 | ~~Cassandra Murmur3Partitioner compat~~ | — | Done |
 | Cluster formation hardening (S1-S3) | fix/standalone-progressive-join | S1-S3 complete — S1: DDL blocked, pk_read, NTS DC validation, parking_lot, spawn_tracked, quorum committed_size, formation timeout. S2: hints all replicas, RowWire streaming, read_range capped, promotion delay configurable. S3: broadcast map cleanup, LazyRaft 3x retry, BroadcastResolver trait, Raft config tunable, digest Result. S4 active. |
 | Temporal v1.31.0 on ferrosa | ferrosa-temporal | Running (shard acquisition WIP) |
-| Beta release v1.0.0-beta.4 | — | Sprints complete |
+| Preview release 0.8.8.8 | — | Sprints complete |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
 
 ## Path to Distributed Operation

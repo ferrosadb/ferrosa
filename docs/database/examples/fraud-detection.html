@@ -53,7 +53,7 @@
 <div id="preamble">
 <div class="sectionbody">
 <div class="paragraph">
-<p>Build a real-time fraud scoring system. Ingest financial transactions, detect suspicious patterns, and flag anomalies&#8201;&#8212;&#8201;all with sub-millisecond lookups.</p>
+<p>Build a fraud scoring tutorial. Ingest financial transactions, detect suspicious patterns, and flag anomalies using lookup-oriented table design.</p>
 </div>
 <div class="admonitionblock note">
 <table>
@@ -406,7 +406,7 @@ SELECT alert_time, account_id, rule_triggered, severity, details, resolved</code
 </div>
 </div>
 <div class="paragraph">
-<p>Because we partitioned by <code>alert_date</code>, this reads a single partition. Even with millions of historical alerts, today&#8217;s queue loads instantly.</p>
+<p>Because we partitioned by <code>alert_date</code>, this reads a single partition. Today&#8217;s queue remains bounded without scanning historical alerts.</p>
 </div>
 </div>
 <div class="sect2">
@@ -574,7 +574,7 @@ WHERE account_id = 'ACCT-1001';</code></pre>
 </ul>
 </div>
 <div class="paragraph">
-<p>From here, you could add a <code>merchant_risk</code> table to score merchants independently, a <code>device_fingerprints</code> table to track which devices are associated with each account, or a <code>blocked_cards</code> table for instant card-level blocks.</p>
+<p>From here, you could add a <code>merchant_risk</code> table to score merchants independently, a <code>device_fingerprints</code> table to track which devices are associated with each account, or a <code>blocked_cards</code> table for direct card-level block lookups.</p>
 </div>
 </div>
 </div>

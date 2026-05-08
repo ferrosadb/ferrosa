@@ -1,4 +1,4 @@
-(defproject ferrosa-jepsen "0.1.0"
+(defproject ferrosa-jepsen "0.8.8.8"
   :description "Jepsen tests for Ferrosa distributed database"
   :url "https://github.com/bkearns/ferrosa"
   :license {:name "Apache-2.0"}

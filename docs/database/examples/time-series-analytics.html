@@ -242,7 +242,7 @@ Instead, your application computes them as ticks arrive and writes the results t
 <div class="paragraph">
 <p>This table uses the same composite partition key pattern as the ticks table: <code>(symbol, candle_date)</code>.
 A full trading day has 390 one-minute candles (6.5 hours of market time), so each partition is tiny&#8201;&#8212;&#8201;just 390 rows.
-Dashboard queries return instantly.</p>
+Dashboard queries stay bounded to a small partition.</p>
 </div>
 </div>
 <div class="sect2">
@@ -497,7 +497,7 @@ WHERE symbol = 'AAPL'
 <div class="paragraph">
 <p>This returns all candles for AAPL on June 15th, newest first.
 A full trading day has 390 candles&#8201;&#8212;&#8201;small enough to send to the frontend in a single response.
-The chart renders instantly because the data is already aggregated.</p>
+The chart can render from a compact, already-aggregated response.</p>
 </div>
 </div>
 <div class="sect2">
@@ -587,7 +587,7 @@ Here is what you practiced:</p>
 <p><strong>Using <code>decimal</code> for financial data.</strong> Floating-point types introduce rounding errors that are unacceptable in finance. The <code>decimal</code> type stores exact values.</p>
 </li>
 <li>
-<p><strong>Descending clustering order for "latest first" queries.</strong> By sorting newest trades first on disk, the most common query pattern&#8201;&#8212;&#8201;"show me what just happened"&#8201;&#8212;&#8201;reads the first few rows of the partition with zero sorting overhead.</p>
+<p><strong>Descending clustering order for "latest first" queries.</strong> By sorting newest trades first on disk, the most common query pattern&#8201;&#8212;&#8201;"show me what just happened"&#8201;&#8212;&#8201;reads the first few rows of the partition without a separate sort step.</p>
 </li>
 </ul>
 </div>

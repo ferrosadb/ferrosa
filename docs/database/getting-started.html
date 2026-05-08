@@ -220,19 +220,19 @@
 
 <div class="container">
 
-  <a href="index.html" class="back-link">&larr; Back to homepage</a>
+  <a href="/" class="back-link">&larr; Ferrosa Suite home</a> · <a href="/database/" class="back-link">Database home</a>
 
   <h1>Getting <span>Started</span></h1>
   <p class="subtitle">Install Ferrosa and run a single-node instance in minutes. Everything you need to connect existing CQL drivers and start querying.</p>
 
   <div class="note">
-    <strong>Beta:</strong> Ferrosa is currently in beta. APIs and configuration may change between releases. Not yet recommended for production workloads without thorough testing.
+    <strong>Developer Preview:</strong> Ferrosa is in active development. APIs, packaging, and configuration may change between releases. Evaluate with representative workloads before production use.
   </div>
 
   <div class="toc">
     <h4>On this page</h4>
     <ul>
-      <li><a href="#install">Install from Package</a></li>
+      <li><a href="#install">Install Preview Binary</a></li>
       <li><a href="#run">Run Ferrosa</a></li>
       <li><a href="#connect">Connect a CQL Driver</a></li>
       <li><a href="#config">Configuration Reference</a></li>
@@ -246,8 +246,10 @@
   <!-- ── Install from Package ── -->
   <h2 id="install">Installation</h2>
 
+  <p>The planned developer-preview installer targets macOS and Linux first. Windows support can be added later if there is demand.</p>
+  <pre><span class="kw">curl</span> -fsSL https://ferrosadb.com/install.sh | bash</pre>
   <div class="note">
-    <strong>Coming Soon:</strong> Ferrosa is under active development. Binary packages are not yet available for download. Check back for release announcements.
+    <strong>Preview installer:</strong> The install script is intended to download the matching Ferrosa release, place binaries on your PATH, and print the next command to run a local node. Until the public installer is published, build from source or use release artifacts from the preview PR/release.
   </div>
 
 
@@ -255,18 +257,18 @@
   <h2 id="run">Run Ferrosa</h2>
 
   <h3>Minimal startup</h3>
-  <pre><span class="cm"># Start with defaults — CQL on :9042, web console on :9090</span>
-<span class="kw">./target/release/ferrosa</span></pre>
+  <pre><span class="cm"># Start with defaults — CQL on :9042, operations console on :9090</span>
+<span class="kw">ferrosa</span></pre>
 
   <h3>With graph engine enabled</h3>
-  <pre><span class="kw">FERROSA_GRAPH_ENABLED</span>=true ./target/release/ferrosa</pre>
+  <pre><span class="kw">FERROSA_GRAPH_ENABLED</span>=true ferrosa</pre>
 
   <h3>Custom ports and auth disabled (development)</h3>
   <pre><span class="kw">FERROSA_CQL_BIND</span>=127.0.0.1:9042 \
 <span class="kw">FERROSA_WEB_BIND</span>=127.0.0.1:9090 \
 <span class="kw">FERROSA_AUTH_DISABLED</span>=true \
 <span class="kw">FERROSA_GRAPH_ENABLED</span>=true \
-./target/release/ferrosa</pre>
+ferrosa</pre>
 
   <div class="note">
     <strong>Note:</strong> Ferrosa starts in standalone mode by default. Two-node pair mode
@@ -274,6 +276,11 @@
     uses Raft consensus and a Murmur3 token ring; there is no separate
     <code>FERROSA_CLUSTER_MODE</code> switch.
   </div>
+
+  <h3>Operations console</h3>
+  <p>The local operations console is served by the running Ferrosa node. Use it during preview to inspect node status, metrics, and operational tables.</p>
+  <p><a href="/assets/screenshots/ferrosa-operations-console.png">Open operations console screenshot</a></p>
+  <img src="/assets/screenshots/ferrosa-operations-console.png" alt="Ferrosa operations console screenshot" style="max-width:100%; border:1px solid var(--border); border-radius:12px; margin:1rem 0;">
 
   <h3>Default ports</h3>
   <table>
@@ -674,8 +681,7 @@ session.execute(<span class="str">"""
       for manual recovery.</li>
   </ul>
   <div class="note">
-    <strong>Beta:</strong> Multi-node cluster mode is experimental. For production HA, two-node
-    pair mode with automatic failover is the recommended configuration.
+    <strong>Developer Preview:</strong> Multi-node cluster mode is still being validated. For HA evaluations, test two-node pair mode and failover behavior before relying on it.
   </div>
 
   <h2 id="faq">Cluster FAQ</h2>

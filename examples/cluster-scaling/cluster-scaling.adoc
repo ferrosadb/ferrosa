@@ -6,17 +6,17 @@
 :icons: font
 :source-highlighter: rouge
 
-Ferrosa scales from a single development node to a production cluster without downtime.
+Ferrosa is designed to grow from a single development node toward clustered deployments without changing APIs.
 Most databases force you to choose your deployment topology up front -- a single-node install that you later throw away and replace with a cluster, or a heavyweight multi-node setup that's overkill for development.
-Ferrosa eliminates that tradeoff: start with one node on your laptop, add a hot standby when you're ready for production, then grow into a full Raft consensus cluster when your traffic demands it.
+Ferrosa aims to reduce that tradeoff: start with one node on your laptop, evaluate pair mode for standby behavior, then test Raft-backed clustering as your operational requirements grow.
 
-This tutorial walks through three stages of that journey: *standalone* (development), *pair mode* (low-volume production with a hot standby), and *Raft cluster* (full production with consensus).
-At each transition, writes and schema changes continue uninterrupted.
+This tutorial walks through three stages of that journey: *standalone* (development), *pair mode* (standby evaluation), and *Raft cluster* (multi-node consensus evaluation).
+At each transition, the demo exercises writes and schema changes so you can observe behavior during topology changes.
 The data you inserted on a single node is still there after you've scaled to three -- no migrations, no re-bootstrapping, no downtime windows.
 
 == Prerequisites
 
-* *Docker and Docker Compose* -- see the link:../cluster-setup/cluster-setup.html[Cluster Setup Guide] if you need to install Docker
+* *Docker and Docker Compose* -- see the link:cluster-setup.html[Cluster Setup Guide] if you need to install Docker
 * *cqlsh* -- `pip install cqlsh`
 * About *4 GB of RAM* available for the three nodes plus the object store
 
@@ -182,7 +182,7 @@ Schema changes now go through Raft consensus, guaranteeing that all nodes agree 
 include::06-cluster-ddl.cql[]
 ----
 
-TIP: In cluster mode, DDL statements are linearizable. A `CREATE TABLE` that succeeds is guaranteed to be visible on every node immediately -- no schema agreement delays.
+TIP: In cluster mode, DDL statements are intended to be linearizable. A `CREATE TABLE` that succeeds should become visible through the replicated schema path without Cassandra-style schema agreement polling.
 
 [[verify]]
 == Verification
@@ -209,7 +209,7 @@ All three nodes should show `"status": "UP"`.
 
 == Running the Demo
 
-The `run-demo.sh` script automates the entire sequence above -- starting each phase, running CQL scripts, maintaining a background writer to prove zero-downtime transitions, and asserting correctness at each stage.
+The `run-demo.sh` script automates the sequence above -- starting each phase, running CQL scripts, maintaining a background writer during transitions, and asserting correctness at each stage.
 
 [source,bash]
 ----
