@@ -25,6 +25,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
+mod auth;
 mod commands;
 mod tui;
 
@@ -108,6 +109,12 @@ enum Commands {
         action: SnapshotAction,
     },
 
+    /// Manage role authentication (set passwords, etc.).
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+
     /// Restore from a snapshot, optionally to a point in time.
     Restore {
         /// Name of the snapshot to restore from.
@@ -120,6 +127,51 @@ enum Commands {
         /// Skip confirmation prompt and proceed even if data will be overwritten.
         #[arg(long)]
         force: bool,
+    },
+}
+
+/// Auth sub-actions.
+#[derive(Debug, Subcommand)]
+enum AuthAction {
+    /// Set the password for an existing role via CQL `ALTER ROLE`.
+    ///
+    /// The new password is read interactively from the terminal (no echo).
+    /// The CLI authenticates as `--admin-user` using `--admin-password-env`
+    /// (or a prompt if unset), then issues
+    /// `ALTER ROLE "<user>" WITH PASSWORD = '<new>'`. The server hashes
+    /// the cleartext via its own `PasswordHasher`. No password material
+    /// is written to disk by this command.
+    ///
+    /// # Password policy
+    ///
+    /// - non-empty
+    /// - at least 8 characters
+    SetPassword {
+        /// Role whose password to change. Defaults to the seed admin.
+        #[arg(long, default_value = "ferrosa_admin")]
+        user: String,
+
+        /// Role used for the admin connection. Defaults to the seed admin.
+        #[arg(long, default_value = "ferrosa_admin")]
+        admin_user: String,
+
+        /// Environment variable holding the admin password. If unset, the
+        /// CLI tries the seed default first; on auth failure, prompts.
+        #[arg(long)]
+        admin_password_env: Option<String>,
+
+        /// Use TLS for the CQL connection (currently a no-op placeholder;
+        /// `CqlClient` does not yet support TLS). Errors out if requested.
+        #[arg(long)]
+        ssl: bool,
+
+        /// Skip the SUPERUSER warning.
+        #[arg(long)]
+        force: bool,
+
+        /// Skip the second-prompt confirmation (for scripting).
+        #[arg(long)]
+        no_confirm: bool,
     },
 }
 
@@ -190,6 +242,32 @@ async fn main() {
             SnapshotAction::List => commands::snapshot_list(&web_host, web_port).await,
             SnapshotAction::Delete { name } => {
                 commands::snapshot_delete(&web_host, web_port, &name).await
+            }
+        },
+        Commands::Auth { action } => match action {
+            AuthAction::SetPassword {
+                user,
+                admin_user,
+                admin_password_env,
+                ssl,
+                force,
+                no_confirm,
+            } => {
+                if let Err(e) = commands::run_auth_set_password(
+                    addr,
+                    &user,
+                    &admin_user,
+                    admin_password_env.as_deref(),
+                    ssl,
+                    force,
+                    no_confirm,
+                )
+                .await
+                {
+                    eprintln!("error: {}", e.message());
+                    process::exit(e.exit_code());
+                }
+                Ok(())
             }
         },
         Commands::Restore {
@@ -471,6 +549,86 @@ mod tests {
             Commands::Restore { point_in_time, .. } => {
                 assert_eq!(point_in_time.as_deref(), Some("2026-03-18T12:00:00Z"));
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    // ── auth set-password CLI tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_auth_set_password_defaults() {
+        let cli = Cli::try_parse_from(["ferrosa-ctl", "auth", "set-password"]).unwrap();
+        match cli.command {
+            Commands::Auth {
+                action:
+                    AuthAction::SetPassword {
+                        user,
+                        admin_user,
+                        admin_password_env,
+                        ssl,
+                        force,
+                        no_confirm,
+                    },
+            } => {
+                assert_eq!(user, "ferrosa_admin");
+                assert_eq!(admin_user, "ferrosa_admin");
+                assert!(admin_password_env.is_none());
+                assert!(!ssl);
+                assert!(!force);
+                assert!(!no_confirm);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_set_password_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "auth",
+            "set-password",
+            "--user",
+            "alice",
+            "--admin-user",
+            "root",
+            "--admin-password-env",
+            "MY_PW",
+            "--ssl",
+            "--force",
+            "--no-confirm",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Auth {
+                action:
+                    AuthAction::SetPassword {
+                        user,
+                        admin_user,
+                        admin_password_env,
+                        ssl,
+                        force,
+                        no_confirm,
+                    },
+            } => {
+                assert_eq!(user, "alice");
+                assert_eq!(admin_user, "root");
+                assert_eq!(admin_password_env.as_deref(), Some("MY_PW"));
+                assert!(ssl);
+                assert!(force);
+                assert!(no_confirm);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_set_password_only_user() {
+        let cli =
+            Cli::try_parse_from(["ferrosa-ctl", "auth", "set-password", "--user", "bob"]).unwrap();
+        match cli.command {
+            Commands::Auth {
+                action: AuthAction::SetPassword { user, .. },
+            } => assert_eq!(user, "bob"),
             other => panic!("unexpected command: {other:?}"),
         }
     }
