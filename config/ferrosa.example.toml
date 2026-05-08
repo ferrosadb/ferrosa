@@ -1,0 +1,88 @@
+# Ferrosa default configuration — single-node, localhost-only.
+#
+# This file is installed to ~/.ferrosa/config/ferrosa.toml on first install.
+# The ferrosa binary reads it via the FERROSA_CONFIG environment variable
+# (set by the launchd plist / systemd unit). Environment variables override
+# every value below — see ferrosa/src/main.rs:config_val for precedence.
+#
+# Format: TOML (matches ferrosa/ferrosa.example.toml in the source tree).
+#
+# Bind addresses default to 127.0.0.1 so a fresh install never accepts traffic
+# from outside the host. To open the database to the LAN, change `bind` to
+# 0.0.0.0 AND ensure auth is enabled (it is by default below).
+
+# ---------------------------------------------------------------------------
+# CQL native protocol — drivers connect here on port 9042.
+# ---------------------------------------------------------------------------
+[cql]
+bind = "127.0.0.1:9042"
+auth_disabled = false           # CQL role auth: false = enforce passwords
+max_connections = 1024
+max_connections_per_ip = 64
+# tls_cert = "~/.ferrosa/config/tls/server.crt"
+# tls_key  = "~/.ferrosa/config/tls/server.key"
+# require_tls = false
+
+# ---------------------------------------------------------------------------
+# Internode RPC — used by multi-node clusters. A single-node install never
+# accepts inbound peers, but ferrosa-net still binds the listener at startup.
+# ---------------------------------------------------------------------------
+[internode]
+bind          = "127.0.0.1:7000"
+cluster_name  = "ferrosa"
+# broadcast = "127.0.0.1:7000"   # advertised to peers; only matters in clusters
+# seed      = "10.0.0.2:7000"    # comma-separated list of seed peers
+# psk       = "shared-secret"    # pre-shared key for internode auth
+
+# ---------------------------------------------------------------------------
+# Storage — local-only by default. Data lives under ~/.ferrosa/data and is
+# expanded by ferrosa's config loader at startup.
+# ---------------------------------------------------------------------------
+[storage]
+data_dir                 = "~/.ferrosa/data"
+flush_threshold_bytes    = 67108864   # 64 MiB — memtable size before flush
+flush_interval_secs      = 30         # background flush cadence
+commit_log_segment_size  = 33554432   # 32 MiB
+
+# ---------------------------------------------------------------------------
+# S3 — DISABLED by default. Single-node installs use local disk only.
+#
+# To enable S3 write-behind for durability beyond the local disk, uncomment
+# the keys below and provide AWS credentials via the standard environment
+# variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) or an instance role.
+# Cassandra-compatible object stores (MinIO, RustFS, Ceph RGW) work too — set
+# `endpoint` to the gateway URL and `allow_http = true` if it's plaintext.
+# ---------------------------------------------------------------------------
+[s3]
+# endpoint   = "https://s3.us-east-1.amazonaws.com"
+# bucket     = "ferrosa-data"
+# region     = "us-east-1"
+# allow_http = false
+
+# ---------------------------------------------------------------------------
+# Graph engine (Cypher / Bolt). Disabled by default; flip `enabled` and set
+# FERROSA_GRAPH_ENABLED=true in the service unit's Environment to start it.
+# ---------------------------------------------------------------------------
+[graph]
+enabled   = false
+bind      = "127.0.0.1:7474"      # HTTP / Cypher REST
+bolt_port = 7687                  # Bolt v5 (Neo4j drivers)
+
+# ---------------------------------------------------------------------------
+# Web admin console — also serves Prometheus metrics at /metrics.
+# Bind to localhost only; if you need remote access, front this with a reverse
+# proxy that handles TLS and auth.
+# ---------------------------------------------------------------------------
+[web]
+bind = "127.0.0.1:9090"
+
+# ---------------------------------------------------------------------------
+# Auth notes
+# ---------------------------------------------------------------------------
+# Auth is enabled by setting cql.auth_disabled = false (above) AND the
+# environment variable FERROSA_AUTH_ENABLED=true (set by the service unit).
+#
+# Roles and password hashes are stored INSIDE ferrosa, in the system_auth
+# keyspace (Cassandra-compatible) — there is NO external auth.yaml file.
+# install.sh seeds the default `cassandra` superuser; rotate that password
+# on first login via `ALTER ROLE cassandra WITH PASSWORD = '...'`.

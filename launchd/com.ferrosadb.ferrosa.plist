@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Ferrosa LaunchAgent template (macOS).
+
+  install.sh substitutes __HOME__ with the installing user's $HOME, then
+  copies this file to ~/Library/LaunchAgents/com.ferrosadb.ferrosa.plist
+  and bootstraps it with:
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ferrosadb.ferrosa.plist
+
+  Notes:
+    * This is a per-user LaunchAgent, NOT a system-wide LaunchDaemon.
+    * Ferrosa does not accept CLI flags; the config path is provided via
+      the FERROSA_CONFIG environment variable (see EnvironmentVariables).
+    * KeepAlive { Crashed = true } restarts on crash but NOT on clean exit,
+      so `launchctl bootout` / `launchctl unload` stop ferrosa as expected.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ferrosadb.ferrosa</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.ferrosa/bin/ferrosa</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FERROSA_CONFIG</key>
+        <string>__HOME__/.ferrosa/config/ferrosa.toml</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.ferrosa</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.ferrosa/logs/ferrosa.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.ferrosa/logs/ferrosa.err.log</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>

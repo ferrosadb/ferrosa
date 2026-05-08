@@ -1,0 +1,39 @@
+# Ferrosa systemd user-unit template (Linux).
+#
+# install.sh copies this file to ~/.config/systemd/user/ferrosa.service and runs:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ferrosa.service
+#
+# Notes:
+#   * This is a per-user unit (`systemctl --user`), NOT a system unit.
+#   * %h is systemd's home-directory expansion — no install-time substitution
+#     is needed for the paths below.
+#   * Ferrosa does not accept CLI flags; the config path is provided via the
+#     FERROSA_CONFIG environment variable.
+#   * For boot-time start without an active login session, the user must run
+#     `loginctl enable-linger $USER` once. install.sh handles this.
+
+[Unit]
+Description=Ferrosa Database
+Documentation=https://ferrosadb.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.ferrosa/bin/ferrosa
+WorkingDirectory=%h/.ferrosa
+Environment=FERROSA_CONFIG=%h/.ferrosa/config/ferrosa.toml
+Environment=RUST_LOG=info
+
+Restart=on-failure
+RestartSec=5
+
+LimitNOFILE=65536
+
+StandardOutput=append:%h/.ferrosa/logs/ferrosa.out.log
+StandardError=append:%h/.ferrosa/logs/ferrosa.err.log
+
+[Install]
+WantedBy=default.target
