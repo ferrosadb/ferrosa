@@ -1,0 +1,1894 @@
+<!DOCTYPE html>
+<!-- ferrosadb.com marketing site -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa Database — AI Native Database</title>
+  <meta name="description" content="Ferrosa Database is a Rust-native distributed database with CQL, graph, SPARQL, vector search, transactions, CDC, and S3-backed storage. Version 0.8.8.8 developer preview.">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-glow: rgba(226, 114, 91, 0.15);
+      --accent-secondary: #f4a261;
+      --accent-cool: #7c9cf5;
+      --accent-green: #6bc9a0;
+      --border: #1e1e2a;
+      --border-hover: #2e2e3e;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Navigation ── */
+    nav {
+      position: fixed;
+      top: 0;
+      width: 100%;
+      z-index: 100;
+      background: rgba(10, 10, 15, 0.85);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+    }
+
+    nav .nav-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+
+    nav .logo {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      text-decoration: none;
+    }
+
+    nav .logo span { color: var(--accent); }
+
+    nav .nav-links {
+      display: flex;
+      gap: 2rem;
+      list-style: none;
+    }
+
+    nav .nav-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    nav .nav-links a:hover { color: var(--text-primary); }
+
+    nav .nav-cta {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.5rem 1.25rem;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+
+    nav .nav-cta:hover { opacity: 0.9; }
+
+    /* ── Sections ── */
+    section {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 6rem 2rem;
+    }
+
+    /* ── Hero ── */
+    .hero {
+      padding-top: 11rem;
+      padding-bottom: 6rem;
+      text-align: center;
+      position: relative;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -60%);
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 0.375rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2rem;
+    }
+
+    .hero-badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .hero h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 1.5rem;
+      position: relative;
+    }
+
+    .hero h1 .gradient {
+      background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero p {
+      font-size: 1.25rem;
+      color: var(--text-secondary);
+      max-width: 640px;
+      margin: 0 auto 2.5rem;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 30px var(--accent-glow);
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      border: 1px solid var(--border);
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--border-hover);
+      background: var(--bg-card-hover);
+    }
+
+    /* ── Stats bar ── */
+    .stats-bar {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-top: 4rem;
+    }
+
+    .stat {
+      background: var(--bg-secondary);
+      padding: 1.75rem 1.5rem;
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: 2rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+    }
+
+    .stat-value .unit { color: var(--accent); }
+
+    .stat-label {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Section headers ── */
+    .section-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1rem;
+    }
+
+    .section-title {
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+      line-height: 1.15;
+    }
+
+    .section-subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    .section-subtitle.centered {
+      margin: 0 auto;
+      text-align: center;
+    }
+
+    .section-title.centered { text-align: center; }
+    .section-label.centered { text-align: center; }
+
+    /* ── Problem section ── */
+    .problem {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .problem section { padding: 5rem 2rem; }
+
+    .pain-points {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .pain-card {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.75rem;
+      transition: border-color 0.2s;
+    }
+
+    .pain-card:hover { border-color: var(--border-hover); }
+
+    .pain-icon {
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .pain-card h3 {
+      font-size: 1.0625rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+
+    .pain-card p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    /* ── Feature grid ── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2.25rem;
+      transition: border-color 0.2s, transform 0.15s;
+    }
+
+    .feature-card:hover {
+      border-color: var(--border-hover);
+      transform: translateY(-2px);
+    }
+
+    .feature-card.highlight {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 3rem;
+      align-items: center;
+    }
+
+    .feature-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .feature-icon.rust { background: rgba(226, 114, 91, 0.12); }
+    .feature-icon.s3 { background: rgba(244, 162, 97, 0.12); }
+    .feature-icon.cql { background: rgba(124, 156, 245, 0.12); }
+    .feature-icon.graph { background: rgba(107, 201, 160, 0.12); }
+    .feature-icon.lock { background: rgba(200, 130, 240, 0.12); }
+    .feature-icon.index { background: rgba(100, 200, 220, 0.12); }
+    .feature-icon.observe { background: rgba(240, 200, 100, 0.12); }
+
+    .feature-card h3 {
+      font-size: 1.1875rem;
+      font-weight: 700;
+      margin-bottom: 0.625rem;
+    }
+
+    .feature-card p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.65;
+    }
+
+    .feature-card .metric {
+      display: inline-block;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.25rem 0.625rem;
+      font-size: 0.8125rem;
+      font-family: var(--font-mono);
+      color: var(--accent);
+      margin-top: 0.75rem;
+    }
+
+    /* ── Code demo ── */
+    .code-demo {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .code-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .code-tab {
+      padding: 0.75rem 1.25rem;
+      font-size: 0.8125rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color 0.2s, border-color 0.2s;
+      background: none;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+    }
+
+    .code-tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    .code-tab:hover { color: var(--text-secondary); }
+
+    .code-block {
+      padding: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.8;
+      overflow-x: auto;
+      display: none;
+    }
+
+    .code-block.active { display: block; }
+
+    .code-block .kw { color: #c792ea; }
+    .code-block .fn { color: #82aaff; }
+    .code-block .str { color: #c3e88d; }
+    .code-block .cm { color: #546e7a; }
+    .code-block .num { color: #f78c6c; }
+    .code-block .type { color: #ffcb6b; }
+    .code-block .op { color: #89ddff; }
+
+    /* ── Comparison table ── */
+    .comparison {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .comparison-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 3rem;
+      font-size: 0.9375rem;
+    }
+
+    .comparison-table th,
+    .comparison-table td {
+      text-align: left;
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .comparison-table thead th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .comparison-table thead th:first-child { color: var(--text-secondary); }
+
+    .comparison-table thead th.ferrosa-col {
+      color: var(--accent);
+    }
+
+    .comparison-table tbody td:first-child {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .comparison-table tbody td {
+      color: var(--text-secondary);
+    }
+
+    .comparison-table tbody td.ferrosa-col {
+      color: var(--accent-green);
+      font-weight: 600;
+    }
+
+    .comparison-table tbody tr:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .check { color: var(--accent-green); }
+    .cross { color: var(--text-muted); }
+
+    /* ── Architecture ── */
+    .arch-diagram {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 3rem;
+      margin-top: 3rem;
+      text-align: center;
+    }
+
+    .arch-layers {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      max-width: 700px;
+      margin: 0 auto;
+    }
+
+    .arch-layer {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.5rem;
+      transition: border-color 0.2s;
+    }
+
+    .arch-layer:hover { border-color: var(--accent); }
+
+    .arch-layer-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      min-width: 100px;
+    }
+
+    .arch-layer-items {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .arch-item {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.375rem 0.75rem;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    .arch-arrow {
+      color: var(--text-muted);
+      font-size: 1.25rem;
+      text-align: center;
+    }
+
+    /* ── Use cases ── */
+    .use-cases {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .use-case {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      transition: border-color 0.2s;
+    }
+
+    .use-case:hover { border-color: var(--border-hover); }
+
+    .use-case-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.75rem;
+    }
+
+    .use-case-label.migrate { color: var(--accent); }
+    .use-case-label.cloud { color: var(--accent-secondary); }
+    .use-case-label.graph-uc { color: var(--accent-green); }
+
+    .use-case h3 {
+      font-size: 1.125rem;
+      font-weight: 700;
+      margin-bottom: 0.625rem;
+    }
+
+    .use-case p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.65;
+    }
+
+    /* ── CTA section ── */
+    .cta-section {
+      text-align: center;
+      padding: 6rem 2rem;
+    }
+
+    .cta-section h2 {
+      font-size: clamp(2rem, 4vw, 3rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+
+    .cta-section p {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2.5rem;
+      max-width: 500px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .cta-actions {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 3rem 2rem;
+    }
+
+    footer .footer-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    footer .footer-left {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    footer .footer-links {
+      display: flex;
+      gap: 1.5rem;
+      list-style: none;
+    }
+
+    footer .footer-links a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.875rem;
+      transition: color 0.2s;
+    }
+
+    footer .footer-links a:hover { color: var(--text-secondary); }
+
+    /* ── Beta Banner ── */
+    .beta-banner {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      text-align: center;
+      padding: 0.5rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      position: fixed;
+      top: 64px;
+      width: 100%;
+      z-index: 99;
+    }
+
+    .beta-tag {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 0.125rem 0.5rem;
+      border-radius: 4px;
+      margin-right: 0.375rem;
+      vertical-align: middle;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 768px) {
+      .stats-bar { grid-template-columns: repeat(2, 1fr); }
+      .feature-card.highlight {
+        grid-template-columns: 1fr;
+        gap: 1.5rem;
+      }
+      .features-grid { grid-template-columns: 1fr; }
+      nav .nav-links { display: none; }
+      .beta-banner { top: 64px; font-size: 0.75rem; }
+      .comparison-table { font-size: 0.8125rem; }
+      .comparison-table th,
+      .comparison-table td { padding: 0.75rem 0.75rem; }
+      footer .footer-inner { flex-direction: column; gap: 1rem; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════ Navigation ═══════════════════ -->
+<nav>
+  <div class="nav-inner">
+    <a href="/" class="logo" style="display:flex;align-items:center;gap:0.5rem;">
+      <img src="/favicon.svg" alt="Fe" width="28" height="28">
+      ferro<span>sa</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#compare">Compare</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#use-cases">Use Cases</a></li>
+      <li><a href="#progress">Scaling</a></li>
+      <li><a href="#download">Download</a></li>
+      <li><a href="cypher.html">Cypher</a></li>
+      <li><a href="sparql.html">SPARQL</a></li>
+    </ul>
+    <a href="#get-started" class="nav-cta">Get Started</a>
+  </div>
+</nav>
+
+<div class="beta-banner">
+  <span class="beta-tag">BETA</span> Ferrosa Database is version 0.8.8.8 and in active development.
+</div>
+
+<!-- ═══════════════════ Hero ═══════════════════ -->
+<section class="hero">
+  <div class="hero-badge">
+    <span class="dot"></span>
+    v0.8.8.8 — active development
+  </div>
+  <h1>
+    One database. <span class="gradient">Many workloads.</span><br>
+    AI native. S3-backed.
+  </h1>
+  <p>
+    Search, vectors, graph, SPARQL, transactions, and real-time CDC on the same tables —
+    not separate stores. CQL compatible. Cypher + Bolt v5. SPARQL 1.1.
+    Strict serializable transactions via Accord. Your data lives in S3 — nodes recover
+    in seconds. Rust-native, zero GC pauses. Start on a single node, scale to a full
+    production cluster — same binary, same config, no migration.
+  </p>
+  <div class="hero-actions">
+    <a href="#get-started" class="btn-primary">Get Started</a>
+    <a href="#features" class="btn-secondary">See How It Works</a>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat">
+      <div class="stat-value">0<span class="unit">ms</span></div>
+      <div class="stat-label">GC Pauses</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">&lt;10<span class="unit">s</span></div>
+      <div class="stat-label">Node Recovery</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">1000<span class="unit">x</span></div>
+      <div class="stat-label">Cheaper Point-in-Time Recovery</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">1→N</div>
+      <div class="stat-label">Seamless Scaling</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Problem ═══════════════════ -->
+<div class="problem">
+  <section>
+    <p class="section-label">The Problem</p>
+    <h2 class="section-title">Most of your database bill<br>isn't serving a single query</h2>
+    <p class="section-subtitle">
+      Pull up your cloud bill. Look past the compute, past the live storage.
+      The largest line items are EBS snapshots, cross-region replicas, and backup retention
+      — copies of data that nobody reads, nobody queries, and nobody thinks about until
+      something goes wrong. It's the most expensive insurance policy in your infrastructure,
+      and it scales with every gigabyte you store.
+    </p>
+
+    <div class="pain-points">
+      <div class="pain-card">
+        <div class="pain-icon">💸</div>
+        <h3>Your Backups Cost More Than Your Database</h3>
+        <p>
+          Point-in-time recovery requires EBS snapshots — a full second copy of your dataset
+          that exists only for "just in case." 10 TB with 30-day retention costs $2,250/month
+          in snapshots alone — on top of the $3,000–7,500/month you're already paying for the
+          live EBS volumes. A year of retention? $15,000/month. That's $180,000/year for data
+          you hope you never need to read.
+        </p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">📀</div>
+        <h3>You Pay for Every Byte Three Times</h3>
+        <p>
+          Once on the live EBS volume. Once in EBS snapshots for recovery. Once more if you
+          replicate across regions. At petabyte scale with RF=3, you're storing 3 PB on EBS
+          ($300K/month), snapshotting 3 PB ($150K/month), and none of that snapshot storage
+          serves a single read.
+        </p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">⏱</div>
+        <h3>GC Pauses Kill Your P99</h3>
+        <p>Java's garbage collector causes unpredictable tail latency spikes. No amount of JVM tuning eliminates the problem — it just moves it.</p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">⏳</div>
+        <h3>Hours to Replace a Node</h3>
+        <p>When a node dies, streaming hundreds of gigabytes from replicas takes hours. Your cluster runs degraded the entire time.</p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">🔧</div>
+        <h3>Ops Expertise Required</h3>
+        <p>Compaction tuning, repair scheduling, bootstrap orchestration, heap sizing — Cassandra demands a dedicated team to keep it healthy.</p>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ═══════════════════ Features ═══════════════════ -->
+<section id="features">
+  <p class="section-label centered">Core Capabilities</p>
+  <h2 class="section-title centered">Everything you need.<br>Nothing you don't.</h2>
+  <p class="section-subtitle centered">
+    One database for AI-native workloads. Search, vectors, graph, SPARQL, transactions, and CDC — unified on S3.
+  </p>
+
+  <div class="features-grid">
+    <!-- Point-in-Time Recovery — full width highlight, lead feature -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon s3">☁</div>
+        <h3>Eliminate Your Backup Bill Entirely</h3>
+        <p>
+          That $2,250/month you're spending on EBS snapshots for 10 TB? That $180,000/year
+          insurance policy? Ferrosa makes it $2.30/month. Not because we compress better or
+          found cheaper storage — because the backup step doesn't exist. Your data is already
+          durable in S3. Point-in-time recovery is just keeping commit log segments longer,
+          and S3 Lifecycle rules tier them to Glacier automatically.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          One command sets your retention policy:
+          <code style="font-size: 0.875rem;">ferrosa-ctl storage retention set --years 1</code>.
+          Ferrosa configures S3 Lifecycle rules that tier your archives through Standard,
+          Infrequent Access, and Glacier automatically. A full year of point-in-time recovery
+          costs ~$45/TB — actually cheaper than 3 months without tiering, because data
+          spends most of its life in Deep Archive at $0.00099/GB.
+        </p>
+        <span class="metric">30d recovery: $2.30 vs $2,250 · 1yr: $45/TB · DynamoDB max: 35 days</span>
+      </div>
+      <div style="padding: 1.5rem;">
+        <table style="width: 100%; font-size: 0.8125rem; font-family: var(--font-mono); border-collapse: collapse;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <th style="text-align: left; padding: 0.5rem; color: var(--text-muted); font-weight: 600;">10 TB Recovery</th>
+              <th style="text-align: right; padding: 0.5rem; color: var(--text-muted); font-weight: 600;">Cassandra</th>
+              <th style="text-align: right; padding: 0.5rem; color: var(--accent); font-weight: 600;">Ferrosa</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <td style="padding: 0.5rem; color: var(--text-secondary);">7 days</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$525/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$0.55/mo</td>
+            </tr>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <td style="padding: 0.5rem; color: var(--text-secondary);">30 days</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$2,250/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$2.30/mo</td>
+            </tr>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <td style="padding: 0.5rem; color: var(--text-secondary);">1 year</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$15,000/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$3.75/mo</td>
+            </tr>
+            <tr>
+              <td style="padding: 0.5rem; color: var(--text-secondary);">3 years</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$30,000/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$5.20/mo</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.75rem; text-align: center;">
+          Cassandra: EBS snapshots at $0.05/GB, 5% daily change rate, RF=3.
+          Ferrosa: S3 Lifecycle tiered commit log retention.
+        </p>
+      </div>
+    </div>
+
+    <!-- S3 Storage — full width highlight -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon s3">☁</div>
+        <h3>S3-Backed Storage</h3>
+        <p>
+          Durable storage lives in S3. Local NVMe is a hot cache, not a commitment.
+          Nodes are ephemeral — lose one, spin up a replacement, and it's serving reads
+          from S3 in seconds instead of streaming for hours.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          NVMe is a bounded cache layer, S3 is the unbounded durable store. Data that doesn't
+          fit on NVMe lives in S3 and gets pulled through on demand. The
+          <code style="font-size: 0.875rem;">local_cache_max_bytes</code> config controls how much
+          NVMe is used. Size your local disks for your working set, not your total dataset.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          Point-in-time recovery retention is one command:
+          <code style="font-size: 0.875rem;">ferrosa-ctl storage retention set --years 1</code>.
+          Ferrosa configures S3 Lifecycle rules that tier your commit log archives through
+          Standard, Infrequent Access, and Glacier automatically. A full year of point-in-time
+          recovery costs ~$45/TB — cheaper than 3 months without tiering. Cold SSTables transition to
+          cheaper storage classes automatically while staying instantly readable through
+          the block cache — 66% savings on storage with zero performance impact.
+          Node retirement is just as simple: decommission a node and its S3 objects are
+          tagged for cleanup.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
+          No vendor lock-in.
+        </p>
+        <span class="metric">S3: ~$0.023/GB/mo · 1yr recovery: ~$45/TB · SSTable tiering: 66% savings</span>
+      </div>
+      <div class="arch-diagram" style="margin-top: 0; border: none; background: var(--bg-primary);">
+        <div class="arch-layers">
+          <div class="arch-layer">
+            <span class="arch-layer-label">Write</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">Commit Log</span>
+              <span class="arch-item">→ Memtable</span>
+              <span class="arch-item">→ ACK</span>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <span class="arch-layer-label">Flush</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">Memtable</span>
+              <span class="arch-item">→ SSTable (local)</span>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <span class="arch-layer-label">Upload</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">SSTable</span>
+              <span class="arch-item">→ S3 (async)</span>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <span class="arch-layer-label">Read</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">Cache hit?</span>
+              <span class="arch-item">→ local NVMe</span>
+              <span class="arch-item">→ S3 fallback</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rust -->
+    <div class="feature-card">
+      <div class="feature-icon rust">⚙</div>
+      <h3>Rust-Native Performance</h3>
+      <p>
+        No JVM. No garbage collector. No stop-the-world pauses.
+        Lock-free reads via ArcSwap, sharded memtables with nanosecond-level write locks,
+        async I/O on Tokio. Predictable latency from the first request to the billionth.
+      </p>
+      <span class="metric">P99 latency: no GC tail</span>
+    </div>
+
+    <!-- CQL -->
+    <div class="feature-card">
+      <div class="feature-icon cql">⌨</div>
+      <h3>Drop-In CQL Compatibility</h3>
+      <p>
+        CQL protocol v4 and v5 — the same wire protocol your drivers already speak.
+        Python, Java, Go, Rust (cdrs-tokio), and Node.js drivers connect without code changes.
+        DDL, DML, prepared statements, batch operations, lightweight transactions
+        (IF NOT EXISTS, IF conditions), system keyspaces, ALLOW FILTERING,
+        toJson(), counter increment/decrement, collection types (map, set, list)
+        with full UPDATE +/- operators and collection bind values in prepared statements — all there.
+      </p>
+      <span class="metric">CQL v4/v5 · Bolt v5 · SPARQL 1.1 · 0 driver changes required</span>
+    </div>
+
+    <!-- Graph -->
+    <div class="feature-card">
+      <div class="feature-icon graph">◈</div>
+      <h3>Graph Engine: Cypher + SPARQL</h3>
+      <p>
+        Full Cypher and SPARQL 1.1 query engines on your CQL tables. No separate graph database.
+        Vertices and edges are normal tables with schema extensions.
+        Variable-length paths, aggregations, expression evaluation,
+        and worst-case optimal joins via leapfrog triejoin for cyclic pattern matching.
+        Bolt v5 wire protocol for Neo4j drivers, HTTP/JSON for Cypher, and
+        W3C SPARQL Protocol for semantic web and RDF workloads.
+      </p>
+      <span class="metric">Cypher · SPARQL 1.1 · Bolt v5 · HTTP/JSON · RDF* · property paths</span>
+    </div>
+
+    <!-- Real-time pub/sub — key differentiator, full width -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon" style="background: rgba(240, 160, 100, 0.12);">⚡</div>
+        <h3>Built-In Pub/Sub &amp; CDC</h3>
+        <p>
+          SUBSCRIBE to any CQL or Cypher query for real-time change streaming.
+          Interval polling with EVERY, or push-on-write with DELTA mode.
+          No external Kafka, Debezium, or CDC connector pipeline needed —
+          change data capture is built into the storage engine.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          Fully backward compatible with existing CQL drivers. Subscribe to
+          tables, graph traversals, or observability views with the same syntax.
+        </p>
+        <span class="metric">SUBSCRIBE social.users EVERY 5s</span>
+      </div>
+      <div class="code-demo" style="margin: 0; border: none;">
+        <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Poll for changes every 5 seconds</span>
+<span class="kw">SUBSCRIBE</span> social.users <span class="kw">EVERY</span> <span class="num">5</span>s;
+
+<span class="cm">-- Push changes as they happen</span>
+<span class="kw">SUBSCRIBE</span> social.users <span class="kw">DELTA</span>;
+
+<span class="cm">-- Subscribe to a graph traversal</span>
+<span class="kw">SUBSCRIBE</span> <span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>]->(b)
+<span class="kw">RETURN</span> b.name <span class="kw">EVERY</span> <span class="num">10</span>s;</pre>
+      </div>
+    </div>
+
+    <!-- Secondary Indexes — full width highlight -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon index">◎</div>
+        <h3>11 Built-In Index Types</h3>
+        <p>
+          Eleven index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
+          composite for multi-column queries, phonetic for fuzzy string matching (Soundex,
+          Metaphone, Double Metaphone, Caverphone), two vector methods for approximate nearest
+          neighbor search, filtered indexes with predicates, and <strong>full-text search</strong> with
+          BM25 ranked retrieval. Native <code>vector&lt;float, N&gt;</code> CQL type
+          for embedding storage — store and query high-dimensional vectors directly.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          Indexes are storage-attached — built asynchronously after SSTable flush with zero
+          impact on the write path. Full-text indexes use inverted-index sidecar files with
+          a pluggable analyzer pipeline (tokenizer, stop words, Porter stemmer).
+          Per-index staleness tracking and operational metrics
+          via <code>system_views.secondary_indexes</code> let you monitor build progress
+          and lag in real time. CQL-compatible DDL with standard <code>CREATE INDEX ... USING 'type'</code> syntax.
+        </p>
+        <span class="metric">B-tree · Hash · Composite · Phonetic · Filtered · Vector (HNSW) · Vector (IVFFlat) · Full-Text</span>
+      </div>
+      <div class="code-demo" style="margin: 0; border: none;">
+        <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- B-tree index for range queries</span>
+<span class="kw">CREATE INDEX</span> idx_email <span class="kw">ON</span> users (email)
+  <span class="kw">USING</span> <span class="str">'btree'</span>;
+
+<span class="cm">-- Phonetic index for fuzzy name matching</span>
+<span class="kw">CREATE INDEX</span> idx_name <span class="kw">ON</span> users (last_name)
+  <span class="kw">USING</span> <span class="str">'phonetic'</span>
+  <span class="kw">WITH OPTIONS</span> = {<span class="str">'algorithm'</span>: <span class="str">'double_metaphone'</span>};
+
+<span class="cm">-- Vector index for ANN search</span>
+<span class="kw">CREATE INDEX</span> idx_embed <span class="kw">ON</span> documents (embedding)
+  <span class="kw">USING</span> <span class="str">'vector'</span>
+  <span class="kw">WITH OPTIONS</span> = {<span class="str">'method'</span>: <span class="str">'hnsw'</span>,
+    <span class="str">'metric'</span>: <span class="str">'cosine'</span>, <span class="str">'dimensions'</span>: <span class="str">'768'</span>};
+
+<span class="cm">-- Full-text search with BM25 ranking</span>
+<span class="kw">CREATE INDEX</span> idx_body <span class="kw">ON</span> articles (body)
+  <span class="kw">USING</span> <span class="str">'fulltext'</span>;
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> articles
+  <span class="kw">WHERE</span> fts_match(body, <span class="str">'distributed AND database'</span>);
+
+<span class="cm">-- Nearest neighbor query</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> documents
+  <span class="kw">ORDER BY</span> embedding <span class="kw">ANN OF</span> [<span class="num">0.1</span>, <span class="num">0.2</span>, ...]
+  <span class="kw">LIMIT</span> <span class="num">10</span>;</pre>
+      </div>
+    </div>
+
+    <!-- Accord Transactions — full width highlight -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon" style="background: rgba(200, 130, 240, 0.12);">⛨</div>
+        <h3>Strict Serializable Transactions</h3>
+        <p>
+          Distributed transactions with strict serializability via the Accord consensus protocol —
+          not Paxos, not 2PC. Multi-partition atomic operations with all-or-nothing semantics.
+          INSERT IF NOT EXISTS, UPDATE/DELETE IF conditions, and batch compare-and-set
+          all work out of the box. Cross-shard transactions coordinate automatically.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          1-RTT fast path through leaseholder for low-latency commits. 2-RTT slow path
+          when coordination is needed. Crash recovery via protocol log replay with
+          .accord sidecar files. Dynamic electorate reconfiguration with a 4-gate join
+          protocol for safe membership changes.
+        </p>
+        <span class="metric">Accord protocol · strict serializable · 1-RTT fast path · Jepsen-verified</span>
+        <p style="margin-top: 0.75rem; font-size: 0.875rem; color: var(--text-secondary);">Verified with Jepsen-style chaos testing across partition, kill, pause, and clock-skew fault injection.</p>
+      </div>
+      <div class="code-demo" style="margin: 0; border: none;">
+        <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Lightweight transactions (Cassandra-compatible)</span>
+<span class="kw">INSERT INTO</span> accounts (id, balance)
+<span class="kw">VALUES</span> (<span class="str">'acct-1'</span>, <span class="num">1000</span>)
+<span class="kw">IF NOT EXISTS</span>;
+
+<span class="cm">-- Conditional update with compare-and-set</span>
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = <span class="num">900</span>
+<span class="kw">WHERE</span> id = <span class="str">'acct-1'</span>
+<span class="kw">IF</span> balance = <span class="num">1000</span>;
+
+<span class="cm">-- Multi-statement transaction</span>
+<span class="kw">BEGIN TRANSACTION</span>
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="num">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-1'</span> <span class="kw">IF</span> balance >= <span class="num">100</span>;
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance + <span class="num">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-2'</span>;
+<span class="kw">COMMIT TRANSACTION</span>;</pre>
+      </div>
+    </div>
+
+    <!-- NVMe Table Pinning -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(120, 200, 255, 0.12);">⚙</div>
+      <h3>NVMe Table Pinning</h3>
+      <p>
+        Pin hot tables to local NVMe for sub-millisecond reads. A single table attribute
+        (<code>storage.pin = nvme</code>) keeps SSTables on local disk, bypassing S3 entirely.
+        Ideal for session caches, materialized views, and lookup tables that tolerate node loss.
+        Optional <code>pin_max_bytes</code> cap evicts oldest SSTables when the budget is exceeded.
+        <code>ALTER TABLE</code> toggles pin mode on live tables — unpinning automatically uploads
+        existing SSTables to S3.
+      </p>
+      <span class="metric">sub-ms reads · per-table config · max_bytes cap · ALTER TABLE toggle</span>
+    </div>
+
+    <!-- Full-Text Search -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(255, 200, 100, 0.12);">🔍</div>
+      <h3>Full-Text Search</h3>
+      <p>
+        Built-in inverted index with BM25 ranked retrieval — no external search engine needed.
+        Create a full-text index on any text column and query with boolean operators
+        (AND, OR, NOT), phrase matching, and prefix wildcards. Pluggable analyzer pipeline:
+        tokenizer, stop-word filter, Porter stemmer. Sidecar index files are built on flush
+        and merged during compaction — zero write-path overhead.
+      </p>
+      <span class="metric">BM25 ranking · AND/OR/NOT/prefix · pluggable analyzers · zero write overhead</span>
+    </div>
+
+    <!-- Lock-free -->
+    <div class="feature-card">
+      <div class="feature-icon lock">⚡</div>
+      <h3>Lock-Free Architecture</h3>
+      <p>
+        Readers never block. ArcSwap provides wait-free atomic view loading.
+        Writers touch sharded memtables for nanoseconds. No global locks, no contention,
+        no coordination overhead on the hot path.
+      </p>
+      <span class="metric">wait-free reads · zero contention</span>
+    </div>
+
+    <!-- Observability -->
+    <div class="feature-card">
+      <div class="feature-icon observe">📊</div>
+      <h3>Built-In Observability</h3>
+      <p>
+        Self-hosted distributed tracing, metrics, and query analysis — no external
+        tools required. 25+ tracing spans across CQL, consensus, storage, and network
+        paths. Slow query detection with parameterized logging. Query fingerprint
+        tracking for automatic optimization recommendations. Per-client billing
+        metering. On-demand flame charts for CPU hot path analysis. All data in
+        <code>system_observability</code> virtual tables, queryable via standard CQL.
+        Optional OTLP export for enterprise monitoring stacks.
+      </p>
+      <span class="metric">25+ spans · slow query log · query fingerprints · billing metering · flame charts · OTLP export</span>
+    </div>
+
+    <!-- Production Cluster -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(140, 200, 120, 0.12);">⛨</div>
+      <h3>Production Cluster Mode</h3>
+      <p>
+        5-node clusters with Raft consensus, 8 tunable consistency levels (ONE through ALL,
+        LOCAL_ONE, LOCAL_QUORUM, EACH_QUORUM), and hinted handoff for replica failure recovery.
+        Operator-controlled node join with approval gate, graceful decommission with streaming
+        protocol, and skew-aware token rebalancing. Background maintenance handles auto-flush,
+        compaction, and commit log GC. Ships as a systemd service with .deb packaging
+        and Docker Compose support.
+      </p>
+      <span class="metric">Raft · tunable CL · hinted handoff · token rebalancing</span>
+    </div>
+
+    <!-- Reconnection & Resilience -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(100, 200, 220, 0.12);">↻</div>
+      <h3>Reconnection &amp; Resilience</h3>
+      <p>
+        Automatic reconnection with exponential backoff for internode links. Graceful drain
+        with configurable timeout ensures in-flight requests complete before shutdown.
+        Connection drop detection and per-connection request limiting provide backpressure
+        under load. Production-quality code built to handle real-world failure scenarios.
+      </p>
+      <span class="metric">auto-reconnect · graceful drain · backpressure</span>
+    </div>
+
+    <!-- Hinted Handoff -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(107, 201, 160, 0.12);">📋</div>
+      <h3>Hinted Handoff</h3>
+      <p>
+        When a replica is temporarily unavailable, writes are stored as hints and replayed
+        automatically when the node recovers. Configurable hint window and TTL ensure data
+        consistency without manual repair for transient failures.
+      </p>
+      <span class="metric">auto hint storage · replay on recovery</span>
+    </div>
+
+    <!-- Node Lifecycle -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(244, 162, 97, 0.12);">🔄</div>
+      <h3>Node Lifecycle Management</h3>
+      <p>
+        Operator-controlled join with approval gate prevents accidental cluster changes.
+        Graceful decommission streams data to remaining nodes before removal. Token
+        rebalancing with skew-aware algorithm redistributes load evenly across the ring.
+      </p>
+      <span class="metric">join · decommission · rebalance</span>
+    </div>
+
+    <!-- Prometheus Metrics -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(240, 200, 100, 0.12);">📈</div>
+      <h3>Prometheus Metrics</h3>
+      <p>
+        Native <code>/metrics</code> endpoint exposes cluster health, query latencies,
+        storage utilization, and connection counts in Prometheus format. No sidecar exporter
+        needed — scrape directly from each Ferrosa node. Integrates with Grafana, Datadog,
+        and any Prometheus-compatible monitoring stack.
+      </p>
+      <span class="metric">native /metrics · no exporter · Grafana-ready</span>
+    </div>
+
+    <!-- WASM User-Defined Functions -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(180, 130, 255, 0.12);">&#x2699;</div>
+      <h3>WebAssembly Functions</h3>
+      <p>
+        User-defined functions execute as sandboxed WebAssembly — no Java, no JavaScript.
+        Upload a compiled WASM binary to a table, reference it in CREATE FUNCTION with an AS clause.
+        Write functions in Rust (preferred), C, Go, or any language that compiles to WASM.
+        Full Wasmtime integration with WIT contract, compilation caching, and sandbox enforcement.
+        Memory-limited, CPU-time-limited, no network or filesystem access. Deterministic execution guaranteed.
+      </p>
+      <span class="metric">WASM sandbox · WIT contract · Wasmtime compilation · moka cache · UDF + UDA</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Code Demo ═══════════════════ -->
+<section>
+  <p class="section-label centered">See It In Action</p>
+  <h2 class="section-title centered">Same CQL. Same drivers.<br>Better everything else.</h2>
+  <p class="section-subtitle centered" style="margin-bottom: 3rem;">
+    Your existing application code works unchanged. Just point your driver at Ferrosa.
+  </p>
+
+  <div class="code-demo">
+    <div class="code-tabs">
+      <button class="code-tab active" onclick="showTab('cql')">CQL</button>
+      <button class="code-tab" onclick="showTab('cypher')">Cypher</button>
+      <button class="code-tab" onclick="showTab('sparql')">SPARQL</button>
+      <button class="code-tab" onclick="showTab('indexes')">Indexes</button>
+      <button class="code-tab" onclick="showTab('python')">Python Driver</button>
+      <button class="code-tab" onclick="showTab('observe')">Observability</button>
+    </div>
+
+    <pre class="code-block active" id="tab-cql"><span class="cm">-- Create a keyspace with S3-backed replication</span>
+<span class="kw">CREATE KEYSPACE</span> <span class="type">social</span> <span class="kw">WITH</span> replication = {
+  <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>,
+  <span class="str">'replication_factor'</span>: <span class="num">3</span>
+};
+
+<span class="cm">-- Tables work exactly like Cassandra</span>
+<span class="kw">CREATE TABLE</span> <span class="type">social.users</span> (
+  user_id <span class="type">uuid</span> <span class="kw">PRIMARY KEY</span>,
+  name <span class="type">text</span>,
+  email <span class="type">text</span>,
+  created_at <span class="type">timestamp</span>
+);
+
+<span class="cm">-- Inserts, selects, updates — all standard CQL</span>
+<span class="kw">INSERT INTO</span> social.users (user_id, name, email, created_at)
+<span class="kw">VALUES</span> (<span class="fn">uuid()</span>, <span class="str">'Alice'</span>, <span class="str">'alice@example.com'</span>, <span class="fn">toTimestamp</span>(<span class="fn">now()</span>));
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> social.users <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="num">?</span>;</pre>
+
+    <pre class="code-block" id="tab-cypher"><span class="cm">-- Graph queries on the same data — no separate database</span>
+<span class="cm">-- Mark tables as graph entities via schema extensions</span>
+
+<span class="kw">ALTER TABLE</span> social.users
+  <span class="kw">WITH</span> extensions = {<span class="str">'graph.type'</span>: <span class="str">'vertex'</span>, <span class="str">'graph.label'</span>: <span class="str">'Person'</span>};
+
+<span class="kw">ALTER TABLE</span> social.follows
+  <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'FOLLOWS'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'Person'</span>
+  };
+
+<span class="cm">-- Then query with Cypher via HTTP/JSON endpoint</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">RETURN</span> b.name, b.email;
+
+<span class="cm">-- Multi-hop: friends of friends</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>*<span class="num">2</span>]->(c:<span class="type">Person</span>)
+<span class="kw">WHERE</span> a.name <span class="op">=</span> <span class="str">'Alice'</span>
+<span class="kw">RETURN DISTINCT</span> c.name;</pre>
+
+    <pre class="code-block" id="tab-sparql"><span class="cm"># SPARQL 1.1 — semantic queries on the same data</span>
+<span class="cm"># W3C standard for RDF, knowledge graphs, and provenance</span>
+
+<span class="kw">PREFIX</span> foaf: &lt;<span class="str">http://xmlns.com/foaf/0.1/</span>&gt;
+
+<span class="cm"># Find all people and who they know</span>
+<span class="kw">SELECT</span> ?person ?friend
+<span class="kw">WHERE</span> {
+  ?person foaf:name ?name .
+  ?person foaf:knows ?friend .
+}
+<span class="kw">ORDER BY</span> ?name <span class="kw">LIMIT</span> <span class="num">20</span>
+
+<span class="cm"># Property paths — transitive closure (who can Alice reach?)</span>
+<span class="kw">SELECT DISTINCT</span> ?reachable
+<span class="kw">WHERE</span> {
+  &lt;<span class="str">http://example.org/alice</span>&gt; foaf:knows+ ?reachable .
+}
+
+<span class="cm"># RDF* annotations — provenance on edges</span>
+<span class="kw">SELECT</span> ?who ?confidence
+<span class="kw">WHERE</span> {
+  &lt;&lt; ?s foaf:knows ?o &gt;&gt; &lt;<span class="str">http://example.org/confidence</span>&gt; ?confidence .
+  <span class="kw">FILTER</span>(?confidence &gt; <span class="num">0.8</span>)
+}
+
+<span class="cm"># INSERT DATA — write triples via SPARQL Update</span>
+<span class="kw">INSERT DATA</span> {
+  &lt;<span class="str">http://example.org/bob</span>&gt; foaf:name <span class="str">"Bob"</span> .
+  &lt;<span class="str">http://example.org/bob</span>&gt; foaf:knows &lt;<span class="str">http://example.org/alice</span>&gt; .
+}</pre>
+
+    <pre class="code-block" id="tab-indexes"><span class="cm">-- B-tree index for sorted range queries</span>
+<span class="kw">CREATE INDEX</span> idx_email <span class="kw">ON</span> <span class="type">social.users</span> (email) <span class="kw">USING</span> <span class="str">'btree'</span>;
+
+<span class="cm">-- Hash index for O(1) equality lookups</span>
+<span class="kw">CREATE INDEX</span> idx_uid <span class="kw">ON</span> <span class="type">social.users</span> (user_id) <span class="kw">USING</span> <span class="str">'hash'</span>;
+
+<span class="cm">-- Composite index on multiple columns</span>
+<span class="kw">CREATE INDEX</span> idx_name <span class="kw">ON</span> <span class="type">social.users</span> (last_name, first_name)
+  <span class="kw">USING</span> <span class="str">'composite'</span>;
+
+<span class="cm">-- Phonetic index — fuzzy name matching</span>
+<span class="kw">CREATE INDEX</span> idx_snd <span class="kw">ON</span> <span class="type">social.users</span> (last_name)
+  <span class="kw">USING</span> <span class="str">'phonetic'</span>
+  <span class="kw">WITH OPTIONS</span> <span class="op">=</span> {<span class="str">'algorithm'</span>: <span class="str">'double_metaphone'</span>};
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> social.users <span class="kw">WHERE</span> last_name <span class="kw">SOUNDS LIKE</span> <span class="str">'Smith'</span>;
+
+<span class="cm">-- Filtered index — partial index over a row subset</span>
+<span class="kw">CREATE INDEX</span> idx_active <span class="kw">ON</span> <span class="type">social.users</span> (email) <span class="kw">USING</span> <span class="str">'btree'</span>
+  <span class="kw">WHERE</span> status <span class="op">=</span> <span class="str">'active'</span>;
+
+<span class="cm">-- Vector index with HNSW for ANN search</span>
+<span class="kw">CREATE INDEX</span> idx_embed <span class="kw">ON</span> <span class="type">docs.articles</span> (embedding)
+  <span class="kw">USING</span> <span class="str">'vector'</span>
+  <span class="kw">WITH OPTIONS</span> <span class="op">=</span> {<span class="str">'method'</span>: <span class="str">'hnsw'</span>, <span class="str">'metric'</span>: <span class="str">'cosine'</span>,
+    <span class="str">'dimensions'</span>: <span class="str">'768'</span>, <span class="str">'m'</span>: <span class="str">'16'</span>, <span class="str">'ef_construction'</span>: <span class="str">'200'</span>};
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> docs.articles
+  <span class="kw">ORDER BY</span> embedding <span class="kw">ANN OF</span> [<span class="num">0.1</span>, <span class="num">0.2</span>, ...]
+  <span class="kw">LIMIT</span> <span class="num">10</span>;
+
+<span class="cm">-- Monitor index health</span>
+<span class="kw">SELECT</span> index_name, status, lag_seconds
+  <span class="kw">FROM</span> system_views.secondary_indexes;</pre>
+
+    <pre class="code-block" id="tab-python"><span class="cm"># Your existing Python code — just change the contact point</span>
+<span class="kw">from</span> cassandra.cluster <span class="kw">import</span> Cluster
+
+<span class="cm"># Before: Cassandra</span>
+<span class="cm"># cluster = Cluster(['cassandra-node-1.prod'])</span>
+
+<span class="cm"># After: Ferrosa — same driver, same API</span>
+cluster = Cluster([<span class="str">'ferrosa-node-1.prod'</span>])
+session = cluster.connect(<span class="str">'social'</span>)
+
+<span class="cm"># Prepared statements work identically</span>
+stmt = session.prepare(<span class="str">"""
+    SELECT name, email FROM users WHERE user_id = ?
+"""</span>)
+
+user = session.execute(stmt, [user_id])
+<span class="fn">print</span>(user.one().name)
+
+<span class="cm"># Batch operations, async queries, retry policies —</span>
+<span class="cm"># everything your driver supports works unchanged.</span></pre>
+
+    <pre class="code-block" id="tab-observe"><span class="cm">-- Self-hosted observability via CQL virtual tables</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.cql_stats;
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.slow_queries;
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.query_fingerprints;
+
+<span class="cm">-- Find queries causing full table scans</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.full_scan_reasons;
+
+<span class="cm">-- Per-client billing metering</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.client_usage;
+
+<span class="cm">-- Distributed traces (self-hosted, no Jaeger needed)</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.spans
+  <span class="kw">WHERE</span> trace_id <span class="op">=</span> <span class="str">?</span>;
+
+<span class="cm">-- Prometheus metrics at /metrics, CLI: ferrosa-ctl monitor (TUI)</span>
+<span class="cm">-- WebSocket push: ws://host:9090/api/ws (subscribe/unsubscribe)</span></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ Comparison ═══════════════════ -->
+<div class="comparison" id="compare">
+  <section>
+    <p class="section-label centered">How We Compare</p>
+    <h2 class="section-title centered">Ferrosa vs. the alternatives</h2>
+    <p class="section-subtitle centered">
+      Search, vectors, graph, SPARQL, transactions, CDC. One database. AI native.
+    </p>
+
+    <table class="comparison-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th class="ferrosa-col">Ferrosa</th>
+          <th>Cassandra</th>
+          <th>ScyllaDB</th>
+          <th>DynamoDB</th>
+          <th>Keyspaces</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Language</td>
+          <td class="ferrosa-col">Rust</td>
+          <td>Java</td>
+          <td>C++</td>
+          <td>Proprietary</td>
+          <td>Managed</td>
+        </tr>
+        <tr>
+          <td>GC Pauses</td>
+          <td class="ferrosa-col">None</td>
+          <td>Yes (JVM)</td>
+          <td>None</td>
+          <td>N/A</td>
+          <td>N/A</td>
+        </tr>
+        <tr>
+          <td>Memory Safety</td>
+          <td class="ferrosa-col">Guaranteed</td>
+          <td>GC-managed</td>
+          <td>Manual (C++)</td>
+          <td>N/A</td>
+          <td>N/A</td>
+        </tr>
+        <tr>
+          <td>CQL Compatible</td>
+          <td class="ferrosa-col"><span class="check">✓</span> v4/v5</td>
+          <td><span class="check">✓</span></td>
+          <td><span class="check">✓</span></td>
+          <td><span class="cross">✗</span></td>
+          <td>Partial</td>
+        </tr>
+        <tr>
+          <td>S3-Native Storage</td>
+          <td class="ferrosa-col"><span class="check">✓</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Graph Queries</td>
+          <td class="ferrosa-col"><span class="check">✓</span> Cypher + Bolt</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Vector Search</td>
+          <td class="ferrosa-col"><span class="check">✓</span> HNSW + IVFFlat</td>
+          <td>SAI (limited)</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Full-Text Search</td>
+          <td class="ferrosa-col"><span class="check">✓</span> BM25 + analyzers</td>
+          <td>SASI (deprecated)</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>NVMe Table Pinning</td>
+          <td class="ferrosa-col"><span class="check">✓</span> per-table</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td>DAX (cache)</td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Secondary Indexes</td>
+          <td class="ferrosa-col">11 types (incl. FTS)</td>
+          <td>SAI / 2i</td>
+          <td>SI</td>
+          <td>GSI / LSI</td>
+          <td>GSI</td>
+        </tr>
+        <tr>
+          <td>Real-Time Pub/Sub</td>
+          <td class="ferrosa-col"><span class="check">✓</span> SUBSCRIBE</td>
+          <td>CDC (external)</td>
+          <td>CDC (external)</td>
+          <td>DynamoDB Streams</td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>UDF Language</td>
+          <td class="ferrosa-col"><span class="check">✓</span> WASM</td>
+          <td>Java</td>
+          <td>Lua / WASM</td>
+          <td>N/A</td>
+          <td>N/A</td>
+        </tr>
+        <tr>
+          <td>Built-in Observability</td>
+          <td class="ferrosa-col"><span class="check">✓</span> CQL + TUI + Web + WS</td>
+          <td>JMX/nodetool</td>
+          <td>Prometheus</td>
+          <td>CloudWatch</td>
+          <td>CloudWatch</td>
+        </tr>
+        <tr>
+          <td>Production Ops</td>
+          <td class="ferrosa-col">Hinted handoff, auto-reconnect, graceful drain, token rebalance, systemd</td>
+          <td>Manual (nodetool)</td>
+          <td>Manual + Operator</td>
+          <td>Managed</td>
+          <td>Managed</td>
+        </tr>
+        <tr>
+          <td>Transactions</td>
+          <td class="ferrosa-col"><span class="check">✓</span> Accord (strict serializable)</td>
+          <td>LWT (Paxos)</td>
+          <td>LWT (Paxos)</td>
+          <td>ACID (single-table)</td>
+          <td>LWT (Paxos)</td>
+        </tr>
+        <tr>
+          <td>Consensus</td>
+          <td class="ferrosa-col">Raft + Accord</td>
+          <td>Paxos (Accord in 5.x)</td>
+          <td>Paxos (Pegasus)</td>
+          <td>N/A (managed)</td>
+          <td>N/A (managed)</td>
+        </tr>
+        <tr>
+          <td>Node Recovery</td>
+          <td class="ferrosa-col">Seconds</td>
+          <td>Hours</td>
+          <td>Hours</td>
+          <td>Automatic</td>
+          <td>Automatic</td>
+        </tr>
+        <tr>
+          <td>Storage Cost (PB)</td>
+          <td class="ferrosa-col">~$23K/mo (tiered: ~$8K)</td>
+          <td>~$100–250K/mo</td>
+          <td>~$100–250K/mo</td>
+          <td>~$250K/mo</td>
+          <td>~$250K/mo</td>
+        </tr>
+        <tr>
+          <td>Recovery Cost (PB, 30d)</td>
+          <td class="ferrosa-col">~$2/mo (commit log only)</td>
+          <td>~$150K/mo (EBS snapshots)</td>
+          <td>~$150K/mo (EBS snapshots)</td>
+          <td>~$250K/mo (on-demand)</td>
+          <td>~$250K/mo (on-demand)</td>
+        </tr>
+        <tr>
+          <td>Recovery Cost (PB, 1yr)</td>
+          <td class="ferrosa-col">~$45/mo (Glacier tiered)</td>
+          <td>~$500K+/mo</td>
+          <td>~$500K+/mo</td>
+          <td>N/A (35 days max)</td>
+          <td>N/A (35 days max)</td>
+        </tr>
+        <tr>
+          <td>Vendor Lock-In</td>
+          <td class="ferrosa-col">None</td>
+          <td>None</td>
+          <td>Cloud tier</td>
+          <td>Full (AWS)</td>
+          <td>Full (AWS)</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+</div>
+
+<!-- ═══════════════════ Architecture ═══════════════════ -->
+<section id="architecture">
+  <p class="section-label centered">Under the Hood</p>
+  <h2 class="section-title centered">Modular Rust crates.<br>Compose what you need.</h2>
+  <p class="section-subtitle centered">
+    Each layer is an independent, tested crate. Use the full stack or embed individual components.
+  </p>
+
+  <div class="arch-diagram">
+    <div class="arch-layers">
+      <div class="arch-layer">
+        <span class="arch-layer-label">Protocol</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">ferrosa-cql</span>
+          <span class="arch-item">ferrosa-net</span>
+          <span class="arch-item">Graph HTTP + Bolt</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Observe</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">system_observability</span>
+          <span class="arch-item">/metrics (Prometheus)</span>
+          <span class="arch-item">REST API + WebSocket</span>
+          <span class="arch-item">ferrosa-ctl TUI</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Query</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">CQL Parser</span>
+          <span class="arch-item">ferrosa-graph</span>
+          <span class="arch-item">Prepared Cache</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Schema</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">ferrosa-schema</span>
+          <span class="arch-item">RBAC</span>
+          <span class="arch-item">Graph Extensions</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Index</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">ferrosa-index</span>
+          <span class="arch-item">B-tree / Hash</span>
+          <span class="arch-item">Composite / Phonetic</span>
+          <span class="arch-item">Vector (HNSW / IVFFlat)</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Storage</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">Memtable</span>
+          <span class="arch-item">Commit Log</span>
+          <span class="arch-item">SSTable (BTI)</span>
+          <span class="arch-item">Compaction (STCS / UCS)</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Durability</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">Local NVMe Cache</span>
+          <span class="arch-item">S3 / MinIO / R2</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Cluster</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">ferrosa-cluster</span>
+          <span class="arch-item">Single / Pair / Full Cluster</span>
+          <span class="arch-item">Raft (openraft)</span>
+          <span class="arch-item">Accord Transactions</span>
+          <span class="arch-item">Tunable CL</span>
+          <span class="arch-item">Hinted Handoff</span>
+          <span class="arch-item">Token Ring</span>
+          <span class="arch-item">Coordinator</span>
+          <span class="arch-item">Streaming</span>
+          <span class="arch-item">Token Rebalancing</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Use Cases ═══════════════════ -->
+<section id="use-cases">
+  <p class="section-label centered">Built For</p>
+  <h2 class="section-title centered">From migration to greenfield</h2>
+
+  <div class="use-cases">
+    <div class="use-case">
+      <p class="use-case-label migrate">Migration</p>
+      <h3>CQL compatible — no rewriting</h3>
+      <p>
+        Same CQL protocol, same drivers, same consistency model. Import existing SSTables directly.
+        Migrate one keyspace at a time with dual-read verification. Your application never knows the difference.
+      </p>
+    </div>
+    <div class="use-case">
+      <p class="use-case-label cloud">Scale Seamlessly</p>
+      <h3>Dev to production without re-architecting</h3>
+      <p>
+        Start with a single node on your laptop. Add a second node for high availability
+        with automatic pair mode. Scale to 3+ nodes and Ferrosa forms a full production cluster with
+        Raft consensus, tunable consistency levels, hinted handoff, and node lifecycle
+        management. Same binary, same config format — just add nodes.
+      </p>
+    </div>
+    <div class="use-case">
+      <p class="use-case-label graph-uc">Graph + Relational</p>
+      <h3>One database for tables and relationships</h3>
+      <p>
+        Stop running separate databases for each workload. Ferrosa speaks CQL for your transactional workloads
+        and Cypher for graph traversals — same tables, same cluster, same operational surface.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Scaling ═══════════════════ -->
+<div class="comparison" id="progress">
+  <section>
+    <p class="section-label centered">Grow With You</p>
+    <h2 class="section-title centered">One binary. Every scale.</h2>
+    <p class="section-subtitle centered">
+      Start on your laptop, ship to production. No re-architecture, no migration between tiers.
+      The same Ferrosa binary handles every stage of your growth.
+    </p>
+
+    <div class="use-cases" style="margin-top: 3rem;">
+      <div class="use-case">
+        <p class="use-case-label migrate">1 Node</p>
+        <h3>Development &amp; prototyping</h3>
+        <p>
+          Run a single Ferrosa node locally. Full CQL compatibility, graph queries, and SUBSCRIBE
+          all work out of the box. No cluster setup, no coordination overhead.
+          Your application code stays exactly the same as you scale up.
+        </p>
+      </div>
+      <div class="use-case">
+        <p class="use-case-label cloud">2 Nodes</p>
+        <h3>High availability with pair mode</h3>
+        <p>
+          Add a second node and Ferrosa automatically enters pair mode — synchronous replication
+          with instant failover. All 11 DDL operations replicate automatically: CREATE, ALTER,
+          and DROP for keyspaces, tables, and roles, plus GRANT and REVOKE. Schema catch-up
+          on rejoin, operator switchover, and force-promote for split-brain recovery.
+        </p>
+      </div>
+      <div class="use-case">
+        <p class="use-case-label graph-uc">3+ Nodes</p>
+        <h3>Full production cluster</h3>
+        <p>
+          Add a third node and Ferrosa transitions to full cluster mode:
+          Raft consensus for metadata (openraft), Murmur3 token ring for data
+          sharding, and a coordinator pattern with tunable consistency levels
+          (ONE, QUORUM, ALL, LOCAL_QUORUM, EACH_QUORUM). Hinted handoff stores
+          writes for temporarily failed replicas and replays on recovery. Streaming
+          protocol handles node bootstrap and decommission. Skew-aware token rebalancing
+          keeps load evenly distributed. Deploy with Docker Compose or bare metal.
+        </p>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ═══════════════════ Download ═══════════════════ -->
+<section id="download" style="padding-bottom: 2rem;">
+  <p class="section-label centered">Download</p>
+  <h2 class="section-title centered">Coming Soon</h2>
+  <p class="section-subtitle centered" style="margin-bottom: 3rem;">
+    Ferrosa is under active development. Sign up below to be notified when the first release is available.
+  </p>
+
+  <div style="max-width: 700px; margin: 0 auto;">
+    <p style="text-align: center; margin-top: 1.5rem; font-size: 0.9375rem; color: var(--text-secondary);">
+      See the <a href="getting-started.html" style="color: var(--accent);">getting started guide</a> for architecture and design details.
+    </p>
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; max-width: 700px; margin: 2.5rem auto 0;">
+      <a href="getting-started.html" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; text-decoration: none; transition: border-color 0.2s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+        <h4 style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.5rem;">Getting Started</h4>
+        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">Install, configure, and connect your first CQL driver in minutes.</p>
+      </a>
+      <a href="examples/index.html" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; text-decoration: none; transition: border-color 0.2s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+        <h4 style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.5rem;">Examples &amp; Tutorials</h4>
+        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">Step-by-step walkthroughs for IoT, analytics, e-commerce, and 10 more use cases — with runnable CQL scripts.</p>
+      </a>
+      <a href="cql-compatibility.html" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; text-decoration: none; transition: border-color 0.2s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+        <h4 style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.5rem;">CQL Compatibility</h4>
+        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">Full CQL reference with supported statements, types, and functions.</p>
+      </a>
+      <a href="migration.html" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; text-decoration: none; transition: border-color 0.2s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+        <h4 style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.5rem;">Migration Guide</h4>
+        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">CQL, Cypher, SPARQL, and vector search — one database for all your workloads.</p>
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Get Started ═══════════════════ -->
+<section class="cta-section" id="get-started">
+  <h2>Ready to leave GC pauses behind?</h2>
+  <p>
+    Ferrosa is in active development. Binary releases are coming soon.
+  </p>
+  <div class="cta-actions">
+    <a href="getting-started.html" class="btn-primary">Read the Docs</a>
+    <a href="examples/index.html" class="btn-secondary">Browse Examples</a>
+  </div>
+</section>
+
+<!-- ═══════════════════ Footer ═══════════════════ -->
+<footer>
+  <div class="footer-inner">
+    <div class="footer-left">
+      &copy; 2026 Ferrosa Contributors
+    </div>
+    <ul class="footer-links">
+      <li><a href="https://ferrosadb.com">ferrosadb.com</a></li>
+      <li><a href="getting-started.html">Docs</a></li>
+      <li><a href="examples/index.html">Examples</a></li>
+      <li><a href="cql-compatibility.html">CQL Reference</a></li>
+      <li><a href="cypher.html">Cypher Reference</a></li>
+      <li><a href="migration.html">Migration Guide</a></li>
+    </ul>
+  </div>
+</footer>
+
+<script>
+function showTab(name) {
+  document.querySelectorAll('.code-block').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.code-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>
+
+</body>
+</html>

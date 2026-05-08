@@ -32,8 +32,8 @@ jobs:
       - name: Verify generated files
         run: |
           echo "Generated files:"
-          ls -la docs/examples/*.html
-          COUNT=$(ls docs/examples/*.html | wc -l)
+          ls -la docs/database/examples/*.html
+          COUNT=$(ls docs/database/examples/*.html | wc -l)
           echo "Total: $COUNT HTML files"
           if [ "$COUNT" -lt 12 ]; then
             echo "::error::Expected at least 12 HTML files, got $COUNT"
@@ -45,7 +45,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/examples/
+          git add docs/database/examples/
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else

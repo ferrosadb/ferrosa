@@ -4,8 +4,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ferrosa — Suite for Database and Agent Memory</title>
-  <meta name="description" content="Ferrosa Suite covers Ferrosa Database for operational database problems and Ferrosa Memory for developer-preview long-context linked memory for agents.">
+  <title>Ferrosa Memory — Long-Context Linked Memory for Agents</title>
+  <meta name="description" content="Ferrosa Memory is a developer-preview memory system for agents with temporal facts, graph links, Datalog-style derived facts, query workbench, and visualization UI.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <style>
     :root {
@@ -760,57 +760,112 @@
 </nav>
 
 <div class="beta-banner">
-  <span class="beta-tag">Developer Preview</span> Ferrosa Suite is version 0.8.8.8 and moving toward a public release.
+  <span class="beta-tag">Developer Preview</span> Ferrosa Memory is a 0.8.8.8 preview for agentic long-context memory.
 </div>
 <section class="hero">
-  <div class="hero-badge"><span class="dot"></span> Ferrosa Suite 0.8.8.8</div>
-  <h1>Infrastructure for data systems <span class="gradient">and agent memory.</span></h1>
-  <p>Ferrosa is a suite for two hard problems: a Rust-native distributed database for operational workloads, and Ferrosa Memory for long-context, linked memory that agents can query, update, and reason over.</p>
+  <div class="hero-badge"><span class="dot"></span> Ferrosa Memory · Developer Preview</div>
+  <h1>Linked memory for <span class="gradient">long-running agents.</span></h1>
+  <p>Ferrosa Memory gives agents a durable memory layer: context segments, entities, temporal facts, graph edges, retrieval, Datalog-style derived facts, and operator UIs for query and visualization.</p>
   <div class="hero-actions">
-    <a href="/database/" class="btn-primary">Use the Database</a>
-    <a href="/ferrosa-memory/" class="btn-secondary">Preview Ferrosa Memory</a>
+    <a href="#quickstart" class="btn-primary">Quickstart</a>
+    <a href="#workbench" class="btn-secondary">Explore the UI</a>
   </div>
 </section>
-<section id="products">
-  <div class="section-label">Two products, one storage philosophy</div>
-  <h2>Pick the layer that matches your problem.</h2>
-  <p style="color:var(--text-secondary); max-width:780px;">Use Ferrosa Database when you need scalable CQL-compatible storage, search, graph, SPARQL, and transactions. Use Ferrosa Memory when you need agents to carry durable context across sessions with temporal facts, graph links, retrieval, and explainable memory operations.</p>
-  <div class="suite-grid">
-    <a class="suite-card" href="/database/">
-      <div class="kicker">Ferrosa Database</div>
-      <h3>Database problems: solved at the storage layer.</h3>
-      <p>CQL-compatible operational storage with S3-backed durability, secondary indexes, vector search, Cypher + Bolt graph queries, SPARQL, transactions, CDC, and observability.</p>
-      <div class="pill-row"><span class="pill">CQL</span><span class="pill">Graph</span><span class="pill">SPARQL</span><span class="pill">Vector search</span><span class="pill">S3-backed</span></div>
-    </a>
-    <a class="suite-card memory" href="/ferrosa-memory/">
-      <div class="kicker">Ferrosa Memory</div>
-      <h3>Agent memory: durable, linked, queryable context.</h3>
-      <p>A developer-preview memory system for agents: temporal facts, entity graphs, folds, retrieval, Datalog-style materialization, workbench query UIs, and visualization for inspecting what the agent remembers and why.</p>
-      <div class="pill-row"><span class="pill">MCP</span><span class="pill">Long context</span><span class="pill">Graph memory</span><span class="pill">Datalog</span><span class="pill">Viz</span></div>
-    </a>
+<section id="overview">
+  <div class="section-label cool">Why it exists</div>
+  <h2>Agents need memory that is structured, explainable, and queryable.</h2>
+  <div class="doc-grid">
+    <div class="doc-card"><h3>Temporal facts</h3><p>Record what changed over time instead of overwriting history. Current facts stay easy to retrieve while superseded facts remain available for audit and reasoning.</p></div>
+    <div class="doc-card"><h3>Graph links</h3><p>Entities, folds, facts, skills, and tags are connected with typed edges so an agent can follow relationships rather than only search text.</p></div>
+    <div class="doc-card"><h3>Retrieval + context windows</h3><p>Hybrid retrieval finds relevant memories, then expands around raw context segments to recover the surrounding conversation or artifact context.</p></div>
+    <div class="doc-card"><h3>Datalog-style materialization</h3><p>Rules can derive and explain higher-level facts from graph state, supporting transparent memory reasoning rather than opaque summaries alone.</p></div>
   </div>
 </section>
-<section id="memory-preview">
-  <div class="section-label cool">Agentic memory preview</div>
-  <h2>Long-context agents need more than a bigger prompt.</h2>
+<section id="architecture">
+  <div class="section-label">Architecture</div>
+  <h2>A thin memory adapter over database, graph, and inference surfaces.</h2>
   <div class="two-col">
     <div>
-      <p style="color:var(--text-secondary);">Ferrosa Memory treats memory as a live data system: raw context segments become entities, temporal facts, graph edges, and queryable views. Agents can retrieve context, follow relationships, record evolving state, and use a workbench to inspect CQL, SPARQL, Datalog, and visualization surfaces.</p>
-      <p style="color:var(--text-secondary);">The implementation draws inspiration from research on virtual context management, generative agents, graph-augmented retrieval, memory evaluation, compression, Datalog-style inference, and hippocampal memory indexing.</p>
+      <p style="color:var(--text-secondary);">Ferrosa Memory exposes an MCP-compatible memory service and an operator workbench. The memory layer owns memory semantics—entities, folds, facts, retrieval outcomes, intentions, skills, Datalog rules, explanations—while Ferrosa Database provides CQL storage, graph traversal, and query surfaces.</p>
+      <p style="color:var(--text-secondary);">The public contract is intentionally small: agents call tools to ingest, retrieve, link, and explain memory. Operators use the workbench and visualization UI to inspect what happened.</p>
     </div>
-    <div class="doc-card">
-      <h3>Research-inspired, product-shaped</h3>
-      <p>Preview docs cite the papers and specs behind the design, including memory architectures, GraphRAG-style retrieval, Datalog materialization, MemoryArena-style evaluation, prompt/context compression, and privacy/security work for persistent agent memory.</p>
-      <a href="/ferrosa-memory/#research" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">Read the research notes →</a>
-    </div>
+    <div class="code-block"><pre><code>Agent / IDE / runtime
+        │ MCP
+        ▼
+Ferrosa Memory service
+  ├─ memory tools + routing
+  ├─ temporal facts + folds
+  ├─ Datalog-derived facts
+  ├─ Workbench query UIs
+  └─ Viz graph surface
+        │
+        ▼
+Ferrosa Database storage + graph</code></pre></div>
+  </div>
+</section>
+<section id="workbench">
+  <div class="section-label cool">Workbench and visualization</div>
+  <h2>Query memory directly, then inspect the graph.</h2>
+  <div class="doc-grid">
+    <div class="doc-card"><h3>Workbench</h3><p>The browser workbench includes Home, Viz, CQL Explorer, SPARQL Explorer, Datalog Explorer, Aliases, Rules, Approvals, and Explanations.</p></div>
+    <div class="doc-card"><h3>Query APIs</h3><p>Use <code>/workbench/api/cql/query</code>, <code>/workbench/api/sparql/query</code>, and <code>/workbench/api/datalog/query</code> to inspect storage, graph, and derived-memory behavior.</p></div>
+    <div class="doc-card"><h3>Visualization</h3><p>The viz surface is served separately from the main memory API. In local developer preview, it is available at <code>http://localhost:18766/viz</code>.</p></div>
+  </div>
+  <div class="note">In shared deployments, keep the visualization surface operator-only. The preview docs assume loopback/local use unless you explicitly configure TLS, auth, and tenant mappings.</div>
+</section>
+<section id="quickstart">
+  <div class="section-label">Quickstart</div>
+  <h2>Local developer preview configuration.</h2>
+  <p style="color:var(--text-secondary); max-width:780px;">The exact binary names and deployment packaging may change before release. The important shape is: run Ferrosa Database, point Ferrosa Memory at its CQL/graph surfaces, expose MCP on the main port, and expose visualization on the adjacent viz port.</p>
+  <div class="code-block"><pre><code># ferrosa-memory.toml — local preview shape
+[server]
+transport = "http"
+http_port = 18765
+
+[ferrosa]
+contact_points = ["127.0.0.1:19042"]
+keyspace = "agent_memory"
+
+[viz]
+enabled = true
+bind = "127.0.0.1:18766"
+
+[security]
+# For local preview only. Use TLS + auth mapping for shared deployment.
+require_tls = false</code></pre></div>
+  <div class="code-block"><pre><code># Local URLs
+MCP endpoint:      http://localhost:18765/mcp
+Workbench:         http://localhost:18765/
+Visualization:     http://localhost:18766/viz
+Viz snapshot API:  http://localhost:18766/viz/snapshot</code></pre></div>
+</section>
+<section id="examples">
+  <div class="section-label cool">Examples</div>
+  <h2>What agents can do with Ferrosa Memory.</h2>
+  <div class="doc-grid">
+    <div class="doc-card"><h3>Remember evolving project state</h3><p>Record an entity once, then write temporal facts as status changes. Ask for the current fact or inspect the supersession chain.</p></div>
+    <div class="doc-card"><h3>Link context into a graph</h3><p>Ingest raw conversation segments, extract entities, add typed edges, then retrieve adjacent memories by graph traversal.</p></div>
+    <div class="doc-card"><h3>Explain derived facts</h3><p>Use Datalog rules and explanation endpoints to show why a derived memory exists instead of treating memory as uninspectable text.</p></div>
+    <div class="doc-card"><h3>Operate the system</h3><p>Use liveness/readiness probes, metrics, query explorers, and the visualization UI to confirm memory is being recorded and linked.</p></div>
+  </div>
+</section>
+<section id="research">
+  <div class="section-label">Research foundation</div>
+  <h2>Inspired by memory systems, graph retrieval, compression, and logic.</h2>
+  <p style="color:var(--text-secondary); max-width:820px;">Ferrosa Memory is product engineering, not a paper implementation, but the design is informed by recent and classic work on agent memory, virtual context, retrieval, Datalog-style inference, and memory evaluation.</p>
+  <div class="doc-grid">
+    <div class="doc-card"><h3>Long-context memory</h3><p>MemGPT-style virtual context management, Generative Agents, MIRIX, Zep, MemR³, and continuum-memory architecture work motivate persistent, queryable memory beyond the prompt.</p></div>
+    <div class="doc-card"><h3>Graph and Datalog reasoning</h3><p>GraphRAG-style retrieval and classic Datalog foundations, including “What You Always Wanted to Know About Datalog,” inform linked memory and rule-derived facts.</p></div>
+    <div class="doc-card"><h3>Compression and evaluation</h3><p>LLMLingua, Context-Folding, NL-Compress, ReCAP, MemoryArena, LongMemEval, and related evaluation work shape how retrieval, summarization, and memory quality are tested.</p></div>
+    <div class="doc-card"><h3>Security and privacy</h3><p>MCPShield, MemoryGraft, privacy-risk, and sandboxing research inform the security posture for persistent agent memory.</p></div>
   </div>
 </section>
 <section id="get-started" class="cta-section">
-  <h2>Start with the problem you have.</h2>
-  <p>Run the database today, or preview Ferrosa Memory when your agents need context that survives the chat window.</p>
+  <h2>Preview Ferrosa Memory with your agents.</h2>
+  <p>Start local, inspect memory in the workbench, and use the viz surface to confirm that context is becoming linked memory.</p>
   <div class="hero-actions">
-    <a href="/database/getting-started.html" class="btn-primary">Database Getting Started</a>
-    <a href="/ferrosa-memory/#quickstart" class="btn-secondary">Memory Quickstart</a>
+    <a href="#quickstart" class="btn-primary">Configure local preview</a>
+    <a href="/database/" class="btn-secondary">Use Ferrosa Database</a>
   </div>
 </section>
 <footer>

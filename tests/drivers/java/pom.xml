@@ -7,7 +7,7 @@
 
     <groupId>ferrosa.test</groupId>
     <artifactId>cql-smoke-test</artifactId>
-    <version>1.0.0</version>
+    <version>0.8.8.8</version>
     <packaging>jar</packaging>
 
     <properties>

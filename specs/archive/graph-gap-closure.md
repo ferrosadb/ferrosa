@@ -1,7 +1,7 @@
 # Graph Gap Closure — Architecture Spec
 
 > Last updated: 2026-03-17
-> Status: Completed — all 7 gaps (G1-G7) implemented in v1.0.0-beta.4
+> Status: Completed — all 7 gaps (G1-G7) implemented in v0.8.8.8
 
 ## Overview
 

@@ -7,7 +7,7 @@ A research knowledge graph tracks the relationships between papers, authors, ins
 These relationships are what make academic data valuable -- citation networks reveal influence, co-authorship reveals collaboration patterns, and funding links reveal the flow of resources through the research ecosystem.
 This tutorial builds a complete research knowledge graph in Ferrosa, querying it with both CQL and Cypher.
 
-NOTE: Complete the link:../cluster-setup.html[3-Node Cluster Setup] tutorial first.
+NOTE: Complete the link:cluster-setup.html[3-Node Cluster Setup] tutorial first.
 Your cluster must have `FERROSA_GRAPH_ENABLED=true` set (which our cluster-setup tutorial includes).
 
 == The Use Case
@@ -486,5 +486,5 @@ The core insight: *same data, two query paradigms.* CQL for speed and scale. Cyp
 === Next steps
 
 * Read the link:../cypher.html[Cypher Reference] for the full query language supported by Ferrosa's graph engine
-* Try the link:../graph-joins/graph-joins.html[Graph Joins & Traversals] tutorial for a social network variant with fraud detection
-* Explore link:../content-personalization/content-personalization.html[Content Personalization] to build a recommendation pipeline
+* Try the link:graph-joins.html[Graph Joins & Traversals] tutorial for a social network variant with fraud detection
+* Explore link:content-personalization.html[Content Personalization] to build a recommendation pipeline

@@ -1,6 +1,6 @@
 {
   "name": "ferrosa-jepsen-node",
-  "version": "1.0.0",
+  "version": "0.8.8.8",
   "main": "workload.js",
   "dependencies": {
     "cassandra-driver": "^4.7.2"

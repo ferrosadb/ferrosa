@@ -7,7 +7,7 @@ Traditional Cassandra warns against join-heavy workloads.
 Ferrosa doesn't -- it has a built-in graph engine with bidirectional traversals and secondary indexes.
 This tutorial shows relationship queries that are impossible in vanilla Cassandra.
 
-NOTE: Complete the link:../cluster-setup.html[3-Node Cluster Setup] tutorial first.
+NOTE: Complete the link:cluster-setup.html[3-Node Cluster Setup] tutorial first.
 Your cluster must have `FERROSA_GRAPH_ENABLED=true` set (which our cluster-setup tutorial includes).
 
 == Why Graph + CQL?

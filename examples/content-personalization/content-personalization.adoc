@@ -7,7 +7,7 @@ Build a recommendation engine backend.
 Track user preferences, content interactions, and viewing history to deliver personalized experiences.
 
 NOTE: This tutorial assumes you have a running 3-node Ferrosa cluster.
-If you haven't set one up yet, follow the link:../cluster-setup.html[3-Node Cluster Setup] guide first -- it only takes about 5 minutes.
+If you haven't set one up yet, follow the link:cluster-setup.html[3-Node Cluster Setup] guide first -- it only takes about 5 minutes.
 
 == Create the Keyspace
 

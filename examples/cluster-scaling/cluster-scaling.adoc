@@ -16,7 +16,7 @@ The data you inserted on a single node is still there after you've scaled to thr
 
 == Prerequisites
 
-* *Docker and Docker Compose* -- see the link:../cluster-setup/cluster-setup.html[Cluster Setup Guide] if you need to install Docker
+* *Docker and Docker Compose* -- see the link:cluster-setup.html[Cluster Setup Guide] if you need to install Docker
 * *cqlsh* -- `pip install cqlsh`
 * About *4 GB of RAM* available for the three nodes plus the object store
 
