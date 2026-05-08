@@ -69,7 +69,11 @@ pub async fn reconcile_once(
             continue;
         }
 
-        let edge_label = edge_tid.table.clone();
+        let edge_label = edge_meta
+            .extensions
+            .get("graph.label")
+            .cloned()
+            .unwrap_or_else(|| edge_tid.table.clone());
         let edge_table_fqn = format!("{}.{}", edge_tid.keyspace, edge_tid.table);
 
         // Scan all edge table partitions.
@@ -796,7 +800,7 @@ mod tests {
             &adj_ks,
             b"alice",
             DIRECTION_OUT,
-            "knows",
+            "KNOWS",
             b"bob",
             "social.knows",
             1000,

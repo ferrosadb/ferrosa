@@ -17,9 +17,11 @@ use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
 use crate::executor::eval;
 use crate::executor::expand::{
-    build_columns, check_timeout, extract_neighbor_id, sort_rows, GraphEngineConfig,
+    build_columns, check_timeout, extract_column_bytes_from_row, extract_neighbor_id,
+    graph_vertex_lookup_key, row_to_json, sort_rows, table_metadata_for, GraphEngineConfig,
 };
 use crate::executor::result::{GraphResult, QueryStats};
+use crate::parser::Direction;
 use crate::parser::ReturnClause;
 use crate::planner::physical::{Anchor, Hop};
 
@@ -66,30 +68,80 @@ pub async fn execute_var_length(
 
     // Apply WHERE filters to anchor partitions.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-    let anchor_col_names =
-        super::expand::column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
     let mut seed_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
+    let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
     for partition in &anchor_partitions {
-        let hex_id = hex::encode(partition.key.key.as_bytes());
-        let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
-        let mut bindings = HashMap::new();
-        bindings.insert(anchor_var.to_string(), row_json);
+        if let Some(meta) = anchor_meta.as_ref() {
+            for row in &partition.rows {
+                let row_json = row_to_json(meta, partition, row);
+                let mut bindings = HashMap::new();
+                bindings.insert(anchor_var.to_string(), row_json.clone());
+                if !anchor.props.is_empty() {
+                    let mut props_pass = true;
+                    for (prop, expected) in &anchor.props {
+                        let filter = crate::parser::Expr::Comparison {
+                            left: Box::new(crate::parser::Expr::Property {
+                                var: anchor_var.to_string(),
+                                name: prop.clone(),
+                            }),
+                            op: crate::parser::CompareOp::Eq,
+                            right: Box::new(expected.clone()),
+                        };
+                        if !eval::filter_passes(&filter, &bindings)? {
+                            props_pass = false;
+                            break;
+                        }
+                    }
+                    if !props_pass {
+                        continue;
+                    }
+                }
 
-        let mut passes = true;
-        for filter in &anchor.filters {
-            if !eval::filter_passes(filter, &bindings)? {
-                passes = false;
-                break;
+                let mut passes = true;
+                for filter in &anchor.filters {
+                    if !eval::filter_passes(filter, &bindings)? {
+                        passes = false;
+                        break;
+                    }
+                }
+                if passes {
+                    seed_keys.push(
+                        graph_vertex_lookup_key(meta, partition, row, &anchor.props)
+                            .unwrap_or_else(|| partition.key.clone()),
+                    );
+                }
             }
-        }
-        if passes {
-            seed_keys.push(partition.key.clone());
+        } else {
+            let anchor_col_names = super::expand::column_names_for_table(
+                schema,
+                &anchor.table.keyspace,
+                &anchor.table.table,
+            );
+            let hex_id = hex::encode(partition.key.key.as_bytes());
+            let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
+            let mut bindings = HashMap::new();
+            bindings.insert(anchor_var.to_string(), row_json);
+
+            let mut passes = true;
+            for filter in &anchor.filters {
+                if !eval::filter_passes(filter, &bindings)? {
+                    passes = false;
+                    break;
+                }
+            }
+            if passes {
+                seed_keys.push(partition.key.clone());
+            }
         }
     }
 
     // Step 2: BFS traversal.
     let adj_ks = adjacency_keyspace_name(keyspace);
     let adj_table_id = TableId::new(&adj_ks, "adjacency");
+    let fallback_edge_table_id = hop
+        .edge_table
+        .as_ref()
+        .map(|edge_table| TableId::new(&edge_table.keyspace, &edge_table.table));
 
     // Track all visited vertex keys (as bytes) for cycle detection (FMEA F2).
     // We mark frontier vertices as visited before expanding them, so the
@@ -118,33 +170,99 @@ pub async fn execute_var_length(
         let mut next_frontier: Vec<DecoratedKey> = Vec::new();
 
         for vertex_key in &frontier {
-            // Read adjacency entries for this vertex.
+            // Read adjacency entries for this vertex. If adjacency has not been
+            // materialized yet (for example in tiny HTTP seam tests), fall back
+            // to the edge table's source-partition rows.
+            let mut neighbor_ids = Vec::new();
             let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
-
                 for row in &partition.rows {
                     if let Some(neighbor_id) =
                         extract_neighbor_id(&row.clustering, hop.edge_label.as_deref())
                     {
-                        // Cycle detection (FMEA F2): skip already-visited vertices.
-                        if visited.contains(&neighbor_id) {
-                            continue;
-                        }
-
-                        // Budget check (FMEA F3, threat T13): cap total visited.
-                        if visited.len() >= config.max_var_path_visited {
-                            return Err(GraphError::ResourceLimit(format!(
-                                "variable-length path visited vertex budget exceeded: {} (limit: {})",
-                                visited.len(),
-                                config.max_var_path_visited
-                            )));
-                        }
-
-                        visited.insert(neighbor_id.clone());
-                        next_frontier.push(DecoratedKey::new(PartitionKey::new(neighbor_id)));
+                        neighbor_ids.push(neighbor_id);
                     }
                 }
+            }
+
+            if neighbor_ids.is_empty() {
+                if let (Some(edge_table_id), Some(edge_table)) =
+                    (&fallback_edge_table_id, hop.edge_table.as_ref())
+                {
+                    if let Some(meta) =
+                        table_metadata_for(schema, &edge_table.keyspace, &edge_table.table)
+                    {
+                        let Some(source_col) = meta.extensions.get("graph.source") else {
+                            continue;
+                        };
+                        let Some(target_col) = meta.extensions.get("graph.target") else {
+                            continue;
+                        };
+                        for partition in write_path.range_read(edge_table_id).await? {
+                            stats.edges_read += partition.rows.len();
+                            for row in &partition.rows {
+                                let source = extract_column_bytes_from_row(
+                                    &meta,
+                                    partition.key.key.as_bytes(),
+                                    row,
+                                    source_col,
+                                );
+                                let target = extract_column_bytes_from_row(
+                                    &meta,
+                                    partition.key.key.as_bytes(),
+                                    row,
+                                    target_col,
+                                );
+                                let current = vertex_key.key.as_bytes();
+                                match hop.direction {
+                                    Direction::Out if source.as_deref() == Some(current) => {
+                                        if let Some(target) = target {
+                                            neighbor_ids.push(target);
+                                        }
+                                    }
+                                    Direction::In if target.as_deref() == Some(current) => {
+                                        if let Some(source) = source {
+                                            neighbor_ids.push(source);
+                                        }
+                                    }
+                                    Direction::Both => {
+                                        if source.as_deref() == Some(current) {
+                                            if let Some(target) = target.clone() {
+                                                neighbor_ids.push(target);
+                                            }
+                                        }
+                                        if target.as_deref() == Some(current) {
+                                            if let Some(source) = source {
+                                                neighbor_ids.push(source);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for neighbor_id in neighbor_ids {
+                // Cycle detection (FMEA F2): skip already-visited vertices.
+                if visited.contains(&neighbor_id) {
+                    continue;
+                }
+
+                // Budget check (FMEA F3, threat T13): cap total visited.
+                if visited.len() >= config.max_var_path_visited {
+                    return Err(GraphError::ResourceLimit(format!(
+                        "variable-length path visited vertex budget exceeded: {} (limit: {})",
+                        visited.len(),
+                        config.max_var_path_visited
+                    )));
+                }
+
+                visited.insert(neighbor_id.clone());
+                next_frontier.push(DecoratedKey::new(PartitionKey::new(neighbor_id)));
             }
         }
 
@@ -178,7 +296,7 @@ pub async fn execute_var_length(
     let proj_col_names = if let Some(ref vt) = hop.vertex_table {
         super::expand::column_names_for_table(schema, &vt.keyspace, &vt.table)
     } else {
-        anchor_col_names.clone()
+        super::expand::column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table)
     };
 
     // Determine the variable name for result binding.
@@ -200,6 +318,26 @@ pub async fn execute_var_length(
         };
         let mut bindings = HashMap::new();
         bindings.insert(result_var.to_string(), row_json.clone());
+        if !hop.target_props.is_empty() {
+            let mut target_passes = true;
+            for (prop, expected) in &hop.target_props {
+                let filter = crate::parser::Expr::Comparison {
+                    left: Box::new(crate::parser::Expr::Property {
+                        var: result_var.to_string(),
+                        name: prop.clone(),
+                    }),
+                    op: crate::parser::CompareOp::Eq,
+                    right: Box::new(expected.clone()),
+                };
+                if !eval::filter_passes(&filter, &bindings)? {
+                    target_passes = false;
+                    break;
+                }
+            }
+            if !target_passes {
+                continue;
+            }
+        }
         // Also bind the anchor var so expressions referencing it work.
         if result_var != anchor_var {
             bindings.insert(anchor_var.to_string(), row_json);

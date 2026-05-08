@@ -30,6 +30,13 @@ from neo4j.exceptions import (
 FERROSA_HOST = os.environ.get("FERROSA_HOST", "127.0.0.1")
 FERROSA_BOLT_PORT = int(os.environ.get("FERROSA_BOLT_PORT", "7687"))
 FERROSA_CQL_PORT = int(os.environ.get("FERROSA_CQL_PORT", "9042"))
+FERROSA_CQL_PROTOCOL_VERSION = int(os.environ.get("FERROSA_CQL_PROTOCOL_VERSION", "4"))
+FERROSA_AUTH_DISABLED = os.environ.get("FERROSA_AUTH_DISABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 BOLT_URI = f"bolt://{FERROSA_HOST}:{FERROSA_BOLT_PORT}"
 BOLT_AUTH = ("cassandra", "cassandra")
@@ -49,7 +56,7 @@ def cql_session():
         contact_points=[FERROSA_HOST],
         port=FERROSA_CQL_PORT,
         load_balancing_policy=RoundRobinPolicy(),
-        protocol_version=5,
+        protocol_version=FERROSA_CQL_PROTOCOL_VERSION,
         schema_metadata_enabled=False,
         token_metadata_enabled=False,
     )
@@ -83,48 +90,68 @@ def social_graph(cql_session):
         "  age INT,"
         "  city TEXT,"
         "  email TEXT"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'vertex',"
         "  'graph.label': 'Person'"
-        "}}"
+        "}"
     )
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.company_v ("
         "  id TEXT PRIMARY KEY,"
         "  name TEXT,"
         "  founded INT"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'vertex',"
         "  'graph.label': 'Company'"
-        "}}"
+        "}"
     )
 
     # Edge tables
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.knows_e ("
         "  src_id TEXT,"
-        "  tgt_id TEXT,"
+        "  dst_id TEXT,"
         "  since_year INT,"
-        "  PRIMARY KEY (src_id, tgt_id)"
-        ") WITH extensions = {{"
+        "  PRIMARY KEY (src_id, dst_id)"
+        ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'KNOWS',"
         "  'graph.source': 'src_id',"
-        "  'graph.target': 'tgt_id'"
-        "}}"
+        "  'graph.target': 'dst_id',"
+        "  'graph.source_label': 'Person',"
+        "  'graph.target_label': 'Person'"
+        "}"
     )
+    sess.execute(
+        f"CREATE TABLE IF NOT EXISTS {ks}.likes_e ("
+        "  src_id TEXT,"
+        "  dst_id TEXT,"
+        "  reason TEXT,"
+        "  PRIMARY KEY (src_id, dst_id)"
+        ") WITH extensions = {"
+        "  'graph.type': 'edge',"
+        "  'graph.label': 'LIKES',"
+        "  'graph.source': 'src_id',"
+        "  'graph.target': 'dst_id',"
+        "  'graph.source_label': 'Person',"
+        "  'graph.target_label': 'Person'"
+        "}"
+    )
+
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.works_at_e ("
         "  src_id TEXT,"
-        "  tgt_id TEXT,"
+        "  dst_id TEXT,"
         "  role TEXT,"
-        "  PRIMARY KEY (src_id, tgt_id)"
-        ") WITH extensions = {{"
+        "  PRIMARY KEY (src_id, dst_id)"
+        ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'WORKS_AT',"
         "  'graph.source': 'src_id',"
-        "  'graph.target': 'tgt_id'"
-        "}}"
+        "  'graph.target': 'dst_id',"
+        "  'graph.source_label': 'Person',"
+        "  'graph.target_label': 'Company'"
+        "}"
     )
 
     # Seed vertices
@@ -164,8 +191,16 @@ def social_graph(cql_session):
         ("dave", "eve", 2022),
     ]:
         sess.execute(
-            f"INSERT INTO {ks}.knows_e (src_id, tgt_id, since_year) "
+            f"INSERT INTO {ks}.knows_e (src_id, dst_id, since_year) "
             f"VALUES ('{src}', '{tgt}', {since})"
+        )
+
+    for src, tgt, reason in [
+        ("eve", "alice", "mentor"),
+    ]:
+        sess.execute(
+            f"INSERT INTO {ks}.likes_e (src_id, dst_id, reason) "
+            f"VALUES ('{src}', '{tgt}', '{reason}')"
         )
 
     for src, tgt, role in [
@@ -175,7 +210,7 @@ def social_graph(cql_session):
         ("dave", "globex", "Analyst"),
     ]:
         sess.execute(
-            f"INSERT INTO {ks}.works_at_e (src_id, tgt_id, role) "
+            f"INSERT INTO {ks}.works_at_e (src_id, dst_id, role) "
             f"VALUES ('{src}', '{tgt}', '{role}')"
         )
 
@@ -224,6 +259,8 @@ class TestBoltWireProtocol:
 
     def test_bolt_auth_invalid_credentials(self):
         """Wrong password returns auth error, not a generic failure."""
+        if FERROSA_AUTH_DISABLED:
+            pytest.skip("auth-disabled test node accepts any Bolt credentials")
         with pytest.raises((AuthError, ServiceUnavailable)):
             bad_driver = GraphDatabase.driver(
                 BOLT_URI, auth=("cassandra", "wrong_password")
@@ -238,6 +275,15 @@ class TestBoltWireProtocol:
         )
         assert len(records) == 1
         assert "n.name" in records[0]
+
+    def test_bolt_run_pull_with_parameters(self, bolt_driver):
+        """RUN parameters bind before PULL returns records."""
+        records, summary = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WHERE n.name = $name RETURN n.name, n.age",
+            name="Alice",
+        )
+        assert records == [{"n.name": "Alice", "n.age": 30}]
 
     def test_bolt_multiple_queries_sequential(self, bolt_driver):
         """Multiple queries on the same driver work sequentially."""
@@ -761,3 +807,105 @@ class TestIndexUsage:
         )
         names = {r["c.name"] for r in records}
         assert names == {"Acme Corp"}
+
+
+class TestBoltCypherReferenceGapParity:
+    """Bolt parity for Cypher reference-gap features covered over HTTP."""
+
+    def test_bolt_return_and_aggregate_distinct(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) RETURN DISTINCT n.city AS city ORDER BY city ASC",
+        )
+        assert records == [
+            {"city": "LA"},
+            {"city": "NYC"},
+            {"city": "SF"},
+        ]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) RETURN count(DISTINCT n.city) AS cities",
+        )
+        assert records == [{"cities": 3}]
+
+    def test_bolt_optional_match_with_and_unwind(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WHERE n.name = 'Eve' "
+            "OPTIONAL MATCH (n)-[:KNOWS]->(friend:Person) "
+            "RETURN n.name AS name, friend.name AS friend",
+        )
+        assert records == [{"name": "Eve", "friend": None}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WITH n.name AS name WHERE name = 'Carol' RETURN name",
+        )
+        assert records == [{"name": "Carol"}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "UNWIND [3, 1, 2] AS x RETURN x ORDER BY x ASC",
+        )
+        assert records == [{"x": 1}, {"x": 2}, {"x": 3}]
+
+    def test_bolt_union_and_pattern_predicates(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "UNWIND [1, 2] AS x RETURN x UNION UNWIND [2, 3] AS x RETURN x ORDER BY x ASC",
+        )
+        assert records == [{"x": 1}, {"x": 2}, {"x": 3}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) "
+            "WHERE EXISTS { (n)-[:KNOWS]->(:Person {name: 'Carol'}) } "
+            "RETURN n.name AS name ORDER BY name ASC",
+        )
+        assert records == [{"name": "Alice"}, {"name": "Bob"}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WHERE NOT (n)-[:KNOWS]->(:Person) "
+            "RETURN n.name AS name ORDER BY name ASC",
+        )
+        assert records == [{"name": "Eve"}]
+
+    def test_bolt_list_map_and_relationship_type_alternatives(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "UNWIND [1, 2, 3] AS x WITH x WHERE x IN [1, 3] RETURN x ORDER BY x ASC",
+        )
+        assert records == [{"x": 1}, {"x": 3}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "RETURN [10, 20, 30][1] AS item, [10, 20, 30][0..2] AS prefix, "
+            "{name: 'Alice', age: 30} AS person",
+        )
+        assert records == [
+            {"item": 20, "prefix": [10, 20], "person": {"name": "Alice", "age": 30}}
+        ]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person)-[:KNOWS|LIKES]->(m:Person) "
+            "RETURN n.name AS src, m.name AS dst ORDER BY src ASC, dst ASC",
+        )
+        assert records == [
+            {"src": "Alice", "dst": "Bob"},
+            {"src": "Alice", "dst": "Carol"},
+            {"src": "Bob", "dst": "Carol"},
+            {"src": "Carol", "dst": "Dave"},
+            {"src": "Dave", "dst": "Eve"},
+            {"src": "Eve", "dst": "Alice"},
+        ]
+
+    def test_bolt_explicit_unsupported_boundaries(self, bolt_driver):
+        with pytest.raises(ClientError):
+            run_cypher(bolt_driver, "MATCH (n:Person:Employee) RETURN n")
+        with pytest.raises(ClientError):
+            run_cypher(bolt_driver, "CALL db.labels()")
+        with pytest.raises(ClientError):
+            run_cypher(bolt_driver, "LOAD CSV FROM 'file:///people.csv' AS row RETURN row")

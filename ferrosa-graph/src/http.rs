@@ -20,6 +20,8 @@ use axum::Router;
 use base64::Engine as _;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -71,6 +73,8 @@ pub struct AppState {
 pub struct QueryRequest {
     pub query: String,
     pub keyspace: String,
+    #[serde(default)]
+    pub params: HashMap<String, Value>,
 }
 
 /// Query parameters for the schema endpoint.
@@ -259,7 +263,12 @@ async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Resp
 
     match state
         .engine
-        .execute(&query_req.query, &query_req.keyspace, &auth)
+        .execute_with_params(
+            &query_req.query,
+            &query_req.keyspace,
+            &auth,
+            &query_req.params,
+        )
         .await
     {
         Ok(result) => {
