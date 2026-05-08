@@ -236,48 +236,12 @@ jobs:
           if-no-files-found: error
 
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────
-  build-macos-x86_64:
-    name: Build macOS x86_64
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-        with:
-          targets: x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-
-      - name: Clippy
-        run: cargo clippy --all-targets --target x86_64-apple-darwin -- -D warnings
-
-      - name: Build x86_64-apple-darwin binaries
-        run: |
-          cargo build --release --target x86_64-apple-darwin -p ferrosa -p ferrosa-ctl
-          strip target/x86_64-apple-darwin/release/ferrosa
-          strip target/x86_64-apple-darwin/release/ferrosa-ctl
-
-      - name: Stage release tarball
-        run: |
-          bash .github/scripts/stage-release-tarball.sh \
-            x86_64-apple-darwin \
-            target/x86_64-apple-darwin/release
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: tarball-x86_64-apple-darwin
-          path: dist/ferrosa-*-x86_64-apple-darwin.tar.gz
-          retention-days: 90
-          if-no-files-found: error
-
-  # ── Aggregate, checksum, sign, and publish ────────────────────────────
   release:
     name: Create Release
     needs:
       - build-linux-x86_64
       - build-linux-aarch64
       - build-macos-aarch64
-      - build-macos-x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
