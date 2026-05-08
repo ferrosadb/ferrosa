@@ -742,9 +742,17 @@
   .screenshot-card { background:var(--bg-card); border:1px solid var(--border); border-radius:16px; overflow:hidden; }
   .screenshot-card img { display:block; width:100%; height:auto; border-bottom:1px solid var(--border); }
   .screenshot-card div { padding:1rem 1.2rem; color:var(--text-secondary); }
-  .reference-list { display:grid; gap:.75rem; margin-top:1.5rem; }
-  .reference-list a { color:var(--accent-cool); font-weight:700; text-decoration:none; }
-  .reference-list a:hover { text-decoration:underline; }
+  .reference-table-wrap { margin-top:1.5rem; border:1px solid var(--border); border-radius:16px; overflow:hidden; background:rgba(255,255,255,.02); }
+  .reference-table { width:100%; border-collapse:collapse; font-size:.875rem; }
+  .reference-table caption { text-align:left; padding:1rem 1.1rem; color:var(--text-secondary); border-bottom:1px solid var(--border); }
+  .reference-table th { text-align:left; padding:.75rem 1rem; color:var(--text-muted); font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; background:rgba(255,255,255,.025); border-bottom:1px solid var(--border); }
+  .reference-table td { padding:.8rem 1rem; color:var(--text-secondary); border-bottom:1px solid rgba(255,255,255,.055); vertical-align:top; }
+  .reference-table tr:last-child td { border-bottom:0; }
+  .reference-table a { color:var(--text-primary); text-decoration:none; border-bottom:1px solid rgba(124,156,245,.35); }
+  .reference-table a:hover { color:var(--accent-cool); border-bottom-color:var(--accent-cool); }
+  .reference-table .ref-id { color:var(--accent-cool); font-family:var(--font-mono); white-space:nowrap; }
+  .reference-table .ref-theme { color:var(--text-muted); white-space:nowrap; }
+  @media (max-width: 760px) { .reference-table th:nth-child(3), .reference-table td:nth-child(3) { display:none; } }
   @media (max-width: 800px) { .two-col { grid-template-columns:1fr; } }
 </style>
 
@@ -878,20 +886,28 @@ Viz snapshot API:  http://localhost:18766/viz/snapshot</code></pre></div>
     <div class="doc-card"><h3>Compression and evaluation</h3><p>LLMLingua-family prompt compression, long-memory benchmarks, and memory-system surveys shape how retrieval, summarization, and memory quality should be evaluated during preview.</p></div>
     <div class="doc-card"><h3>Logic and safety</h3><p>Datalog-style derived facts and neuro-symbolic rule-evaluation work inform explainable memory operations. Preview deployments should keep memory tooling local or explicitly protected with TLS, auth, tenant isolation, and operator review.</p></div>
   </div>
-  <div class="reference-list">
-    <a href="https://arxiv.org/abs/2402.17753">LoCoMo: Evaluating Very Long-Term Conversational Memory of LLM Agents</a>
-    <a href="https://arxiv.org/abs/2410.10813">LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory</a>
-    <a href="https://arxiv.org/abs/2509.18868">Memory in Large Language Models: Mechanisms, Evaluation and Evolution</a>
-    <a href="https://arxiv.org/abs/2603.25973">MemoryCD: Benchmarking Long-Context User Memory for Lifelong Cross-Domain Personalization</a>
-    <a href="https://arxiv.org/abs/2502.06975">Episodic Memory is the Missing Piece for Long-Term LLM Agents</a>
-    <a href="https://arxiv.org/abs/2602.16313">Benchmarking Agent Memory in Interdependent Multi-Session Agentic Tasks</a>
-    <a href="https://arxiv.org/abs/2402.11821">Microstructures and Accuracy of Graph Recall by Large Language Models</a>
-    <a href="https://arxiv.org/abs/2404.16130">From Local to Global: A Graph RAG Approach to Query-Focused Summarization</a>
-    <a href="https://arxiv.org/abs/2310.05736">LLMLingua: Compressing Prompts for Accelerated Inference of Large Language Models</a>
-    <a href="https://arxiv.org/abs/2310.06839">LongLLMLingua: Accelerating and Enhancing LLMs in Long Context Scenarios via Prompt Compression</a>
-    <a href="https://arxiv.org/abs/2402.04617">InfLLM: Training-Free Long-Context Extrapolation for LLMs with an Efficient Context Memory</a>
-    <a href="https://arxiv.org/abs/2604.28087">Towards Neuro-symbolic Causal Rule Synthesis, Verification, and Evaluation Grounded in Legal and Safety Principles</a>
-    <a href="https://arxiv.org/abs/2605.04018">Rethinking Reasoning-Intensive Retrieval: Evaluating and Advancing Retrievers in Agentic Search Systems</a>
+  <div class="reference-table-wrap">
+    <table class="reference-table">
+      <caption>Selected references from the local research corpus. Links point to canonical arXiv records.</caption>
+      <thead>
+        <tr><th>Paper</th><th>arXiv</th><th>Theme</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><a href="https://arxiv.org/abs/2402.17753">LoCoMo: Evaluating Very Long-Term Conversational Memory of LLM Agents</a></td><td class="ref-id">2402.17753</td><td class="ref-theme">long-term conversational memory</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2410.10813">LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory</a></td><td class="ref-id">2410.10813</td><td class="ref-theme">memory evaluation</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2509.18868">Memory in Large Language Models: Mechanisms, Evaluation and Evolution</a></td><td class="ref-id">2509.18868</td><td class="ref-theme">memory taxonomy</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2603.25973">MemoryCD: Benchmarking Long-Context User Memory for Lifelong Cross-Domain Personalization</a></td><td class="ref-id">2603.25973</td><td class="ref-theme">cross-domain user memory</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2502.06975">Episodic Memory is the Missing Piece for Long-Term LLM Agents</a></td><td class="ref-id">2502.06975</td><td class="ref-theme">episodic memory</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2602.16313">Benchmarking Agent Memory in Interdependent Multi-Session Agentic Tasks</a></td><td class="ref-id">2602.16313</td><td class="ref-theme">multi-session agents</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2402.11821">Microstructures and Accuracy of Graph Recall by Large Language Models</a></td><td class="ref-id">2402.11821</td><td class="ref-theme">graph recall</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2404.16130">From Local to Global: A Graph RAG Approach to Query-Focused Summarization</a></td><td class="ref-id">2404.16130</td><td class="ref-theme">GraphRAG</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2310.05736">LLMLingua: Compressing Prompts for Accelerated Inference of Large Language Models</a></td><td class="ref-id">2310.05736</td><td class="ref-theme">prompt compression</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2310.06839">LongLLMLingua: Accelerating and Enhancing LLMs in Long Context Scenarios via Prompt Compression</a></td><td class="ref-id">2310.06839</td><td class="ref-theme">long-context compression</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2402.04617">InfLLM: Training-Free Long-Context Extrapolation for LLMs with an Efficient Context Memory</a></td><td class="ref-id">2402.04617</td><td class="ref-theme">context memory</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2604.28087">Towards Neuro-symbolic Causal Rule Synthesis, Verification, and Evaluation Grounded in Legal and Safety Principles</a></td><td class="ref-id">2604.28087</td><td class="ref-theme">rules + verification</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2605.04018">Rethinking Reasoning-Intensive Retrieval: Evaluating and Advancing Retrievers in Agentic Search Systems</a></td><td class="ref-id">2605.04018</td><td class="ref-theme">agentic retrieval</td></tr>
+      </tbody>
+    </table>
   </div>
 </section>
 <section id="get-started" class="cta-section">
