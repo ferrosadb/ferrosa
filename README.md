@@ -1,5 +1,8 @@
 # Ferrosa
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Status: Developer Preview](https://img.shields.io/badge/status-developer%20preview-orange)](#project-status)
+
 A Rust reimplementation of Apache Cassandra with S3-backed storage.
 
 Ferrosa is a distributed database that speaks the CQL protocol, enabling existing
@@ -7,6 +10,23 @@ Cassandra applications to connect without modification. Under the hood, it repla
 Cassandra's local-disk storage model with a write-behind architecture where ephemeral
 local storage serves as a fast cache and S3-compatible object storage provides
 durability.
+
+> **Status: Developer Preview.** Ferrosa is under active development. APIs, on-disk
+> formats, and configuration may change before a stable 1.0. Don't run it on data you
+> can't lose. Please report issues — we want to hear them.
+
+## Quick Install
+
+```bash
+curl -fsSL https://ferrosadb.com/install.sh | bash
+```
+
+The installer detects your platform (macOS arm64/x86_64, Linux x86_64/aarch64),
+downloads the latest release into `~/.ferrosa/bin/`, writes a default config to
+`~/.ferrosa/config/`, and offers to register a launchctl/systemd unit and set CQL
+admin credentials.
+
+To build from source instead, see [Building](#testing) below.
 
 ## Why Ferrosa?
 
@@ -164,6 +184,17 @@ planner pipeline. Point-in-time recovery is implemented with commit log archivin
 snapshot management, and timestamp-filtered restoration. See the
 [architecture specs](specs/README.md) for the full specification and status.
 
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development
+workflow, hygiene checklist, and what we accept. By contributing, you agree to the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+Security issues should be reported privately — see [SECURITY.md](SECURITY.md).
+
 ## License
 
-All rights reserved.
+Ferrosa is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE) for details.
+
+Copyright 2026 Ferrosa, Inc.
