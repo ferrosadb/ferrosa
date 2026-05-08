@@ -114,6 +114,20 @@ def social_graph(cql_session):
         "}}"
     )
     sess.execute(
+        f"CREATE TABLE IF NOT EXISTS {ks}.likes_e ("
+        "  src_id TEXT,"
+        "  tgt_id TEXT,"
+        "  reason TEXT,"
+        "  PRIMARY KEY (src_id, tgt_id)"
+        ") WITH extensions = {{"
+        "  'graph.type': 'edge',"
+        "  'graph.label': 'LIKES',"
+        "  'graph.source': 'src_id',"
+        "  'graph.target': 'tgt_id'"
+        "}}"
+    )
+
+    sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.works_at_e ("
         "  src_id TEXT,"
         "  tgt_id TEXT,"
@@ -166,6 +180,14 @@ def social_graph(cql_session):
         sess.execute(
             f"INSERT INTO {ks}.knows_e (src_id, tgt_id, since_year) "
             f"VALUES ('{src}', '{tgt}', {since})"
+        )
+
+    for src, tgt, reason in [
+        ("eve", "alice", "mentor"),
+    ]:
+        sess.execute(
+            f"INSERT INTO {ks}.likes_e (src_id, tgt_id, reason) "
+            f"VALUES ('{src}', '{tgt}', '{reason}')"
         )
 
     for src, tgt, role in [
@@ -770,3 +792,105 @@ class TestIndexUsage:
         )
         names = {r["c.name"] for r in records}
         assert names == {"Acme Corp"}
+
+
+class TestBoltCypherReferenceGapParity:
+    """Bolt parity for Cypher reference-gap features covered over HTTP."""
+
+    def test_bolt_return_and_aggregate_distinct(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) RETURN DISTINCT n.city AS city ORDER BY city ASC",
+        )
+        assert records == [
+            {"city": "LA"},
+            {"city": "NYC"},
+            {"city": "SF"},
+        ]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) RETURN count(DISTINCT n.city) AS cities",
+        )
+        assert records == [{"cities": 3}]
+
+    def test_bolt_optional_match_with_and_unwind(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WHERE n.name = 'Eve' "
+            "OPTIONAL MATCH (n)-[:KNOWS]->(friend:Person) "
+            "RETURN n.name AS name, friend.name AS friend",
+        )
+        assert records == [{"name": "Eve", "friend": None}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WITH n.name AS name WHERE name = 'Carol' RETURN name",
+        )
+        assert records == [{"name": "Carol"}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "UNWIND [3, 1, 2] AS x RETURN x ORDER BY x ASC",
+        )
+        assert records == [{"x": 1}, {"x": 2}, {"x": 3}]
+
+    def test_bolt_union_and_pattern_predicates(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "UNWIND [1, 2] AS x RETURN x UNION UNWIND [2, 3] AS x RETURN x ORDER BY x ASC",
+        )
+        assert records == [{"x": 1}, {"x": 2}, {"x": 3}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) "
+            "WHERE EXISTS { (n)-[:KNOWS]->(:Person {name: 'Carol'}) } "
+            "RETURN n.name AS name ORDER BY name ASC",
+        )
+        assert records == [{"name": "Alice"}, {"name": "Bob"}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WHERE NOT (n)-[:KNOWS]->(:Person) "
+            "RETURN n.name AS name ORDER BY name ASC",
+        )
+        assert records == [{"name": "Eve"}]
+
+    def test_bolt_list_map_and_relationship_type_alternatives(self, bolt_driver):
+        records, _ = run_cypher(
+            bolt_driver,
+            "UNWIND [1, 2, 3] AS x WITH x WHERE x IN [1, 3] RETURN x ORDER BY x ASC",
+        )
+        assert records == [{"x": 1}, {"x": 3}]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "RETURN [10, 20, 30][1] AS item, [10, 20, 30][0..2] AS prefix, "
+            "{name: 'Alice', age: 30} AS person",
+        )
+        assert records == [
+            {"item": 20, "prefix": [10, 20], "person": {"name": "Alice", "age": 30}}
+        ]
+
+        records, _ = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person)-[:KNOWS|LIKES]->(m:Person) "
+            "RETURN n.name AS src, m.name AS dst ORDER BY src ASC, dst ASC",
+        )
+        assert records == [
+            {"src": "Alice", "dst": "Bob"},
+            {"src": "Alice", "dst": "Carol"},
+            {"src": "Bob", "dst": "Carol"},
+            {"src": "Carol", "dst": "Dave"},
+            {"src": "Dave", "dst": "Eve"},
+            {"src": "Eve", "dst": "Alice"},
+        ]
+
+    def test_bolt_explicit_unsupported_boundaries(self, bolt_driver):
+        with pytest.raises(ClientError):
+            run_cypher(bolt_driver, "MATCH (n:Person:Employee) RETURN n")
+        with pytest.raises(ClientError):
+            run_cypher(bolt_driver, "CALL db.labels()")
+        with pytest.raises(ClientError):
+            run_cypher(bolt_driver, "LOAD CSV FROM 'file:///people.csv' AS row RETURN row")

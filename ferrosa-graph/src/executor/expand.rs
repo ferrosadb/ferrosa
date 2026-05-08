@@ -18,13 +18,19 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{Mutation, TableId};
 
 use crate::adjacency::observer::derive_adjacency_mutations;
-use crate::adjacency::schema::adjacency_keyspace_name;
+use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::parser::{CompareOp, Expr, Literal, ReturnClause, ReturnItem, SortDir};
+use crate::parser::{CompareOp, Direction, Expr, Literal, ReturnClause, ReturnItem, SortDir};
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
+
+#[derive(Debug, Clone)]
+struct ExpandState {
+    current_key: DecoratedKey,
+    bindings: HashMap<String, serde_json::Value>,
+}
 
 struct MergeWriteShape {
     key: DecoratedKey,
@@ -114,9 +120,56 @@ pub async fn execute(
     let start = Instant::now();
 
     match plan {
+        PhysicalPlan::Union { arms, all } => {
+            let mut columns: Option<Vec<String>> = None;
+            let mut rows = Vec::new();
+            let mut stats = QueryStats::default();
+            for arm in arms {
+                let result = Box::pin(execute(
+                    arm,
+                    write_path,
+                    keyspace,
+                    config,
+                    virtual_tables,
+                    schema,
+                ))
+                .await?;
+                if let Some(existing) = &columns {
+                    if existing != &result.columns {
+                        return Err(GraphError::Validation(
+                            "UNION arms must return identical columns".to_string(),
+                        ));
+                    }
+                } else {
+                    columns = Some(result.columns.clone());
+                }
+                stats.vertices_read += result.stats.vertices_read;
+                stats.edges_read += result.stats.edges_read;
+                stats.vertices_written += result.stats.vertices_written;
+                stats.vertices_deleted += result.stats.vertices_deleted;
+                rows.extend(result.rows);
+            }
+            if !all {
+                let mut seen = std::collections::HashSet::new();
+                rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
+            }
+            stats.execution_ms = start.elapsed().as_millis() as u64;
+            Ok(GraphResult {
+                columns: columns.unwrap_or_default(),
+                rows,
+                stats,
+            })
+        }
+        PhysicalPlan::Unwind {
+            expr,
+            var,
+            return_clause,
+        } => execute_unwind(&expr, &var, &return_clause, start),
         PhysicalPlan::Expand {
             anchor,
             hops,
+            optional_hops,
+            with_pipeline,
             return_clause,
         } => {
             execute_expand(
@@ -124,6 +177,8 @@ pub async fn execute(
                 keyspace,
                 &anchor,
                 &hops,
+                &optional_hops,
+                with_pipeline.as_ref(),
                 &return_clause,
                 config,
                 start,
@@ -271,24 +326,322 @@ pub async fn execute(
     }
 }
 
-/// Execute an Expand plan.
+fn graph_filter_passes<'a>(
+    expr: &'a Expr,
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    schema: Option<&'a Schema>,
+    bindings: &'a HashMap<String, serde_json::Value>,
+    current_var: &'a str,
+    current_key: &'a DecoratedKey,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
+    Box::pin(async move {
+        match expr {
+            Expr::And(left, right) => Ok(graph_filter_passes(
+                left,
+                write_path,
+                keyspace,
+                schema,
+                bindings,
+                current_var,
+                current_key,
+            )
+            .await?
+                && graph_filter_passes(
+                    right,
+                    write_path,
+                    keyspace,
+                    schema,
+                    bindings,
+                    current_var,
+                    current_key,
+                )
+                .await?),
+            Expr::Or(left, right) => Ok(graph_filter_passes(
+                left,
+                write_path,
+                keyspace,
+                schema,
+                bindings,
+                current_var,
+                current_key,
+            )
+            .await?
+                || graph_filter_passes(
+                    right,
+                    write_path,
+                    keyspace,
+                    schema,
+                    bindings,
+                    current_var,
+                    current_key,
+                )
+                .await?),
+            Expr::Not(inner) => Ok(!graph_filter_passes(
+                inner,
+                write_path,
+                keyspace,
+                schema,
+                bindings,
+                current_var,
+                current_key,
+            )
+            .await?),
+            Expr::PatternPredicate {
+                start_var,
+                hops,
+                negated,
+            } => {
+                let exists = pattern_predicate_exists(
+                    write_path,
+                    keyspace,
+                    schema,
+                    bindings,
+                    current_var,
+                    current_key,
+                    start_var,
+                    hops,
+                )
+                .await?;
+                Ok(if *negated { !exists } else { exists })
+            }
+            _ => eval::filter_passes(expr, bindings),
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pattern_predicate_exists(
+    write_path: &WritePath,
+    keyspace: &str,
+    schema: Option<&Schema>,
+    bindings: &HashMap<String, serde_json::Value>,
+    current_var: &str,
+    current_key: &DecoratedKey,
+    start_var: &str,
+    hops: &[crate::parser::PatternPredicateHop],
+) -> Result<bool> {
+    if hops.is_empty() {
+        return Ok(bindings.contains_key(start_var));
+    }
+    if start_var != current_var {
+        return Err(GraphError::Validation(format!(
+            "pattern predicate start variable `{start_var}` is not bound at this point"
+        )));
+    }
+
+    let adj_ks = adjacency_keyspace_name(keyspace);
+    let adj_table_id = TableId::new(&adj_ks, "adjacency");
+    let mut frontier = vec![current_key.clone()];
+
+    for (hop_index, hop) in hops.iter().enumerate() {
+        let mut next_frontier = Vec::new();
+        for vertex_key in &frontier {
+            let mut source_keys = vec![vertex_key.clone()];
+            let hex_candidate = DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                hex::encode(vertex_key.key.as_bytes()).into_bytes(),
+            ));
+            source_keys.push(hex_candidate);
+            if hop_index == 0 {
+                if let Some(serde_json::Value::Object(obj)) = bindings.get(start_var) {
+                    for (name, value) in obj {
+                        if name == "id" || name.ends_with("_id") {
+                            if let serde_json::Value::String(s) = value {
+                                let candidate = DecoratedKey::new(
+                                    ferrosa_common::PartitionKey::new(s.as_bytes().to_vec()),
+                                );
+                                if !source_keys
+                                    .iter()
+                                    .any(|key| key.key.as_bytes() == candidate.key.as_bytes())
+                                {
+                                    source_keys.push(candidate);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // The adjacency and edge tables are keyed by source vertex for outgoing traversals.
+            // Direction::Both can use that same outgoing index here; incoming-only predicates
+            // need a reverse adjacency/edge index before they can be efficient.
+            if matches!(hop.direction, Direction::In) {
+                return Err(GraphError::Validation(
+                    "incoming pattern predicates require a reverse adjacency index".into(),
+                ));
+            }
+
+            let mut neighbor_ids = Vec::new();
+            for source_key in &source_keys {
+                if let Some(partition) = write_path.read(&adj_table_id, source_key).await? {
+                    for row in &partition.rows {
+                        if let Some(neighbor_id) = extract_neighbor_id_for_direction(
+                            &row.clustering,
+                            hop.rel_type.as_deref(),
+                            Some(DIRECTION_OUT),
+                        ) {
+                            neighbor_ids.push(neighbor_id);
+                        }
+                    }
+                }
+            }
+
+            // Indexed fallback: if derived adjacency rows are unavailable, read the
+            // relationship table partition for this source vertex. This is still a
+            // primary-key lookup, not a full edge-table scan.
+            if neighbor_ids.is_empty() {
+                if let (Some(schema_ref), Some(rel_type)) = (schema, hop.rel_type.as_ref()) {
+                    if let Some(edge_meta) =
+                        resolve_table_by_graph_label(schema_ref, keyspace, rel_type)
+                    {
+                        if edge_meta
+                            .extensions
+                            .get("graph.type")
+                            .is_some_and(|graph_type| graph_type == "edge")
+                        {
+                            let edge_tid = TableId::new(&edge_meta.keyspace, &edge_meta.name);
+                            let strategy = graph_replication_strategy(schema, &edge_meta.keyspace)?;
+                            for source_key in &source_keys {
+                                if let Some(edge_partition) = write_path
+                                    .pk_read(
+                                        &edge_tid,
+                                        source_key,
+                                        ConsistencyLevel::One,
+                                        &strategy,
+                                    )
+                                    .await?
+                                {
+                                    for row in &edge_partition.rows {
+                                        if let Some(components) = decode_clustering_components(
+                                            &row.clustering,
+                                            edge_meta.clustering_key.len(),
+                                        ) {
+                                            if let Some(dst) = components.first() {
+                                                neighbor_ids.push(dst.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for neighbor_id in neighbor_ids {
+                let neighbor_key =
+                    DecoratedKey::new(ferrosa_common::PartitionKey::new(neighbor_id.clone()));
+
+                if let Some(target_label) = &hop.target_label {
+                    let Some(schema_ref) = schema else {
+                        return Err(GraphError::Validation(
+                            "pattern predicate label filters require schema metadata".into(),
+                        ));
+                    };
+                    let Some(target_meta) =
+                        resolve_table_by_graph_label(schema_ref, keyspace, target_label)
+                    else {
+                        return Err(GraphError::Validation(format!(
+                            "unknown graph label in pattern predicate: {target_label}"
+                        )));
+                    };
+                    let target_tid = TableId::new(&target_meta.keyspace, &target_meta.name);
+                    let matched = find_vertex_match(
+                        write_path,
+                        &target_tid,
+                        &target_meta,
+                        &HashMap::new(),
+                        &neighbor_id,
+                        hop.target_props.as_slice(),
+                        "_pattern_predicate_target",
+                        schema,
+                    )
+                    .await?;
+                    if matched.is_none() {
+                        continue;
+                    }
+                }
+
+                next_frontier.push(neighbor_key);
+            }
+        }
+        if next_frontier.is_empty() {
+            return Ok(false);
+        }
+        next_frontier.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+        next_frontier.dedup_by(|a, b| a.key.as_bytes() == b.key.as_bytes());
+        frontier = next_frontier;
+    }
+
+    Ok(!frontier.is_empty())
+}
+
+fn execute_unwind(
+    expr: &Expr,
+    var: &str,
+    return_clause: &ReturnClause,
+    start: Instant,
+) -> Result<GraphResult> {
+    let value = eval::eval_expr(expr, &HashMap::new())?;
+    let values = match value {
+        serde_json::Value::Array(values) => values,
+        serde_json::Value::Null => Vec::new(),
+        other => {
+            return Err(GraphError::Validation(format!(
+                "UNWIND expects a list expression, got {other:?}"
+            )))
+        }
+    };
+    let mut rows = Vec::new();
+    for value in values {
+        let mut bindings = HashMap::new();
+        bindings.insert(var.to_string(), value);
+        let row = return_clause
+            .items
+            .iter()
+            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
+            .collect::<Vec<_>>();
+        rows.push(row);
+    }
+    let columns = return_clause
+        .items
+        .iter()
+        .map(|item| {
+            item.alias
+                .clone()
+                .unwrap_or_else(|| expr_to_column_name(&item.expr))
+        })
+        .collect::<Vec<_>>();
+    sort_rows(&mut rows, &columns, &return_clause.order_by);
+    if let Some(limit) = return_clause.limit {
+        rows.truncate(limit.max(0) as usize);
+    }
+    Ok(GraphResult {
+        columns,
+        rows,
+        stats: QueryStats {
+            vertices_read: 0,
+            edges_read: 0,
+            vertices_written: 0,
+            vertices_deleted: 0,
+            execution_ms: start.elapsed().as_millis() as u64,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_expand(
     write_path: &WritePath,
     keyspace: &str,
     anchor: &Anchor,
     hops: &[Hop],
+    optional_hops: &[Hop],
+    with_pipeline: Option<&crate::parser::WithPipeline>,
     return_clause: &ReturnClause,
     config: &GraphEngineConfig,
     start: Instant,
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
-    struct ExpandState {
-        current_key: DecoratedKey,
-        bindings: HashMap<String, serde_json::Value>,
-    }
-
     let mut stats = QueryStats::default();
 
     // Step 1: Anchor lookup.
@@ -356,17 +709,27 @@ async fn execute_expand(
 
                 let mut bindings = HashMap::new();
                 bindings.insert(anchor_var.to_string(), row_json);
+                let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)
+                    .unwrap_or_else(|| partition.key.clone());
 
                 let mut passes = true;
                 for filter in &anchor.filters {
-                    if !eval::filter_passes(filter, &bindings)? {
+                    if !graph_filter_passes(
+                        filter,
+                        write_path,
+                        keyspace,
+                        schema,
+                        &bindings,
+                        anchor_var,
+                        &current_key,
+                    )
+                    .await?
+                    {
                         passes = false;
                         break;
                     }
                 }
                 if passes {
-                    let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)
-                        .unwrap_or_else(|| partition.key.clone());
                     current_states.push(ExpandState {
                         current_key,
                         bindings,
@@ -381,7 +744,17 @@ async fn execute_expand(
 
             let mut passes = true;
             for filter in &anchor.filters {
-                if !eval::filter_passes(filter, &bindings)? {
+                if !graph_filter_passes(
+                    filter,
+                    write_path,
+                    keyspace,
+                    schema,
+                    &bindings,
+                    anchor_var,
+                    &partition.key,
+                )
+                .await?
+                {
                     passes = false;
                     break;
                 }
@@ -422,9 +795,11 @@ async fn execute_expand(
                     .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
 
                 for row in &partition.rows {
-                    if let Some(neighbor_id) =
-                        extract_neighbor_id(&row.clustering, hop.edge_label.as_deref())
-                    {
+                    if let Some(neighbor_id) = extract_neighbor_id_for_direction(
+                        &row.clustering,
+                        hop.edge_label.as_deref(),
+                        expected_adjacency_direction(hop.direction),
+                    ) {
                         let edge_match = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
                             if let (Some(et), Some(meta)) =
                                 (hop.edge_table.as_ref(), edge_meta.as_ref())
@@ -535,6 +910,24 @@ async fn execute_expand(
         current_states = next_states;
     }
 
+    if !optional_hops.is_empty() {
+        current_states = execute_optional_hops(
+            write_path,
+            keyspace,
+            current_states,
+            optional_hops,
+            config,
+            start,
+            schema,
+            &mut stats,
+        )
+        .await?;
+    }
+
+    if let Some(with_pipeline) = with_pipeline {
+        current_states = apply_with_pipeline(current_states, with_pipeline)?;
+    }
+
     // Step 3: Build result from return clause, projecting property values.
     let columns = build_columns(return_clause);
 
@@ -579,6 +972,245 @@ async fn execute_expand(
         rows,
         stats,
     })
+}
+
+fn pipeline_value_cmp(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (serde_json::Value::Number(an), serde_json::Value::Number(bn)) => an
+            .as_f64()
+            .partial_cmp(&bn.as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (serde_json::Value::String(as_), serde_json::Value::String(bs)) => as_.cmp(bs),
+        (serde_json::Value::Bool(ab), serde_json::Value::Bool(bb)) => ab.cmp(bb),
+        _ => format!("{a:?}").cmp(&format!("{b:?}")),
+    }
+}
+
+fn apply_with_pipeline(
+    states: Vec<ExpandState>,
+    with_pipeline: &crate::parser::WithPipeline,
+) -> Result<Vec<ExpandState>> {
+    let mut projected = Vec::with_capacity(states.len());
+    for state in states {
+        let mut bindings = HashMap::new();
+        for item in &with_pipeline.clause.items {
+            let value =
+                eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null);
+            let name = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| expr_to_column_name(&item.expr));
+            bindings.insert(name, value);
+        }
+        if let Some(where_clause) = &with_pipeline.where_clause {
+            if !eval::filter_passes(where_clause, &bindings)? {
+                continue;
+            }
+        }
+        projected.push(ExpandState {
+            current_key: state.current_key,
+            bindings,
+        });
+    }
+
+    if with_pipeline.clause.distinct {
+        let mut seen = std::collections::HashSet::new();
+        projected.retain(|state| {
+            let key = serde_json::to_string(&state.bindings).unwrap_or_default();
+            seen.insert(key)
+        });
+    }
+
+    if !with_pipeline.clause.order_by.is_empty() {
+        projected.sort_by(|a, b| {
+            for order in &with_pipeline.clause.order_by {
+                let av =
+                    eval::eval_expr(&order.expr, &a.bindings).unwrap_or(serde_json::Value::Null);
+                let bv =
+                    eval::eval_expr(&order.expr, &b.bindings).unwrap_or(serde_json::Value::Null);
+                let cmp = pipeline_value_cmp(&av, &bv);
+                if cmp != std::cmp::Ordering::Equal {
+                    return match order.direction {
+                        SortDir::Asc => cmp,
+                        SortDir::Desc => cmp.reverse(),
+                    };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    if let Some(limit) = with_pipeline.clause.limit {
+        projected.truncate(limit.max(0) as usize);
+    }
+    Ok(projected)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_optional_hops(
+    write_path: &WritePath,
+    keyspace: &str,
+    states: Vec<ExpandState>,
+    optional_hops: &[Hop],
+    config: &GraphEngineConfig,
+    start: Instant,
+    schema: Option<&Schema>,
+    stats: &mut QueryStats,
+) -> Result<Vec<ExpandState>> {
+    let optional_vars: Vec<String> = optional_hops
+        .iter()
+        .flat_map(|hop| hop.var.iter().chain(hop.rel_var.iter()))
+        .cloned()
+        .collect();
+    let mut current_states = states;
+    let adj_ks = adjacency_keyspace_name(keyspace);
+    let adj_table_id = TableId::new(&adj_ks, "adjacency");
+
+    for hop in optional_hops {
+        check_timeout(start, config.query_timeout)?;
+        let mut next_states = Vec::new();
+        for state in &current_states {
+            let before_len = next_states.len();
+            let vertex_key = &state.current_key;
+            if matches!(hop.direction, Direction::In) {
+                return Err(GraphError::Validation(
+                    "incoming OPTIONAL MATCH requires a reverse adjacency index".into(),
+                ));
+            }
+            if let Some(partition) = write_path.read(&adj_table_id, vertex_key).await? {
+                stats.edges_read += partition.rows.len();
+                let edge_meta = hop
+                    .edge_table
+                    .as_ref()
+                    .and_then(|et| table_metadata_for(schema, &et.keyspace, &et.table));
+                let vertex_meta = hop
+                    .vertex_table
+                    .as_ref()
+                    .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
+                for row in &partition.rows {
+                    if !adjacency_row_matches_direction(&row.clustering, hop.direction) {
+                        continue;
+                    }
+                    let Some(neighbor_id) = extract_neighbor_id_for_direction(
+                        &row.clustering,
+                        hop.edge_label.as_deref(),
+                        expected_adjacency_direction(hop.direction),
+                    ) else {
+                        continue;
+                    };
+                    let edge_match = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
+                        if let (Some(et), Some(meta)) =
+                            (hop.edge_table.as_ref(), edge_meta.as_ref())
+                        {
+                            let edge_tid = TableId::new(&et.keyspace, &et.table);
+                            find_edge_match(
+                                write_path,
+                                &edge_tid,
+                                meta,
+                                &state.bindings,
+                                &hop.prop_filters,
+                                vertex_key.key.as_bytes(),
+                                &neighbor_id,
+                                schema,
+                            )
+                            .await?
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if !hop.prop_filters.is_empty()
+                        && !edge_row_passes_filters(edge_match.as_ref(), &hop.prop_filters)
+                    {
+                        continue;
+                    }
+                    let mut target_bindings = HashMap::new();
+                    if let Some(var_name) = &hop.var {
+                        if let Some(value) = state.bindings.get(var_name) {
+                            target_bindings.insert(var_name.clone(), value.clone());
+                        }
+                    }
+                    let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
+                        hop.vertex_table
+                            .as_ref()
+                            .map(|vt| TableId::new(&vt.keyspace, &vt.table)),
+                        vertex_meta.as_ref(),
+                    ) {
+                        find_vertex_match(
+                            write_path,
+                            &vertex_tid,
+                            meta,
+                            &target_bindings,
+                            &neighbor_id,
+                            hop.target_props
+                                .iter()
+                                .filter(|(name, _)| name != "__where__")
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            hop.var.as_deref().unwrap_or("_optional_hop"),
+                            schema,
+                        )
+                        .await?
+                        .map(|matched| matched.json)
+                    } else {
+                        None
+                    };
+                    if hop.vertex_table.is_some() && neighbor_json.is_none() {
+                        continue;
+                    }
+                    let mut bindings = state.bindings.clone();
+                    if let Some(var_name) = &hop.var {
+                        bindings.insert(
+                            var_name.clone(),
+                            neighbor_json.unwrap_or_else(|| {
+                                serde_json::Value::String(hex::encode(&neighbor_id))
+                            }),
+                        );
+                    }
+                    let neighbor_key =
+                        DecoratedKey::new(ferrosa_common::PartitionKey::new(neighbor_id.clone()));
+                    if let Some(rel_var) = &hop.rel_var {
+                        let edge_json = edge_binding_json(
+                            row,
+                            edge_match.as_ref(),
+                            hop.edge_label.as_deref(),
+                            vertex_key,
+                            &neighbor_id,
+                        );
+                        bindings.insert(rel_var.clone(), edge_json);
+                    }
+                    next_states.push(ExpandState {
+                        current_key: neighbor_key,
+                        bindings,
+                    });
+                }
+            }
+            if next_states.len() == before_len {
+                let mut bindings = state.bindings.clone();
+                for var in &optional_vars {
+                    bindings
+                        .entry(var.clone())
+                        .or_insert(serde_json::Value::Null);
+                }
+                next_states.push(ExpandState {
+                    current_key: state.current_key.clone(),
+                    bindings,
+                });
+            }
+            if next_states.len() > config.max_fan_out_per_hop {
+                return Err(GraphError::ResourceLimit(format!(
+                    "fan-out limit exceeded: {} neighbors (limit: {})",
+                    next_states.len(),
+                    config.max_fan_out_per_hop
+                )));
+            }
+        }
+        stats.vertices_read += next_states.len();
+        current_states = next_states;
+    }
+    Ok(current_states)
 }
 
 /// Check whether an edge row passes all property filters.
@@ -2560,19 +3192,30 @@ async fn execute_aggregate(
             .iter()
             .map(|proj| match proj {
                 AggregateProjection::GroupKey(_) => Ok(None),
-                AggregateProjection::AggregateFunc { name, arg } => {
+                AggregateProjection::AggregateFunc { name, arg, .. } => {
                     let count_star = name == "count" && matches!(arg, Expr::Var(v) if v == "*");
                     create_accumulator(name, count_star, config.max_collect_size).map(Some)
                 }
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let mut seen_distinct: Vec<std::collections::HashSet<String>> = projections
+            .iter()
+            .map(|_| std::collections::HashSet::new())
+            .collect();
+
         // Feed rows into accumulators.
         for row in group_rows {
             for (proj_idx, proj) in projections.iter().enumerate() {
-                if let AggregateProjection::AggregateFunc { arg, .. } = proj {
+                if let AggregateProjection::AggregateFunc { arg, distinct, .. } = proj {
                     if let Some(ref mut acc) = accumulators[proj_idx] {
                         let value = eval_aggregate_arg(arg, row, inner_columns);
+                        if *distinct {
+                            let key = serde_json::to_string(&value).unwrap_or_default();
+                            if !seen_distinct[proj_idx].insert(key) {
+                                continue;
+                            }
+                        }
                         acc.accumulate(&value);
                     }
                 }
@@ -2661,6 +3304,7 @@ fn eval_aggregate_arg(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null)
         }
+        Expr::Distinct(inner) => eval_aggregate_arg(inner, row, columns),
         Expr::Function { name, args } => {
             // Nested function calls: for now just return the inner result column
             let col_name = format!("{}({})", name, if args.is_empty() { "*" } else { "?" });
@@ -2832,6 +3476,7 @@ fn expr_to_column_name(expr: &Expr) -> String {
     match expr {
         Expr::Property { var, name } => format!("{var}.{name}"),
         Expr::Var(v) => v.clone(),
+        Expr::Distinct(inner) => expr_to_column_name(inner),
         Expr::Function { name, args } => {
             let arg_str = if args.is_empty() {
                 "*".to_string()
@@ -2926,6 +3571,25 @@ fn column_type_for_property(
         .map(|col| col.column_type.clone())
 }
 
+fn adjacency_direction(clustering: &[u8]) -> Option<u8> {
+    if clustering.len() < 3 {
+        return None;
+    }
+    let dir_len = u16::from_be_bytes([clustering[0], clustering[1]]) as usize;
+    if dir_len != 1 || clustering.len() < 3 {
+        return None;
+    }
+    Some(clustering[2])
+}
+
+fn adjacency_row_matches_direction(clustering: &[u8], direction: Direction) -> bool {
+    match direction {
+        Direction::Out => adjacency_direction(clustering) == Some(0),
+        Direction::In => adjacency_direction(clustering) == Some(1),
+        Direction::Both => true,
+    }
+}
+
 /// Extract the neighbor ID from an adjacency row's clustering key.
 ///
 /// Clustering format (standard composite, per SSTable writer's multi-column
@@ -2937,6 +3601,28 @@ fn column_type_for_property(
 /// If `expected_label` is Some, only returns the neighbor ID if the edge
 /// label matches (case-insensitive).
 pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> Option<Vec<u8>> {
+    extract_neighbor_id_for_direction(clustering, expected_label, None)
+}
+
+fn label_matches_alternative(actual: &str, expected: &str) -> bool {
+    expected
+        .split('|')
+        .any(|candidate| actual.eq_ignore_ascii_case(candidate.trim()))
+}
+
+fn expected_adjacency_direction(direction: Direction) -> Option<u8> {
+    match direction {
+        Direction::Out => Some(DIRECTION_OUT),
+        Direction::In => Some(DIRECTION_IN),
+        Direction::Both => None,
+    }
+}
+
+fn extract_neighbor_id_for_direction(
+    clustering: &[u8],
+    expected_label: Option<&str>,
+    expected_direction: Option<u8>,
+) -> Option<Vec<u8>> {
     // Minimum: 2+1 (direction component) + 2 (label_len) + 2 (id_len) = 7
     if clustering.len() < 7 {
         return None;
@@ -2944,6 +3630,13 @@ pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> O
 
     // Component 0: direction. Skip [u16 len][1 byte].
     let dir_len = u16::from_be_bytes([clustering[0], clustering[1]]) as usize;
+    if dir_len != 1 || 2 + dir_len > clustering.len() {
+        return None;
+    }
+    let direction = clustering[2];
+    if expected_direction.is_some_and(|expected| direction != expected) {
+        return None;
+    }
     let mut pos = 2 + dir_len;
     if pos + 2 > clustering.len() {
         return None;
@@ -2960,7 +3653,7 @@ pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> O
 
     if let Some(expected) = expected_label {
         let label_str = std::str::from_utf8(label_bytes).ok()?;
-        if !label_str.eq_ignore_ascii_case(expected) {
+        if !label_matches_alternative(label_str, expected) {
             return None;
         }
     }
@@ -3201,6 +3894,8 @@ mod tests {
                 filters: vec![],
             },
             hops: vec![],
+            optional_hops: vec![],
+            with_pipeline: None,
             return_clause: ReturnClause {
                 distinct: false,
                 items,
@@ -4500,6 +5195,8 @@ mod tests {
                 filters: vec![],
             },
             hops: vec![],
+            optional_hops: vec![],
+            with_pipeline: None,
             return_clause: inner_return_clause,
         };
 
@@ -4509,6 +5206,7 @@ mod tests {
             projections: vec![AggregateProjection::AggregateFunc {
                 name: "count".to_string(),
                 arg: Expr::Var("*".to_string()),
+                distinct: false,
             }],
             return_clause: outer_return_clause,
         };

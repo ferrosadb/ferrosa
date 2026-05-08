@@ -99,10 +99,12 @@ impl<'input> Parser<'input> {
                     delta,
                 })
             }
-            TokenKind::Keyword(Keyword::Optional)
-            | TokenKind::Keyword(Keyword::With)
+            TokenKind::Keyword(Keyword::Unwind) => self.parse_unwind_statement(),
+            TokenKind::Keyword(Keyword::With)
             | TokenKind::Keyword(Keyword::Union)
-            | TokenKind::Keyword(Keyword::Unwind) => Err(ParseError::new(
+            | TokenKind::Keyword(Keyword::Call)
+            | TokenKind::Keyword(Keyword::Foreach)
+            | TokenKind::Keyword(Keyword::Load) => Err(ParseError::new(
                 format!("unsupported Cypher clause: {:?}", tok.kind),
                 tok.span,
             )),
@@ -131,6 +133,28 @@ impl<'input> Parser<'input> {
                 tok.span,
             )),
         }
+    }
+
+    fn parse_unwind_statement(&mut self) -> ParseResult<Statement> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Unwind))?;
+        let expr = self.parse_expr()?;
+        self.lexer.expect(&TokenKind::Keyword(Keyword::As))?;
+        let tok = self.lexer.next_token()?;
+        let var = match tok.kind {
+            TokenKind::Ident(name) => name.to_string(),
+            _ => {
+                return Err(ParseError::new(
+                    format!("expected variable after AS, got {:?}", tok.kind),
+                    tok.span,
+                ));
+            }
+        };
+        let return_clause = self.parse_return_clause()?;
+        Ok(Statement::Unwind {
+            expr,
+            var,
+            return_clause,
+        })
     }
 
     /// Parse one or more consecutive MERGE clauses with an optional trailing SET and RETURN.
@@ -189,7 +213,7 @@ impl<'input> Parser<'input> {
             None
         };
 
-        // Check what follows: RETURN, SET, DELETE, DETACH DELETE.
+        // Check what follows: RETURN, OPTIONAL MATCH, SET, DELETE, DETACH DELETE.
         let tok = self.lexer.peek()?;
         match &tok.kind {
             TokenKind::Keyword(Keyword::Return) => {
@@ -197,6 +221,34 @@ impl<'input> Parser<'input> {
                 Ok(Statement::Match {
                     pattern,
                     where_clause,
+                    return_clause,
+                })
+            }
+            TokenKind::Keyword(Keyword::With) => {
+                let with_pipeline = self.parse_with_pipeline()?;
+                let return_clause = self.parse_return_clause()?;
+                Ok(Statement::MatchWith {
+                    pattern,
+                    where_clause,
+                    with_pipeline,
+                    return_clause,
+                })
+            }
+            TokenKind::Keyword(Keyword::Optional) => {
+                self.lexer.next_token()?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Match))?;
+                let optional_pattern = self.parse_pattern_list()?;
+                let optional_where_clause = if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                let return_clause = self.parse_return_clause()?;
+                Ok(Statement::MatchWithOptional {
+                    pattern,
+                    where_clause,
+                    optional_pattern,
+                    optional_where_clause,
                     return_clause,
                 })
             }
@@ -230,9 +282,15 @@ impl<'input> Parser<'input> {
                     variables,
                 })
             }
+            TokenKind::Keyword(Keyword::Call)
+            | TokenKind::Keyword(Keyword::Foreach)
+            | TokenKind::Keyword(Keyword::Load) => Err(ParseError::new(
+                format!("unsupported Cypher clause: {:?}", tok.kind),
+                tok.span,
+            )),
             _ => Err(ParseError::new(
                 format!(
-                    "expected RETURN, SET, DELETE, or DETACH DELETE after MATCH, got {:?}",
+                    "expected RETURN, OPTIONAL MATCH, WITH, SET, DELETE, or DETACH DELETE after MATCH, got {:?}",
                     tok.kind
                 ),
                 tok.span,
@@ -383,6 +441,13 @@ impl<'input> Parser<'input> {
             }
         }
 
+        if self.lexer.peek()?.kind == TokenKind::Colon {
+            let tok = self.lexer.peek()?;
+            return Err(ParseError::new(
+                "multi-label node patterns are not yet supported".to_string(),
+                tok.span,
+            ));
+        }
         self.lexer.expect(&TokenKind::RParen)?;
 
         Ok(Pattern::Node { var, label, props })
@@ -500,7 +565,7 @@ impl<'input> Parser<'input> {
         let tok = self.lexer.peek()?;
         match &tok.kind {
             TokenKind::Colon => {
-                rel_type = Some(self.parse_label()?);
+                rel_type = Some(self.parse_label_alternatives()?);
             }
             TokenKind::Ident(_) => {
                 let name_tok = self.lexer.next_token()?;
@@ -508,7 +573,7 @@ impl<'input> Parser<'input> {
                     var = Some(name.to_string());
                 }
                 if self.lexer.peek()?.kind == TokenKind::Colon {
-                    rel_type = Some(self.parse_label()?);
+                    rel_type = Some(self.parse_label_alternatives()?);
                 }
             }
             TokenKind::Star => {
@@ -570,6 +635,11 @@ impl<'input> Parser<'input> {
     /// Parse `:Label` — consume colon and return the label name.
     fn parse_label(&mut self) -> ParseResult<String> {
         self.lexer.expect(&TokenKind::Colon)?;
+        self.parse_label_name()
+    }
+
+    /// Parse a label/type name after ':' or '|'. Keywords can be labels too.
+    fn parse_label_name(&mut self) -> ParseResult<String> {
         let tok = self.lexer.next_token()?;
         match tok.kind {
             TokenKind::Ident(name) => Ok(name.to_string()),
@@ -579,10 +649,24 @@ impl<'input> Parser<'input> {
                 Ok(text.to_string())
             }
             _ => Err(ParseError::new(
-                format!("expected label name after ':', got {:?}", tok.kind),
+                format!("expected label name, got {:?}", tok.kind),
                 tok.span,
             )),
         }
+    }
+
+    /// Parse relationship type alternatives: `:KNOWS|LIKES`.
+    ///
+    /// Stored as a `|`-joined string for this correctness-first slice so older
+    /// single-label fields keep their shape; downstream label matching splits it
+    /// back into a bounded alternatives list.
+    fn parse_label_alternatives(&mut self) -> ParseResult<String> {
+        self.lexer.expect(&TokenKind::Colon)?;
+        let mut labels = vec![self.parse_label_name()?];
+        while self.lexer.eat(&TokenKind::Pipe)? {
+            labels.push(self.parse_label_name()?);
+        }
+        Ok(labels.join("|"))
     }
 
     /// Parse `{key: value, ...}`.
@@ -656,31 +740,24 @@ impl<'input> Parser<'input> {
                 let inner = self.parse_not_expr()?;
                 self.exit_expr();
 
-                // If a relationship follows, this is a negative pattern —
-                // consume and discard the relationship chain.
+                // If a relationship follows, this is a negative pattern predicate.
                 let next = self.lexer.peek()?;
+                let next_kind = next.kind.clone();
+                let next_span = next.span;
                 if matches!(
-                    next.kind,
+                    next_kind,
                     TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus
                 ) {
-                    // Negative pattern expressions (NOT (a)-[:REL]->(b)) are
-                    // not yet supported. Return an error instead of silently
-                    // returning all rows (which is incorrect).
-                    let _ = inner;
-                    loop {
-                        let tok = self.lexer.peek()?;
-                        match &tok.kind {
-                            TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus => {
-                                let _rel = self.parse_rel_pattern()?;
-                                let _node = self.parse_node_pattern()?;
-                            }
-                            _ => break,
+                    let start_var = match inner {
+                        Expr::Var(v) => v,
+                        _ => {
+                            return Err(ParseError::new(
+                                "negative pattern predicate must start with a bound variable, e.g. NOT (a)-[:REL]->(b)",
+                                next_span,
+                            ));
                         }
-                    }
-                    return Err(ParseError {
-                        message: "negative pattern expressions (NOT (a)-[:REL]->(b)) are not yet supported".into(),
-                        span: crate::parser::error::Span { start: 0, end: 0 },
-                    });
+                    };
+                    return self.parse_pattern_predicate_from_start(start_var, next_span, true);
                 }
 
                 return Ok(Expr::Not(Box::new(inner)));
@@ -696,6 +773,67 @@ impl<'input> Parser<'input> {
         }
     }
 
+    fn parse_pattern_predicate_from_start(
+        &mut self,
+        start_var: String,
+        span: crate::parser::error::Span,
+        negated: bool,
+    ) -> ParseResult<Expr> {
+        let mut hops = Vec::new();
+        loop {
+            let rel = self.parse_rel_pattern()?;
+            let target = self.parse_node_pattern()?;
+            let Pattern::Rel {
+                rel_type,
+                direction,
+                props,
+                length_range,
+                ..
+            } = rel
+            else {
+                unreachable!("parse_rel_pattern returns Pattern::Rel")
+            };
+            if length_range.is_some() {
+                return Err(ParseError::new(
+                    "variable-length pattern predicates are not yet supported",
+                    span,
+                ));
+            }
+            if !props.is_empty() {
+                return Err(ParseError::new(
+                    "relationship property filters in pattern predicates are not yet supported",
+                    span,
+                ));
+            }
+            let Pattern::Node {
+                label: target_label,
+                props: target_props,
+                ..
+            } = target
+            else {
+                unreachable!("parse_node_pattern returns Pattern::Node")
+            };
+            hops.push(PatternPredicateHop {
+                rel_type,
+                direction,
+                target_label,
+                target_props,
+            });
+            let tok = self.lexer.peek()?;
+            if !matches!(
+                tok.kind,
+                TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus
+            ) {
+                break;
+            }
+        }
+        Ok(Expr::PatternPredicate {
+            start_var,
+            hops,
+            negated,
+        })
+    }
+
     fn parse_comparison(&mut self) -> ParseResult<Expr> {
         let left = self.parse_addition()?;
 
@@ -708,6 +846,14 @@ impl<'input> Parser<'input> {
                 self.lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
                 return Ok(Expr::IsNull(Box::new(left)));
             }
+        }
+
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::In))? {
+            let list = self.parse_addition()?;
+            return Ok(Expr::In {
+                value: Box::new(left),
+                list: Box::new(list),
+            });
         }
 
         let tok = self.lexer.peek()?;
@@ -795,8 +941,75 @@ impl<'input> Parser<'input> {
                 right: Box::new(inner?),
             })
         } else {
-            self.parse_primary()
+            self.parse_postfix()
         }
+    }
+
+    fn parse_postfix(&mut self) -> ParseResult<Expr> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            if self.lexer.eat(&TokenKind::LBracket)? {
+                let start = if self.lexer.peek()?.kind == TokenKind::Dot {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
+                };
+                if self.lexer.eat(&TokenKind::Dot)? {
+                    self.lexer.expect(&TokenKind::Dot)?;
+                    let end = if self.lexer.peek()?.kind == TokenKind::RBracket {
+                        None
+                    } else {
+                        Some(self.parse_expr()?)
+                    };
+                    self.lexer.expect(&TokenKind::RBracket)?;
+                    expr = Expr::Slice {
+                        target: Box::new(expr),
+                        start: start.map(Box::new),
+                        end: end.map(Box::new),
+                    };
+                } else {
+                    let Some(index) = start else {
+                        return Err(ParseError::new(
+                            "expected list index or slice bound",
+                            self.lexer.peek()?.span,
+                        ));
+                    };
+                    self.lexer.expect(&TokenKind::RBracket)?;
+                    expr = Expr::Index {
+                        target: Box::new(expr),
+                        index: Box::new(index),
+                    };
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(expr)
+    }
+
+    fn parse_list_predicate_call(&mut self, kind: ListPredicateKind) -> ParseResult<Expr> {
+        self.lexer.expect(&TokenKind::LParen)?;
+        let var_tok = self.lexer.next_token()?;
+        let var = match var_tok.kind {
+            TokenKind::Ident(name) => name.to_string(),
+            _ => {
+                return Err(ParseError::new(
+                    format!("expected list predicate variable, got {:?}", var_tok.kind),
+                    var_tok.span,
+                ));
+            }
+        };
+        self.lexer.expect(&TokenKind::Keyword(Keyword::In))?;
+        let list = self.parse_expr()?;
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Where))?;
+        let predicate = self.parse_expr()?;
+        self.lexer.expect(&TokenKind::RParen)?;
+        Ok(Expr::ListPredicate {
+            kind,
+            var,
+            list: Box::new(list),
+            predicate: Box::new(predicate),
+        })
     }
 
     fn parse_primary(&mut self) -> ParseResult<Expr> {
@@ -834,6 +1047,29 @@ impl<'input> Parser<'input> {
                     unreachable!()
                 }
             }
+            TokenKind::Keyword(Keyword::All) => {
+                self.lexer.next_token()?;
+                self.parse_list_predicate_call(ListPredicateKind::All)
+            }
+            TokenKind::Keyword(Keyword::Exists) => {
+                let exists_tok = self.lexer.next_token()?;
+                self.lexer.expect(&TokenKind::LBrace)?;
+                let start = self.parse_node_pattern()?;
+                let Pattern::Node {
+                    var: Some(start_var),
+                    ..
+                } = start
+                else {
+                    return Err(ParseError::new(
+                        "EXISTS pattern predicate must start with a bound variable, e.g. EXISTS { (a)-[:REL]->(b) }",
+                        exists_tok.span,
+                    ));
+                };
+                let expr =
+                    self.parse_pattern_predicate_from_start(start_var, exists_tok.span, false)?;
+                self.lexer.expect(&TokenKind::RBrace)?;
+                Ok(expr)
+            }
             TokenKind::Keyword(Keyword::True) => {
                 self.lexer.next_token()?;
                 Ok(Expr::Literal(Literal::Bool(true)))
@@ -846,6 +1082,19 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 Ok(Expr::Literal(Literal::Null))
             }
+            TokenKind::LBracket => {
+                self.lexer.next_token()?;
+                let mut items = Vec::new();
+                if !self.lexer.eat(&TokenKind::RBracket)? {
+                    items.push(self.parse_expr()?);
+                    while self.lexer.eat(&TokenKind::Comma)? {
+                        items.push(self.parse_expr()?);
+                    }
+                    self.lexer.expect(&TokenKind::RBracket)?;
+                }
+                Ok(Expr::List(items))
+            }
+            TokenKind::LBrace => Ok(Expr::Map(self.parse_prop_map()?)),
             TokenKind::LParen => {
                 // Parenthesized expression — recursion depth is tracked
                 // via parse_expr's enter_expr/exit_expr.
@@ -861,6 +1110,12 @@ impl<'input> Parser<'input> {
                 } else {
                     unreachable!()
                 };
+
+                // Common list predicates use scoped syntax: any(x IN list WHERE pred).
+                if name.eq_ignore_ascii_case("any") && self.lexer.peek()?.kind == TokenKind::LParen
+                {
+                    return self.parse_list_predicate_call(ListPredicateKind::Any);
+                }
 
                 // Check for property access (var.prop) or function call (fn(...)).
                 let next = self.lexer.peek()?.clone();
@@ -887,16 +1142,17 @@ impl<'input> Parser<'input> {
                     }
                     TokenKind::LParen => {
                         self.lexer.next_token()?;
-                        if self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))? {
-                            return Err(ParseError::new(
-                                "aggregate DISTINCT is not supported; use RETURN DISTINCT or remove DISTINCT",
-                                next.span,
-                            ));
-                        }
                         let mut args = vec![];
                         if self.lexer.peek()?.kind != TokenKind::RParen {
                             loop {
-                                args.push(self.parse_expr()?);
+                                let distinct_arg =
+                                    self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
+                                let arg = self.parse_expr()?;
+                                args.push(if distinct_arg {
+                                    Expr::Distinct(Box::new(arg))
+                                } else {
+                                    arg
+                                });
                                 if !self.lexer.eat(&TokenKind::Comma)? {
                                     break;
                                 }
@@ -916,6 +1172,53 @@ impl<'input> Parser<'input> {
     }
 
     // --- RETURN clause ---
+
+    fn parse_with_pipeline(&mut self) -> ParseResult<WithPipeline> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::With))?;
+        let distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
+        let mut items = vec![self.parse_return_item()?];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            items.push(self.parse_return_item()?);
+        }
+        let where_clause = if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let order_by = if self.lexer.eat(&TokenKind::Keyword(Keyword::Order))? {
+            self.lexer.expect(&TokenKind::Keyword(Keyword::By))?;
+            let mut orders = vec![self.parse_order_item()?];
+            while self.lexer.eat(&TokenKind::Comma)? {
+                orders.push(self.parse_order_item()?);
+            }
+            orders
+        } else {
+            vec![]
+        };
+        let limit = if self.lexer.eat(&TokenKind::Keyword(Keyword::Limit))? {
+            let tok = self.lexer.next_token()?;
+            match tok.kind {
+                TokenKind::Integer(v) => Some(v),
+                _ => {
+                    return Err(ParseError::new(
+                        format!("expected integer after LIMIT, got {:?}", tok.kind),
+                        tok.span,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(WithPipeline {
+            clause: ReturnClause {
+                distinct,
+                items,
+                order_by,
+                limit,
+            },
+            where_clause,
+        })
+    }
 
     fn parse_return_clause(&mut self) -> ParseResult<ReturnClause> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Return))?;
@@ -1118,22 +1421,43 @@ impl<'input> Parser<'input> {
 /// Parse a complete Cypher statement from source text.
 pub fn parse(input: &str) -> ParseResult<Statement> {
     let mut parser = Parser::new(input);
-    let stmt = parser.parse_statement()?;
-    // Ensure we consumed all input.
+    let first = parser.parse_statement()?;
+    let mut arms = vec![first];
+    let mut union_all = false;
+    while parser.lexer.peek()?.kind == TokenKind::Keyword(Keyword::Union) {
+        parser.lexer.next_token()?;
+        let this_all = parser.lexer.eat(&TokenKind::Keyword(Keyword::All))?;
+        if arms.len() > 1 && this_all != union_all {
+            let pos = parser.lexer.pos();
+            return Err(ParseError::new(
+                "cannot mix UNION and UNION ALL in one query".to_string(),
+                Span {
+                    start: pos,
+                    end: pos,
+                },
+            ));
+        }
+        union_all = this_all;
+        arms.push(parser.parse_statement()?);
+    }
     let tok = parser.lexer.next_token()?;
     if tok.kind != TokenKind::Eof {
         let message = match &tok.kind {
-            TokenKind::Keyword(Keyword::Optional)
-            | TokenKind::Keyword(Keyword::With)
-            | TokenKind::Keyword(Keyword::Union)
-            | TokenKind::Keyword(Keyword::Unwind) => {
+            TokenKind::Keyword(Keyword::With) | TokenKind::Keyword(Keyword::Unwind) => {
                 format!("unsupported Cypher clause: {:?}", tok.kind)
             }
             _ => format!("unexpected token after statement: {:?}", tok.kind),
         };
         return Err(ParseError::new(message, tok.span));
     }
-    Ok(stmt)
+    if arms.len() == 1 {
+        Ok(arms.pop().expect("one arm"))
+    } else {
+        Ok(Statement::Union {
+            arms,
+            all: union_all,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1833,35 +2157,54 @@ mod tests {
     // --- DISTINCT in function calls ---
 
     #[test]
-    fn parse_collect_distinct_errors_explicitly() {
-        let err = parse("MATCH (a)-[:KNOWS]->(b) RETURN collect(DISTINCT b.name)").unwrap_err();
-        assert!(
-            err.message.contains("aggregate DISTINCT is not supported"),
-            "error should explicitly reject aggregate DISTINCT, got: {}",
-            err.message
-        );
+    fn parse_collect_distinct_marks_aggregate_argument() {
+        let stmt = parse("MATCH (a)-[:KNOWS]->(b) RETURN collect(DISTINCT b.name)").unwrap();
+        let Statement::Match { return_clause, .. } = stmt else {
+            panic!("expected MATCH statement");
+        };
+        let Expr::Function { name, args } = &return_clause.items[0].expr else {
+            panic!("expected collect function");
+        };
+        assert_eq!(name, "collect");
+        assert!(matches!(args.first(), Some(Expr::Distinct(_))));
     }
 
     // --- Negative pattern in WHERE ---
 
     #[test]
     fn parse_not_pattern_in_where() {
-        // Negative pattern expressions are not yet supported and should
-        // return an error instead of silently returning all rows.
-        let result = parse(
+        let stmt = parse(
             "MATCH (a:Person), (b:Person) \
              WHERE NOT (a)-[:FOLLOWS]->(b) AND b.name <> 'Alice' \
              RETURN b.name",
-        );
-        assert!(
-            result.is_err(),
-            "negative patterns should return an error, got: {result:?}"
-        );
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("negative pattern"),
-            "error should mention negative patterns: {err_msg}"
-        );
+        )
+        .unwrap();
+
+        let Statement::Match {
+            where_clause: Some(where_clause),
+            ..
+        } = stmt
+        else {
+            panic!("expected MATCH with WHERE clause");
+        };
+
+        let Expr::And(left, right) = where_clause else {
+            panic!("expected conjunction in WHERE clause");
+        };
+        match *left {
+            Expr::PatternPredicate {
+                start_var,
+                hops,
+                negated,
+            } => {
+                assert_eq!(start_var, "a");
+                assert!(negated);
+                assert_eq!(hops.len(), 1);
+                assert_eq!(hops[0].rel_type.as_deref(), Some("FOLLOWS"));
+            }
+            other => panic!("expected NOT pattern predicate, got {other:?}"),
+        }
+        assert!(matches!(*right, Expr::Comparison { .. }));
     }
 
     // --- MERGE: node patterns ---
@@ -1929,16 +2272,40 @@ mod tests {
 
     #[test]
     fn unsupported_clauses_return_explicit_errors() {
-        for (query, clause) in [
-            ("OPTIONAL MATCH (n) RETURN n", "Optional"),
-            ("MATCH (n) RETURN n WITH n RETURN n", "With"),
-            ("UNWIND [1,2] AS x RETURN x", "Unwind"),
-            ("MATCH (n) RETURN n UNION MATCH (m) RETURN m", "Union"),
+        for (query, expected) in [
+            (
+                "OPTIONAL MATCH (n) RETURN n",
+                "unsupported statement keyword: Keyword(Optional)",
+            ),
+            (
+                "WITH 1 AS x RETURN x",
+                "unsupported Cypher clause: Keyword(With)",
+            ),
+            (
+                "MATCH (n) RETURN n WITH n RETURN n",
+                "unsupported Cypher clause: Keyword(With)",
+            ),
+            (
+                "CALL db.labels()",
+                "unsupported Cypher clause: Keyword(Call)",
+            ),
+            (
+                "MATCH (n) CALL { WITH n RETURN n } RETURN n",
+                "unsupported Cypher clause: Keyword(Call)",
+            ),
+            (
+                "FOREACH (x IN [1] | CREATE (:Person {name: 'x'}))",
+                "unsupported Cypher clause: Keyword(Foreach)",
+            ),
+            (
+                "LOAD CSV FROM 'file:///people.csv' AS row RETURN row",
+                "unsupported Cypher clause: Keyword(Load)",
+            ),
         ] {
             let err = parse(query).unwrap_err();
             assert!(
-                err.message.contains("unsupported Cypher clause") && err.message.contains(clause),
-                "{query} should mention unsupported {clause}, got: {}",
+                err.message.contains(expected),
+                "{query} should mention {expected}, got: {}",
                 err.message
             );
         }

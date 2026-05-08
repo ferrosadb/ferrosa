@@ -41,7 +41,14 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "OPTIONAL" => Keyword::Optional,
     "WITH" => Keyword::With,
     "UNION" => Keyword::Union,
+    "ALL" => Keyword::All,
     "UNWIND" => Keyword::Unwind,
+    "EXISTS" => Keyword::Exists,
+    "IN" => Keyword::In,
+    "CSV" => Keyword::Csv,
+    "LOAD" => Keyword::Load,
+    "FOREACH" => Keyword::Foreach,
+    "CALL" => Keyword::Call,
 };
 
 /// Check if two token kinds match. For keywords, this compares the
@@ -173,6 +180,7 @@ impl<'input> Lexer<'input> {
             b'+' => self.single(TokenKind::Plus, start),
             b'*' => self.single(TokenKind::Star, start),
             b'/' => self.single(TokenKind::Slash, start),
+            b'|' => self.single(TokenKind::Pipe, start),
 
             // = or potential compound.
             b'=' => self.single(TokenKind::Eq, start),

@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::is_aggregate_function;
-use crate::parser::{Assignment, Direction, Expr, Pattern, PropMap, ReturnClause, Statement};
+use crate::parser::{
+    Assignment, Direction, Expr, Pattern, PropMap, ReturnClause, Statement, WithPipeline,
+};
 use crate::planner::logical::{LogicalPlan, ResolvedTable};
 
 /// A single hop in a graph traversal.
@@ -102,7 +104,11 @@ pub enum AggregateProjection {
     /// A group key (references a column by index in the inner result).
     GroupKey(usize),
     /// An aggregate function (name + argument expression).
-    AggregateFunc { name: String, arg: Expr },
+    AggregateFunc {
+        name: String,
+        arg: Expr,
+        distinct: bool,
+    },
 }
 
 /// A single relation in a WCO join pattern.
@@ -140,11 +146,21 @@ pub const MAX_VAR_HOPS: u32 = 10;
 #[allow(clippy::large_enum_variant)]
 pub enum PhysicalPlan {
     /// Expand from an anchor through a sequence of hops.
+    Union { arms: Vec<PhysicalPlan>, all: bool },
+    Unwind {
+        expr: Expr,
+        var: String,
+        return_clause: ReturnClause,
+    },
     Expand {
         /// Starting vertex.
         anchor: Anchor,
-        /// Sequence of edge+vertex hops.
+        /// Required sequence of edge+vertex hops.
         hops: Vec<Hop>,
+        /// Optional MATCH sequence executed with left-join semantics.
+        optional_hops: Vec<Hop>,
+        /// Optional WITH pipeline applied before final RETURN.
+        with_pipeline: Option<WithPipeline>,
         /// Return clause for projecting results.
         return_clause: ReturnClause,
     },
@@ -246,6 +262,68 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             let filters = extract_filters(where_clause);
             plan_match(pattern, &logical.bindings, filters, return_clause.clone())
         }
+        Statement::Union { arms, all } => {
+            let mut planned = Vec::with_capacity(arms.len());
+            for arm in arms {
+                planned.push(plan(LogicalPlan {
+                    bindings: logical.bindings.clone(),
+                    statement: arm.clone(),
+                    keyspace: logical.keyspace.clone(),
+                })?);
+            }
+            Ok(PhysicalPlan::Union {
+                arms: planned,
+                all: *all,
+            })
+        }
+        Statement::Unwind {
+            expr,
+            var,
+            return_clause,
+        } => Ok(PhysicalPlan::Unwind {
+            expr: expr.clone(),
+            var: var.clone(),
+            return_clause: return_clause.clone(),
+        }),
+        Statement::MatchWith {
+            pattern,
+            where_clause,
+            with_pipeline,
+            return_clause,
+        } => {
+            let filters = extract_filters(where_clause);
+            let mut plan = plan_match(pattern, &logical.bindings, filters, return_clause.clone())?;
+            match &mut plan {
+                PhysicalPlan::Expand {
+                    with_pipeline: target,
+                    ..
+                } => {
+                    *target = Some(with_pipeline.clone());
+                    Ok(plan)
+                }
+                _ => Err(GraphError::Validation(
+                    "WITH currently supports non-cyclic fixed-hop MATCH plans".to_string(),
+                )),
+            }
+        }
+        Statement::MatchWithOptional {
+            pattern,
+            where_clause,
+            optional_pattern,
+            optional_where_clause,
+            return_clause,
+        } => {
+            let filters = extract_filters(where_clause);
+            let optional_filters = extract_filters(optional_where_clause);
+            plan_match_with_optional(
+                pattern,
+                optional_pattern,
+                &logical.bindings,
+                filters,
+                optional_filters,
+                return_clause.clone(),
+            )
+        }
         Statement::Create {
             patterns,
             return_clause,
@@ -291,6 +369,120 @@ fn extract_filters(where_clause: &Option<Expr>) -> Vec<Expr> {
         Some(expr) => vec![expr.clone()],
         None => vec![],
     }
+}
+
+fn plan_match_with_optional(
+    pattern: &[Pattern],
+    optional_pattern: &[Pattern],
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+    filters: Vec<Expr>,
+    optional_filters: Vec<Expr>,
+    return_clause: ReturnClause,
+) -> Result<PhysicalPlan> {
+    let mut plan = plan_match(pattern, bindings, filters, return_clause)?;
+    let optional_hops = plan_optional_hops(optional_pattern, bindings, optional_filters)?;
+    match &mut plan {
+        PhysicalPlan::Expand {
+            optional_hops: target,
+            ..
+        } => {
+            *target = optional_hops;
+            Ok(plan)
+        }
+        _ => Err(GraphError::Validation(
+            "OPTIONAL MATCH currently supports non-cyclic fixed-hop MATCH plans".to_string(),
+        )),
+    }
+}
+
+fn plan_optional_hops(
+    patterns: &[Pattern],
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+    optional_filters: Vec<Expr>,
+) -> Result<Vec<Hop>> {
+    let elements: Vec<&Pattern> = if patterns.len() == 1 {
+        match &patterns[0] {
+            Pattern::Path(elems) => elems.iter().collect(),
+            other => vec![other],
+        }
+    } else {
+        patterns.iter().collect()
+    };
+    if elements.len() < 3 {
+        return Err(GraphError::Validation(
+            "OPTIONAL MATCH requires a relationship pattern for this slice".to_string(),
+        ));
+    }
+    let mut hops = Vec::new();
+    let mut i = 1;
+    while i < elements.len() {
+        let Pattern::Rel {
+            var,
+            rel_type,
+            direction,
+            props,
+            length_range,
+        } = elements[i]
+        else {
+            i += 1;
+            continue;
+        };
+        if length_range.is_some() {
+            return Err(GraphError::Validation(
+                "OPTIONAL MATCH variable-length paths are not yet supported".to_string(),
+            ));
+        }
+        let edge_label = rel_type.clone();
+        let edge_table = rel_type.as_ref().and_then(|rt| {
+            if rt.contains('|') {
+                None
+            } else {
+                bindings
+                    .values()
+                    .find(|r| r.label.eq_ignore_ascii_case(rt) && r.graph_type == "edge")
+                    .cloned()
+            }
+        });
+        let (next_var, vertex_table, target_props) = if i + 1 < elements.len() {
+            if let Pattern::Node { var, label, props } = elements[i + 1] {
+                let vt = var
+                    .as_ref()
+                    .and_then(|v| bindings.get(v))
+                    .cloned()
+                    .or_else(|| {
+                        label.as_ref().and_then(|label| {
+                            bindings
+                                .values()
+                                .find(|r| {
+                                    r.label.eq_ignore_ascii_case(label) && r.graph_type == "vertex"
+                                })
+                                .cloned()
+                        })
+                    });
+                (var.clone(), vt, props.clone())
+            } else {
+                (None, None, vec![])
+            }
+        } else {
+            (None, None, vec![])
+        };
+        let mut target_props = target_props;
+        for filter in &optional_filters {
+            target_props.push(("__where__".to_string(), filter.clone()));
+        }
+        hops.push(Hop {
+            var: next_var,
+            rel_var: var.clone(),
+            edge_label,
+            direction: *direction,
+            edge_table,
+            vertex_table,
+            prop_filters: props.clone(),
+            target_props,
+        });
+        i += 2;
+    }
+    Ok(hops)
 }
 
 /// Plan a CREATE statement: for each pattern element, look up the binding and
@@ -357,10 +549,16 @@ fn collect_create_ops(
                 } else {
                     // Try looking up by rel_type through bindings values.
                     rel_type.as_ref().and_then(|rt| {
-                        bindings
-                            .values()
-                            .find(|r| r.label.eq_ignore_ascii_case(rt) && r.graph_type == "edge")
-                            .cloned()
+                        if rt.contains('|') {
+                            None
+                        } else {
+                            bindings
+                                .values()
+                                .find(|r| {
+                                    r.label.eq_ignore_ascii_case(rt) && r.graph_type == "edge"
+                                })
+                                .cloned()
+                        }
                     })
                 };
                 if let Some(table) = resolved {
@@ -1111,14 +1309,17 @@ fn plan_match(
                 Expr::Function { name, args } if is_aggregate_function(name) => {
                     // Determine the argument expression. For count(*) with no args,
                     // use a Var("*") sentinel.
-                    let arg = if args.is_empty() {
-                        Expr::Var("*".to_string())
+                    let (arg, distinct) = if args.is_empty() {
+                        (Expr::Var("*".to_string()), false)
+                    } else if let Expr::Distinct(inner) = &args[0] {
+                        ((**inner).clone(), true)
                     } else {
-                        args[0].clone()
+                        (args[0].clone(), false)
                     };
                     projections.push(AggregateProjection::AggregateFunc {
                         name: name.to_lowercase(),
                         arg: arg.clone(),
+                        distinct,
                     });
                     // Add the arg expression to the inner return clause so the
                     // Expand plan produces the raw column the accumulator needs.
@@ -1146,6 +1347,8 @@ fn plan_match(
         let expand = PhysicalPlan::Expand {
             anchor,
             hops,
+            optional_hops: vec![],
+            with_pipeline: None,
             return_clause: inner_return_clause,
         };
 
@@ -1159,6 +1362,8 @@ fn plan_match(
         Ok(PhysicalPlan::Expand {
             anchor,
             hops,
+            optional_hops: vec![],
+            with_pipeline: None,
             return_clause,
         })
     }

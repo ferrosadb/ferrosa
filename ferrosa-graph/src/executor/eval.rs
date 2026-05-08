@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::error::{GraphError, Result};
-use crate::parser::{ArithOp, CompareOp, Expr, Literal};
+use crate::parser::{ArithOp, CompareOp, Expr, ListPredicateKind, Literal};
 
 /// Evaluate a Cypher expression against variable bindings.
 ///
@@ -38,6 +38,18 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
             let lv = eval_expr(left, bindings)?;
             let rv = eval_expr(right, bindings)?;
             Ok(eval_compare(&lv, op, &rv))
+        }
+
+        Expr::In { value, list } => {
+            let value = eval_expr(value, bindings)?;
+            let list = eval_expr(list, bindings)?;
+            match list {
+                Value::Array(items) => Ok(Value::Bool(items.iter().any(|item| item == &value))),
+                Value::Null => Ok(Value::Null),
+                other => Err(GraphError::Validation(format!(
+                    "IN expects a list expression on the right-hand side, got {other:?}"
+                ))),
+            }
         }
 
         Expr::Arithmetic { left, op, right } => {
@@ -94,6 +106,10 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
             }
         }
 
+        Expr::PatternPredicate { .. } => Err(GraphError::Validation(
+            "pattern predicates require graph-aware evaluation".into(),
+        )),
+
         Expr::IsNull(e) => {
             let v = eval_expr(e, bindings)?;
             Ok(Value::Bool(v.is_null()))
@@ -105,6 +121,119 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
         }
 
         Expr::Function { name, args } => eval_function(name, args, bindings),
+        Expr::Distinct(inner) => eval_expr(inner, bindings),
+        Expr::List(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(eval_expr(item, bindings)?);
+            }
+            Ok(Value::Array(values))
+        }
+        Expr::ListPredicate {
+            kind,
+            var,
+            list,
+            predicate,
+        } => {
+            let list = eval_expr(list, bindings)?;
+            let Value::Array(items) = list else {
+                return Ok(Value::Null);
+            };
+            let mut saw_null = false;
+            match kind {
+                ListPredicateKind::Any => {
+                    for item in items {
+                        let mut scoped = bindings.clone();
+                        scoped.insert(var.clone(), item);
+                        match as_bool(&eval_expr(predicate, &scoped)?) {
+                            Some(true) => return Ok(Value::Bool(true)),
+                            Some(false) => {}
+                            None => saw_null = true,
+                        }
+                    }
+                    Ok(if saw_null {
+                        Value::Null
+                    } else {
+                        Value::Bool(false)
+                    })
+                }
+                ListPredicateKind::All => {
+                    for item in items {
+                        let mut scoped = bindings.clone();
+                        scoped.insert(var.clone(), item);
+                        match as_bool(&eval_expr(predicate, &scoped)?) {
+                            Some(true) => {}
+                            Some(false) => return Ok(Value::Bool(false)),
+                            None => saw_null = true,
+                        }
+                    }
+                    Ok(if saw_null {
+                        Value::Null
+                    } else {
+                        Value::Bool(true)
+                    })
+                }
+            }
+        }
+        Expr::Map(props) => {
+            let mut map = serde_json::Map::new();
+            for (name, expr) in props {
+                map.insert(name.clone(), eval_expr(expr, bindings)?);
+            }
+            Ok(Value::Object(map))
+        }
+        Expr::Index { target, index } => {
+            let target = eval_expr(target, bindings)?;
+            let index = eval_expr(index, bindings)?;
+            let Some(index) = index.as_i64() else {
+                return Ok(Value::Null);
+            };
+            if index < 0 {
+                return Ok(Value::Null);
+            }
+            match target {
+                Value::Array(items) => {
+                    Ok(items.get(index as usize).cloned().unwrap_or(Value::Null))
+                }
+                Value::String(s) => Ok(s
+                    .chars()
+                    .nth(index as usize)
+                    .map(|ch| Value::String(ch.to_string()))
+                    .unwrap_or(Value::Null)),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        Expr::Slice { target, start, end } => {
+            let target = eval_expr(target, bindings)?;
+            let start = match start {
+                Some(expr) => eval_expr(expr, bindings)?.as_i64().unwrap_or(0).max(0) as usize,
+                None => 0,
+            };
+            let end_value = match end {
+                Some(expr) => {
+                    Some(eval_expr(expr, bindings)?.as_i64().unwrap_or(0).max(0) as usize)
+                }
+                None => None,
+            };
+            match target {
+                Value::Array(items) => {
+                    let len = items.len();
+                    let from = start.min(len);
+                    let to = end_value.unwrap_or(len).min(len).max(from);
+                    Ok(Value::Array(items[from..to].to_vec()))
+                }
+                Value::String(s) => {
+                    let chars = s.chars().collect::<Vec<_>>();
+                    let len = chars.len();
+                    let from = start.min(len);
+                    let to = end_value.unwrap_or(len).min(len).max(from);
+                    Ok(Value::String(chars[from..to].iter().collect()))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
     }
 }
 

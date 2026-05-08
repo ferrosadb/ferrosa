@@ -26,7 +26,9 @@ use crate::error::{GraphError, Result};
 use crate::executor::expand::{execute, GraphEngineConfig};
 use crate::executor::result::GraphResult;
 use crate::executor::subscribe::SubscriptionRegistry;
-use crate::parser::{parse, Assignment, Expr, Literal, Pattern, ReturnClause, Statement};
+use crate::parser::{
+    parse, Assignment, Expr, Literal, Pattern, ReturnClause, Statement, WithPipeline,
+};
 use crate::planner::logical::validate;
 use crate::planner::physical::{plan, PhysicalPlan};
 
@@ -509,10 +511,15 @@ fn bind_expr_params(expr: Expr, params: &HashMap<String, Value>) -> Result<Expr>
                 .map(|arg| bind_expr_params(arg, params))
                 .collect::<Result<Vec<_>>>()?,
         },
+        Expr::Distinct(inner) => Expr::Distinct(Box::new(bind_expr_params(*inner, params)?)),
         Expr::Comparison { left, op, right } => Expr::Comparison {
             left: Box::new(bind_expr_params(*left, params)?),
             op,
             right: Box::new(bind_expr_params(*right, params)?),
+        },
+        Expr::In { value, list } => Expr::In {
+            value: Box::new(bind_expr_params(*value, params)?),
+            list: Box::new(bind_expr_params(*list, params)?),
         },
         Expr::Arithmetic { left, op, right } => Expr::Arithmetic {
             left: Box::new(bind_expr_params(*left, params)?),
@@ -528,8 +535,58 @@ fn bind_expr_params(expr: Expr, params: &HashMap<String, Value>) -> Result<Expr>
             Box::new(bind_expr_params(*right, params)?),
         ),
         Expr::Not(inner) => Expr::Not(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::PatternPredicate {
+            start_var,
+            hops,
+            negated,
+        } => Expr::PatternPredicate {
+            start_var,
+            hops: hops
+                .into_iter()
+                .map(|hop| {
+                    Ok(crate::parser::PatternPredicateHop {
+                        rel_type: hop.rel_type,
+                        direction: hop.direction,
+                        target_label: hop.target_label,
+                        target_props: bind_prop_map_params(hop.target_props, params)?,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, GraphError>>()?,
+            negated,
+        },
         Expr::IsNull(inner) => Expr::IsNull(Box::new(bind_expr_params(*inner, params)?)),
         Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::List(items) => Expr::List(
+            items
+                .into_iter()
+                .map(|item| bind_expr_params(item, params))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Expr::ListPredicate {
+            kind,
+            var,
+            list,
+            predicate,
+        } => Expr::ListPredicate {
+            kind,
+            var,
+            list: Box::new(bind_expr_params(*list, params)?),
+            predicate: Box::new(bind_expr_params(*predicate, params)?),
+        },
+        Expr::Map(props) => Expr::Map(bind_prop_map_params(props, params)?),
+        Expr::Index { target, index } => Expr::Index {
+            target: Box::new(bind_expr_params(*target, params)?),
+            index: Box::new(bind_expr_params(*index, params)?),
+        },
+        Expr::Slice { target, start, end } => Expr::Slice {
+            target: Box::new(bind_expr_params(*target, params)?),
+            start: start
+                .map(|expr| bind_expr_params(*expr, params).map(Box::new))
+                .transpose()?,
+            end: end
+                .map(|expr| bind_expr_params(*expr, params).map(Box::new))
+                .transpose()?,
+        },
         other => other,
     })
 }
@@ -645,6 +702,58 @@ fn bind_statement_params(
                 .transpose()?,
             return_clause: bind_return_clause_params(return_clause, params)?,
         },
+        Statement::Union { arms, all } => Statement::Union {
+            arms: arms
+                .into_iter()
+                .map(|arm| bind_statement_params(arm, params))
+                .collect::<Result<Vec<_>>>()?,
+            all,
+        },
+        Statement::Unwind {
+            expr,
+            var,
+            return_clause,
+        } => Statement::Unwind {
+            expr: bind_expr_params(expr, params)?,
+            var,
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::MatchWith {
+            pattern,
+            where_clause,
+            with_pipeline,
+            return_clause,
+        } => Statement::MatchWith {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            with_pipeline: WithPipeline {
+                clause: bind_return_clause_params(with_pipeline.clause, params)?,
+                where_clause: with_pipeline
+                    .where_clause
+                    .map(|expr| bind_expr_params(expr, params))
+                    .transpose()?,
+            },
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::MatchWithOptional {
+            pattern,
+            where_clause,
+            optional_pattern,
+            optional_where_clause,
+            return_clause,
+        } => Statement::MatchWithOptional {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            optional_pattern: bind_patterns_params(optional_pattern, params)?,
+            optional_where_clause: optional_where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
         Statement::Create {
             patterns,
             return_clause,
@@ -705,9 +814,22 @@ fn bind_statement_params(
 /// Format a physical plan as a human-readable string for EXPLAIN output.
 fn format_plan(plan: &PhysicalPlan) -> String {
     match plan {
+        PhysicalPlan::Union { arms, all } => {
+            format!("Union {{ all: {all}, arms: {} }}", arms.len())
+        }
+        PhysicalPlan::Unwind {
+            var, return_clause, ..
+        } => {
+            format!(
+                "Unwind {{ var: {var}, return: {} item(s) }}",
+                return_clause.items.len()
+            )
+        }
         PhysicalPlan::Expand {
             anchor,
             hops,
+            optional_hops,
+            with_pipeline,
             return_clause,
         } => {
             let mut out = String::new();
@@ -725,6 +847,18 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             for (i, hop) in hops.iter().enumerate() {
                 out.push_str(&format!(
                     "  hop[{}]: edge_label={:?}, direction={:?}, var={:?}\n",
+                    i, hop.edge_label, hop.direction, hop.var
+                ));
+            }
+            if with_pipeline.is_some() {
+                out.push_str(
+                    "  with: pipeline
+",
+                );
+            }
+            for (i, hop) in optional_hops.iter().enumerate() {
+                out.push_str(&format!(
+                    "  optional_hop[{}]: edge_label={:?}, direction={:?}, var={:?}\n",
                     i, hop.edge_label, hop.direction, hop.var
                 ));
             }
@@ -1002,6 +1136,8 @@ mod tests {
                 filters: vec![],
             },
             hops: vec![],
+            optional_hops: vec![],
+            with_pipeline: None,
             return_clause: ReturnClause {
                 distinct: false,
                 items: vec![ReturnItem {

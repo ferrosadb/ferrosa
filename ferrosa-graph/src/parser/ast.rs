@@ -44,6 +44,13 @@ pub enum SortDir {
     Desc,
 }
 
+/// Common Cypher list predicate kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    Any,
+    All,
+}
+
 /// A literal value in Cypher.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
@@ -67,12 +74,16 @@ pub enum Expr {
     Parameter(String),
     /// Function call: `count(n)`, `id(n)`
     Function { name: String, args: Vec<Expr> },
+    /// DISTINCT marker used inside aggregate functions, e.g. `count(DISTINCT n.age)`.
+    Distinct(Box<Expr>),
     /// Comparison: `a.age > 30`
     Comparison {
         left: Box<Expr>,
         op: CompareOp,
         right: Box<Expr>,
     },
+    /// Membership: `expr IN list`.
+    In { value: Box<Expr>, list: Box<Expr> },
     /// Arithmetic: `a.age + 1`
     Arithmetic {
         left: Box<Expr>,
@@ -85,6 +96,30 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     /// Boolean NOT.
     Not(Box<Expr>),
+    /// List literal: `[1, 2, 3]`.
+    List(Vec<Expr>),
+    /// Scoped list predicate, e.g. `any(x IN xs WHERE x > 0)`.
+    ListPredicate {
+        kind: ListPredicateKind,
+        var: String,
+        list: Box<Expr>,
+        predicate: Box<Expr>,
+    },
+    /// Map literal: `{name: 'Alice'}`.
+    Map(PropMap),
+    /// List/map/string indexing: `expr[index]`.
+    Index { target: Box<Expr>, index: Box<Expr> },
+    /// List/string slicing: `expr[start..end]`.
+    Slice {
+        target: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
+    PatternPredicate {
+        start_var: String,
+        hops: Vec<PatternPredicateHop>,
+        negated: bool,
+    },
     /// `expr IS NULL`
     IsNull(Box<Expr>),
     /// `expr IS NOT NULL`
@@ -93,6 +128,15 @@ pub enum Expr {
 
 /// A property map in a node or edge pattern: `{name: 'Alice', age: 30}`.
 pub type PropMap = Vec<(String, Expr)>;
+
+/// One relationship+target-node hop in a WHERE pattern predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternPredicateHop {
+    pub rel_type: Option<String>,
+    pub direction: Direction,
+    pub target_label: Option<String>,
+    pub target_props: PropMap,
+}
 
 /// A graph pattern element.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +189,12 @@ pub struct ReturnClause {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithPipeline {
+    pub clause: ReturnClause,
+    pub where_clause: Option<Expr>,
+}
+
 /// A property assignment in a SET clause: `n.name = 'Bob'`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
@@ -160,6 +210,30 @@ pub enum Statement {
     Match {
         pattern: Vec<Pattern>,
         where_clause: Option<Expr>,
+        return_clause: ReturnClause,
+    },
+    /// `MATCH pattern [WHERE expr] WITH ... RETURN ...`
+    MatchWith {
+        pattern: Vec<Pattern>,
+        where_clause: Option<Expr>,
+        with_pipeline: WithPipeline,
+        return_clause: ReturnClause,
+    },
+    /// `MATCH pattern [WHERE expr] OPTIONAL MATCH pattern [WHERE expr] RETURN ...`
+    Unwind {
+        expr: Expr,
+        var: String,
+        return_clause: ReturnClause,
+    },
+    Union {
+        arms: Vec<Statement>,
+        all: bool,
+    },
+    MatchWithOptional {
+        pattern: Vec<Pattern>,
+        where_clause: Option<Expr>,
+        optional_pattern: Vec<Pattern>,
+        optional_where_clause: Option<Expr>,
         return_clause: ReturnClause,
     },
     /// `CREATE pattern, ... [RETURN ...]`
@@ -187,7 +261,9 @@ pub enum Statement {
         delta: bool,
     },
     /// `UNSUBSCRIBE [stream_id]`
-    Unsubscribe { stream_id: Option<u16> },
+    Unsubscribe {
+        stream_id: Option<u16>,
+    },
     /// `MERGE pattern ... [MERGE pattern ...] [SET assignments] [RETURN ...]`
     Merge {
         patterns: Vec<Pattern>,

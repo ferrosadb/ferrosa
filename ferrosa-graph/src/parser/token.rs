@@ -34,7 +34,14 @@ pub enum Keyword {
     Optional,
     With,
     Union,
+    All,
     Unwind,
+    Exists,
+    In,
+    Call,
+    Foreach,
+    Load,
+    Csv,
 }
 
 /// A token produced by the lexer.
@@ -73,6 +80,7 @@ pub enum TokenKind<'input> {
     Minus,    // -
     Star,     // *
     Slash,    // /
+    Pipe,     // |
 
     // Relationship arrows
     ArrowRight,   // ->

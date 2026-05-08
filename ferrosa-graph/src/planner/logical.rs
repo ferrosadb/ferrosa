@@ -104,7 +104,11 @@ fn check_table_permission(
 /// Determine the permission needed for a statement.
 fn permission_for_statement(stmt: &Statement) -> Permission {
     match stmt {
-        Statement::Match { .. } => Permission::Select,
+        Statement::Match { .. }
+        | Statement::MatchWith { .. }
+        | Statement::MatchWithOptional { .. }
+        | Statement::Unwind { .. }
+        | Statement::Union { .. } => Permission::Select,
         Statement::Create { .. } => Permission::Modify,
         Statement::Set { .. } => Permission::Modify,
         Statement::Delete { .. } => Permission::Modify,
@@ -128,12 +132,36 @@ pub fn validate(
 
     // Collect patterns from the statement.
     let patterns: &[Pattern] = match &statement {
+        Statement::Unwind { .. } | Statement::Union { .. } => &[],
         Statement::Match { pattern, .. } => pattern,
+        Statement::MatchWith { pattern, .. } => pattern,
+        Statement::MatchWithOptional {
+            pattern,
+            optional_pattern,
+            ..
+        } => {
+            for pat in optional_pattern {
+                resolve_pattern_labels(snap, auth, keyspace, perm, pat, &mut bindings)?;
+            }
+            pattern
+        }
         Statement::Create { patterns, .. } => patterns,
         Statement::Set { pattern, .. } => pattern,
         Statement::Delete { pattern, .. } => pattern,
         Statement::Subscribe { inner, .. } => match inner.as_ref() {
+            Statement::Unwind { .. } | Statement::Union { .. } => &[],
             Statement::Match { pattern, .. } => pattern,
+            Statement::MatchWith { pattern, .. } => pattern,
+            Statement::MatchWithOptional {
+                pattern,
+                optional_pattern,
+                ..
+            } => {
+                for pat in optional_pattern {
+                    resolve_pattern_labels(snap, auth, keyspace, perm, pat, &mut bindings)?;
+                }
+                pattern
+            }
             _ => {
                 return Err(GraphError::Validation(
                     "SUBSCRIBE requires a MATCH query".to_string(),
@@ -182,10 +210,24 @@ fn resolve_pattern_labels(
         }
         Pattern::Rel { var, rel_type, .. } => {
             if let Some(rel_type_str) = rel_type {
-                let resolved = resolve_label(snap, keyspace, rel_type_str)?;
-                check_table_permission(snap, auth, perm, &resolved)?;
+                let labels: Vec<&str> = rel_type_str.split('|').collect();
+                let mut resolved_labels = Vec::new();
+                for label in &labels {
+                    let resolved = resolve_label(snap, keyspace, label)?;
+                    check_table_permission(snap, auth, perm, &resolved)?;
+                    resolved_labels.push(resolved);
+                }
                 if let Some(var_name) = var {
-                    bindings.insert(var_name.clone(), resolved);
+                    if labels.len() == 1 {
+                        if let Some(resolved) = resolved_labels.into_iter().next() {
+                            bindings.insert(var_name.clone(), resolved);
+                        }
+                    } else {
+                        return Err(GraphError::Validation(
+                            "relationship variables over type alternatives are not yet supported"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
         }

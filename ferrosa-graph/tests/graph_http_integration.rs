@@ -124,6 +124,19 @@ fn register_social_tables_with_storage(storage: &StorageEngine) {
     }
 }
 
+fn register_social_likes_table_with_storage(storage: &StorageEngine) {
+    let schema = TableSchema {
+        keyspace: "social".to_string(),
+        table: "likes_e".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        regular_columns: vec![],
+        extensions: HashMap::new(),
+    };
+    storage.register_table(schema).unwrap();
+}
+
 /// Create the "social" keyspace with vertex and edge tables for a social graph.
 fn create_social_graph_schema(schema: &Schema) {
     let auth = superuser_auth();
@@ -278,6 +291,70 @@ fn create_social_graph_schema(schema: &Schema) {
                 params: TableParams::default(),
                 flags: HashSet::new(),
                 extensions: knows_ext,
+                is_system: false,
+            },
+            &auth,
+        )
+        .unwrap();
+}
+
+fn create_social_likes_edge_schema(schema: &Schema) {
+    let auth = superuser_auth();
+    let mut likes_cols = IndexMap::new();
+    likes_cols.insert(
+        "src_id".to_string(),
+        ColumnMetadata {
+            name: "src_id".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    likes_cols.insert(
+        "dst_id".to_string(),
+        ColumnMetadata {
+            name: "dst_id".to_string(),
+            kind: ColumnKind::Clustering,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::Asc,
+            mask: None,
+        },
+    );
+    likes_cols.insert(
+        "weight".to_string(),
+        ColumnMetadata {
+            name: "weight".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "int".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+
+    let mut likes_ext = HashMap::new();
+    likes_ext.insert("graph.type".to_string(), "edge".to_string());
+    likes_ext.insert("graph.label".to_string(), "LIKES".to_string());
+    likes_ext.insert("graph.source".to_string(), "src_id".to_string());
+    likes_ext.insert("graph.target".to_string(), "dst_id".to_string());
+    likes_ext.insert("graph.source_label".to_string(), "Person".to_string());
+    likes_ext.insert("graph.target_label".to_string(), "Person".to_string());
+
+    schema
+        .create_table(
+            TableMetadata {
+                keyspace: "social".to_string(),
+                name: "likes_e".to_string(),
+                id: Uuid::new_v4(),
+                columns: likes_cols,
+                partition_key: vec!["src_id".to_string()],
+                clustering_key: vec![("dst_id".to_string(), ClusteringOrder::Asc)],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: likes_ext,
                 is_system: false,
             },
             &auth,
@@ -1347,6 +1424,640 @@ async fn http_query_params_bind_match_merge_and_set_literals() {
 }
 
 #[tokio::test]
+async fn return_distinct_deduplicates_projected_rows() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for (id, name) in [
+        ("00000000-0000-0000-0000-00000000d001", "Alice"),
+        ("00000000-0000-0000-0000-00000000d002", "Alice"),
+        ("00000000-0000-0000-0000-00000000d003", "Bob"),
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{id: '{id}', name: '{name}'}}) RETURN n.name"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    let all_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name ORDER BY n.name",
+            "keyspace": "social"
+        })),
+    );
+    let all_resp = app.clone().oneshot(all_req).await.unwrap();
+    assert_eq!(all_resp.status(), StatusCode::OK);
+    let all_body = response_json(all_resp).await;
+    assert_eq!(
+        all_body["rows"],
+        serde_json::json!([["Alice"], ["Alice"], ["Bob"]]),
+        "non-DISTINCT query should preserve duplicates"
+    );
+
+    let distinct_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN DISTINCT n.name ORDER BY n.name",
+            "keyspace": "social"
+        })),
+    );
+    let distinct_resp = app.oneshot(distinct_req).await.unwrap();
+    assert_eq!(distinct_resp.status(), StatusCode::OK);
+    let distinct_body = response_json(distinct_resp).await;
+    assert_eq!(
+        distinct_body["rows"],
+        serde_json::json!([["Alice"], ["Bob"]]),
+        "RETURN DISTINCT should deduplicate whole projected rows"
+    );
+}
+
+#[tokio::test]
+async fn negative_pattern_predicate_filters_existing_relationships() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for query in [
+        "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN r",
+        "MERGE (c:Person {name: 'Cara'}) RETURN c.name",
+    ] {
+        let setup_req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({"query": query, "keyspace": "social"})),
+        );
+        assert_eq!(
+            app.clone().oneshot(setup_req).await.unwrap().status(),
+            StatusCode::OK,
+            "setup query failed: {query}"
+        );
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person) WHERE NOT (a)-[:KNOWS]->(:Person) RETURN a.name ORDER BY a.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "negative pattern query failed: {body:?}"
+    );
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([["Bob"], ["Cara"]]),
+        "negative pattern should keep only nodes without a matching outgoing KNOWS edge"
+    );
+}
+
+#[tokio::test]
+async fn negative_multi_hop_pattern_predicate_filters_existing_paths() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for query in [
+        "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN r",
+        "MERGE (b:Person {name: 'Bob'})-[r:KNOWS]->(d:Person {name: 'Dana'}) RETURN r",
+        "MERGE (c:Person {name: 'Cara'}) RETURN c.name",
+        "MERGE (d:Person {name: 'Dana'}) RETURN d.name",
+    ] {
+        let setup_req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({"query": query, "keyspace": "social"})),
+        );
+        assert_eq!(
+            app.clone().oneshot(setup_req).await.unwrap().status(),
+            StatusCode::OK,
+            "setup query failed: {query}"
+        );
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person) WHERE NOT (a)-[:KNOWS]->(:Person)-[:KNOWS]->(:Person {name: 'Dana'}) RETURN a.name ORDER BY a.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([["Bob"], ["Cara"], ["Dana"]]),
+        "multi-hop negative pattern should exclude only starts that have the full path"
+    );
+}
+
+#[tokio::test]
+async fn exists_pattern_predicate_filters_rows_with_matching_paths() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for query in [
+        "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'})",
+        "MERGE (b:Person {name: 'Bob'})-[r:KNOWS]->(d:Person {name: 'Dana'})",
+        "MERGE (c:Person {name: 'Cara'}) RETURN c.name",
+        "MERGE (d:Person {name: 'Dana'}) RETURN d.name",
+    ] {
+        let setup_req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({"query": query, "keyspace": "social"})),
+        );
+        assert_eq!(
+            app.clone().oneshot(setup_req).await.unwrap().status(),
+            StatusCode::OK,
+            "setup query failed: {query}"
+        );
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person) WHERE EXISTS { (a)-[:KNOWS]->(:Person)-[:KNOWS]->(:Person {name: 'Dana'}) } RETURN a.name ORDER BY a.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "EXISTS pattern query failed: {body:?}"
+    );
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([["Alice"]]),
+        "EXISTS pattern should keep only starts that have the full path"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_distinct_deduplicates_inputs_per_group() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(schema, storage);
+
+    for query in [
+        "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000a101', name: 'Alice', age: 10})",
+        "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000b202', name: 'Bob', age: 10})",
+        "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000c303', name: 'Cara', age: 20})",
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({ "query": query, "keyspace": "social" })),
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "setup query failed: {query}");
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN count(DISTINCT n.age) AS ages, sum(DISTINCT n.age) AS total, avg(DISTINCT n.age) AS avg_age, collect(DISTINCT n.age) AS collected",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "aggregate DISTINCT query failed: {body:?}"
+    );
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1);
+    let row = rows[0].as_array().expect("aggregate row");
+    assert_eq!(row[0], serde_json::json!(2));
+    assert_eq!(row[1], serde_json::json!(30.0));
+    assert_eq!(row[2], serde_json::json!(15.0));
+    let mut collected = row[3]
+        .as_array()
+        .expect("collect result")
+        .iter()
+        .map(|v| v.as_i64().expect("integer age"))
+        .collect::<Vec<_>>();
+    collected.sort_unstable();
+    assert_eq!(collected, vec![10, 20]);
+}
+
+#[tokio::test]
+async fn where_in_list_literal_filters_rows() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for query in [
+        "MERGE (n:Person {name: 'Alice'})",
+        "MERGE (n:Person {name: 'Bob'})",
+        "MERGE (n:Person {name: 'Cara'})",
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({ "query": query, "keyspace": "social" })),
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "setup query failed: {query}");
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) WHERE n.name IN ['Alice', 'Cara'] RETURN n.name ORDER BY n.name ASC",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "IN query failed: {body:?}");
+    assert_eq!(body["rows"], serde_json::json!([["Alice"], ["Cara"]]));
+}
+
+#[tokio::test]
+async fn list_indexing_and_map_literal_project_values() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "UNWIND [0] AS _ RETURN [10, 20, 30][1] AS item, {name: 'Alice', age: 7} AS m",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "list/map query failed: {body:?}");
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([[20, {"name": "Alice", "age": 7}]])
+    );
+}
+
+#[tokio::test]
+async fn list_slicing_projects_sublist() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "UNWIND [0] AS _ RETURN [10, 20, 30, 40][1..3] AS slice",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "list slice query failed: {body:?}");
+    assert_eq!(body["rows"], serde_json::json!([[[20, 30]]]));
+}
+
+#[tokio::test]
+async fn list_predicates_any_and_all_evaluate_scoped_variables() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "UNWIND [0] AS _ RETURN any(x IN [1, 2, 3] WHERE x = 2) AS has_two, all(x IN [1, 2, 3] WHERE x > 0) AS all_positive",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "list predicate query failed: {body:?}"
+    );
+    assert_eq!(body["rows"], serde_json::json!([[true, true]]));
+}
+
+#[tokio::test]
+async fn relationship_type_alternatives_match_any_listed_type() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    create_social_likes_edge_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    register_social_likes_table_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for query in [
+        "MERGE (a:Person {name: 'AltAlice'})",
+        "MERGE (b:Person {name: 'AltBob'})",
+        "MERGE (c:Person {name: 'AltCara'})",
+        "MERGE (d:Person {name: 'AltDana'})",
+        "MERGE (a:Person {name: 'AltAlice'})-[r:KNOWS]->(b:Person {name: 'AltBob'}) RETURN r",
+        "MERGE (c:Person {name: 'AltCara'})-[r:LIKES]->(d:Person {name: 'AltDana'}) RETURN r",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/graph/query",
+                Some(serde_json::json!({"query": query, "keyspace": "social"})),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = response_json(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "setup query failed: {query}; body: {body:?}"
+        );
+    }
+
+    for (query, expected_rows) in [
+        (
+            "MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n.name, m.name ORDER BY n.name ASC",
+            serde_json::json!([["AltAlice", "AltBob"]]),
+        ),
+        (
+            "MATCH (n:Person)-[:LIKES]->(m:Person) RETURN n.name, m.name ORDER BY n.name ASC",
+            serde_json::json!([["AltCara", "AltDana"]]),
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/graph/query",
+                Some(serde_json::json!({"query": query, "keyspace": "social"})),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = response_json(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "single-label query failed: {body:?}"
+        );
+        assert_eq!(
+            body["rows"], expected_rows,
+            "single-label query mismatch: {query}"
+        );
+    }
+
+    let resp = app
+        .oneshot(json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": "MATCH (n:Person)-[:KNOWS|LIKES]->(m:Person) RETURN n.name, m.name ORDER BY n.name ASC",
+                "keyspace": "social"
+            })),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "type alternative query failed: {body:?}"
+    );
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([["AltAlice", "AltBob"], ["AltCara", "AltDana"]])
+    );
+}
+
+#[tokio::test]
+async fn multi_label_node_patterns_return_explicit_boundary_error() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(schema, storage);
+
+    let resp = app
+        .oneshot(json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": "MATCH (n:Person:Employee) RETURN n.name",
+                "keyspace": "social"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("multi-label node patterns are not yet supported"),
+        "unexpected error: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn optional_match_preserves_rows_and_nulls_missing_pattern() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for query in [
+        "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'})",
+        "MERGE (c:Person {name: 'Cara'})",
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({ "query": query, "keyspace": "social" })),
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "setup query failed: {query}");
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) OPTIONAL MATCH (n)-[:KNOWS]->(friend:Person) RETURN n.name, friend.name ORDER BY n.name ASC",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "OPTIONAL MATCH query failed: {body:?}"
+    );
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([["Alice", "Bob"], ["Bob", null], ["Cara", null]])
+    );
+}
+
+#[tokio::test]
+async fn with_projects_alias_filters_orders_and_limits_pipeline() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for query in [
+        "MERGE (n:Person {name: 'Alice'})",
+        "MERGE (n:Person {name: 'Bob'})",
+        "MERGE (n:Person {name: 'Cara'})",
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({ "query": query, "keyspace": "social" })),
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "setup query failed: {query}");
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) WITH n.name AS name WHERE name = 'Cara' RETURN name ORDER BY name ASC LIMIT 1",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "WITH query failed: {body:?}");
+    assert_eq!(body["rows"], serde_json::json!([["Cara"]]));
+}
+
+#[tokio::test]
+async fn unwind_list_literal_expands_rows_and_preserves_empty_list() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "UNWIND [3, 1, 2] AS x RETURN x ORDER BY x ASC",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "UNWIND query failed: {body:?}");
+    assert_eq!(body["rows"], serde_json::json!([[1], [2], [3]]));
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "UNWIND [] AS x RETURN x",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "UNWIND empty list query failed: {body:?}"
+    );
+    assert_eq!(body["rows"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn union_all_preserves_duplicates_and_union_deduplicates_rows() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "UNWIND [1, 2] AS x RETURN x UNION ALL UNWIND [2, 3] AS x RETURN x",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "UNION ALL query failed: {body:?}");
+    assert_eq!(body["rows"], serde_json::json!([[1], [2], [2], [3]]));
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "UNWIND [1, 2] AS x RETURN x UNION UNWIND [2, 3] AS x RETURN x",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "UNION query failed: {body:?}");
+    assert_eq!(body["rows"], serde_json::json!([[1], [2], [3]]));
+}
+
+#[tokio::test]
 async fn http_query_missing_param_returns_validation_error() {
     let (schema, storage, _dir) = setup();
     create_social_graph_schema(&schema);
@@ -1380,11 +2091,35 @@ async fn http_unsupported_cypher_clauses_return_explicit_400() {
     create_social_graph_schema(&schema);
     register_social_tables_with_storage(&storage);
 
-    for (query, clause) in [
-        ("OPTIONAL MATCH (n) RETURN n", "Optional"),
-        ("MATCH (n) RETURN n WITH n RETURN n", "With"),
-        ("UNWIND [1,2] AS x RETURN x", "Unwind"),
-        ("MATCH (n) RETURN n UNION MATCH (m) RETURN m", "Union"),
+    for (query, expected) in [
+        (
+            "OPTIONAL MATCH (n) RETURN n",
+            "unsupported statement keyword: Keyword(Optional)",
+        ),
+        (
+            "WITH 1 AS x RETURN x",
+            "unsupported Cypher clause: Keyword(With)",
+        ),
+        (
+            "MATCH (n) RETURN n WITH n RETURN n",
+            "unsupported Cypher clause: Keyword(With)",
+        ),
+        (
+            "CALL db.labels()",
+            "unsupported Cypher clause: Keyword(Call)",
+        ),
+        (
+            "MATCH (n) CALL { WITH n RETURN n } RETURN n",
+            "unsupported Cypher clause: Keyword(Call)",
+        ),
+        (
+            "FOREACH (x IN [1] | CREATE (:Person {name: 'x'}))",
+            "unsupported Cypher clause: Keyword(Foreach)",
+        ),
+        (
+            "LOAD CSV FROM 'file:///people.csv' AS row RETURN row",
+            "unsupported Cypher clause: Keyword(Load)",
+        ),
     ] {
         let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
         let req = json_request(
@@ -1401,8 +2136,8 @@ async fn http_unsupported_cypher_clauses_return_explicit_400() {
         let body = response_json(resp).await;
         let error = body["error"].as_str().unwrap();
         assert!(
-            error.contains("unsupported Cypher clause") && error.contains(clause),
-            "{query} should mention unsupported {clause}, got: {error}"
+            error.contains(expected),
+            "{query} should mention {expected}, got: {error}"
         );
     }
 }
