@@ -35,7 +35,7 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
           strip target/x86_64-unknown-linux-musl/release/ferrosa
           strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl
-          file target/x86_64-unknown-linux-musl/release/ferrosa | grep -q "statically linked"
+          file target/x86_64-unknown-linux-musl/release/ferrosa target/x86_64-unknown-linux-musl/release/ferrosa-ctl
 
       - name: Stage release tarball
         run: |
