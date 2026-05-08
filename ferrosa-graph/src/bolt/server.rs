@@ -30,6 +30,8 @@ pub struct BoltConfig {
     pub max_message_size: usize,
     /// Maximum concurrent connections.
     pub max_connections: usize,
+    /// When true, skip credential validation and authenticate as a superuser.
+    pub auth_disabled: bool,
 }
 
 impl Default for BoltConfig {
@@ -38,6 +40,7 @@ impl Default for BoltConfig {
             bind_addr: "0.0.0.0:7687".parse().unwrap(),
             max_message_size: 16 * 1024 * 1024, // 16MB
             max_connections: 256,
+            auth_disabled: false,
         }
     }
 }
@@ -180,48 +183,28 @@ async fn handle_connection(
 
     match hello {
         BoltMessage::Hello { extra } => {
-            // Extract credentials from the HELLO fields.
-            let username =
-                find_string_field(&extra, "principal").unwrap_or_else(|| "cassandra".to_string());
-            let password = find_string_field(&extra, "credentials").unwrap_or_default();
-
-            // Extract optional keyspace / database selection.
+            // Extract optional keyspace / database selection. Bolt 5 official
+            // drivers send authentication in a subsequent LOGON message, not
+            // necessarily in HELLO.
             if let Some(db) = find_string_field(&extra, "db") {
                 state.keyspace = db;
             }
 
-            match schema.authenticate(&username, &password) {
-                Ok(auth_ctx) => {
-                    state.authenticated = true;
-                    state.auth_context = Some(auth_ctx);
-
-                    let success = BoltMessage::Success {
-                        metadata: vec![
-                            ("server".into(), PackValue::String("Ferrosa/0.1.0".into())),
-                            ("connection_id".into(), PackValue::String("bolt-1".into())),
-                        ],
-                    };
-                    send_message(&mut stream, &success).await?;
-                }
-                Err(_) => {
-                    let failure = BoltMessage::Failure {
-                        metadata: vec![
-                            (
-                                "code".into(),
-                                PackValue::String("Neo.ClientError.Security.Unauthorized".into()),
-                            ),
-                            (
-                                "message".into(),
-                                PackValue::String("authentication failed".into()),
-                            ),
-                        ],
-                    };
-                    send_message(&mut stream, &failure).await?;
-                    return Err(GraphError::PermissionDenied(
-                        "authentication failed".to_string(),
-                    ));
-                }
+            // Backward-compatible path for older clients that still include
+            // credentials in HELLO.
+            if find_string_field(&extra, "principal").is_some()
+                || find_string_field(&extra, "credentials").is_some()
+            {
+                authenticate_bolt_fields(&extra, &schema, config.auth_disabled, &mut state).await?;
             }
+
+            let success = BoltMessage::Success {
+                metadata: vec![
+                    ("server".into(), PackValue::String("Ferrosa/0.1.0".into())),
+                    ("connection_id".into(), PackValue::String("bolt-1".into())),
+                ],
+            };
+            send_message(&mut stream, &success).await?;
         }
         _ => {
             return Err(GraphError::Internal(
@@ -230,18 +213,19 @@ async fn handle_connection(
         }
     }
 
-    // Handle optional LOGON message (Bolt 5+).
+    // Handle optional LOGON message (Bolt 5+). If the next message is not
+    // LOGON, process it as a regular message; clients that authenticated via
+    // HELLO can start RUN/PULL immediately.
     let logon_data = read_message(&mut stream, &mut decoder, config.max_message_size).await?;
     let logon_msg = BoltMessage::decode(&logon_data)
         .map_err(|e| GraphError::Internal(format!("LOGON decode: {e}")))?;
 
     match logon_msg {
-        BoltMessage::Logon { .. } => {
-            // Accept LOGON, already authenticated via HELLO.
+        BoltMessage::Logon { auth } => {
+            authenticate_bolt_fields(&auth, &schema, config.auth_disabled, &mut state).await?;
             let success = BoltMessage::Success { metadata: vec![] };
             send_message(&mut stream, &success).await?;
         }
-        // If it's not a LOGON, process it as a regular message.
         other => {
             let reply = process_message(other, &engine, &schema, &mut state).await?;
             send_replies(&mut stream, &reply).await?;
@@ -268,6 +252,10 @@ async fn handle_connection(
                     metadata: vec![
                         (
                             "code".into(),
+                            PackValue::String("Neo.ClientError.Request.Invalid".into()),
+                        ),
+                        (
+                            "neo4j_code".into(),
                             PackValue::String("Neo.ClientError.Request.Invalid".into()),
                         ),
                         (
@@ -320,7 +308,12 @@ async fn process_message(
                 .or_else(|| find_string_field(&params, "db"))
                 .unwrap_or_else(|| state.keyspace.clone());
 
-            match engine.execute(&query, &keyspace, &auth).await {
+            let params = pack_params_to_json(params);
+
+            match engine
+                .execute_with_params(&query, &keyspace, &auth, &params)
+                .await
+            {
                 Ok(result) => {
                     let fields: Vec<PackValue> = result
                         .columns
@@ -341,9 +334,11 @@ async fn process_message(
                     Ok(vec![success])
                 }
                 Err(e) => {
+                    let code = error_code(&e);
                     let failure = BoltMessage::Failure {
                         metadata: vec![
-                            ("code".into(), PackValue::String(error_code(&e).into())),
+                            ("code".into(), PackValue::String(code.into())),
+                            ("neo4j_code".into(), PackValue::String(code.into())),
                             ("message".into(), PackValue::String(e.to_string())),
                         ],
                     };
@@ -455,6 +450,38 @@ async fn process_message(
     }
 }
 
+async fn authenticate_bolt_fields(
+    fields: &[(String, PackValue)],
+    schema: &Arc<Schema>,
+    auth_disabled: bool,
+    state: &mut ConnectionState,
+) -> Result<(), GraphError> {
+    let username =
+        find_string_field(fields, "principal").unwrap_or_else(|| "anonymous".to_string());
+    let password = find_string_field(fields, "credentials").unwrap_or_default();
+
+    let auth_ctx = if auth_disabled {
+        AuthContext {
+            role: username,
+            is_superuser: true,
+            must_change_password: false,
+        }
+    } else {
+        match schema.authenticate(&username, &password) {
+            Ok(auth_ctx) => auth_ctx,
+            Err(_) => {
+                return Err(GraphError::PermissionDenied(
+                    "authentication failed".to_string(),
+                ));
+            }
+        }
+    };
+
+    state.authenticated = true;
+    state.auth_context = Some(auth_ctx);
+    Ok(())
+}
+
 /// Read a single chunked Bolt message from the stream.
 async fn read_message(
     stream: &mut TcpStream,
@@ -530,6 +557,45 @@ fn find_string_field(map: &[(String, PackValue)], key: &str) -> Option<String> {
     })
 }
 
+/// Convert Bolt RUN parameter values to JSON values consumed by the Cypher engine.
+fn pack_params_to_json(
+    params: Vec<(String, PackValue)>,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    params
+        .into_iter()
+        .filter(|(name, _)| name != "db")
+        .map(|(name, value)| (name, pack_to_json_value(&value)))
+        .collect()
+}
+
+fn pack_to_json_value(v: &PackValue) -> serde_json::Value {
+    match v {
+        PackValue::Null => serde_json::Value::Null,
+        PackValue::Bool(b) => serde_json::Value::Bool(*b),
+        PackValue::Int(i) => serde_json::Value::Number((*i).into()),
+        PackValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        PackValue::Bytes(bytes) => serde_json::Value::Array(
+            bytes
+                .iter()
+                .map(|b| serde_json::Value::Number((*b as u64).into()))
+                .collect(),
+        ),
+        PackValue::String(s) => serde_json::Value::String(s.clone()),
+        PackValue::List(values) => {
+            serde_json::Value::Array(values.iter().map(pack_to_json_value).collect())
+        }
+        PackValue::Map(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), pack_to_json_value(v)))
+                .collect(),
+        ),
+        PackValue::Structure { .. } => serde_json::Value::Null,
+    }
+}
+
 /// Convert a `serde_json::Value` to a `PackValue`.
 fn json_to_pack_value(v: &serde_json::Value) -> PackValue {
     match v {
@@ -583,6 +649,7 @@ mod tests {
         );
         assert_eq!(config.max_message_size, 16 * 1024 * 1024);
         assert_eq!(config.max_connections, 256);
+        assert!(!config.auth_disabled);
     }
 
     #[test]

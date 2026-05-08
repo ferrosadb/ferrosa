@@ -304,4 +304,166 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn duplicate_commit_delivery_after_follower_loss_is_idempotent() {
+        let mut cluster = TestCluster::new(5);
+        let surviving_nodes = vec![1u64, 2, 3];
+        let t0 = ts(7000);
+        let tid = txn(1, 7000);
+
+        for &node_id in &surviving_nodes {
+            cluster.send(TestMessage {
+                src: 1,
+                dst: node_id,
+                payload: TestMessagePayload::PreAccept {
+                    txn_id: tid,
+                    t0,
+                    key: b"duplicate-commit:key".to_vec(),
+                },
+            });
+        }
+        cluster.drain();
+
+        let max_t = cluster
+            .replicas
+            .iter()
+            .filter_map(|r| r.txn_states.get(&tid))
+            .map(|s| s.t)
+            .max()
+            .unwrap_or(t0);
+        let deps = vec![txn(2, 6900), txn(3, 6950)];
+
+        // Simulate retry/replay after nodes 4 and 5 are lost: each survivor
+        // receives the same Commit twice. This must not create duplicate txn
+        // state or mutate the serialized commit value across deliveries.
+        for _ in 0..2 {
+            for &node_id in &surviving_nodes {
+                cluster.send(TestMessage {
+                    src: 1,
+                    dst: node_id,
+                    payload: TestMessagePayload::Commit {
+                        txn_id: tid,
+                        t0,
+                        t: max_t,
+                        deps: deps.clone(),
+                    },
+                });
+            }
+        }
+        cluster.drain();
+
+        for &node_id in &surviving_nodes {
+            let replica = cluster.replica(node_id);
+            assert_eq!(
+                replica.txn_states.len(),
+                1,
+                "node {node_id} must retain exactly one state entry for duplicate commit"
+            );
+            let state = replica.txn_states.get(&tid).unwrap();
+            assert_eq!(state.phase, TxnPhase::Committed);
+            assert_eq!(state.t, max_t);
+            assert_eq!(state.deps.len(), deps.len());
+            for dep in &deps {
+                assert!(state.deps.contains(dep));
+            }
+        }
+        cluster.assert_consistent(&tid);
+    }
+
+    #[test]
+    fn majority_partition_progresses_and_healed_minority_catches_up_in_commit_order() {
+        let mut cluster = TestCluster::new(5);
+        let majority = [1u64, 2, 3];
+        let minority = [4u64, 5];
+        let mut committed = Vec::new();
+
+        // Minority partition: only the majority receives and commits writes.
+        for i in 0..3u64 {
+            let t0 = ts(14_000 + i * 10);
+            let t = ts(14_001 + i * 10);
+            let txn_id = txn(1, 14_000 + i * 10);
+            for &node_id in &majority {
+                cluster.send(TestMessage {
+                    src: 1,
+                    dst: node_id,
+                    payload: TestMessagePayload::PreAccept {
+                        txn_id,
+                        t0,
+                        key: format!("partition:key:{i}").into_bytes(),
+                    },
+                });
+            }
+            cluster.drain();
+            for &node_id in &majority {
+                cluster.send(TestMessage {
+                    src: 1,
+                    dst: node_id,
+                    payload: TestMessagePayload::Commit {
+                        txn_id,
+                        t0,
+                        t,
+                        deps: vec![],
+                    },
+                });
+            }
+            cluster.drain();
+            committed.push((txn_id, t0, t));
+        }
+
+        for &(txn_id, _, _) in &committed {
+            for &node_id in &majority {
+                assert_eq!(
+                    cluster
+                        .replica(node_id)
+                        .txn_states
+                        .get(&txn_id)
+                        .unwrap()
+                        .phase,
+                    TxnPhase::Committed
+                );
+            }
+            for &node_id in &minority {
+                assert!(
+                    !cluster.replica(node_id).txn_states.contains_key(&txn_id),
+                    "minority node {node_id} should not observe majority write before heal"
+                );
+            }
+        }
+
+        // Heal: replay the committed log in commit order to the minority.
+        for &(txn_id, t0, t) in &committed {
+            for &node_id in &minority {
+                cluster.send(TestMessage {
+                    src: 1,
+                    dst: node_id,
+                    payload: TestMessagePayload::Commit {
+                        txn_id,
+                        t0,
+                        t,
+                        deps: vec![],
+                    },
+                });
+            }
+            cluster.drain();
+        }
+
+        let expected_order: Vec<TxnId> = committed.iter().map(|(txn_id, _, _)| *txn_id).collect();
+        for &node_id in &[1u64, 2, 3, 4, 5] {
+            let mut observed: Vec<_> = cluster
+                .replica(node_id)
+                .txn_states
+                .keys()
+                .copied()
+                .collect();
+            observed.sort();
+            assert_eq!(
+                observed, expected_order,
+                "node {node_id} commit order diverged after heal"
+            );
+        }
+        for &(txn_id, _, _) in &committed {
+            cluster.assert_consistent(&txn_id);
+        }
+    }
 }

@@ -851,4 +851,115 @@ mod tests {
             "accepted_ballot must remain at the original Accept ballot"
         );
     }
+
+    #[test]
+    fn leader_loss_recovery_replays_commit_idempotently_after_election() {
+        let mut cluster = TestCluster::new(5);
+        let t0 = ts(12_000);
+        let t = ts(12_001);
+        let txn_id = txn(1, 12_000);
+
+        preaccept_on_cluster(&mut cluster, txn_id, t0, b"leader-loss:key");
+        let accept_ok_count =
+            accept_on_replicas(&mut cluster, txn_id, t0, t, BallotNumber(1), &[2, 3, 4]);
+        assert_eq!(
+            accept_ok_count, 3,
+            "old leader should have accepted quorum before loss"
+        );
+
+        // Old leader crashes after a commit reaches only one replica.
+        commit_on_replicas(&mut cluster, txn_id, t0, t, &[2]);
+
+        // New leader/recovery coordinator observes quorum and decides to commit
+        // the originally accepted value.
+        let responses =
+            recover_from_replicas(&mut cluster, 3, txn_id, t0, BallotNumber(10), &[2, 3, 4]);
+        let gen = BallotGenerator::new();
+        let mut coord = RecoveryCoordinator::start_recovery(txn_id, t0, 5, &gen);
+        let mut decision = None;
+        for msg in &responses {
+            if let TestMessagePayload::RecoverOK {
+                state,
+                superseding,
+                wait,
+                ..
+            } = &msg.payload
+            {
+                if let Some(d) = coord.handle_recover_ok(RecoverOKResponse {
+                    from: msg.src,
+                    state: state.clone(),
+                    superseding: superseding.clone(),
+                    waiting: wait.clone(),
+                }) {
+                    decision = Some(d);
+                }
+            }
+        }
+        assert_eq!(
+            decision,
+            Some(RecoveryDecision::Commit {
+                deps: HashSet::new(),
+                timestamp: t,
+            })
+        );
+
+        // Replay the recovered commit twice to the majority. This models retry
+        // after a leadership transition; final state must still be one txn entry
+        // with the same committed value on each replica.
+        for _ in 0..2 {
+            commit_on_replicas(&mut cluster, txn_id, t0, t, &[2, 3, 4]);
+        }
+
+        for node_id in [2u64, 3, 4] {
+            let replica = cluster.replica(node_id);
+            assert_eq!(
+                replica.txn_states.len(),
+                1,
+                "node {node_id} must not duplicate txn state"
+            );
+            let state = replica.txn_states.get(&txn_id).unwrap();
+            assert_eq!(state.phase, TxnPhase::Committed);
+            assert_eq!(state.t, t);
+            assert!(state.deps.is_empty());
+        }
+        cluster.assert_consistent(&txn_id);
+    }
+
+    #[test]
+    fn recovered_node_catches_up_missed_commit_to_consistent_state() {
+        let mut cluster = TestCluster::new(5);
+        let t0 = ts(13_000);
+        let t = ts(13_001);
+        let txn_id = txn(1, 13_000);
+
+        preaccept_on_cluster(&mut cluster, txn_id, t0, b"recovered-node:key");
+        let accept_ok_count =
+            accept_on_replicas(&mut cluster, txn_id, t0, t, BallotNumber(1), &[2, 3, 4]);
+        assert_eq!(accept_ok_count, 3);
+
+        // Node 5 is down during the original commit, so it has no committed
+        // state for this transaction.
+        commit_on_replicas(&mut cluster, txn_id, t0, t, &[2, 3, 4]);
+        let node5_pre_catchup = cluster.replica(5).txn_states.get(&txn_id);
+        assert!(
+            node5_pre_catchup.is_none_or(|state| state.phase != TxnPhase::Committed),
+            "node 5 should not be committed before catch-up while down"
+        );
+
+        // Node 5 recovers and receives the committed value from the recovery
+        // coordinator / catch-up path.
+        commit_on_replicas(&mut cluster, txn_id, t0, t, &[5]);
+
+        for node_id in [2u64, 3, 4, 5] {
+            let state = cluster
+                .replica(node_id)
+                .txn_states
+                .get(&txn_id)
+                .unwrap_or_else(|| panic!("node {node_id} should have caught up txn state"));
+            assert_eq!(state.phase, TxnPhase::Committed);
+            assert_eq!(state.t, t);
+            assert!(state.deps.is_empty());
+        }
+        cluster.assert_consistent(&txn_id);
+    }
 }

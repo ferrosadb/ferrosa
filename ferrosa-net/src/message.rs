@@ -724,6 +724,65 @@ mod tests {
     }
 
     #[test]
+    fn raft_opaque_payload_variants_roundtrip_without_reframing() {
+        let variants = vec![
+            (
+                MsgType::RaftAppendEntries,
+                Message::RaftAppendEntries(Bytes::from_static(b"append-entries\0payload")),
+            ),
+            (
+                MsgType::RaftAppendResponse,
+                Message::RaftAppendResponse(Bytes::from_static(b"append-response")),
+            ),
+            (
+                MsgType::RaftVote,
+                Message::RaftVote(Bytes::from_static(b"vote-request")),
+            ),
+            (
+                MsgType::RaftVoteResponse,
+                Message::RaftVoteResponse(Bytes::from_static(b"vote-response")),
+            ),
+            (
+                MsgType::RaftInstallSnapshot,
+                Message::RaftInstallSnapshot(Bytes::from_static(b"snapshot-bytes")),
+            ),
+        ];
+
+        for (msg_type, msg) in variants {
+            assert_eq!(msg.msg_type(), msg_type, "msg type mismatch for {msg:?}");
+            let mut buf = BytesMut::new();
+            msg.encode(&mut buf).unwrap();
+            let decoded = Message::decode(msg_type, &mut buf.freeze()).unwrap();
+            assert_eq!(decoded, msg, "roundtrip mismatch for {msg_type:?}");
+        }
+    }
+
+    #[test]
+    fn schema_then_query_write_frames_preserve_replay_order_and_payloads() {
+        let frames = vec![
+            Message::PairSchemaSync(Bytes::from_static(b"schema-snapshot:v1")),
+            Message::PairDdlForward(Bytes::from_static(b"create table ks.t")),
+            Message::MutationForward(Bytes::from_static(b"insert ks.t pk=1")),
+            Message::ReadRequest(Bytes::from_static(b"select ks.t pk=1")),
+        ];
+
+        let decoded: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                let mut buf = BytesMut::new();
+                frame.encode(&mut buf).unwrap();
+                Message::decode(frame.msg_type(), &mut buf.freeze()).unwrap()
+            })
+            .collect();
+
+        assert_eq!(decoded, frames);
+        assert!(matches!(decoded[0], Message::PairSchemaSync(_)));
+        assert!(matches!(decoded[1], Message::PairDdlForward(_)));
+        assert!(matches!(decoded[2], Message::MutationForward(_)));
+        assert!(matches!(decoded[3], Message::ReadRequest(_)));
+    }
+
+    #[test]
     fn repair_write_roundtrip() {
         let payload = Bytes::from_static(b"repair-data");
         let msg = Message::RepairWrite(payload.clone());
@@ -849,6 +908,62 @@ mod tests {
             host_id: Uuid::new_v4(),
         };
         assert_eq!(msg.msg_type(), MsgType::ClusterInviteAck);
+    }
+
+    #[test]
+    fn cluster_invite_peer_order_permutations_roundtrip_without_losing_membership() {
+        let peer_a = (
+            Uuid::from_bytes([0xAA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            "127.0.0.1:7001".parse().unwrap(),
+        );
+        let peer_b = (
+            Uuid::from_bytes([0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            "127.0.0.1:7002".parse().unwrap(),
+        );
+        let peer_c = (
+            Uuid::from_bytes([0xCC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]),
+            "127.0.0.1:7003".parse().unwrap(),
+        );
+        let permutations = vec![
+            vec![peer_a, peer_b, peer_c],
+            vec![peer_a, peer_c, peer_b],
+            vec![peer_b, peer_a, peer_c],
+            vec![peer_b, peer_c, peer_a],
+            vec![peer_c, peer_a, peer_b],
+            vec![peer_c, peer_b, peer_a],
+        ];
+
+        for peers in permutations {
+            let msg = Message::ClusterInvite {
+                initiator: Uuid::from_bytes([0x11; 16]),
+                peers: peers.clone(),
+            };
+            let mut buf = BytesMut::new();
+            msg.encode(&mut buf).unwrap();
+            let decoded = Message::decode(MsgType::ClusterInvite, &mut buf.freeze()).unwrap();
+            assert_eq!(decoded, msg, "peer order must survive invite roundtrip");
+            match decoded {
+                Message::ClusterInvite { peers: decoded, .. } => {
+                    assert_eq!(decoded.len(), 3);
+                    for peer in peers {
+                        assert!(decoded.contains(&peer), "missing peer {peer:?}");
+                    }
+                }
+                other => panic!("expected ClusterInvite, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_invite_ack_host_ids_roundtrip_for_distinct_join_orders() {
+        for first_byte in [0x01, 0x7F, 0xFF] {
+            let host_id = Uuid::from_bytes([first_byte; 16]);
+            let msg = Message::ClusterInviteAck { host_id };
+            let mut buf = BytesMut::new();
+            msg.encode(&mut buf).unwrap();
+            let decoded = Message::decode(MsgType::ClusterInviteAck, &mut buf.freeze()).unwrap();
+            assert_eq!(decoded, msg);
+        }
     }
 
     proptest! {

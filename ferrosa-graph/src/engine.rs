@@ -4,11 +4,14 @@
 //! and reconciliation loop. Provides the top-level `execute()` and `explain()`
 //! entry points consumed by the HTTP endpoint.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use serde::Serialize;
+use serde_json::Value;
 
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_schema::auth::role::AuthContext;
@@ -18,13 +21,15 @@ use ferrosa_storage::{ObserverMode, StorageEngine, WriteObserver};
 use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
-use crate::adjacency::reconcile::spawn_reconciliation;
+use crate::adjacency::reconcile::{reconcile_once, spawn_reconciliation};
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
-use crate::executor::expand::{execute, GraphEngineConfig};
-use crate::executor::result::GraphResult;
+use crate::executor::expand::{build_columns, execute, GraphEngineConfig};
+use crate::executor::result::{GraphResult, QueryStats};
 use crate::executor::subscribe::SubscriptionRegistry;
-use crate::parser::{parse, Statement};
+use crate::parser::{
+    parse, Assignment, Expr, Literal, Pattern, ReturnClause, Statement, WithPipeline,
+};
 use crate::planner::logical::validate;
 use crate::planner::physical::{plan, PhysicalPlan};
 
@@ -62,6 +67,28 @@ fn replication_needs_repair(replication: &ferrosa_schema::ReplicationParams) -> 
     }
 }
 
+fn empty_match_for_missing_label(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Match { .. } | Statement::MatchWith { .. } | Statement::MatchWithOptional { .. }
+    )
+}
+
+fn empty_match_result(statement: &Statement) -> GraphResult {
+    let columns = match statement {
+        Statement::Match { return_clause, .. }
+        | Statement::MatchWith { return_clause, .. }
+        | Statement::MatchWithOptional { return_clause, .. } => build_columns(return_clause),
+        _ => vec![],
+    };
+
+    GraphResult {
+        columns,
+        rows: vec![],
+        stats: QueryStats::default(),
+    }
+}
+
 /// Composite configuration for the graph engine.
 pub struct GraphConfig {
     pub engine: GraphEngineConfig,
@@ -95,6 +122,7 @@ pub struct GraphEngine {
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
     reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
+    registered_adjacency_keyspaces: Mutex<HashSet<String>>,
 }
 
 /// Information about a vertex or edge label in the graph schema.
@@ -261,7 +289,68 @@ impl GraphEngine {
             reconciliation_handles,
             reconciliation_cancel,
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
+            registered_adjacency_keyspaces: Mutex::new(edge_keyspaces),
         }
+    }
+
+    fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<bool> {
+        let snap = self.schema.snapshot();
+        let has_edge_table = snap.tables.iter().any(|((ks, _), meta)| {
+            ks == keyspace && meta.extensions.get("graph.type") == Some(&"edge".to_string())
+        });
+        if !has_edge_table {
+            return Ok(false);
+        }
+
+        let adj_ks = adjacency_keyspace_name(keyspace);
+        let adj_meta = adjacency_keyspace_metadata(&snap, keyspace);
+        if !snap.keyspaces.contains_key(&adj_ks) {
+            self.schema
+                .create_keyspace_internal(adj_meta)
+                .map_err(|e| {
+                    GraphError::Validation(format!(
+                        "failed to register graph adjacency keyspace {adj_ks}: {e}"
+                    ))
+                })?;
+        }
+
+        let snap = self.schema.snapshot();
+        if !snap
+            .tables
+            .contains_key(&(adj_ks.clone(), "adjacency".to_string()))
+        {
+            self.schema
+                .create_table_internal(adjacency_table_metadata(keyspace))
+                .map_err(|e| {
+                    GraphError::Validation(format!(
+                        "failed to register graph adjacency table {adj_ks}.adjacency: {e}"
+                    ))
+                })?;
+        }
+
+        let adj_schema = adjacency_table_metadata(keyspace).to_storage_schema();
+        if let Err(e) = self.storage.register_table(adj_schema) {
+            let msg = e.to_string();
+            let already = msg.contains("already registered") || msg.contains("already exists");
+            if !already {
+                return Err(GraphError::Storage(e));
+            }
+        }
+        let should_register_observer = {
+            let mut registered = self.registered_adjacency_keyspaces.lock().map_err(|_| {
+                GraphError::Internal("graph adjacency keyspace registry lock poisoned".to_string())
+            })?;
+            registered.insert(keyspace.to_string())
+        };
+        if should_register_observer {
+            self.storage
+                .register_observer(Arc::new(AdjacencyIndexObserver::new(
+                    Arc::clone(&self.schema),
+                    keyspace.to_string(),
+                )));
+        }
+
+        Ok(should_register_observer)
     }
 
     /// Execute a Cypher query: parse -> validate -> plan -> execute.
@@ -271,9 +360,40 @@ impl GraphEngine {
         keyspace: &str,
         auth: &AuthContext,
     ) -> Result<GraphResult> {
-        let statement = parse(query)?;
+        self.execute_with_params(query, keyspace, auth, &HashMap::new())
+            .await
+    }
+
+    pub async fn execute_with_params(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<GraphResult> {
+        let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace)?;
+        if adjacency_registered {
+            let wp = self.write_path.load();
+            let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
+            tracing::info!(
+                keyspace,
+                entries_checked = metrics.entries_checked,
+                entries_repaired = metrics.entries_repaired,
+                "graph engine: reconciled newly registered adjacency keyspace"
+            );
+        }
+        let statement = bind_statement_params(parse(query)?, params)?;
         let snap = self.schema.snapshot();
-        let logical = validate(&snap, auth, keyspace, statement)?;
+        let logical = match validate(&snap, auth, keyspace, statement.clone()) {
+            Ok(logical) => logical,
+            Err(GraphError::Validation(msg))
+                if msg.contains("no table with graph.label")
+                    && empty_match_for_missing_label(&statement) =>
+            {
+                return Ok(empty_match_result(&statement));
+            }
+            Err(e) => return Err(e),
+        };
         let physical = plan(logical)?;
         let wp = self.write_path.load();
         execute(
@@ -412,12 +532,383 @@ impl Drop for GraphEngine {
     }
 }
 
+fn json_param_to_literal(name: &str, value: &Value) -> Result<Literal> {
+    match value {
+        Value::Null => Ok(Literal::Null),
+        Value::Bool(v) => Ok(Literal::Bool(*v)),
+        Value::String(v) => Ok(Literal::String(v.clone())),
+        Value::Number(v) => {
+            if let Some(i) = v.as_i64() {
+                Ok(Literal::Integer(i))
+            } else if let Some(f) = v.as_f64() {
+                Ok(Literal::Float(f))
+            } else {
+                Err(GraphError::Validation(format!(
+                    "parameter ${name} number cannot be represented"
+                )))
+            }
+        }
+        Value::Array(_) | Value::Object(_) => Err(GraphError::Validation(format!(
+            "parameter ${name} must be a scalar value"
+        ))),
+    }
+}
+
+fn bind_expr_params(expr: Expr, params: &HashMap<String, Value>) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Parameter(name) => {
+            let value = params.get(&name).ok_or_else(|| {
+                GraphError::Validation(format!("missing required query parameter ${name}"))
+            })?;
+            Expr::Literal(json_param_to_literal(&name, value)?)
+        }
+        Expr::Function { name, args } => Expr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| bind_expr_params(arg, params))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        Expr::Distinct(inner) => Expr::Distinct(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::Comparison { left, op, right } => Expr::Comparison {
+            left: Box::new(bind_expr_params(*left, params)?),
+            op,
+            right: Box::new(bind_expr_params(*right, params)?),
+        },
+        Expr::In { value, list } => Expr::In {
+            value: Box::new(bind_expr_params(*value, params)?),
+            list: Box::new(bind_expr_params(*list, params)?),
+        },
+        Expr::Arithmetic { left, op, right } => Expr::Arithmetic {
+            left: Box::new(bind_expr_params(*left, params)?),
+            op,
+            right: Box::new(bind_expr_params(*right, params)?),
+        },
+        Expr::And(left, right) => Expr::And(
+            Box::new(bind_expr_params(*left, params)?),
+            Box::new(bind_expr_params(*right, params)?),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(bind_expr_params(*left, params)?),
+            Box::new(bind_expr_params(*right, params)?),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::PatternPredicate {
+            start_var,
+            hops,
+            negated,
+        } => Expr::PatternPredicate {
+            start_var,
+            hops: hops
+                .into_iter()
+                .map(|hop| {
+                    Ok(crate::parser::PatternPredicateHop {
+                        rel_type: hop.rel_type,
+                        direction: hop.direction,
+                        target_label: hop.target_label,
+                        target_props: bind_prop_map_params(hop.target_props, params)?,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, GraphError>>()?,
+            negated,
+        },
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::List(items) => Expr::List(
+            items
+                .into_iter()
+                .map(|item| bind_expr_params(item, params))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Expr::ListPredicate {
+            kind,
+            var,
+            list,
+            predicate,
+        } => Expr::ListPredicate {
+            kind,
+            var,
+            list: Box::new(bind_expr_params(*list, params)?),
+            predicate: Box::new(bind_expr_params(*predicate, params)?),
+        },
+        Expr::Map(props) => Expr::Map(bind_prop_map_params(props, params)?),
+        Expr::Index { target, index } => Expr::Index {
+            target: Box::new(bind_expr_params(*target, params)?),
+            index: Box::new(bind_expr_params(*index, params)?),
+        },
+        Expr::Slice { target, start, end } => Expr::Slice {
+            target: Box::new(bind_expr_params(*target, params)?),
+            start: start
+                .map(|expr| bind_expr_params(*expr, params).map(Box::new))
+                .transpose()?,
+            end: end
+                .map(|expr| bind_expr_params(*expr, params).map(Box::new))
+                .transpose()?,
+        },
+        other => other,
+    })
+}
+
+fn bind_prop_map_params(
+    props: Vec<(String, Expr)>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<(String, Expr)>> {
+    props
+        .into_iter()
+        .map(|(name, expr)| Ok((name, bind_expr_params(expr, params)?)))
+        .collect()
+}
+
+fn bind_pattern_params(pattern: Pattern, params: &HashMap<String, Value>) -> Result<Pattern> {
+    Ok(match pattern {
+        Pattern::Node { var, label, props } => Pattern::Node {
+            var,
+            label,
+            props: bind_prop_map_params(props, params)?,
+        },
+        Pattern::Rel {
+            var,
+            rel_type,
+            direction,
+            props,
+            length_range,
+        } => Pattern::Rel {
+            var,
+            rel_type,
+            direction,
+            props: bind_prop_map_params(props, params)?,
+            length_range,
+        },
+        Pattern::Path(elements) => Pattern::Path(
+            elements
+                .into_iter()
+                .map(|p| bind_pattern_params(p, params))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+fn bind_patterns_params(
+    patterns: Vec<Pattern>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<Pattern>> {
+    patterns
+        .into_iter()
+        .map(|pattern| bind_pattern_params(pattern, params))
+        .collect()
+}
+
+fn bind_return_clause_params(
+    clause: ReturnClause,
+    params: &HashMap<String, Value>,
+) -> Result<ReturnClause> {
+    Ok(ReturnClause {
+        distinct: clause.distinct,
+        items: clause
+            .items
+            .into_iter()
+            .map(|item| {
+                Ok(crate::parser::ReturnItem {
+                    expr: bind_expr_params(item.expr, params)?,
+                    alias: item.alias,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        order_by: clause
+            .order_by
+            .into_iter()
+            .map(|item| {
+                Ok(crate::parser::OrderItem {
+                    expr: bind_expr_params(item.expr, params)?,
+                    direction: item.direction,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        limit: clause.limit,
+    })
+}
+
+fn bind_assignments_params(
+    assignments: Vec<Assignment>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<Assignment>> {
+    assignments
+        .into_iter()
+        .map(|assignment| {
+            Ok(Assignment {
+                var: assignment.var,
+                property: assignment.property,
+                value: bind_expr_params(assignment.value, params)?,
+            })
+        })
+        .collect()
+}
+
+fn bind_statement_params(
+    statement: Statement,
+    params: &HashMap<String, Value>,
+) -> Result<Statement> {
+    Ok(match statement {
+        Statement::Match {
+            pattern,
+            where_clause,
+            return_clause,
+        } => Statement::Match {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::Union { arms, all } => Statement::Union {
+            arms: arms
+                .into_iter()
+                .map(|arm| bind_statement_params(arm, params))
+                .collect::<Result<Vec<_>>>()?,
+            all,
+        },
+        Statement::Unwind {
+            expr,
+            var,
+            with_pipeline,
+            return_clause,
+        } => Statement::Unwind {
+            expr: bind_expr_params(expr, params)?,
+            var,
+            with_pipeline: with_pipeline
+                .map(|pipeline| {
+                    Ok::<WithPipeline, GraphError>(WithPipeline {
+                        clause: bind_return_clause_params(pipeline.clause, params)?,
+                        where_clause: pipeline
+                            .where_clause
+                            .map(|expr| bind_expr_params(expr, params))
+                            .transpose()?,
+                    })
+                })
+                .transpose()?,
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::Return { return_clause } => Statement::Return {
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::MatchWith {
+            pattern,
+            where_clause,
+            with_pipeline,
+            return_clause,
+        } => Statement::MatchWith {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            with_pipeline: WithPipeline {
+                clause: bind_return_clause_params(with_pipeline.clause, params)?,
+                where_clause: with_pipeline
+                    .where_clause
+                    .map(|expr| bind_expr_params(expr, params))
+                    .transpose()?,
+            },
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::MatchWithOptional {
+            pattern,
+            where_clause,
+            optional_pattern,
+            optional_where_clause,
+            return_clause,
+        } => Statement::MatchWithOptional {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            optional_pattern: bind_patterns_params(optional_pattern, params)?,
+            optional_where_clause: optional_where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::Create {
+            patterns,
+            return_clause,
+        } => Statement::Create {
+            patterns: bind_patterns_params(patterns, params)?,
+            return_clause: return_clause
+                .map(|clause| bind_return_clause_params(clause, params))
+                .transpose()?,
+        },
+        Statement::Set {
+            pattern,
+            where_clause,
+            assignments,
+        } => Statement::Set {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            assignments: bind_assignments_params(assignments, params)?,
+        },
+        Statement::Delete {
+            pattern,
+            where_clause,
+            detach,
+            variables,
+        } => Statement::Delete {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            detach,
+            variables,
+        },
+        Statement::Subscribe {
+            inner,
+            interval,
+            delta,
+        } => Statement::Subscribe {
+            inner: Box::new(bind_statement_params(*inner, params)?),
+            interval,
+            delta,
+        },
+        Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        } => Statement::Merge {
+            patterns: bind_patterns_params(patterns, params)?,
+            set_clause: bind_assignments_params(set_clause, params)?,
+            return_clause: return_clause
+                .map(|clause| bind_return_clause_params(clause, params))
+                .transpose()?,
+        },
+        Statement::Unsubscribe { stream_id } => Statement::Unsubscribe { stream_id },
+    })
+}
+
 /// Format a physical plan as a human-readable string for EXPLAIN output.
 fn format_plan(plan: &PhysicalPlan) -> String {
     match plan {
+        PhysicalPlan::Union { arms, all } => {
+            format!("Union {{ all: {all}, arms: {} }}", arms.len())
+        }
+        PhysicalPlan::Unwind {
+            var, return_clause, ..
+        } => {
+            format!(
+                "Unwind {{ var: {var}, return: {} item(s) }}",
+                return_clause.items.len()
+            )
+        }
+        PhysicalPlan::ReturnOnly { return_clause } => {
+            format!(
+                "ReturnOnly {{ return: {} item(s) }}",
+                return_clause.items.len()
+            )
+        }
         PhysicalPlan::Expand {
             anchor,
             hops,
+            optional_hops,
+            with_pipeline,
             return_clause,
         } => {
             let mut out = String::new();
@@ -435,6 +926,18 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             for (i, hop) in hops.iter().enumerate() {
                 out.push_str(&format!(
                     "  hop[{}]: edge_label={:?}, direction={:?}, var={:?}\n",
+                    i, hop.edge_label, hop.direction, hop.var
+                ));
+            }
+            if with_pipeline.is_some() {
+                out.push_str(
+                    "  with: pipeline
+",
+                );
+            }
+            for (i, hop) in optional_hops.iter().enumerate() {
+                out.push_str(&format!(
+                    "  optional_hop[{}]: edge_label={:?}, direction={:?}, var={:?}\n",
                     i, hop.edge_label, hop.direction, hop.var
                 ));
             }
@@ -464,11 +967,13 @@ fn format_plan(plan: &PhysicalPlan) -> String {
         PhysicalPlan::SetProperties {
             expand,
             assignments,
+            variable_tables,
         } => {
             let mut out = String::new();
             out.push_str("SetProperties {\n");
             out.push_str(&format!("  expand: {}\n", format_plan(expand)));
             out.push_str(&format!("  assignments: {}\n", assignments.len()));
+            out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
             out.push('}');
             out
         }
@@ -712,6 +1217,8 @@ mod tests {
                 filters: vec![],
             },
             hops: vec![],
+            optional_hops: vec![],
+            with_pipeline: None,
             return_clause: ReturnClause {
                 distinct: false,
                 items: vec![ReturnItem {

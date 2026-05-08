@@ -260,4 +260,61 @@ mod tests {
         let empty = buf.drain_all();
         assert!(empty.is_empty());
     }
+
+    #[test]
+    fn reorder_buffer_preserves_arrival_order_for_equal_timestamps() {
+        let timing = default_timing();
+        let mut buf = ReorderBuffer::new(DEFAULT_CAPACITY, timing);
+
+        buf.push(msg(100, 1)).unwrap();
+        buf.push(msg(100, 2)).unwrap();
+        buf.push(msg(100, 3)).unwrap();
+
+        let drained = buf.drain_all();
+        let payloads: Vec<u8> = drained.iter().map(|m| m.payload[0]).collect();
+        assert_eq!(payloads, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn reorder_buffer_orders_all_three_message_arrival_permutations_deterministically() {
+        let timing = default_timing();
+        let permutations = [
+            [(100, 1), (200, 2), (300, 3)],
+            [(100, 1), (300, 3), (200, 2)],
+            [(200, 2), (100, 1), (300, 3)],
+            [(200, 2), (300, 3), (100, 1)],
+            [(300, 3), (100, 1), (200, 2)],
+            [(300, 3), (200, 2), (100, 1)],
+        ];
+
+        for permutation in permutations {
+            let mut buf = ReorderBuffer::new(DEFAULT_CAPACITY, timing);
+            for (t0, tag) in permutation {
+                buf.push(msg(t0, tag)).unwrap();
+            }
+
+            let payloads: Vec<u8> = buf.drain_all().iter().map(|m| m.payload[0]).collect();
+            assert_eq!(payloads, vec![1, 2, 3], "permutation {permutation:?}");
+        }
+    }
+
+    #[test]
+    fn reorder_buffer_drains_medium_deterministic_batch_under_tight_bound() {
+        let timing = default_timing();
+        let mut buf = ReorderBuffer::new(DEFAULT_CAPACITY, timing);
+        for i in (0..1_000i64).rev() {
+            buf.push(msg(i, (i % 251) as u8)).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let drained = buf.drain_all();
+        let elapsed = started.elapsed();
+
+        assert_eq!(drained.len(), 1_000);
+        assert!(drained.windows(2).all(|w| w[0].t0 <= w[1].t0));
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "draining 1000 deterministic Accord messages took {elapsed:?}"
+        );
+    }
 }
