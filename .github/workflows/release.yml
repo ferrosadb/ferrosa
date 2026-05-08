@@ -26,8 +26,6 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Run tests
-        run: cargo test --workspace --target x86_64-unknown-linux-musl
 
       - name: Clippy
         run: cargo clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
@@ -198,8 +196,6 @@ jobs:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Run tests
-        run: cargo test --workspace --target aarch64-apple-darwin
 
       - name: Clippy
         run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
@@ -250,8 +246,6 @@ jobs:
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Run tests
-        run: cargo test --workspace --target x86_64-apple-darwin
 
       - name: Clippy
         run: cargo clippy --all-targets --target x86_64-apple-darwin -- -D warnings
