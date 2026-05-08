@@ -18,6 +18,7 @@
 //!   monitor      Interactive TUI dashboard (T24)
 //!   snapshot     Manage node snapshots (create / list / delete)
 //!   restore      Restore from a snapshot, optionally to a point in time
+//!   auth         Manage installer-seeded admin credentials
 //! ```
 
 use std::net::SocketAddr;
@@ -25,6 +26,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
+mod auth;
 mod commands;
 mod tui;
 
@@ -121,6 +123,35 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Manage installer-seeded admin credentials in `~/.ferrosa/config/auth.yaml`.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+/// Auth sub-actions.
+#[derive(Debug, Subcommand)]
+enum AuthAction {
+    /// Hash a password (read from stdin, no echo) and write it to auth.yaml.
+    SetPassword {
+        /// Username for the credential (e.g. `admin`).
+        #[arg(long)]
+        user: String,
+
+        /// Realm — `cql` for the CQL native protocol, `graph` for HTTP/Bolt basic auth.
+        #[arg(long)]
+        realm: String,
+
+        /// Path to auth.yaml (defaults to `$HOME/.ferrosa/config/auth.yaml`).
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+
+        /// Overwrite an existing entry without prompting.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Snapshot sub-actions.
@@ -148,6 +179,31 @@ enum SnapshotAction {
 
 /// Unified error type used by `main` so all match arms have the same type.
 type MainError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Synchronous wrapper for `auth set-password` — wires the CLI args to the
+/// `auth::run_set_password` core function.
+fn run_auth_set_password(
+    user: String,
+    realm: String,
+    config: Option<std::path::PathBuf>,
+    force: bool,
+) -> Result<(), auth::AuthError> {
+    let realm: auth::Realm = realm
+        .parse()
+        .map_err(|e: String| auth::AuthError::Hash(e))?;
+    let config_path = match config {
+        Some(p) => p,
+        None => auth::default_config_path()?,
+    };
+    let opts = auth::SetPasswordOpts {
+        realm,
+        user,
+        config_path,
+        force,
+    };
+    let mut source = auth::StdioPasswordSource;
+    auth::run_set_password(&opts, &mut source, chrono::Utc::now())
+}
 
 #[tokio::main]
 async fn main() {
@@ -206,6 +262,14 @@ async fn main() {
             )
             .await
         }
+        Commands::Auth { action } => match action {
+            AuthAction::SetPassword {
+                user,
+                realm,
+                config,
+                force,
+            } => run_auth_set_password(user, realm, config, force).map_err(Into::into),
+        },
     };
 
     if let Err(e) = result {
@@ -470,6 +534,74 @@ mod tests {
         match cli.command {
             Commands::Restore { point_in_time, .. } => {
                 assert_eq!(point_in_time.as_deref(), Some("2026-03-18T12:00:00Z"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_set_password_minimal() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "auth",
+            "set-password",
+            "--user",
+            "admin",
+            "--realm",
+            "cql",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Auth {
+                action:
+                    AuthAction::SetPassword {
+                        user,
+                        realm,
+                        config,
+                        force,
+                    },
+            } => {
+                assert_eq!(user, "admin");
+                assert_eq!(realm, "cql");
+                assert!(config.is_none());
+                assert!(!force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_set_password_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "auth",
+            "set-password",
+            "--user",
+            "admin",
+            "--realm",
+            "graph",
+            "--config",
+            "/tmp/foo/auth.yaml",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Auth {
+                action:
+                    AuthAction::SetPassword {
+                        user,
+                        realm,
+                        config,
+                        force,
+                    },
+            } => {
+                assert_eq!(user, "admin");
+                assert_eq!(realm, "graph");
+                assert_eq!(
+                    config.as_deref().unwrap().to_str().unwrap(),
+                    "/tmp/foo/auth.yaml"
+                );
+                assert!(force);
             }
             other => panic!("unexpected command: {other:?}"),
         }

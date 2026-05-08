@@ -1810,6 +1810,8 @@ name = "ferrosa-ctl"
 version = "0.8.8+8"
 dependencies = [
  "arc-swap",
+ "argon2 0.6.0-rc.8",
+ "chrono",
  "clap",
  "crossterm",
  "ferrosa-cluster",
@@ -1817,11 +1819,16 @@ dependencies = [
  "ferrosa-schema",
  "ferrosa-storage",
  "ferrosa-udf",
+ "password-hash 0.6.1",
  "ratatui",
  "reqwest",
+ "rpassword",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tabled",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
 ]
@@ -4752,6 +4759,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ac5b223d9738ef56e0b98305410be40fa0941bf6036c56f1506751e43552d64"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rsa"
 version = "0.10.0-rc.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4768,6 +4786,16 @@ dependencies = [
  "signature",
  "spki",
  "zeroize",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5352,6 +5380,19 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -6502,6 +6543,12 @@ dependencies = [
  "crypto-common 0.2.1",
  "ctutils",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
