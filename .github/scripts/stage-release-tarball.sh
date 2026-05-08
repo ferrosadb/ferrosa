@@ -9,7 +9,7 @@
 #   LICENSE
 #   NOTICE
 #   README.md
-#   config/ferrosa.example.yaml      (if present in repo at tag time)
+#   config/ferrosa.example.toml      (if present in repo at tag time)
 #   launchd/com.ferrosadb.ferrosa.plist (if present)
 #   systemd/ferrosa.service          (if present)
 #
@@ -71,7 +71,7 @@ done
 # Platform integration directories — bundle if present at tag time.
 # (Created by Task #7. Tarball must succeed even before that lands.)
 for entry in \
-    "config/ferrosa.example.yaml" \
+    "config/ferrosa.example.toml" \
     "launchd/com.ferrosadb.ferrosa.plist" \
     "systemd/ferrosa.service"; do
   if [[ -f "$entry" ]]; then
