@@ -83,20 +83,20 @@ def social_graph(cql_session):
         "  age INT,"
         "  city TEXT,"
         "  email TEXT"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'vertex',"
         "  'graph.label': 'Person'"
-        "}}"
+        "}"
     )
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.company_v ("
         "  id TEXT PRIMARY KEY,"
         "  name TEXT,"
         "  founded INT"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'vertex',"
         "  'graph.label': 'Company'"
-        "}}"
+        "}"
     )
 
     # Edge tables
@@ -106,12 +106,12 @@ def social_graph(cql_session):
         "  tgt_id TEXT,"
         "  since_year INT,"
         "  PRIMARY KEY (src_id, tgt_id)"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'KNOWS',"
         "  'graph.source': 'src_id',"
         "  'graph.target': 'tgt_id'"
-        "}}"
+        "}"
     )
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.likes_e ("
@@ -119,12 +119,12 @@ def social_graph(cql_session):
         "  tgt_id TEXT,"
         "  reason TEXT,"
         "  PRIMARY KEY (src_id, tgt_id)"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'LIKES',"
         "  'graph.source': 'src_id',"
         "  'graph.target': 'tgt_id'"
-        "}}"
+        "}"
     )
 
     sess.execute(
@@ -133,12 +133,12 @@ def social_graph(cql_session):
         "  tgt_id TEXT,"
         "  role TEXT,"
         "  PRIMARY KEY (src_id, tgt_id)"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'WORKS_AT',"
         "  'graph.source': 'src_id',"
         "  'graph.target': 'tgt_id'"
-        "}}"
+        "}"
     )
 
     # Seed vertices
