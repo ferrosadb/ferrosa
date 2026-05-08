@@ -646,7 +646,7 @@ fn edge_binding_json(
     serde_json::Value::Object(map)
 }
 
-fn table_metadata_for(
+pub(super) fn table_metadata_for(
     schema: Option<&Schema>,
     keyspace: &str,
     table: &str,
@@ -658,7 +658,7 @@ fn table_metadata_for(
         .cloned()
 }
 
-fn row_to_json(
+pub(super) fn row_to_json(
     meta: &ferrosa_schema::metadata::table::TableMetadata,
     partition: &ferrosa_sstable::types::Partition,
     row: &Row,
@@ -834,7 +834,7 @@ fn prop_map_passes(
     Ok(true)
 }
 
-fn graph_vertex_lookup_key(
+pub(super) fn graph_vertex_lookup_key(
     meta: &ferrosa_schema::metadata::table::TableMetadata,
     partition: &ferrosa_sstable::types::Partition,
     row: &Row,
@@ -860,7 +860,7 @@ fn graph_vertex_lookup_key(
     Some(DecoratedKey::new(PartitionKey::new(bytes)))
 }
 
-fn extract_column_bytes_from_row(
+pub(super) fn extract_column_bytes_from_row(
     meta: &ferrosa_schema::metadata::table::TableMetadata,
     partition_key: &[u8],
     row: &Row,

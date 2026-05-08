@@ -4,11 +4,13 @@
 //! and reconciliation loop. Provides the top-level `execute()` and `explain()`
 //! entry points consumed by the HTTP endpoint.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use serde::Serialize;
+use serde_json::Value;
 
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_schema::auth::role::AuthContext;
@@ -24,7 +26,7 @@ use crate::error::{GraphError, Result};
 use crate::executor::expand::{execute, GraphEngineConfig};
 use crate::executor::result::GraphResult;
 use crate::executor::subscribe::SubscriptionRegistry;
-use crate::parser::{parse, Statement};
+use crate::parser::{parse, Assignment, Expr, Literal, Pattern, ReturnClause, Statement};
 use crate::planner::logical::validate;
 use crate::planner::physical::{plan, PhysicalPlan};
 
@@ -317,8 +319,19 @@ impl GraphEngine {
         keyspace: &str,
         auth: &AuthContext,
     ) -> Result<GraphResult> {
+        self.execute_with_params(query, keyspace, auth, &HashMap::new())
+            .await
+    }
+
+    pub async fn execute_with_params(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<GraphResult> {
         self.ensure_adjacency_storage_for_keyspace(keyspace)?;
-        let statement = parse(query)?;
+        let statement = bind_statement_params(parse(query)?, params)?;
         let snap = self.schema.snapshot();
         let logical = validate(&snap, auth, keyspace, statement)?;
         let physical = plan(logical)?;
@@ -457,6 +470,236 @@ impl Drop for GraphEngine {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+fn json_param_to_literal(name: &str, value: &Value) -> Result<Literal> {
+    match value {
+        Value::Null => Ok(Literal::Null),
+        Value::Bool(v) => Ok(Literal::Bool(*v)),
+        Value::String(v) => Ok(Literal::String(v.clone())),
+        Value::Number(v) => {
+            if let Some(i) = v.as_i64() {
+                Ok(Literal::Integer(i))
+            } else if let Some(f) = v.as_f64() {
+                Ok(Literal::Float(f))
+            } else {
+                Err(GraphError::Validation(format!(
+                    "parameter ${name} number cannot be represented"
+                )))
+            }
+        }
+        Value::Array(_) | Value::Object(_) => Err(GraphError::Validation(format!(
+            "parameter ${name} must be a scalar value"
+        ))),
+    }
+}
+
+fn bind_expr_params(expr: Expr, params: &HashMap<String, Value>) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Parameter(name) => {
+            let value = params.get(&name).ok_or_else(|| {
+                GraphError::Validation(format!("missing required query parameter ${name}"))
+            })?;
+            Expr::Literal(json_param_to_literal(&name, value)?)
+        }
+        Expr::Function { name, args } => Expr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| bind_expr_params(arg, params))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        Expr::Comparison { left, op, right } => Expr::Comparison {
+            left: Box::new(bind_expr_params(*left, params)?),
+            op,
+            right: Box::new(bind_expr_params(*right, params)?),
+        },
+        Expr::Arithmetic { left, op, right } => Expr::Arithmetic {
+            left: Box::new(bind_expr_params(*left, params)?),
+            op,
+            right: Box::new(bind_expr_params(*right, params)?),
+        },
+        Expr::And(left, right) => Expr::And(
+            Box::new(bind_expr_params(*left, params)?),
+            Box::new(bind_expr_params(*right, params)?),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(bind_expr_params(*left, params)?),
+            Box::new(bind_expr_params(*right, params)?),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(bind_expr_params(*inner, params)?)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(bind_expr_params(*inner, params)?)),
+        other => other,
+    })
+}
+
+fn bind_prop_map_params(
+    props: Vec<(String, Expr)>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<(String, Expr)>> {
+    props
+        .into_iter()
+        .map(|(name, expr)| Ok((name, bind_expr_params(expr, params)?)))
+        .collect()
+}
+
+fn bind_pattern_params(pattern: Pattern, params: &HashMap<String, Value>) -> Result<Pattern> {
+    Ok(match pattern {
+        Pattern::Node { var, label, props } => Pattern::Node {
+            var,
+            label,
+            props: bind_prop_map_params(props, params)?,
+        },
+        Pattern::Rel {
+            var,
+            rel_type,
+            direction,
+            props,
+            length_range,
+        } => Pattern::Rel {
+            var,
+            rel_type,
+            direction,
+            props: bind_prop_map_params(props, params)?,
+            length_range,
+        },
+        Pattern::Path(elements) => Pattern::Path(
+            elements
+                .into_iter()
+                .map(|p| bind_pattern_params(p, params))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+fn bind_patterns_params(
+    patterns: Vec<Pattern>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<Pattern>> {
+    patterns
+        .into_iter()
+        .map(|pattern| bind_pattern_params(pattern, params))
+        .collect()
+}
+
+fn bind_return_clause_params(
+    clause: ReturnClause,
+    params: &HashMap<String, Value>,
+) -> Result<ReturnClause> {
+    Ok(ReturnClause {
+        distinct: clause.distinct,
+        items: clause
+            .items
+            .into_iter()
+            .map(|item| {
+                Ok(crate::parser::ReturnItem {
+                    expr: bind_expr_params(item.expr, params)?,
+                    alias: item.alias,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        order_by: clause
+            .order_by
+            .into_iter()
+            .map(|item| {
+                Ok(crate::parser::OrderItem {
+                    expr: bind_expr_params(item.expr, params)?,
+                    direction: item.direction,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        limit: clause.limit,
+    })
+}
+
+fn bind_assignments_params(
+    assignments: Vec<Assignment>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<Assignment>> {
+    assignments
+        .into_iter()
+        .map(|assignment| {
+            Ok(Assignment {
+                var: assignment.var,
+                property: assignment.property,
+                value: bind_expr_params(assignment.value, params)?,
+            })
+        })
+        .collect()
+}
+
+fn bind_statement_params(
+    statement: Statement,
+    params: &HashMap<String, Value>,
+) -> Result<Statement> {
+    Ok(match statement {
+        Statement::Match {
+            pattern,
+            where_clause,
+            return_clause,
+        } => Statement::Match {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::Create {
+            patterns,
+            return_clause,
+        } => Statement::Create {
+            patterns: bind_patterns_params(patterns, params)?,
+            return_clause: return_clause
+                .map(|clause| bind_return_clause_params(clause, params))
+                .transpose()?,
+        },
+        Statement::Set {
+            pattern,
+            where_clause,
+            assignments,
+        } => Statement::Set {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            assignments: bind_assignments_params(assignments, params)?,
+        },
+        Statement::Delete {
+            pattern,
+            where_clause,
+            detach,
+            variables,
+        } => Statement::Delete {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            detach,
+            variables,
+        },
+        Statement::Subscribe {
+            inner,
+            interval,
+            delta,
+        } => Statement::Subscribe {
+            inner: Box::new(bind_statement_params(*inner, params)?),
+            interval,
+            delta,
+        },
+        Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        } => Statement::Merge {
+            patterns: bind_patterns_params(patterns, params)?,
+            set_clause: bind_assignments_params(set_clause, params)?,
+            return_clause: return_clause
+                .map(|clause| bind_return_clause_params(clause, params))
+                .transpose()?,
+        },
+        Statement::Unsubscribe { stream_id } => Statement::Unsubscribe { stream_id },
+    })
 }
 
 /// Format a physical plan as a human-readable string for EXPLAIN output.

@@ -31,6 +31,10 @@ pub enum Keyword {
     Every,
     Delta,
     Merge,
+    Optional,
+    With,
+    Union,
+    Unwind,
 }
 
 /// A token produced by the lexer.
@@ -46,6 +50,8 @@ pub enum TokenKind<'input> {
     Integer(i64),
     /// A floating-point literal.
     Float(f64),
+    /// Query parameter: `$name`.
+    Parameter(&'input str),
 
     // Punctuation
     LParen,   // (

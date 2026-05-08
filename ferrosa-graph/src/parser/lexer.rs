@@ -38,6 +38,10 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "EVERY" => Keyword::Every,
     "DELTA" => Keyword::Delta,
     "MERGE" => Keyword::Merge,
+    "OPTIONAL" => Keyword::Optional,
+    "WITH" => Keyword::With,
+    "UNION" => Keyword::Union,
+    "UNWIND" => Keyword::Unwind,
 };
 
 /// Check if two token kinds match. For keywords, this compares the
@@ -335,6 +339,9 @@ impl<'input> Lexer<'input> {
             // Number: integer or float.
             b'0'..=b'9' => self.lex_number(start),
 
+            // Parameter: $name.
+            b'$' => self.lex_parameter(start),
+
             // Identifier or keyword.
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(start),
 
@@ -352,6 +359,37 @@ impl<'input> Lexer<'input> {
         self.pos += 1;
         Ok(Token {
             kind,
+            span: Span {
+                start,
+                end: self.pos,
+            },
+        })
+    }
+
+    fn lex_parameter(&mut self, start: usize) -> ParseResult<Token<'input>> {
+        self.pos += 1; // skip '$'
+        let name_start = self.pos;
+        if self.pos >= self.bytes.len()
+            || !matches!(self.bytes[self.pos], b'a'..=b'z' | b'A'..=b'Z' | b'_')
+        {
+            return Err(ParseError::new(
+                "expected parameter name after '$'",
+                Span {
+                    start,
+                    end: self.pos,
+                },
+            ));
+        }
+        self.pos += 1;
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'0'..=b'9' => self.pos += 1,
+                _ => break,
+            }
+        }
+        let name = &self.input[name_start..self.pos];
+        Ok(Token {
+            kind: TokenKind::Parameter(name),
             span: Span {
                 start,
                 end: self.pos,

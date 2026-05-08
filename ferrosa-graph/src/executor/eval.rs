@@ -19,6 +19,10 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
     match expr {
         Expr::Literal(lit) => Ok(literal_to_json(lit)),
 
+        Expr::Parameter(name) => Err(GraphError::Validation(format!(
+            "unbound query parameter ${name} reached expression evaluator"
+        ))),
+
         Expr::Var(name) => Ok(bindings.get(name.as_str()).cloned().unwrap_or(Value::Null)),
 
         Expr::Property { var, name } => {

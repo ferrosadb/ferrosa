@@ -63,6 +63,8 @@ pub enum Expr {
     Property { var: String, name: String },
     /// Literal value.
     Literal(Literal),
+    /// Query parameter reference: `$name`. Bound before planning/execution.
+    Parameter(String),
     /// Function call: `count(n)`, `id(n)`
     Function { name: String, args: Vec<Expr> },
     /// Comparison: `a.age > 30`

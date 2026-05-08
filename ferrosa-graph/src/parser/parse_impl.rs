@@ -99,6 +99,13 @@ impl<'input> Parser<'input> {
                     delta,
                 })
             }
+            TokenKind::Keyword(Keyword::Optional)
+            | TokenKind::Keyword(Keyword::With)
+            | TokenKind::Keyword(Keyword::Union)
+            | TokenKind::Keyword(Keyword::Unwind) => Err(ParseError::new(
+                format!("unsupported Cypher clause: {:?}", tok.kind),
+                tok.span,
+            )),
             TokenKind::Keyword(Keyword::Merge) => self.parse_merge(),
             TokenKind::Keyword(Keyword::Unsubscribe) => {
                 self.lexer.next_token()?; // consume UNSUBSCRIBE
@@ -819,6 +826,14 @@ impl<'input> Parser<'input> {
                     unreachable!()
                 }
             }
+            TokenKind::Parameter(_) => {
+                let tok = self.lexer.next_token()?;
+                if let TokenKind::Parameter(name) = tok.kind {
+                    Ok(Expr::Parameter(name.to_string()))
+                } else {
+                    unreachable!()
+                }
+            }
             TokenKind::Keyword(Keyword::True) => {
                 self.lexer.next_token()?;
                 Ok(Expr::Literal(Literal::Bool(true)))
@@ -848,7 +863,7 @@ impl<'input> Parser<'input> {
                 };
 
                 // Check for property access (var.prop) or function call (fn(...)).
-                let next = self.lexer.peek()?;
+                let next = self.lexer.peek()?.clone();
                 match &next.kind {
                     TokenKind::Dot => {
                         self.lexer.next_token()?;
@@ -872,9 +887,12 @@ impl<'input> Parser<'input> {
                     }
                     TokenKind::LParen => {
                         self.lexer.next_token()?;
-                        // TODO: DISTINCT modifier is consumed and ignored for now.
-                        // A future pass should propagate it to the aggregate executor.
-                        let _distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
+                        if self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))? {
+                            return Err(ParseError::new(
+                                "aggregate DISTINCT is not supported; use RETURN DISTINCT or remove DISTINCT",
+                                next.span,
+                            ));
+                        }
                         let mut args = vec![];
                         if self.lexer.peek()?.kind != TokenKind::RParen {
                             loop {
@@ -1104,10 +1122,16 @@ pub fn parse(input: &str) -> ParseResult<Statement> {
     // Ensure we consumed all input.
     let tok = parser.lexer.next_token()?;
     if tok.kind != TokenKind::Eof {
-        return Err(ParseError::new(
-            format!("unexpected token after statement: {:?}", tok.kind),
-            tok.span,
-        ));
+        let message = match &tok.kind {
+            TokenKind::Keyword(Keyword::Optional)
+            | TokenKind::Keyword(Keyword::With)
+            | TokenKind::Keyword(Keyword::Union)
+            | TokenKind::Keyword(Keyword::Unwind) => {
+                format!("unsupported Cypher clause: {:?}", tok.kind)
+            }
+            _ => format!("unexpected token after statement: {:?}", tok.kind),
+        };
+        return Err(ParseError::new(message, tok.span));
     }
     Ok(stmt)
 }
@@ -1809,17 +1833,13 @@ mod tests {
     // --- DISTINCT in function calls ---
 
     #[test]
-    fn parse_collect_distinct() {
-        let stmt = parse("MATCH (a)-[:KNOWS]->(b) RETURN collect(DISTINCT b.name)").unwrap();
-        if let Statement::Match { return_clause, .. } = stmt {
-            assert!(matches!(
-                &return_clause.items[0].expr,
-                Expr::Function { name, args }
-                    if name == "collect" && args.len() == 1
-            ));
-        } else {
-            panic!("expected Match");
-        }
+    fn parse_collect_distinct_errors_explicitly() {
+        let err = parse("MATCH (a)-[:KNOWS]->(b) RETURN collect(DISTINCT b.name)").unwrap_err();
+        assert!(
+            err.message.contains("aggregate DISTINCT is not supported"),
+            "error should explicitly reject aggregate DISTINCT, got: {}",
+            err.message
+        );
     }
 
     // --- Negative pattern in WHERE ---
@@ -1884,6 +1904,44 @@ mod tests {
             "expected 'unsupported statement keyword', got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn parse_parameters_as_explicit_parameter_exprs() {
+        let stmt = parse("MATCH (n:Person {name: $name}) WHERE n.age >= $age RETURN n").unwrap();
+        if let Statement::Match {
+            pattern,
+            where_clause,
+            ..
+        } = stmt
+        {
+            let Pattern::Node { props, .. } = &pattern[0] else {
+                panic!("expected node pattern")
+            };
+            assert!(matches!(&props[0].1, Expr::Parameter(name) if name == "name"));
+            assert!(
+                matches!(where_clause.unwrap(), Expr::Comparison { right, .. } if matches!(*right, Expr::Parameter(ref name) if name == "age"))
+            );
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn unsupported_clauses_return_explicit_errors() {
+        for (query, clause) in [
+            ("OPTIONAL MATCH (n) RETURN n", "Optional"),
+            ("MATCH (n) RETURN n WITH n RETURN n", "With"),
+            ("UNWIND [1,2] AS x RETURN x", "Unwind"),
+            ("MATCH (n) RETURN n UNION MATCH (m) RETURN m", "Union"),
+        ] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                err.message.contains("unsupported Cypher clause") && err.message.contains(clause),
+                "{query} should mention unsupported {clause}, got: {}",
+                err.message
+            );
+        }
     }
 
     // --- MERGE: relationship patterns and multi-clause ---

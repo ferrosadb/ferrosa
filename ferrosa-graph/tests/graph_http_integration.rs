@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use base64::Engine as _;
+use futures::future::join_all;
 use indexmap::IndexMap;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -309,6 +310,28 @@ fn build_app_with_write_path(
         auth_disabled: false,
     };
     build_router(state)
+}
+
+fn build_app_and_engine(
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+) -> (axum::Router, Arc<GraphEngine>) {
+    let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
+    ));
+    let engine = Arc::new(GraphEngine::new(
+        Arc::clone(&schema),
+        Arc::clone(&storage),
+        write_path,
+        GraphEngineConfig::default(),
+        std::time::Duration::from_secs(300),
+    ));
+    let state = AppState {
+        engine: Arc::clone(&engine),
+        schema: Arc::clone(&schema),
+        auth_disabled: false,
+    };
+    (build_router(state), engine)
 }
 
 #[derive(Debug)]
@@ -737,9 +760,283 @@ async fn graph_full_workflow() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn http_var_length_and_shortest_path_are_fast_and_correct_on_cycle() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    for name in ["VarPathA", "VarPathB", "VarPathC", "VarPathD"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "node MERGE should succeed for {name}"
+        );
+    }
+
+    for (src, dst) in [
+        ("VarPathA", "VarPathB"),
+        ("VarPathB", "VarPathC"),
+        ("VarPathC", "VarPathA"),
+        ("VarPathC", "VarPathD"),
+    ] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (a:Person {{name: '{src}'}})-[r:KNOWS]->(b:Person {{name: '{dst}'}}) RETURN r"),
+                "keyspace": "social"
+            })),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "edge MERGE should succeed for {src}->{dst}"
+        );
+    }
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'VarPathA'})-[:KNOWS]->(b:Person {name: 'VarPathB'}) RETURN b.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let fixed_body = response_json(resp).await;
+    assert_eq!(
+        fixed_body["rows"].as_array().unwrap(),
+        &vec![serde_json::json!(["VarPathB"])],
+        "fixed-hop setup must work before testing varpath"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'VarPathA'})-[:KNOWS*1..4]->(b:Person {name: 'VarPathD'}) RETURN b.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("tiny cyclic varpath query should complete under 1s")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows, &vec![serde_json::json!(["VarPathD"])]);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH p = shortestPath((a:Person {name: 'VarPathA'})-[:KNOWS*1..4]->(b:Person {name: 'VarPathD'})) RETURN b.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("tiny shortestPath query should complete under 1s")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows, &vec![serde_json::json!(["VarPathD"])]);
+}
+
+#[tokio::test]
+async fn concurrent_merge_node_and_relationship_remain_idempotent() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let node_futures = (0..8).map(|_| {
+        let schema = Arc::clone(&schema);
+        let storage = Arc::clone(&storage);
+        async move {
+            let app = build_app(schema, storage);
+            let req = json_request(
+                "POST",
+                "/graph/query",
+                Some(serde_json::json!({
+                    "query": "MERGE (n:Person {name: 'ConcurrentNode'}) RETURN n",
+                    "keyspace": "social"
+                })),
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    });
+    for status in join_all(node_futures).await {
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let rel_futures = (0..8).map(|_| {
+        let schema = Arc::clone(&schema);
+        let storage = Arc::clone(&storage);
+        async move {
+            let app = build_app(schema, storage);
+            let req = json_request(
+                "POST",
+                "/graph/query",
+                Some(serde_json::json!({
+                    "query": "MERGE (a:Person {name: 'ConcurrentSrc'})-[r:KNOWS]->(b:Person {name: 'ConcurrentDst'}) RETURN r",
+                    "keyspace": "social"
+                })),
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    });
+    for status in join_all(rel_futures).await {
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'ConcurrentNode'}) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = response_json(resp).await["rows"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        rows.len(),
+        1,
+        "concurrent node MERGE should materialize one node"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'ConcurrentSrc'})-[r:KNOWS]->(b:Person {name: 'ConcurrentDst'}) RETURN r",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = response_json(resp).await["rows"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        rows.len(),
+        1,
+        "concurrent relationship MERGE should materialize one edge"
+    );
+}
+
 // ── Slice 7: MERGE executor tests ────────────────────────────────────────────
 
 /// MERGE the same node twice; verify that only one row exists (idempotency).
+#[tokio::test]
+async fn graph_subscribe_sse_snapshot_delta_and_unsubscribe_cancel() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let (app, engine) = build_app_and_engine(Arc::clone(&schema), Arc::clone(&storage));
+
+    let create_alice = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000a001', name: 'Alice'}) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let create_alice_resp = app.clone().oneshot(create_alice).await.unwrap();
+    let create_alice_status = create_alice_resp.status();
+    let create_alice_body = response_json(create_alice_resp).await;
+    assert_eq!(
+        create_alice_status,
+        StatusCode::OK,
+        "create Alice failed: {create_alice_body}"
+    );
+
+    let subscribe = json_request(
+        "POST",
+        "/graph/subscribe",
+        Some(serde_json::json!({
+            "query": "SUBSCRIBE MATCH (n:Person) RETURN n.name EVERY 500 ms DELTA",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.clone().oneshot(subscribe).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(engine.subscription_registry().count(), 1);
+
+    let create_bob = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000b002', name: 'Bob'}) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    assert_eq!(
+        app.clone().oneshot(create_bob).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+
+    let unsubscribe = json_request(
+        "POST",
+        "/graph/unsubscribe",
+        Some(serde_json::json!({"stream_id": 1})),
+    );
+    let unsub_resp = app.clone().oneshot(unsubscribe).await.unwrap();
+    assert_eq!(unsub_resp.status(), StatusCode::OK);
+    assert_eq!(engine.subscription_registry().count(), 0);
+
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        axum::body::to_bytes(resp.into_body(), 1_048_576),
+    )
+    .await
+    .expect("subscription body should finish after unsubscribe")
+    .unwrap();
+    let sse = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        sse.contains("event: snapshot"),
+        "SSE did not contain snapshot: {sse}"
+    );
+    assert!(
+        sse.contains("Alice"),
+        "snapshot did not contain initial row: {sse}"
+    );
+    assert!(
+        sse.contains("event: delta"),
+        "SSE did not contain delta: {sse}"
+    );
+    assert!(sse.contains("Bob"), "delta did not contain new row: {sse}");
+}
+
 #[tokio::test]
 async fn merge_node_is_idempotent() {
     let (schema, storage, _dir) = setup();
@@ -997,6 +1294,117 @@ async fn http_merge_then_match_round_trip() {
         !body["rows"].as_array().unwrap().is_empty(),
         "MATCH after MERGE must return at least one row"
     );
+}
+
+#[tokio::test]
+async fn http_query_params_bind_match_merge_and_set_literals() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (n:Person {name: $name}) SET n.age = $age RETURN n",
+            "keyspace": "social",
+            "params": {"name": "Param Alice", "age": 41}
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "MERGE with params must return 200"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: $name}) WHERE n.age = $age RETURN n.name, n.age",
+            "keyspace": "social",
+            "params": {"name": "Param Alice", "age": 41}
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "MATCH with params must return 200"
+    );
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "parameterized MATCH should find exactly the bound row"
+    );
+    assert_eq!(rows[0][0], "Param Alice");
+    assert_eq!(rows[0][1], 41);
+}
+
+#[tokio::test]
+async fn http_query_missing_param_returns_validation_error() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let app = build_app(schema, storage);
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: $name}) RETURN n",
+            "keyspace": "social",
+            "params": {}
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing required query parameter $name"),
+        "error should name the missing parameter: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn http_unsupported_cypher_clauses_return_explicit_400() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    for (query, clause) in [
+        ("OPTIONAL MATCH (n) RETURN n", "Optional"),
+        ("MATCH (n) RETURN n WITH n RETURN n", "With"),
+        ("UNWIND [1,2] AS x RETURN x", "Unwind"),
+        ("MATCH (n) RETURN n UNION MATCH (m) RETURN m", "Union"),
+    ] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({"query": query, "keyspace": "social"})),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{query} should be rejected"
+        );
+        let body = response_json(resp).await;
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("unsupported Cypher clause") && error.contains(clause),
+            "{query} should mention unsupported {clause}, got: {error}"
+        );
+    }
 }
 
 /// Mutation responses must carry the canonical `{"columns":..., "rows":..., "stats":...}` shape.

@@ -239,6 +239,15 @@ class TestBoltWireProtocol:
         assert len(records) == 1
         assert "n.name" in records[0]
 
+    def test_bolt_run_pull_with_parameters(self, bolt_driver):
+        """RUN parameters bind before PULL returns records."""
+        records, summary = run_cypher(
+            bolt_driver,
+            "MATCH (n:Person) WHERE n.name = $name RETURN n.name, n.age",
+            name="Alice",
+        )
+        assert records == [{"n.name": "Alice", "n.age": 30}]
+
     def test_bolt_multiple_queries_sequential(self, bolt_driver):
         """Multiple queries on the same driver work sequentially."""
         for _ in range(5):

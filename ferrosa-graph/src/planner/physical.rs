@@ -1010,8 +1010,22 @@ fn plan_match(
 
                 // Look for the next node.
                 let (next_var, vertex_table, target_props) = if i + 1 < elements.len() {
-                    if let Pattern::Node { var, props, .. } = &elements[i + 1] {
-                        let vt = var.as_ref().and_then(|v| bindings.get(v)).cloned();
+                    if let Pattern::Node { var, label, props } = &elements[i + 1] {
+                        let vt =
+                            var.as_ref()
+                                .and_then(|v| bindings.get(v))
+                                .cloned()
+                                .or_else(|| {
+                                    label.as_ref().and_then(|label| {
+                                        bindings
+                                            .values()
+                                            .find(|r| {
+                                                r.label.eq_ignore_ascii_case(label)
+                                                    && r.graph_type == "vertex"
+                                            })
+                                            .cloned()
+                                    })
+                                });
                         (var.clone(), vt, props.clone())
                     } else {
                         (None, None, vec![])
