@@ -428,9 +428,29 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     ))),
                 },
                 "totimestamp" if args.len() == 1 => {
-                    // Convert argument to timestamp
-                    let inner = term_to_cql_value(&args[0], &CqlType::Timestamp)?;
-                    Ok(inner)
+                    // CQL `toTimestamp(timeuuid) -> timestamp`. The argument
+                    // must produce a TimeUUID — most commonly `now()`, which
+                    // only types as Timeuuid. Evaluating the inner term with
+                    // target=Timestamp would fail at the `now()` arm above
+                    // ("now() returns timeuuid, but column expects timestamp").
+                    // So evaluate the inner with target=Timeuuid, then convert.
+                    let inner = term_to_cql_value(&args[0], &CqlType::Timeuuid)?;
+                    match inner {
+                        CqlValue::Timeuuid(uuid) => {
+                            let bytes = uuid.as_bytes();
+                            let time_low =
+                                u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+                            let time_mid = u16::from_be_bytes([bytes[4], bytes[5]]) as u64;
+                            let time_hi =
+                                (u16::from_be_bytes([bytes[6], bytes[7]]) & 0x0FFF) as u64;
+                            let uuid_ts = time_low | (time_mid << 32) | (time_hi << 48);
+                            let millis = (uuid_ts - UUID_EPOCH_OFFSET) / 10_000;
+                            Ok(CqlValue::Timestamp(millis as i64))
+                        }
+                        _ => Err(CqlError::Invalid(
+                            "toTimestamp requires a timeuuid argument".into(),
+                        )),
+                    }
                 }
                 "todate" if args.len() == 1 => {
                     let inner = term_to_cql_value(&args[0], &CqlType::Date)?;
@@ -1777,6 +1797,33 @@ mod tests {
         let val =
             term_to_cql_value(&Term::IntegerLiteral(1710000000), &CqlType::Timestamp).unwrap();
         assert_eq!(val, CqlValue::Timestamp(1710000000));
+    }
+
+    #[test]
+    fn term_to_timestamp_of_now_evaluates_to_timestamp() {
+        // Regression: INSERT ... VALUES (toTimestamp(now())) into a `timestamp`
+        // column previously failed with "type mismatch: now() returns timeuuid,
+        // but column expects timestamp" because the inner `now()` was evaluated
+        // with target=Timestamp instead of Timeuuid.
+        let term = Term::FunctionCall {
+            name: "toTimestamp".into(),
+            args: vec![Term::FunctionCall {
+                name: "now".into(),
+                args: vec![],
+                keyspace: None,
+            }],
+            keyspace: None,
+        };
+        let val = term_to_cql_value(&term, &CqlType::Timestamp).unwrap();
+        let CqlValue::Timestamp(millis) = val else {
+            panic!("expected Timestamp, got {val:?}");
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let diff = (millis - now_ms).abs();
+        assert!(
+            diff < 5_000,
+            "toTimestamp(now()) should be within 5s of now, diff={diff}ms"
+        );
     }
 
     #[test]
