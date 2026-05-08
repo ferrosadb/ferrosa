@@ -12,9 +12,9 @@ permissions:
   contents: write
 
 jobs:
-  # ── Linux x86_64 (glibc + musl) ──────────────────────────────────────
-  build-linux:
-    name: Build Linux x86_64
+  # ── Linux x86_64 (musl static) ───────────────────────────────────────
+  build-linux-x86_64:
+    name: Build Linux x86_64 (musl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -27,19 +27,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --target x86_64-unknown-linux-musl
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
 
-      # glibc binary (standard Linux)
-      - name: Build x86_64 glibc binaries
-        run: |
-          cargo build --release -p ferrosa -p ferrosa-ctl
-          strip target/release/ferrosa
-          strip target/release/ferrosa-ctl
-
-      # musl static binary (Alpine, containers, anywhere)
       - name: Build x86_64 musl static binaries
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
@@ -47,21 +39,13 @@ jobs:
           strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl
           file target/x86_64-unknown-linux-musl/release/ferrosa | grep -q "statically linked"
 
-      - name: Package tarballs
-        id: package
+      - name: Stage release tarball
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-
-          tar czf "dist/ferrosa-${VERSION}-x86_64-linux-gnu.tar.gz" \
-            -C target/release ferrosa ferrosa-ctl
-          tar czf "dist/ferrosa-${VERSION}-x86_64-linux-musl.tar.gz" \
-            -C target/x86_64-unknown-linux-musl/release ferrosa ferrosa-ctl
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          bash .github/scripts/stage-release-tarball.sh \
+            x86_64-unknown-linux-musl \
+            target/x86_64-unknown-linux-musl/release
 
       - name: Build Debian package
-        id: deb
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ARCH="amd64"
@@ -98,13 +82,14 @@ jobs:
           chmod 755 "${PKG_DIR}/DEBIAN/postinst"
 
           mkdir -p "${PKG_DIR}/usr/bin"
-          cp target/release/ferrosa "${PKG_DIR}/usr/bin/"
-          cp target/release/ferrosa-ctl "${PKG_DIR}/usr/bin/"
-          strip "${PKG_DIR}/usr/bin/ferrosa"
-          strip "${PKG_DIR}/usr/bin/ferrosa-ctl"
+          cp target/x86_64-unknown-linux-musl/release/ferrosa "${PKG_DIR}/usr/bin/"
+          cp target/x86_64-unknown-linux-musl/release/ferrosa-ctl "${PKG_DIR}/usr/bin/"
 
           mkdir -p "${PKG_DIR}/lib/systemd/system"
-          cat > "${PKG_DIR}/lib/systemd/system/ferrosa.service" <<SERVICE
+          if [ -f systemd/ferrosa.service ]; then
+            cp systemd/ferrosa.service "${PKG_DIR}/lib/systemd/system/ferrosa.service"
+          else
+            cat > "${PKG_DIR}/lib/systemd/system/ferrosa.service" <<SERVICE
           [Unit]
           Description=Ferrosa Database Server
           After=network-online.target
@@ -127,7 +112,8 @@ jobs:
           [Install]
           WantedBy=multi-user.target
           SERVICE
-          sed -i 's/^          //' "${PKG_DIR}/lib/systemd/system/ferrosa.service"
+            sed -i 's/^          //' "${PKG_DIR}/lib/systemd/system/ferrosa.service"
+          fi
 
           mkdir -p "${PKG_DIR}/etc/ferrosa"
           mkdir -p "${PKG_DIR}/var/lib/ferrosa"
@@ -136,18 +122,74 @@ jobs:
               > "${PKG_DIR}/usr/share/doc/ferrosa/copyright"
 
           dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_FILE"
-          echo "deb_file=${DEB_FILE}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Linux artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: linux-x86_64
-          path: dist/ferrosa-*
+          name: tarball-x86_64-unknown-linux-musl
+          path: |
+            dist/ferrosa-*-x86_64-unknown-linux-musl.tar.gz
+            dist/ferrosa_*_amd64.deb
           retention-days: 90
+          if-no-files-found: error
+
+  # ── Linux aarch64 (musl static, cross-compiled) ──────────────────────
+  build-linux-aarch64:
+    name: Build Linux aarch64 (musl, cross)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: aarch64-musl
+
+      # We use `cross` (https://github.com/cross-rs/cross) for aarch64-musl —
+      # simpler than zigbuild for a workspace this size and well-maintained.
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+
+      # NOTE: workspace-wide tests are skipped for this target. The runner is
+      # x86_64; we cannot natively execute aarch64 binaries here. Clippy still
+      # runs as a static-analysis gate.
+      - name: Clippy (aarch64-musl)
+        run: cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+
+      - name: Build aarch64 musl static binaries
+        run: |
+          cross build --release --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
+          # `strip` from binutils handles foreign ELF; use the cross toolchain's
+          # aarch64 strip if present, fall back to plain strip which on modern
+          # binutils is multi-arch capable.
+          if command -v aarch64-linux-gnu-strip >/dev/null 2>&1; then
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-ctl
+          else
+            sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa
+            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-ctl
+          fi
+
+      - name: Stage release tarball
+        run: |
+          bash .github/scripts/stage-release-tarball.sh \
+            aarch64-unknown-linux-musl \
+            target/aarch64-unknown-linux-musl/release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tarball-aarch64-unknown-linux-musl
+          path: dist/ferrosa-*-aarch64-unknown-linux-musl.tar.gz
+          retention-days: 90
+          if-no-files-found: error
 
   # ── macOS Apple Silicon (aarch64) ─────────────────────────────────────
-  build-macos:
-    name: Build macOS Apple Silicon
+  build-macos-aarch64:
+    name: Build macOS aarch64
     runs-on: macos-14
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -156,18 +198,23 @@ jobs:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Run tests
+        run: cargo test --workspace --target aarch64-apple-darwin
+
+      - name: Clippy
+        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+
       - name: Build aarch64-apple-darwin binaries
         run: |
           cargo build --release --target aarch64-apple-darwin -p ferrosa -p ferrosa-ctl
           strip target/aarch64-apple-darwin/release/ferrosa
           strip target/aarch64-apple-darwin/release/ferrosa-ctl
 
-      - name: Package tarball
+      - name: Stage release tarball
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          tar czf "dist/ferrosa-${VERSION}-aarch64-apple-darwin.tar.gz" \
-            -C target/aarch64-apple-darwin/release ferrosa ferrosa-ctl
+          bash .github/scripts/stage-release-tarball.sh \
+            aarch64-apple-darwin \
+            target/aarch64-apple-darwin/release
 
       - name: Package Homebrew bottle (tar.gz)
         run: |
@@ -182,32 +229,107 @@ jobs:
             -C dist ferrosa/${VERSION}
           rm -rf "dist/ferrosa"
 
-      - name: Upload macOS artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: macos-aarch64
-          path: dist/ferrosa-*
+          name: tarball-aarch64-apple-darwin
+          path: |
+            dist/ferrosa-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            dist/ferrosa-*.arm64_sonoma.bottle.tar.gz
           retention-days: 90
+          if-no-files-found: error
 
-  # ── Create GitHub Release (private repo) ──────────────────────────────
+  # ── macOS Intel (x86_64) ──────────────────────────────────────────────
+  build-macos-x86_64:
+    name: Build macOS x86_64
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run tests
+        run: cargo test --workspace --target x86_64-apple-darwin
+
+      - name: Clippy
+        run: cargo clippy --all-targets --target x86_64-apple-darwin -- -D warnings
+
+      - name: Build x86_64-apple-darwin binaries
+        run: |
+          cargo build --release --target x86_64-apple-darwin -p ferrosa -p ferrosa-ctl
+          strip target/x86_64-apple-darwin/release/ferrosa
+          strip target/x86_64-apple-darwin/release/ferrosa-ctl
+
+      - name: Stage release tarball
+        run: |
+          bash .github/scripts/stage-release-tarball.sh \
+            x86_64-apple-darwin \
+            target/x86_64-apple-darwin/release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tarball-x86_64-apple-darwin
+          path: dist/ferrosa-*-x86_64-apple-darwin.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+
+  # ── Aggregate, checksum, sign, and publish ────────────────────────────
   release:
     name: Create Release
-    needs: [build-linux, build-macos]
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+      - build-macos-aarch64
+      - build-macos-x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Download Linux artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          name: linux-x86_64
-          path: dist/
+          path: artifacts
 
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: macos-aarch64
-          path: dist/
+      - name: Flatten artifacts into dist/
+        run: |
+          mkdir -p dist
+          # Each artifact lives in artifacts/<name>/...; copy everything to dist/
+          find artifacts -type f \( -name 'ferrosa-*.tar.gz' -o -name 'ferrosa_*.deb' \) \
+            -exec cp -v {} dist/ \;
+          ls -lh dist/
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          # Deterministic order so the file content is reproducible
+          : > SHA256SUMS
+          for f in $(ls ferrosa-*.tar.gz ferrosa_*.deb 2>/dev/null | sort); do
+            sha256sum "$f" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+
+      # TODO(human): set up minisign signing.
+      # To enable, add the following secrets to the repo:
+      #   - MINISIGN_SECRET_KEY: contents of the minisign private key (encrypted)
+      #   - MINISIGN_PASSWORD:   passphrase for the key
+      # Then uncomment the step below. Public key should be published in the
+      # repo (e.g. .github/minisign.pub) and on ferrosadb.com so users can
+      # verify with `minisign -V -p minisign.pub -m SHA256SUMS`.
+      #
+      # - name: Sign SHA256SUMS with minisign
+      #   if: env.MINISIGN_SECRET_KEY != ''
+      #   env:
+      #     MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      #     MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+      #   run: |
+      #     sudo apt-get update && sudo apt-get install -y minisign
+      #     printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+      #     printf '%s\n%s\n' "$MINISIGN_PASSWORD" "$MINISIGN_PASSWORD" \
+      #       | minisign -S -s /tmp/minisign.key -m dist/SHA256SUMS
+      #     shred -u /tmp/minisign.key
 
       - name: List release artifacts
         run: ls -lh dist/
@@ -221,27 +343,36 @@ jobs:
           NOTES=$(cat <<'NOTES'
           ## What's Included
 
-          | Artifact | Platform | Description |
-          |----------|----------|-------------|
-          | `ferrosa-VERSION-x86_64-linux-gnu.tar.gz` | Linux x86_64 (glibc) | Standard Linux binary |
-          | `ferrosa-VERSION-x86_64-linux-musl.tar.gz` | Linux x86_64 (musl) | Statically linked, works on Alpine/containers |
-          | `ferrosa-VERSION_amd64.deb` | Debian/Ubuntu x86_64 | Package with systemd service |
-          | `ferrosa-VERSION-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | Native ARM64 binary |
-          | `ferrosa-VERSION.arm64_sonoma.bottle.tar.gz` | macOS (Homebrew) | Homebrew bottle for tap install |
+          Ferrosa is published as compressed tarballs for four target triples:
 
-          ### Quick Start (Linux)
+          | Tarball | Platform |
+          |---------|----------|
+          | `ferrosa-vVERSION-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static musl) |
+          | `ferrosa-vVERSION-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 (static musl) |
+          | `ferrosa-vVERSION-x86_64-apple-darwin.tar.gz` | macOS Intel |
+          | `ferrosa-vVERSION-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+          | `SHA256SUMS` | Checksums for all tarballs |
+
+          Additional packages:
+          - `ferrosa_VERSION_amd64.deb` — Debian/Ubuntu package with systemd unit
+          - `ferrosa-VERSION.arm64_sonoma.bottle.tar.gz` — Homebrew bottle for tap install
+
+          ### Verifying downloads
 
           ```bash
-          tar xzf ferrosa-VERSION-x86_64-linux-gnu.tar.gz
-          ./ferrosa
+          sha256sum -c SHA256SUMS --ignore-missing
           ```
 
-          ### Quick Start (macOS)
+          ### Quick Start (Linux / macOS)
 
           ```bash
-          tar xzf ferrosa-VERSION-aarch64-apple-darwin.tar.gz
-          ./ferrosa
+          tar xzf ferrosa-vVERSION-<target>.tar.gz
+          ./ferrosa --help
           ```
+
+          Each tarball contains: `ferrosa`, `ferrosa-ctl`, `LICENSE`, `NOTICE`,
+          `README.md`, and platform integration files (`config/`, `launchd/`,
+          `systemd/`) where applicable.
           NOTES
           )
 
