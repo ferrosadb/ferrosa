@@ -219,10 +219,15 @@ pub enum Statement {
         with_pipeline: WithPipeline,
         return_clause: ReturnClause,
     },
-    /// `MATCH pattern [WHERE expr] OPTIONAL MATCH pattern [WHERE expr] RETURN ...`
+    /// Top-level scalar projection: `RETURN expr [, ...]`.
+    Return {
+        return_clause: ReturnClause,
+    },
+    /// `UNWIND expr AS var RETURN ...`
     Unwind {
         expr: Expr,
         var: String,
+        with_pipeline: Option<WithPipeline>,
         return_clause: ReturnClause,
     },
     Union {

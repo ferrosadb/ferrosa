@@ -100,6 +100,9 @@ impl<'input> Parser<'input> {
                 })
             }
             TokenKind::Keyword(Keyword::Unwind) => self.parse_unwind_statement(),
+            TokenKind::Keyword(Keyword::Return) => Ok(Statement::Return {
+                return_clause: self.parse_return_clause()?,
+            }),
             TokenKind::Keyword(Keyword::With)
             | TokenKind::Keyword(Keyword::Union)
             | TokenKind::Keyword(Keyword::Call)
@@ -149,10 +152,17 @@ impl<'input> Parser<'input> {
                 ));
             }
         };
+        let with_pipeline = if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::With))
+        {
+            Some(self.parse_with_pipeline()?)
+        } else {
+            None
+        };
         let return_clause = self.parse_return_clause()?;
         Ok(Statement::Unwind {
             expr,
             var,
+            with_pipeline,
             return_clause,
         })
     }
@@ -1147,7 +1157,11 @@ impl<'input> Parser<'input> {
                             loop {
                                 let distinct_arg =
                                     self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
-                                let arg = self.parse_expr()?;
+                                let arg = if self.lexer.eat(&TokenKind::Star)? {
+                                    Expr::Var("*".to_string())
+                                } else {
+                                    self.parse_expr()?
+                                };
                                 args.push(if distinct_arg {
                                     Expr::Distinct(Box::new(arg))
                                 } else {

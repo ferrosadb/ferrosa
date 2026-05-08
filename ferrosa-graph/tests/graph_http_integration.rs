@@ -736,8 +736,9 @@ async fn query_nonexistent_label_returns_error() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    // Should return 400 (validation error: unknown label)
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    assert_eq!(body["rows"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -1619,6 +1620,45 @@ async fn exists_pattern_predicate_filters_rows_with_matching_paths() {
         serde_json::json!([["Alice"]]),
         "EXISTS pattern should keep only starts that have the full path"
     );
+}
+
+#[tokio::test]
+async fn count_star_counts_matching_rows_as_signed_integer() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    for (id, name) in [
+        ("11111111-1111-1111-1111-111111111111", "Alice"),
+        ("22222222-2222-2222-2222-222222222222", "Bob"),
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("CREATE (n:Person {{id: '{id}', name: '{name}'}})"),
+                "keyspace": "social"
+            })),
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN count(*)",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "count(*) response body: {body:?}");
+    assert_eq!(body["columns"], serde_json::json!(["count(*)"]));
+    assert_eq!(body["rows"][0][0].as_i64(), Some(2));
 }
 
 #[tokio::test]

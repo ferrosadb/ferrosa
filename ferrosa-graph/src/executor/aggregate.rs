@@ -19,7 +19,7 @@ pub trait Accumulator: Send {
 
 /// Counts non-null values. For `count(*)`, all rows are counted.
 pub struct CountAcc {
-    count: u64,
+    count: i64,
     count_star: bool,
 }
 

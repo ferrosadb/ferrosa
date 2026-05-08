@@ -108,6 +108,7 @@ fn permission_for_statement(stmt: &Statement) -> Permission {
         | Statement::MatchWith { .. }
         | Statement::MatchWithOptional { .. }
         | Statement::Unwind { .. }
+        | Statement::Return { .. }
         | Statement::Union { .. } => Permission::Select,
         Statement::Create { .. } => Permission::Modify,
         Statement::Set { .. } => Permission::Modify,
@@ -132,7 +133,7 @@ pub fn validate(
 
     // Collect patterns from the statement.
     let patterns: &[Pattern] = match &statement {
-        Statement::Unwind { .. } | Statement::Union { .. } => &[],
+        Statement::Unwind { .. } | Statement::Return { .. } | Statement::Union { .. } => &[],
         Statement::Match { pattern, .. } => pattern,
         Statement::MatchWith { pattern, .. } => pattern,
         Statement::MatchWithOptional {
@@ -149,7 +150,7 @@ pub fn validate(
         Statement::Set { pattern, .. } => pattern,
         Statement::Delete { pattern, .. } => pattern,
         Statement::Subscribe { inner, .. } => match inner.as_ref() {
-            Statement::Unwind { .. } | Statement::Union { .. } => &[],
+            Statement::Unwind { .. } | Statement::Return { .. } | Statement::Union { .. } => &[],
             Statement::Match { pattern, .. } => pattern,
             Statement::MatchWith { pattern, .. } => pattern,
             Statement::MatchWithOptional {

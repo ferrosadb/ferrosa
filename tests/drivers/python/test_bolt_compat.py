@@ -30,6 +30,13 @@ from neo4j.exceptions import (
 FERROSA_HOST = os.environ.get("FERROSA_HOST", "127.0.0.1")
 FERROSA_BOLT_PORT = int(os.environ.get("FERROSA_BOLT_PORT", "7687"))
 FERROSA_CQL_PORT = int(os.environ.get("FERROSA_CQL_PORT", "9042"))
+FERROSA_CQL_PROTOCOL_VERSION = int(os.environ.get("FERROSA_CQL_PROTOCOL_VERSION", "4"))
+FERROSA_AUTH_DISABLED = os.environ.get("FERROSA_AUTH_DISABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 BOLT_URI = f"bolt://{FERROSA_HOST}:{FERROSA_BOLT_PORT}"
 BOLT_AUTH = ("cassandra", "cassandra")
@@ -49,7 +56,7 @@ def cql_session():
         contact_points=[FERROSA_HOST],
         port=FERROSA_CQL_PORT,
         load_balancing_policy=RoundRobinPolicy(),
-        protocol_version=5,
+        protocol_version=FERROSA_CQL_PROTOCOL_VERSION,
         schema_metadata_enabled=False,
         token_metadata_enabled=False,
     )
@@ -103,41 +110,47 @@ def social_graph(cql_session):
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.knows_e ("
         "  src_id TEXT,"
-        "  tgt_id TEXT,"
+        "  dst_id TEXT,"
         "  since_year INT,"
-        "  PRIMARY KEY (src_id, tgt_id)"
+        "  PRIMARY KEY (src_id, dst_id)"
         ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'KNOWS',"
         "  'graph.source': 'src_id',"
-        "  'graph.target': 'tgt_id'"
+        "  'graph.target': 'dst_id',"
+        "  'graph.source_label': 'Person',"
+        "  'graph.target_label': 'Person'"
         "}"
     )
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.likes_e ("
         "  src_id TEXT,"
-        "  tgt_id TEXT,"
+        "  dst_id TEXT,"
         "  reason TEXT,"
-        "  PRIMARY KEY (src_id, tgt_id)"
+        "  PRIMARY KEY (src_id, dst_id)"
         ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'LIKES',"
         "  'graph.source': 'src_id',"
-        "  'graph.target': 'tgt_id'"
+        "  'graph.target': 'dst_id',"
+        "  'graph.source_label': 'Person',"
+        "  'graph.target_label': 'Person'"
         "}"
     )
 
     sess.execute(
         f"CREATE TABLE IF NOT EXISTS {ks}.works_at_e ("
         "  src_id TEXT,"
-        "  tgt_id TEXT,"
+        "  dst_id TEXT,"
         "  role TEXT,"
-        "  PRIMARY KEY (src_id, tgt_id)"
+        "  PRIMARY KEY (src_id, dst_id)"
         ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'WORKS_AT',"
         "  'graph.source': 'src_id',"
-        "  'graph.target': 'tgt_id'"
+        "  'graph.target': 'dst_id',"
+        "  'graph.source_label': 'Person',"
+        "  'graph.target_label': 'Company'"
         "}"
     )
 
@@ -178,7 +191,7 @@ def social_graph(cql_session):
         ("dave", "eve", 2022),
     ]:
         sess.execute(
-            f"INSERT INTO {ks}.knows_e (src_id, tgt_id, since_year) "
+            f"INSERT INTO {ks}.knows_e (src_id, dst_id, since_year) "
             f"VALUES ('{src}', '{tgt}', {since})"
         )
 
@@ -186,7 +199,7 @@ def social_graph(cql_session):
         ("eve", "alice", "mentor"),
     ]:
         sess.execute(
-            f"INSERT INTO {ks}.likes_e (src_id, tgt_id, reason) "
+            f"INSERT INTO {ks}.likes_e (src_id, dst_id, reason) "
             f"VALUES ('{src}', '{tgt}', '{reason}')"
         )
 
@@ -197,7 +210,7 @@ def social_graph(cql_session):
         ("dave", "globex", "Analyst"),
     ]:
         sess.execute(
-            f"INSERT INTO {ks}.works_at_e (src_id, tgt_id, role) "
+            f"INSERT INTO {ks}.works_at_e (src_id, dst_id, role) "
             f"VALUES ('{src}', '{tgt}', '{role}')"
         )
 
@@ -246,6 +259,8 @@ class TestBoltWireProtocol:
 
     def test_bolt_auth_invalid_credentials(self):
         """Wrong password returns auth error, not a generic failure."""
+        if FERROSA_AUTH_DISABLED:
+            pytest.skip("auth-disabled test node accepts any Bolt credentials")
         with pytest.raises((AuthError, ServiceUnavailable)):
             bad_driver = GraphDatabase.driver(
                 BOLT_URI, auth=("cassandra", "wrong_password")

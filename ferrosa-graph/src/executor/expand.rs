@@ -23,7 +23,9 @@ use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::parser::{CompareOp, Direction, Expr, Literal, ReturnClause, ReturnItem, SortDir};
+use crate::parser::{
+    CompareOp, Direction, Expr, Literal, ReturnClause, ReturnItem, SortDir, WithPipeline,
+};
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
 
 #[derive(Debug, Clone)]
@@ -163,8 +165,10 @@ pub async fn execute(
         PhysicalPlan::Unwind {
             expr,
             var,
+            with_pipeline,
             return_clause,
-        } => execute_unwind(&expr, &var, &return_clause, start),
+        } => execute_unwind(&expr, &var, with_pipeline.as_ref(), &return_clause, start),
+        PhysicalPlan::ReturnOnly { return_clause } => execute_return_only(&return_clause, start),
         PhysicalPlan::Expand {
             anchor,
             hops,
@@ -204,12 +208,14 @@ pub async fn execute(
         PhysicalPlan::SetProperties {
             expand,
             assignments,
+            variable_tables,
         } => {
             execute_set(
                 write_path,
                 *expand,
                 keyspace,
                 &assignments,
+                &variable_tables,
                 config,
                 virtual_tables,
                 start,
@@ -575,9 +581,35 @@ async fn pattern_predicate_exists(
     Ok(!frontier.is_empty())
 }
 
+fn execute_return_only(return_clause: &ReturnClause, start: Instant) -> Result<GraphResult> {
+    let bindings = HashMap::new();
+    let mut rows = vec![return_clause
+        .items
+        .iter()
+        .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
+        .collect::<Vec<_>>()];
+    let columns = build_columns(return_clause);
+    sort_rows(&mut rows, &columns, &return_clause.order_by);
+    if let Some(limit) = return_clause.limit {
+        rows.truncate(limit.max(0) as usize);
+    }
+    Ok(GraphResult {
+        columns,
+        rows,
+        stats: QueryStats {
+            vertices_read: 0,
+            edges_read: 0,
+            vertices_written: 0,
+            vertices_deleted: 0,
+            execution_ms: start.elapsed().as_millis() as u64,
+        },
+    })
+}
+
 fn execute_unwind(
     expr: &Expr,
     var: &str,
+    with_pipeline: Option<&WithPipeline>,
     return_clause: &ReturnClause,
     start: Instant,
 ) -> Result<GraphResult> {
@@ -591,27 +623,33 @@ fn execute_unwind(
             )))
         }
     };
-    let mut rows = Vec::new();
+    let mut states = Vec::new();
     for value in values {
         let mut bindings = HashMap::new();
         bindings.insert(var.to_string(), value);
-        let row = return_clause
-            .items
-            .iter()
-            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
-            .collect::<Vec<_>>();
-        rows.push(row);
+        states.push(ExpandState {
+            current_key: DecoratedKey::new(PartitionKey::new(Vec::new())),
+            bindings,
+        });
     }
-    let columns = return_clause
-        .items
-        .iter()
-        .map(|item| {
-            item.alias
-                .clone()
-                .unwrap_or_else(|| expr_to_column_name(&item.expr))
-        })
-        .collect::<Vec<_>>();
-    sort_rows(&mut rows, &columns, &return_clause.order_by);
+    if let Some(with_pipeline) = with_pipeline {
+        states = apply_with_pipeline(states, with_pipeline)?;
+    }
+
+    let columns = build_columns(return_clause);
+    let mut rows = Vec::new();
+    for state in &states {
+        rows.push(
+            return_clause
+                .items
+                .iter()
+                .map(|item| {
+                    eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    sort_projected_rows_by_bindings(&mut rows, &states, return_clause);
     if let Some(limit) = return_clause.limit {
         rows.truncate(limit.max(0) as usize);
     }
@@ -931,6 +969,7 @@ async fn execute_expand(
     // Step 3: Build result from return clause, projecting property values.
     let columns = build_columns(return_clause);
 
+    let mut result_states = Vec::new();
     let mut rows = Vec::new();
     for state in &current_states {
         if rows.len() >= config.max_result_rows {
@@ -944,13 +983,13 @@ async fn execute_expand(
                 eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
             })
             .collect();
+        result_states.push(state.clone());
         rows.push(row);
     }
 
-    // Apply ORDER BY.
-    if !return_clause.order_by.is_empty() {
-        sort_rows(&mut rows, &columns, &return_clause.order_by);
-    }
+    // Apply ORDER BY before projection-only values disappear. Cypher permits
+    // ordering by expressions that are not part of RETURN.
+    sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
 
     // Apply DISTINCT.
     if return_clause.distinct {
@@ -972,6 +1011,57 @@ async fn execute_expand(
         rows,
         stats,
     })
+}
+
+fn sort_projected_rows_by_bindings(
+    rows: &mut Vec<Vec<serde_json::Value>>,
+    states: &[ExpandState],
+    return_clause: &ReturnClause,
+) {
+    if return_clause.order_by.is_empty() || rows.len() != states.len() {
+        if !return_clause.order_by.is_empty() {
+            let columns = build_columns(return_clause);
+            sort_rows(rows, &columns, &return_clause.order_by);
+        }
+        return;
+    }
+
+    let columns = build_columns(return_clause);
+    let mut paired: Vec<(Vec<serde_json::Value>, &ExpandState)> =
+        rows.drain(..).zip(states.iter()).collect();
+    paired.sort_by(|(row_a, a), (row_b, b)| {
+        for order in &return_clause.order_by {
+            let av = projected_order_value(&order.expr, &columns, row_a, &a.bindings);
+            let bv = projected_order_value(&order.expr, &columns, row_b, &b.bindings);
+            let cmp = pipeline_value_cmp(&av, &bv);
+            if cmp != std::cmp::Ordering::Equal {
+                return match order.direction {
+                    SortDir::Asc => cmp,
+                    SortDir::Desc => cmp.reverse(),
+                };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    rows.extend(paired.into_iter().map(|(row, _)| row));
+}
+
+fn projected_order_value(
+    expr: &Expr,
+    columns: &[String],
+    row: &[serde_json::Value],
+    bindings: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let value = eval::eval_expr(expr, bindings).unwrap_or(serde_json::Value::Null);
+    if !value.is_null() {
+        return value;
+    }
+    let column_name = expr_to_column_name(expr);
+    columns
+        .iter()
+        .position(|col| col == &column_name)
+        .and_then(|idx| row.get(idx).cloned())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn pipeline_value_cmp(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
@@ -1835,6 +1925,163 @@ fn expr_to_bytes(expr: &Expr) -> std::result::Result<Vec<u8>, GraphError> {
     }
 }
 
+fn expr_to_column_bytes(
+    expr: &Expr,
+    column_type: &str,
+) -> std::result::Result<Vec<u8>, GraphError> {
+    let Expr::Literal(lit) = expr else {
+        return Err(GraphError::Validation(format!(
+            "cannot convert expression to bytes: {expr:?}"
+        )));
+    };
+    let ty = column_type.to_ascii_lowercase();
+    match (lit, ty.as_str()) {
+        (Literal::String(s), _) => Ok(s.as_bytes().to_vec()),
+        (Literal::Integer(i), "int" | "integer") => Ok((*i as i32).to_be_bytes().to_vec()),
+        (Literal::Integer(i), _) => Ok(i.to_be_bytes().to_vec()),
+        (Literal::Float(f), _) => Ok(f.to_be_bytes().to_vec()),
+        (Literal::Bool(b), _) => Ok(vec![if *b { 1 } else { 0 }]),
+        (Literal::Null, _) => Ok(vec![]),
+    }
+}
+
+fn create_row_from_schema(
+    op: &CreateOp,
+    meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
+    timestamp: i64,
+) -> Result<(DecoratedKey, Row, String)> {
+    let Some(meta) = meta else {
+        let key_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let hex_key = hex::encode(&key_bytes);
+        let cells: Vec<(u16, CellValue)> = op
+            .props
+            .iter()
+            .enumerate()
+            .map(|(idx, (_name, expr))| {
+                let bytes = expr_to_bytes(expr).unwrap_or_default();
+                (idx as u16, CellValue::live(bytes, timestamp))
+            })
+            .collect();
+        return Ok((
+            DecoratedKey::new(PartitionKey::new(key_bytes)),
+            Row {
+                clustering: vec![],
+                cells,
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            },
+            hex_key,
+        ));
+    };
+
+    let prop = |name: &str| {
+        op.props
+            .iter()
+            .find(|(prop_name, _)| prop_name == name)
+            .map(|(_, expr)| expr)
+    };
+
+    let mut key_components = Vec::new();
+    for pk_name in &meta.partition_key {
+        let column = meta.columns.get(pk_name).ok_or_else(|| {
+            GraphError::Validation(format!(
+                "table {}.{} partition key column {pk_name} missing from metadata",
+                meta.keyspace, meta.name
+            ))
+        })?;
+        let key_bytes = if let Some(expr) = prop(pk_name) {
+            expr_to_column_bytes(expr, &column.column_type)?
+        } else {
+            // Neo4j-style CREATE does not require applications to provide an
+            // id property. For schema-backed Ferrosa vertex tables, synthesize
+            // a primary key using the declared CQL type so the row can still be
+            // materialized without treating the key as a regular property.
+            match column.column_type.as_str() {
+                "text" | "varchar" | "ascii" => uuid::Uuid::new_v4().to_string().into_bytes(),
+                "uuid" => uuid::Uuid::new_v4().as_bytes().to_vec(),
+                other => {
+                    return Err(GraphError::Validation(format!(
+                        "CREATE for label {} requires partition key property {pk_name} for unsupported generated key type {other}",
+                        op.table.label
+                    )))
+                }
+            }
+        };
+        key_components.push(key_bytes);
+    }
+    let key_bytes = if key_components.len() == 1 {
+        key_components.remove(0)
+    } else {
+        encode_components(&key_components)
+    };
+    let hex_key = hex::encode(&key_bytes);
+
+    let mut clustering_components = Vec::new();
+    for (ck_name, _) in &meta.clustering_key {
+        let column = meta.columns.get(ck_name).ok_or_else(|| {
+            GraphError::Validation(format!(
+                "table {}.{} clustering key column {ck_name} missing from metadata",
+                meta.keyspace, meta.name
+            ))
+        })?;
+        let expr = prop(ck_name).ok_or_else(|| {
+            GraphError::Validation(format!(
+                "CREATE for label {} requires clustering key property {ck_name}",
+                op.table.label
+            ))
+        })?;
+        clustering_components.push(expr_to_column_bytes(expr, &column.column_type)?);
+    }
+    let clustering = if clustering_components.is_empty() {
+        vec![]
+    } else if clustering_components.len() == 1 {
+        clustering_components.remove(0)
+    } else {
+        encode_components(&clustering_components)
+    };
+
+    let mut cells = Vec::new();
+    let mut regular_idx = 0u16;
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some(expr) = prop(&column.name) {
+                    cells.push((
+                        regular_idx,
+                        CellValue::live(
+                            expr_to_column_bytes(expr, &column.column_type)?,
+                            timestamp,
+                        ),
+                    ));
+                }
+                regular_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        DecoratedKey::new(PartitionKey::new(key_bytes)),
+        Row {
+            clustering,
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+        },
+        hex_key,
+    ))
+}
+
+fn encode_components(components: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for component in components {
+        out.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        out.extend_from_slice(component);
+    }
+    out
+}
+
 /// Generate a current timestamp in microseconds since epoch.
 fn now_micros() -> i64 {
     std::time::SystemTime::now()
@@ -1864,28 +2111,10 @@ async fn execute_create(
         let table_id = TableId::new(&op.table.keyspace, &op.table.table);
         let strategy = graph_replication_strategy(schema, &op.table.keyspace)?;
 
-        // Generate a unique key for the new vertex/edge using a UUID.
-        let key_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
-        let hex_key = hex::encode(&key_bytes);
-        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-
-        // Build cells from properties.
-        let cells: Vec<(u16, CellValue)> = op
-            .props
-            .iter()
-            .enumerate()
-            .map(|(idx, (_name, expr))| {
-                let bytes = expr_to_bytes(expr).unwrap_or_default();
-                (idx as u16, CellValue::live(bytes, timestamp))
-            })
-            .collect();
-
-        let row = Row {
-            clustering: vec![],
-            cells,
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-        };
+        let meta = schema.and_then(|schema| {
+            table_metadata_for(Some(schema), &op.table.keyspace, &op.table.table)
+        });
+        let (key, row, hex_key) = create_row_from_schema(op, meta.as_ref(), timestamp)?;
 
         write_path
             .write(
@@ -2920,6 +3149,7 @@ async fn execute_set(
     expand: PhysicalPlan,
     keyspace: &str,
     assignments: &[(String, String, Expr)],
+    variable_tables: &HashMap<String, String>,
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
     start: Instant,
@@ -2957,27 +3187,53 @@ async fn execute_set(
                 continue;
             }
 
-            // Get the vertex ID from the row.
-            if let Some(serde_json::Value::String(hex_id)) = row_values.get(col_idx) {
+            // Get the vertex ID from the row. `RETURN n`/`Expr::Var` produces a
+            // JSON object with `_id`; older/simple projections can still be a
+            // bare hex string.
+            let hex_id = match row_values.get(col_idx) {
+                Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                Some(serde_json::Value::Object(map)) => map.get("_id").and_then(|v| v.as_str()),
+                _ => None,
+            };
+
+            if let Some(hex_id) = hex_id {
                 let key_bytes = hex::decode(hex_id)
                     .map_err(|e| GraphError::Internal(format!("invalid hex vertex ID: {e}")))?;
                 let key = DecoratedKey::new(PartitionKey::new(key_bytes));
 
-                // Build cells for the updated properties.
-                let cells: Vec<(u16, CellValue)> = matching_assignments
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, (_var, _prop, val))| {
-                        let bytes = expr_to_bytes(val).unwrap_or_default();
-                        (idx as u16, CellValue::live(bytes, timestamp))
-                    })
-                    .collect();
+                let table_name = variable_tables
+                    .get(col_name)
+                    .map(String::as_str)
+                    .unwrap_or(col_name);
+                let table_id = TableId::new(keyspace, table_name);
 
-                // We need a table_id; look up via the variable. For simplicity,
-                // we use the first assignment's variable to find it in the expand's
-                // anchor table. In a full implementation we'd carry table metadata.
-                // For now, use the column name to identify the table.
-                let table_id = TableId::new(keyspace, col_name);
+                let mut cells = Vec::with_capacity(matching_assignments.len());
+                for (_var, prop, val) in matching_assignments {
+                    let Some(column_idx) =
+                        regular_column_index_for_property(schema, keyspace, table_name, prop)
+                    else {
+                        if matches!(
+                            column_kind_for_property(schema, keyspace, table_name, prop),
+                            Some(
+                                ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                                    | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                            )
+                        ) {
+                            continue;
+                        }
+                        return Err(GraphError::Validation(format!(
+                            "execute_set: SET references unknown property '{}' on table '{}.{}'",
+                            prop, keyspace, table_name
+                        )));
+                    };
+                    let bytes =
+                        encode_property_value_for_table(schema, keyspace, table_name, prop, val)?;
+                    cells.push((column_idx, CellValue::live(bytes, timestamp)));
+                }
+
+                if cells.is_empty() {
+                    continue;
+                }
 
                 let update_row = Row {
                     clustering: vec![],

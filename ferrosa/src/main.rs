@@ -864,6 +864,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bolt_bind: std::net::SocketAddr = std::net::SocketAddr::from(([0, 0, 0, 0], bolt_port));
         let bolt_config = ferrosa_graph::bolt::server::BoltConfig {
             bind_addr: bolt_bind,
+            auth_disabled,
             ..ferrosa_graph::bolt::server::BoltConfig::default()
         };
         let bolt_engine = graph_engine;

@@ -146,10 +146,17 @@ pub const MAX_VAR_HOPS: u32 = 10;
 #[allow(clippy::large_enum_variant)]
 pub enum PhysicalPlan {
     /// Expand from an anchor through a sequence of hops.
-    Union { arms: Vec<PhysicalPlan>, all: bool },
+    Union {
+        arms: Vec<PhysicalPlan>,
+        all: bool,
+    },
+    ReturnOnly {
+        return_clause: ReturnClause,
+    },
     Unwind {
         expr: Expr,
         var: String,
+        with_pipeline: Option<WithPipeline>,
         return_clause: ReturnClause,
     },
     Expand {
@@ -188,6 +195,10 @@ pub enum PhysicalPlan {
         expand: Box<PhysicalPlan>,
         /// Then: apply these assignments.
         assignments: Vec<(String, String, Expr)>, // (var, property, value)
+        /// Mapping from variable name to resolved storage table name so writes
+        /// update the matched label table rather than a table named after the
+        /// Cypher variable.
+        variable_tables: HashMap<String, String>,
     },
     /// Delete matched nodes/rels.
     DeleteNodes {
@@ -279,10 +290,15 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
         Statement::Unwind {
             expr,
             var,
+            with_pipeline,
             return_clause,
         } => Ok(PhysicalPlan::Unwind {
             expr: expr.clone(),
             var: var.clone(),
+            with_pipeline: with_pipeline.clone(),
+            return_clause: return_clause.clone(),
+        }),
+        Statement::Return { return_clause } => Ok(PhysicalPlan::ReturnOnly {
             return_clause: return_clause.clone(),
         }),
         Statement::MatchWith {
@@ -904,6 +920,14 @@ fn plan_set(
     Ok(PhysicalPlan::SetProperties {
         expand: Box::new(expand),
         assignments: assignment_tuples,
+        variable_tables: assignments
+            .iter()
+            .filter_map(|a| {
+                bindings
+                    .get(&a.var)
+                    .map(|rt| (a.var.clone(), rt.table.clone()))
+            })
+            .collect(),
     })
 }
 
@@ -1562,11 +1586,16 @@ mod tests {
             PhysicalPlan::SetProperties {
                 expand,
                 assignments,
+                variable_tables,
             } => {
                 assert!(matches!(*expand, PhysicalPlan::Expand { .. }));
                 assert_eq!(assignments.len(), 1);
                 assert_eq!(assignments[0].0, "n");
                 assert_eq!(assignments[0].1, "name");
+                assert_eq!(
+                    variable_tables.get("n").map(String::as_str),
+                    Some("person_v")
+                );
             }
             other => panic!("expected SetProperties, got {other:?}"),
         }

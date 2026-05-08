@@ -5,7 +5,8 @@
 //! entry points consumed by the HTTP endpoint.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -20,11 +21,11 @@ use ferrosa_storage::{ObserverMode, StorageEngine, WriteObserver};
 use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
-use crate::adjacency::reconcile::spawn_reconciliation;
+use crate::adjacency::reconcile::{reconcile_once, spawn_reconciliation};
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
-use crate::executor::expand::{execute, GraphEngineConfig};
-use crate::executor::result::GraphResult;
+use crate::executor::expand::{build_columns, execute, GraphEngineConfig};
+use crate::executor::result::{GraphResult, QueryStats};
 use crate::executor::subscribe::SubscriptionRegistry;
 use crate::parser::{
     parse, Assignment, Expr, Literal, Pattern, ReturnClause, Statement, WithPipeline,
@@ -66,6 +67,28 @@ fn replication_needs_repair(replication: &ferrosa_schema::ReplicationParams) -> 
     }
 }
 
+fn empty_match_for_missing_label(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Match { .. } | Statement::MatchWith { .. } | Statement::MatchWithOptional { .. }
+    )
+}
+
+fn empty_match_result(statement: &Statement) -> GraphResult {
+    let columns = match statement {
+        Statement::Match { return_clause, .. }
+        | Statement::MatchWith { return_clause, .. }
+        | Statement::MatchWithOptional { return_clause, .. } => build_columns(return_clause),
+        _ => vec![],
+    };
+
+    GraphResult {
+        columns,
+        rows: vec![],
+        stats: QueryStats::default(),
+    }
+}
+
 /// Composite configuration for the graph engine.
 pub struct GraphConfig {
     pub engine: GraphEngineConfig,
@@ -99,6 +122,7 @@ pub struct GraphEngine {
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
     reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
+    registered_adjacency_keyspaces: Mutex<HashSet<String>>,
 }
 
 /// Information about a vertex or edge label in the graph schema.
@@ -265,16 +289,17 @@ impl GraphEngine {
             reconciliation_handles,
             reconciliation_cancel,
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
+            registered_adjacency_keyspaces: Mutex::new(edge_keyspaces),
         }
     }
 
-    fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<()> {
+    fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<bool> {
         let snap = self.schema.snapshot();
         let has_edge_table = snap.tables.iter().any(|((ks, _), meta)| {
             ks == keyspace && meta.extensions.get("graph.type") == Some(&"edge".to_string())
         });
         if !has_edge_table {
-            return Ok(());
+            return Ok(false);
         }
 
         let adj_ks = adjacency_keyspace_name(keyspace);
@@ -311,7 +336,21 @@ impl GraphEngine {
                 return Err(GraphError::Storage(e));
             }
         }
-        Ok(())
+        let should_register_observer = {
+            let mut registered = self.registered_adjacency_keyspaces.lock().map_err(|_| {
+                GraphError::Internal("graph adjacency keyspace registry lock poisoned".to_string())
+            })?;
+            registered.insert(keyspace.to_string())
+        };
+        if should_register_observer {
+            self.storage
+                .register_observer(Arc::new(AdjacencyIndexObserver::new(
+                    Arc::clone(&self.schema),
+                    keyspace.to_string(),
+                )));
+        }
+
+        Ok(should_register_observer)
     }
 
     /// Execute a Cypher query: parse -> validate -> plan -> execute.
@@ -332,10 +371,29 @@ impl GraphEngine {
         auth: &AuthContext,
         params: &HashMap<String, Value>,
     ) -> Result<GraphResult> {
-        self.ensure_adjacency_storage_for_keyspace(keyspace)?;
+        let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace)?;
+        if adjacency_registered {
+            let wp = self.write_path.load();
+            let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
+            tracing::info!(
+                keyspace,
+                entries_checked = metrics.entries_checked,
+                entries_repaired = metrics.entries_repaired,
+                "graph engine: reconciled newly registered adjacency keyspace"
+            );
+        }
         let statement = bind_statement_params(parse(query)?, params)?;
         let snap = self.schema.snapshot();
-        let logical = validate(&snap, auth, keyspace, statement)?;
+        let logical = match validate(&snap, auth, keyspace, statement.clone()) {
+            Ok(logical) => logical,
+            Err(GraphError::Validation(msg))
+                if msg.contains("no table with graph.label")
+                    && empty_match_for_missing_label(&statement) =>
+            {
+                return Ok(empty_match_result(&statement));
+            }
+            Err(e) => return Err(e),
+        };
         let physical = plan(logical)?;
         let wp = self.write_path.load();
         execute(
@@ -712,10 +770,25 @@ fn bind_statement_params(
         Statement::Unwind {
             expr,
             var,
+            with_pipeline,
             return_clause,
         } => Statement::Unwind {
             expr: bind_expr_params(expr, params)?,
             var,
+            with_pipeline: with_pipeline
+                .map(|pipeline| {
+                    Ok::<WithPipeline, GraphError>(WithPipeline {
+                        clause: bind_return_clause_params(pipeline.clause, params)?,
+                        where_clause: pipeline
+                            .where_clause
+                            .map(|expr| bind_expr_params(expr, params))
+                            .transpose()?,
+                    })
+                })
+                .transpose()?,
+            return_clause: bind_return_clause_params(return_clause, params)?,
+        },
+        Statement::Return { return_clause } => Statement::Return {
             return_clause: bind_return_clause_params(return_clause, params)?,
         },
         Statement::MatchWith {
@@ -825,6 +898,12 @@ fn format_plan(plan: &PhysicalPlan) -> String {
                 return_clause.items.len()
             )
         }
+        PhysicalPlan::ReturnOnly { return_clause } => {
+            format!(
+                "ReturnOnly {{ return: {} item(s) }}",
+                return_clause.items.len()
+            )
+        }
         PhysicalPlan::Expand {
             anchor,
             hops,
@@ -888,11 +967,13 @@ fn format_plan(plan: &PhysicalPlan) -> String {
         PhysicalPlan::SetProperties {
             expand,
             assignments,
+            variable_tables,
         } => {
             let mut out = String::new();
             out.push_str("SetProperties {\n");
             out.push_str(&format!("  expand: {}\n", format_plan(expand)));
             out.push_str(&format!("  assignments: {}\n", assignments.len()));
+            out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
             out.push('}');
             out
         }
