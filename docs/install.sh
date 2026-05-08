@@ -48,7 +48,8 @@ detect_target() {
   os=$(uname -s); arch=$(uname -m)
   case "$os/$arch" in
     Darwin/arm64)              echo "aarch64-apple-darwin" ;;
-    Darwin/x86_64)             echo "x86_64-apple-darwin" ;;
+    Darwin/x86_64)
+      die "Intel macOS is not supported in v0.x. Please build from source: https://github.com/ferrosadb/ferrosa#building" ;;
     Linux/x86_64)              echo "x86_64-unknown-linux-musl" ;;
     Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-musl" ;;
     *) die "unsupported platform: $os/$arch" ;;
