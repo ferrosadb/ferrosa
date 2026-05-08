@@ -1588,28 +1588,28 @@ user = session.execute(stmt, [user_id])
           <td>Automatic</td>
         </tr>
         <tr>
-          <td>Storage Cost (PB)</td>
-          <td class="ferrosa-col">~$23K/mo (tiered: ~$8K)</td>
-          <td>~$100–250K/mo</td>
-          <td>~$100–250K/mo</td>
-          <td>~$250K/mo</td>
-          <td>~$250K/mo</td>
+          <td>Storage Cost Model</td>
+          <td class="ferrosa-col">Object-store-first; tiering depends on workload and retention policy</td>
+          <td>Local / block storage; snapshot and replica costs depend on deployment</td>
+          <td>Local / block storage; cloud tier varies by operator and workload</td>
+          <td>Managed service pricing; depends on provisioned/on-demand capacity and region</td>
+          <td>Managed service pricing; depends on capacity mode, region, and traffic shape</td>
         </tr>
         <tr>
-          <td>Recovery Cost (PB, 30d)</td>
-          <td class="ferrosa-col">~$2/mo (commit log only)</td>
-          <td>~$150K/mo (EBS snapshots)</td>
-          <td>~$150K/mo (EBS snapshots)</td>
-          <td>~$250K/mo (on-demand)</td>
-          <td>~$250K/mo (on-demand)</td>
+          <td>Recovery Cost Model (30d)</td>
+          <td class="ferrosa-col">Commit-log + object lifecycle model; validate against recovery objectives</td>
+          <td>Snapshot / replica retention model</td>
+          <td>Snapshot / replica retention model</td>
+          <td>Managed backup / restore pricing model</td>
+          <td>Managed backup / point-in-time recovery pricing model</td>
         </tr>
         <tr>
-          <td>Recovery Cost (PB, 1yr)</td>
-          <td class="ferrosa-col">~$45/mo (Glacier tiered)</td>
-          <td>~$500K+/mo</td>
-          <td>~$500K+/mo</td>
-          <td>N/A (35 days max)</td>
-          <td>N/A (35 days max)</td>
+          <td>Long-Term Recovery Model</td>
+          <td class="ferrosa-col">Lifecycle-tiered object storage; cost depends on archive class and restore plan</td>
+          <td>Long-retention snapshot / archive model</td>
+          <td>Long-retention snapshot / archive model</td>
+          <td>Service retention limits and archive strategy vary by setup</td>
+          <td>Service retention limits and archive strategy vary by setup</td>
         </tr>
         <tr>
           <td>Vendor Lock-In</td>
