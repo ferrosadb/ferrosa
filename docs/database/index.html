@@ -1043,8 +1043,8 @@
           for embedding storage — store and query high-dimensional vectors directly.
         </p>
         <p style="margin-top: 0.75rem;">
-          Indexes are storage-attached — built asynchronously after SSTable flush with zero
-          impact on the write path. Full-text indexes use inverted-index sidecar files with
+          Indexes are storage-attached — built asynchronously after SSTable flush to keep
+          write-path impact bounded. Full-text indexes use inverted-index sidecar files with
           a pluggable analyzer pipeline (tokenizer, stop words, Porter stemmer).
           Per-index staleness tracking and operational metrics
           via <code>system_views.secondary_indexes</code> let you monitor build progress
@@ -1771,7 +1771,7 @@ user = session.execute(stmt, [user_id])
         <h3>High availability with pair mode</h3>
         <p>
           Add a second node and Ferrosa automatically enters pair mode — synchronous replication
-          with instant failover. All 11 DDL operations replicate automatically: CREATE, ALTER,
+          with operator-driven failover paths. All 11 DDL operations replicate automatically: CREATE, ALTER,
           and DROP for keyspaces, tables, and roles, plus GRANT and REVOKE. Schema catch-up
           on rejoin, operator switchover, and force-promote for split-brain recovery.
         </p>

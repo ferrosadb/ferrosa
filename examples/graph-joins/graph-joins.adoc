@@ -191,7 +191,7 @@ curl -X POST http://localhost:7474/graph/query \
 
 Bidirectional traversal is where the graph engine truly shines.
 In vanilla Cassandra, this requires `ALLOW FILTERING` (full-table scan).
-In Ferrosa, the graph engine's reverse adjacency index makes it instant:
+In Ferrosa, the graph engine's reverse adjacency index makes it a direct indexed lookup:
 
 [source,bash]
 ----

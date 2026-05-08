@@ -90,7 +90,7 @@ include::schema.cql[lines=18..28]
 
 This table uses the same composite partition key pattern as the ticks table: `(symbol, candle_date)`.
 A full trading day has 390 one-minute candles (6.5 hours of market time), so each partition is tiny -- just 390 rows.
-Dashboard queries return instantly.
+Dashboard queries stay bounded to a small partition.
 
 === The daily summary table
 
@@ -180,7 +180,7 @@ WHERE symbol = 'AAPL'
 
 This returns all candles for AAPL on June 15th, newest first.
 A full trading day has 390 candles -- small enough to send to the frontend in a single response.
-The chart renders instantly because the data is already aggregated.
+The chart can render from a compact, already-aggregated response.
 
 === Compare candles across stocks
 
@@ -245,6 +245,6 @@ Here is what you practiced:
 * *Pre-computed aggregations for fast dashboards.* Instead of computing OHLC candles from raw ticks on every query, you maintain a `candles_1m` table with pre-aggregated data. This is the "write more, read fast" philosophy of the Cassandra data model.
 * *Multiple tables for multiple access patterns.* Raw ticks for detailed history, 1-minute candles for charts, daily summaries for reports -- three tables serving three different query patterns, all from the same underlying data.
 * *Using `decimal` for financial data.* Floating-point types introduce rounding errors that are unacceptable in finance. The `decimal` type stores exact values.
-* *Descending clustering order for "latest first" queries.* By sorting newest trades first on disk, the most common query pattern -- "show me what just happened" -- reads the first few rows of the partition with zero sorting overhead.
+* *Descending clustering order for "latest first" queries.* By sorting newest trades first on disk, the most common query pattern -- "show me what just happened" -- reads the first few rows of the partition without a separate sort step.
 
 Next, try the <<ecommerce.adoc#,E-Commerce Platform>> tutorial to learn about collection types, denormalized query tables, and the update/delete patterns used in shopping cart and order workflows.

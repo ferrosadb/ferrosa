@@ -12,7 +12,7 @@ If you haven't set one up yet, follow the link:cluster-setup.html[3-Node Cluster
 == Create the Keyspace
 
 Personalization data needs to be fast and always available.
-When a user opens your app, they expect to see their recommendations instantly -- not a loading spinner.
+When a user opens your app, they expect recommendations to load quickly from precomputed access patterns -- not a loading spinner.
 Let's create a keyspace with full replication across all three nodes.
 
 With RF=3, every user's preference data is available even if a node goes down.
@@ -150,7 +150,7 @@ You just built the backend for a content recommendation engine. Here is what you
 
 * Designed a *denormalized schema* where titles are duplicated across tables to avoid expensive joins
 * Used *CQL collection types* (sets) to model multi-valued preferences like genres and tags
-* Built a *watch history* table with descending time order for instant "Recently Watched" queries
+* Built a *watch history* table with descending time order for efficient "Recently Watched" queries
 * Created a *pre-ranked recommendations* table that serves the "For You" page in a single read
 * Used a *secondary index* on genre for catalog browsing, and learned when indexes are appropriate
 * Queried *set membership* with `CONTAINS` to find users with overlapping taste profiles

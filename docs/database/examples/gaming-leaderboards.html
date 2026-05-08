@@ -411,7 +411,7 @@ VALUES ('casual', 5, b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2, 'neonknight', 62000);
 <h3 id="_player_profile">Player Profile</h3>
 <div class="paragraph">
 <p>The first thing a player sees when they open the game.
-One partition read, sub-millisecond response.</p>
+One partition read, optimized for low-latency profile loading.</p>
 </div>
 </div>
 <div class="sect2">
@@ -518,13 +518,13 @@ WHERE player_id = c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3;</code></pre>
 <div class="ulist">
 <ul>
 <li>
-<p>Designed a <strong>player profile</strong> table for sub-millisecond identity lookups</p>
+<p>Designed a <strong>player profile</strong> table for low-latency identity lookups</p>
 </li>
 <li>
 <p>Built a <strong>match history</strong> table with per-player performance tracking using descending time order</p>
 </li>
 <li>
-<p>Created a <strong>pre-ranked leaderboard</strong> partitioned by game mode for instant top-10 queries</p>
+<p>Created a <strong>pre-ranked leaderboard</strong> partitioned by game mode for efficient top-10 queries</p>
 </li>
 <li>
 <p>Used <strong>CQL collection types</strong> (lists) to store variable-length player rosters in match records</p>

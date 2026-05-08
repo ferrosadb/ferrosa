@@ -146,7 +146,7 @@ Pull up the fraud analyst's daily queue -- every alert generated today, newest f
 include::queries.cql[lines=17..20]
 ----
 
-Because we partitioned by `alert_date`, this reads a single partition. Even with millions of historical alerts, today's queue loads instantly.
+Because we partitioned by `alert_date`, this reads a single partition. Today's queue remains bounded without scanning historical alerts.
 
 === Find unresolved alerts only
 
@@ -235,4 +235,4 @@ You built the data layer for a real-time fraud detection system. Here is what yo
 * *Risk scoring at write time.* By computing the `risk_score` when the transaction is written, you avoid expensive recalculation on reads. The score is just another column -- no joins, no subqueries.
 * *Profile lookups for context.* The `account_profile` table gives O(1) access to behavioral baselines. Your fraud engine compares each transaction against these baselines to decide if it looks suspicious.
 
-From here, you could add a `merchant_risk` table to score merchants independently, a `device_fingerprints` table to track which devices are associated with each account, or a `blocked_cards` table for instant card-level blocks.
+From here, you could add a `merchant_risk` table to score merchants independently, a `device_fingerprints` table to track which devices are associated with each account, or a `blocked_cards` table for direct card-level block lookups.

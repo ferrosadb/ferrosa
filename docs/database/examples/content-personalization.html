@@ -69,7 +69,7 @@ If you haven&#8217;t set one up yet, follow the <a href="cluster-setup.html">3-N
 <div class="sectionbody">
 <div class="paragraph">
 <p>Personalization data needs to be fast and always available.
-When a user opens your app, they expect to see their recommendations instantly&#8201;&#8212;&#8201;not a loading spinner.
+When a user opens your app, they expect recommendations to load quickly from precomputed access patterns&#8201;&#8212;&#8201;not a loading spinner.
 Let&#8217;s create a keyspace with full replication across all three nodes.</p>
 </div>
 <div class="paragraph">
@@ -500,7 +500,7 @@ ALLOW FILTERING;</code></pre>
 <p>Used <strong>CQL collection types</strong> (sets) to model multi-valued preferences like genres and tags</p>
 </li>
 <li>
-<p>Built a <strong>watch history</strong> table with descending time order for instant "Recently Watched" queries</p>
+<p>Built a <strong>watch history</strong> table with descending time order for efficient "Recently Watched" queries</p>
 </li>
 <li>
 <p>Created a <strong>pre-ranked recommendations</strong> table that serves the "For You" page in a single read</p>

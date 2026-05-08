@@ -266,7 +266,7 @@
   <!-- ── Overview ── -->
   <h2 id="overview">Migration Overview</h2>
 
-  <p>Ferrosa is designed as a drop-in replacement for Apache Cassandra at the protocol level. The migration strategy is incremental:</p>
+  <p>Ferrosa is designed for Cassandra-compatible protocol access where supported, with migrations validated incrementally against your schema, drivers, and workload. The migration strategy is incremental:</p>
 
   <ol>
     <li>Start a Ferrosa node alongside your existing Cassandra cluster</li>
@@ -303,7 +303,7 @@
       <tr><td>Node lifecycle</td><td><span class="check">Compatible</span></td><td>Join and decommission via <code>ferrosa-ctl</code></td></tr>
       <tr><td>Token rebalancing</td><td><span class="check">Compatible</span></td><td>Operator-triggered via <code>ferrosa-ctl rebalance</code></td></tr>
       <tr><td>Secondary indexes</td><td><span class="check">Compatible</span></td><td>8 index types including vector (HNSW, IVFFlat)</td></tr>
-      <tr><td>UDTs</td><td><span class="check">Supported</span></td><td>CREATE/ALTER/DROP TYPE fully implemented</td></tr>
+      <tr><td>UDTs</td><td><span class="check">Supported</span></td><td>CREATE/ALTER/DROP TYPE implemented</td></tr>
       <tr><td>Materialized views</td><td><span class="cross">Not yet</span></td><td>Planned</td></tr>
       <tr><td>LWT</td><td><span class="check">Compatible</span></td><td>IF NOT EXISTS, IF conditions, batch CAS — Accord protocol (strict serializable)</td></tr>
       <tr><td>Transactions</td><td><span class="check">Supported</span></td><td>BEGIN TRANSACTION / COMMIT / ROLLBACK — multi-partition atomic operations</td></tr>
@@ -592,11 +592,11 @@ stmt_f = ferro.prepare(query)
     via leaseholder, compared to Paxos's minimum 2-RTT.</p>
 
   <div class="success">
-    <strong>Temporal compatibility:</strong> All LWT patterns used by
-    <a href="https://temporal.io">Temporal</a> are fully implemented. If you run Temporal
-    on Cassandra with LWT-based persistence, Ferrosa is a drop-in replacement — same
-    INSERT IF NOT EXISTS, same conditional UPDATE IF, same batch CAS semantics. No Temporal
-    configuration changes required beyond updating the Cassandra contact points.
+    <strong>Temporal compatibility:</strong> Ferrosa implements the LWT patterns used by
+    <a href="https://temporal.io">Temporal</a>'s Cassandra persistence path. If you run Temporal
+    on Cassandra with LWT-based persistence, evaluate Ferrosa against the same
+    INSERT IF NOT EXISTS, conditional UPDATE IF, and batch CAS semantics, with expected
+    configuration changes limited to the Cassandra contact points.
   </div>
 
   <h3>Beyond LWT: multi-statement transactions</h3>
