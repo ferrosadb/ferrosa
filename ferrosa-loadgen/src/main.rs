@@ -176,6 +176,7 @@ fn main() {
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
         auth_enabled: false,
         auth_warn: false,
+        max_pending_replay_mutations_without_schema: 1024,
         write_verify: false,
     };
 

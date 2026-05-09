@@ -1,7 +1,7 @@
 ---
 type: bug
 priority: P0
-status: in-process
+status: fixed
 created: 2026-04-30
 reported-by: claude (ferrosa-memory operator)
 affected-versions: ferrosa main as of 2026-04-30

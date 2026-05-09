@@ -56,6 +56,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         write_verify: true,
         auth_enabled: false,
         auth_warn: false,
+        max_pending_replay_mutations_without_schema: 1024,
     }
 }
 
