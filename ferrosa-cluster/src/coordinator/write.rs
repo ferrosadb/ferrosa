@@ -515,6 +515,7 @@ mod tests {
             auth_enabled: false,
             auth_warn: false,
             write_verify: false,
+            max_pending_replay_mutations_without_schema: 1024,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
     }
@@ -697,6 +698,68 @@ mod tests {
             }
             other => panic!("expected Unavailable, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn coordinate_write_local_quorum_succeeds_with_one_of_three_replicas_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let (server, addr, remote_ok_host_id) =
+            start_rpc_server(MsgType::MutationForward, Arc::new(MutationAckHandler)).await;
+
+        let local_node_id = 1u64;
+        let remote_down_host_id = Uuid::new_v4();
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        pm.add_peer_entry((remote_down_host_id, "127.0.0.1:1".parse().unwrap()))
+            .await;
+
+        let mut local = make_node("10.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote_ok = make_node(&addr.to_string());
+        remote_ok.host_id = remote_ok_host_id;
+        let mut remote_down = make_node("127.0.0.1:1");
+        remote_down.host_id = remote_down_host_id;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote_ok);
+        ring.add_node(3u64, remote_down);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        ring.assign_tokens(3u64, &[200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage.clone(),
+            3,
+            ConsistencyLevel::LocalQuorum,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        coordinator
+            .coordinate_write_with(&table_id, &key, row, 1000, ConsistencyLevel::LocalQuorum, 3)
+            .await
+            .expect("RF=3 LOCAL_QUORUM should succeed with local + one remote ACK when exactly one replica is down");
+
+        let stored = storage.read(&table_id, &key).unwrap();
+        assert!(stored.is_some(), "local replica should retain the write");
+        assert!(
+            pm.has_peer(remote_ok_host_id),
+            "reachable remote should be cached after successful reconnect"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

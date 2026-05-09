@@ -56,6 +56,25 @@ fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     }
 }
 
+/// Resolve hinted-handoff storage under the configured data directory unless
+/// the operator explicitly overrides it.
+fn resolve_hinted_handoff_dir(
+    config: &toml::Value,
+    data_dir: &Path,
+    env_override: Option<&str>,
+) -> std::path::PathBuf {
+    env_override
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            config
+                .get("cluster")
+                .and_then(|s| s.get("hinted_handoff_dir"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| data_dir.join("hints"))
+}
+
 /// Load host_id from disk, env var, or generate a new one.
 fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     load_or_generate_host_id_with(data_dir, std::env::var("FERROSA_HOST_ID").ok())
@@ -495,7 +514,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Create ModeController — starts in standalone mode
-    let cluster_config = Arc::new(ferrosa_cluster::ClusterConfig::from_env());
+    let mut cluster_config = ferrosa_cluster::ClusterConfig::from_env();
+    cluster_config.hinted_handoff_dir = resolve_hinted_handoff_dir(
+        &file_config,
+        data_path,
+        std::env::var("FERROSA_HINTED_HANDOFF_DIR").ok().as_deref(),
+    );
+    let cluster_config = Arc::new(cluster_config);
     let net_config = Arc::new(ferrosa_net::config::NetConfig::from_env());
 
     // Build handler registry — shared between RPC server and ModeController.
@@ -1277,6 +1302,42 @@ mod tests {
 
         let result = config_val(key, &config, "storage", "nonexistent", "default_val");
         assert_eq!(result, "default_val");
+    }
+
+    #[test]
+    fn default_hinted_handoff_dir_lives_under_storage_data_dir() {
+        let config = empty_config();
+        let data_dir = Path::new("/var/lib/ferrosa");
+
+        let result = resolve_hinted_handoff_dir(&config, data_dir, None);
+
+        assert_eq!(result, Path::new("/var/lib/ferrosa").join("hints"));
+    }
+
+    #[test]
+    fn hinted_handoff_env_override_is_preserved() {
+        let config = empty_config();
+        let data_dir = Path::new("/var/lib/ferrosa");
+
+        let result = resolve_hinted_handoff_dir(&config, data_dir, Some("/custom/hints"));
+
+        assert_eq!(result, Path::new("/custom/hints"));
+    }
+
+    #[test]
+    fn hinted_handoff_toml_override_is_preserved() {
+        let config = toml::from_str(
+            r#"
+            [cluster]
+            hinted_handoff_dir = "/toml/hints"
+            "#,
+        )
+        .unwrap();
+        let data_dir = Path::new("/var/lib/ferrosa");
+
+        let result = resolve_hinted_handoff_dir(&config, data_dir, None);
+
+        assert_eq!(result, Path::new("/toml/hints"));
     }
 
     #[test]

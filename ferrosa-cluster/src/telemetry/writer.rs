@@ -182,6 +182,7 @@ mod tests {
             write_verify: false,
             auth_enabled: false,
             auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
         };
         let engine = Arc::new(StorageEngine::new(config, None).unwrap());
         engine

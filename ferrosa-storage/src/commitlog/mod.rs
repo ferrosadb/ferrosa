@@ -214,23 +214,20 @@ impl CommitLog {
         // before moving on; on callback error, remaining segments are left
         // intact for retry.
         for (id, path) in &segment_files {
-            // A 0-byte segment is the torn-create state: the writer
-            // rolled to a new segment file, but was killed (OOM, kill -9,
-            // host reboot) before the header was durably written. By
-            // construction it carries no records, so it is safe — and
-            // mandatory — to skip it on replay rather than refuse to
-            // start. (See specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.)
-            //
-            // We deliberately do NOT extend tolerance to `0 < n < HEADER_SIZE`:
-            // that case means the writer wrote bytes but didn't finish
-            // the header, which is real corruption and must surface loudly.
+            // A too-short segment is the torn-create/torn-header state: the
+            // writer rolled to a new segment file, but was killed (OOM,
+            // kill -9, host reboot) before the header was durably completed.
+            // It carries no complete records, so it is safe — and mandatory —
+            // to skip it on replay rather than refuse to start. (See
+            // specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.)
             match fs::metadata(path) {
-                Ok(meta) if meta.len() == 0 => {
+                Ok(meta) if meta.len() < descriptor::HEADER_SIZE as u64 => {
                     EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         segment_id = id,
                         path = %path.display(),
-                        "commitlog: skipping zero-byte segment on replay (torn-create from previous crash); \
+                        bytes = meta.len(),
+                        "commitlog: skipping too-short segment on replay (torn create/header from previous crash); \
                          file will be cleaned up below"
                     );
                     if let Err(e) = fs::remove_file(path) {
@@ -612,15 +609,16 @@ impl CommitLog {
             if !path.exists() {
                 continue;
             }
-            // Same torn-create tolerance as open_and_replay: 0-byte segments
-            // are skipped (see specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md).
+            // Same torn-create/torn-header tolerance as open_and_replay:
+            // too-short segments are skipped (see specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md).
             match fs::metadata(path) {
-                Ok(meta) if meta.len() == 0 => {
+                Ok(meta) if meta.len() < descriptor::HEADER_SIZE as u64 => {
                     EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         segment_id = id,
                         path = %path.display(),
-                        "commitlog: skipping zero-byte segment on catch-up replay"
+                        bytes = meta.len(),
+                        "commitlog: skipping too-short segment on catch-up replay"
                     );
                     continue;
                 }
@@ -1459,10 +1457,9 @@ mod tests {
             mutations.is_empty(),
             "0-byte segment carries no records; replay must yield none"
         );
-        assert_eq!(
-            empty_segment_skipped_total(),
-            before + 1,
-            "EMPTY_SEGMENT_SKIPPED_TOTAL must increment exactly once"
+        assert!(
+            empty_segment_skipped_total() > before,
+            "EMPTY_SEGMENT_SKIPPED_TOTAL must increment for the skipped torn segment"
         );
         assert!(
             !bad_path.exists(),
@@ -1472,12 +1469,12 @@ mod tests {
         cl.shutdown().unwrap();
     }
 
-    /// Negative case: a partial-header (>0 but < HEADER_SIZE bytes) segment is
-    /// real corruption — the writer wrote bytes but did not finish the header.
-    /// Replay must still hard-fail in this case. We do NOT extend torn-create
-    /// tolerance into the partial-header window.
+    /// Regression: a partial-header (>0 but < HEADER_SIZE bytes) segment is a
+    /// torn tail from a previous crash and must not block startup. It carries no
+    /// complete records, so replay should skip and clean it up just like the
+    /// zero-byte torn-create case.
     #[test]
-    fn open_and_replay_still_fails_on_partial_header_segment() {
+    fn open_and_replay_tolerates_partial_header_segment() {
         use super::descriptor::HEADER_SIZE;
         let dir = tempfile::tempdir().unwrap();
 
@@ -1485,13 +1482,24 @@ mod tests {
         let bad_path = dir.path().join("commitlog-3.log");
         std::fs::write(&bad_path, vec![0u8; HEADER_SIZE - 1]).unwrap();
 
+        let before = empty_segment_skipped_total();
         let config = CommitLogConfig::test_config(dir.path());
-        let result = CommitLog::open_and_replay(config);
+        let (cl, mutations) = CommitLog::open_and_replay(config)
+            .expect("open_and_replay must tolerate partial-header torn-tail segments at startup");
+
         assert!(
-            result.is_err(),
-            "partial-header segment must NOT be silently tolerated — that \
-             would mask real corruption. Got: {:?}",
-            result.as_ref().map(|_| "Ok")
+            mutations.is_empty(),
+            "partial-header segment carries no complete records; replay must yield none"
         );
+        assert!(
+            empty_segment_skipped_total() > before,
+            "torn partial-header segment must increment the skipped-segment counter"
+        );
+        assert!(
+            !bad_path.exists(),
+            "the partial-header segment must be cleaned up by replay"
+        );
+
+        cl.shutdown().unwrap();
     }
 }

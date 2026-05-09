@@ -768,9 +768,10 @@
     <ul class="nav-links">
       <li><a href="../database/">Database</a></li>
       <li><a href="./">Memory</a></li>
+      <li><a href="getting-started.html">Setup</a></li>
       <li><a href="../database/examples/">Examples</a></li>
     </ul>
-    <a href="#get-started" class="nav-cta">Get Started</a>
+    <a href="getting-started.html" class="nav-cta">Get Started</a>
   </div>
 </nav>
 
@@ -782,7 +783,7 @@
   <h1>Linked memory for <span class="gradient">long-running agents.</span></h1>
   <p>Ferrosa Memory gives agents a developer-preview memory layer: context segments, entities, temporal facts, graph edges, retrieval, Datalog-style derived facts, and operator UIs for query and visualization.</p>
   <div class="hero-actions">
-    <a href="#quickstart" class="btn-primary">Quickstart</a>
+    <a href="getting-started.html" class="btn-primary">Quickstart</a>
     <a href="#workbench" class="btn-secondary">Explore the UI</a>
   </div>
 </section>
@@ -841,8 +842,11 @@ Ferrosa Database storage + graph</code></pre></div>
 <section id="quickstart">
   <div class="section-label">Quickstart</div>
   <h2>Local developer preview configuration.</h2>
-  <p style="color:var(--text-secondary); max-width:780px;">The exact binary names and deployment packaging may change before release. The planned installer targets macOS and Linux first. The important shape is: run Ferrosa Database, point Ferrosa Memory at its CQL/graph surfaces, expose MCP on the main port, and expose visualization on the adjacent viz port.</p>
-  <div class="code-block"><pre><code>curl -fsSL https://ferrosadb.com/install.sh | bash
+  <p style="color:var(--text-secondary); max-width:780px;">For the shortest path, run the hosted memory setup script. It downloads the onboarding prompt, optionally clones or updates the public repositories, offers to pull <code>nomic-embed-text-v2-moe</code>, and hands the user to Hermes, Claude, Codex, or another LLM harness. Minimal native mode can use local filesystem storage with no S3/MinIO; the full Compose mode adds a three-node cluster and MinIO for operator testing.</p>
+  <div class="code-block"><pre><code>curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
+
+# Optional semantic/vector search layer:
+ollama pull nomic-embed-text-v2-moe
 
 # ferrosa-memory.toml — local preview shape
 [server]
@@ -914,7 +918,7 @@ Viz snapshot API:  http://localhost:18766/viz/snapshot</code></pre></div>
   <h2>Preview Ferrosa Memory with your agents.</h2>
   <p>Start local, inspect memory in the workbench, and use the viz surface to check how context is becoming linked memory.</p>
   <div class="hero-actions">
-    <a href="#quickstart" class="btn-primary">Configure local preview</a>
+    <a href="getting-started.html" class="btn-primary">Configure local preview</a>
     <a href="../database/" class="btn-secondary">Use Ferrosa Database</a>
   </div>
 </section>
@@ -925,6 +929,7 @@ Viz snapshot API:  http://localhost:18766/viz/snapshot</code></pre></div>
       <a href="../database/" style="color:var(--text-secondary); text-decoration:none;">Database</a>
       <a href="./" style="color:var(--text-secondary); text-decoration:none;">Memory</a>
       <a href="../database/getting-started.html" style="color:var(--text-secondary); text-decoration:none;">DB Docs</a>
+      <a href="getting-started.html" style="color:var(--text-secondary); text-decoration:none;">Memory Setup</a>
       <a href="#examples" style="color:var(--text-secondary); text-decoration:none;">Memory Examples</a>
     </div>
   </div>
