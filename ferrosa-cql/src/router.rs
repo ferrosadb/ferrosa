@@ -6860,6 +6860,7 @@ mod tests {
             write_verify: true,
             auth_enabled: false,
             auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
 
@@ -7057,6 +7058,86 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    #[tokio::test]
+    async fn feedback_outcomes_boolean_is_stored_as_single_byte_at_succeeded_column() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let create_ks = crate::parser::parse(
+            "CREATE KEYSPACE agent_memory WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, create_ks).await.unwrap();
+
+        let create_table = crate::parser::parse(
+            "CREATE TABLE agent_memory.feedback_outcomes (\
+             tenant_id uuid, \
+             created_at bigint, \
+             query_id uuid, \
+             session_id uuid, \
+             program_type text, \
+             query_embedding text, \
+             task_complexity text, \
+             succeeded boolean, \
+             latency_ms int, \
+             token_cost int, \
+             guideline_version text, \
+             PRIMARY KEY ((tenant_id), created_at, query_id))",
+        )
+        .unwrap();
+        route(&state, &ctx, create_table).await.unwrap();
+
+        let tenant_id = uuid::Uuid::from_bytes([0x11; 16]);
+        let session_id = uuid::Uuid::from_bytes([0x22; 16]);
+        let query_id = uuid::Uuid::from_bytes([0x33; 16]);
+        // Mirrors ferrosa-memory's prepared `feedback_put`: it intentionally
+        // omits nullable regular columns (`query_embedding`, `guideline_version`).
+        // Storage cell indexes must still be schema indexes, not VALUES-list
+        // indexes, or the final timestamp can land in `succeeded`'s BooleanType
+        // slot during replica mutation forwarding/replay.
+        let insert = crate::parser::parse(&format!(
+            "INSERT INTO agent_memory.feedback_outcomes \
+             (tenant_id, session_id, query_id, program_type, task_complexity, \
+              succeeded, latency_ms, token_cost, created_at) \
+             VALUES ({tenant_id}, {session_id}, {query_id}, \
+                     'hybrid_search', 'linear', true, 42, 7, 1700000000000)"
+        ))
+        .unwrap();
+        route(&state, &ctx, insert).await.unwrap();
+
+        let table_id = ferrosa_storage::TableId::new("agent_memory", "feedback_outcomes");
+        let decorated_key =
+            bridge::build_decorated_key(&[CqlValue::Uuid(tenant_id)], &[CqlType::Uuid]).unwrap();
+        let partition = state
+            .engine
+            .read(&table_id, &decorated_key)
+            .unwrap()
+            .expect("feedback_outcomes partition should exist");
+        let row = partition.rows.first().expect("insert should write one row");
+        let succeeded = row
+            .cells
+            .iter()
+            .find(|(idx, _)| *idx == 4)
+            .expect("succeeded should be storage column index 4")
+            .1
+            .value
+            .as_deref();
+
+        assert_eq!(
+            succeeded,
+            Some(&[1u8][..]),
+            "feedback_outcomes.succeeded must be stored as the 1-byte BooleanType representation, not an 8-byte integer/timestamp-adjacent value"
+        );
     }
 
     #[tokio::test]
@@ -11249,6 +11330,7 @@ mod tests {
             write_verify: true,
             auth_enabled: false,
             auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
         };
         let engine = StorageEngine::new(engine_config, None).unwrap();
 

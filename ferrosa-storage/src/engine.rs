@@ -101,6 +101,14 @@ pub struct StorageEngineConfig {
     /// logs this at `ERROR` level and `auth_warn` is effectively
     /// ignored. See Sprint D.
     pub auth_warn: bool,
+    /// Maximum number of commit-log replay mutations that may be buffered in
+    /// memory when no table schema is available yet.
+    ///
+    /// Normal crash recovery preloads local `schema.json` and streams replay
+    /// directly into registered tables. This cap is only for legacy/no-schema
+    /// compatibility paths; exceeding it fails closed instead of rebuilding the
+    /// original unbounded pending `Vec<Mutation>` OOM bug.
+    pub max_pending_replay_mutations_without_schema: usize,
 }
 
 impl StorageEngineConfig {
@@ -182,6 +190,12 @@ impl StorageEngineConfig {
             Some("false" | "0" | "off" | "no")
         );
 
+        let max_pending_replay_mutations_without_schema =
+            std::env::var("FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024);
+
         Ok(Self {
             commit_log,
             compaction,
@@ -194,6 +208,7 @@ impl StorageEngineConfig {
             write_verify,
             auth_enabled,
             auth_warn,
+            max_pending_replay_mutations_without_schema,
         })
     }
 
@@ -223,6 +238,7 @@ impl StorageEngineConfig {
             // Off by default — tests that exercise warn-mode denials
             // must flip this to true themselves.
             auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
         }
     }
 }
@@ -649,9 +665,6 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
 
-        let (commit_log, pending_mutations) =
-            crate::commitlog::CommitLog::open_and_replay(config.commit_log.clone())?;
-
         let compaction_executor = CompactionExecutor::new();
 
         let upload_manager = match (&config.object_store, runtime) {
@@ -672,11 +685,70 @@ impl StorageEngine {
 
         let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
+        let tables = RwLock::new(HashMap::new());
+        let schema_path = config.data_dir.join("schema.json");
+        if let Ok(data) = std::fs::read_to_string(&schema_path) {
+            match serde_json::from_str::<Vec<TableSchema>>(&data) {
+                Ok(schemas) => {
+                    for schema in schemas {
+                        let table_id = TableId::new(&schema.keyspace, &schema.table);
+                        match Self::build_table_state(&config, schema, vec![]) {
+                            Ok(state) => {
+                                for (index_name, _col_pos) in state.store.indexed_columns() {
+                                    index_tracker.register_index(
+                                        table_id.keyspace(),
+                                        table_id.table(),
+                                        index_name,
+                                    );
+                                }
+                                tables.write().insert(table_id, state);
+                            }
+                            Err(e) => tracing::warn!(
+                                "failed to re-register table from schema.json before replay: {e}"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "failed to parse schema.json at {} before replay: {e}",
+                    schema_path.display()
+                ),
+            }
+        }
+
+        let deferred_replay_mutations = parking_lot::Mutex::new(Vec::new());
+        let mut pending_mutations = Vec::new();
+        let max_pending_without_schema = config.max_pending_replay_mutations_without_schema;
+        let mut seen_replay_ids: std::collections::HashSet<[u8; 16]> =
+            std::collections::HashSet::new();
+        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming(
+            config.commit_log.clone(),
+            |mutation| {
+                if !mutation.has_legacy_id() && !seen_replay_ids.insert(mutation.mutation_id) {
+                    return Ok(());
+                }
+
+                if tables.read().is_empty() {
+                    if pending_mutations.len() >= max_pending_without_schema {
+                        return Err(ferrosa_common::Error::InvalidData(format!(
+                            "commit-log replay schema unavailable and pending replay limit \
+                             ({max_pending_without_schema}) exceeded; restore local/S3 schema \
+                             before replay or raise FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA"
+                        )));
+                    }
+                    pending_mutations.push(mutation);
+                } else if !Self::apply_replay_mutation_to_tables(&tables, &mutation) {
+                    deferred_replay_mutations.lock().push(mutation);
+                }
+                Ok(())
+            },
+        )?;
+
         let engine = Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables,
             commit_log,
-            deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            deferred_replay_mutations,
             compaction_executor,
             upload_manager,
             local_cache,
@@ -808,8 +880,15 @@ impl StorageEngine {
     }
 
     fn apply_replay_mutation_if_registered(&self, mutation: &Mutation) -> bool {
+        Self::apply_replay_mutation_to_tables(&self.tables, mutation)
+    }
+
+    fn apply_replay_mutation_to_tables(
+        tables: &RwLock<HashMap<TableId, TableState>>,
+        mutation: &Mutation,
+    ) -> bool {
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-        let tables = self.tables.read();
+        let tables = tables.read();
         let Some(state) = tables.get(&table_id) else {
             return false;
         };
@@ -1022,27 +1101,16 @@ impl StorageEngine {
         self.register_table_inner(schema, indexed_columns)
     }
 
-    /// Internal: create a `TableStore` for a table, loading existing SSTables
-    /// and sidecar files from disk. Idempotent: skips already-registered tables.
-    fn register_table_inner(
-        &self,
+    /// Builds per-table state for a schema without requiring a fully constructed
+    /// `StorageEngine`. Startup replay uses this to preload schema-backed tables
+    /// before streaming commit-log entries, avoiding an eager pending-mutation Vec.
+    fn build_table_state(
+        config: &StorageEngineConfig,
         schema: TableSchema,
         indexed_columns: Vec<(String, usize)>,
-    ) -> ferrosa_common::Result<()> {
+    ) -> ferrosa_common::Result<TableState> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
-        {
-            let tables = self.tables.read();
-            if tables.contains_key(&table_id) {
-                drop(tables);
-                self.replay_deferred_mutations_for_table(&table_id);
-                return Ok(());
-            }
-        }
-        let table_dir = self
-            .config
-            .data_dir
-            .join("sstables")
-            .join(table_id.to_string());
+        let table_dir = config.data_dir.join("sstables").join(table_id.to_string());
         std::fs::create_dir_all(&table_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
         })?;
@@ -1056,7 +1124,7 @@ impl StorageEngine {
         // FERROSA_WRITE_VERIFY=false actually disables Gate B at finish()
         // time. Default is Gate-B-on (see SSTableWriter::finish).
         let write_options = ferrosa_sstable::WriteOptions {
-            verify_output: self.config.write_verify,
+            verify_output: config.write_verify,
             ..ferrosa_sstable::WriteOptions::default()
         };
         let store = if existing_sstables.is_empty() && indexed_columns.is_empty() {
@@ -1080,20 +1148,40 @@ impl StorageEngine {
             )
         };
 
-        // Register each declared index in the tracker.
-        for (index_name, _col_pos) in store.indexed_columns() {
-            self.index_tracker
-                .register_index(table_id.keyspace(), table_id.table(), index_name);
-        }
-
-        let state = TableState {
+        Ok(TableState {
             schema,
             store,
             pin_config: None,
             pinned_sstables: Vec::new(),
             first_unflushed_write_at: parking_lot::Mutex::new(None),
             last_commit_log_position: parking_lot::Mutex::new(None),
-        };
+        })
+    }
+
+    /// Internal: create a `TableStore` for a table, loading existing SSTables
+    /// and sidecar files from disk. Idempotent: skips already-registered tables.
+    fn register_table_inner(
+        &self,
+        schema: TableSchema,
+        indexed_columns: Vec<(String, usize)>,
+    ) -> ferrosa_common::Result<()> {
+        let table_id = TableId::new(&schema.keyspace, &schema.table);
+        {
+            let tables = self.tables.read();
+            if tables.contains_key(&table_id) {
+                drop(tables);
+                self.replay_deferred_mutations_for_table(&table_id);
+                return Ok(());
+            }
+        }
+        let state = Self::build_table_state(&self.config, schema, indexed_columns)?;
+
+        // Register each declared index in the tracker.
+        for (index_name, _col_pos) in state.store.indexed_columns() {
+            self.index_tracker
+                .register_index(table_id.keyspace(), table_id.table(), index_name);
+        }
+
         self.tables.write().insert(table_id.clone(), state);
 
         // Trigger compaction check for tables loaded with existing SSTables.
@@ -2446,23 +2534,37 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Flushes tables that exceed the size threshold OR have unflushed data
-    /// older than `flush_max_age_secs`. The time-based trigger ensures small,
-    /// infrequently-updated tables are durable within a bounded window.
+    #[cfg(test)]
+    pub(crate) fn is_table_registered_for_test(&self, table_id: &TableId) -> bool {
+        self.tables.read().contains_key(table_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_replay_mutation_count_for_test(&self) -> usize {
+        self.deferred_replay_mutations.lock().len()
+    }
+
+    /// Flushes tables that exceed the size threshold, have unflushed data older
+    /// than `flush_max_age_secs`, or are holding closed commit-log segments
+    /// hostage. The time-based trigger ensures small, infrequently-updated
+    /// tables are durable within a bounded window; the retention-pressure
+    /// trigger prevents one cold dirty memtable from pinning closed segments
+    /// after hotter tables have already flushed.
     pub fn flush_if_needed(&self) -> ferrosa_common::Result<()> {
         let now = std::time::Instant::now();
         let max_age = std::time::Duration::from_secs(self.config.flush_max_age_secs);
+        let retention_pressure = self.commit_log.closed_segment_count() > 0;
         let tables = self.tables.read();
         let to_flush: Vec<TableId> = tables
             .iter()
             .filter(|(_, state)| {
-                let size_exceeded =
-                    state.store.memtable_size() as u64 >= self.config.flush_threshold_bytes;
+                let memtable_size = state.store.memtable_size();
+                let size_exceeded = memtable_size as u64 >= self.config.flush_threshold_bytes;
                 let age_exceeded = state
                     .first_unflushed_write_at
                     .lock()
                     .is_some_and(|t| now.duration_since(t) >= max_age);
-                size_exceeded || (age_exceeded && state.store.memtable_size() > 0)
+                memtable_size > 0 && (size_exceeded || age_exceeded || retention_pressure)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -5560,6 +5662,58 @@ mod tests {
             1,
             "one SSTable should exist after flush_all"
         );
+    }
+
+    #[test]
+    fn flush_if_needed_force_flushes_cold_table_holding_closed_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 512,
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            flush_threshold_bytes: 1024 * 1024,
+            flush_max_age_secs: 3600,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        let cold = table_id();
+        let hot = table_id_2();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(test_schema_2()).unwrap();
+
+        engine
+            .write(&cold, &make_key("cold"), make_row(b"cold", 1000), 1000)
+            .unwrap();
+        for i in 0..16 {
+            engine
+                .write(
+                    &hot,
+                    &make_key(&format!("hot-{i}")),
+                    make_row(format!("hot-{i}").as_bytes(), 2000 + i),
+                    2000 + i,
+                )
+                .unwrap();
+        }
+        engine.flush(&hot).unwrap();
+
+        assert!(
+            engine.commit_log_closed_segment_count() > 0,
+            "test setup must retain at least one closed segment before retention-pressure flush"
+        );
+        assert!(
+            engine.memtable_size(&cold) > 0,
+            "cold table must still be unflushed before retention-pressure flush"
+        );
+
+        engine.flush_if_needed().unwrap();
+
+        assert_eq!(
+            engine.memtable_size(&cold),
+            0,
+            "flush_if_needed must force-flush cold memtables when closed commit-log segments are retained"
+        );
+        assert_eq!(engine.commit_log_closed_segment_count(), 0);
     }
 
     /// Regression test: write data, flush to SSTable, read back the exact
@@ -9531,6 +9685,108 @@ mod tests {
     /// restart — `load_local_schema_if_present` reads the `schema.json` written
     /// by `flush` and re-registers all tables so that the new engine can write
     /// and read without calling `register_table` again.
+    #[test]
+    fn open_reloads_local_schema_before_commitlog_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+
+        assert!(
+            engine.is_table_registered_for_test(&tid),
+            "StorageEngine::open must reload schema.json before commit-log replay so recovered nodes do not forward writes for locally unregistered tables"
+        );
+        assert_eq!(
+            engine.deferred_replay_mutation_count_for_test(),
+            0,
+            "schema-backed open should not start with deferred replay mutations"
+        );
+    }
+
+    #[test]
+    fn open_streams_schema_backed_commitlog_replay_without_pending_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+        let key = make_key("schema-backed-replay");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.flush(&tid).unwrap();
+            engine
+                .write(&tid, &key, make_row(b"streamed", 42), 42)
+                .unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+
+        assert!(
+            pending.is_empty(),
+            "StorageEngine::open must stream schema-backed commit-log replay directly into registered tables instead of returning an eager pending Vec"
+        );
+        let replayed = engine
+            .read(&tid, &key)
+            .unwrap()
+            .expect("schema-backed unflushed row should be visible immediately after open");
+        assert_eq!(replayed.rows.len(), 1);
+        assert_eq!(engine.deferred_replay_mutation_count_for_test(), 0);
+    }
+
+    #[test]
+    fn open_no_schema_fallback_fails_before_unbounded_pending_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..2 {
+                engine
+                    .write(
+                        &tid,
+                        &make_key(&format!("no-schema-{i}")),
+                        make_row(b"pending", i),
+                        i,
+                    )
+                    .unwrap();
+            }
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        let schema_path = dir.path().join("schema.json");
+        if schema_path.exists() {
+            std::fs::remove_file(schema_path).unwrap();
+        }
+
+        let config = StorageEngineConfig {
+            max_pending_replay_mutations_without_schema: 1,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let err = match StorageEngine::open(config, None) {
+            Ok(_) => panic!(
+                "no-schema compatibility replay must fail closed instead of growing an unbounded pending Vec"
+            ),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("schema unavailable") && err.contains("pending replay limit"),
+            "error must explain that schema must be restored before commit-log replay can continue; got: {err}"
+        );
+    }
+
     #[test]
     fn schema_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
