@@ -460,6 +460,7 @@ mod tests {
             write_verify: true,
             auth_enabled: false,
             auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
         };
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
         let registry = Arc::new(HandlerRegistry::new());
@@ -928,6 +929,7 @@ mod tests {
                 write_verify: true,
                 auth_enabled: false,
                 auth_warn: false,
+                max_pending_replay_mutations_without_schema: 1024,
             };
             let storage = Arc::new(
                 ferrosa_storage::StorageEngine::new(storage_config, None).expect("storage engine"),

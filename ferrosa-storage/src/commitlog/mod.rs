@@ -1458,7 +1458,7 @@ mod tests {
             "0-byte segment carries no records; replay must yield none"
         );
         assert!(
-            empty_segment_skipped_total() >= before + 1,
+            empty_segment_skipped_total() > before,
             "EMPTY_SEGMENT_SKIPPED_TOTAL must increment for the skipped torn segment"
         );
         assert!(
@@ -1492,7 +1492,7 @@ mod tests {
             "partial-header segment carries no complete records; replay must yield none"
         );
         assert!(
-            empty_segment_skipped_total() >= before + 1,
+            empty_segment_skipped_total() > before,
             "torn partial-header segment must increment the skipped-segment counter"
         );
         assert!(

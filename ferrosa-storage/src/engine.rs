@@ -21,6 +21,7 @@ use parking_lot::RwLock;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
+use ferrosa_schema::SchemaSnapshot;
 use ferrosa_sstable::types::{Partition, Row};
 
 use crate::cache::LocalCache;
@@ -688,7 +689,7 @@ impl StorageEngine {
         let tables = RwLock::new(HashMap::new());
         let schema_path = config.data_dir.join("schema.json");
         if let Ok(data) = std::fs::read_to_string(&schema_path) {
-            match serde_json::from_str::<Vec<TableSchema>>(&data) {
+            match Self::table_schemas_from_schema_json(&data) {
                 Ok(schemas) => {
                     for schema in schemas {
                         let table_id = TableId::new(&schema.keyspace, &schema.table);
@@ -1101,6 +1102,24 @@ impl StorageEngine {
         self.register_table_inner(schema, indexed_columns)
     }
 
+    fn table_schemas_from_schema_json(data: &str) -> Result<Vec<TableSchema>, String> {
+        match serde_json::from_str::<Vec<TableSchema>>(data) {
+            Ok(schemas) => Ok(schemas),
+            Err(legacy_err) => {
+                let snapshot = serde_json::from_str::<SchemaSnapshot>(data).map_err(|snapshot_err| {
+                    format!(
+                        "legacy TableSchema list parse failed: {legacy_err}; SchemaSnapshot parse failed: {snapshot_err}"
+                    )
+                })?;
+                Ok(snapshot
+                    .tables
+                    .into_values()
+                    .map(|metadata| metadata.to_storage_schema())
+                    .collect())
+            }
+        }
+    }
+
     /// Builds per-table state for a schema without requiring a fully constructed
     /// `StorageEngine`. Startup replay uses this to preload schema-backed tables
     /// before streaming commit-log entries, avoiding an eager pending-mutation Vec.
@@ -1297,7 +1316,7 @@ impl StorageEngine {
             Ok(d) => d,
             Err(_) => return, // No schema.json yet — first run.
         };
-        let schemas: Vec<TableSchema> = match serde_json::from_str(&data) {
+        let schemas = match Self::table_schemas_from_schema_json(&data) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -4144,6 +4163,98 @@ mod tests {
 
     fn table_id() -> TableId {
         TableId::new("test_ks", "test_table")
+    }
+
+    #[test]
+    fn open_accepts_current_schema_snapshot_json_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_snapshot = serde_json::json!({
+            "version": "00000000-0000-0000-0000-000000000001",
+            "keyspaces": {},
+            "tables": [
+                [
+                    ["test_ks", "test_table"],
+                    {
+                        "keyspace": "test_ks",
+                        "name": "test_table",
+                        "id": "00000000-0000-0000-0000-000000000002",
+                        "columns": {
+                            "pk": {
+                                "name": "pk",
+                                "kind": "PartitionKey",
+                                "position": 0,
+                                "column_type": "text",
+                                "clustering_order": "None",
+                                "mask": null
+                            },
+                            "ck": {
+                                "name": "ck",
+                                "kind": "Clustering",
+                                "position": 0,
+                                "column_type": "int",
+                                "clustering_order": "Asc",
+                                "mask": null
+                            },
+                            "val": {
+                                "name": "val",
+                                "kind": "Regular",
+                                "position": 0,
+                                "column_type": "text",
+                                "clustering_order": "None",
+                                "mask": null
+                            }
+                        },
+                        "partition_key": ["pk"],
+                        "clustering_key": [["ck", "Asc"]],
+                        "params": {
+                            "bloom_filter_fp_chance": 0.01,
+                            "caching": { "keys": "ALL", "rows_per_partition": "NONE" },
+                            "comment": "",
+                            "compaction": {},
+                            "compression": {},
+                            "crc_check_chance": 1.0,
+                            "default_time_to_live": 0,
+                            "gc_grace_seconds": 864000,
+                            "max_index_interval": 2048,
+                            "min_index_interval": 128,
+                            "memtable_flush_period_in_ms": 0,
+                            "speculative_retry": "99PERCENTILE",
+                            "additional_write_policy": "99PERCENTILE",
+                            "cdc": false,
+                            "read_repair": "BLOCKING",
+                            "allow_auto_snapshot": true,
+                            "incremental_backups": true
+                        },
+                        "flags": [],
+                        "extensions": {},
+                        "is_system": false
+                    }
+                ]
+            ],
+            "roles": {},
+            "grants": {},
+            "indexes": [],
+            "types": [],
+            "functions": [],
+            "aggregates": []
+        });
+        std::fs::write(
+            dir.path().join("schema.json"),
+            serde_json::to_vec_pretty(&schema_snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        assert!(
+            pending.is_empty(),
+            "no commit-log mutations should be pending"
+        );
+
+        let key = make_key("pk1");
+        engine
+            .write(&table_id(), &key, make_row(b"schema-backed", 1000), 1000)
+            .expect("table from current SchemaSnapshot JSON should be registered before replay");
     }
 
     #[test]
