@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa Memory Getting Started</title>
+  <meta name="description" content="Run, configure, and use Ferrosa Memory locally with Ferrosa Database and MCP-compatible agent harnesses.">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root { --bg:#0a0a0f; --card:#16161f; --card2:#111118; --text:#e8e8ed; --muted:#9494a3; --accent:#7c9cf5; --accent2:#e2725b; --border:#262637; --code:#0d0d14; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background:var(--bg); color:var(--text); line-height:1.65; }
+    nav { position:sticky; top:0; background:rgba(10,10,15,.9); backdrop-filter:blur(16px); border-bottom:1px solid var(--border); z-index:10; }
+    nav .inner { max-width:1100px; margin:0 auto; padding:1rem 1.5rem; display:flex; align-items:center; justify-content:space-between; gap:1rem; }
+    nav a { color:var(--text); text-decoration:none; }
+    nav .links { display:flex; gap:1rem; flex-wrap:wrap; }
+    nav .links a { color:var(--muted); font-size:.92rem; }
+    main { max-width:980px; margin:0 auto; padding:3rem 1.5rem 5rem; }
+    h1 { font-size:clamp(2.2rem,5vw,4rem); line-height:1.05; letter-spacing:-.04em; margin:2rem 0 1rem; }
+    h2 { font-size:1.65rem; margin-top:3rem; border-top:1px solid var(--border); padding-top:2rem; }
+    h3 { margin-top:2rem; }
+    p, li, td { color:var(--muted); }
+    a { color:var(--accent); }
+    .hero { background:linear-gradient(135deg,rgba(124,156,245,.14),rgba(226,114,91,.08)); border:1px solid var(--border); border-radius:22px; padding:2rem; }
+    .pill { display:inline-block; border:1px solid rgba(124,156,245,.35); color:var(--accent); background:rgba(124,156,245,.08); border-radius:999px; padding:.25rem .7rem; font-size:.8rem; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; margin:1rem 0; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:1.25rem; }
+    table { width:100%; border-collapse:collapse; background:var(--card2); border:1px solid var(--border); border-radius:12px; overflow:hidden; display:table; }
+    th, td { padding:.75rem .9rem; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+    th { color:var(--text); font-size:.78rem; text-transform:uppercase; letter-spacing:.08em; }
+    tr:last-child td { border-bottom:0; }
+    pre { background:var(--code); border:1px solid var(--border); border-radius:14px; padding:1rem; overflow:auto; }
+    code { font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace; color:#dcdcf0; }
+    .warn { border-left:3px solid var(--accent2); background:rgba(226,114,91,.08); padding:1rem 1.2rem; border-radius:0 12px 12px 0; color:var(--muted); }
+    footer { max-width:980px; margin:0 auto; padding:2rem 1.5rem; color:#6b6b7a; border-top:1px solid var(--border); }
+  </style>
+</head>
+<body>
+<nav><div class="inner"><a href="./"><strong>Ferrosa <span style="color:var(--accent)">Memory</span></strong></a><div class="links"><a href="../database/">Database</a><a href="./">Memory overview</a><a href="#quickstart">Quickstart</a><a href="#examples">Examples</a></div></div></nav>
+<main>
+  <section class="hero">
+    <span class="pill">Developer preview</span>
+    <h1>Run and use Ferrosa Memory locally.</h1>
+    <p>Ferrosa Memory is an MCP-compatible memory layer for agents. It stores entities, temporal facts, graph edges, raw context segments, retrieval traces, and derived facts on top of Ferrosa Database.</p>
+  </section>
+
+  <h2 id="quickstart">Fast setup</h2>
+  <p>Most users should start with the hosted setup scripts instead of cloning repositories manually.</p>
+  <pre><code># Ferrosa Database only
+curl -fsSL https://ferrosadb.com/setup.sh | bash
+
+# Ferrosa Memory plus LLM onboarding
+curl -fsSL https://ferrosadb.com/setup-memory.sh | bash</code></pre>
+  <p><code>setup-memory.sh</code> downloads <code>ONBOARDING.md</code>, optionally clones or updates the public repos, offers to pull the Nomic embedding model, and hands the user to their selected LLM harness with <code>onboard me using ONBOARDING.md</code>.</p>
+
+  <h2>What you will run</h2>
+  <div class="grid">
+    <div class="card"><strong>Minimal native mode</strong><p>One Ferrosa Database process using local filesystem storage plus one Ferrosa Memory MCP/workbench process.</p></div>
+    <div class="card"><strong>Full Compose mode</strong><p>Three local Ferrosa nodes plus optional MinIO/S3-compatible storage for cluster/operator testing.</p></div>
+    <div class="card"><strong>Nomic embeddings</strong><p>Optional <code>nomic-embed-text-v2-moe</code> via Ollama. If skipped, semantic/vector search is degraded.</p></div>
+    <div class="card"><strong>Agent harnesses</strong><p>Use ONBOARDING.md to configure Hermes, Claude, Codex, skills, hooks, hints, and prompts.</p></div>
+  </div>
+
+  <table>
+    <tr><th>Service</th><th>Local endpoint</th></tr>
+    <tr><td>MCP/workbench</td><td><code>http://127.0.0.1:18765/</code></td></tr>
+    <tr><td>MCP JSON-RPC</td><td><code>http://127.0.0.1:18765/mcp</code></td></tr>
+    <tr><td>Viz</td><td><code>http://127.0.0.1:18766/viz</code></td></tr>
+    <tr><td>CQL</td><td><code>127.0.0.1:19042-19044</code></td></tr>
+    <tr><td>Graph HTTP</td><td><code>http://127.0.0.1:17474-17476</code></td></tr>
+    <tr><td>Bolt</td><td><code>127.0.0.1:17687-17689</code></td></tr>
+    <tr><td>MinIO, full stack only</td><td><code>http://127.0.0.1:19000</code>, console <code>19001</code></td></tr>
+  </table>
+
+  <h2>Manual source setup</h2>
+  <h3>1. Check prerequisites</h3>
+  <pre><code>rustc --version
+cargo --version
+git --version
+curl --version
+python3 --version
+ollama --version              # optional semantic search layer
+docker compose version        # full Docker stack only
+podman compose version        # full Podman stack only</code></pre>
+
+  <h3>2. Optional Nomic embedding layer</h3>
+  <pre><code>ollama pull nomic-embed-text-v2-moe
+ollama list | grep nomic-embed-text-v2-moe</code></pre>
+  <div class="warn">If embeddings are skipped, lexical/phonetic search still works, but semantic/vector search quality is degraded.</div>
+
+  <h3>3. Clone the public repositories, if contributing from source</h3>
+  <pre><code>mkdir -p ~/src/ferrosa-suite
+cd ~/src/ferrosa-suite
+
+git clone https://github.com/bkearns/ferrosa.git ferrosa
+git clone https://github.com/bkearns/ferrosa-memory.git ferrosa-memory</code></pre>
+
+  <h3>4. Native minimal mode</h3>
+  <pre><code>cd ~/src/ferrosa-suite/ferrosa
+cargo build --release
+
+cd ~/src/ferrosa-suite/ferrosa-memory
+cargo build --release</code></pre>
+  <p>Use repository config examples or <code>setup-memory.sh</code>/<code>ONBOARDING.md</code> to choose ports, local data directories, credentials, embedding settings, skills, hooks, and harness prompts.</p>
+
+  <h3>5. Full Compose development stack</h3>
+  <pre><code>cd ~/src/ferrosa-suite/ferrosa
+docker build -t ferrosa-memory-node:latest .
+# or: podman build -t ferrosa-memory-node:latest .
+
+cd ~/src/ferrosa-suite/ferrosa-memory
+docker compose up -d
+# or: podman compose up -d</code></pre>
+
+  <h3>5. Verify health</h3>
+  <pre><code>curl -fsS http://127.0.0.1:18765/healthz/live && echo
+curl -fsS http://127.0.0.1:18765/healthz/ready && echo
+curl -fsS http://127.0.0.1:18766/viz | head -c 64 && echo</code></pre>
+
+  <p>Expected output includes <code>ok</code>, <code>ready</code>, and an HTML doctype from the viz UI.</p>
+
+  <h2>Connect an MCP client</h2>
+  <p>Configure an MCP HTTP server pointing at:</p>
+  <pre><code>http://127.0.0.1:18765/mcp</code></pre>
+  <p>Generic MCP server shape:</p>
+  <pre><code>{
+  "name": "ferrosa-memory",
+  "transport": "http",
+  "url": "http://127.0.0.1:18765/mcp",
+  "headers": {
+    "Authorization": "Basic &lt;base64 username:password&gt;"
+  }
+}</code></pre>
+  <div class="warn">Use unique credentials and TLS/auth boundaries for shared deployments. Default local credentials are only appropriate for single-user development on loopback.</div>
+
+  <h2>Smoke-test MCP with curl</h2>
+  <pre><code>curl -sS -u ferrosa_user:ferrosa_user \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+  http://127.0.0.1:18765/mcp
+
+curl -sS -u ferrosa_user:ferrosa_user \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_stats","arguments":{}}}' \
+  http://127.0.0.1:18765/mcp</code></pre>
+
+  <h2 id="examples">Memory examples</h2>
+  <h3>Ingest a memory entity</h3>
+  <pre><code>{
+  "tool": "smart_ingest",
+  "arguments": {
+    "entity_name": "Project migration rule",
+    "entity_type": "decision",
+    "content": "Schema migrations should be additive by default so live memory clusters can be upgraded without deleting data."
+  }
+}</code></pre>
+
+  <h3>Retrieve related memory</h3>
+  <pre><code>{
+  "tool": "hybrid_search",
+  "arguments": {
+    "query": "what migration rule did we decide on for live memory clusters",
+    "limit": 5
+  }
+}</code></pre>
+
+  <h3>Record an evolving fact</h3>
+  <pre><code>{
+  "tool": "write_temporal_fact",
+  "arguments": {
+    "entity_id": "&lt;entity UUID from smart_ingest&gt;",
+    "fact_text": "Current rule: prefer additive migrations for live memory clusters."
+  }
+}</code></pre>
+
+  <h3>Search raw context segments</h3>
+  <pre><code>{
+  "tool": "search_context_segments",
+  "arguments": {
+    "query": "migration policy additive",
+    "limit": 5,
+    "expand": {"prev": 1, "next": 1, "max_tokens": 2000}
+  }
+}</code></pre>
+
+  <h2>Operate safely</h2>
+  <p>Stop and start without deleting data:</p>
+  <pre><code>cd ~/src/ferrosa-suite/ferrosa-memory
+docker compose stop
+docker compose start
+# or: podman compose stop && podman compose start</code></pre>
+  <p>After rebuilding an image, recreate nodes one at a time and wait for health before moving on:</p>
+  <pre><code>docker compose up -d --no-deps --force-recreate node1</code></pre>
+  <div class="warn">Do not run <code>down -v</code> unless you intentionally want to delete persisted memory data.</div>
+
+  <h2>Troubleshooting</h2>
+  <table>
+    <tr><th>Symptom</th><th>Check</th></tr>
+    <tr><td><code>live</code> fails</td><td>MCP container status, port mapping, HTTP vs HTTPS config.</td></tr>
+    <tr><td><code>ready</code> fails</td><td>CQL node health, auth, contact points.</td></tr>
+    <tr><td>Agent cannot list tools</td><td>MCP config path and harness restart/reload.</td></tr>
+    <tr><td><code>get_stats</code> times out</td><td>Node replay/OOM logs and CQL read timeouts.</td></tr>
+    <tr><td>Container MCP cannot reach CQL</td><td>Host networking or container-routable contact points if config uses localhost.</td></tr>
+  </table>
+  <pre><code>cd ~/src/ferrosa-suite/ferrosa-memory
+docker compose logs --tail=100 node1 node2 node3 ferrosa-memory-mcp</code></pre>
+
+  <h2>Next steps</h2>
+  <ul>
+    <li>Add Ferrosa Memory as an MCP server to your agent harness.</li>
+    <li>Run the ingest, retrieval, temporal fact, and context segment examples.</li>
+    <li>Use the workbench and viz UI to inspect stored memories and graph links.</li>
+    <li>Run long-horizon evaluation scenarios before making broad reasoning claims.</li>
+  </ul>
+</main>
+<footer>Ferrosa Suite · Developer preview · <a href="./">Memory overview</a></footer>
+</body>
+</html>

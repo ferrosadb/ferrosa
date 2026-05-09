@@ -760,6 +760,7 @@
     <ul class="nav-links">
       <li><a href="/database/">Database</a></li>
       <li><a href="/ferrosa-memory/">Memory</a></li>
+      <li><a href="/ferrosa-memory/getting-started.html">Memory Setup</a></li>
       <li><a href="/database/examples/">Examples</a></li>
     </ul>
     <a href="#get-started" class="nav-cta">Get Started</a>
@@ -775,7 +776,7 @@
   <p>Ferrosa is a developer-preview suite for two related problems: a Rust-native distributed database for operational workloads, and Ferrosa Memory for linked agent context that can be queried, updated, and inspected over time.</p>
   <div class="hero-actions">
     <a href="/database/" class="btn-primary">Use the Database</a>
-    <a href="/ferrosa-memory/" class="btn-secondary">Preview Ferrosa Memory</a>
+    <a href="/ferrosa-memory/getting-started.html" class="btn-secondary">Set Up Ferrosa Memory</a>
   </div>
 </section>
 <section id="products">
@@ -793,6 +794,7 @@
       <div class="kicker">Ferrosa Memory</div>
       <h3>Agent memory: durable, linked, queryable context.</h3>
       <p>A developer-preview memory system for agents: temporal facts, entity graphs, folds, retrieval, Datalog-style materialization, workbench query UIs, and visualization for inspecting what the agent is recording and linking.</p>
+      <p style="margin-top:1rem;"><span class="pill">MCP on 18765</span> <span class="pill">Viz on 18766</span></p>
       <div class="pill-row"><span class="pill">MCP</span><span class="pill">Long context</span><span class="pill">Graph memory</span><span class="pill">Datalog</span><span class="pill">Viz</span></div>
     </a>
   </div>
@@ -808,7 +810,8 @@
     <div class="doc-card">
       <h3>Research-inspired, product-shaped</h3>
       <p>Preview docs cite the papers and specs behind the design, including memory architectures, GraphRAG-style retrieval, Datalog materialization, MemoryArena-style evaluation, prompt/context compression, and privacy/security work for persistent agent memory.</p>
-      <a href="/ferrosa-memory/#research" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">Read the research notes →</a>
+      <a href="/ferrosa-memory/#research" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">Read the research notes →</a><br>
+      <a href="/ferrosa-memory/getting-started.html" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">Run the local memory stack →</a>
     </div>
   </div>
   <div class="screenshot-grid">
@@ -825,11 +828,15 @@
 <section id="get-started" class="cta-section">
   <h2>Start with the problem you have.</h2>
   <p>Install a local developer preview for macOS or Linux, then evaluate the database and memory surfaces against your own workflows.</p>
-  <div class="code-block"><pre><code>curl -fsSL https://ferrosadb.com/install.sh | bash</code></pre></div>
-  <p style="color:var(--text-secondary); max-width:760px; margin:1rem auto 0;">The installer is planned for macOS and Linux first. Windows support can be added later if there is demand.</p>
+  <div class="code-block"><pre><code># Database only
+curl -fsSL https://ferrosadb.com/setup.sh | bash
+
+# Ferrosa Memory + LLM onboarding
+curl -fsSL https://ferrosadb.com/setup-memory.sh | bash</code></pre></div>
+  <p style="color:var(--text-secondary); max-width:760px; margin:1rem auto 0;">Memory setup can run minimal native binaries with local filesystem storage, or a full Compose cluster with optional MinIO. Nomic embeddings are optional; without them semantic/vector search is degraded.</p>
   <div class="hero-actions">
     <a href="/database/getting-started.html" class="btn-primary">Database Getting Started</a>
-    <a href="/ferrosa-memory/#quickstart" class="btn-secondary">Memory Quickstart</a>
+    <a href="/ferrosa-memory/getting-started.html" class="btn-secondary">Memory Quickstart</a>
   </div>
 </section>
 <footer>

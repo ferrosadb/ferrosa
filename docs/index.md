@@ -6,6 +6,7 @@ User-facing documentation for Ferrosa Database and Ferrosa Memory.
 
 - [Ferrosa Database](database/) — distributed database docs, examples, CQL, Cypher, SPARQL, and migration guides.
 - [Ferrosa Memory](ferrosa-memory/) — developer-preview long-context linked memory for agents.
+- [Ferrosa Memory Getting Started](ferrosa-memory/getting-started.html) — run the local stack, connect MCP clients, and try memory examples.
 
 ## Database Docs
 
