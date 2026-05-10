@@ -29,6 +29,7 @@
 use crate::deployment::DeploymentMode;
 use crate::node::{NodeId, Role, SimulatedNode};
 use crate::rng::SeededRng;
+use crate::trace::{TlaAction, Trace};
 use std::collections::{BTreeMap, BinaryHeap};
 
 /// One unit of simulated time.  All deadlines are stored as a count
@@ -150,6 +151,8 @@ pub struct SimulatedCluster {
     next_seq: u64,
     /// Seeded RNG for randomized election timeouts.
     rng: SeededRng,
+    /// Append-only trace of every TLA+ action observed.
+    trace: Trace,
 }
 
 impl SimulatedCluster {
@@ -193,7 +196,16 @@ impl SimulatedCluster {
             now: 0,
             next_seq,
             rng,
+            trace: Trace::new(),
         }
+    }
+
+    /// Borrow the action trace recorded so far.
+    ///
+    /// W5.4 reproducibility: same seed = same `Trace`.  W5.10
+    /// refinement: each [`TlaAction`] is checked against the spec.
+    pub fn trace(&self) -> &Trace {
+        &self.trace
     }
 
     /// Number of voters in the cluster.
@@ -340,6 +352,8 @@ impl SimulatedCluster {
             last_log_index = state.node.log_len;
             last_log_term = state.node.term.saturating_sub(1);
         }
+        self.trace
+            .push(self.now, TlaAction::BecomeCandidate { node: id, term });
 
         // Re-arm the election timer (in case the vote round fails).
         let next_timeout = self.nodes[&id].election_deadline.unwrap();
@@ -362,6 +376,14 @@ impl SimulatedCluster {
                     last_log_term,
                 },
             );
+            self.trace.push(
+                self.now,
+                TlaAction::RequestVote {
+                    from: id,
+                    to: peer,
+                    term,
+                },
+            );
         }
 
         // If a single-voter cluster, immediate self-majority.
@@ -382,10 +404,13 @@ impl SimulatedCluster {
         // need an active borrow on `self.nodes` below.
         let new_timeout = self.now + self.random_election_timeout();
         let granted;
+        let stepped_down;
+        let final_term;
         {
             let state = self.nodes.get_mut(&to).expect("node exists");
             // §5.1: if the request term is *higher*, step down.
-            if term > state.node.term {
+            stepped_down = term > state.node.term;
+            if stepped_down {
                 state.node.term = term;
                 state.node.role = Role::Follower;
                 state.node.voted_for = None;
@@ -401,7 +426,33 @@ impl SimulatedCluster {
                 state.election_deadline = Some(new_timeout);
             }
             granted = can_grant;
+            final_term = state.node.term;
         }
+        if stepped_down {
+            self.trace.push(
+                self.now,
+                TlaAction::BecomeFollower {
+                    node: to,
+                    term: final_term,
+                },
+            );
+        }
+        self.trace.push(
+            self.now,
+            if granted {
+                TlaAction::GrantVote {
+                    from: to,
+                    to: from,
+                    term,
+                }
+            } else {
+                TlaAction::RejectVote {
+                    from: to,
+                    to: from,
+                    term,
+                }
+            },
+        );
 
         // Re-arm the recipient's timer if the deadline moved.
         if granted {
@@ -447,23 +498,38 @@ impl SimulatedCluster {
 
     fn on_heartbeat(&mut self, _from: NodeId, to: NodeId, term: u64) {
         let new_timeout = self.now + self.random_election_timeout();
-        let state = self.nodes.get_mut(&to).expect("node exists");
-        if term < state.node.term {
-            return; // stale leader
+        let stepped_down;
+        let final_term;
+        {
+            let state = self.nodes.get_mut(&to).expect("node exists");
+            if term < state.node.term {
+                return; // stale leader
+            }
+            stepped_down = term > state.node.term || state.node.role != Role::Follower;
+            if term > state.node.term {
+                state.node.term = term;
+                state.node.voted_for = None;
+            }
+            state.node.role = Role::Follower;
+            state.election_deadline = Some(new_timeout);
+            final_term = state.node.term;
         }
-        if term > state.node.term {
-            state.node.term = term;
-            state.node.voted_for = None;
-        }
-        state.node.role = Role::Follower;
-        state.election_deadline = Some(new_timeout);
-        let new_deadline = state.election_deadline.unwrap();
+        let new_deadline = self.nodes[&to].election_deadline.unwrap();
         self.queue.push(Scheduled {
             deadline: new_deadline,
             seq: self.next_seq,
             event: Event::ElectionTimeout { node: to },
         });
         self.next_seq += 1;
+        if stepped_down {
+            self.trace.push(
+                self.now,
+                TlaAction::BecomeFollower {
+                    node: to,
+                    term: final_term,
+                },
+            );
+        }
     }
 
     fn become_leader(&mut self, id: NodeId) {
@@ -474,11 +540,21 @@ impl SimulatedCluster {
             state.election_deadline = None;
             term = state.node.term;
         }
+        self.trace
+            .push(self.now, TlaAction::BecomeLeader { node: id, term });
         // Immediately broadcast a heartbeat so followers latch.
         for peer in self.peer_ids(id) {
             self.schedule(
                 1,
                 Event::Heartbeat {
+                    from: id,
+                    to: peer,
+                    term,
+                },
+            );
+            self.trace.push(
+                self.now,
+                TlaAction::AppendEntries {
                     from: id,
                     to: peer,
                     term,
@@ -512,5 +588,32 @@ mod tests {
         for id in [1, 2, 3] {
             assert_eq!(cluster.deployment_mode(id), DeploymentMode::Cluster);
         }
+    }
+
+    /// W5.4 RED → GREEN: two cluster runs with the same seed produce
+    /// identical traces, byte-for-byte.  This is the determinism
+    /// contract that the TLA+ refinement check (W5.10) and the
+    /// nightly 100K-seed workflow (W5.11) both rely on.
+    #[test]
+    fn same_seed_produces_same_trace() {
+        let mut a = SimulatedCluster::with_voters(3, 42);
+        let mut b = SimulatedCluster::with_voters(3, 42);
+        let _la = a.run_until_leader(10_000).unwrap();
+        let _lb = b.run_until_leader(10_000).unwrap();
+        assert_eq!(a.trace(), b.trace());
+        assert!(!a.trace().is_empty());
+    }
+
+    /// Different seeds should *eventually* produce different traces.
+    /// This is a soft guarantee — splitmix64 is statistically strong
+    /// over a few hundred draws.  The test pins the contract: same
+    /// seed = same trace; different seed = different trace.
+    #[test]
+    fn different_seeds_produce_different_traces() {
+        let mut a = SimulatedCluster::with_voters(3, 1);
+        let mut b = SimulatedCluster::with_voters(3, 2);
+        let _ = a.run_until_leader(10_000).unwrap();
+        let _ = b.run_until_leader(10_000).unwrap();
+        assert_ne!(a.trace(), b.trace());
     }
 }
