@@ -9,7 +9,7 @@
 //! `addr: ""` entry persist and the cluster never converges.
 //!
 //! This module mirrors the DDL forwarding path
-//! ([`crate::ddl_path::forward_ddl_to_leader`]):
+//! (`crate::ddl_path::forward_ddl_to_leader`):
 //!
 //! 1. Non-leader serialises the [`crate::raft::RaftCommand`] with bincode and
 //!    sends it as [`Message::ClusterRaftForward`] on [`Lane::Data`].
