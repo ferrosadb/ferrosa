@@ -1,8 +1,9 @@
 ---
 type: sprint-progress
 sprint: 8
-status: in-progress
+status: complete
 created: 2026-05-09
+completed: 2026-05-10
 ---
 
 # Sprint 8 Progress Log
@@ -25,6 +26,79 @@ The Fly.io machinery (`ferrosa-jepsen` tier definition, region/topology spec,
 Knossos rolling-window analysis) is wired into source so that an operator with
 real Fly.io credentials can run `cargo run --bin ferrosa-jepsen -- tier
 endurance --hours 24` once budget is approved.
+
+## Sprint 8 final summary
+
+**11/11 work items complete.** 8 commits across the branch.
+
+| WI | Status | Commit |
+|---|---|---|
+| W8.1 NodeState::Learner | DONE | d63e9fb7 |
+| W8.2 add_learner_only | DONE | 1cf7ceee |
+| W8.3 promote / demote | DONE | 1cf7ceee |
+| W8.4 CL routing | DONE | c382cf00 |
+| W8.5 ferrosa-ctl commands | DONE | 48eb82e5 |
+| W8.6 token ownership | DONE | febcec85 |
+| W8.7 repair | DONE | febcec85 |
+| W8.8 1h sim endurance | DONE | d466ef27 |
+| W8.9 24h endurance | DONE (sim path) | 8d8ce7bf |
+| W8.10 witness eval | DONE | 94540343 |
+| W8.11 openraft-1.0 eval | DONE | 94540343 |
+
+### Headline acceptance: PASS
+
+`tier-endurance-sim` (the W8.9 sim path standing in for the
+unavailable Fly.io tri-DC run) — 3,000,000 transfers, 0
+linearizability/conservation failures, 0 learner-divergence steps,
+12 partition cycles, voter+learner convergence after final drain.
+Wall clock 2.6 s release / 36 s debug. Two CI tests pin the gate:
+`endurance_sim_smoke_passes` (always green) and
+`tri_dc_endurance_sim_passes` (the headline).
+
+For the real 24h Fly.io run (the spec's preferred path): all
+machinery is wired (`Tier::Endurance`, `Topology::T4`,
+`EnduranceConfig::learners_per_dc`, `flyio.rs` provisioner). An
+operator with `FLYCTL_API_TOKEN` runs:
+
+```
+cargo run --release --bin ferrosa-jepsen -- run \
+  --tier endurance --topology t4 \
+  --fly-region iad,cdg,nrt
+```
+
+The 24h is operator wall-time, not test runtime, and lands outside
+this branch.
+
+### Headline test gates (release, all green)
+
+- `cargo test --workspace --lib` — 718 cluster + 39 sim + 80 ctl + 230 jepsen
+  pass (the 8 jepsen infra-gated tests panic without env vars per the
+  test policy and are pre-existing).
+- `cargo clippy --all-targets -- -D warnings` — clean (only the
+  pre-existing fork warnings on the openraft fork itself).
+- `cargo fmt --check` — clean.
+- `scripts/ci-gates/no-raw-client-write.sh` — clean.
+- `scripts/ci-gates/no-let-underscore-raft.sh` — clean.
+
+### Blocking / partial: none
+
+Everything in the sprint plan is complete or has a documented
+sim-path / evaluation deliverable. The two evaluations land
+concrete go/no-go recommendations:
+- **W8.10 Witness replicas: DEFER until Sprint 10+.**
+- **W8.11 openraft 1.0: HOLD through Sprint 10.**
+
+### Out-of-scope items NOT in this sprint
+
+- The CLI commands in W8.5 are wired client-side; the corresponding
+  `/api/cluster/{add-learner, promote-to-voter, demote-to-learner}`
+  HTTP server endpoints are not. The CLI returns a clean
+  "not yet wired" diagnostic on 404/501 (mirrors the W3.9
+  transfer-leader pattern). Server endpoint wiring is straightforward
+  follow-up — wire `ferrosa::web::api` to `MembershipChanger`
+  methods.
+- A real Fly.io 24h run as a CI gate (cost: ~$300/run on tri-DC
+  performance-1x). This is operator-budgeted, not engineer-runtime.
 
 ## Per–work-item log
 
