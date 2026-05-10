@@ -12,11 +12,15 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod cluster;
 pub mod deployment;
 pub mod node;
+pub mod rng;
 
+pub use cluster::{Event, SimulatedCluster, Tick};
 pub use deployment::DeploymentMode;
 pub use node::{NodeId, Role, SimulatedNode};
+pub use rng::SeededRng;
 
 #[cfg(test)]
 mod smoke {
