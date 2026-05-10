@@ -90,6 +90,94 @@ async fn add_voter_updates_all_four_maps() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_metadata_propagates_addr() {
+    // 3-voter cluster.  We update node 2's addr and expect every node's
+    // state.members to reflect the new value.
+    let cluster = TestCluster::with_voters(3).await;
+    cluster
+        .wait_for_leader(Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Pick a voter to refresh.  Use node 2 — we need its host_id.
+    // The harness assigns NodeIds 1..=N but does not retain the original
+    // host_id.  Recover it by inverting: in the harness, NodeId N is
+    // synthesised, not derived from a host_id.  So inject a JoinNode
+    // first that establishes a known (host, addr) pair that subsequent
+    // updates can target.
+    let target_host = Uuid::new_v4();
+    let target_addr_v1: std::net::SocketAddr = "127.0.0.1:7100".parse().unwrap();
+    let target_addr_v2: std::net::SocketAddr = "127.0.0.1:7200".parse().unwrap();
+    let target_node_id = uuid_to_node_id(target_host);
+    cluster.add_pending_node(target_node_id).await;
+
+    let changer = MembershipChanger::new(
+        cluster.leader_node().raft.clone(),
+        cluster.membership_network(),
+    );
+    changer
+        .add_voter(target_host, target_addr_v1)
+        .await
+        .expect("seed add_voter");
+
+    // Sanity: addr is v1 on every node.
+    let mut converged = false;
+    for _ in 0..40 {
+        let nodes = cluster.nodes();
+        let mut ok = true;
+        for node in &nodes {
+            let st = node.state_snapshot().await;
+            match st.members.get(&target_node_id) {
+                Some(info) if info.addr == target_addr_v1.to_string() => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        drop(nodes);
+        if ok {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(converged, "v1 addr did not propagate before update");
+
+    // Now update.
+    changer
+        .update_metadata(target_host, Some(target_addr_v2), None)
+        .await
+        .expect("update_metadata");
+
+    // Every node should converge on v2 within 2 s.
+    let mut updated = false;
+    for _ in 0..40 {
+        let nodes = cluster.nodes();
+        let mut ok = true;
+        for node in &nodes {
+            let st = node.state_snapshot().await;
+            match st.members.get(&target_node_id) {
+                Some(info) if info.addr == target_addr_v2.to_string() => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        drop(nodes);
+        if ok {
+            updated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(updated, "addr update did not propagate to followers");
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_voter_idempotent() {
     let cluster = TestCluster::with_voters(3).await;
     cluster

@@ -1211,10 +1211,10 @@ impl ModeController {
                     // refresh path would silently drop the proposal and the
                     // joining node's BasicNode addr stays empty forever.
                     let cluster_raft_forward_handler = Arc::new(
-                        crate::raft_forward::ClusterRaftForwardHandler::new(raft_arc.clone()),
+                        crate::raft_forward::ClusterMembershipForwardHandler::new(raft_arc.clone()),
                     );
                     registry.register(
-                        MsgType::ClusterRaftForward,
+                        MsgType::ClusterMembershipForward,
                         cluster_raft_forward_handler,
                     );
 

@@ -12,10 +12,10 @@
 //! ([`crate::ddl_path::forward_ddl_to_leader`]):
 //!
 //! 1. Non-leader serialises the [`crate::raft::RaftCommand`] with bincode and
-//!    sends it as [`Message::ClusterRaftForward`] on [`Lane::Data`].
-//! 2. The leader runs [`ClusterRaftForwardHandler`], deserialises the
+//!    sends it as [`Message::ClusterMembershipForward`] on [`Lane::Data`].
+//! 2. The leader runs [`ClusterMembershipForwardHandler`], deserialises the
 //!    command, calls `client_write` locally, and replies with a
-//!    [`Message::ClusterRaftForwardAck`] carrying the bincode-serialised
+//!    [`Message::ClusterMembershipForwardAck`] carrying the bincode-serialised
 //!    [`ForwardAckBody`].
 //!
 //! Unlike the DDL forwarder we use bincode (not JSON) because `RaftCommand`
@@ -103,7 +103,7 @@ where
     }
 }
 
-/// Body of a [`Message::ClusterRaftForwardAck`].
+/// Body of a [`Message::ClusterMembershipForwardAck`].
 ///
 /// `Ok` indicates the leader applied the command via `client_write`.  `Err`
 /// carries the leader's stringified error so the non-leader can surface it
@@ -133,7 +133,7 @@ pub async fn forward_raft_command_to_leader(
     let resp = match peer_manager
         .send(
             leader_uuid,
-            Message::ClusterRaftForward(body.clone()),
+            Message::ClusterMembershipForward(body.clone()),
             Lane::Data,
         )
         .await
@@ -153,7 +153,11 @@ pub async fn forward_raft_command_to_leader(
                 .await
                 .map_err(ClusterError::Net)?;
             peer_manager
-                .send(leader_uuid, Message::ClusterRaftForward(body), Lane::Data)
+                .send(
+                    leader_uuid,
+                    Message::ClusterMembershipForward(body),
+                    Lane::Data,
+                )
                 .await
                 .map_err(ClusterError::Net)?
         }
@@ -161,9 +165,9 @@ pub async fn forward_raft_command_to_leader(
     };
 
     match resp {
-        Message::ClusterRaftForwardAck(body) => decode_ack(&body),
+        Message::ClusterMembershipForwardAck(body) => decode_ack(&body),
         other => Err(ClusterError::Internal(format!(
-            "unexpected response to ClusterRaftForward: {:?}",
+            "unexpected response to ClusterMembershipForward: {:?}",
             other.msg_type()
         ))),
     }
@@ -173,8 +177,9 @@ fn decode_ack(body: &Bytes) -> Result<()> {
     if body.is_empty() {
         return Ok(());
     }
-    let ack: ForwardAckBody = bincode::deserialize(body)
-        .map_err(|e| ClusterError::Internal(format!("ClusterRaftForwardAck decode failed: {e}")))?;
+    let ack: ForwardAckBody = bincode::deserialize(body).map_err(|e| {
+        ClusterError::Internal(format!("ClusterMembershipForwardAck decode failed: {e}"))
+    })?;
     match ack {
         ForwardAckBody::Ok => Ok(()),
         ForwardAckBody::Err(msg) => Err(ClusterError::RaftError(msg)),
@@ -187,9 +192,9 @@ fn encode_ack(body: &ForwardAckBody) -> Bytes {
 
 /// Decode `body` as a [`RaftCommand`], invoke `propose`, and produce the
 /// bincode-serialized [`ForwardAckBody`] that should be wrapped in a
-/// [`Message::ClusterRaftForwardAck`].
+/// [`Message::ClusterMembershipForwardAck`].
 ///
-/// Extracted from [`ClusterRaftForwardHandler::handle`] so the
+/// Extracted from [`ClusterMembershipForwardHandler::handle`] so the
 /// decode-and-respond logic can be unit-tested without spinning up an openraft
 /// instance.
 pub(crate) async fn process_forwarded_command<F, Fut>(body: &[u8], propose: F) -> Bytes
@@ -213,24 +218,24 @@ where
 ///
 /// Non-leader nodes that hit `ForwardToLeader` from their local
 /// [`openraft::Raft::client_write`] send the proposal here via
-/// [`Message::ClusterRaftForward`].  This handler decodes it, calls
+/// [`Message::ClusterMembershipForward`].  This handler decodes it, calls
 /// `client_write` locally (which succeeds because we are the leader), and
-/// replies with a [`Message::ClusterRaftForwardAck`].
-pub struct ClusterRaftForwardHandler {
+/// replies with a [`Message::ClusterMembershipForwardAck`].
+pub struct ClusterMembershipForwardHandler {
     raft: Arc<FerrosRaft>,
 }
 
-impl ClusterRaftForwardHandler {
+impl ClusterMembershipForwardHandler {
     pub fn new(raft: Arc<FerrosRaft>) -> Self {
         Self { raft }
     }
 }
 
 #[async_trait]
-impl RpcHandler for ClusterRaftForwardHandler {
+impl RpcHandler for ClusterMembershipForwardHandler {
     async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
         let body = match msg {
-            Message::ClusterRaftForward(b) => b,
+            Message::ClusterMembershipForward(b) => b,
             _ => return None,
         };
         let raft = self.raft.clone();
@@ -241,7 +246,7 @@ impl RpcHandler for ClusterRaftForwardHandler {
                 .map_err(|e| e.to_string())
         })
         .await;
-        Some(Message::ClusterRaftForwardAck(ack_bytes))
+        Some(Message::ClusterMembershipForwardAck(ack_bytes))
     }
 }
 
@@ -280,7 +285,7 @@ mod tests {
     impl RpcHandler for EchoOkHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             match msg {
-                Message::ClusterRaftForward(_) => Some(Message::ClusterRaftForwardAck(
+                Message::ClusterMembershipForward(_) => Some(Message::ClusterMembershipForwardAck(
                     encoded_ack(&ForwardAckBody::Ok),
                 )),
                 _ => None,
@@ -294,7 +299,7 @@ mod tests {
     impl RpcHandler for EchoErrHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             match msg {
-                Message::ClusterRaftForward(_) => Some(Message::ClusterRaftForwardAck(
+                Message::ClusterMembershipForward(_) => Some(Message::ClusterMembershipForwardAck(
                     encoded_ack(&ForwardAckBody::Err("simulated leader rejection".into())),
                 )),
                 _ => None,
@@ -353,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn forward_raft_command_to_leader_round_trips_via_existing_peer() {
         let (server, addr, leader_uuid) =
-            start_rpc_server(MsgType::ClusterRaftForward, Arc::new(EchoOkHandler)).await;
+            start_rpc_server(MsgType::ClusterMembershipForward, Arc::new(EchoOkHandler)).await;
 
         let peer_manager = Arc::new(PeerManager::new(
             Arc::new(NetConfig::default()),
@@ -561,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn forward_raft_command_to_leader_surfaces_leader_error() {
         let (server, addr, leader_uuid) =
-            start_rpc_server(MsgType::ClusterRaftForward, Arc::new(EchoErrHandler)).await;
+            start_rpc_server(MsgType::ClusterMembershipForward, Arc::new(EchoErrHandler)).await;
 
         let peer_manager = Arc::new(PeerManager::new(
             Arc::new(NetConfig::default()),

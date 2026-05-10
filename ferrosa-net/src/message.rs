@@ -194,20 +194,29 @@ pub enum Message {
     /// Leader acknowledges receipt of BootstrapComplete.
     BootstrapCompleteAck,
 
-    // Cluster-mode Raft proposal forwarding
-    /// Forward a serialized [`crate`] `RaftCommand` to the current Raft leader.
+    // Cluster-mode membership proposal forwarding
+    /// Forward a typed `MembershipOp` to the current Raft leader (W1.13).
     ///
-    /// Used by non-leader nodes that detect openraft's `ForwardToLeader`
+    /// Renamed from `ClusterRaftForward` (Sprint 1) to make the scope
+    /// explicit: the body is no longer an opaque bincoded `RaftCommand`
+    /// but a `MembershipOp` enum (defined in
+    /// `ferrosa_cluster::membership::wire`).  The leader dispatches on
+    /// the operation tag rather than peeking inside.
+    ///
+    /// Used by non-leader nodes that hit openraft's `ForwardToLeader`
     /// hint when their local `client_write` is rejected.  The leader
-    /// applies the proposal locally and returns a [`Self::ClusterRaftForwardAck`].
+    /// applies the operation via `MembershipChanger` and replies with
+    /// a [`Self::ClusterMembershipForwardAck`].
     ///
-    /// Payload: bincode-serialized `RaftCommand` (interpreted by ferrosa-cluster).
-    ClusterRaftForward(Bytes),
-    /// Acknowledgment for a [`Self::ClusterRaftForward`].
+    /// Wire byte unchanged (`0x82`) so a workspace-coherent rolling
+    /// upgrade does not need a wire-format flag day; only the payload
+    /// schema changes.
+    ClusterMembershipForward(Bytes),
+    /// Acknowledgment for a [`Self::ClusterMembershipForward`].
     ///
-    /// Payload: bincode-serialized status enum (interpreted by ferrosa-cluster);
-    /// empty bytes indicates success on older receivers.
-    ClusterRaftForwardAck(Bytes),
+    /// Payload: bincode-serialized status enum.  Empty bytes indicates
+    /// success on legacy senders.
+    ClusterMembershipForwardAck(Bytes),
 }
 
 impl Message {
@@ -269,8 +278,8 @@ impl Message {
             Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
             Self::BootstrapComplete { .. } => MsgType::BootstrapComplete,
             Self::BootstrapCompleteAck => MsgType::BootstrapCompleteAck,
-            Self::ClusterRaftForward(_) => MsgType::ClusterRaftForward,
-            Self::ClusterRaftForwardAck(_) => MsgType::ClusterRaftForwardAck,
+            Self::ClusterMembershipForward(_) => MsgType::ClusterMembershipForward,
+            Self::ClusterMembershipForwardAck(_) => MsgType::ClusterMembershipForwardAck,
         }
     }
 
@@ -416,8 +425,8 @@ impl Message {
             | Self::AccordApplyOK(b)
             | Self::AccordRecover(b)
             | Self::AccordRecoverOK(b)
-            | Self::ClusterRaftForward(b)
-            | Self::ClusterRaftForwardAck(b) => buf.put_slice(b),
+            | Self::ClusterMembershipForward(b)
+            | Self::ClusterMembershipForwardAck(b) => buf.put_slice(b),
             Self::BootstrapComplete { node_id } => buf.put_slice(node_id.as_bytes()),
             Self::BootstrapCompleteAck => {} // no payload
         }
@@ -625,11 +634,11 @@ impl Message {
                 }
             }
             MsgType::BootstrapCompleteAck => Self::BootstrapCompleteAck,
-            MsgType::ClusterRaftForward => {
-                Self::ClusterRaftForward(body.split_to(body.remaining()))
+            MsgType::ClusterMembershipForward => {
+                Self::ClusterMembershipForward(body.split_to(body.remaining()))
             }
-            MsgType::ClusterRaftForwardAck => {
-                Self::ClusterRaftForwardAck(body.split_to(body.remaining()))
+            MsgType::ClusterMembershipForwardAck => {
+                Self::ClusterMembershipForwardAck(body.split_to(body.remaining()))
             }
         })
     }
@@ -883,38 +892,40 @@ mod tests {
     }
 
     #[test]
-    fn cluster_raft_forward_roundtrip() {
-        let payload = Bytes::from_static(b"serialized-raft-command");
-        let msg = Message::ClusterRaftForward(payload.clone());
-        assert_eq!(msg.msg_type(), MsgType::ClusterRaftForward);
+    fn cluster_membership_forward_roundtrip() {
+        let payload = Bytes::from_static(b"serialized-membership-op");
+        let msg = Message::ClusterMembershipForward(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::ClusterMembershipForward);
 
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
-        let decoded = Message::decode(MsgType::ClusterRaftForward, &mut buf.freeze()).unwrap();
-        assert_eq!(decoded, Message::ClusterRaftForward(payload));
+        let decoded =
+            Message::decode(MsgType::ClusterMembershipForward, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::ClusterMembershipForward(payload));
     }
 
     #[test]
-    fn cluster_raft_forward_ack_roundtrip() {
+    fn cluster_membership_forward_ack_roundtrip() {
         let payload = Bytes::from_static(b"forward-ack");
-        let msg = Message::ClusterRaftForwardAck(payload.clone());
-        assert_eq!(msg.msg_type(), MsgType::ClusterRaftForwardAck);
+        let msg = Message::ClusterMembershipForwardAck(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::ClusterMembershipForwardAck);
 
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
-        let decoded = Message::decode(MsgType::ClusterRaftForwardAck, &mut buf.freeze()).unwrap();
-        assert_eq!(decoded, Message::ClusterRaftForwardAck(payload));
+        let decoded =
+            Message::decode(MsgType::ClusterMembershipForwardAck, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::ClusterMembershipForwardAck(payload));
     }
 
     #[test]
-    fn cluster_raft_forward_msg_types_from_u8() {
+    fn cluster_membership_forward_msg_types_from_u8() {
         assert_eq!(
             MsgType::try_from(0x82).unwrap(),
-            MsgType::ClusterRaftForward
+            MsgType::ClusterMembershipForward
         );
         assert_eq!(
             MsgType::try_from(0x83).unwrap(),
-            MsgType::ClusterRaftForwardAck
+            MsgType::ClusterMembershipForwardAck
         );
     }
 

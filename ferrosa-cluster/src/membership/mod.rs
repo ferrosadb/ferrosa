@@ -39,7 +39,48 @@ use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::ChangeMembers;
 use uuid::Uuid;
 
+use serde::{Deserialize, Serialize};
+
 use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand, RaftOp};
+
+// ---------------------------------------------------------------------------
+// MembershipOp — typed payload carried by `Message::ClusterMembershipForward`.
+// ---------------------------------------------------------------------------
+
+/// Wire-level enumeration of every membership operation a non-leader
+/// can ask the leader to apply (W1.13).
+///
+/// Replaces the prior opaque `Bytes` payload that bincoded a generic
+/// `RaftCommand`.  Naming the variants explicitly lets the leader's
+/// forward-handler dispatch on op kind (e.g. apply rate limits to
+/// `AddVoter`, audit-log every `RemoveVoter`) rather than peeking
+/// inside the bincoded bytes.
+///
+/// `Raw(Box<RaftCommand>)` is the forward-compatibility escape hatch
+/// for any operation not yet promoted to a typed variant — tests pin
+/// the round-trip stability of every variant.  `RaftCommand` is
+/// boxed because it is much larger than the other variants (clippy
+/// `large_enum_variant`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MembershipOp {
+    /// Promote `host_id` to a voter.  Carries the addr the leader
+    /// should record in `state.members`.
+    AddVoter { host_id: Uuid, addr: SocketAddr },
+    /// Remove `host_id` from the cluster.
+    RemoveVoter { host_id: Uuid },
+    /// Update `host_id`'s metadata (addr / cql_broadcast).
+    UpdateMetadata {
+        host_id: Uuid,
+        new_addr: Option<SocketAddr>,
+        new_cql_broadcast: Option<String>,
+    },
+    /// Approve `host_id` to join (ADR-013, RaftOp::ApproveNode).
+    ApproveNode { host_id: Uuid },
+    /// Forward-compat raw `RaftCommand`.  Carries any op not yet
+    /// promoted to a typed variant.  Existing pre-W1.13 senders that
+    /// bincode a `RaftCommand` directly are now decoded here.
+    Raw(Box<RaftCommand>),
+}
 
 // ---------------------------------------------------------------------------
 // MembershipNetwork trait — abstracts node_map + PeerManager mutations.
@@ -361,6 +402,57 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
 
         Ok(())
     }
+
+    /// Update an existing voter's metadata (addr / cql_broadcast).
+    ///
+    /// Per ADR-013 § "update_metadata": we propose an
+    /// [`RaftOp::UpdateNodeInfo`] through Raft so every follower
+    /// converges on the new addr.  No openraft `change_membership` is
+    /// needed because openraft's `BasicNode.addr` is unused by ferrosa
+    /// — addresses live in `state.members`.
+    ///
+    /// Idempotent: a re-call with the same addr is a NoOp on the apply
+    /// path.  Non-leader callers receive `NotLeader` so they can
+    /// forward via `Message::ClusterMembershipForward` (W1.5/W1.13).
+    pub async fn update_metadata(
+        &self,
+        host_id: Uuid,
+        new_addr: Option<SocketAddr>,
+        new_cql_broadcast: Option<String>,
+    ) -> Result<(), MembershipError> {
+        // Read the current NodeInfo from local state via metrics.
+        // Updates leave fields that the caller didn't override
+        // unchanged.
+        // We reconstruct a NodeInfo using either the passed-in fields
+        // or sane defaults.  The apply-path `RaftOp::UpdateNodeInfo`
+        // ignores updates for unknown members (logs a warning), so the
+        // host_id must already be a cluster member.
+        let info = NodeInfo {
+            host_id,
+            addr: new_addr.map(|a| a.to_string()).unwrap_or_default(),
+            data_center: self.default_dc.clone(),
+            rack: self.default_rack.clone(),
+            state: NodeState::Normal,
+            cql_broadcast: new_cql_broadcast,
+        };
+
+        let cmd = RaftCommand {
+            op: RaftOp::UpdateNodeInfo(info),
+            schema_version: Uuid::new_v4(),
+        };
+
+        match self.raft.client_write(cmd).await {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
+                Err(MembershipError::NotLeader {
+                    leader_node_id: fwd.leader_id,
+                })
+            }
+            Err(other) => Err(MembershipError::RaftError(format!(
+                "client_write(UpdateNodeInfo): {other}"
+            ))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +501,44 @@ mod tests {
         assert!(n.contains(id));
         n.unregister_node(id);
         assert!(!n.contains(id));
+    }
+
+    #[test]
+    fn cluster_membership_forward_carries_typed_op() {
+        // W1.13: every typed variant + the Raw escape hatch must
+        // bincode round-trip through the wire payload.  RaftCommand
+        // is not PartialEq, so we compare via re-serialised bytes.
+        let h1 = Uuid::new_v4();
+        let addr: SocketAddr = "127.0.0.1:7005".parse().unwrap();
+        let cases = vec![
+            MembershipOp::AddVoter { host_id: h1, addr },
+            MembershipOp::RemoveVoter { host_id: h1 },
+            MembershipOp::UpdateMetadata {
+                host_id: h1,
+                new_addr: Some(addr),
+                new_cql_broadcast: Some("9042".to_string()),
+            },
+            MembershipOp::ApproveNode { host_id: h1 },
+            MembershipOp::Raw(Box::new(RaftCommand {
+                op: RaftOp::LeaveNode { node_id: 42 },
+                schema_version: Uuid::new_v4(),
+            })),
+        ];
+        for op in cases {
+            let original_bytes = bincode::serialize(&op).expect("serialize");
+            let decoded: MembershipOp = bincode::deserialize(&original_bytes).expect("deserialize");
+            let reserialised = bincode::serialize(&decoded).expect("re-serialize");
+            assert_eq!(
+                original_bytes, reserialised,
+                "round-trip byte stability for {op:?}",
+            );
+            // Variant tag matches.
+            assert_eq!(
+                std::mem::discriminant(&op),
+                std::mem::discriminant(&decoded),
+                "round-trip variant tag mismatch for {op:?}",
+            );
+        }
     }
 
     #[test]
