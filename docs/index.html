@@ -100,6 +100,39 @@
 
     nav .nav-cta:hover { opacity: 0.9; }
 
+    nav .nav-toggle {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 2.5rem;
+      height: 2.5rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-card);
+      color: var(--text-primary);
+      cursor: pointer;
+    }
+
+    nav .nav-toggle span,
+    nav .nav-toggle span::before,
+    nav .nav-toggle span::after {
+      display: block;
+      width: 1.1rem;
+      height: 2px;
+      border-radius: 2px;
+      background: currentColor;
+      content: '';
+      transition: transform 0.2s, opacity 0.2s;
+    }
+
+    nav .nav-toggle span { position: relative; }
+    nav .nav-toggle span::before { position: absolute; transform: translateY(-6px); }
+    nav .nav-toggle span::after { position: absolute; transform: translateY(6px); }
+
+    nav.nav-open .nav-toggle span { background: transparent; }
+    nav.nav-open .nav-toggle span::before { background: var(--text-primary); transform: rotate(45deg); }
+    nav.nav-open .nav-toggle span::after { background: var(--text-primary); transform: rotate(-45deg); }
+
     /* ── Sections ── */
     section {
       max-width: 1200px;
@@ -711,8 +744,55 @@
         gap: 1.5rem;
       }
       .features-grid { grid-template-columns: 1fr; }
-      nav .nav-links { display: none; }
-      .beta-banner { top: 64px; font-size: 0.75rem; }
+      nav { padding: 0 1rem; }
+      nav .nav-inner {
+        height: 64px;
+        min-height: 64px;
+        gap: 0.75rem;
+        padding: 0;
+        position: relative;
+      }
+      body { overflow-x: hidden; }
+      nav .logo { margin-right: auto; }
+      nav .nav-cta {
+        display: inline-flex;
+        flex-shrink: 0;
+        padding: 0.5rem 0.75rem;
+      }
+      nav .nav-toggle { display: inline-flex; }
+      nav .nav-links {
+        position: fixed;
+        top: 64px;
+        left: 0;
+        right: 0;
+        display: none;
+        flex-direction: column;
+        gap: 0;
+        padding: 0.5rem 1rem 1rem;
+        background: rgba(10, 10, 15, 0.98);
+        border-bottom: 1px solid var(--border);
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+      }
+      nav.nav-open .nav-links { display: flex; }
+      nav .nav-links li { list-style: none; }
+      nav .nav-links a {
+        display: block;
+        padding: 0.75rem 0;
+        white-space: nowrap;
+      }
+      section {
+        width: 100%;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        overflow-wrap: anywhere;
+      }
+      .hero { padding-top: 11rem; }
+      .hero h1 { font-size: clamp(2rem, 11vw, 3rem); }
+      .hero p { font-size: 1rem; }
+      .hero-actions { flex-direction: column; align-items: stretch; }
+      .btn-primary,
+      .btn-secondary { width: 100%; text-align: center; }
+      .beta-banner { top: 148px; font-size: 0.75rem; }
       .comparison-table { font-size: 0.8125rem; }
       .comparison-table th,
       .comparison-table td { padding: 0.75rem 0.75rem; }
@@ -757,13 +837,15 @@
       <img src="/favicon.svg" alt="Fe" width="28" height="28">
       ferro<span>sa</span>
     </a>
-    <ul class="nav-links">
+    <ul class="nav-links" id="site-nav-links">
       <li><a href="/database/">Database</a></li>
       <li><a href="/ferrosa-memory/">Memory</a></li>
       <li><a href="/ferrosa-memory/getting-started.html">Memory Setup</a></li>
       <li><a href="/database/examples/">Examples</a></li>
+      <li><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></li>
     </ul>
     <a href="#get-started" class="nav-cta">Get Started</a>
+    <button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav-links"><span></span></button>
   </div>
 </nav>
 
@@ -850,5 +932,24 @@ curl -fsSL https://ferrosadb.com/setup-memory.sh | bash</code></pre></div>
     </div>
   </div>
 </footer>
+
+<script>
+  document.querySelectorAll('nav').forEach((nav) => {
+    const toggle = nav.querySelector('.nav-toggle');
+    if (!toggle) return;
+    toggle.addEventListener('click', () => {
+      const open = nav.classList.toggle('nav-open');
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+    });
+    nav.querySelectorAll('.nav-links a').forEach((link) => {
+      link.addEventListener('click', () => {
+        nav.classList.remove('nav-open');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-label', 'Open navigation');
+      });
+    });
+  });
+</script>
 </body>
 </html>
