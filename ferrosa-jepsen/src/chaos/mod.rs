@@ -3,6 +3,7 @@ pub mod composed;
 pub mod disk;
 pub mod network;
 pub mod process;
+pub mod topology;
 pub mod wan_bridge;
 
 use std::path::PathBuf;
@@ -130,6 +131,26 @@ impl NemesisRegistry {
         reg.register(Box::new(network::PartitionHalves));
         reg.register(Box::new(process::KillMinority));
         reg.register(Box::new(clock::ClockSkewSmall));
+        // Sprint 2 topology nemeses (W2.6/W2.7/W2.8). They are in the
+        // smoke tier because they exercise the membership bug class
+        // every PR must regress against.
+        reg.register(Box::new(topology::AddNodeViaFollower {
+            seed_service: "node3".to_string(),
+            new_node_service: "node4".to_string(),
+            compose_file: None,
+        }));
+        reg.register(Box::new(topology::DecommissionLeader {
+            admin_url: "http://localhost:19090/admin/membership-snapshot".to_string(),
+            ctl_binary: "ferrosa-ctl".to_string(),
+        }));
+        reg.register(Box::new(topology::RandomStartupOrder {
+            compose_file: None,
+            node_services: vec![
+                "node1".to_string(),
+                "node2".to_string(),
+                "node3".to_string(),
+            ],
+        }));
         reg
     }
 
@@ -182,13 +203,17 @@ mod tests {
         let reg = NemesisRegistry::phase1();
         let mut names = reg.names();
         names.sort();
+        // Sprint 2: phase1 now also includes the three topology nemeses.
         assert_eq!(
             names,
             vec![
+                "add-node-via-follower",
                 "clock-skew-small",
+                "decommission-leader",
                 "kill-minority",
                 "noop",
-                "partition-halves"
+                "partition-halves",
+                "random-startup-order",
             ]
         );
     }
@@ -198,13 +223,16 @@ mod tests {
         let reg = NemesisRegistry::phase2();
         let mut names = reg.names();
         names.sort();
-        assert_eq!(names.len(), 15);
+        // 15 phase2 + 3 Sprint 2 topology = 18.
+        assert_eq!(names.len(), 18);
         assert_eq!(
             names,
             vec![
+                "add-node-via-follower",
                 "clock-skew-large",
                 "clock-skew-small",
                 "clock-strobe",
+                "decommission-leader",
                 "disk-fail",
                 "disk-slow",
                 "jitter-network",
@@ -216,6 +244,7 @@ mod tests {
                 "partition-one",
                 "partition-ring",
                 "pause-node",
+                "random-startup-order",
                 "slow-network",
             ]
         );
