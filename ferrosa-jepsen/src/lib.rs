@@ -11,6 +11,9 @@ pub mod cql_session;
 pub mod docker_provision;
 pub mod driver;
 pub mod endurance;
+/// W8.9 — sim-equivalent endurance run (used when Fly.io is
+/// unavailable; ADR-016 layered verification stack).
+pub mod endurance_sim;
 pub mod firecracker;
 pub mod flyio;
 pub mod history;

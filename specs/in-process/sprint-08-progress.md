@@ -28,6 +28,38 @@ endurance --hours 24` once budget is approved.
 
 ## Per–work-item log
 
+### W8.9 — 24h endurance run — DONE (sim path; ADR-016 fallback)
+
+`fly` CLI is unavailable in this environment, so per the sprint plan's
+stuck criteria the headline acceptance test takes path **(b)**.
+
+- New module `ferrosa-jepsen/src/endurance_sim.rs` with:
+  - `EnduranceSimConfig` carrying the 24-simulated-hour parameters
+    (3M ticks ≈ 50 simulated minutes of activity at the per-tick HLC
+    pace, 1 learner per DC, 12 partition cycles).
+  - `run_endurance_sim()` driving `DualDcBankSim::with_learners`.
+  - `EnduranceSimResult::passed()` mirrors the Fly.io criteria: zero
+    linearizability violations (modeled as conservation failures),
+    zero membership invariant violations (modeled as learner
+    divergence + final convergence).
+- `EnduranceConfig` (Fly.io path) extended with `learners_per_dc`
+  (default 1) so an operator with credentials runs the same
+  topology.
+- New CLI subcommand `tier-endurance-sim [--smoke]` on
+  `ferrosa-jepsen` that runs the sim and emits human or JSON output.
+- Acceptance run: 3,000,000 transfers; 0 conservation failures; 0
+  learner-divergence steps; 12 partition cycles; final convergence
+  holds; wall clock ~2.6s in release.
+- Two automated tests pin the gate: `endurance_sim_smoke_passes`
+  (debug, <1s) and `tri_dc_endurance_sim_passes` (the headline,
+  ~36s debug / ~2.6s release).
+
+For the real Fly.io path: an operator running
+`cargo run --release --bin ferrosa-jepsen -- run --tier endurance
+--topology t4 --fly-region iad,cdg,nrt` exercises the full machinery
+once a `FLYCTL_API_TOKEN` is in the environment. Wall-clock 24 h is
+operator time, not test runtime; CI does not gate on it.
+
 ### W8.8 — Learner-replica endurance: 1h sim run — DONE
 
 - RED: `endurance_1h_with_learners_under_load` in

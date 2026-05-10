@@ -22,6 +22,16 @@ pub struct EnduranceConfig {
     pub verification_window: Duration,
     /// How often to run rolling verification.
     pub verification_interval: Duration,
+    /// W8.9 / ADR-014 — number of long-lived learner replicas per DC.
+    /// The Fly.io tri-DC topology runs 3 voters + this many learners
+    /// per DC. Operators tune this to trade learner read capacity
+    /// against AppendEntries fan-out.
+    #[serde(default = "default_learners_per_dc")]
+    pub learners_per_dc: usize,
+}
+
+fn default_learners_per_dc() -> usize {
+    1
 }
 
 impl Default for EnduranceConfig {
@@ -32,6 +42,7 @@ impl Default for EnduranceConfig {
             nemesis_interval: (Duration::from_secs(30), Duration::from_secs(120)),
             verification_window: Duration::from_secs(600), // 10-minute window
             verification_interval: Duration::from_secs(600), // verify every 10 minutes
+            learners_per_dc: 1,                              // ADR-014 / W8.9 default
         }
     }
 }
@@ -45,6 +56,7 @@ impl EnduranceConfig {
             nemesis_interval: (Duration::from_secs(10), Duration::from_secs(30)),
             verification_window: Duration::from_secs(120),
             verification_interval: Duration::from_secs(120),
+            learners_per_dc: 1,
         }
     }
 }

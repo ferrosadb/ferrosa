@@ -1900,6 +1900,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs-next",
+ "ferrosa-sim",
  "pkcs5",
  "rand 0.10.1",
  "reqwest",
