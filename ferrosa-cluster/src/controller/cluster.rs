@@ -113,6 +113,59 @@ pub(super) fn build_recovered_topology_refresh_plan(
     plan
 }
 
+pub(super) fn build_initial_raft_members(
+    local_host_id: uuid::Uuid,
+    local_addr: SocketAddr,
+    peers: &[(uuid::Uuid, SocketAddr)],
+) -> std::collections::BTreeMap<u64, openraft::BasicNode> {
+    let local_node_id = uuid_to_node_id(local_host_id);
+    let mut members = std::collections::BTreeMap::new();
+    members.insert(
+        local_node_id,
+        openraft::BasicNode {
+            addr: local_addr.to_string(),
+        },
+    );
+    for (peer_uuid, addr) in peers {
+        let peer_node_id = uuid_to_node_id(*peer_uuid);
+        members.insert(
+            peer_node_id,
+            openraft::BasicNode {
+                addr: addr.to_string(),
+            },
+        );
+    }
+    members
+}
+
+pub(super) fn build_raft_members_from_node_info(
+    nodes: &[crate::raft::NodeInfo],
+) -> std::collections::BTreeMap<u64, openraft::BasicNode> {
+    nodes
+        .iter()
+        .map(|node| {
+            (
+                uuid_to_node_id(node.host_id),
+                openraft::BasicNode {
+                    addr: node.addr.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+pub(super) fn membership_addresses_need_repair(
+    current: &std::collections::BTreeMap<u64, openraft::BasicNode>,
+    desired: &std::collections::BTreeMap<u64, openraft::BasicNode>,
+) -> bool {
+    desired.iter().any(|(node_id, desired_node)| {
+        !desired_node.addr.is_empty()
+            && current
+                .get(node_id)
+                .is_none_or(|current_node| current_node.addr != desired_node.addr)
+    })
+}
+
 impl ModeController {
     fn normalize_cluster_peer_addr(&self, addr: SocketAddr) -> SocketAddr {
         SocketAddr::new(addr.ip(), self.net_config.bind_addr.port())
@@ -135,6 +188,13 @@ impl ModeController {
         let Some(pm) = pm_guard.as_ref().as_ref().cloned() else {
             return;
         };
+        {
+            let mut recent = self.recent_reconnect_invites.lock();
+            if recent.len() >= super::MAX_CONNECTED_PEERS {
+                recent.clear();
+            }
+            recent.insert(recipient, std::time::Instant::now());
+        }
         let local_host_id = self.local_host_id;
         // Build the peer list from our `connected_peers` plus self. The
         // recipient is excluded — the receiver doesn't need its own
@@ -421,6 +481,7 @@ impl ModeController {
         let peer_manager_for_bootstrap = peer_manager.clone();
         let local_host_id_for_refresh = self.local_host_id;
         let local_addr_for_refresh = self.net_config.broadcast_addr.to_string();
+        let local_raft_addr_for_init = self.net_config.broadcast_addr;
         let local_cql_broadcast_for_refresh = self.config.cql_broadcast.clone();
 
         // 4. Build TokenRing with deterministic initial tokens.
@@ -1030,23 +1091,14 @@ impl ModeController {
                 });
             }
 
-            // Build initial membership: all known nodes including self
-            let mut members = std::collections::BTreeMap::new();
-            members.insert(
-                local_node_id,
-                openraft::BasicNode {
-                    addr: String::new(),
-                },
+            // Build initial membership: all known nodes including self.
+            // OpenRaft commits this map durably; the local seed must not
+            // author itself with an empty address.
+            let members = build_initial_raft_members(
+                local_host_id_for_refresh,
+                local_raft_addr_for_init,
+                &peers,
             );
-            for (peer_uuid, addr) in &peers {
-                let peer_node_id = uuid_to_node_id(*peer_uuid);
-                members.insert(
-                    peer_node_id,
-                    openraft::BasicNode {
-                        addr: addr.to_string(),
-                    },
-                );
-            }
 
             // Only the seed (original Primary) calls initialize().
             // Non-seed nodes will receive their membership via AppendEntries
@@ -1097,6 +1149,69 @@ impl ModeController {
                         leader = lid,
                         "raft leader elected, swapping DDL path to Cluster"
                     );
+                    if has_recovered_topology_state {
+                        let refresh_plan = build_recovered_topology_refresh_plan(
+                            local_host_id_for_refresh,
+                            local_addr_for_refresh.clone(),
+                            local_cql_broadcast_for_refresh.clone(),
+                            &config_for_promotion.data_center,
+                            &config_for_promotion.rack,
+                            &peers,
+                            &peer_cql_broadcasts,
+                        );
+                        let desired_raft_members = build_raft_members_from_node_info(&refresh_plan);
+                        let raft_for_membership_repair = raft_arc.clone();
+                        tokio::spawn(async move {
+                            let mut interval =
+                                tokio::time::interval(std::time::Duration::from_secs(2));
+                            let mut clean_observations = 0u8;
+                            loop {
+                                interval.tick().await;
+                                let metrics = raft_for_membership_repair.metrics().borrow().clone();
+                                if metrics.state != openraft::ServerState::Leader {
+                                    clean_observations = 0;
+                                    continue;
+                                }
+                                let current_members = metrics
+                                    .membership_config
+                                    .nodes()
+                                    .map(|(node_id, node)| (*node_id, node.clone()))
+                                    .collect();
+                                if !membership_addresses_need_repair(
+                                    &current_members,
+                                    &desired_raft_members,
+                                ) {
+                                    clean_observations = clean_observations.saturating_add(1);
+                                    if clean_observations >= 2 {
+                                        tracing::info!(
+                                            "OpenRaft membership node addresses match recovered topology"
+                                        );
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                clean_observations = 0;
+                                if let Err(e) = raft_for_membership_repair
+                                    .change_membership(
+                                        openraft::ChangeMembers::SetNodes(
+                                            desired_raft_members.clone(),
+                                        ),
+                                        true,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        %e,
+                                        "leader failed to repair OpenRaft membership node addresses; will retry"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "submitted OpenRaft membership node-address repair"
+                                    );
+                                }
+                            }
+                        });
+                    }
                     if has_recovered_topology_state && lid == local_node_id {
                         let refresh_plan = build_recovered_topology_refresh_plan(
                             local_host_id_for_refresh,
@@ -1191,6 +1306,21 @@ impl ModeController {
                         node_map_for_ddl.clone(),
                     ));
                     registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
+
+                    // Register the cluster Raft-forward handler so that when a
+                    // non-leader hits ForwardToLeader on a membership refresh
+                    // (e.g. UpdateNodeInfo from on_peer_connected) it can
+                    // forward the proposal here and the leader proposes it
+                    // locally.  Without this the bug at membership.rs's
+                    // refresh path would silently drop the proposal and the
+                    // joining node's BasicNode addr stays empty forever.
+                    let cluster_raft_forward_handler = Arc::new(
+                        crate::raft_forward::ClusterRaftForwardHandler::new(raft_arc.clone()),
+                    );
+                    registry.register(
+                        MsgType::ClusterRaftForward,
+                        cluster_raft_forward_handler,
+                    );
 
                     ddl_path.store(Arc::new(DdlPath::Cluster {
                         raft: raft_arc.clone(),
@@ -1309,9 +1439,6 @@ impl ModeController {
                         // the cluster is reforming, not adding new token owners.
                         tracing::info!("starting bootstrap streaming to new token owners");
 
-                        /// Partition count threshold above which we switch from
-                        /// per-row streaming to SSTable file-based bulk transfer.
-                        const BOOTSTRAP_SSTABLE_THRESHOLD: usize = 1_000;
 
                         if let Some(ring) = &**ring_for_bootstrap.load() {
                             let schema_snap = schema_for_bootstrap.snapshot();
@@ -1324,7 +1451,102 @@ impl ModeController {
                                     continue;
                                 }
                                 let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
-                                const BOOTSTRAP_READ_LIMIT: usize = 100_000;
+                                // Prefer SSTable file streaming before any row-range scan.
+                                // `StorageEngine::read_range` materializes all partitions from
+                                // all SSTables before applying its limit; on large recovered
+                                // tables that can OOM the joining/restarting node before the
+                                // existing bulk path has a chance to run.
+                                if let Err(e) = storage_for_bootstrap.flush_all() {
+                                    tracing::warn!(%e, ks, tbl, "bootstrap: flush before SSTable stream failed; skipping row fallback to avoid unbounded materialization");
+                                    continue;
+                                }
+
+                                let sstable_base = storage_for_bootstrap
+                                    .data_dir()
+                                    .join("sstables")
+                                    .join(table_id.to_string());
+
+                                let sstable_dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&sstable_base) {
+                                    Ok(entries) => entries
+                                        .filter_map(|e| e.ok())
+                                        .filter(|e| e.path().is_dir())
+                                        .map(|e| e.path())
+                                        .collect(),
+                                    Err(_) => {
+                                        tracing::debug!(ks, tbl, "bootstrap: no SSTable dir at {}, using empty/small row path", sstable_base.display());
+                                        vec![]
+                                    }
+                                };
+
+                                if !sstable_dirs.is_empty() {
+                                    tracing::info!(
+                                        ks,
+                                        tbl,
+                                        sstables = sstable_dirs.len(),
+                                        "bootstrap: using SSTable bulk transfer before row materialization"
+                                    );
+
+                                    let mut sstable_streamed = false;
+                                    for sstable_dir in &sstable_dirs {
+                                        let sstable_id = sstable_dir
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "unknown".to_string());
+
+                                        for (&target_node_id, &target_uuid) in &node_map {
+                                            if target_node_id == local_node_id {
+                                                continue;
+                                            }
+                                            session_counter += 1;
+                                            let request = SstableSendRequest {
+                                                sstable_dir,
+                                                keyspace: ks,
+                                                table: tbl,
+                                                sstable_id: &sstable_id,
+                                                session_id: session_counter,
+                                                source_node: local_node_id,
+                                                chunk_size: config.chunk_size_bytes,
+                                            };
+                                            match StreamSender::send_sstable_files(
+                                                &request,
+                                                &peer_manager_for_bootstrap,
+                                                target_uuid,
+                                            )
+                                            .await
+                                            {
+                                                Ok(bytes) => {
+                                                    tracing::info!(
+                                                        target = target_node_id,
+                                                        bytes,
+                                                        sstable_id = %sstable_id,
+                                                        "bootstrap: SSTable streamed {ks}.{tbl}"
+                                                    );
+                                                    sstable_streamed = true;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        %e,
+                                                        target = target_node_id,
+                                                        sstable_id = %sstable_id,
+                                                        "bootstrap: SSTable stream failed for {ks}.{tbl}; not falling back to unbounded row materialization"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if !sstable_streamed {
+                                        tracing::warn!(
+                                            ks,
+                                            tbl,
+                                            sstables = sstable_dirs.len(),
+                                            "bootstrap: all SSTable streams failed; leaving table for retry/repair instead of row materialization"
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                const BOOTSTRAP_READ_LIMIT: usize = 1_000;
                                 let partitions = match storage_for_bootstrap.read_range(
                                     &table_id,
                                     None,
@@ -1333,94 +1555,10 @@ impl ModeController {
                                 ) {
                                     Ok(p) => p,
                                     Err(e) => {
-                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to read table");
+                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to read small in-memory table");
                                         continue;
                                     }
                                 };
-
-                                if partitions.len() >= BOOTSTRAP_SSTABLE_THRESHOLD {
-                                    tracing::info!(
-                                        ks,
-                                        tbl,
-                                        partitions = partitions.len(),
-                                        "bootstrap: using SSTable bulk transfer (threshold: {BOOTSTRAP_SSTABLE_THRESHOLD})"
-                                    );
-
-                                    if let Err(e) = storage_for_bootstrap.flush_all() {
-                                        tracing::warn!(%e, ks, tbl, "bootstrap: flush before SSTable stream failed, falling back to row path");
-                                    } else {
-                                        let sstable_base = storage_for_bootstrap
-                                            .data_dir()
-                                            .join("sstables")
-                                            .join(table_id.to_string());
-
-                                        let sstable_dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&sstable_base) {
-                                            Ok(entries) => entries
-                                                .filter_map(|e| e.ok())
-                                                .filter(|e| e.path().is_dir())
-                                                .map(|e| e.path())
-                                                .collect(),
-                                            Err(_) => {
-                                                tracing::debug!(ks, tbl, "bootstrap: no SSTable dir at {}, using row path", sstable_base.display());
-                                                vec![]
-                                            }
-                                        };
-
-                                        if !sstable_dirs.is_empty() {
-                                            let mut sstable_streamed = false;
-                                            for sstable_dir in &sstable_dirs {
-                                                let sstable_id = sstable_dir
-                                                    .file_name()
-                                                    .map(|n| n.to_string_lossy().to_string())
-                                                    .unwrap_or_else(|| "unknown".to_string());
-
-                                                for (&target_node_id, &target_uuid) in &node_map {
-                                                    if target_node_id == local_node_id {
-                                                        continue;
-                                                    }
-                                                    session_counter += 1;
-                                                    let request = SstableSendRequest {
-                                                        sstable_dir,
-                                                        keyspace: ks,
-                                                        table: tbl,
-                                                        sstable_id: &sstable_id,
-                                                        session_id: session_counter,
-                                                        source_node: local_node_id,
-                                                        chunk_size: config.chunk_size_bytes,
-                                                    };
-                                                    match StreamSender::send_sstable_files(
-                                                        &request,
-                                                        &peer_manager_for_bootstrap,
-                                                        target_uuid,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(bytes) => {
-                                                            tracing::info!(
-                                                                target = target_node_id,
-                                                                bytes,
-                                                                sstable_id = %sstable_id,
-                                                                "bootstrap: SSTable streamed {ks}.{tbl}"
-                                                            );
-                                                            sstable_streamed = true;
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                %e,
-                                                                target = target_node_id,
-                                                                sstable_id = %sstable_id,
-                                                                "bootstrap: SSTable stream failed for {ks}.{tbl}"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if sstable_streamed {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
 
                                 let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
                                     std::collections::HashMap::new();

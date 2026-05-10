@@ -34,6 +34,7 @@ pub use mutation::Mutation;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -57,6 +58,13 @@ pub static EMPTY_SEGMENT_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Reads the `EMPTY_SEGMENT_SKIPPED_TOTAL` counter.
 pub fn empty_segment_skipped_total() -> u64 {
     EMPTY_SEGMENT_SKIPPED_TOTAL.load(Ordering::Relaxed)
+}
+
+fn is_zeroed_segment_header(path: &std::path::Path) -> ferrosa_common::Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; descriptor::HEADER_SIZE];
+    file.read_exact(&mut header)?;
+    Ok(header.iter().all(|byte| *byte == 0))
 }
 
 /// The commit log: write-ahead log for mutation durability.
@@ -231,7 +239,20 @@ impl CommitLog {
                          file will be cleaned up below"
                     );
                     if let Err(e) = fs::remove_file(path) {
-                        tracing::warn!(%e, "commitlog: failed to remove zero-byte segment file");
+                        tracing::warn!(%e, "commitlog: failed to remove torn segment file");
+                    }
+                    continue;
+                }
+                Ok(_) if is_zeroed_segment_header(path)? => {
+                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        segment_id = id,
+                        path = %path.display(),
+                        "commitlog: skipping segment with all-zero header on replay \
+                         (preallocated/torn segment from previous crash); file will be cleaned up below"
+                    );
+                    if let Err(e) = fs::remove_file(path) {
+                        tracing::warn!(%e, "commitlog: failed to remove torn segment file");
                     }
                     continue;
                 }
@@ -619,6 +640,16 @@ impl CommitLog {
                         path = %path.display(),
                         bytes = meta.len(),
                         "commitlog: skipping too-short segment on catch-up replay"
+                    );
+                    continue;
+                }
+                Ok(_) if is_zeroed_segment_header(path)? => {
+                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        segment_id = id,
+                        path = %path.display(),
+                        "commitlog: skipping segment with all-zero header on catch-up replay \
+                         (preallocated/torn segment from previous crash)"
                     );
                     continue;
                 }
@@ -1500,6 +1531,43 @@ mod tests {
             "the partial-header segment must be cleaned up by replay"
         );
 
+        cl.shutdown().unwrap();
+    }
+
+    /// Regression: a crash can leave a preallocated segment-sized file with an
+    /// all-zero header. That has no valid descriptor or records and must be
+    /// treated like a torn create, not as fatal ChecksumMismatch.
+    #[test]
+    fn open_and_replay_tolerates_zeroed_header_segment() {
+        use super::descriptor::HEADER_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+
+        let bad_path = dir.path().join("commitlog-47.log");
+        let mut bytes = vec![0u8; HEADER_SIZE + 4096];
+        // Leave the header zeroed; the extra bytes model a sparse/preallocated
+        // tail observed after an OOM crash.
+        std::fs::write(&bad_path, &bytes).unwrap();
+        assert_eq!(
+            std::fs::read(&bad_path).unwrap()[..HEADER_SIZE],
+            bytes[..HEADER_SIZE]
+        );
+
+        let before = empty_segment_skipped_total();
+        let config = CommitLogConfig::test_config(dir.path());
+        let (cl, mutations) = CommitLog::open_and_replay(config)
+            .expect("open_and_replay must tolerate all-zero-header torn segments at startup");
+
+        assert!(mutations.is_empty());
+        assert!(
+            empty_segment_skipped_total() > before,
+            "zeroed-header segment must increment the skipped-segment counter"
+        );
+        assert!(
+            !bad_path.exists(),
+            "the zeroed-header segment must be cleaned up by replay"
+        );
+
+        bytes[0] = 1; // keep the local buffer used so the test documents intent.
         cl.shutdown().unwrap();
     }
 }

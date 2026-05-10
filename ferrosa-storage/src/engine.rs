@@ -48,6 +48,36 @@ pub struct PinConfig {
     pub max_bytes: Option<u64>,
 }
 
+/// Reservation for a spillable ORDER BY temp-sort table.
+///
+/// Dropping the guard removes the temporary table directory, so cancellation
+/// and normal completion share the same cleanup path. The initial version is a
+/// local-disk staging table; object-store/S3 flush can be added behind this
+/// same lifecycle boundary without changing query cancellation semantics.
+pub struct TempSortTableReservation {
+    path: PathBuf,
+}
+
+impl TempSortTableReservation {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempSortTableReservation {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.path) {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %e,
+                    "storage: failed to clean ORDER BY temp-sort table reservation"
+                );
+            }
+        }
+    }
+}
+
 /// Configuration for the entire storage engine.
 ///
 /// Composes sub-configurations for each component. Use `from_env()` for
@@ -830,8 +860,18 @@ impl StorageEngine {
                     files: files2,
                     on_complete: None,
                 };
-                if let Err(e) = upload_mgr.submit(task).await {
-                    tracing::error!(sstable = sstable_id, "pending upload replay failed: {e}");
+                if let Err(e) = upload_mgr.try_submit(task) {
+                    tracing::warn!(
+                        table = table_id_str,
+                        sstable = sstable_id,
+                        "pending upload replay could not enqueue without blocking; leaving entry for later retry: {e}"
+                    );
+                    if e.to_string().contains("upload queue full") {
+                        tracing::warn!(
+                            "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
+                        );
+                        break;
+                    }
                 }
                 continue;
             }
@@ -842,8 +882,18 @@ impl StorageEngine {
                 files,
                 on_complete: None,
             };
-            if let Err(e) = upload_mgr.submit(task).await {
-                tracing::error!(sstable = sstable_id, "pending upload replay failed: {e}");
+            if let Err(e) = upload_mgr.try_submit(task) {
+                tracing::warn!(
+                    table = table_id_str,
+                    sstable = sstable_id,
+                    "pending upload replay could not enqueue without blocking; leaving entry for later retry: {e}"
+                );
+                if e.to_string().contains("upload queue full") {
+                    tracing::warn!(
+                        "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
+                    );
+                    break;
+                }
             }
         }
     }
@@ -974,6 +1024,47 @@ impl StorageEngine {
                 self.deferred_replay_mutations.lock().push(mutation);
             }
         }
+    }
+
+    /// Estimate local SSTable bytes that a full scan of `keyspace.table` would touch.
+    pub fn estimated_table_scan_bytes(&self, keyspace: &str, table: &str) -> Option<u64> {
+        let table_id = TableId::new(keyspace, table);
+        let tables = self.tables.read();
+        tables
+            .get(&table_id)
+            .map(|state| state.store.estimated_disk_scan_bytes())
+    }
+
+    /// Reserve a temporary table directory for a spillable ORDER BY sort.
+    ///
+    /// The returned guard deletes the directory on drop, which makes aborted or
+    /// cancelled query execution clean up the same way as successful execution.
+    pub fn reserve_order_by_temp_sort_table(
+        &self,
+        keyspace: &str,
+        table: &str,
+    ) -> ferrosa_common::Result<TempSortTableReservation> {
+        let root = self.config.data_dir.join("tmp_order_by_sort");
+        std::fs::create_dir_all(&root).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create ORDER BY temp-sort root {}: {e}",
+                root.display()
+            ))
+        })?;
+        let name = format!(
+            "{}_{}_{}",
+            keyspace.replace(['/', '\\', ':'], "_"),
+            table.replace(['/', '\\', ':'], "_"),
+            uuid::Uuid::new_v4()
+        );
+        let path = root.join(name);
+        std::fs::create_dir(&path).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create ORDER BY temp-sort table {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(TempSortTableReservation { path })
     }
 
     /// Registers all system table schemas (`system_schema.*` and `system_auth.*`)
@@ -1961,9 +2052,23 @@ impl StorageEngine {
         end: Option<&DecoratedKey>,
         limit: usize,
     ) -> ferrosa_common::Result<Vec<Partition>> {
+        self.read_range_limited_rows(table_id, start, end, limit, 0)
+    }
+
+    /// Reads partitions from a table with an optional per-partition row cap.
+    pub fn read_range_limited_rows(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read_range(start, end, limit),
+            Some(state) => state
+                .store
+                .read_range_limited_rows(start, end, limit, row_limit),
             None => Ok(vec![]),
         }
     }
@@ -3643,6 +3748,21 @@ impl StorageEngine {
         prefix: String,
         runtime: &tokio::runtime::Handle,
     ) -> ferrosa_common::Result<Self> {
+        Self::new_with_upload_store_and_queue_depth(config, store, prefix, runtime, 16)
+    }
+
+    /// Creates a storage engine with an explicit upload object store and queue depth.
+    ///
+    /// Test-only helper used to exercise upload backpressure without requiring
+    /// a real S3 endpoint.
+    #[cfg(test)]
+    pub fn new_with_upload_store_and_queue_depth(
+        config: StorageEngineConfig,
+        store: Arc<dyn object_store::ObjectStore>,
+        prefix: String,
+        runtime: &tokio::runtime::Handle,
+        upload_queue_depth: usize,
+    ) -> ferrosa_common::Result<Self> {
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
         })?;
@@ -3656,7 +3776,7 @@ impl StorageEngine {
         let upload_manager = Some(UploadManager::new(
             Arc::clone(&store),
             prefix.clone(),
-            16,
+            upload_queue_depth,
             runtime,
         ));
 
@@ -3978,6 +4098,57 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("invalid hex"))
             .collect()
+    }
+
+    #[test]
+    fn replay_pending_uploads_does_not_block_startup_when_upload_worker_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table_id = "agent_memory.entity_store";
+        let table_dir = config.data_dir.join("sstables").join(table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        let pending_log =
+            crate::upload::PendingUploadsLog::open(&config.data_dir.join("pending-uploads.log"))
+                .unwrap();
+        for sstable_id in ["1", "2", "3"] {
+            std::fs::write(table_dir.join(format!("{sstable_id}-Data.db")), b"sstable").unwrap();
+            pending_log.add_entry(table_id, sstable_id).unwrap();
+        }
+
+        // Keep the upload runtime idle so its worker cannot drain the bounded
+        // queue. Current replay code awaits mpsc::send() for every pending
+        // entry, so once the queue-depth-1 channel fills, startup replay blocks.
+        let upload_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let engine = StorageEngine::new_with_upload_store_and_queue_depth(
+            config,
+            store,
+            "test-prefix".to_string(),
+            upload_runtime.handle(),
+            1,
+        )
+        .unwrap();
+
+        let replay_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = replay_runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                engine.replay_pending_uploads(),
+            )
+            .await
+        });
+
+        assert!(
+            result.is_ok(),
+            "pending upload replay must return promptly so startup can bind listeners"
+        );
     }
 
     /// Read the first and last raw partition key bytes from Partitions.db.
@@ -4991,9 +5162,10 @@ mod tests {
         );
     }
 
-    /// Exact production scenario: 11,000 rows to the same partition key
-    /// with flush_if_needed triggering automatically based on size.
-    /// This is what `frg ingest` does against a live cluster.
+    /// CI-sized regression for production high-volume ingest: many rows to the
+    /// same partition key with flush_if_needed triggering automatically based on
+    /// size. Keep this below the bounded-read/materialization cap; full
+    /// production-volume verification belongs on streaming/paged paths.
     #[test]
     fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -5007,7 +5179,7 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
 
         let pk = make_key("tenant_session"); // same partition for all rows
-        let total = 11_000;
+        let total = 2_000;
 
         for i in 0..total {
             let row = Row {

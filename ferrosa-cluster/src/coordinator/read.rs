@@ -78,6 +78,53 @@ pub fn select_index_ready_replicas(
     ready
 }
 
+trait RangeReadStorage {
+    fn read_range_unbounded(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>>;
+
+    fn read_range_bounded_rows(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>>;
+}
+
+impl RangeReadStorage for ferrosa_storage::StorageEngine {
+    fn read_range_unbounded(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        self.read_range(table_id, None, None, limit)
+    }
+
+    fn read_range_bounded_rows(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        self.read_range_limited_rows(table_id, None, None, limit, row_limit)
+    }
+}
+
+fn read_local_range_limited_rows(
+    storage: &impl RangeReadStorage,
+    table_id: &TableId,
+    limit: usize,
+    row_limit: usize,
+) -> ferrosa_common::Result<Vec<Partition>> {
+    if row_limit > 0 {
+        storage.read_range_bounded_rows(table_id, limit, row_limit)
+    } else {
+        storage.read_range_unbounded(table_id, limit)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal result type for a single replica read
 // ---------------------------------------------------------------------------
@@ -815,14 +862,34 @@ impl ClusterCoordinator {
     ///
     /// Must be shorter than the CQL client timeout (typically 10s) so the
     /// coordinator returns a result (even partial/error) before the client
-    /// gives up. A 120s timeout caused SELECT to hang on startup when
+    /// gives up. A long timeout caused SELECT to hang on startup when
     /// remote nodes hadn't established connections yet.
-    const BULK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const BULK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
     pub async fn coordinate_range_read(
         &self,
         table_id: &TableId,
     ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        self.coordinate_range_read_limited(table_id, crate::write_path::DEFAULT_RANGE_READ_LIMIT)
+            .await
+    }
+
+    pub async fn coordinate_range_read_limited(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        self.coordinate_range_read_limited_rows(table_id, limit, 0)
+            .await
+    }
+
+    pub async fn coordinate_range_read_limited_rows(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+        row_limit: usize,
+    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        let limit = limit.clamp(1, crate::write_path::DEFAULT_RANGE_READ_LIMIT);
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
 
@@ -836,6 +903,8 @@ impl ClusterCoordinator {
         let req_payload = RangeReadRequestPayload {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
+            limit,
+            row_limit,
         };
         let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
 
@@ -856,8 +925,7 @@ impl ClusterCoordinator {
 
                 async move {
                     if node_id == local_id {
-                        storage
-                            .read_range(&table_id, None, None, 1_000_000)
+                        read_local_range_limited_rows(storage.as_ref(), &table_id, limit, row_limit)
                             .map_err(ClusterError::Storage)
                     } else {
                         let (hid, addr) = remote.ok_or_else(|| {
@@ -894,7 +962,7 @@ impl ClusterCoordinator {
                                 if payload.truncated {
                                     tracing::warn!(
                                         peer = %hid,
-                                        "range read response truncated at 1M partitions; \
+                                        "range read response truncated at the range-read materialization cap; \
                                          results may be incomplete"
                                     );
                                 }
@@ -2617,6 +2685,102 @@ mod tests {
         );
     }
 
+    struct GeneratorRangeStorage {
+        generated_rows: usize,
+    }
+
+    impl RangeReadStorage for GeneratorRangeStorage {
+        fn read_range_unbounded(
+            &self,
+            _table_id: &TableId,
+            _limit: usize,
+        ) -> ferrosa_common::Result<Vec<Partition>> {
+            panic!("bounded local coordinator path must not call unbounded storage read");
+        }
+
+        fn read_range_bounded_rows(
+            &self,
+            _table_id: &TableId,
+            limit: usize,
+            row_limit: usize,
+        ) -> ferrosa_common::Result<Vec<Partition>> {
+            assert_eq!(limit, 1, "partition limit should be passed through");
+            assert_eq!(row_limit, 1, "row_limit should be passed through");
+            let retained = self.generated_rows.min(row_limit);
+            Ok(vec![Partition {
+                key: test_key(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: (0..retained)
+                    .map(|i| {
+                        let mut row = test_row(i as i64);
+                        row.clustering = (i as u32).to_be_bytes().to_vec();
+                        row
+                    })
+                    .collect(),
+            }])
+        }
+    }
+
+    #[test]
+    fn local_range_read_limited_rows_uses_bounded_generator_storage() {
+        let storage = GeneratorRangeStorage {
+            generated_rows: 100_000,
+        };
+        let table_id = TableId::new("test_ks", "test_tbl");
+
+        let partitions = read_local_range_limited_rows(&storage, &table_id, 1, 1)
+            .expect("bounded local range read should use generator storage bounded seam");
+
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinate_range_read_limited_rows_bounds_local_replica_before_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        for i in 0..20_000u32 {
+            let mut row = test_row(i as i64);
+            row.clustering = i.to_be_bytes().to_vec();
+            storage.write(&table_id, &key, row, i as i64).unwrap();
+        }
+        storage.flush(&table_id).unwrap();
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(75),
+            coordinator.coordinate_range_read_limited_rows(&table_id, 1, 1),
+        )
+        .await
+        .expect("local bounded range read must not materialize all rows before LIMIT");
+
+        let partitions = read.expect("bounded local range read should succeed");
+        assert_eq!(partitions.len(), 1, "expected the one written partition");
+        assert_eq!(
+            partitions[0].rows.len(),
+            1,
+            "row_limit=1 must retain only one row from the partition"
+        );
+    }
+
     #[tokio::test]
     async fn coordinate_range_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
         let dir = tempfile::tempdir().unwrap();
@@ -2634,7 +2798,7 @@ mod tests {
             MsgType::RangeReadRequest,
             Arc::new(DelayedRangeReadHandler {
                 partition: partition.clone(),
-                delay: std::time::Duration::from_secs(6),
+                delay: std::time::Duration::from_secs(1),
             }),
         )
         .await;
@@ -2712,7 +2876,7 @@ mod tests {
             MsgType::IndexReadRequest,
             Arc::new(DelayedIndexReadHandler {
                 partition: partition.clone(),
-                delay: std::time::Duration::from_secs(6),
+                delay: std::time::Duration::from_secs(1),
             }),
         )
         .await;

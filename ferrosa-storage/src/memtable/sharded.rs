@@ -181,6 +181,43 @@ impl Memtable for ShardedBTreeMemtable {
         k_way_merge(shard_data)
     }
 
+    fn snapshot_range_limited(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+    ) -> Vec<Partition> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Each shard contributes at most `limit` matches, so this avoids the
+        // previous all-memtable materialization while preserving global token
+        // order after the k-way merge. The over-read is bounded by
+        // num_shards * limit, not table cardinality.
+        let shard_data: Vec<Vec<Partition>> = std::thread::scope(|s| {
+            let handles: Vec<_> = self
+                .shards
+                .iter()
+                .map(|shard| {
+                    s.spawn(|| {
+                        let guard = shard.read();
+                        guard
+                            .iter()
+                            .filter(|(key, _)| {
+                                start.is_none_or(|s| *key >= s) && end.is_none_or(|e| *key <= e)
+                            })
+                            .take(limit)
+                            .map(|(_, arc)| Partition::clone(arc))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        k_way_merge(shard_data).into_iter().take(limit).collect()
+    }
+
     fn size_bytes(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }

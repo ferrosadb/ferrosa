@@ -38,6 +38,15 @@ fn should_yield_during_reconciliation(processed: usize, yield_every: usize) -> b
     yield_every > 0 && processed > 0 && processed.is_multiple_of(yield_every)
 }
 
+async fn skip_immediate_reconciliation_tick(ticker: &mut tokio::time::Interval) {
+    // `tokio::time::interval` ticks immediately on first poll. Reconciliation is
+    // a safety-net scan over potentially large graph tables, so starting it
+    // immediately on process boot competes with cluster formation and can keep a
+    // runtime worker busy before the node has accepted user traffic. Consume the
+    // immediate tick so the first pass runs after the configured interval.
+    ticker.tick().await;
+}
+
 /// Run one reconciliation pass for a keyspace.
 pub async fn reconcile_once(
     schema: &Schema,
@@ -391,6 +400,7 @@ pub fn spawn_reconciliation(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        skip_immediate_reconciliation_tick(&mut ticker).await;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -446,6 +456,22 @@ mod tests {
     #[test]
     fn reconcile_yield_policy_can_be_disabled() {
         assert!(!should_yield_during_reconciliation(32, 0));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_timer_skips_immediate_first_tick() {
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+
+        // This would otherwise complete immediately. After the helper, the next
+        // tick should wait for the configured interval instead of launching a
+        // full reconciliation pass at process startup.
+        skip_immediate_reconciliation_tick(&mut ticker).await;
+
+        let next_tick = tokio::time::timeout(Duration::from_millis(10), ticker.tick()).await;
+        assert!(
+            next_tick.is_err(),
+            "reconciliation should not run again until the configured interval elapses"
+        );
     }
 
     fn test_storage_engine(dir: &std::path::Path) -> Arc<StorageEngine> {

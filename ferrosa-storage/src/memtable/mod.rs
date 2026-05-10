@@ -99,6 +99,22 @@ pub trait Memtable: Send + Sync {
     /// active view — no new writes are coming.
     fn snapshot(&self) -> Vec<Partition>;
 
+    /// Collect at most `limit` partitions in token order within the optional
+    /// range. Implementations should avoid cloning/materializing partitions
+    /// after the requested window is full.
+    fn snapshot_range_limited(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+    ) -> Vec<Partition> {
+        self.snapshot()
+            .into_iter()
+            .filter(|p| start.is_none_or(|s| p.key >= *s) && end.is_none_or(|e| p.key <= *e))
+            .take(limit)
+            .collect()
+    }
+
     /// Approximate memory usage in bytes. Wait-free (`AtomicUsize`).
     fn size_bytes(&self) -> usize;
 
