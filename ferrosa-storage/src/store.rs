@@ -44,6 +44,7 @@ use crate::merge;
 /// Maximum number of row positions collected from secondary index before
 /// returning an error. Prevents OOM from high-cardinality queries.
 const INDEX_RESULT_CAP: usize = 10_000;
+const RANGE_READ_MATERIALIZATION_CAP: usize = 10_000;
 
 /// Atomic snapshot of the storage engine's current state.
 ///
@@ -384,6 +385,22 @@ impl<F: FlushTarget> TableStore<F> {
     /// rejects (Layer 3 of the timeuuid-flush-wedge fix).
     pub fn flush_dir(&self) -> &std::path::Path {
         self.flush_target.base_dir()
+    }
+
+    /// Estimate on-disk bytes that a full table scan would need to touch.
+    ///
+    /// This intentionally counts only SSTable component files already present
+    /// on local disk. It is a cheap planner signal for expensive read shapes
+    /// such as arbitrary unbounded `ORDER BY`; it is not a billing-accurate
+    /// byte counter and does not include active/flushing memtable contents.
+    pub fn estimated_disk_scan_bytes(&self) -> u64 {
+        let guard = self.view.load();
+        guard
+            .sstable_ids
+            .iter()
+            .map(|(gen, dir)| dir.join(format!("{gen}-Data.db")))
+            .filter_map(|path| std::fs::metadata(path).ok().map(|meta| meta.len()))
+            .sum()
     }
 
     /// Write a row into the active memtable and update secondary indexes.
@@ -896,35 +913,71 @@ impl<F: FlushTarget> TableStore<F> {
     /// Reads partitions from the memtable in token order with an optional
     /// token range filter and limit.
     ///
-    /// Currently scans the active memtable only (full snapshot, then filter).
-    /// This is O(N) in the memtable size — acceptable for an initial impl
-    /// but should be optimized with a range-aware iterator when the
-    /// SkipListMemtable is available. SSTable range reads will be added
-    /// when the SSTable reader supports range iteration.
+    /// Bounds partition materialization and can optionally bound retained rows
+    /// per partition for safe LIMIT-first scan shapes.
     pub fn read_range(
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
         limit: usize,
     ) -> Result<Vec<Partition>> {
-        let guard = self.view.load();
+        self.read_range_limited_rows(start, end, limit, 0)
+    }
 
-        // Collect partitions from all sources: active memtable, flushing
-        // memtable, and SSTables. Merge by partition key.
-        let mut all_partitions: Vec<Partition> = Vec::new();
-
-        // Active memtable
-        let snapshot = guard.active.snapshot();
-        all_partitions.extend(snapshot);
-
-        // Flushing memtable
-        if let Some(ref flushing) = guard.flushing {
-            all_partitions.extend(flushing.snapshot());
+    pub fn read_range_limited_rows(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+        row_limit: usize,
+    ) -> Result<Vec<Partition>> {
+        if limit > RANGE_READ_MATERIALIZATION_CAP {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "range read limit {limit} exceeds materialization cap {RANGE_READ_MATERIALIZATION_CAP}; use a paged/streaming read path"
+            )));
         }
 
-        // SSTables — read all partitions from each
+        let guard = self.view.load();
+
+        // Collect partitions from bounded sources only. This is still a
+        // materializing read path, so fail closed once the requested window is
+        // exhausted instead of continuing to decode arbitrary table volume.
+        let mut all_partitions: Vec<Partition> = Vec::new();
+
+        let trim_rows = |partitions: &mut Vec<Partition>| {
+            if row_limit > 0 {
+                for partition in partitions {
+                    partition.rows.truncate(row_limit);
+                }
+            }
+        };
+
+        // Active memtable: clone only the requested window, not the whole
+        // active memtable. This keeps CQL LIMIT/page-size scans from hanging
+        // behind full-table materialization.
+        let mut active = guard.active.snapshot_range_limited(start, end, limit);
+        trim_rows(&mut active);
+        all_partitions.extend(active);
+
+        // Flushing memtable
+        if all_partitions.len() < limit {
+            if let Some(ref flushing) = guard.flushing {
+                let remaining = limit.saturating_sub(all_partitions.len());
+                let mut flushing_parts = flushing.snapshot_range_limited(start, end, remaining);
+                trim_rows(&mut flushing_parts);
+                all_partitions.extend(flushing_parts);
+            }
+        }
+
+        // SSTables — read only the remaining budget from each, and when a row
+        // cap is requested skip unretained rows while decoding instead of
+        // materializing full wide partitions and truncating afterwards.
         for (i, sstable) in guard.sstables.iter().enumerate() {
-            match sstable.read_all_partitions() {
+            let remaining = limit.saturating_sub(all_partitions.len());
+            if remaining == 0 {
+                break;
+            }
+            match sstable.read_partitions_limited_rows(remaining, row_limit) {
                 Ok(parts) => all_partitions.extend(parts),
                 Err(e) => {
                     let id = guard
@@ -1512,6 +1565,20 @@ mod tests {
                 ..WriteOptions::default()
             },
         )
+    }
+
+    #[test]
+    fn range_read_rejects_unbounded_materialization_limit() {
+        let store = test_store();
+
+        let err = store
+            .read_range(None, None, RANGE_READ_MATERIALIZATION_CAP + 1)
+            .expect_err("range reads above the materialization cap must fail closed");
+
+        assert!(
+            err.to_string().contains("paged/streaming read path"),
+            "error should direct callers away from materializing scans: {err}"
+        );
     }
 
     // -------------------------------------------------------------------------

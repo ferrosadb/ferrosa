@@ -102,10 +102,14 @@ impl Default for GraphConfig {
         Self {
             engine: GraphEngineConfig::default(),
             http: crate::http::GraphHttpConfig::default(),
-            reconciliation_interval: std::time::Duration::from_secs(300),
+            reconciliation_interval: std::time::Duration::ZERO,
             enabled: false,
         }
     }
+}
+
+fn background_reconciliation_enabled(interval: std::time::Duration) -> bool {
+    !interval.is_zero()
 }
 
 /// Default per-connection subscription limit (FMEA F5).
@@ -269,7 +273,9 @@ impl GraphEngine {
             // spawn_reconciliation requires a tokio runtime. In test
             // contexts (e.g., proptest without #[tokio::test]), there may
             // be no runtime. Check before spawning.
-            if tokio::runtime::Handle::try_current().is_ok() {
+            if background_reconciliation_enabled(reconciliation_interval)
+                && tokio::runtime::Handle::try_current().is_ok()
+            {
                 let handle = spawn_reconciliation(
                     Arc::clone(&schema),
                     Arc::new(WritePath::direct(Arc::clone(&storage))),
@@ -1121,10 +1127,17 @@ mod tests {
     fn graph_config_defaults() {
         let config = GraphConfig::default();
         assert!(!config.enabled);
-        assert_eq!(
-            config.reconciliation_interval,
+        assert_eq!(config.reconciliation_interval, std::time::Duration::ZERO);
+        assert!(!background_reconciliation_enabled(
+            config.reconciliation_interval
+        ));
+    }
+
+    #[test]
+    fn positive_reconciliation_interval_enables_background_safety_net() {
+        assert!(background_reconciliation_enabled(
             std::time::Duration::from_secs(300)
-        );
+        ));
     }
 
     /// Helper to create a StorageEngine for tests using a temp directory.

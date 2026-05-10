@@ -11,6 +11,23 @@ use crate::mode::DeploymentMode;
 
 use super::ModeController;
 
+pub(super) fn should_send_cluster_invite_after_join_trigger(
+    join_enqueued: bool,
+    last_sent: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    // Join proposals and ClusterInvite delivery solve different problems.
+    // A recreated existing member may already be present in the ring with
+    // current metadata, so trigger_cluster_join() intentionally dedupes the
+    // JoinNode/UpdateNodeInfo proposal. That peer can still be in pair mode,
+    // though, and needs a fresh ClusterInvite to transition into cluster mode
+    // and register Raft/Bulk/Data handlers.
+    join_enqueued
+        || last_sent
+            .map(|sent| now.duration_since(sent) >= super::CLUSTER_RECONNECT_INVITE_COOLDOWN)
+            .unwrap_or(true)
+}
+
 impl PeerEventListener for ModeController {
     fn on_peer_connected(&self, peer: PeerId) {
         let (host_id, addr) = peer;
@@ -55,7 +72,7 @@ impl PeerEventListener for ModeController {
                     .as_ref()
                     .as_ref()
                     .and_then(|pm| pm.get_peer_cql_broadcast_sync(host_id));
-                self.trigger_cluster_join(host_id, addr, cql_broadcast);
+                let enqueued = self.trigger_cluster_join(host_id, addr, cql_broadcast);
                 // Re-broadcast ClusterInvite to the new peer. The pair →
                 // forming → cluster transition delivered an invite once,
                 // but a peer that crashed or was recreated *after* that
@@ -63,7 +80,13 @@ impl PeerEventListener for ModeController {
                 // in pair mode with no Raft handler registered. Without
                 // this, recreating any single node breaks Raft quorum
                 // forever. Match the connect path used by `transition_to_*`.
-                self.send_cluster_invite_to(host_id);
+                if should_send_cluster_invite_after_join_trigger(
+                    enqueued,
+                    self.recent_reconnect_invites.lock().get(&host_id).copied(),
+                    std::time::Instant::now(),
+                ) {
+                    self.send_cluster_invite_to(host_id);
+                }
             }
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "peer connected during formation");
@@ -241,12 +264,18 @@ impl InboundPeerCallback for ModeController {
             }
             DeploymentMode::Cluster => {
                 tracing::info!(peer = %host_id, "new inbound peer in cluster mode, triggering join");
-                self.trigger_cluster_join(host_id, reverse_addr, cql_broadcast);
+                let enqueued = self.trigger_cluster_join(host_id, reverse_addr, cql_broadcast);
                 // See on_peer_connected for the full rationale: a recreated
                 // peer would otherwise miss the one-shot ClusterInvite from
                 // the original pair → forming → cluster transition and
                 // stay stuck in pair mode (no Raft handler → no quorum).
-                self.send_cluster_invite_to(host_id);
+                if should_send_cluster_invite_after_join_trigger(
+                    enqueued,
+                    self.recent_reconnect_invites.lock().get(&host_id).copied(),
+                    std::time::Instant::now(),
+                ) {
+                    self.send_cluster_invite_to(host_id);
+                }
             }
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "inbound peer during formation");

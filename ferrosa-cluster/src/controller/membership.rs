@@ -262,12 +262,18 @@ impl ModeController {
     /// Checks de-duplication (via `pending_joins`), approval (via `approved_nodes`
     /// or `auto_join`), and spawns an async task to propose `JoinNode` +
     /// `AssignTokens` via Raft.
+    ///
+    /// Returns `true` only when a join/metadata refresh was newly enqueued.
+    /// Cluster-mode reconnect handling uses this to avoid re-sending
+    /// `ClusterInvite` on every duplicate reconnect for an already-known live
+    /// member; unbounded invite storms churn lanes and make LOCAL_QUORUM reads
+    /// time out even while containers look healthy.
     pub(super) fn trigger_cluster_join(
         &self,
         host_id: Uuid,
         addr: std::net::SocketAddr,
         cql_broadcast: Option<String>,
-    ) {
+    ) -> bool {
         let peer_manager = self.peer_manager.load().as_ref().as_ref().cloned();
         let has_outbound_peer = peer_manager
             .as_ref()
@@ -288,7 +294,7 @@ impl ModeController {
                     node_id = peer_node_id,
                     "peer already present in token ring with current metadata, skipping join trigger"
                 );
-                return;
+                return false;
             }
         }
 
@@ -297,7 +303,7 @@ impl ModeController {
             let approved = self.approved_nodes.lock();
             if !approved.contains(&host_id) {
                 tracing::warn!(peer = %host_id, "peer not approved to join cluster, ignoring");
-                return;
+                return false;
             }
         }
 
@@ -309,7 +315,7 @@ impl ModeController {
             let mut pending = pending_joins.lock();
             if pending.contains(&host_id) {
                 tracing::debug!(peer = %host_id, "peer join already pending, skipping duplicate trigger");
-                return;
+                return false;
             }
             if pending.len() >= super::MAX_PENDING_JOINS {
                 tracing::warn!(
@@ -331,6 +337,9 @@ impl ModeController {
         let local_host_id = self.local_host_id;
         let raft_runtime = self.raft_runtime.get().cloned();
         let data_runtime = self.data_runtime.get().cloned();
+        // Ring is needed for resolving the Raft leader's u64 NodeId back to a
+        // ferrosa Uuid when openraft asks us to forward a non-leader proposal.
+        let ring_holder = self.ring.clone();
 
         self.spawn_tracked(async move {
             if let Some(pm) = peer_manager.as_ref() {
@@ -423,19 +432,77 @@ impl ModeController {
                     }),
                     schema_version: Uuid::new_v4(),
                 };
-                let refresh_result = raft.client_write(refresh_cmd).await;
-                clear_pending_join(&pending_joins, host_id);
-                if let Err(e) = refresh_result {
-                    tracing::warn!(peer = %host_id, leader, %e, "UpdateNodeInfo proposal failed");
-                    return;
-                }
 
-                tracing::info!(
-                    peer = %host_id,
-                    node_id = peer_node_id,
-                    leader,
-                    "peer metadata refreshed via on_peer_connected"
-                );
+                let refresh_result = raft.client_write(refresh_cmd.clone()).await;
+                clear_pending_join(&pending_joins, host_id);
+
+                let outcome = match refresh_result {
+                    Ok(_) => Ok(()),
+                    Err(raft_err) => {
+                        Err(crate::raft_forward::classify_client_write_error(&raft_err))
+                    }
+                };
+                let was_local_ok = outcome.is_ok();
+
+                let dispatch_pm = peer_manager.clone();
+                let dispatch_ring = ring_holder.clone();
+                let dispatch_result = crate::raft_forward::dispatch_propose_outcome(
+                    outcome,
+                    refresh_cmd,
+                    move |leader_node_id| {
+                        (**dispatch_ring.load())
+                            .as_ref()
+                            .and_then(|ring| ring.get_node(leader_node_id).map(|n| n.host_id))
+                    },
+                    move |leader_uuid, cmd| {
+                        let pm = dispatch_pm.clone();
+                        async move {
+                            match pm.as_ref() {
+                                Some(pm) => {
+                                    crate::raft_forward::forward_raft_command_to_leader(
+                                        pm.as_ref(),
+                                        leader_uuid,
+                                        cmd,
+                                    )
+                                    .await
+                                }
+                                None => Err(crate::error::ClusterError::Internal(
+                                    "raft forward: peer_manager not set, cannot forward to leader"
+                                        .into(),
+                                )),
+                            }
+                        }
+                    },
+                )
+                .await;
+
+                match dispatch_result {
+                    Ok(()) => {
+                        if was_local_ok {
+                            tracing::info!(
+                                peer = %host_id,
+                                node_id = peer_node_id,
+                                leader,
+                                "peer metadata refreshed via on_peer_connected"
+                            );
+                        } else {
+                            tracing::info!(
+                                peer = %host_id,
+                                node_id = peer_node_id,
+                                leader,
+                                "peer metadata refresh forwarded to raft leader"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %host_id,
+                            leader,
+                            %e,
+                            "UpdateNodeInfo refresh did not converge — will retry on next reconnect"
+                        );
+                    }
+                }
                 return;
             }
 
@@ -487,5 +554,7 @@ impl ModeController {
                 "peer admitted to cluster via on_peer_connected"
             );
         });
+
+        true
     }
 }

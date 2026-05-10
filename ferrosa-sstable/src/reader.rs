@@ -205,7 +205,27 @@ impl<R: ReadAt> SSTableReader<R> {
     /// partition until EOF. Used by the compaction executor to merge
     /// multiple SSTables.
     pub fn read_all_partitions(&self) -> Result<Vec<crate::types::Partition>> {
+        self.read_partitions_limited(usize::MAX)
+    }
+
+    /// Scan partitions sequentially, stopping once `limit` partitions have
+    /// been decoded. This bounds range-read materialization while preserving
+    /// the existing all-partitions API for compaction callers.
+    pub fn read_partitions_limited(&self, limit: usize) -> Result<Vec<crate::types::Partition>> {
+        self.read_partitions_limited_rows(limit, 0)
+    }
+
+    /// Scan partitions sequentially, retaining at most `row_limit` rows per
+    /// decoded partition when `row_limit > 0`.
+    pub fn read_partitions_limited_rows(
+        &self,
+        limit: usize,
+        row_limit: usize,
+    ) -> Result<Vec<crate::types::Partition>> {
         let mut partitions = Vec::new();
+        if limit == 0 {
+            return Ok(partitions);
+        }
         if let Some(ref ci) = self.compression_info {
             // Decompress on demand — the buffer is freed when this scope ends.
             // Previously the decompressed buffer was cached in the SSTableReader,
@@ -213,12 +233,18 @@ impl<R: ReadAt> SSTableReader<R> {
             // SSTable held its entire decompressed Data.db in memory.
             let decompressed = decompress_data(&self.data, ci)?;
             let mut reader = crate::data::DataReader::new(&decompressed, &self.header, 0);
-            while let Some(partition) = reader.read_partition()? {
+            while partitions.len() < limit {
+                let Some(partition) = reader.read_partition_limited_rows(row_limit)? else {
+                    break;
+                };
                 partitions.push(partition);
             }
         } else {
             let mut reader = crate::data::DataReader::new(&self.data, &self.header, 0);
-            while let Some(partition) = reader.read_partition()? {
+            while partitions.len() < limit {
+                let Some(partition) = reader.read_partition_limited_rows(row_limit)? else {
+                    break;
+                };
                 partitions.push(partition);
             }
         }
@@ -290,8 +316,12 @@ mod tests {
     /// Build a Data.db blob for a single partition.
     ///
     /// Key is the raw partition key bytes. Produces one row with clustering
-    /// key `[0,0,0,1]`, timestamp delta 42, and cell value `b"hello"`.
+    /// key `[0,0,0,1]`, timestamp delta 42, and cell value `b"hello-0"`.
     fn build_data_blob(key: &[u8]) -> Vec<u8> {
+        build_data_blob_with_rows(key, 1)
+    }
+
+    fn build_data_blob_with_rows(key: &[u8], rows: usize) -> Vec<u8> {
         let mut data = Vec::new();
 
         // Partition header: u16 BE key len + key bytes
@@ -301,26 +331,27 @@ mod tests {
         // Live deletion time (Cassandra 5.x: single byte 0x80)
         data.push(DELETION_IS_LIVE);
 
-        // Row flags: HAS_TIMESTAMP | HAS_ALL_COLUMNS
-        data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
+        for row_idx in 0..rows {
+            // Row flags: HAS_TIMESTAMP | HAS_ALL_COLUMNS
+            data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
 
-        // Clustering key (ClusteringPrefix format, Int32Type = fixed-length)
-        let clustering = [0x00u8, 0x00, 0x00, 0x01];
-        push_unsigned_vint(&mut data, 0); // clustering header: all non-null, non-empty
-        data.extend_from_slice(&clustering);
+            // Clustering key (ClusteringPrefix format, Int32Type = fixed-length)
+            let clustering = (row_idx as i32 + 1).to_be_bytes();
+            push_unsigned_vint(&mut data, 0); // clustering header: all non-null, non-empty
+            data.extend_from_slice(&clustering);
 
-        // Row body size + prev unfiltered size (both skipped by reader)
-        push_unsigned_vint(&mut data, 20);
-        push_unsigned_vint(&mut data, 0);
+            let value = format!("hello-{row_idx}");
+            let mut row_body = Vec::new();
+            push_unsigned_vint(&mut row_body, 42 + row_idx as u64);
+            row_body.push(CELL_USE_ROW_TIMESTAMP);
+            push_unsigned_vint(&mut row_body, value.len() as u64);
+            row_body.extend_from_slice(value.as_bytes());
 
-        // Liveness timestamp delta = 42 (unsigned varint)
-        push_unsigned_vint(&mut data, 42);
-
-        // Cell: use row timestamp, value = b"hello"
-        data.push(CELL_USE_ROW_TIMESTAMP);
-        let value = b"hello";
-        push_unsigned_vint(&mut data, value.len() as u64);
-        data.extend_from_slice(value);
+            // Row body size + prev unfiltered size + body
+            push_unsigned_vint(&mut data, row_body.len() as u64);
+            push_unsigned_vint(&mut data, 0);
+            data.extend_from_slice(&row_body);
+        }
 
         // End of partition
         data.push(END_OF_PARTITION);
@@ -442,7 +473,7 @@ mod tests {
         assert_eq!(row.clustering, vec![0x00, 0x00, 0x00, 0x01]);
         assert_eq!(row.primary_key_liveness.timestamp, 1_000_042);
         assert_eq!(row.cells.len(), 1);
-        assert_eq!(row.cells[0].1.value.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(b"hello-0".as_slice()));
     }
 
     #[test]
@@ -488,6 +519,44 @@ mod tests {
         // will return NotFound, which is also correct behavior.
         let result = reader.get_partition(&missing).unwrap();
         assert!(result.is_none(), "expected None for absent key");
+    }
+
+    #[test]
+    fn read_partitions_limited_rows_skips_unretained_rows_and_continues() {
+        let header = test_header();
+
+        let dk1 = DecoratedKey::new(PartitionKey::from(b"k1".as_slice()));
+        let dk2 = DecoratedKey::new(PartitionKey::from(b"k2".as_slice()));
+
+        let mut data_bytes = Vec::new();
+        let pos1 = data_bytes.len() as u64;
+        data_bytes.extend_from_slice(&build_data_blob_with_rows(b"k1", 3));
+        let pos2 = data_bytes.len() as u64;
+        data_bytes.extend_from_slice(&build_data_blob_with_rows(b"k2", 2));
+
+        let partitions_bytes = build_partition_index(&[(&dk1, pos1), (&dk2, pos2)]);
+        let filter_bytes = build_bloom_filter(&[&dk1, &dk2]);
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+
+        let reader = SSTableReader::open(components).unwrap();
+        let partitions = reader.read_partitions_limited_rows(2, 1).unwrap();
+
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k1");
+        assert_eq!(partitions[1].key.key.as_bytes(), b"k2");
+        assert_eq!(partitions[0].rows.len(), 1);
+        assert_eq!(partitions[1].rows.len(), 1);
+        assert_eq!(partitions[0].rows[0].clustering, 1_i32.to_be_bytes());
+        assert_eq!(partitions[1].rows[0].clustering, 1_i32.to_be_bytes());
     }
 
     #[test]
