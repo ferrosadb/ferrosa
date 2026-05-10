@@ -1,0 +1,345 @@
+# T3 dual-DC topology — 3 voters in DC1 + 3 voters in DC2 (Sprint 6 W6.9, ADR-015).
+#
+# This compose file extends the single-DC `jepsen-cluster.yml` to a 3+3 layout:
+#
+#   DC1 network: dc1-net   (172.30.1.0/24)
+#   DC2 network: dc2-net   (172.30.2.0/24)
+#   WAN bridge:  wan-net   (172.30.0.0/24, both DCs attached)
+#
+# DC1 nodes only see each other directly on dc1-net. DC2 nodes only see each
+# other on dc2-net. Cross-DC traffic crosses wan-net (when permitted by the
+# nemesis); a dc-partition nemesis will sever that bridge to validate ADR-015
+# §S-48 (each DC retains LOCAL_QUORUM availability under WAN partition).
+#
+# Per-DC Raft groups are derived from FERROSA_DATA_CENTER:
+#   dc1: RaftGroupId::for_dc("dc1") → uuid-v5(NS_FERROSA_RAFT, "dc1")
+#   dc2: RaftGroupId::for_dc("dc2") → uuid-v5(NS_FERROSA_RAFT, "dc2")
+#
+# Usage:
+#   docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml up -d --build
+#   docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml down -v
+#
+# Acceptance: both DCs reach Cluster mode within 30s of start; an integration
+# test polls each node's /health endpoint to verify (W6.9, R6).
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Volume permissions — RustFS runs as UID 10001
+  # ---------------------------------------------------------------------------
+  volume-permissions:
+    image: alpine
+    volumes:
+      - jepsen-t3-rustfs-data:/data
+    command: >
+      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # S3-compatible object store (single instance shared by both DCs).
+  # ---------------------------------------------------------------------------
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: ferrosa-jepsen-t3-rustfs
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    networks:
+      - wan-net
+    ports:
+      - "29000:9000"
+      - "29001:9001"
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - jepsen-t3-rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  rustfs-init:
+    image: minio/mc
+    container_name: ferrosa-jepsen-t3-rustfs-init
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    networks:
+      - wan-net
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa-jepsen-t3 --ignore-existing &&
+             echo 'bucket ferrosa-jepsen-t3 ready'"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # DC1 — 3 voters
+  #
+  # Each DC1 node sets FERROSA_DATA_CENTER=dc1 and seeds only the other DC1
+  # nodes. Cross-DC connectivity is established via wan-net at runtime (Sprint
+  # 7 wires Accord across the WAN; Sprint 6 leaves cross-DC writes returning
+  # NotImplemented).
+  # ---------------------------------------------------------------------------
+  dc1-node1:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: ferrosa-jepsen-t3-dc1-node1
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [dc1-net, wan-net]
+    ports:
+      - "29042:9042"
+      - "29090:9090"
+    environment:
+      FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
+      FERROSA_DATA_CENTER: "dc1"
+      FERROSA_RACK: "rack1"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "dc1-node1:7000"
+      FERROSA_SEED: "dc1-node2:7000,dc1-node3:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-jepsen-t3"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - jepsen-t3-dc1-node1-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  dc1-node2:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: ferrosa-jepsen-t3-dc1-node2
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [dc1-net, wan-net]
+    ports:
+      - "29043:9042"
+      - "29091:9090"
+    environment:
+      FERROSA_HOST_ID: "11111111-1111-1111-1111-222222222222"
+      FERROSA_DATA_CENTER: "dc1"
+      FERROSA_RACK: "rack1"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "dc1-node2:7000"
+      FERROSA_SEED: "dc1-node1:7000,dc1-node3:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-jepsen-t3"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - jepsen-t3-dc1-node2-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  dc1-node3:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: ferrosa-jepsen-t3-dc1-node3
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [dc1-net, wan-net]
+    ports:
+      - "29044:9042"
+      - "29092:9090"
+    environment:
+      FERROSA_HOST_ID: "11111111-1111-1111-1111-333333333333"
+      FERROSA_DATA_CENTER: "dc1"
+      FERROSA_RACK: "rack1"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "dc1-node3:7000"
+      FERROSA_SEED: "dc1-node1:7000,dc1-node2:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-jepsen-t3"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - jepsen-t3-dc1-node3-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # DC2 — 3 voters
+  # ---------------------------------------------------------------------------
+  dc2-node1:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: ferrosa-jepsen-t3-dc2-node1
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [dc2-net, wan-net]
+    ports:
+      - "29142:9042"
+      - "29190:9090"
+    environment:
+      FERROSA_HOST_ID: "22222222-2222-2222-2222-111111111111"
+      FERROSA_DATA_CENTER: "dc2"
+      FERROSA_RACK: "rack1"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "dc2-node1:7000"
+      FERROSA_SEED: "dc2-node2:7000,dc2-node3:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-jepsen-t3"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - jepsen-t3-dc2-node1-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  dc2-node2:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: ferrosa-jepsen-t3-dc2-node2
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [dc2-net, wan-net]
+    ports:
+      - "29143:9042"
+      - "29191:9090"
+    environment:
+      FERROSA_HOST_ID: "22222222-2222-2222-2222-222222222222"
+      FERROSA_DATA_CENTER: "dc2"
+      FERROSA_RACK: "rack1"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "dc2-node2:7000"
+      FERROSA_SEED: "dc2-node1:7000,dc2-node3:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-jepsen-t3"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - jepsen-t3-dc2-node2-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  dc2-node3:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: ferrosa-jepsen-t3-dc2-node3
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [dc2-net, wan-net]
+    ports:
+      - "29144:9042"
+      - "29192:9090"
+    environment:
+      FERROSA_HOST_ID: "22222222-2222-2222-2222-333333333333"
+      FERROSA_DATA_CENTER: "dc2"
+      FERROSA_RACK: "rack1"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "dc2-node3:7000"
+      FERROSA_SEED: "dc2-node1:7000,dc2-node2:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-jepsen-t3"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - jepsen-t3-dc2-node3-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+networks:
+  dc1-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+  dc2-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
+  wan-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  jepsen-t3-rustfs-data:
+  jepsen-t3-dc1-node1-data:
+  jepsen-t3-dc1-node2-data:
+  jepsen-t3-dc1-node3-data:
+  jepsen-t3-dc2-node1-data:
+  jepsen-t3-dc2-node2-data:
+  jepsen-t3-dc2-node3-data:
