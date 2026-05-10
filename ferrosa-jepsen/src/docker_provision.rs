@@ -75,7 +75,7 @@ pub struct ClusterInfo {
     /// The nodes in this cluster, in order.
     pub nodes: Vec<NodeInfo>,
     /// Compose file used to provision the cluster.
-    compose_file: PathBuf,
+    pub(crate) compose_file: PathBuf,
 }
 
 impl ClusterInfo {
