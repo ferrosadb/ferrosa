@@ -136,6 +136,51 @@ where
     replayed
 }
 
+/// W6.3: per-DC log directory layout.
+///
+/// Each DC's Raft log lives in `raft_data_dir/<dc-name>/`, isolated
+/// from any other DC running on the same physical disk. Single-DC
+/// deployments transparently land under
+/// `raft_data_dir/<DEFAULT_DC_NAME>/` — readers tolerant to legacy
+/// `raft_data_dir/` layouts must migrate at upgrade (ADR-015 R3).
+pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::PathBuf {
+    base.join(dc_name)
+}
+
+/// W6.3: partition a `(host_id, addr)` peer list by DC, given a lookup
+/// table from `host_id` to DC name. Peers not present in `dcs` default
+/// to `local_dc` — this preserves single-DC behavior when no per-peer
+/// DC metadata has been published.
+///
+/// Returns `(local_dc_peers, other_dcs)` where `other_dcs` groups
+/// non-local peers by DC name. Local-DC voters drive Raft membership;
+/// non-local-DC peers participate in cross-DC routing only (Sprint 7
+/// will plumb them into Accord).
+pub fn partition_peers_by_dc(
+    peers: &[(uuid::Uuid, SocketAddr)],
+    dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    local_dc: &str,
+) -> (
+    Vec<(uuid::Uuid, SocketAddr)>,
+    std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>>,
+) {
+    let mut local = Vec::new();
+    let mut others: std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>> =
+        std::collections::BTreeMap::new();
+    for (uuid, addr) in peers {
+        let dc = dcs.get(uuid).map(String::as_str).unwrap_or(local_dc);
+        if dc == local_dc {
+            local.push((*uuid, *addr));
+        } else {
+            others
+                .entry(dc.to_string())
+                .or_default()
+                .push((*uuid, *addr));
+        }
+    }
+    (local, others)
+}
+
 pub(super) fn build_recovered_topology_refresh_plan(
     local_host_id: uuid::Uuid,
     local_addr: String,
@@ -296,6 +341,26 @@ impl ModeController {
             .into_iter()
             .map(|(peer_uuid, addr)| (peer_uuid, self.normalize_cluster_peer_addr(addr)))
             .collect();
+
+        // W6.3 (ADR-015): partition the peer set by DC. Only same-DC
+        // peers participate in this node's Raft group; cross-DC peers
+        // are tracked in the controller's connected_peers map for
+        // future Accord routing (Sprint 7) but are not voters here.
+        //
+        // Backward-compat: peers with no recorded DC default to the
+        // local DC, so existing single-DC clusters keep their full
+        // peer list as voters unchanged.
+        let local_dc = self.config.data_center.clone();
+        let peer_dc_map = self.peer_dcs_snapshot();
+        let (peers, cross_dc_peers) = partition_peers_by_dc(&peers, &peer_dc_map, &local_dc);
+        if !cross_dc_peers.is_empty() {
+            tracing::info!(
+                local_dc = %local_dc,
+                local_voters = peers.len(),
+                cross_dc_count = cross_dc_peers.values().map(|v| v.len()).sum::<usize>(),
+                "transition_to_cluster: cross-DC peers excluded from local Raft group (Sprint 6 scaffolding; Accord cross-DC arrives in Sprint 7)"
+            );
+        }
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {
@@ -366,14 +431,24 @@ impl ModeController {
             }
         }
 
-        // 1. Create sled log store
-        let raft_dir = if let Some(ref dir) = self.config.raft_data_dir {
+        // 1. Create sled log store. W6.3 (ADR-015): per-DC subdir so a
+        // node hosting multiple DCs (operator command `bootstrap-dc`,
+        // W6.7) keeps each DC's log isolated. Single-DC deployments
+        // land under `<base>/<local_dc>/`; on upgrade, an installer or
+        // operator must migrate any existing flat-layout `raft_data_dir`
+        // (ADR-015 R3).
+        let raft_base = if let Some(ref dir) = self.config.raft_data_dir {
             dir.clone()
         } else {
             let data_dir =
                 std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
             std::path::Path::new(&data_dir).join("raft")
         };
+        let raft_dir = raft_log_dir_for_dc(&raft_base, &local_dc);
+        if let Err(e) = std::fs::create_dir_all(&raft_dir) {
+            tracing::error!(%e, dir = %raft_dir.display(), "failed to create per-DC raft log dir");
+            return;
+        }
         let mut log_store = match SledLogStore::new(&raft_dir) {
             Ok(s) => s,
             Err(e) => {

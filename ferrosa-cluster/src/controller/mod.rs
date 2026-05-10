@@ -12,7 +12,7 @@
 //!   5. Operator can `switchover()` to swap roles
 
 pub mod bootstrap;
-mod cluster;
+pub mod cluster;
 pub mod cluster_rejoin;
 mod membership;
 mod operator;
@@ -172,6 +172,14 @@ pub struct ModeController {
     /// [`RaftGroupId::default_dc`]. Replaces the prior single
     /// `raft_instance` field — see ADR-015.
     pub(super) raft_groups: Arc<ArcSwap<HashMap<RaftGroupId, Arc<FerrosRaft>>>>,
+    /// Known DC for each connected peer. Populated by
+    /// [`Self::record_peer_dc`] when a peer announces its DC during the
+    /// connection handshake. Used by `transition_to_cluster` to filter
+    /// Raft voters down to the local DC (W6.3).
+    ///
+    /// Peers absent from this map default to the local DC — this
+    /// preserves single-DC behavior unchanged.
+    pub(super) peer_dcs: Mutex<HashMap<Uuid, String>>,
     /// Persistent hint store — holds mutations destined for temporarily
     /// unreachable replicas.  Shared with `ClusterCoordinator`.
     pub(super) hint_store: Arc<HintStore>,
@@ -291,6 +299,7 @@ impl ModeController {
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
@@ -348,6 +357,7 @@ impl ModeController {
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
@@ -405,6 +415,7 @@ impl ModeController {
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
@@ -607,6 +618,31 @@ impl ModeController {
     /// the `RaftGroupId` from a DC name.
     pub fn set_raft_for_dc(&self, dc_name: &str, raft: Arc<FerrosRaft>) {
         self.set_raft_for_group(RaftGroupId::for_dc(dc_name), raft);
+    }
+
+    /// Record a connected peer's DC. Called by the peer handshake (or
+    /// tests, before triggering `transition_to_cluster`) so that the
+    /// per-DC Raft formation path (W6.3) can filter local-DC voters
+    /// from cross-DC peers.
+    ///
+    /// Idempotent: re-recording overwrites the prior entry. Pass the
+    /// peer's `data_center` as configured at the peer (matches the
+    /// `FERROSA_DATA_CENTER` env var on that node).
+    pub fn record_peer_dc(&self, host_id: Uuid, dc_name: impl Into<String>) {
+        self.peer_dcs.lock().insert(host_id, dc_name.into());
+    }
+
+    /// Look up a peer's DC, if known. Returns `None` for peers that
+    /// have not announced a DC; callers should treat that as "same DC
+    /// as local" for backward compat.
+    pub fn peer_dc(&self, host_id: Uuid) -> Option<String> {
+        self.peer_dcs.lock().get(&host_id).cloned()
+    }
+
+    /// Snapshot of the peer-DC map. Used by `transition_to_cluster` and
+    /// by tests.
+    pub(crate) fn peer_dcs_snapshot(&self) -> HashMap<Uuid, String> {
+        self.peer_dcs.lock().clone()
     }
 
     /// Return a snapshot of the current token ring.
