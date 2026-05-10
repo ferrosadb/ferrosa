@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -65,6 +66,36 @@ pub struct ClusterConfig {
     /// effectively has CheckQuorum disabled). Override with
     /// `FERROSA_RAFT_CHECK_QUORUM_RATIO=<float>`. Set to `0.0` to disable.
     pub raft_check_quorum_ratio: f64,
+    /// W6.8: per-DC config overrides for nodes hosting more than one
+    /// Raft group (e.g., the W6.7 `bootstrap-dc` operator command
+    /// adding a third DC on the same physical node). Each entry maps
+    /// a DC name to its overrides; missing entries inherit the
+    /// node-level defaults.
+    ///
+    /// Parsed from environment variables of the form
+    /// `FERROSA_RAFT_DATA_DIR_<DC_NAME>`,
+    /// `FERROSA_RACK_<DC_NAME>`, etc. Default: empty (single-DC
+    /// behavior unchanged).
+    #[serde(default)]
+    pub per_dc_overrides: BTreeMap<String, PerDcOverride>,
+}
+
+/// W6.8: per-DC config overrides — each field is `Option<T>` so the
+/// node-level default applies for unspecified fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerDcOverride {
+    /// Override for [`ClusterConfig::raft_data_dir`].
+    pub raft_data_dir: Option<PathBuf>,
+    /// Override for [`ClusterConfig::rack`].
+    pub rack: Option<String>,
+}
+
+impl PerDcOverride {
+    /// True iff every field is `None` — used by `from_env` to skip
+    /// recording empty overrides.
+    pub fn is_empty(&self) -> bool {
+        self.raft_data_dir.is_none() && self.rack.is_none()
+    }
 }
 
 impl Default for ClusterConfig {
@@ -87,6 +118,7 @@ impl Default for ClusterConfig {
             raft_election_timeout_max_ms: 6000,
             raft_enable_pre_vote: true,
             raft_check_quorum_ratio: 0.75,
+            per_dc_overrides: BTreeMap::new(),
         }
     }
 }
@@ -187,8 +219,75 @@ impl ClusterConfig {
             }
         }
 
+        // W6.8: per-DC overrides. Pulled from the live env so we
+        // don't need to hard-code a DC list — every env var matching
+        // `FERROSA_RAFT_DATA_DIR_<NAME>` or `FERROSA_RACK_<NAME>` (with
+        // `<NAME>` non-empty) populates an entry.
+        config.per_dc_overrides = parse_per_dc_overrides_from_env();
+
         config
     }
+
+    /// Effective `raft_data_dir` for a DC, honoring per-DC overrides.
+    ///
+    /// Returns the DC-specific override if one is configured;
+    /// otherwise the node-level [`Self::raft_data_dir`].
+    pub fn raft_data_dir_for_dc(&self, dc_name: &str) -> Option<PathBuf> {
+        if let Some(o) = self.per_dc_overrides.get(dc_name) {
+            if let Some(d) = &o.raft_data_dir {
+                return Some(d.clone());
+            }
+        }
+        self.raft_data_dir.clone()
+    }
+
+    /// Effective `rack` for a DC, honoring per-DC overrides.
+    pub fn rack_for_dc(&self, dc_name: &str) -> String {
+        if let Some(o) = self.per_dc_overrides.get(dc_name) {
+            if let Some(r) = &o.rack {
+                return r.clone();
+            }
+        }
+        self.rack.clone()
+    }
+}
+
+/// Parse per-DC overrides from the live process environment.
+///
+/// Recognised patterns (case-sensitive):
+///
+/// - `FERROSA_RAFT_DATA_DIR_<DC>` — path for that DC's sled log.
+/// - `FERROSA_RACK_<DC>` — rack name within that DC.
+///
+/// `<DC>` is the literal DC name; characters allowed in env-var
+/// names are constrained, so this is intended for ASCII DC names
+/// like `dc1`, `us-east`, `eu_west_2`, etc. (the env-var var name
+/// must remain a valid `[A-Za-z0-9_]+`; operators must use `_` in
+/// place of `-` if their DC names contain dashes).
+fn parse_per_dc_overrides_from_env() -> BTreeMap<String, PerDcOverride> {
+    let mut overrides: BTreeMap<String, PerDcOverride> = BTreeMap::new();
+    for (key, value) in std::env::vars() {
+        let dc_opt = key
+            .strip_prefix("FERROSA_RAFT_DATA_DIR_")
+            .map(|dc| ("raft_data_dir", dc))
+            .or_else(|| key.strip_prefix("FERROSA_RACK_").map(|dc| ("rack", dc)));
+        let Some((field, dc)) = dc_opt else {
+            continue;
+        };
+        if dc.is_empty() {
+            continue;
+        }
+        let entry = overrides.entry(dc.to_string()).or_default();
+        match field {
+            "raft_data_dir" => entry.raft_data_dir = Some(PathBuf::from(value)),
+            "rack" => entry.rack = Some(value),
+            _ => unreachable!(),
+        }
+    }
+    // Drop any entries that ended up empty (e.g., env contained only
+    // an explicitly empty value).
+    overrides.retain(|_, v| !v.is_empty());
+    overrides
 }
 
 #[cfg(test)]
@@ -246,5 +345,126 @@ mod tests {
         let bytes = bincode::serialize(&config).unwrap();
         let decoded: ClusterConfig = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.node_role, NodeRole::Indexer);
+    }
+
+    /// W6.8 RED: per-DC config carries independent raft_data_dir
+    /// + rack overrides. Default node-level fields apply when no
+    /// per-DC override exists.
+    #[test]
+    fn cluster_config_per_dc() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "dc1".to_string(),
+            PerDcOverride {
+                raft_data_dir: Some(PathBuf::from("/var/lib/ferrosa/raft-dc1")),
+                rack: Some("rack-east".to_string()),
+            },
+        );
+        overrides.insert(
+            "dc2".to_string(),
+            PerDcOverride {
+                raft_data_dir: Some(PathBuf::from("/var/lib/ferrosa/raft-dc2")),
+                rack: None,
+            },
+        );
+
+        let config = ClusterConfig {
+            data_center: "dc1".to_string(),
+            rack: "rack-default".to_string(),
+            raft_data_dir: Some(PathBuf::from("/var/lib/ferrosa/raft-default")),
+            per_dc_overrides: overrides,
+            ..ClusterConfig::default()
+        };
+
+        // dc1 has both override fields.
+        assert_eq!(
+            config.raft_data_dir_for_dc("dc1"),
+            Some(PathBuf::from("/var/lib/ferrosa/raft-dc1"))
+        );
+        assert_eq!(config.rack_for_dc("dc1"), "rack-east");
+
+        // dc2 only overrides raft_data_dir; rack falls through to
+        // node-level default.
+        assert_eq!(
+            config.raft_data_dir_for_dc("dc2"),
+            Some(PathBuf::from("/var/lib/ferrosa/raft-dc2"))
+        );
+        assert_eq!(config.rack_for_dc("dc2"), "rack-default");
+
+        // Unknown DC: both fall through.
+        assert_eq!(
+            config.raft_data_dir_for_dc("dc-unknown"),
+            Some(PathBuf::from("/var/lib/ferrosa/raft-default"))
+        );
+        assert_eq!(config.rack_for_dc("dc-unknown"), "rack-default");
+    }
+
+    /// W6.8 RED: backward-compat — when no per-DC overrides are
+    /// configured (the default), a single-DC cluster behaves
+    /// exactly like today's clusters: node-level fields apply for
+    /// every DC name.
+    #[test]
+    fn single_dc_default_keeps_node_level_fields_unchanged() {
+        let config = ClusterConfig {
+            rack: "rack9".to_string(),
+            raft_data_dir: Some(PathBuf::from("/data/raft")),
+            ..ClusterConfig::default()
+        };
+        assert!(config.per_dc_overrides.is_empty());
+        assert_eq!(
+            config.raft_data_dir_for_dc("default"),
+            Some(PathBuf::from("/data/raft"))
+        );
+        assert_eq!(config.rack_for_dc("default"), "rack9");
+    }
+
+    /// W6.8: per-DC overrides round-trip through serde.
+    #[test]
+    fn per_dc_overrides_serde_roundtrip() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "dc1".to_string(),
+            PerDcOverride {
+                raft_data_dir: Some(PathBuf::from("/raft/dc1")),
+                rack: Some("rack-1".to_string()),
+            },
+        );
+        let config = ClusterConfig {
+            per_dc_overrides: overrides,
+            ..ClusterConfig::default()
+        };
+        let bytes = bincode::serialize(&config).expect("ser");
+        let back: ClusterConfig = bincode::deserialize(&bytes).expect("de");
+        assert_eq!(back.per_dc_overrides.len(), 1);
+        let dc1 = back.per_dc_overrides.get("dc1").unwrap();
+        assert_eq!(dc1.raft_data_dir, Some(PathBuf::from("/raft/dc1")));
+        assert_eq!(dc1.rack.as_deref(), Some("rack-1"));
+    }
+
+    /// W6.8: `parse_per_dc_overrides_from_env` reads `FERROSA_RAFT_DATA_DIR_<DC>`
+    /// and `FERROSA_RACK_<DC>` and groups them by DC. Uses a shared
+    /// global env, so this test sets/clears the vars within its own
+    /// process scope.
+    #[test]
+    fn parse_per_dc_overrides_from_env_groups_by_dc() {
+        // Env mutation is process-global; use a unique DC name so we
+        // don't race with other tests.
+        let dc = format!("env_dc_{}", uuid::Uuid::new_v4().simple());
+        let raft_var = format!("FERROSA_RAFT_DATA_DIR_{dc}");
+        let rack_var = format!("FERROSA_RACK_{dc}");
+        // SAFETY: env vars are inherently process-global; this test
+        // is single-threaded with respect to its own keys.
+        std::env::set_var(&raft_var, "/raft/from-env");
+        std::env::set_var(&rack_var, "rack-env");
+
+        let overrides = parse_per_dc_overrides_from_env();
+        let entry = overrides
+            .get(&dc)
+            .expect("env override grouped under DC name");
+        assert_eq!(entry.raft_data_dir, Some(PathBuf::from("/raft/from-env")));
+        assert_eq!(entry.rack.as_deref(), Some("rack-env"));
+
+        std::env::remove_var(&raft_var);
+        std::env::remove_var(&rack_var);
     }
 }

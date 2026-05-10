@@ -436,9 +436,11 @@ impl ModeController {
         // W6.7) keeps each DC's log isolated. Single-DC deployments
         // land under `<base>/<local_dc>/`; on upgrade, an installer or
         // operator must migrate any existing flat-layout `raft_data_dir`
-        // (ADR-015 R3).
-        let raft_base = if let Some(ref dir) = self.config.raft_data_dir {
-            dir.clone()
+        // (ADR-015 R3). W6.8: a per-DC override
+        // (`FERROSA_RAFT_DATA_DIR_<DC>`) takes precedence over the
+        // node-level default.
+        let raft_base = if let Some(dir) = self.config.raft_data_dir_for_dc(&local_dc) {
+            dir
         } else {
             let data_dir =
                 std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());

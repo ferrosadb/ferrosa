@@ -22,7 +22,7 @@ pub mod system_table_writer;
 pub mod telemetry;
 pub mod write_path;
 
-pub use config::ClusterConfig;
+pub use config::{ClusterConfig, PerDcOverride};
 pub use consistency::ConsistencyLevel;
 pub use controller::{
     bootstrap_silent_failure_counts, cluster_rejoin_attempts_total, cluster_rejoin_failures_total,
