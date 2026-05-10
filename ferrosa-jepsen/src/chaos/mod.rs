@@ -140,7 +140,7 @@ impl NemesisRegistry {
             compose_file: None,
         }));
         reg.register(Box::new(topology::DecommissionLeader {
-            admin_url: "http://localhost:19090/admin/membership-snapshot".to_string(),
+            admin_url: "http://localhost:49090/admin/membership-snapshot".to_string(),
             ctl_binary: "ferrosa-ctl".to_string(),
         }));
         reg.register(Box::new(topology::RandomStartupOrder {

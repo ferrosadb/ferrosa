@@ -347,15 +347,15 @@ mod tests {
             nodes: vec![
                 JepsenNodeInfo {
                     host: "localhost",
-                    cql_port: 19042,
+                    cql_port: 49042,
                 },
                 JepsenNodeInfo {
                     host: "localhost",
-                    cql_port: 19043,
+                    cql_port: 49043,
                 },
                 JepsenNodeInfo {
                     host: "localhost",
-                    cql_port: 19044,
+                    cql_port: 49044,
                 },
             ],
             compose_file: std::path::PathBuf::from("/tmp/fake.yml"),
@@ -367,9 +367,9 @@ mod tests {
                 assert_eq!(
                     addrs,
                     vec![
-                        "localhost:19042".to_string(),
-                        "localhost:19043".to_string(),
-                        "localhost:19044".to_string(),
+                        "localhost:49042".to_string(),
+                        "localhost:49043".to_string(),
+                        "localhost:49044".to_string(),
                     ],
                     "real session must use the cluster's CQL contact points"
                 );

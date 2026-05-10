@@ -1,8 +1,9 @@
 # Jepsen 3-node Ferrosa cluster for orchestrator provisioning tests.
 #
 # Starts a 3-node Ferrosa cluster backed by RustFS (S3-compatible).
-# Node CQL ports are mapped to localhost 19042/19043/19044 to avoid
-# colliding with any existing cluster on 9042-9044.
+# Node CQL ports are mapped to localhost 49042/49043/49044 (4xxxx range
+# reserved for jepsen integration tests; avoids colliding with any
+# existing 9042 cluster or with ferrosa-memory's 19042 layout).
 #
 # Usage:
 #   docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster.yml up -d --build
@@ -34,8 +35,8 @@ services:
       volume-permissions:
         condition: service_completed_successfully
     ports:
-      - "19000:9000"
-      - "19001:9001"
+      - "49000:9000"
+      - "49001:9001"
     environment:
       RUSTFS_VOLUMES: /data/rustfs0
       RUSTFS_ADDRESS: "0.0.0.0:9000"
@@ -80,8 +81,8 @@ services:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "19042:9042"   # CQL
-      - "19090:9090"   # Admin / observability
+      - "49042:9042"   # CQL
+      - "49090:9090"   # Admin / observability
     environment:
       FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
@@ -118,8 +119,8 @@ services:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "19043:9042"   # CQL
-      - "19091:9090"   # Admin / observability
+      - "49043:9042"   # CQL
+      - "49091:9090"   # Admin / observability
     environment:
       FERROSA_HOST_ID: "22222222-2222-2222-2222-222222222222"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
@@ -156,8 +157,8 @@ services:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "19044:9042"   # CQL
-      - "19092:9090"   # Admin / observability
+      - "49044:9042"   # CQL
+      - "49092:9090"   # Admin / observability
     environment:
       FERROSA_HOST_ID: "33333333-3333-3333-3333-333333333333"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"

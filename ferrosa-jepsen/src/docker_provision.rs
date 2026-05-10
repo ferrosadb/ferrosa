@@ -18,7 +18,7 @@ use tracing::{debug, info};
 use crate::config::Topology;
 
 // CQL ports assigned to each of the three Jepsen cluster nodes on localhost.
-const NODE_CQL_PORTS: [u16; 3] = [19042, 19043, 19044];
+const NODE_CQL_PORTS: [u16; 3] = [49042, 49043, 49044];
 
 /// Detect whether `docker` or `podman` is available and return the binary name.
 ///
@@ -336,9 +336,9 @@ mod tests {
     fn node_info_cql_address() {
         let node = NodeInfo {
             host: "localhost",
-            cql_port: 19042,
+            cql_port: 49042,
         };
-        assert_eq!(node.cql_address(), "localhost:19042");
+        assert_eq!(node.cql_address(), "localhost:49042");
     }
 
     #[test]
@@ -347,15 +347,15 @@ mod tests {
             nodes: vec![
                 NodeInfo {
                     host: "localhost",
-                    cql_port: 19042,
+                    cql_port: 49042,
                 },
                 NodeInfo {
                     host: "localhost",
-                    cql_port: 19043,
+                    cql_port: 49043,
                 },
                 NodeInfo {
                     host: "localhost",
-                    cql_port: 19044,
+                    cql_port: 49044,
                 },
             ],
             compose_file: PathBuf::from("/tmp/fake.yml"),

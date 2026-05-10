@@ -125,7 +125,7 @@ impl NemesisAction for AddNodeViaFollower {
 /// the current leader and waits for cluster size to drop by one.
 pub struct DecommissionLeader {
     /// Address of the admin HTTP endpoint to query for the current leader
-    /// (e.g. `"http://localhost:19090/admin/membership-snapshot"`).
+    /// (e.g. `"http://localhost:49090/admin/membership-snapshot"`).
     pub admin_url: String,
     /// `ferrosa-ctl` binary path (`"ferrosa-ctl"` if on PATH).
     pub ctl_binary: String,

@@ -20,6 +20,9 @@ COPY ferrosa-ctl/Cargo.toml ferrosa-ctl/Cargo.toml
 COPY ferrosa-jepsen/Cargo.toml ferrosa-jepsen/Cargo.toml
 COPY ferrosa-loadgen/Cargo.toml ferrosa-loadgen/Cargo.toml
 COPY ferrosa-index-builder/Cargo.toml ferrosa-index-builder/Cargo.toml
+# Vendored openraft fork — workspace Cargo.toml [patch.crates-io] points here.
+# Required at this layer because the first `cargo build` below resolves the patch.
+COPY vendor/ vendor/
 
 # Create stub lib.rs for each crate so cargo fetch + dep build works
 RUN for d in ferrosa ferrosa-common ferrosa-sstable ferrosa-storage ferrosa-schema \
