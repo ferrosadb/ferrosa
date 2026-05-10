@@ -1886,7 +1886,7 @@ mod tests {
         sm.apply(vec![entry]).await.unwrap();
 
         // Build snapshot.
-        let _ = sm.build_snapshot().await.unwrap();
+        sm.build_snapshot().await.unwrap();
 
         // Now get_current_snapshot should return Some.
         let snap = sm.get_current_snapshot().await.unwrap();
