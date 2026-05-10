@@ -325,7 +325,10 @@ pub async fn raft_transfer_leader(
     web_port: u16,
     to_host_id: &str,
 ) -> Result<(), WebError> {
-    let url = format!("http://{}:{}/api/cluster/raft/transfer-leader", host, web_port);
+    let url = format!(
+        "http://{}:{}/api/cluster/raft/transfer-leader",
+        host, web_port
+    );
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)

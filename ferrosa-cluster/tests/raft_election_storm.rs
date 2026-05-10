@@ -1167,8 +1167,7 @@ async fn ferrosa_partitioned_node_does_not_advance_term() {
     // wired yet, the test fails with a clear message pointing back to the
     // ADR and the deferred work item.
     assert_eq!(
-        term_advance,
-        0,
+        term_advance, 0,
         "ADR-012 W3.12: PreVote did not suppress term advance during partition. \
          node3 term advanced from {initial_node3_term} to {partitioned_node3_term} \
          (delta {term_advance}). Cluster final leader_term={final_leader_term}, \
