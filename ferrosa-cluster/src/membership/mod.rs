@@ -46,6 +46,8 @@ use crate::raft::{
     DEFAULT_DC_NAME,
 };
 
+use ferrosa_common::{AccordTimestamp, TxnId};
+
 // ---------------------------------------------------------------------------
 // MembershipOp — typed payload carried by `Message::ClusterMembershipForward`.
 // ---------------------------------------------------------------------------
@@ -345,6 +347,77 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         Duration::from_secs(3),
         Duration::from_secs(10),
     ];
+
+    /// W7.6 — Apply-durability barrier for Accord vote-commits.
+    ///
+    /// Submit a `RaftOp::AccordApply { txn_id, hlc, mutation }` through
+    /// this DC's Raft group and **block** until openraft reports the
+    /// resulting log entry as applied on the local state machine
+    /// (`wait().applied_index_at_least(commit_index)`).
+    ///
+    /// The Accord coordinator MUST call this — not raw `client_write`
+    /// — so that "vote-committed" implies "durably applied on the
+    /// local DC's Raft group". Without the barrier, the coordinator
+    /// could mark a txn committed before the apply landed and lose
+    /// data on crash.
+    ///
+    /// Idempotent at the state-machine layer: replays of the same
+    /// `txn_id` short-circuit at `state.applied_accord_txns` (I-28).
+    ///
+    /// `apply_timeout` defaults to [`Self::with_apply_timeout`].
+    /// Returns:
+    /// - `Ok(())` once the local Raft has applied the entry;
+    /// - `Err(MembershipError::NotLeader { .. })` if forwarded;
+    /// - `Err(MembershipError::ApplyTimeout)` if the wait times out;
+    /// - `Err(MembershipError::RaftError(..))` for openraft errors.
+    pub async fn accord_vote_commit(
+        &self,
+        txn_id: TxnId,
+        hlc: AccordTimestamp,
+        mutation: Vec<u8>,
+    ) -> Result<(), MembershipError> {
+        let cmd = RaftCommand {
+            op: RaftOp::AccordApply {
+                txn_id,
+                hlc,
+                mutation,
+            },
+            schema_version: Uuid::new_v4(),
+        };
+
+        // Submit via openraft. ForwardToLeader → NotLeader.
+        let resp = match self.raft.client_write(cmd).await {
+            Ok(r) => r,
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
+                return Err(MembershipError::NotLeader {
+                    leader_node_id: fwd.leader_id,
+                });
+            }
+            Err(other) => {
+                return Err(MembershipError::RaftError(format!(
+                    "client_write(AccordApply): {other}"
+                )));
+            }
+        };
+
+        // Apply-durability barrier (W7.6). openraft's wait() resolves
+        // when last_applied advances to or past the entry's log_id —
+        // which is the durability guarantee Accord vote-commit
+        // requires.
+        let target_idx = resp.log_id.index;
+        self.raft
+            .wait(Some(self.apply_timeout))
+            .applied_index_at_least(Some(target_idx), "accord_vote_commit")
+            .await
+            .map_err(|e| match e {
+                openraft::metrics::WaitError::Timeout(_, _) => MembershipError::ApplyTimeout,
+                openraft::metrics::WaitError::ShuttingDown => {
+                    MembershipError::RaftError("raft is shutting down".into())
+                }
+            })?;
+
+        Ok(())
+    }
 
     /// Add a node as a voter.  Idempotent.
     ///
