@@ -115,6 +115,46 @@ pub trait MembershipNetwork: Send + Sync + 'static {
 }
 
 // ---------------------------------------------------------------------------
+// AccordDrainQuery — abstracted access to in-flight Accord txns (W7.8).
+// ---------------------------------------------------------------------------
+
+/// W7.8 / I-30 — interface the [`MembershipChanger::swap_dc`] uses to
+/// query the Accord coordinator pool for in-flight transactions
+/// referencing a leaving DC's voters.
+///
+/// In production this is wired to the cross-DC Accord coordinator's
+/// txn registry (`AccordCoordinator` + `EpochDrain`); tests use a
+/// deterministic stub. Decoupling avoids pulling the Accord runtime
+/// into `membership/` and keeps `swap_dc` unit-testable.
+pub trait AccordDrainQuery: Send + Sync {
+    /// Return every Accord txn currently in-flight that references at
+    /// least one of `voters` as a participant. An empty `Vec` means
+    /// the drain has completed.
+    fn inflight_for_voters(&self, voters: &[u64]) -> Vec<TxnId>;
+}
+
+/// Outcome of a [`MembershipChanger::swap_dc`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapDcOutcome {
+    /// The drain finished within the deadline. `iterations` records
+    /// how many polls it took (operator-visible signal that gives
+    /// production some idea how long the drain ran).
+    Drained {
+        /// Number of poll iterations until the drain reported zero
+        /// in-flight txns.
+        iterations: usize,
+    },
+    /// The drain did not complete before the deadline. `remaining`
+    /// reports how many txns were still in flight at timeout — the
+    /// operator MUST inspect them and either retry the swap or abort
+    /// the txns explicitly.
+    TimedOut {
+        /// Remaining in-flight txns at the moment the deadline expired.
+        remaining: usize,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // MembershipError
 // ---------------------------------------------------------------------------
 
@@ -347,6 +387,45 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         Duration::from_secs(3),
         Duration::from_secs(10),
     ];
+
+    /// W7.8 / I-30 — Drain in-flight Accord transactions for a DC swap.
+    ///
+    /// Polls `drain` for transactions referencing any of `leaving_voters`
+    /// every `poll_interval` until either the in-flight set is empty
+    /// (returns [`SwapDcOutcome::Drained`]) or `deadline` elapses
+    /// (returns [`SwapDcOutcome::TimedOut`]).
+    ///
+    /// The caller is expected to issue the joint
+    /// `change_membership(AddVoters + RemoveVoters)` after a successful
+    /// drain — the drain itself is the protocol invariant. Callers that
+    /// hit `TimedOut` MUST decide whether to abort the in-flight txns
+    /// (Accord recovery), retry the swap, or escalate.
+    ///
+    /// `deadline` defaults to 60 s in production callers per ADR-015
+    /// W7.8 REFACTOR; tests pass tighter values.
+    pub async fn swap_dc(
+        &self,
+        leaving_voters: &[u64],
+        drain: &dyn AccordDrainQuery,
+        deadline: Duration,
+        poll_interval: Duration,
+    ) -> Result<SwapDcOutcome, MembershipError> {
+        let started = std::time::Instant::now();
+        let mut iterations = 0usize;
+        loop {
+            let inflight = drain.inflight_for_voters(leaving_voters);
+            if inflight.is_empty() {
+                return Ok(SwapDcOutcome::Drained { iterations });
+            }
+            if started.elapsed() >= deadline {
+                return Ok(SwapDcOutcome::TimedOut {
+                    remaining: inflight.len(),
+                });
+            }
+            tokio::time::sleep(poll_interval).await;
+            iterations += 1;
+        }
+    }
 
     /// W7.6 — Apply-durability barrier for Accord vote-commits.
     ///
