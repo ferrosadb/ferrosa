@@ -279,6 +279,15 @@ pub struct SledLogStore {
     meta: sled::Tree,
 }
 
+/// Counts of entries cleared by [`SledLogStore::reset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetCounts {
+    /// Entries removed from the `log` tree.
+    pub log_entries: u64,
+    /// Keys removed from the `meta` tree (vote / committed / last_purged).
+    pub meta_keys: u64,
+}
+
 #[allow(clippy::result_large_err)] // StorageIOError is 224 bytes — dictated by openraft
 impl SledLogStore {
     /// Open (or create) a log store at the given filesystem `path`.
@@ -287,6 +296,53 @@ impl SledLogStore {
         let log = db.open_tree("log")?;
         let meta = db.open_tree("meta")?;
         Ok(Self { db, log, meta })
+    }
+
+    /// Wipe a node's persisted Raft state at `path`.
+    ///
+    /// Clears the `log` and `meta` trees so the node rejoins the cluster as
+    /// an empty learner: no persisted vote/term, no log entries, no purge
+    /// marker. The leader's `InstallSnapshot` / `AppendEntries` will replay
+    /// committed history onto the reset node.
+    ///
+    /// # When to use
+    ///
+    /// Recovery for the disruptor-partition failure mode (see
+    /// `specs/in-process/bug-raft-stale-candidate-runaway-term-no-prevote.md`):
+    /// a node whose term has run away past the live quorum and whose log is
+    /// behind cannot self-recover, because peers reject its votes (its log
+    /// is too short) AND it rejects the leader's heartbeats (its term is too
+    /// high). Wiping local Raft state and rejoining is the only escape.
+    ///
+    /// # Lock contention
+    ///
+    /// Sled holds an exclusive lock on the database directory. If a Ferrosa
+    /// process is still using `path`, this call returns
+    /// `sled::Error::Io(...)` from `flock(2)`. Stop the node before reset.
+    ///
+    /// # Safety
+    ///
+    /// Only uncommitted writes — those Raft never replicated to a quorum —
+    /// can be lost. By Raft's durability guarantee, committed writes survive
+    /// on the remaining majority and are replayed back to this node.
+    pub fn reset(path: &Path) -> Result<ResetCounts, sled::Error> {
+        let db = sled::open(path)?;
+        let log = db.open_tree("log")?;
+        let meta = db.open_tree("meta")?;
+
+        let log_entries = log.len() as u64;
+        let meta_keys = meta.len() as u64;
+
+        log.clear()?;
+        meta.clear()?;
+        log.flush()?;
+        meta.flush()?;
+        db.flush()?;
+
+        Ok(ResetCounts {
+            log_entries,
+            meta_keys,
+        })
     }
 
     // -- helpers ----------------------------------------------------------
@@ -1062,5 +1118,86 @@ mod tests {
         let entries = store.try_get_log_entries(3u64..4u64).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].log_id.index, 3);
+    }
+
+    // -- reset ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reset_clears_log_and_meta_and_counts_what_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Pre-populate: 3 log entries + a vote + a committed marker.
+        {
+            let mut store = SledLogStore::new(dir.path()).unwrap();
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=3 {
+                let entry = blank_entry(7, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+
+            let vote = Vote::new(7, 99);
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_vote(
+                &mut store, &vote,
+            )
+            .await
+            .unwrap();
+
+            let committed = Some(LogId::new(CommittedLeaderId::new(7, 0), 3));
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_committed(
+                &mut store, committed,
+            )
+            .await
+            .unwrap();
+
+            store.db.flush().unwrap();
+        } // drop releases sled lock
+
+        let counts = SledLogStore::reset(dir.path()).expect("reset must succeed on a free dir");
+        assert_eq!(counts.log_entries, 3, "all 3 log entries should be cleared");
+        assert_eq!(
+            counts.meta_keys, 2,
+            "vote + committed keys should be cleared"
+        );
+
+        // Reopen and confirm trees are empty.
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let remaining = store.try_get_log_entries(0u64..100u64).await.unwrap();
+        assert!(remaining.is_empty(), "log tree must be empty after reset");
+        let vote_after =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::read_vote(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert!(vote_after.is_none(), "vote must be cleared after reset");
+    }
+
+    #[test]
+    fn reset_on_empty_store_is_a_noop_with_zero_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Touch a store so the on-disk layout exists, then drop.
+        let _ = SledLogStore::new(dir.path()).unwrap();
+
+        let counts = SledLogStore::reset(dir.path()).expect("reset on empty store must succeed");
+        assert_eq!(counts.log_entries, 0);
+        assert_eq!(counts.meta_keys, 0);
+    }
+
+    #[test]
+    fn reset_fails_if_sled_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hold an open store: this keeps sled's flock on the dir.
+        let _live = SledLogStore::new(dir.path()).unwrap();
+
+        let err = SledLogStore::reset(dir.path())
+            .expect_err("reset must refuse while a Ferrosa node still holds the sled lock");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("lock") || msg.to_lowercase().contains("io"),
+            "expected lock/io error, got: {msg}"
+        );
     }
 }
