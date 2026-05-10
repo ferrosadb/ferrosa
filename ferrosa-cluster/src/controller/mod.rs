@@ -422,6 +422,15 @@ impl ModeController {
     ///
     /// Also registers the `ClusterInviteHandler` so this node can process
     /// incoming `ClusterInvite` messages and connect to discovered peers.
+    /// Read access to the registered `PeerManager`, if any.
+    ///
+    /// Returns `None` until `set_peer_manager` has been called — typically
+    /// during early bootstrap before networking comes up. Used by the
+    /// `/admin/membership-snapshot` endpoint (Sprint 2 W2.3).
+    pub fn peer_manager_arc(&self) -> Option<Arc<ferrosa_net::peer::PeerManager>> {
+        self.peer_manager.load().as_ref().clone()
+    }
+
     pub fn set_peer_manager(self: &Arc<Self>, pm: Arc<ferrosa_net::peer::PeerManager>) {
         // Register ClusterInvite handler so this node can process
         // incoming invites and connect to discovered peers.

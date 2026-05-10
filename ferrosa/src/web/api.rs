@@ -84,6 +84,20 @@ pub fn cluster_routes() -> Router<WebAppState> {
         .route("/rebalance", post(rebalance_handler))
 }
 
+/// Sprint 2 W2.3: routes mounted at `/admin/*`. Currently exposes a single
+/// endpoint, `GET /admin/membership-snapshot`, which returns a JSON object
+/// with the four membership maps that the Jepsen structural-invariant checker
+/// (`ferrosa_jepsen::checker::membership::MembershipSnapshot`) expects.
+///
+/// The `/admin/*` path lives outside `/api/*` so it is not subject to the
+/// API auth middleware. This endpoint is read-only and exposes only
+/// information that is already returnable through `/api/cluster/*`; if a
+/// future deployment wants to gate `/admin/*` behind a separate auth layer,
+/// register a middleware here.
+pub fn admin_routes() -> Router<WebAppState> {
+    Router::new().route("/membership-snapshot", get(membership_snapshot_handler))
+}
+
 async fn cluster_status(State(mc): State<Arc<ModeController>>) -> Json<Value> {
     Json(json!({
         "mode": mc.mode().to_string(),
@@ -320,6 +334,113 @@ async fn rebalance_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode
             Json(json!({ "error": e.to_string() })),
         ),
     }
+}
+
+/// `GET /admin/membership-snapshot` — Sprint 2 W2.3.
+///
+/// Returns the four membership maps the Jepsen structural-invariant checker
+/// expects (`ferrosa_jepsen::checker::membership::MembershipSnapshot`):
+///
+///   - `state_members`: per-host_id `{host_id, addr, state}` view, projected
+///     from the local token ring (the ring is built from `state.members`).
+///   - `openraft_voters`: voter host_ids from openraft metrics.
+///   - `openraft_learners`: learner host_ids from openraft metrics.
+///   - `node_map`: same as `openraft_voters` for now — this endpoint will be
+///     hardened in Sprint 4 once the network factory exposes its registry
+///     publicly. The current projection still detects four-maps drift across
+///     reporters because every reporter resolves the same data on its own
+///     state machine.
+///   - `peer_manager_peers`: from `peer_manager.live_peer_ids()`.
+///   - `committed_cluster_size`: openraft voter count.
+///   - `live_peer_count`: peer_manager live peer count.
+///   - `reporter_host_id`: this node's `host_id`.
+///
+/// Returns 200 with the JSON body in all cases — when a particular map is
+/// not yet wired (e.g. no token ring installed) the corresponding field is
+/// returned empty, never absent. This makes the JSON shape stable across
+/// node lifecycles so the checker can rely on it.
+async fn membership_snapshot_handler(State(mc): State<Arc<ModeController>>) -> Json<Value> {
+    use serde_json::Map;
+
+    let mut state_members = Map::new();
+    if let Some(ring) = mc.token_ring() {
+        for node_id in ring.node_ids() {
+            if let Some(info) = ring.get_node(node_id) {
+                let host_str = info.host_id.to_string();
+                state_members.insert(
+                    host_str.clone(),
+                    json!({
+                        "host_id": host_str,
+                        "addr": info.addr,
+                        "state": node_state_to_str(info.state).to_lowercase(),
+                    }),
+                );
+            }
+        }
+    }
+
+    // Project openraft voters (and learners) by best-effort.
+    // Without a stable node_id ↔ host_id map exposed by ModeController we
+    // surface the openraft node_ids as-is. Cross-snapshot comparisons still
+    // detect drift because every reporter uses the same translation.
+    let mut openraft_voters: Vec<String> = Vec::new();
+    let mut openraft_learners: Vec<String> = Vec::new();
+    let mut committed_cluster_size: usize = 0;
+    if let Some(raft) = mc.raft() {
+        let metrics = raft.metrics().borrow().clone();
+        let voter_ids: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
+        committed_cluster_size = voter_ids.len();
+        // Translate node_id → host_id via the token ring (best effort).
+        let ring = mc.token_ring();
+        for v in voter_ids {
+            let host = ring
+                .as_ref()
+                .and_then(|r| r.get_node(v))
+                .map(|info| info.host_id.to_string())
+                .unwrap_or_else(|| format!("node_id={v}"));
+            openraft_voters.push(host);
+        }
+        for n in metrics.membership_config.nodes() {
+            // Learners = nodes ∖ voters.
+            let id = *n.0;
+            if metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .all(|v| v != id)
+            {
+                let host = ring
+                    .as_ref()
+                    .and_then(|r| r.get_node(id))
+                    .map(|info| info.host_id.to_string())
+                    .unwrap_or_else(|| format!("node_id={id}"));
+                openraft_learners.push(host);
+            }
+        }
+    }
+
+    // node_map: until network_factory exposes its registry, project from voters.
+    let node_map: Vec<String> = openraft_voters.clone();
+
+    // peer_manager.peers — surface live peers when the peer manager is set.
+    let mut peer_manager_peers: Vec<String> = Vec::new();
+    let mut live_peer_count: usize = 0;
+    if let Some(pm) = mc.peer_manager_arc() {
+        let live_ids = pm.live_peer_ids();
+        live_peer_count = live_ids.len();
+        peer_manager_peers = live_ids.into_iter().map(|u| u.to_string()).collect();
+    }
+
+    Json(json!({
+        "reporter_host_id": mc.host_id().to_string(),
+        "state_members": Value::Object(state_members),
+        "openraft_voters": openraft_voters,
+        "openraft_learners": openraft_learners,
+        "node_map": node_map,
+        "peer_manager_peers": peer_manager_peers,
+        "committed_cluster_size": committed_cluster_size,
+        "live_peer_count": live_peer_count,
+    }))
 }
 
 /// Convert [`NodeState`] to a human-readable string for JSON output.
@@ -803,6 +924,89 @@ mod tests {
             assert!(node["state"].is_string(), "state must be a string");
             assert_eq!(node["state"], "Normal", "state should be Normal");
             assert_eq!(node["token_count"], 16, "each node has 16 tokens");
+        }
+    }
+
+    /// Sprint 2 W2.3: GET /admin/membership-snapshot returns the four maps
+    /// the structural-invariant checker expects.
+    ///
+    /// The endpoint must serialize a JSON object with at least the fields
+    /// `state_members`, `openraft_voters`, `openraft_learners`, `node_map`,
+    /// `peer_manager_peers`, `committed_cluster_size`, `live_peer_count`, and
+    /// `reporter_host_id`. Pre-Sprint-2 there was no such endpoint at all.
+    #[tokio::test]
+    async fn admin_membership_snapshot_returns_all_four_maps() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+
+        let state = make_state();
+
+        // Seed a 3-node token ring so state_members has content.
+        let mut ring = TokenRing::new();
+        for i in 1u64..=3 {
+            let host_id = uuid::Uuid::new_v4();
+            ring.add_node(
+                i,
+                NodeInfo {
+                    host_id,
+                    addr: format!("10.0.0.{}:7000", i),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                },
+            );
+        }
+        state.mode_controller.set_token_ring(Arc::new(ring));
+
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/admin/membership-snapshot")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /admin/membership-snapshot must succeed (Sprint 2 W2.3)"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for field in [
+            "reporter_host_id",
+            "state_members",
+            "openraft_voters",
+            "openraft_learners",
+            "node_map",
+            "peer_manager_peers",
+            "committed_cluster_size",
+            "live_peer_count",
+        ] {
+            assert!(
+                parsed.get(field).is_some(),
+                "membership snapshot must include field `{field}`; got {parsed}"
+            );
+        }
+
+        // state_members must be an object keyed by host_id with 3 entries
+        // matching the seeded ring.
+        let members = parsed["state_members"]
+            .as_object()
+            .expect("state_members must be an object");
+        assert_eq!(members.len(), 3, "expected 3 entries in state_members");
+        for (_host_id, view) in members {
+            let view = view.as_object().expect("each entry must be an object");
+            assert!(view.contains_key("host_id"));
+            assert!(view.contains_key("addr"));
+            assert!(view.contains_key("state"));
+            assert_ne!(
+                view["addr"].as_str(),
+                Some(""),
+                "I-07: state.members entries must not have empty addrs"
+            );
         }
     }
 
