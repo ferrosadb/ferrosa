@@ -711,8 +711,39 @@
         gap: 1.5rem;
       }
       .features-grid { grid-template-columns: 1fr; }
-      nav .nav-links { display: none; }
-      .beta-banner { top: 64px; font-size: 0.75rem; }
+      nav { padding: 0 1rem; }
+      nav .nav-inner {
+        height: auto;
+        min-height: 64px;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        padding: 0.75rem 0;
+      }
+      body { overflow-x: hidden; }
+      nav .nav-cta { display: none; }
+      nav .nav-links {
+        order: 3;
+        flex: 0 0 100%;
+        min-width: 0;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, max-content));
+        gap: 0.45rem 1rem;
+        padding: 0.25rem 0 0.5rem;
+      }
+      nav .nav-links a { white-space: nowrap; }
+      section {
+        width: 100%;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        overflow-wrap: anywhere;
+      }
+      .hero { padding-top: 15rem; }
+      .hero h1 { font-size: clamp(2rem, 11vw, 3rem); }
+      .hero p { font-size: 1rem; }
+      .hero-actions { flex-direction: column; align-items: stretch; }
+      .btn-primary,
+      .btn-secondary { width: 100%; text-align: center; }
+      .beta-banner { top: 148px; font-size: 0.75rem; }
       .comparison-table { font-size: 0.8125rem; }
       .comparison-table th,
       .comparison-table td { padding: 0.75rem 0.75rem; }
