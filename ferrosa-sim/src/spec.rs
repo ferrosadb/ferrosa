@@ -105,12 +105,40 @@ pub fn state_machine_safety(cluster: &SimulatedCluster) -> InvariantResult {
     InvariantResult::Holds
 }
 
+/// W5.8 / TLA+ `NoTermAdvanceWithoutPreVoteMajority`: when PreVote
+/// is enabled, no node may have entered `Candidate` without first
+/// collecting a PreVote majority.  Snapshot form: if a candidate
+/// exists, its term must equal the maximum term observed in the
+/// cluster (i.e. it didn't unilaterally race ahead).  This is a
+/// weaker form of the TLA+ invariant; the stronger form rides on
+/// the trace verifier (W5.10).
+pub fn no_term_advance_without_prevote_majority(cluster: &SimulatedCluster) -> InvariantResult {
+    let max_term = cluster
+        .voter_ids()
+        .iter()
+        .map(|id| cluster.node(*id).term)
+        .max()
+        .unwrap_or(0);
+    for id in cluster.voter_ids() {
+        let n = cluster.node(id);
+        if n.role == Role::Candidate && n.term > max_term + 1 {
+            return InvariantResult::Violated(format!(
+                "NoTermAdvanceWithoutPreVoteMajority: node {id} \
+                 candidate at term {} but max cluster term is {max_term}",
+                n.term
+            ));
+        }
+    }
+    InvariantResult::Holds
+}
+
 /// Run every invariant against a snapshot.  Returns `Ok` only if
 /// every invariant holds.
 pub fn check_all(cluster: &SimulatedCluster) -> Result<(), String> {
     election_safety(cluster).into_result()?;
     leader_append_only(cluster).into_result()?;
     state_machine_safety(cluster).into_result()?;
+    no_term_advance_without_prevote_majority(cluster).into_result()?;
     Ok(())
 }
 

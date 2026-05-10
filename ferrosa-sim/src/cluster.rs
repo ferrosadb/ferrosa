@@ -65,6 +65,32 @@ pub enum Event {
         /// Candidate's last log term (Raft log up-to-date check).
         last_log_term: u64,
     },
+    /// W5.8 PreVote: a probe that *does not* mutate term.  If the
+    /// candidate collects a quorum of `PreVoteReply { granted = true }`,
+    /// it then issues the real `RequestVote`.
+    PreVoteRequest {
+        /// PreCandidate that issued the probe.
+        from: NodeId,
+        /// Voter being asked.
+        to: NodeId,
+        /// Hypothetical term.
+        term: u64,
+        /// PreCandidate's last log index.
+        last_log_index: u64,
+        /// PreCandidate's last log term.
+        last_log_term: u64,
+    },
+    /// Reply to a previous [`Event::PreVoteRequest`].
+    PreVoteReply {
+        /// Voter that produced the reply.
+        from: NodeId,
+        /// PreCandidate the reply is delivered to.
+        to: NodeId,
+        /// Term being probed.
+        term: u64,
+        /// Whether the PreVote was granted.
+        granted: bool,
+    },
     /// Reply to a previous [`Event::RequestVote`].
     RequestVoteReply {
         /// Voter that produced the reply.
@@ -137,6 +163,9 @@ struct NodeState {
     /// Set of voters that have granted us a vote in
     /// `node.term` — populated only while `node.role == Candidate`.
     votes_received: std::collections::BTreeSet<NodeId>,
+    /// W5.8: voters that have granted a PreVote at the next
+    /// hypothetical term.  Reset on each fresh PreVote round.
+    pre_votes_received: std::collections::BTreeSet<NodeId>,
     /// `true` if the node is crashed (e.g. by a `KillMinority`
     /// nemesis).  Crashed nodes drop every event addressed to them
     /// and never schedule new ones.
@@ -160,6 +189,9 @@ pub struct SimulatedCluster {
     /// Pairs `(from, to)` whose messages must be dropped.  Modelled
     /// as a `BTreeSet` so iteration is deterministic.
     dropped_links: std::collections::BTreeSet<(NodeId, NodeId)>,
+    /// W5.8: when `true`, election timeouts run a PreVote round
+    /// before bumping the term.  `false` keeps the W5.3 behaviour.
+    pub(crate) pre_vote_enabled: bool,
 }
 
 impl SimulatedCluster {
@@ -193,6 +225,7 @@ impl SimulatedCluster {
                     node,
                     election_deadline: Some(election),
                     votes_received: Default::default(),
+                    pre_votes_received: Default::default(),
                     crashed: false,
                 },
             );
@@ -206,7 +239,15 @@ impl SimulatedCluster {
             rng,
             trace: Trace::new(),
             dropped_links: std::collections::BTreeSet::new(),
+            pre_vote_enabled: false,
         }
+    }
+
+    /// Builder-style flip: enable PreVote (W5.8).  Election timeouts
+    /// then schedule a `PreVoteRequest` round before bumping term.
+    pub fn with_pre_vote(mut self) -> Self {
+        self.pre_vote_enabled = true;
+        self
     }
 
     /// Borrow the action trace recorded so far.
@@ -360,6 +401,19 @@ impl SimulatedCluster {
                 granted,
             } => self.on_request_vote_reply(from, to, term, granted),
             Event::Heartbeat { from, to, term } => self.on_heartbeat(from, to, term),
+            Event::PreVoteRequest {
+                from,
+                to,
+                term,
+                last_log_index,
+                last_log_term,
+            } => self.on_pre_vote_request(from, to, term, last_log_index, last_log_term),
+            Event::PreVoteReply {
+                from,
+                to,
+                term,
+                granted,
+            } => self.on_pre_vote_reply(from, to, term, granted),
         }
         true
     }
@@ -373,7 +427,9 @@ impl SimulatedCluster {
             Event::ElectionTimeout { node } => crashed(node),
             Event::RequestVote { from, to, .. }
             | Event::RequestVoteReply { from, to, .. }
-            | Event::Heartbeat { from, to, .. } => {
+            | Event::Heartbeat { from, to, .. }
+            | Event::PreVoteRequest { from, to, .. }
+            | Event::PreVoteReply { from, to, .. } => {
                 crashed(from) || crashed(to) || partitioned(from, to)
             }
         }
@@ -436,6 +492,7 @@ impl SimulatedCluster {
                 node,
                 election_deadline: Some(deadline),
                 votes_received: Default::default(),
+                pre_votes_received: Default::default(),
                 crashed: false,
             },
         );
@@ -488,12 +545,19 @@ impl SimulatedCluster {
             return;
         }
 
+        if self.pre_vote_enabled {
+            self.start_pre_vote(id);
+        } else {
+            self.start_real_candidacy(id);
+        }
+    }
+
+    fn start_real_candidacy(&mut self, id: NodeId) {
         let peers = self.peer_ids(id);
         let new_timeout = self.now + self.random_election_timeout();
         let (term, last_log_index, last_log_term);
         {
             let state = self.nodes.get_mut(&id).expect("node exists");
-            // Become candidate.
             state.node.term += 1;
             state.node.role = Role::Candidate;
             state.node.voted_for = Some(id);
@@ -507,7 +571,6 @@ impl SimulatedCluster {
         self.trace
             .push(self.now, TlaAction::BecomeCandidate { node: id, term });
 
-        // Re-arm the election timer (in case the vote round fails).
         let next_timeout = self.nodes[&id].election_deadline.unwrap();
         self.queue.push(Scheduled {
             deadline: next_timeout,
@@ -516,7 +579,6 @@ impl SimulatedCluster {
         });
         self.next_seq += 1;
 
-        // Broadcast RequestVote to every peer.
         for peer in peers {
             self.schedule(
                 1,
@@ -538,9 +600,100 @@ impl SimulatedCluster {
             );
         }
 
-        // If a single-voter cluster, immediate self-majority.
         if self.voter_count() == 1 {
             self.become_leader(id);
+        }
+    }
+
+    fn start_pre_vote(&mut self, id: NodeId) {
+        let peers = self.peer_ids(id);
+        let new_timeout = self.now + self.random_election_timeout();
+        let (hypothetical_term, last_log_index, last_log_term);
+        {
+            let state = self.nodes.get_mut(&id).expect("node exists");
+            state.node.role = Role::PreCandidate;
+            state.pre_votes_received.clear();
+            state.pre_votes_received.insert(id);
+            state.election_deadline = Some(new_timeout);
+            hypothetical_term = state.node.term + 1;
+            last_log_index = state.node.log_len;
+            last_log_term = state.node.term.saturating_sub(1);
+        }
+
+        let next_timeout = self.nodes[&id].election_deadline.unwrap();
+        self.queue.push(Scheduled {
+            deadline: next_timeout,
+            seq: self.next_seq,
+            event: Event::ElectionTimeout { node: id },
+        });
+        self.next_seq += 1;
+
+        for peer in peers {
+            self.schedule(
+                1,
+                Event::PreVoteRequest {
+                    from: id,
+                    to: peer,
+                    term: hypothetical_term,
+                    last_log_index,
+                    last_log_term,
+                },
+            );
+        }
+
+        if self.voter_count() == 1 {
+            // Single-voter cluster: PreVote majority is trivially
+            // satisfied, proceed straight to real candidacy.
+            self.start_real_candidacy(id);
+        }
+    }
+
+    fn on_pre_vote_request(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) {
+        let granted;
+        let reply_term;
+        {
+            let state = self.nodes.get(&to).expect("node exists");
+            // PreVote does NOT mutate term.  Grant iff the candidate
+            // would beat us in a real election: term ≥ ours and
+            // log up-to-date.
+            let log_ok = last_log_term > state.node.term.saturating_sub(1)
+                || (last_log_term == state.node.term.saturating_sub(1)
+                    && last_log_index >= state.node.log_len);
+            granted = term > state.node.term && log_ok;
+            reply_term = state.node.term;
+        }
+        self.schedule(
+            1,
+            Event::PreVoteReply {
+                from: to,
+                to: from,
+                term: reply_term,
+                granted,
+            },
+        );
+    }
+
+    fn on_pre_vote_reply(&mut self, from: NodeId, to: NodeId, _term: u64, granted: bool) {
+        let promote;
+        {
+            let state = self.nodes.get_mut(&to).expect("node exists");
+            if state.node.role != Role::PreCandidate {
+                return;
+            }
+            if granted {
+                state.pre_votes_received.insert(from);
+            }
+            promote = state.pre_votes_received.len() >= self.quorum_size();
+        }
+        if promote {
+            self.start_real_candidacy(to);
         }
     }
 
@@ -767,5 +920,44 @@ mod tests {
         let _ = a.run_until_leader(10_000).unwrap();
         let _ = b.run_until_leader(10_000).unwrap();
         assert_ne!(a.trace(), b.trace());
+    }
+
+    /// W5.8 RED → GREEN: a 3-voter cluster with PreVote enabled
+    /// reaches a leader and the leader's term has incremented past 0
+    /// (i.e. the PreVote round successfully promoted the
+    /// PreCandidate to a real candidate, then to a leader).
+    #[test]
+    fn pre_vote_round_promotes_to_leader() {
+        let mut cluster = SimulatedCluster::with_voters(3, 42).with_pre_vote();
+        let leader = cluster.run_until_leader(10_000).unwrap();
+        assert!(matches!(leader, 1..=3));
+        let term = cluster.node(leader).term;
+        assert!(term >= 1, "leader should have term ≥ 1, got {term}");
+    }
+
+    /// W5.8: PreVote suppresses term advances when no quorum is
+    /// available.  Construct a partition that isolates one node
+    /// from the other two; the isolated node must NOT bump term
+    /// because no quorum can grant a PreVote.
+    #[test]
+    fn pre_vote_blocks_term_advance_in_minority_partition() {
+        let mut cluster = SimulatedCluster::with_voters(3, 99).with_pre_vote();
+        // Drive the cluster to a leader first.
+        cluster.run_until_leader(10_000);
+        let initial_term = (1..=3).map(|i| cluster.node(i).term).max().unwrap();
+
+        // Isolate node 1 from {2, 3}.
+        cluster.partition_pair(1, 2);
+        cluster.partition_pair(1, 3);
+        // Run for many election cycles.  Without PreVote, node 1
+        // would repeatedly bump its term during partition.  With
+        // PreVote, its term must stay ≤ initial.
+        cluster.run_for(50_000);
+
+        let n1_term = cluster.node(1).term;
+        assert!(
+            n1_term <= initial_term + 1,
+            "isolated node 1 advanced term from {initial_term} to {n1_term} despite PreVote"
+        );
     }
 }
