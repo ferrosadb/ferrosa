@@ -1812,6 +1812,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "serde_json",
+ "sled",
  "tabled",
  "tempfile",
  "tokio",
