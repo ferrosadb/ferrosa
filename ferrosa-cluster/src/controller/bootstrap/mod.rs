@@ -37,6 +37,7 @@
 //! modes that touch each phase; the W4.15 integration tests exercise
 //! S-01 through S-37 against the live `transition_to_cluster`.
 
+pub mod deliver_invites;
 pub mod phase;
 
 pub use phase::{BootstrapError, BootstrapPhase};
