@@ -1,12 +1,39 @@
 ---
 type: bug
 priority: P1
-status: open
+status: fixed
 created: 2026-05-10
+fixed: 2026-05-10
 discovered-by: ferrosa-jepsen test cql_session::tests::rust_driver_connects_to_cluster
+fixed-in: ferrosa-cql/src/router.rs::filter_system_columns
 ---
 
 # Bug: `SELECT now() FROM system.local` returns row with zero columns
+
+## Resolution
+
+`filter_system_columns` (`ferrosa-cql/src/router.rs:628`) handled only
+`SelectColumn::Star` and `SelectColumn::Column(name)`; any
+`SelectColumn::FunctionCall` projection silently fell through and produced
+zero output columns. With one source row and zero columns the response
+was `(rows=[[]])` — both cdrs-tokio and python cassandra-driver crash on
+`rows[0][0]` / "Invalid shape in axis 0: 0".
+
+The fix extends the match to handle the three zero-arg builtin function
+calls used in projection contexts: `now()` → `Timeuuid` via
+`bridge::eval_now()`; `currenttimestamp()` → `Timestamp(epoch_ms)`;
+`uuid()` → `Uuid(v4())`. Each emits one column with an appropriate
+display name (alias if provided, else lowercased function name) and
+type. Other function calls remain skipped to preserve prior behaviour.
+
+Regression test:
+`router::tests::select_now_from_system_local_returns_one_timeuuid_column`
+asserts `col_count == 1` against the wire-encoded response.
+
+The pre-existing test
+`select_now_from_system_local_returns_timeuuid` only checked row count
+(it passed even with zero columns) — the new test catches the column
+count specifically.
 
 ## Symptom
 
