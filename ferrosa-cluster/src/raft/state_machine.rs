@@ -1701,6 +1701,66 @@ mod tests {
         );
     }
 
+    /// W7.2 RED → GREEN. Two `AccordApply` entries fed in reverse HLC
+    /// order (t2 before t1) must drain in ascending HLC order — t1
+    /// before t2 — so every replica sees the same apply order (I-27).
+    #[tokio::test]
+    async fn apply_buffers_out_of_order_accord_entries() {
+        let mut sm = FerrosStateMachine::new();
+        let t1 = AccordTimestamp::synthetic(1_000_000_000);
+        let t2 = AccordTimestamp::synthetic(2_000_000_000);
+        let txn1 = TxnId::new(1, t1);
+        let txn2 = TxnId::new(1, t2);
+
+        // Feed t2 FIRST, then t1 — exactly the reverse order.
+        let entries = vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::AccordApply {
+                    txn_id: txn2,
+                    hlc: t2,
+                    mutation: Vec::new(),
+                },
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::AccordApply {
+                    txn_id: txn1,
+                    hlc: t1,
+                    mutation: Vec::new(),
+                },
+            ),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        // While the watermark is below t1, both must be buffered.
+        sm.advance_accord_watermark(AccordTimestamp::synthetic(500_000_000));
+        assert_eq!(sm.accord_apply_buffer().len(), 2, "below t1 — both stall");
+
+        // Advance the watermark to release t1 first.
+        sm.advance_accord_watermark(t1);
+        assert_eq!(
+            sm.accord_apply_buffer().len(),
+            1,
+            "watermark = t1 must release exactly t1"
+        );
+        assert!(
+            sm.state().applied_accord_txns.contains(&txn1),
+            "t1 ledger entry must be recorded first"
+        );
+        assert!(
+            !sm.state().applied_accord_txns.contains(&txn2),
+            "t2 must still be buffered"
+        );
+
+        // Now release t2.
+        sm.advance_accord_watermark(t2);
+        assert!(sm.accord_apply_buffer().is_empty());
+        assert!(sm.state().applied_accord_txns.contains(&txn2));
+    }
+
     #[tokio::test]
     async fn apply_create_keyspace() {
         let mut sm = FerrosStateMachine::new();
