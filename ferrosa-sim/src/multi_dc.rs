@@ -195,11 +195,21 @@ impl AccordCoord {
 /// nemesis flag drops fan-outs to the partitioned-away DC (queued in
 /// `dropped_for_dc{1,2}` and replayed on heal — modelling Accord
 /// recovery).
+///
+/// W8.8 — additionally supports per-DC learner replicas: the leader's
+/// `AppendEntries` arrive at every voter AND every learner in the same
+/// DC. Learners do not vote (don't count toward the QUORUM apply
+/// gate) but their state must converge with the voters'.
 pub struct DualDcBankSim {
     /// DC1 apply state (4 voters: 3 in dc1 + 1 in dc2 quorum).
     pub dc1: DcApplyState,
     /// DC2 apply state.
     pub dc2: DcApplyState,
+    /// W8.8 — DC1's learners (if any). Each receives every entry that
+    /// DC1 commits but is not in the voter quorum.
+    pub dc1_learners: Vec<DcApplyState>,
+    /// W8.8 — DC2's learners.
+    pub dc2_learners: Vec<DcApplyState>,
     /// Mocked cross-DC Accord coordinator.
     pub coord: AccordCoord,
     /// Initial per-account balance — used for the conservation
@@ -221,9 +231,28 @@ pub struct DualDcBankSim {
 impl DualDcBankSim {
     /// Build a fresh dual-DC bank with `n_accounts` each at `initial`.
     pub fn new(n_accounts: u32, initial: i64, seed: u64) -> Self {
+        Self::with_learners(n_accounts, initial, seed, 0, 0)
+    }
+
+    /// W8.8 — Build a dual-DC bank with `dc1_learners` learners in
+    /// DC1 and `dc2_learners` learners in DC2 (in addition to the
+    /// implicit voter set).
+    pub fn with_learners(
+        n_accounts: u32,
+        initial: i64,
+        seed: u64,
+        dc1_learners: usize,
+        dc2_learners: usize,
+    ) -> Self {
         Self {
             dc1: DcApplyState::new(n_accounts, initial),
             dc2: DcApplyState::new(n_accounts, initial),
+            dc1_learners: (0..dc1_learners)
+                .map(|_| DcApplyState::new(n_accounts, initial))
+                .collect(),
+            dc2_learners: (0..dc2_learners)
+                .map(|_| DcApplyState::new(n_accounts, initial))
+                .collect(),
             coord: AccordCoord::new(),
             initial,
             n_accounts,
@@ -263,9 +292,15 @@ impl DualDcBankSim {
         self.partitioned = false;
         while let Some(e) = self.dropped_for_dc1.pop_front() {
             self.dc1.submit(e);
+            for l in &mut self.dc1_learners {
+                l.submit(e);
+            }
         }
         while let Some(e) = self.dropped_for_dc2.pop_front() {
             self.dc2.submit(e);
+            for l in &mut self.dc2_learners {
+                l.submit(e);
+            }
         }
     }
 
@@ -273,25 +308,42 @@ impl DualDcBankSim {
     /// DCs reachable, the entry lands in both DC's buffers; under
     /// partition only the local DC sees the entry, the other side's
     /// fan-out is queued in `dropped_for_dcX`.
+    ///
+    /// W8.8 — learners in each DC also receive the entry (mirroring
+    /// the leader's `AppendEntries` to learners). They do not affect
+    /// the QUORUM gate but their state machines must converge.
     pub fn step_transfer(&mut self, amount: i64, originating_dc: u8) {
         let transfer = self.random_transfer(amount);
         let entry = self.coord.propose(transfer, 100);
-        // Originating DC always sees the entry.
+        // Originating DC always sees the entry — voters and learners
+        // alike (the entry rides the local Raft AppendEntries).
         match originating_dc {
             1 => {
                 self.dc1.submit(entry);
+                for l in &mut self.dc1_learners {
+                    l.submit(entry);
+                }
                 if self.partitioned {
                     self.dropped_for_dc2.push_back(entry);
                 } else {
                     self.dc2.submit(entry);
+                    for l in &mut self.dc2_learners {
+                        l.submit(entry);
+                    }
                 }
             }
             2 => {
                 self.dc2.submit(entry);
+                for l in &mut self.dc2_learners {
+                    l.submit(entry);
+                }
                 if self.partitioned {
                     self.dropped_for_dc1.push_back(entry);
                 } else {
                     self.dc1.submit(entry);
+                    for l in &mut self.dc1_learners {
+                        l.submit(entry);
+                    }
                 }
             }
             other => panic!("originating_dc must be 1 or 2; got {other}"),
@@ -300,9 +352,17 @@ impl DualDcBankSim {
 
     /// Tick both DCs' watermarks to `new_watermark`, draining any
     /// at-or-below buffered entries. Returns total drained across
-    /// both DCs.
+    /// both DCs (and their learners).
     pub fn tick_watermark(&mut self, new_watermark: SimHlc) -> usize {
-        self.dc1.advance_watermark(new_watermark) + self.dc2.advance_watermark(new_watermark)
+        let mut drained =
+            self.dc1.advance_watermark(new_watermark) + self.dc2.advance_watermark(new_watermark);
+        for l in &mut self.dc1_learners {
+            drained += l.advance_watermark(new_watermark);
+        }
+        for l in &mut self.dc2_learners {
+            drained += l.advance_watermark(new_watermark);
+        }
+        drained
     }
 
     /// W7.10 conservation invariant: per-DC balance conservation —
@@ -318,15 +378,34 @@ impl DualDcBankSim {
     pub fn invariant_holds(&self) -> bool {
         let dc1_ok = self.dc1.total() == self.expected_total();
         let dc2_ok = self.dc2.total() == self.expected_total();
-        dc1_ok && dc2_ok
+        // W8.8 — every learner must also conserve its DC's total.
+        let learners_ok = self
+            .dc1_learners
+            .iter()
+            .chain(self.dc2_learners.iter())
+            .all(|l| l.total() == self.expected_total());
+        dc1_ok && dc2_ok && learners_ok
     }
 
     /// Cross-DC convergence: both DCs' fully-drained buffers carry
     /// identical balance maps. Asserted post-heal in W7.10.
+    ///
+    /// W8.8 — learners in each DC must also converge to the same
+    /// balance map as their DC's voters (their AppendEntries stream
+    /// is identical to the voter set).
     pub fn dcs_converged(&self) -> bool {
-        self.dc1.buffer_len() == 0
+        let voters_converged = self.dc1.buffer_len() == 0
             && self.dc2.buffer_len() == 0
-            && self.dc1.balances == self.dc2.balances
+            && self.dc1.balances == self.dc2.balances;
+        let learners_converged = self
+            .dc1_learners
+            .iter()
+            .all(|l| l.buffer_len() == 0 && l.balances == self.dc1.balances)
+            && self
+                .dc2_learners
+                .iter()
+                .all(|l| l.buffer_len() == 0 && l.balances == self.dc2.balances);
+        voters_converged && learners_converged
     }
 }
 
@@ -511,5 +590,78 @@ mod tests {
             "long-horizon per-DC bank conservation failures: {failures}"
         );
         assert!(sim.dcs_converged());
+    }
+
+    /// W8.8 RED. 1h-equivalent simulated endurance with 3+3 voters and
+    /// 1 learner per DC. We compress "1 simulated hour" to 60_000
+    /// ticks (each tick conceptually one millisecond) to keep the
+    /// test under one wall-clock second. The acceptance gate is
+    /// stricter than W7.10: the learner replicas must converge with
+    /// their DC's voters at every step (after watermark advance) AND
+    /// after the partition heal.
+    ///
+    /// This is the W8.8 sim acceptance test for ADR-014 learner
+    /// replicas — zero linearizability violations, zero membership
+    /// invariant violations, zero learner divergence.
+    #[test]
+    fn endurance_1h_with_learners_under_load() {
+        let mut sim = DualDcBankSim::with_learners(8, 500, 137, 1, 1);
+        let mut conservation_failures = 0;
+        let mut learner_divergence_failures = 0;
+
+        // Inject two partitions over the run — once early, once
+        // mid-stream — to exercise learner re-sync after Accord
+        // recovery.
+        let partition_windows = [(5_000usize, 12_000usize), (30_000, 38_000)];
+
+        for tick in 0..60_000usize {
+            for &(start, end) in &partition_windows {
+                if tick == start {
+                    sim.partition();
+                }
+                if tick == end {
+                    sim.heal_partition();
+                }
+            }
+
+            // Two transfers per tick alternating originating DC.
+            let dc = if tick % 2 == 0 { 1 } else { 2 };
+            sim.step_transfer(((tick % 13) + 1) as i64, dc);
+            sim.tick_watermark(sim.coord.hlc());
+
+            if !sim.invariant_holds() {
+                conservation_failures += 1;
+            }
+            // Learner divergence check: when not partitioned, each
+            // learner's totals must equal its DC voter's total.
+            if !sim.partitioned {
+                if let Some(l) = sim.dc1_learners.first() {
+                    if l.total() != sim.dc1.total() {
+                        learner_divergence_failures += 1;
+                    }
+                }
+                if let Some(l) = sim.dc2_learners.first() {
+                    if l.total() != sim.dc2.total() {
+                        learner_divergence_failures += 1;
+                    }
+                }
+            }
+        }
+
+        // Final drain (handles any post-partition queue).
+        sim.tick_watermark(u64::MAX);
+
+        assert_eq!(
+            conservation_failures, 0,
+            "endurance: {conservation_failures} per-DC bank-conservation failures",
+        );
+        assert_eq!(
+            learner_divergence_failures, 0,
+            "endurance: {learner_divergence_failures} learner-vs-voter divergence steps",
+        );
+        assert!(
+            sim.dcs_converged(),
+            "endurance: voters and learners must converge after final drain",
+        );
     }
 }

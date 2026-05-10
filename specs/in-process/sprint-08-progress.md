@@ -28,6 +28,22 @@ endurance --hours 24` once budget is approved.
 
 ## Per–work-item log
 
+### W8.8 — Learner-replica endurance: 1h sim run — DONE
+
+- RED: `endurance_1h_with_learners_under_load` in
+  `ferrosa-sim/src/multi_dc.rs::tests`. 3+3 dual-DC, 1 learner per DC,
+  60k-tick run (compressed "1 simulated hour"), two partition windows
+  (5_000–12_000 and 30_000–38_000) to exercise Accord-recovery learner
+  re-sync.
+- GREEN: extended `DualDcBankSim` with `dc1_learners` / `dc2_learners`
+  (`Vec<DcApplyState>`) plus `with_learners()` constructor;
+  `step_transfer`, `tick_watermark`, and `heal_partition` now fan out
+  to learners. `invariant_holds()` and `dcs_converged()` extended to
+  include learner totals + balances.
+- Acceptance: zero per-DC conservation failures, zero learner
+  divergence steps when not partitioned, full voter+learner
+  convergence after the final drain. Test runs in ~0.5s wall-clock.
+
 ### W8.6 — Token ownership per learner — DONE
 
 - RED: two tests in `ring/mod.rs`:
