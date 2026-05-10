@@ -37,7 +37,15 @@
 //! modes that touch each phase; the W4.15 integration tests exercise
 //! S-01 through S-37 against the live `transition_to_cluster`.
 
+pub mod bootstrap_stream;
+pub mod create_raft;
 pub mod deliver_invites;
+pub mod drain_queue;
+pub mod establish_pools;
 pub mod phase;
+pub mod promote;
+pub mod replay_schema;
+pub mod util;
+pub mod wait_leader;
 
 pub use phase::{BootstrapError, BootstrapPhase};
