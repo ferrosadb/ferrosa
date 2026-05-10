@@ -49,6 +49,11 @@ pub enum ClusterError {
     Net(ferrosa_net::error::NetError),
     /// Internal error.
     Internal(String),
+    /// Operation is not yet implemented (Sprint 6 W6.5: cross-DC
+    /// consensus path stubbed until Sprint 7's Accord wiring lands).
+    /// `feature` names the missing path so logs and clients can tell
+    /// "QUORUM cross-DC" apart from "EACH_QUORUM cross-DC".
+    NotImplemented { feature: String },
 }
 
 impl fmt::Display for ClusterError {
@@ -99,6 +104,9 @@ impl fmt::Display for ClusterError {
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::Net(e) => write!(f, "net: {e}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
+            Self::NotImplemented { feature } => {
+                write!(f, "not implemented: {feature}")
+            }
         }
     }
 }
