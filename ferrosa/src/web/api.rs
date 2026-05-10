@@ -450,6 +450,8 @@ fn node_state_to_str(state: NodeState) -> String {
         NodeState::Normal => "Normal".to_string(),
         NodeState::Leaving => "Leaving".to_string(),
         NodeState::Decommissioned => "Decommissioned".to_string(),
+        NodeState::Learner { owns_tokens: true } => "Learner(owns_tokens)".to_string(),
+        NodeState::Learner { owns_tokens: false } => "Learner".to_string(),
     }
 }
 

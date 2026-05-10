@@ -47,17 +47,24 @@ impl TokenRing {
 
     /// Find RF replicas for a token using SimpleStrategy.
     /// Walks clockwise from token, collecting distinct node IDs.
+    ///
+    /// W8.1/W8.6: includes `NodeState::Normal` voters and
+    /// `NodeState::Learner { owns_tokens: true }` replicas.
+    /// Excludes `Joining`, `Leaving`, `Decommissioned`, and
+    /// `Learner { owns_tokens: false }`.
     pub fn replicas(&self, token: Token, rf: usize) -> Vec<u64> {
-        // Only return nodes in Normal state — Joining nodes are still
-        // receiving bootstrap data and should not serve reads.
         let mut result = Vec::with_capacity(rf);
         let mut seen = HashSet::new();
 
-        let is_normal = |nid: u64| -> bool {
-            self.nodes
-                .get(&nid)
-                .is_some_and(|n| n.state == crate::raft::NodeState::Normal)
+        let is_replica_eligible = |nid: u64| -> bool {
+            self.nodes.get(&nid).is_some_and(|n| match n.state {
+                crate::raft::NodeState::Normal => true,
+                crate::raft::NodeState::Learner { owns_tokens } => owns_tokens,
+                _ => false,
+            })
         };
+        // Bind to a stable name so the reuse below reads naturally.
+        let is_normal = is_replica_eligible;
 
         // Walk clockwise from token (entries >= token)
         for (_, &node_id) in self.ring.range(token..) {
@@ -463,6 +470,42 @@ mod tests {
 
         ring.set_node_state(1, NodeState::Decommissioned);
         assert_eq!(ring.get_node(1).unwrap().state, NodeState::Decommissioned);
+    }
+
+    // -----------------------------------------------------------------------
+    // W8.1 — NodeState::Learner is distinct from voter Normal: a learner with
+    // owns_tokens=false must be excluded from `replicas()` (voter quorum).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn node_state_learner_distinct_from_voter() {
+        // Build a ring with two voters and one learner. The learner sits on a
+        // token between the two voters; if `replicas()` ignored the role table
+        // it would be returned. With NodeState::Learner { owns_tokens: false }
+        // the learner must NOT appear.
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000")); // Normal voter
+        ring.add_node(2, make_node("10.0.0.2:7000")); // Normal voter
+        let mut learner = make_node("10.0.0.3:7000");
+        learner.state = NodeState::Learner { owns_tokens: false };
+        ring.add_node(3, learner);
+
+        // Place the learner between the two voters in the ring.
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(3, &[150]); // learner — must be skipped
+        ring.assign_tokens(2, &[200]);
+
+        // RF=2: must return the two voters, never the learner.
+        let replicas = ring.replicas(50, 2);
+        assert_eq!(
+            replicas.len(),
+            2,
+            "expected exactly two voter replicas, got {replicas:?}"
+        );
+        assert!(
+            !replicas.contains(&3),
+            "learner with owns_tokens=false must be excluded from replicas(): {replicas:?}"
+        );
     }
 
     #[test]

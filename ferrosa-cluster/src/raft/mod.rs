@@ -64,6 +64,13 @@ pub type FerrosRaft = openraft::Raft<FerrosRaftConfig>;
 // ---------------------------------------------------------------------------
 
 /// Lifecycle state of a cluster node.
+///
+/// W8.1 (ADR-014): `Learner { owns_tokens }` is a long-lived, non-voting
+/// replica state. Distinct from the transient learner-during-add-voter
+/// path (which is a property of openraft's internal Membership map, not
+/// of `state.members`). Learners do not participate in Raft quorum,
+/// cannot become leader, and — when `owns_tokens=false` — are excluded
+/// from `ring.replicas()` so they do not serve voter-CL reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeState {
     /// Node is bootstrapping and has not yet been accepted by the cluster.
@@ -74,6 +81,48 @@ pub enum NodeState {
     Leaving,
     /// Node has been fully removed from the ring.
     Decommissioned,
+    /// Long-lived non-voting replica (W8.1 / ADR-014).
+    ///
+    /// `owns_tokens=true`: full read replica that participates in
+    /// repair and appears in `ring.replicas()` for `LOCAL_ONE` /
+    /// `ALL` (but never counts toward voter quorum).
+    ///
+    /// `owns_tokens=false`: state-machine replica only — useful for
+    /// analytics nodes or future witness replicas. Excluded from
+    /// `ring.replicas()` regardless of CL.
+    Learner {
+        /// Whether this learner owns ring tokens (i.e. should appear in
+        /// `replicas()` and participate in repair).
+        owns_tokens: bool,
+    },
+}
+
+impl NodeState {
+    /// Whether this lifecycle state represents a Raft voter that
+    /// counts toward quorum and serves voter-CL reads.
+    ///
+    /// Returns true only for [`NodeState::Normal`]. `Joining` is
+    /// pre-bootstrap (data not yet streamed); `Leaving` and
+    /// `Decommissioned` are post-removal; `Learner` is non-voting
+    /// by definition.
+    pub fn is_voter(&self) -> bool {
+        matches!(self, NodeState::Normal)
+    }
+
+    /// Whether this state is `Learner { .. }`.
+    pub fn is_learner(&self) -> bool {
+        matches!(self, NodeState::Learner { .. })
+    }
+
+    /// For `Learner`, whether the learner owns ring tokens. For all
+    /// non-learner states, returns `true` (they own tokens via the
+    /// normal path — this is not a learner-specific concept).
+    pub fn owns_tokens(&self) -> bool {
+        match self {
+            NodeState::Learner { owns_tokens } => *owns_tokens,
+            _ => true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
