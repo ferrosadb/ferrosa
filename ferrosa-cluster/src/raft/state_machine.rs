@@ -1701,6 +1701,151 @@ mod tests {
         );
     }
 
+    /// W7.5 RED → GREEN. Applying the same `RaftOp::AccordApply` twice
+    /// is a NoOp — the ledger short-circuits the replay. Final state
+    /// matches the single-apply state (I-28).
+    #[tokio::test]
+    async fn accord_apply_idempotent() {
+        let mut sm = FerrosStateMachine::new();
+        let hlc = AccordTimestamp::synthetic(1_000_000_000);
+        let txn = TxnId::new(7, hlc);
+
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc,
+                mutation: vec![1, 2, 3],
+            },
+        )])
+        .await
+        .unwrap();
+        sm.advance_accord_watermark(hlc);
+        assert_eq!(sm.state().applied_accord_txns.len(), 1);
+        let watermark_after_first = sm.state().hlc_watermark;
+
+        // Replay the same txn — buffer must NOT grow; ledger size
+        // unchanged; watermark unchanged.
+        sm.apply(vec![make_entry(
+            1,
+            2,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc,
+                mutation: vec![1, 2, 3],
+            },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(sm.accord_apply_buffer().len(), 0, "replay must be deduped");
+        assert_eq!(
+            sm.state().applied_accord_txns.len(),
+            1,
+            "ledger must remain at 1 entry"
+        );
+        assert_eq!(
+            sm.state().hlc_watermark,
+            watermark_after_first,
+            "watermark must not regress on replay"
+        );
+    }
+
+    /// W7.4 RED → GREEN. An entry whose HLC is 500ms in the future
+    /// relative to local "now" with max_skew = 200ms stalls. Cross-DC
+    /// writes pause until the local clock catches up. Above
+    /// REORDER_BUFFER_ALARM_DEPTH the buffer reports over-threshold so
+    /// the alarm gauge fires.
+    #[tokio::test]
+    async fn reorder_buffer_stalls_above_max_skew() {
+        use crate::raft::multi_dc_apply::{watermark_for, REORDER_BUFFER_ALARM_DEPTH};
+        use std::time::Duration;
+
+        let mut sm = FerrosStateMachine::new();
+        let max_skew = Duration::from_millis(200);
+        let now_us = 100_000u64;
+        // Entry hlc = now + 500ms (skew far exceeds 200ms bound).
+        let future_hlc = AccordTimestamp::synthetic(now_us + 500_000);
+        let txn = TxnId::new(1, future_hlc);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc: future_hlc,
+                mutation: Vec::new(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        // Watermark at now - max_skew = max(0, -100ms) = 0. Entry stalls.
+        sm.advance_accord_watermark(watermark_for(now_us, max_skew));
+        assert_eq!(sm.accord_apply_buffer().len(), 1, "skew > bound stalls");
+        assert!(!sm.state().applied_accord_txns.contains(&txn));
+
+        // Push enough entries past the alarm threshold (still future
+        // from "now") so the gauge fires.
+        for i in 0..=(REORDER_BUFFER_ALARM_DEPTH as u64) {
+            let h = AccordTimestamp::synthetic(now_us + 600_000 + i);
+            let id = TxnId::new(1, h);
+            sm.apply(vec![make_entry(
+                1,
+                2 + i,
+                RaftOp::AccordApply {
+                    txn_id: id,
+                    hlc: h,
+                    mutation: Vec::new(),
+                },
+            )])
+            .await
+            .unwrap();
+        }
+        assert!(
+            sm.accord_apply_buffer().over_alarm_threshold(),
+            "buffer above {REORDER_BUFFER_ALARM_DEPTH} entries must trigger the alarm"
+        );
+    }
+
+    /// W7.3 RED → GREEN. With `max_skew = 200ms`, the heartbeat-driven
+    /// watermark advances when `now - 200ms > entry.hlc`. Until that
+    /// crossing, the entry stalls in the reorder buffer.
+    #[tokio::test]
+    async fn watermark_advances_with_max_skew_200ms() {
+        use crate::raft::multi_dc_apply::watermark_for;
+        use std::time::Duration;
+
+        let mut sm = FerrosStateMachine::new();
+        // Feed an entry with HLC = 800ms.
+        let hlc = AccordTimestamp::synthetic(800_000);
+        let txn = TxnId::new(1, hlc);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc,
+                mutation: Vec::new(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        let max_skew = Duration::from_millis(200);
+
+        // At now = 900ms, watermark = 700_000us — below the entry's
+        // HLC, so the entry must stall.
+        sm.advance_accord_watermark(watermark_for(900_000, max_skew));
+        assert_eq!(sm.accord_apply_buffer().len(), 1);
+        assert!(!sm.state().applied_accord_txns.contains(&txn));
+
+        // At now = 1100ms, watermark = 900_000us — above 800_000us, so
+        // the entry releases.
+        sm.advance_accord_watermark(watermark_for(1_100_000, max_skew));
+        assert!(sm.accord_apply_buffer().is_empty());
+        assert!(sm.state().applied_accord_txns.contains(&txn));
+    }
+
     /// W7.2 RED → GREEN. Two `AccordApply` entries fed in reverse HLC
     /// order (t2 before t1) must drain in ascending HLC order — t1
     /// before t2 — so every replica sees the same apply order (I-27).
