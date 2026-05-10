@@ -403,6 +403,34 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         Ok(())
     }
 
+    /// Approve `host_id` to join the cluster (auto_join=false path).
+    ///
+    /// Replicates [`RaftOp::ApproveNode`] through Raft so every
+    /// follower's `state.approved_nodes` reflects it (W1.6, ADR-013
+    /// § "RaftOp::ApproveNode is no longer dead code").  Today's
+    /// `controller::approve_node` only mutates the local cache —
+    /// that's a future-removed code path; new callers must go
+    /// through this API.
+    ///
+    /// Idempotent: re-approving a host_id is a NoOp on apply.
+    pub async fn approve_node(&self, host_id: Uuid) -> Result<(), MembershipError> {
+        let cmd = RaftCommand {
+            op: RaftOp::ApproveNode { host_id },
+            schema_version: Uuid::new_v4(),
+        };
+        match self.raft.client_write(cmd).await {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
+                Err(MembershipError::NotLeader {
+                    leader_node_id: fwd.leader_id,
+                })
+            }
+            Err(other) => Err(MembershipError::RaftError(format!(
+                "client_write(ApproveNode): {other}"
+            ))),
+        }
+    }
+
     /// Update an existing voter's metadata (addr / cql_broadcast).
     ///
     /// Per ADR-013 § "update_metadata": we propose an

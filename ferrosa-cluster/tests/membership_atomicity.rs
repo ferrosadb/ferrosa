@@ -90,6 +90,55 @@ async fn add_voter_updates_all_four_maps() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approve_node_replicates_to_followers() {
+    // W1.6 — approve_node must propose RaftOp::ApproveNode so every
+    // follower's state.approved_nodes reflects the approval.  Today's
+    // controller-only cache is a regression footgun (auto_join=false
+    // clusters split-brain on approvals).
+    let cluster = TestCluster::with_voters(3).await;
+    cluster
+        .wait_for_leader(Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let pending_host = Uuid::new_v4();
+
+    let changer = MembershipChanger::new(
+        cluster.leader_node().raft.clone(),
+        cluster.membership_network(),
+    );
+    changer
+        .approve_node(pending_host)
+        .await
+        .expect("approve_node");
+
+    let mut converged = false;
+    for _ in 0..40 {
+        let nodes = cluster.nodes();
+        let mut ok = true;
+        for node in &nodes {
+            let st = node.state_snapshot().await;
+            if !st.approved_nodes.contains(&pending_host) {
+                ok = false;
+                break;
+            }
+        }
+        drop(nodes);
+        if ok {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        converged,
+        "approve_node did not replicate to every follower's approved_nodes",
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_metadata_propagates_addr() {
     // 3-voter cluster.  We update node 2's addr and expect every node's
     // state.members to reflect the new value.

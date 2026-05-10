@@ -42,6 +42,71 @@ use crate::raft::{
 use crate::ring::TokenRing;
 
 // ---------------------------------------------------------------------------
+// ApplyError — typed sub-errors that can occur inside `apply_command`.
+// ---------------------------------------------------------------------------
+
+/// Typed sub-error from a single side-effect during `apply_command` (W1.7).
+///
+/// Today the apply path logs and swallows every Schema / Engine /
+/// SystemTableWriter failure (`tracing::error!(%e, ...)` with no
+/// further propagation), which has produced two known
+/// silent-data-loss bugs:
+///
+/// 1. `engine.register_table` failure — writes to the new table go
+///    nowhere yet `RaftResponse::Ok` is returned to the client.
+/// 2. `schema.create_table_internal` failure — schema diverges from
+///    the Raft log; queries blow up with "unknown table" hours later.
+///
+/// `ApplyError` accumulates these so `apply_command` can return
+/// `RaftResponse::Error(_)` and callers (`MembershipChanger`,
+/// `client_write` users, the schema-coherence audit) can act.  The
+/// migration is staged: Sprint 1 introduces the type and wires the
+/// engine path; subsequent sprints migrate the remaining sites.
+#[derive(Debug, Clone)]
+pub enum ApplyError {
+    /// `engine.register_table` failed — writes to the table will not
+    /// land in storage.  The most dangerous class of error.
+    EngineRegisterTable {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
+    /// `engine.unregister_table` failed — stale data may persist
+    /// after a DropTable / DropKeyspace.
+    EngineUnregisterTable {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
+    /// Catch-all for sites not yet migrated to a typed variant.
+    Other(String),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EngineRegisterTable {
+                keyspace,
+                table,
+                reason,
+            } => write!(
+                f,
+                "engine.register_table({keyspace}.{table}) failed: {reason}"
+            ),
+            Self::EngineUnregisterTable {
+                keyspace,
+                table,
+                reason,
+            } => write!(
+                f,
+                "engine.unregister_table({keyspace}.{table}) failed: {reason}"
+            ),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RaftState
 // ---------------------------------------------------------------------------
 
@@ -548,6 +613,7 @@ impl FerrosStateMachine {
     fn apply_command(&mut self, cmd: RaftCommand) -> RaftResponse {
         let RaftCommand { op, schema_version } = cmd;
         let mut schema_changed = true;
+        let mut apply_errors: Vec<ApplyError> = Vec::new();
         match op {
             // ---- DDL: Keyspaces ----------------------------------------
             RaftOp::CreateKeyspace(ks) => {
@@ -604,6 +670,11 @@ impl FerrosStateMachine {
                         let tid = TableId::new(&ks, &tbl);
                         if let Err(e) = engine.unregister_table(&tid) {
                             tracing::error!(%e, "Raft apply: unregister_table failed");
+                            apply_errors.push(ApplyError::EngineUnregisterTable {
+                                keyspace: ks,
+                                table: tbl,
+                                reason: e.to_string(),
+                            });
                         }
                     }
                 }
@@ -660,6 +731,11 @@ impl FerrosStateMachine {
                     if let Some(engine) = &self.engine {
                         if let Err(e) = engine.register_table(table.to_storage_schema()) {
                             tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                            apply_errors.push(ApplyError::EngineRegisterTable {
+                                keyspace: table.keyspace.clone(),
+                                table: table.name.clone(),
+                                reason: e.to_string(),
+                            });
                         }
                     }
                     if let Some(writer) = &self.system_writer {
@@ -690,6 +766,11 @@ impl FerrosStateMachine {
                     let tid = TableId::new(&keyspace, &table);
                     if let Err(e) = engine.unregister_table(&tid) {
                         tracing::error!(%e, "Raft apply: unregister_table failed — stale table data may remain");
+                        apply_errors.push(ApplyError::EngineUnregisterTable {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                            reason: e.to_string(),
+                        });
                     }
                 }
                 if let Some(writer) = &self.system_writer {
@@ -1113,7 +1194,20 @@ impl FerrosStateMachine {
                 schema.set_schema_version(schema_version);
             }
         }
-        RaftResponse::Ok
+
+        // W1.7 — surface accumulated sub-errors instead of silently
+        // returning Ok.  Callers can detect engine/schema/system_writer
+        // failures and decide whether to retry, alert, or escalate.
+        if apply_errors.is_empty() {
+            RaftResponse::Ok
+        } else {
+            let summary = apply_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            RaftResponse::Error(summary)
+        }
     }
 }
 
@@ -2471,6 +2565,65 @@ mod tests {
             max_pending_replay_mutations_without_schema: 1024,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    /// W1.7 — `apply_command` returns `RaftResponse::Error` instead of
+    /// silently swallowing engine.register_table failures.
+    ///
+    /// The engine's `register_table` calls `std::fs::create_dir_all` on
+    /// `<data_dir>/sstables/<keyspace>:<table>`.  If that path already
+    /// exists as a regular file, the call fails with "Not a directory".
+    /// We pre-create the file, then issue `RaftOp::CreateTable` and
+    /// confirm the apply returns `RaftResponse::Error` carrying the
+    /// `engine.register_table` reason.
+    #[tokio::test]
+    async fn apply_command_propagates_engine_register_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        // Pre-create the path the engine will try to mkdir, as a file.
+        let sabotage_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&sabotage_dir).unwrap();
+        let target = sabotage_dir.join("regress_ks.victim_tbl");
+        std::fs::write(&target, b"not a directory").unwrap();
+
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let ks = simple_keyspace("regress_ks");
+        let table = simple_table("regress_ks", "victim_tbl");
+        // Apply CreateKeyspace first so the schema/system table writes
+        // succeed; only the engine.register_table on the table should
+        // fail because the sabotage file blocks the mkdir.
+        let create_ks_entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
+        let create_tbl_entry = make_entry(1, 2, RaftOp::CreateTable(Box::new(table)));
+
+        let responses = sm
+            .apply(vec![create_ks_entry, create_tbl_entry])
+            .await
+            .unwrap();
+
+        // Two responses: CreateKeyspace -> Ok, CreateTable -> Error.
+        assert_eq!(responses.len(), 2);
+        assert!(
+            matches!(&responses[0], RaftResponse::Ok),
+            "CreateKeyspace should succeed: {:?}",
+            responses[0]
+        );
+        match &responses[1] {
+            RaftResponse::Error(msg) => {
+                assert!(
+                    msg.contains("engine.register_table"),
+                    "expected register_table failure, got: {msg}"
+                );
+                assert!(
+                    msg.contains("regress_ks") && msg.contains("victim_tbl"),
+                    "error should name the failing keyspace/table: {msg}"
+                );
+            }
+            other => panic!("expected RaftResponse::Error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
