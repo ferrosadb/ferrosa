@@ -384,11 +384,61 @@ impl SledLogStore {
         index.to_be_bytes()
     }
 
+    /// Magic prefix that disambiguates log-entry framings (W1.19c).
+    ///
+    /// Legacy entries (pre-Sprint-1) are bare bincoded `Entry`s that
+    /// start with a `LogId.term: u64` little-endian byte.  A bincoded
+    /// term value of `0x46` (chr 'F') is theoretically possible but
+    /// vanishingly unlikely in steady state — and the second byte of
+    /// 'F' would have to be 'R' (`0x52`), then 'E' (`0x45`), which
+    /// would require term equal to `0x3145_5246` (little-endian
+    /// `0x31 0x45 0x52 0x46`), a value above 800 million.  No real
+    /// cluster reaches this.  We use the four magic bytes as a
+    /// definitive "current-format" marker.
+    const ENTRY_MAGIC: [u8; 4] = *b"FRE1";
+
+    /// Tag for the current entry format (after the magic).  Bumping
+    /// this signals a forward-compatible payload schema change.
+    const ENTRY_FORMAT_VERSION: u8 = 1;
+
     fn serialize_entry(entry: &Entry<FerrosRaftConfig>) -> Result<Vec<u8>, StorageIOError<u64>> {
-        bincode::serialize(entry).map_err(|e| StorageIOError::write_logs(to_any_error(e)))
+        let payload =
+            bincode::serialize(entry).map_err(|e| StorageIOError::write_logs(to_any_error(e)))?;
+        let mut out = Vec::with_capacity(payload.len() + 5);
+        out.extend_from_slice(&Self::ENTRY_MAGIC);
+        out.push(Self::ENTRY_FORMAT_VERSION);
+        out.extend_from_slice(&payload);
+        Ok(out)
     }
 
     fn deserialize_entry(bytes: &[u8]) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
+        // Tagged path: bytes start with FRE1 + version byte.
+        if bytes.len() >= 5 && bytes[..4] == Self::ENTRY_MAGIC {
+            let version = bytes[4];
+            if version != Self::ENTRY_FORMAT_VERSION {
+                // Unknown format version — fail loud.
+                #[derive(Debug)]
+                struct UnsupportedVersion(String);
+                impl std::fmt::Display for UnsupportedVersion {
+                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str(&self.0)
+                    }
+                }
+                impl std::error::Error for UnsupportedVersion {}
+                return Err(StorageIOError::read_logs(to_any_error(UnsupportedVersion(
+                    format!(
+                        "unsupported entry format version {version}; expected {}",
+                        Self::ENTRY_FORMAT_VERSION
+                    ),
+                ))));
+            }
+            return bincode::deserialize(&bytes[5..])
+                .map_err(|e| StorageIOError::read_logs(to_any_error(e)));
+        }
+
+        // Legacy path: bare bincoded Entry, with a fall-through to the
+        // pre-UpdateNodeInfo schema for entries written by older
+        // ferrosa builds.
         match bincode::deserialize(bytes) {
             Ok(entry) => Ok(entry),
             Err(current_err) => {
@@ -905,6 +955,83 @@ mod tests {
         assert_eq!(state.last_purged_log_id, None);
         assert!(state.last_log_id.is_some());
         assert_eq!(state.last_log_id.unwrap().index, 3);
+    }
+
+    /// W1.19c — round-trip an entry through the new
+    /// magic-prefix framing.  The bytes must start with `FRE1` + the
+    /// version tag, and decode back into the same entry.
+    #[test]
+    fn entry_with_magic_prefix_roundtrips() {
+        let entry = normal_entry(
+            3,
+            7,
+            RaftOp::LeaveNode {
+                node_id: 0xDEAD_BEEFu64,
+            },
+        );
+        let bytes = SledLogStore::serialize_entry(&entry).unwrap();
+        assert_eq!(
+            &bytes[..4],
+            &SledLogStore::ENTRY_MAGIC,
+            "tagged entry must start with the magic prefix",
+        );
+        assert_eq!(
+            bytes[4],
+            SledLogStore::ENTRY_FORMAT_VERSION,
+            "fifth byte is the format version tag",
+        );
+        let decoded = SledLogStore::deserialize_entry(&bytes).unwrap();
+        match decoded.payload {
+            EntryPayload::Normal(RaftCommand {
+                op: RaftOp::LeaveNode { node_id },
+                ..
+            }) => assert_eq!(node_id, 0xDEAD_BEEFu64),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// W1.19c — legacy entries (no magic prefix) still decode.
+    /// Asserts the back-compat fallthrough remains in place.
+    #[test]
+    fn legacy_log_decode_unambiguous() {
+        // Hand-craft a bare bincoded Entry — legacy on-disk form.
+        let entry = normal_entry(
+            5,
+            11,
+            RaftOp::AssignTokens {
+                node_id: 42,
+                tokens: vec![100, 200, 300],
+            },
+        );
+        let bare = bincode::serialize(&entry).unwrap();
+        // Untagged decode goes through the legacy fallthrough.
+        let decoded = SledLogStore::deserialize_entry(&bare).unwrap();
+        match decoded.payload {
+            EntryPayload::Normal(RaftCommand {
+                op: RaftOp::AssignTokens { node_id, tokens },
+                ..
+            }) => {
+                assert_eq!(node_id, 42);
+                assert_eq!(tokens, vec![100, 200, 300]);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// W1.19c — an unknown future format version is rejected loudly
+    /// instead of being silently reinterpreted as legacy data.
+    #[test]
+    fn entry_with_unknown_version_fails_loud() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SledLogStore::ENTRY_MAGIC);
+        bytes.push(0xFF); // version we do not understand
+        bytes.extend_from_slice(&[0u8; 64]);
+        let err = SledLogStore::deserialize_entry(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported entry format version"),
+            "expected unknown-version error, got: {msg}",
+        );
     }
 
     #[test]
