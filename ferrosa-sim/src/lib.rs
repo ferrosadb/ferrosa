@@ -14,6 +14,7 @@
 
 pub mod cluster;
 pub mod deployment;
+pub mod nemesis;
 pub mod node;
 pub mod rng;
 pub mod trace;

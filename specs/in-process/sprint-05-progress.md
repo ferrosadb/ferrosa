@@ -54,6 +54,7 @@ hard-to-reproduce flakes.
 | W5.2  | **Done** | feat(sim): W5.2 | 1 (`madsim_runs_single_node`) | `SimulatedNode` + `Role` + mirrored `DeploymentMode`; protocol-level only — no openraft/sled wrapping. |
 | W5.3  | **Done** | feat(sim): W5.3 | 3 (`madsim_runs_3_node_to_cluster`, RNG determinism × 2) | `SimulatedCluster` discrete-event loop: `ElectionTimeout`, `RequestVote`, `RequestVoteReply`, `Heartbeat`. 3-voter cluster reaches a leader in <10K simulated ticks. |
 | W5.4  | **Done** | feat(sim): W5.4 | 2 (`same_seed_produces_same_trace`, `different_seeds_produce_different_traces`) | `Trace` + `TlaAction` types; trace recorded for every transition. README documents the determinism contract. |
+| W5.5  | **Done** | feat(sim): W5.5 | 3 (`sim_nemesis_partition_halves`, `sim_nemesis_kill_minority`, `sim_nemesis_add_node`) | `Nemesis` trait + `PartitionHalves`, `KillMinority`, `AddNode`. Cluster API: `partition_pair`, `kill`, `add_voter`, `run_for`. |
 
 ## Final commit count
 

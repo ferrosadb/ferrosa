@@ -137,6 +137,10 @@ struct NodeState {
     /// Set of voters that have granted us a vote in
     /// `node.term` — populated only while `node.role == Candidate`.
     votes_received: std::collections::BTreeSet<NodeId>,
+    /// `true` if the node is crashed (e.g. by a `KillMinority`
+    /// nemesis).  Crashed nodes drop every event addressed to them
+    /// and never schedule new ones.
+    crashed: bool,
 }
 
 /// Aggregate of N [`SimulatedNode`]s sharing a deterministic clock.
@@ -153,6 +157,9 @@ pub struct SimulatedCluster {
     rng: SeededRng,
     /// Append-only trace of every TLA+ action observed.
     trace: Trace,
+    /// Pairs `(from, to)` whose messages must be dropped.  Modelled
+    /// as a `BTreeSet` so iteration is deterministic.
+    dropped_links: std::collections::BTreeSet<(NodeId, NodeId)>,
 }
 
 impl SimulatedCluster {
@@ -186,6 +193,7 @@ impl SimulatedCluster {
                     node,
                     election_deadline: Some(election),
                     votes_received: Default::default(),
+                    crashed: false,
                 },
             );
         }
@@ -197,6 +205,7 @@ impl SimulatedCluster {
             next_seq,
             rng,
             trace: Trace::new(),
+            dropped_links: std::collections::BTreeSet::new(),
         }
     }
 
@@ -235,6 +244,45 @@ impl SimulatedCluster {
             }
         }
         self.leader()
+    }
+
+    /// Drive the event loop for `duration` simulated ticks, draining
+    /// every event whose deadline falls in the window.
+    pub fn run_for(&mut self, duration: Tick) {
+        let target = self.now + duration;
+        while self.now < target {
+            // Stop if no event is scheduled to fire by `target`.
+            let next_deadline = self.queue.peek().map(|s| s.deadline);
+            match next_deadline {
+                Some(d) if d <= target => {}
+                _ => break,
+            }
+            if !self.step() {
+                break;
+            }
+        }
+        self.now = self.now.max(target);
+    }
+
+    /// Schedule a heartbeat from the current leader to a peer at
+    /// `now + delay` ticks.  No-op if there is no leader.
+    pub fn schedule_leader_heartbeat(&mut self, delay: Tick) {
+        let Some(leader) = self.leader() else {
+            return;
+        };
+        let term = self.nodes[&leader].node.term;
+        for peer in self.peer_ids(leader) {
+            self.queue.push(Scheduled {
+                deadline: self.now + delay,
+                seq: self.next_seq,
+                event: Event::Heartbeat {
+                    from: leader,
+                    to: peer,
+                    term,
+                },
+            });
+            self.next_seq += 1;
+        }
     }
 
     /// First node currently in [`Role::Leader`], if any.
@@ -281,6 +329,11 @@ impl SimulatedCluster {
             return false;
         };
         self.now = self.now.max(next.deadline);
+        // Nemesis filters: drop events targeting crashed nodes, and
+        // drop messages that cross a partitioned link.
+        if self.event_dropped(&next.event) {
+            return true;
+        }
         match next.event {
             Event::ElectionTimeout { node } => self.on_election_timeout(node),
             Event::RequestVote {
@@ -299,6 +352,95 @@ impl SimulatedCluster {
             Event::Heartbeat { from, to, term } => self.on_heartbeat(from, to, term),
         }
         true
+    }
+
+    fn event_dropped(&self, event: &Event) -> bool {
+        let crashed = |id: NodeId| self.nodes.get(&id).map(|n| n.crashed).unwrap_or(true);
+        let partitioned = |from: NodeId, to: NodeId| {
+            self.dropped_links.contains(&(from, to)) || self.dropped_links.contains(&(to, from))
+        };
+        match *event {
+            Event::ElectionTimeout { node } => crashed(node),
+            Event::RequestVote { from, to, .. }
+            | Event::RequestVoteReply { from, to, .. }
+            | Event::Heartbeat { from, to, .. } => {
+                crashed(from) || crashed(to) || partitioned(from, to)
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Nemesis API (W5.5).  Each method is a pure mutation on cluster
+    // state — no events are scheduled here; the next `step` call
+    // observes the change.
+    // -------------------------------------------------------------
+
+    /// Drop every message between `a` and `b`, in both directions.
+    pub fn partition_pair(&mut self, a: NodeId, b: NodeId) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        self.dropped_links.insert((lo, hi));
+    }
+
+    /// Re-enable messages between `a` and `b`.
+    pub fn unpartition_pair(&mut self, a: NodeId, b: NodeId) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        self.dropped_links.remove(&(lo, hi));
+    }
+
+    /// Crash-stop `id`.  All future events for this node are dropped
+    /// until [`Self::revive`] is called.
+    pub fn kill(&mut self, id: NodeId) {
+        if let Some(state) = self.nodes.get_mut(&id) {
+            state.crashed = true;
+        }
+    }
+
+    /// Revive a previously-killed node.  Re-arms its election timer.
+    pub fn revive(&mut self, id: NodeId) {
+        let new_timeout = self.now + self.random_election_timeout();
+        if let Some(state) = self.nodes.get_mut(&id) {
+            state.crashed = false;
+            state.node.role = Role::Follower;
+            state.election_deadline = Some(new_timeout);
+        }
+        self.queue.push(Scheduled {
+            deadline: new_timeout,
+            seq: self.next_seq,
+            event: Event::ElectionTimeout { node: id },
+        });
+        self.next_seq += 1;
+    }
+
+    /// Add `new_id` as a fresh follower.  Schedules its first
+    /// election timeout.
+    pub fn add_voter(&mut self, new_id: NodeId) {
+        if self.nodes.contains_key(&new_id) {
+            return;
+        }
+        let deadline = self.now + self.random_election_timeout();
+        let mut node = SimulatedNode::new(new_id);
+        node.role = Role::Follower;
+        self.nodes.insert(
+            new_id,
+            NodeState {
+                node,
+                election_deadline: Some(deadline),
+                votes_received: Default::default(),
+                crashed: false,
+            },
+        );
+        self.queue.push(Scheduled {
+            deadline,
+            seq: self.next_seq,
+            event: Event::ElectionTimeout { node: new_id },
+        });
+        self.next_seq += 1;
+    }
+
+    /// Remove `id` from the cluster.  Future events targeting it are
+    /// dropped.
+    pub fn remove_voter(&mut self, id: NodeId) {
+        self.nodes.remove(&id);
     }
 
     fn schedule(&mut self, delay: Tick, event: Event) {
