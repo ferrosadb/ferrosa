@@ -27,8 +27,15 @@ pub enum CLRoute {
     /// replica set. Reachable in single-DC mode for `All`,
     /// `EachQuorum`, etc., where there's only one DC and it's local.
     AllDcs,
-    /// Multi-DC consensus required but not yet implemented (Sprint 7).
-    /// Coordinator MUST fail the request with the contained error.
+    /// Multi-DC: route the operation through Accord (CEP-15) for
+    /// strict-serializable cross-DC consensus (Sprint 7 / ADR-015).
+    /// The coordinator drives Accord pre-accept across both DCs'
+    /// Raft groups; on apply each DC commits its share via
+    /// [`crate::membership::MembershipChanger::accord_vote_commit`].
+    CrossDcAccord,
+    /// Multi-DC consensus required but not yet implemented. Reserved
+    /// for cross-DC LWT (`Serial` / `LocalSerial` ↔ `EachQuorum`
+    /// composition) which Sprint 7 does not deliver.
     NotImplementedCrossDc(ClusterError),
 }
 
@@ -41,6 +48,11 @@ impl CLRoute {
     /// True iff this route fans out to every DC.
     pub fn is_all_dcs(&self) -> bool {
         matches!(self, Self::AllDcs)
+    }
+
+    /// True iff this route is `CrossDcAccord` (Sprint 7).
+    pub fn is_cross_dc_accord(&self) -> bool {
+        matches!(self, Self::CrossDcAccord)
     }
 
     /// True iff this route is `NotImplementedCrossDc`.
@@ -77,35 +89,35 @@ pub fn route_for_cl(cl: ConsistencyLevel, dc_count: usize) -> CLRoute {
         | ConsistencyLevel::LocalSerial => CLRoute::LocalDcOnly,
         ConsistencyLevel::Quorum => {
             if multi_dc {
-                CLRoute::NotImplementedCrossDc(ClusterError::NotImplemented {
-                    feature: "QUORUM cross-DC consensus (Sprint 7 / ADR-015 Accord)".to_string(),
-                })
+                // Sprint 7 W7.7: cross-DC QUORUM goes through Accord.
+                CLRoute::CrossDcAccord
             } else {
                 CLRoute::LocalDcOnly
             }
         }
         ConsistencyLevel::EachQuorum => {
             if multi_dc {
-                CLRoute::NotImplementedCrossDc(ClusterError::NotImplemented {
-                    feature: "EACH_QUORUM cross-DC fan-out (Sprint 7 / ADR-015 Accord)".to_string(),
-                })
+                // Sprint 7 W7.7: cross-DC EACH_QUORUM goes through Accord.
+                CLRoute::CrossDcAccord
             } else {
                 CLRoute::LocalDcOnly
             }
         }
         ConsistencyLevel::All => {
             if multi_dc {
-                CLRoute::NotImplementedCrossDc(ClusterError::NotImplemented {
-                    feature: "ALL cross-DC fan-out (Sprint 7 / ADR-015 Accord)".to_string(),
-                })
+                // Sprint 7 W7.7: cross-DC ALL goes through Accord.
+                CLRoute::CrossDcAccord
             } else {
                 CLRoute::AllDcs
             }
         }
         ConsistencyLevel::Serial => {
             if multi_dc {
+                // Sprint 7 does not deliver cross-DC LWT (SERIAL +
+                // CAS). Sprint 8 layers Accord LWT on top of the W7.7
+                // adapter; until then, surface the original error.
                 CLRoute::NotImplementedCrossDc(ClusterError::NotImplemented {
-                    feature: "SERIAL cross-DC LWT (Sprint 7 / ADR-015 Accord)".to_string(),
+                    feature: "SERIAL cross-DC LWT (Sprint 8 / Accord LWT)".to_string(),
                 })
             } else {
                 CLRoute::LocalDcOnly
@@ -134,47 +146,37 @@ mod tests {
         assert!(route_for_cl(ConsistencyLevel::LocalQuorum, 3).is_local_dc_only());
     }
 
-    /// W6.5 RED: `QUORUM` in a multi-DC topology returns
-    /// `NotImplemented` until Sprint 7 wires Accord.
+    /// W7.7 GREEN: `QUORUM` in a multi-DC topology routes through
+    /// Accord. (Sprint 6 returned `NotImplemented`; Sprint 7 wires
+    /// the cross-DC adapter.)
     #[test]
-    fn quorum_returns_not_implemented_cross_dc() {
+    fn quorum_routes_through_accord_in_multi_dc() {
         let route = route_for_cl(ConsistencyLevel::Quorum, 2);
-        match route {
-            CLRoute::NotImplementedCrossDc(ClusterError::NotImplemented { feature }) => {
-                assert!(feature.contains("QUORUM"));
-                assert!(feature.contains("Sprint 7"));
-            }
-            other => panic!("expected NotImplementedCrossDc, got {other:?}"),
-        }
+        assert!(
+            route.is_cross_dc_accord(),
+            "multi-DC QUORUM must take the CrossDcAccord route, got {route:?}"
+        );
 
-        // Single-DC backward-compat: QUORUM still works.
+        // Single-DC backward-compat: QUORUM keeps the local-Raft path.
         assert!(
             route_for_cl(ConsistencyLevel::Quorum, 1).is_local_dc_only(),
             "single-DC QUORUM keeps the existing single-Raft path"
         );
     }
 
-    /// W6.5 RED: same for `EACH_QUORUM`.
+    /// W7.7 GREEN: same for `EACH_QUORUM`.
     #[test]
-    fn each_quorum_returns_not_implemented() {
+    fn each_quorum_routes_through_accord_in_multi_dc() {
         let route = route_for_cl(ConsistencyLevel::EachQuorum, 2);
-        match route {
-            CLRoute::NotImplementedCrossDc(ClusterError::NotImplemented { feature }) => {
-                assert!(feature.contains("EACH_QUORUM"));
-            }
-            other => panic!("expected NotImplementedCrossDc, got {other:?}"),
-        }
-
-        // Single-DC: EACH_QUORUM degenerates to local-DC quorum.
+        assert!(route.is_cross_dc_accord());
         assert!(route_for_cl(ConsistencyLevel::EachQuorum, 1).is_local_dc_only());
     }
 
-    /// `ALL` and `SERIAL` cross-DC also need Accord. Sanity-check so
-    /// the scaffolding doesn't silently route them into a half-built
-    /// path.
+    /// W7.7 GREEN: `ALL` cross-DC also goes through Accord. `SERIAL`
+    /// (cross-DC LWT) is deferred to Sprint 8.
     #[test]
-    fn all_and_serial_cross_dc_are_not_implemented() {
-        assert!(route_for_cl(ConsistencyLevel::All, 2).is_not_implemented());
+    fn all_routes_through_accord_serial_still_deferred() {
+        assert!(route_for_cl(ConsistencyLevel::All, 2).is_cross_dc_accord());
         assert!(route_for_cl(ConsistencyLevel::Serial, 2).is_not_implemented());
 
         // Single-DC: ALL fans out to every replica (one DC == "all
@@ -184,16 +186,23 @@ mod tests {
     }
 
     /// `into_result()` short-circuits the cross-DC error to the
-    /// standard `ClusterError` path used by coordinators.
+    /// standard `ClusterError` path used by coordinators. Only
+    /// `NotImplementedCrossDc` produces `Err`; `CrossDcAccord` is now
+    /// a happy-path route and passes through `Ok`.
     #[test]
-    fn into_result_short_circuits_cross_dc() {
-        let r = route_for_cl(ConsistencyLevel::Quorum, 2).into_result();
+    fn into_result_short_circuits_only_not_implemented() {
+        // SERIAL multi-DC remains NotImplemented in Sprint 7.
+        let r = route_for_cl(ConsistencyLevel::Serial, 2).into_result();
         match r {
             Err(ClusterError::NotImplemented { feature }) => {
-                assert!(feature.contains("QUORUM"));
+                assert!(feature.contains("SERIAL"));
             }
             other => panic!("expected Err(NotImplemented), got {other:?}"),
         }
+
+        // Cross-DC Accord routes pass through Ok.
+        let r = route_for_cl(ConsistencyLevel::Quorum, 2).into_result();
+        assert!(r.is_ok(), "QUORUM cross-DC must now succeed at routing");
 
         // Local routes pass through.
         let r = route_for_cl(ConsistencyLevel::LocalQuorum, 2).into_result();

@@ -78,29 +78,31 @@ async fn dc_partition_does_not_cause_global_outage() {
         "dc2 write must commit despite WAN partition; got {dc2_resp:?}"
     );
 
-    // 2. Cross-DC writes (QUORUM / EACH_QUORUM / SERIAL / ALL)
-    // cleanly fail with `NotImplemented` until Sprint 7. The CL
-    // routing helper is the single chokepoint that decides this.
+    // 2. Cross-DC writes route through Accord in Sprint 7
+    // (`CrossDcAccord`); cross-DC SERIAL (LWT) is deferred to
+    // Sprint 8. The CL routing helper is the single chokepoint
+    // that decides this.
     for cl in [
         ConsistencyLevel::Quorum,
         ConsistencyLevel::EachQuorum,
         ConsistencyLevel::All,
-        ConsistencyLevel::Serial,
     ] {
-        let r = route_for_cl(cl, 2).into_result();
-        match r {
-            Err(ClusterError::NotImplemented { feature }) => {
-                assert!(
-                    !feature.is_empty(),
-                    "NotImplemented variant must name the missing feature"
-                );
-                assert!(
-                    feature.contains("Sprint 7"),
-                    "feature mention must point operators at Sprint 7: {feature}"
-                );
-            }
-            other => panic!("CL {cl:?} cross-DC must return NotImplemented; got {other:?}"),
+        let r = route_for_cl(cl, 2);
+        assert!(
+            r.is_cross_dc_accord(),
+            "CL {cl:?} cross-DC must take the CrossDcAccord route; got {r:?}"
+        );
+    }
+    // SERIAL (cross-DC LWT) still NotImplemented in Sprint 7.
+    let r = route_for_cl(ConsistencyLevel::Serial, 2).into_result();
+    match r {
+        Err(ClusterError::NotImplemented { feature }) => {
+            assert!(
+                feature.contains("SERIAL"),
+                "SERIAL feature label expected in NotImplemented: {feature}"
+            );
         }
+        other => panic!("SERIAL cross-DC must remain NotImplemented in Sprint 7; got {other:?}"),
     }
 
     // 3. LOCAL CLs keep working in dual-DC mode (per ADR-015 §S-48).
