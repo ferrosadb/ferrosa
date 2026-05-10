@@ -184,11 +184,12 @@ impl NemesisRegistry {
         reg.register(Box::new(wan_bridge::DcAsymmetric));
         reg.register(Box::new(wan_bridge::DcFlap));
         reg.register(Box::new(wan_bridge::DcLossy));
-        // Composed (5)
+        // Composed (6) — Sprint 7 W7.11 adds dc-partition+dc-slow
         reg.register(Box::new(composed::partition_and_kill()));
         reg.register(Box::new(composed::slow_and_clock()));
         reg.register(Box::new(composed::dc_partition_and_kill()));
         reg.register(Box::new(composed::dc_slow_and_disk()));
+        reg.register(Box::new(composed::dc_partition_and_slow()));
         reg.register(Box::new(composed::everything()));
         reg
     }

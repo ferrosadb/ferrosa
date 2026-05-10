@@ -186,6 +186,10 @@ fn resolve_nemesis_registry(tier: Tier) -> NemesisRegistry {
         Tier::Smoke => NemesisRegistry::phase1(),
         Tier::Standard => NemesisRegistry::phase2(),
         Tier::Full | Tier::Endurance => NemesisRegistry::full(),
+        // Sprint 7 W7.11: tier-multi-dc uses the full registry
+        // which includes the W7.11 dc-partition+dc-slow composed
+        // nemesis required by the headline run.
+        Tier::MultiDc => NemesisRegistry::full(),
     }
 }
 
