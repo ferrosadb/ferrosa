@@ -20,15 +20,15 @@ members = [
     "ferrosa-index-builder",
     "ferrosa-sim",
 ]
-# vendor/ is the openraft fork (its own workspace); excluded from this one.
-exclude = ["vendor"]
 
 [patch.crates-io]
-# Sprint 3 (ADR-012): repoint to local fork containing PreVote+CheckQuorum
-# +Leadership-Transfer scaffolding from `correctness/prevote-checkquorum` branch.
-# Once an operator pushes the branch to ferrosadb/openraft, switch to:
-#   openraft = { git = "https://github.com/ferrosadb/openraft.git", branch = "correctness/prevote-checkquorum" }
-openraft = { path = "vendor/openraft" }
+# Sprint 3 (ADR-012): the ferrosadb/openraft fork carries PreVote +
+# CheckQuorum + Leadership Transfer + the separate-replication-timeout
+# patch. Pinned to the `correctness/prevote-checkquorum` branch so we
+# pick up rebases automatically; for reproducible builds switch to a
+# specific `rev = "..."` tag. Fork README and rationale:
+#   https://github.com/ferrosadb/openraft/blob/correctness/prevote-checkquorum/README-FERROSADB.md
+openraft = { git = "https://github.com/ferrosadb/openraft.git", branch = "correctness/prevote-checkquorum" }
 
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.
