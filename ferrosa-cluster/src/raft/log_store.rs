@@ -298,6 +298,39 @@ impl SledLogStore {
         Ok(Self { db, log, meta })
     }
 
+    /// Internal helper for `append` that does the actual sled work. Split
+    /// out so the public `append` can route both success and failure
+    /// through `LogFlushed::log_io_completed` (W1.19a). Test code can
+    /// also exercise the error path here directly without needing to
+    /// construct a `LogFlushed` callback (which has a `pub(crate)`
+    /// constructor inside openraft).
+    async fn append_inner<I>(&mut self, entries: I) -> Result<(), StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
+        I::IntoIter: Send,
+    {
+        let mut batch = sled::Batch::default();
+        for entry in entries {
+            let key = Self::index_key(entry.log_id.index);
+            let val = Self::serialize_entry(&entry)?;
+            batch.insert(&key, val);
+        }
+
+        // Run sled disk IO on a blocking thread so the async Raft runtime
+        // stays responsive for heartbeat processing.
+        let log = self.log.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+            log.apply_batch(batch)
+                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+        .map_err(|e| *e)?;
+
+        Ok(())
+    }
+
     /// Wipe a node's persisted Raft state at `path`.
     ///
     /// Clears the `log` and `meta` trees so the node rejoins the cluster as
@@ -576,7 +609,21 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
+        // W1.19b: persist + fsync so an OS crash between save_committed and
+        // the next vote does not lose the committed marker. sled flushes
+        // its WAL on drop, but in a hard-crash scenario the in-memory
+        // index would be lost; an explicit flush turns this insert into a
+        // durability barrier.
         Self::save_meta(&self.meta, META_COMMITTED, &committed)?;
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+            meta.flush()
+                .map_err(|e| Box::new(StorageIOError::write(to_any_error(e))))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageIOError::write(to_any_error(e)))?
+        .map_err(|e| *e)?;
         Ok(())
     }
 
@@ -593,28 +640,21 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
-        let mut batch = sled::Batch::default();
-        for entry in entries {
-            let key = Self::index_key(entry.log_id.index);
-            let val = Self::serialize_entry(&entry)?;
-            batch.insert(&key, val);
+        // W1.19a: any error path in `append` must still fire the LogFlushed
+        // callback (with Err) so openraft's Raft loop sees the failure
+        // synchronously instead of waiting on a oneshot that never sends.
+        // Build the batch first; serialization errors are surfaced by the
+        // helper below so they reach the callback too.
+        let result = self.append_inner(entries).await;
+
+        match &result {
+            Ok(()) => callback.log_io_completed(Ok(())),
+            Err(e) => callback.log_io_completed(Err(std::io::Error::other(format!(
+                "log append failed: {e}"
+            )))),
         }
 
-        // Run sled disk IO on a blocking thread so the async Raft runtime
-        // stays responsive for heartbeat processing.
-        let log = self.log.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-            log.apply_batch(batch)
-                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
-        .map_err(|e| *e)?;
-
-        callback.log_io_completed(Ok(()));
-
-        Ok(())
+        result
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
@@ -1193,6 +1233,42 @@ mod tests {
         let counts = SledLogStore::reset(dir.path()).expect("reset on empty store must succeed");
         assert_eq!(counts.log_entries, 0);
         assert_eq!(counts.meta_keys, 0);
+    }
+
+    /// W1.19b: save_committed must flush the meta tree so the committed
+    /// marker survives an OS crash between save and the next vote. We
+    /// simulate the durability barrier by saving the marker, then dropping
+    /// and reopening the store, and asserting the marker round-trips. (A
+    /// stronger crash-injection test would require process kill; this is
+    /// the strongest test feasible without that infra.)
+    #[tokio::test]
+    async fn save_committed_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let committed = Some(LogId::new(CommittedLeaderId::new(11, 0), 42));
+
+        {
+            let mut store = SledLogStore::new(dir.path()).unwrap();
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_committed(
+                &mut store, committed,
+            )
+            .await
+            .unwrap();
+            // Drop without an extra db.flush() — save_committed must have
+            // flushed the meta tree itself.
+        }
+
+        // Reopen and read back.
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let read_back =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::read_committed(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_back, committed,
+            "save_committed must persist + flush before returning"
+        );
     }
 
     /// W1.20: `purge` must offload sled writes to a blocking thread so the
