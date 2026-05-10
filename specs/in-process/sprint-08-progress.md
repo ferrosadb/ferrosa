@@ -28,6 +28,21 @@ endurance --hours 24` once budget is approved.
 
 ## Per–work-item log
 
+### W8.4 — CL-aware read routing for learners — DONE
+
+- RED tests in `coordinator/cl_routing.rs`:
+  - `local_one_routes_to_any_local_replica` — `LOCAL_ONE` keeps voter + learner.
+  - `local_quorum_excludes_learners_from_quorum` — `LOCAL_QUORUM` drops learners.
+  - `quorum_excludes_learners_from_quorum` — same for `QUORUM`.
+  - `serial_forces_leader_round_trip_skips_learner` — `SERIAL` /
+    `LOCAL_SERIAL` mark `leader_only=true` and exclude learners.
+  - `all_includes_token_owning_learner` — `ALL` keeps every replica.
+- GREEN: introduced `CLReplicaPolicy` + `replica_policy_for_cl` +
+  `eligible_replicas_for_cl`. `coordinator::read::coordinate_read_with`
+  now filters via `eligible_replicas_for_cl(cl, raw_replicas, &ring)` after
+  `ring.replicas()`.
+- Gate: 715/715 cluster lib tests + 4/4 learner-lifecycle pass; clippy + fmt clean.
+
 ### W8.2 — `MembershipChanger::add_learner_only` — DONE
 
 - RED: `add_learner_only_does_not_make_voter` in

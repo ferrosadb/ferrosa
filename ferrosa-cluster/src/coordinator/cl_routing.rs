@@ -14,6 +14,127 @@
 
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
+use crate::raft::NodeState;
+use crate::ring::TokenRing;
+
+// ---------------------------------------------------------------------------
+// W8.4 — CL → eligible-roles table for learner-aware read routing.
+// ---------------------------------------------------------------------------
+
+/// Set of roles eligible to serve a given consistency level.
+///
+/// W8.4 / ADR-014: voter-quorum CLs (`QUORUM`, `LOCAL_QUORUM`,
+/// `LOCAL_SERIAL`, `SERIAL`) must exclude learners; `ALL` and the
+/// single-replica CLs (`ONE`, `LOCAL_ONE`) include learners that
+/// own tokens.
+///
+/// `SERIAL` / `LOCAL_SERIAL` further mark the read as leader-only
+/// (LWT round-trip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CLReplicaPolicy {
+    /// Whether `NodeState::Normal` voters are eligible.
+    pub include_voters: bool,
+    /// Whether `NodeState::Learner { owns_tokens: true }` replicas
+    /// are eligible. (Learners with `owns_tokens=false` are always
+    /// excluded.)
+    pub include_learners: bool,
+    /// Whether the operation must round-trip through the leader
+    /// (`SERIAL` / `LOCAL_SERIAL` LWT). Coordinators that observe
+    /// this flag must skip learners regardless of `include_learners`
+    /// (a learner is never the leader by definition).
+    pub leader_only: bool,
+}
+
+impl CLReplicaPolicy {
+    /// Voters only — used for `QUORUM`, `LOCAL_QUORUM`, `Two`, `Three`.
+    pub const VOTERS_ONLY: Self = Self {
+        include_voters: true,
+        include_learners: false,
+        leader_only: false,
+    };
+
+    /// Voters and token-owning learners — used for `ONE` / `LOCAL_ONE`.
+    pub const ANY_REPLICA: Self = Self {
+        include_voters: true,
+        include_learners: true,
+        leader_only: false,
+    };
+
+    /// Voters and learners — used for `ALL` (every replica that owns
+    /// the token, learner or voter).
+    pub const ALL_REPLICAS: Self = Self {
+        include_voters: true,
+        include_learners: true,
+        leader_only: false,
+    };
+
+    /// Leader-only round-trip — used for `SERIAL` / `LOCAL_SERIAL`.
+    pub const LEADER_ONLY: Self = Self {
+        include_voters: true,
+        include_learners: false,
+        leader_only: true,
+    };
+}
+
+/// Map a consistency level to the role-eligibility policy from
+/// ADR-014's CL routing table.
+pub fn replica_policy_for_cl(cl: ConsistencyLevel) -> CLReplicaPolicy {
+    match cl {
+        // Single-replica reads — any replica that owns the token.
+        ConsistencyLevel::One | ConsistencyLevel::LocalOne => CLReplicaPolicy::ANY_REPLICA,
+        // Voter-quorum reads — never count learners.
+        ConsistencyLevel::Two
+        | ConsistencyLevel::Three
+        | ConsistencyLevel::Quorum
+        | ConsistencyLevel::LocalQuorum
+        | ConsistencyLevel::EachQuorum => CLReplicaPolicy::VOTERS_ONLY,
+        // ALL — every voter and every learner that owns the token.
+        ConsistencyLevel::All => CLReplicaPolicy::ALL_REPLICAS,
+        // Strict-consistency CLs — leader round-trip; learners excluded
+        // (they are never the leader).
+        ConsistencyLevel::Serial | ConsistencyLevel::LocalSerial => CLReplicaPolicy::LEADER_ONLY,
+    }
+}
+
+/// Filter `replicas` (as produced by `TokenRing::replicas()`) to only
+/// those eligible under `cl`.
+///
+/// Note: `TokenRing::replicas()` already excludes
+/// `NodeState::Learner { owns_tokens: false }`. This filter applies
+/// the additional CL-specific role policy:
+///
+/// - For voter-quorum CLs: drop any remaining `Learner { .. }` nodes.
+/// - For `LEADER_ONLY` CLs: drop learners (the actual leader test
+///   happens at the coordinator's read path, which sends to the
+///   leader directly).
+/// - For `ANY_REPLICA` and `ALL_REPLICAS`: pass through.
+pub fn eligible_replicas_for_cl(
+    cl: ConsistencyLevel,
+    replicas: &[u64],
+    ring: &TokenRing,
+) -> Vec<u64> {
+    let policy = replica_policy_for_cl(cl);
+    replicas
+        .iter()
+        .copied()
+        .filter(|&n| {
+            let info = match ring.get_node(n) {
+                Some(i) => i,
+                None => return false,
+            };
+            match info.state {
+                NodeState::Normal => policy.include_voters,
+                NodeState::Learner { owns_tokens: true } => {
+                    policy.include_learners && !policy.leader_only
+                }
+                // owns_tokens=false learners are already filtered upstream;
+                // leaving the explicit case for safety.
+                NodeState::Learner { owns_tokens: false } => false,
+                _ => false,
+            }
+        })
+        .collect()
+}
 
 /// What the coordinator should do for a `(topology, CL)` pair.
 #[derive(Debug)]
@@ -129,6 +250,134 @@ pub fn route_for_cl(cl: ConsistencyLevel, dc_count: usize) -> CLRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::NodeInfo;
+    use uuid::Uuid;
+
+    // ----- W8.4 helper builders -----
+
+    fn voter_node(addr: &str) -> NodeInfo {
+        NodeInfo {
+            host_id: Uuid::new_v4(),
+            addr: addr.to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        }
+    }
+
+    fn learner_node(addr: &str, owns_tokens: bool) -> NodeInfo {
+        NodeInfo {
+            host_id: Uuid::new_v4(),
+            addr: addr.to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Learner { owns_tokens },
+            cql_broadcast: None,
+        }
+    }
+
+    fn build_ring_with(nodes: &[(u64, NodeInfo)]) -> TokenRing {
+        let mut ring = TokenRing::new();
+        for (id, info) in nodes {
+            ring.add_node(*id, info.clone());
+        }
+        ring
+    }
+
+    /// W8.4 RED. `LOCAL_ONE` accepts any local replica — voter or
+    /// token-owning learner. The eligibility filter must NOT drop
+    /// learners.
+    #[test]
+    fn local_one_routes_to_any_local_replica() {
+        let ring = build_ring_with(&[
+            (1, voter_node("10.0.0.1:7000")),
+            (2, learner_node("10.0.0.2:7000", true)),
+        ]);
+        let eligible = eligible_replicas_for_cl(ConsistencyLevel::LocalOne, &[1, 2], &ring);
+        assert_eq!(eligible.len(), 2, "LOCAL_ONE should accept both replicas");
+        assert!(eligible.contains(&1));
+        assert!(eligible.contains(&2));
+
+        // ONE behaves identically.
+        let eligible_one = eligible_replicas_for_cl(ConsistencyLevel::One, &[1, 2], &ring);
+        assert_eq!(eligible_one.len(), 2);
+    }
+
+    /// W8.4 RED. `LOCAL_QUORUM` excludes learners from the eligibility
+    /// set so the quorum is drawn purely from voters.
+    #[test]
+    fn local_quorum_excludes_learners_from_quorum() {
+        let ring = build_ring_with(&[
+            (1, voter_node("10.0.0.1:7000")),
+            (2, voter_node("10.0.0.2:7000")),
+            (3, learner_node("10.0.0.3:7000", true)),
+        ]);
+        let eligible = eligible_replicas_for_cl(ConsistencyLevel::LocalQuorum, &[1, 2, 3], &ring);
+        assert_eq!(eligible.len(), 2, "learner must not count toward quorum");
+        assert!(!eligible.contains(&3));
+
+        // Sanity: with the learner gone the quorum size is the same.
+        assert!(eligible.contains(&1));
+        assert!(eligible.contains(&2));
+    }
+
+    /// W8.4 RED. `QUORUM` excludes learners, identically to
+    /// `LOCAL_QUORUM` (voter-quorum semantics).
+    #[test]
+    fn quorum_excludes_learners_from_quorum() {
+        let ring = build_ring_with(&[
+            (1, voter_node("10.0.0.1:7000")),
+            (2, voter_node("10.0.0.2:7000")),
+            (3, voter_node("10.0.0.3:7000")),
+            (4, learner_node("10.0.0.4:7000", true)),
+        ]);
+        let eligible = eligible_replicas_for_cl(ConsistencyLevel::Quorum, &[1, 2, 3, 4], &ring);
+        assert_eq!(eligible.len(), 3);
+        assert!(!eligible.contains(&4));
+    }
+
+    /// W8.4 RED. `SERIAL` is leader-only — the eligibility filter
+    /// excludes learners. (The coordinator's read path then routes to
+    /// the leader; learners can never be leader, so this filter is the
+    /// last line of defense against a learner accidentally serving an
+    /// LWT read.)
+    #[test]
+    fn serial_forces_leader_round_trip_skips_learner() {
+        let ring = build_ring_with(&[
+            (1, voter_node("10.0.0.1:7000")),
+            (2, learner_node("10.0.0.2:7000", true)),
+        ]);
+        let policy = replica_policy_for_cl(ConsistencyLevel::Serial);
+        assert!(
+            policy.leader_only,
+            "SERIAL must mark the read as leader-only",
+        );
+        let eligible = eligible_replicas_for_cl(ConsistencyLevel::Serial, &[1, 2], &ring);
+        assert_eq!(eligible, vec![1], "learner must be skipped under SERIAL");
+
+        // LOCAL_SERIAL behaves identically.
+        let policy = replica_policy_for_cl(ConsistencyLevel::LocalSerial);
+        assert!(policy.leader_only);
+        let eligible_local =
+            eligible_replicas_for_cl(ConsistencyLevel::LocalSerial, &[1, 2], &ring);
+        assert_eq!(eligible_local, vec![1]);
+    }
+
+    /// W8.4 sanity: `ALL` includes learners that own tokens.
+    #[test]
+    fn all_includes_token_owning_learner() {
+        let ring = build_ring_with(&[
+            (1, voter_node("10.0.0.1:7000")),
+            (2, learner_node("10.0.0.2:7000", true)),
+            (3, learner_node("10.0.0.3:7000", false)),
+        ]);
+        // Note: replicas() already excludes (3) at the ring layer; the
+        // filter must not re-include it. Pass [1, 2] as `replicas` to
+        // mirror what the ring would have returned.
+        let eligible = eligible_replicas_for_cl(ConsistencyLevel::All, &[1, 2], &ring);
+        assert_eq!(eligible.len(), 2, "ALL should keep voter and token learner");
+    }
 
     /// W6.5 RED: `LOCAL_QUORUM` always routes within the local DC,
     /// regardless of topology. Single-DC and multi-DC clusters must
