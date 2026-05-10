@@ -29,7 +29,8 @@ async fn harness_3_node_cluster_elects_leader_and_commits() {
     );
 
     // Verify every node sees the same leader.
-    for node in cluster.nodes() {
+    let nodes = cluster.nodes();
+    for node in &nodes {
         let metrics = node.raft.metrics().borrow().clone();
         assert_eq!(
             metrics.current_leader,
@@ -39,6 +40,7 @@ async fn harness_3_node_cluster_elects_leader_and_commits() {
             metrics.current_leader
         );
     }
+    drop(nodes);
 
     // Verify a client_write goes through and replicates.
     let resp = cluster

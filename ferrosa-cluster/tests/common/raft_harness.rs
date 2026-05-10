@@ -53,7 +53,9 @@ use openraft::{
     SnapshotMeta, StorageError, StoredMembership,
 };
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use uuid::Uuid;
 
+use ferrosa_cluster::membership::MembershipNetwork;
 use ferrosa_cluster::raft::log_store::SledLogStore;
 use ferrosa_cluster::raft::state_machine::{FerrosStateMachine, RaftState};
 use ferrosa_cluster::raft::{FerrosRaft, FerrosRaftConfig, RaftCommand, RaftResponse};
@@ -113,6 +115,11 @@ impl NodeRegistry {
     fn unregister(&self, node_id: u64) {
         let mut g = self.inner.lock().expect("registry lock");
         g.senders.remove(&node_id);
+    }
+
+    fn contains(&self, node_id: u64) -> bool {
+        let g = self.inner.lock().expect("registry lock");
+        g.senders.contains_key(&node_id)
     }
 
     fn sender(&self, node_id: u64) -> Option<mpsc::Sender<RpcEnvelope>> {
@@ -417,6 +424,85 @@ impl TestNode {
 pub struct TestCluster {
     nodes: Vec<TestNode>,
     registry: NodeRegistry,
+    /// Newly-added voter nodes that joined post-bootstrap (W1.1+).
+    /// Held alongside `nodes` so their dispatcher loops keep running
+    /// for the lifetime of the cluster.
+    extra_nodes: Arc<StdMutex<Vec<TestNode>>>,
+    /// Default openraft Config used to bring up post-bootstrap voters.
+    raft_lib_config: Arc<RaftLibConfig>,
+}
+
+/// Borrowed iterator across bootstrap + extra nodes.  Returned by
+/// [`TestCluster::nodes`].
+pub struct NodeRefs<'a> {
+    primary: &'a [TestNode],
+    extras_guard: std::sync::MutexGuard<'a, Vec<TestNode>>,
+}
+
+impl<'a> NodeRefs<'a> {
+    pub fn iter(&self) -> NodeRefsIter<'_> {
+        NodeRefsIter {
+            primary: self.primary.iter(),
+            extras: self.extras_guard.iter(),
+        }
+    }
+
+    /// Whether the iterator contains a given `node_id`.
+    pub fn contains(&self, node_id: u64) -> bool {
+        self.iter().any(|n| n.node_id == node_id)
+    }
+}
+
+impl<'a, 'b> IntoIterator for &'b NodeRefs<'a> {
+    type Item = &'b TestNode;
+    type IntoIter = NodeRefsIter<'b>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct NodeRefsIter<'a> {
+    primary: std::slice::Iter<'a, TestNode>,
+    extras: std::slice::Iter<'a, TestNode>,
+}
+
+impl<'a> Iterator for NodeRefsIter<'a> {
+    type Item = &'a TestNode;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.primary.next().or_else(|| self.extras.next())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HarnessMembershipNetwork — collapses maps 3 and 4 into the registry.
+// ---------------------------------------------------------------------------
+
+/// `MembershipNetwork` impl backed by the harness's `NodeRegistry`.
+///
+/// In production these are two separate stores; in the harness, a
+/// peer is "registered" iff there is an inbound mpsc Sender for it,
+/// and "connected" iff partition rules allow delivery.  This is a
+/// faithful enough emulation for Sprint 1 atomicity tests.
+pub struct HarnessMembershipNetwork {
+    registry: NodeRegistry,
+}
+
+impl MembershipNetwork for HarnessMembershipNetwork {
+    fn register_node(&self, _node_id: u64, _host_id: Uuid) {
+        // The harness pre-registers every node when it spawns the
+        // dispatcher, so explicit register_node is a NoOp.  The
+        // important invariant — that `contains()` reports true after
+        // `register_node` — is satisfied by the prior
+        // `add_pending_node` call.
+    }
+
+    fn unregister_node(&self, node_id: u64) {
+        self.registry.unregister(node_id);
+    }
+
+    fn contains(&self, node_id: u64) -> bool {
+        self.registry.contains(node_id)
+    }
 }
 
 impl TestCluster {
@@ -468,11 +554,53 @@ impl TestCluster {
             .await
             .expect("initial seed initialize");
 
-        Self { nodes, registry }
+        Self {
+            nodes,
+            registry,
+            extra_nodes: Arc::new(StdMutex::new(Vec::new())),
+            raft_lib_config,
+        }
     }
 
-    pub fn nodes(&self) -> &[TestNode] {
-        &self.nodes
+    /// Spin up a new `TestNode` with the given `node_id`, register its
+    /// dispatcher, and stash it in `extra_nodes` so it survives.  This
+    /// is what `MembershipChanger::add_voter` needs in the harness:
+    /// the leader's `add_learner` will start replicating to the new
+    /// node_id immediately, so the dispatcher must be ready first.
+    pub async fn add_pending_node(&self, node_id: u64) {
+        let node =
+            build_test_node(node_id, self.raft_lib_config.clone(), self.registry.clone()).await;
+        self.extra_nodes
+            .lock()
+            .expect("extra_nodes lock")
+            .push(node);
+    }
+
+    /// Whether the harness has a dispatcher registered for `node_id`.
+    /// True for both bootstrap voters and any `add_pending_node`
+    /// additions; false after `unregister_node`.
+    pub fn is_registered(&self, node_id: u64) -> bool {
+        self.registry.contains(node_id)
+    }
+
+    /// Construct an [`Arc<HarnessMembershipNetwork>`] backed by the
+    /// shared registry — pass to `MembershipChanger::new`.
+    pub fn membership_network(&self) -> Arc<HarnessMembershipNetwork> {
+        Arc::new(HarnessMembershipNetwork {
+            registry: self.registry.clone(),
+        })
+    }
+
+    /// Snapshot view of every node — bootstrap voters plus
+    /// `add_pending_node` additions.  Returned as raw pointers wrapped
+    /// in a `NodeRefs` guard so callers cannot accidentally drop the
+    /// extras lock guard.  Use exclusively as a short-lived iterator.
+    pub fn nodes(&self) -> NodeRefs<'_> {
+        let extras = self.extra_nodes.lock().expect("extra_nodes lock");
+        NodeRefs {
+            primary: &self.nodes,
+            extras_guard: extras,
+        }
     }
 
     pub fn node_ids(&self) -> Vec<u64> {
@@ -541,14 +669,20 @@ impl TestCluster {
 
     /// Drop all nodes, aborting their dispatchers and freeing their sled stores.
     pub async fn shutdown(self) {
-        let TestCluster { nodes, registry } = self;
-        for n in nodes {
+        let TestCluster {
+            nodes,
+            registry,
+            extra_nodes,
+            ..
+        } = self;
+        let extras =
+            std::mem::take(&mut *extra_nodes.lock().expect("extra_nodes lock at shutdown"));
+        for n in nodes.into_iter().chain(extras.into_iter()) {
             registry.unregister(n.node_id);
             // openraft 0.9 has `Raft::shutdown` returning a Result; the harness
             // tolerates either Ok (normal) or Err (already shut down).
             let _ = n.raft.shutdown().await;
             n.dispatcher.abort();
-            // Detach: drain the JoinHandle without blocking on the abort.
             drop(n.dispatcher);
         }
     }
