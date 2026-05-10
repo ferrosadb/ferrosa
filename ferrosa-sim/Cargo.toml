@@ -1,0 +1,19 @@
+[package]
+name = "ferrosa-sim"
+version.workspace = true
+edition = "2021"
+
+# Sprint 5 (ADR-017): deterministic simulation harness for the Raft layer.
+#
+# Decision: in-house single-threaded discrete-event simulator instead of
+# Madsim.  ferrosa-cluster pulls in openraft 0.9 + sled + a custom network
+# stack, all of which would require shimming.  The headline goal of Sprint
+# 5 (TLA+ refinement check, W5.10) needs a *protocol-level* simulator, not
+# a full process simulator.  See `specs/in-process/sprint-05-progress.md`.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"

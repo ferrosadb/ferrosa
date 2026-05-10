@@ -18,6 +18,7 @@ members = [
     "ferrosa-loadgen",
     "ferrosa-sparql",
     "ferrosa-index-builder",
+    "ferrosa-sim",
 ]
 
 [patch.crates-io]

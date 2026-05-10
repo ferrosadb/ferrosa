@@ -1989,6 +1989,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-sim"
+version = "0.8.8+8"
+dependencies = [
+ "proptest",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "ferrosa-sparql"
 version = "0.8.8+8"
 dependencies = [
