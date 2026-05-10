@@ -15,6 +15,7 @@
 pub mod bootstrap;
 pub mod cluster;
 pub mod deployment;
+pub mod multi_dc;
 pub mod nemesis;
 pub mod node;
 pub mod refinement;
