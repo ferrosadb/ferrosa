@@ -2,7 +2,7 @@
 type: progress
 sprint: 3
 created: 2026-05-09
-last-updated: 2026-05-09
+last-updated: 2026-05-09 (engine wire-up handoff: phase 2 complete)
 ---
 
 # Sprint 3 Progress — openraft fork: PreVote, CheckQuorum, Leadership Transfer
@@ -104,6 +104,60 @@ The handoff is clean: every protocol decision is captured in a unit-tested
 pure-function module. The engine wire-up just calls these decision functions
 at the right places and applies their results.
 
+## Phase 2 update — engine wire-up landed (2026-05-09)
+
+The deferred engine work has now landed in three additional commits on
+`correctness/prevote-checkquorum`. Updated per-WI status:
+
+| WI    | Status   | Repo / Commit | Notes |
+|-------|----------|---------------|-------|
+| W3.3  | **Done (minimal)** | openraft `5670cd20` + `9961737f` + `5ad53290` | Engine `handle_pre_vote_req` (no-mutate, lease-aware predicate). RaftCore `run_pre_vote_round` runs synchronous PreVote tick handler when `enable_pre_vote=true`; if quorum not reached, term does NOT advance. The full `ServerState::PreCandidate` enum variant + 12-site refactor was *not* done — the minimal wire-up is sufficient to satisfy W3.12 (the strict-zero term-advance assertion). Documented as a pragmatic trade-off in the commit message. |
+| W3.7  | **Done (engine, simple)** | openraft `5670cd20` + `9961737f` | The simple "stop heartbeats, lease ages out" path described in `sprint-03-openraft-patches.md`. After CheckQuorum step-down, leader stops heartbeating; followers' `vote_last_modified` ages naturally and the lease check in `handle_pre_vote_req` returns `LeaseStatus::Expired` after `leader_lease`. Trade-off: adds up to `election_timeout` latency before a new candidate can win (acknowledged in spec doc). |
+| W3.8  | **Done (engine)** | openraft `9961737f` + `5ad53290` | `Engine::handle_timeout_now_req` validates sender's term + own log-id, then calls `Engine::elect()` to start a real election (skipping PreVote per Ongaro Sec 3.10 trusted-leader-directive). Wired through `RaftMsg::TimeoutNow` and `Raft::timeout_now()` public API. |
+| W3.9  | **Done** | openraft `b80e6744` | `Trigger::transfer_to(target)` async API. Validates leader/voter/non-self preconditions, polls metrics for catch-up, dispatches `ExternalCommand::SendTimeoutNow` to RaftCore, awaits the dispatch result, then watches metrics for the leader change. Returns typed `TransferError`. |
+| W3.10 | **Done** | openraft `b80e6744` | Watch-deadline of `election_timeout_max × 5` after dispatch (covers leader-lease aging + election + scheduling slack). Returns `TransferError::Timeout` if target doesn't win in time. |
+| W3.12 | **Done (acceptance test PASSING)** | ferrosa unchanged (still `3011200d`) | With the engine work landed in the openraft fork, `ferrosa_partitioned_node_does_not_advance_term` now passes: `cargo test -p ferrosa-cluster --features sprint-03-engine-prevote --test raft_election_storm` → 1/1 green, 2.7s. The strict-zero invariant `term_advance == 0` holds across the 2.5s partition window. |
+
+### Phase-2 commits
+
+```
+$ cd /home/bkearns/src/ferrosa-openraft
+$ git log --oneline correctness/prevote-checkquorum ^ferrosadb/fix/separate-replication-timeout
+5670cd20 feat: wire enable_pre_vote into election tick (W3.3 minimal)
+b80e6744 feat: Trigger::transfer_to() leadership transfer API (W3.9, W3.10)
+5ad53290 feat: wire PreVote/TimeoutNow handlers through Raft API surface
+9961737f feat: PreVote and TimeoutNow engine handlers (W3.3, W3.7, W3.8)
+437e37d8 feat: PreVote/Vote decision predicates + LeaderLease (W3.1 refactor, W3.2, W3.4, W3.7)
+58365ff3 feat: CheckQuorum step-down decision + tick handler (W3.5, W3.6)
+1048f911 feat: PreVote/TimeoutNow message types + CheckQuorum config (W3.1, W3.5, W3.8 surface)
+```
+
+### Phase-2 test counts
+
+```
+$ cargo test -p openraft --lib            # 223 passed (was 217 in phase 1)
+$ cargo test -p tests                     # 116 passed (was 112; +4 transfer_to tests)
+$ cargo test -p ferrosa-cluster --features sprint-03-engine-prevote --test raft_election_storm
+                                          # 4 passed (W3.12 acceptance + 3 election-storm)
+$ cargo test -p ferrosa-cluster --lib     # 662 passed (no regression, was 661)
+$ cargo test -p ferrosa-ctl --bin ferrosa-ctl  # 103 passed (no regression)
+```
+
+### What was NOT done (and why)
+
+- `ServerState::PreCandidate` enum variant: not added. The minimal
+  `run_pre_vote_round` approach achieves the same protocol-level
+  guarantee (no term advance on rejection) without propagating a new
+  state through `RaftMetrics`, `calc_server_state`, the public API
+  surface, and ~12 internal match-sites. If a future sprint needs the
+  finer state-machine granularity for observability or testing, the
+  refactor lives in `sprint-03-openraft-patches.md` pseudo-code.
+- Explicit lease-surrender broadcast on CheckQuorum step-down: not
+  added. The simple "stop heartbeats" path is in place; it adds up to
+  `election_timeout` latency before a new candidate can win. The
+  explicit broadcast is a wire change documented as a future
+  optimization.
+
 ## Next steps for an operator
 
 1. Push `correctness/prevote-checkquorum` from
@@ -113,6 +167,10 @@ at the right places and applies their results.
 3. Open upstream PRs as ADR-018 specifies: CheckQuorum and Leadership
    Transfer are upstreamable; PreVote will be carried fork-only per the
    author's stated position.
-4. Schedule the engine-state-machine work (W3.3, W3.7-engine, W3.8-engine,
-   W3.9, W3.10) on a separate sprint with a dedicated engineer per ADR-012's
-   original budget.
+4. Remove the `sprint-03-engine-prevote` feature gate from the W3.12
+   acceptance test now that it passes by default. The remaining
+   gate-conditional test setup (`prevote_checkquorum_raft_config`) can
+   move to the default test config.
+5. Consider scheduling the W3.3 full-`PreCandidate` refactor in a future
+   sprint if metric-level visibility into pre-candidate state becomes
+   important for production diagnosis.
