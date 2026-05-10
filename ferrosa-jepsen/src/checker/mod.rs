@@ -289,16 +289,57 @@ impl UnifiedChecker {
     }
 
     /// Run all applicable checkers on a history.
+    ///
+    /// Sprint 2 W2.12: when `jepsen_dir` is set AND a Knossos history file
+    /// has been written via [`Self::check_all_with_history_file`], the
+    /// Clojure-based Knossos checker is invoked via `lein run`. The
+    /// in-process check does not shell out — `check_all` is intended for
+    /// fast unit-level invocations that don't have a written history.
     pub fn check_all(&self, history: &History) -> AllCheckResults {
+        self.check_all_with_history_file(history, None)
+    }
+
+    /// Run all checkers, optionally pointing at a written history JSONL
+    /// for the Knossos subprocess. Sprint 2 W2.12.
+    pub fn check_all_with_history_file(
+        &self,
+        history: &History,
+        history_path: Option<&std::path::Path>,
+    ) -> AllCheckResults {
         let linear = check_linearizability(history);
 
-        // Knossos and Elle require a running Jepsen cluster with lein;
-        // return None when the subprocess checkers are not available.
-        let knossos_result: Option<knossos::KnossosResult> = None;
-        let elle_result: Option<elle::ElleResult> = None;
+        // Sprint 2 W2.12 — invoke Knossos when configured.
+        let knossos_result: Option<knossos::KnossosResult> = match (&self.jepsen_dir, history_path)
+        {
+            (Some(dir), Some(path)) => {
+                let checker = knossos::KnossosChecker::new(dir.clone());
+                match checker.check(path) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        // Surface as an explicit anomaly so the operator
+                        // sees the failure (per the fail-loud philosophy)
+                        // — never silently swallow a checker error.
+                        tracing::error!(error = %e, "Knossos checker failed; treating as anomaly");
+                        Some(knossos::KnossosResult {
+                            valid: false,
+                            model: "cas-register".into(),
+                            algorithm: "wgl".into(),
+                            ok_count: 0,
+                            fail_count: 0,
+                            info_count: 0,
+                            anomalies: vec![knossos::KnossosAnomaly {
+                                anomaly_type: "checker-error".into(),
+                                description: format!("Knossos invocation failed: {e}"),
+                            }],
+                        })
+                    }
+                }
+            }
+            _ => None,
+        };
 
-        // Acknowledge jepsen_dir for future use.
-        let _ = &self.jepsen_dir;
+        // Elle requires a running Jepsen cluster with lein; not yet wired.
+        let elle_result: Option<elle::ElleResult> = None;
 
         // Run Sprint 2 W2.4 structural-invariant checks if snapshots present.
         let membership_violations = if self.membership_snapshots.is_empty() {
@@ -1311,6 +1352,45 @@ mod tests {
         assert!(
             !results.all_passed(),
             "all_passed must be false when membership_violations are present"
+        );
+    }
+
+    /// W2.12: when `jepsen_dir` is set but no history file is provided,
+    /// Knossos is not invoked and the result remains `None`.
+    #[test]
+    fn unified_checker_skips_knossos_without_history_file() {
+        let checker = UnifiedChecker::with_jepsen_dir("/tmp/nonexistent");
+        let history = History { operations: vec![] };
+        let results = checker.check_all(&history);
+        assert!(
+            results.knossos.is_none(),
+            "Knossos must not be invoked without a written history"
+        );
+    }
+
+    /// W2.12: when both `jepsen_dir` and `history_path` are set BUT the
+    /// jepsen project doesn't exist, the wrapper returns a checker-error
+    /// anomaly rather than panicking — fail-loud per CLAUDE.md.
+    #[test]
+    fn unified_checker_surfaces_knossos_invocation_failure() {
+        let checker = UnifiedChecker::with_jepsen_dir("/nonexistent/jepsen/dir");
+        let dir = tempfile::tempdir().unwrap();
+        let history_path = dir.path().join("history.jsonl");
+        std::fs::write(&history_path, "[]").unwrap();
+        let history = History { operations: vec![] };
+
+        let results = checker.check_all_with_history_file(&history, Some(&history_path));
+        let kn = results
+            .knossos
+            .expect("must surface a Knossos result, even on invocation failure");
+        assert!(!kn.valid, "invocation failure must be reported as invalid");
+        assert!(
+            !kn.anomalies.is_empty()
+                && kn
+                    .anomalies
+                    .iter()
+                    .any(|a| a.anomaly_type == "checker-error"),
+            "must include a checker-error anomaly so the operator knows the harness broke"
         );
     }
 
