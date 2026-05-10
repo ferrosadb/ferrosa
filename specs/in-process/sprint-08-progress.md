@@ -28,6 +28,31 @@ endurance --hours 24` once budget is approved.
 
 ## Per–work-item log
 
+### W8.10 — Witness replicas — design evaluation — DONE
+
+`specs/in-process/witness-replicas-evaluation.md` lands a sharp
+go/no-go: **DEFER until Sprint 10+**. Cost analysis shows ~$180/month
+saving on a 3-DC deployment (43%) which is real but not transformative.
+Engineering effort breakdown puts the work at ~2_400 LOC (refining
+ADR-015's 2_000–4_000 estimate) split across openraft fork
+(`quorum/`, `progress/`, `replication/`, `engine/`) plus
+ferrosa-cluster integration. Concrete reopen criteria listed
+(storage:compute cost ratio, 5+-DC topology, openraft 1.0 lands
+witnesses upstream, regulatory data-sovereignty driver).
+
+### W8.11 — openraft 1.0 migration evaluation — DONE
+
+`specs/in-process/openraft-1.0-migration-evaluation.md` lands a
+go/no-go: **HOLD through Sprint 10**. Patch inventory shows ~1_580
+LOC of fork carried today (CheckQuorum, LeadershipTransfer, PreVote,
++ minor patches). Best-case post-1.0 carry is ~800 LOC (CheckQuorum
++ LeadershipTransfer merged); worst-case is current LOC + API
+rebase. Full effort estimate: 7 engineer-weeks (one engineer)
+or 4 weeks paired. Concrete pull-the-trigger criteria listed
+(1.0.0 shipped, CheckQuorum + LeadershipTransfer merged, 2-week
+no-other-Raft-work window, fork tax >2_500 LOC OR customer feature
+demand).
+
 ### W8.9 — 24h endurance run — DONE (sim path; ADR-016 fallback)
 
 `fly` CLI is unavailable in this environment, so per the sprint plan's

@@ -42,7 +42,7 @@ impl Default for EnduranceConfig {
             nemesis_interval: (Duration::from_secs(30), Duration::from_secs(120)),
             verification_window: Duration::from_secs(600), // 10-minute window
             verification_interval: Duration::from_secs(600), // verify every 10 minutes
-            learners_per_dc: 1,                              // ADR-014 / W8.9 default
+            learners_per_dc: 1,                            // ADR-014 / W8.9 default
         }
     }
 }
