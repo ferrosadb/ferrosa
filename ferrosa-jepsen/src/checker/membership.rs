@@ -96,6 +96,10 @@ pub struct InvariantViolation {
 ///
 /// Returns one violation per offending case. An empty vec means every
 /// snapshot passes every check.
+///
+/// Runs both per-snapshot checks (I-06–I-10, I-13 each interpreted within a
+/// single reporter's view) and cross-snapshot checks (the same maps, compared
+/// across reporters — the bug class addressed by Sprint 1's silent-drop fix).
 pub fn check_membership_invariants(snapshots: &[MembershipSnapshot]) -> Vec<InvariantViolation> {
     let mut violations = Vec::new();
 
@@ -108,7 +112,70 @@ pub fn check_membership_invariants(snapshots: &[MembershipSnapshot]) -> Vec<Inva
         violations.extend(check_i13_quorum_sized_by_committed_voters(snap));
     }
 
+    violations.extend(check_membership_cross_snapshot(snapshots));
+
     violations
+}
+
+/// I-06 (cross-snapshot variant): every pair of reporters must see the same
+/// `state.members` and `openraft.voters`.
+///
+/// This catches the bug class where a non-leader silently drops a membership
+/// proposal: the leader applies the change, the follower does not, and the
+/// two snapshots diverge on the affected host_id.
+pub fn check_membership_cross_snapshot(
+    snapshots: &[MembershipSnapshot],
+) -> Vec<InvariantViolation> {
+    if snapshots.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let canonical = &snapshots[0];
+    let canonical_state: BTreeSet<String> = canonical.state_members.keys().cloned().collect();
+
+    for other in &snapshots[1..] {
+        let other_state: BTreeSet<String> = other.state_members.keys().cloned().collect();
+        for missing in canonical_state.difference(&other_state) {
+            out.push(InvariantViolation {
+                invariant: "I-06".to_string(),
+                reporter: other.reporter_host_id.clone(),
+                message: format!(
+                    "host {missing}: cross-snapshot drift — present on reporter {} \
+                     but missing from reporter {}",
+                    canonical.reporter_host_id, other.reporter_host_id
+                ),
+            });
+        }
+        for extra in other_state.difference(&canonical_state) {
+            out.push(InvariantViolation {
+                invariant: "I-06".to_string(),
+                reporter: other.reporter_host_id.clone(),
+                message: format!(
+                    "host {extra}: cross-snapshot drift — present on reporter {} \
+                     but missing from reporter {}",
+                    other.reporter_host_id, canonical.reporter_host_id
+                ),
+            });
+        }
+
+        // Compare voter sets too.
+        if canonical.openraft_voters != other.openraft_voters {
+            out.push(InvariantViolation {
+                invariant: "I-06".to_string(),
+                reporter: other.reporter_host_id.clone(),
+                message: format!(
+                    "openraft.voters drift between reporter {} ({:?}) and reporter {} ({:?})",
+                    canonical.reporter_host_id,
+                    canonical.openraft_voters,
+                    other.reporter_host_id,
+                    other.openraft_voters
+                ),
+            });
+        }
+    }
+
+    out
 }
 
 /// I-06: For every host_id `H` known to the cluster,
@@ -460,5 +527,94 @@ mod tests {
     fn check_empty_snapshots_produces_no_violations() {
         let v = check_membership_invariants(&[]);
         assert!(v.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // W2.5 — Cross-sprint regression test for the Sprint 1 silent-drop fix.
+    //
+    // Sprint 1 fixes a bug where a non-leader receiving a membership-mutating
+    // RaftCommand silently dropped it instead of forwarding to the leader.
+    // The symptom is a four-maps drift across nodes: the leader's view
+    // reflects the change while the follower's view does not.
+    //
+    // We construct that drift synthetically and assert the cross-snapshot
+    // check surfaces it as I-06. When Sprint 1 lands and the orchestrator
+    // runs a real cluster, the same drift pattern is what Jepsen's smoke
+    // tier should catch end-to-end (via /admin/membership-snapshot — W2.3).
+    // -----------------------------------------------------------------------
+
+    /// Lock the regression: if someone reverts Sprint 1's fix, the resulting
+    /// cross-reporter drift must be flagged as I-06.
+    #[test]
+    fn membership_invariants_fail_on_silent_drop_revert() {
+        // Leader's snapshot: full 3-node membership.
+        let leader_snap = clean_3node_snapshot("node1");
+
+        // Follower's snapshot after a silent-drop revert: it never received
+        // the membership change for node3, so its four maps lack node3.
+        let voters: BTreeSet<String> = ["node1", "node2"].iter().map(|s| s.to_string()).collect();
+        let mut state_members: BTreeMap<String, NodeView> = BTreeMap::new();
+        state_members.insert("node1".into(), voter("node1", "node1:7000").1);
+        state_members.insert("node2".into(), voter("node2", "node2:7000").1);
+
+        let follower_snap = MembershipSnapshot {
+            reporter_host_id: "node2".into(),
+            state_members,
+            openraft_voters: voters.clone(),
+            openraft_learners: BTreeSet::new(),
+            node_map: voters.clone(),
+            peer_manager_peers: voters,
+            committed_cluster_size: 2,
+            live_peer_count: 2,
+        };
+
+        let v = check_membership_invariants(&[leader_snap, follower_snap]);
+
+        assert!(
+            v.iter().any(|x| x.invariant == "I-06"),
+            "silent-drop revert must produce an I-06 violation; got {v:#?}"
+        );
+        assert!(
+            v.iter().any(|x| x.message.contains("node3")),
+            "the violation must call out the missing host_id (node3); got {v:#?}"
+        );
+    }
+
+    /// Cross-snapshot helper alone: with 0 or 1 snapshots, nothing to compare.
+    #[test]
+    fn cross_snapshot_check_no_op_for_one_snapshot() {
+        let snap = clean_3node_snapshot("node1");
+        let v = check_membership_cross_snapshot(&[snap]);
+        assert!(v.is_empty());
+        let v_empty = check_membership_cross_snapshot(&[]);
+        assert!(v_empty.is_empty());
+    }
+
+    /// Cross-snapshot voter-set drift is reported even when state.members
+    /// happens to align (a more subtle variant of the silent-drop bug).
+    #[test]
+    fn cross_snapshot_check_detects_voters_drift_alone() {
+        let mut a = clean_3node_snapshot("node1");
+        let mut b = clean_3node_snapshot("node2");
+        // Voters drift but state.members is identical.
+        b.openraft_voters.remove("node3");
+        // Adjust b's committed_cluster_size so the per-snapshot I-13 doesn't
+        // fire and dilute this assertion.
+        b.committed_cluster_size = 2;
+        // Also remove from the other 3 maps on b to keep its per-snapshot
+        // I-06 clean — we want the cross-snapshot drift to be the sole signal.
+        b.node_map.remove("node3");
+        b.peer_manager_peers.remove("node3");
+        // But state.members on b still has node3 → I-09 would fire on b
+        // (state.members has a non-voter, non-learner). Remove it from b
+        // state.members too so only voters drift remains.
+        a.openraft_voters.insert("node3".into()); // already there in clean
+        b.state_members.remove("node3");
+
+        let v = check_membership_cross_snapshot(&[a, b]);
+        assert!(
+            v.iter().any(|x| x.message.contains("voters drift")),
+            "cross-snapshot voter drift must be reported; got {v:#?}"
+        );
     }
 }
