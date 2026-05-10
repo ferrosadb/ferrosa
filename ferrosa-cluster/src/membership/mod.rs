@@ -41,7 +41,10 @@ use uuid::Uuid;
 
 use serde::{Deserialize, Serialize};
 
-use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand, RaftOp};
+use crate::raft::{
+    uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand, RaftGroupId, RaftOp,
+    DEFAULT_DC_NAME,
+};
 
 // ---------------------------------------------------------------------------
 // MembershipOp — typed payload carried by `Message::ClusterMembershipForward`.
@@ -224,6 +227,12 @@ impl MembershipNetwork for DummyNetwork {
 const DEFAULT_APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The single transactional API for cluster membership changes.
+///
+/// W6.4 (ADR-015): a `MembershipChanger` is scoped to a single Raft
+/// group via [`Self::dc_name`] / [`Self::group_id`]. Multi-DC
+/// deployments instantiate one changer per DC; single-DC deployments
+/// transparently use the [`DEFAULT_DC_NAME`] group via
+/// [`Self::new`].
 pub struct MembershipChanger<N: MembershipNetwork> {
     raft: Arc<FerrosRaft>,
     network: Arc<N>,
@@ -233,19 +242,52 @@ pub struct MembershipChanger<N: MembershipNetwork> {
     /// override via [`Self::with_node_metadata_defaults`].
     default_dc: String,
     default_rack: String,
+    /// DC this changer operates on (W6.4). Drives `default_dc` for
+    /// new joiners by default and identifies the Raft group via
+    /// [`RaftGroupId::for_dc`].
+    dc_name: String,
 }
 
 impl<N: MembershipNetwork> MembershipChanger<N> {
     /// Construct a fresh changer.  In production this is built once
     /// per node at cluster-mode entry; in tests, one per test.
+    ///
+    /// Backward-compat: defaults to the [`DEFAULT_DC_NAME`] group, so
+    /// existing single-DC callers do not need to pass a DC. Multi-DC
+    /// callers should use [`Self::for_dc`].
     pub fn new(raft: Arc<FerrosRaft>, network: Arc<N>) -> Self {
+        Self::for_dc(DEFAULT_DC_NAME, raft, network)
+    }
+
+    /// Construct a changer scoped to the given DC's Raft group (W6.4).
+    ///
+    /// The `raft` argument MUST be the `Arc<FerrosRaft>` for that DC's
+    /// group — typically obtained via
+    /// `controller.raft_for_dc(dc_name)`.
+    pub fn for_dc(dc_name: impl Into<String>, raft: Arc<FerrosRaft>, network: Arc<N>) -> Self {
+        let dc_name = dc_name.into();
+        // Default new-joiner DC matches the changer's DC. Operators can
+        // still override via [`Self::with_node_metadata_defaults`] for
+        // unusual topologies.
+        let default_dc = dc_name.clone();
         Self {
             raft,
             network,
             apply_timeout: DEFAULT_APPLY_TIMEOUT,
-            default_dc: "datacenter1".to_string(),
+            default_dc,
             default_rack: "rack1".to_string(),
+            dc_name,
         }
+    }
+
+    /// DC this changer is bound to.
+    pub fn dc_name(&self) -> &str {
+        &self.dc_name
+    }
+
+    /// [`RaftGroupId`] of the group this changer operates on.
+    pub fn group_id(&self) -> RaftGroupId {
+        RaftGroupId::for_dc(&self.dc_name)
     }
 
     /// Override the default apply-barrier deadline (test-only convenience).
