@@ -113,6 +113,67 @@ struct PersistedSnapshot {
 // FerrosStateMachine
 // ---------------------------------------------------------------------------
 
+/// W1.21 / I-19: errors that can prevent a fail-loud recovery from
+/// silently downgrading a joint or mismatched membership configuration.
+///
+/// Constructed by [`FerrosStateMachine::try_recover_membership_from_topology_state`]
+/// when synthesizing a membership from `state.members` would lose
+/// information that the actual log entry encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryError {
+    /// The last committed Membership log entry was a joint config
+    /// (mid-transition between two voter sets), but the snapshot was
+    /// older than that log entry. Synthesizing a single-config Membership
+    /// from `state.members` would silently drop the joint transition,
+    /// risking a split-brain during the next election.
+    ///
+    /// Resolution: replay the log Membership entry verbatim instead of
+    /// synthesizing.
+    JointConfigLost {
+        /// Voter sets from the log Membership entry (multiple sets means
+        /// joint).
+        log_configs: Vec<BTreeSet<u64>>,
+        /// What synthesis would have produced from `state.members`.
+        synthesized_voters: BTreeSet<u64>,
+    },
+    /// The last committed Membership log entry was a single-config that
+    /// disagrees with the voter set derived from `state.members`. This
+    /// indicates state.members has drifted from the consensus view —
+    /// likely a sign of a separate bug (silent JoinNode/LeaveNode without
+    /// the corresponding Membership change).
+    SingleConfigMismatch {
+        log_voters: BTreeSet<u64>,
+        synthesized_voters: BTreeSet<u64>,
+    },
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JointConfigLost {
+                log_configs,
+                synthesized_voters,
+            } => write!(
+                f,
+                "JointConfigLost: log Membership had {} configs ({:?}); state.members synthesized {:?}",
+                log_configs.len(),
+                log_configs,
+                synthesized_voters
+            ),
+            Self::SingleConfigMismatch {
+                log_voters,
+                synthesized_voters,
+            } => write!(
+                f,
+                "SingleConfigMismatch: log voters {:?} != state.members voters {:?}",
+                log_voters, synthesized_voters
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {}
+
 /// Openraft state machine for Ferrosa.
 ///
 /// Applies [`RaftCommand`] entries to [`RaftState`] and optionally propagates
@@ -264,6 +325,71 @@ impl FerrosStateMachine {
             StoredMembership::new(self.last_applied, Membership::new(vec![voters], None));
         self.refresh_current_snapshot_membership();
         true
+    }
+
+    /// W1.21 / I-19: fail-loud variant of [`Self::recover_membership_from_topology_state`]
+    /// that detects the lost-joint-config corner case.
+    ///
+    /// When given the actual last committed `Membership` from the log
+    /// (`log_membership`), this function refuses to silently downgrade a
+    /// joint config (e.g. `{old_voters, new_voters}`) into a single-config
+    /// synthesized from `state.members`. If the log contained a joint config
+    /// at the time of the last apply, that is the only safe membership;
+    /// rebuilding a single-config from `state.members` would lose the joint
+    /// transition and could cause split-brain on the next election.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — synthesized a single-config from `state.members`
+    ///   because there was no membership in the log (or the log_membership
+    ///   matched the synthesized one).
+    /// - `Ok(false)` — explicit `last_membership` was already set, or
+    ///   `state.members` was empty; no recovery needed.
+    /// - `Err(RecoveryError::JointConfigLost { .. })` — the snapshot is
+    ///   older than the last log Membership entry AND that entry was a
+    ///   joint config; recovery would silently drop it.
+    pub fn try_recover_membership_from_topology_state(
+        &mut self,
+        log_membership: Option<&Membership<u64, BasicNode>>,
+    ) -> Result<bool, RecoveryError> {
+        let membership_empty = self
+            .last_membership
+            .membership()
+            .get_joint_config()
+            .iter()
+            .all(|c| c.is_empty());
+        if !membership_empty || self.state.members.is_empty() {
+            return Ok(false);
+        }
+
+        let voters: BTreeSet<u64> = self.state.members.keys().copied().collect();
+        if voters.is_empty() {
+            return Ok(false);
+        }
+
+        // If we have an actual log membership, use it as the authoritative
+        // truth. A joint config (configs.len() > 1) cannot be reconstructed
+        // from the single voter set in state.members.
+        if let Some(log_m) = log_membership {
+            let log_configs = log_m.get_joint_config();
+            if log_configs.len() > 1 {
+                return Err(RecoveryError::JointConfigLost {
+                    log_configs: log_configs.to_vec(),
+                    synthesized_voters: voters,
+                });
+            }
+            // Single-config log entry: must match the synthesized voter set.
+            if log_configs.len() == 1 && log_configs[0] != voters {
+                return Err(RecoveryError::SingleConfigMismatch {
+                    log_voters: log_configs[0].clone(),
+                    synthesized_voters: voters,
+                });
+            }
+        }
+
+        self.last_membership =
+            StoredMembership::new(self.last_applied, Membership::new(vec![voters], None));
+        self.refresh_current_snapshot_membership();
+        Ok(true)
     }
 
     /// Create a new state machine wired to local `Schema` and `StorageEngine`
@@ -1660,6 +1786,139 @@ mod tests {
         assert!(configs[0].contains(&node1));
         assert!(configs[0].contains(&node2));
         assert_eq!(sm.last_membership.log_id().clone(), sm.last_applied);
+    }
+
+    /// W1.21 / I-19: when state.members exists but the last committed log
+    /// Membership entry encoded a joint config, recovery must NOT
+    /// silently downgrade the joint config into a synthesized single-
+    /// config (which would lose the in-flight transition and could
+    /// split-brain on the next election). Instead it must return
+    /// RecoveryError::JointConfigLost so the operator sees the
+    /// discrepancy.
+    #[tokio::test]
+    async fn recover_membership_fails_loud_on_lost_joint_config() {
+        let mut sm = FerrosStateMachine::new();
+        let node1 = uuid_to_node_id(Uuid::from_u128(1));
+        let node2 = uuid_to_node_id(Uuid::from_u128(2));
+        let node3 = uuid_to_node_id(Uuid::from_u128(3));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(1),
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(2),
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // last_membership is empty, simulating the snapshot being older
+        // than the latest Membership log entry.
+        sm.last_membership = StoredMembership::default();
+
+        // Construct the actual log Membership entry: a joint config in the
+        // middle of swapping {node1, node2} → {node1, node3}.
+        let joint = Membership::new(
+            vec![
+                BTreeSet::from([node1, node2]),
+                BTreeSet::from([node1, node3]),
+            ],
+            None,
+        );
+
+        let result = sm.try_recover_membership_from_topology_state(Some(&joint));
+        match result {
+            Err(RecoveryError::JointConfigLost {
+                log_configs,
+                synthesized_voters,
+            }) => {
+                assert_eq!(
+                    log_configs.len(),
+                    2,
+                    "the log Membership had two configs (joint)"
+                );
+                // synthesized would have been {node1, node2} from
+                // state.members.
+                assert!(synthesized_voters.contains(&node1));
+                assert!(synthesized_voters.contains(&node2));
+                assert!(!synthesized_voters.contains(&node3));
+            }
+            other => panic!("expected RecoveryError::JointConfigLost, got {other:?}"),
+        }
+
+        // The state machine's last_membership must NOT have been mutated
+        // — fail loud means refuse to proceed, not patch silently.
+        assert!(sm
+            .last_membership
+            .membership()
+            .get_joint_config()
+            .iter()
+            .all(|c| c.is_empty()));
+    }
+
+    /// W1.21 helper-test: when the log Membership is a single-config that
+    /// matches state.members, the function succeeds (not an error). This
+    /// pins the happy path so the fail-loud path doesn't over-fire.
+    #[tokio::test]
+    async fn recover_membership_succeeds_on_matching_single_config() {
+        let mut sm = FerrosStateMachine::new();
+        let node1 = uuid_to_node_id(Uuid::from_u128(1));
+        let node2 = uuid_to_node_id(Uuid::from_u128(2));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(1),
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(2),
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+        sm.last_membership = StoredMembership::default();
+
+        let single = Membership::new(vec![BTreeSet::from([node1, node2])], None);
+        assert!(matches!(
+            sm.try_recover_membership_from_topology_state(Some(&single)),
+            Ok(true)
+        ));
     }
 
     #[tokio::test]
