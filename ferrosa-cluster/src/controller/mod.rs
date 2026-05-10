@@ -30,7 +30,7 @@ pub(crate) use token::deterministic_tokens_for_node;
 #[cfg(test)]
 pub(crate) use token::generate_deterministic_token;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
@@ -62,7 +62,7 @@ use crate::ddl_path::DdlPath;
 use crate::hints::{HintConfig, HintStore};
 use crate::mode::DeploymentMode;
 use crate::pair::PairRole;
-use crate::raft::FerrosRaft;
+use crate::raft::{FerrosRaft, RaftGroupId};
 use crate::ring::TokenRing;
 use crate::state::PairClusterState;
 use crate::write_path::WritePath;
@@ -166,8 +166,12 @@ pub struct ModeController {
     pub(super) promote_epoch: std::sync::atomic::AtomicU64,
     /// All connected peers, tracked across mode transitions.
     pub(super) connected_peers: Mutex<Vec<(Uuid, SocketAddr)>>,
-    /// Raft instance, set asynchronously after cluster transition completes.
-    pub(super) raft_instance: Arc<ArcSwap<Option<Arc<FerrosRaft>>>>,
+    /// Per-DC Raft groups, set asynchronously after cluster transition
+    /// completes. Multi-DC deployments populate one entry per DC; single-DC
+    /// (the default) populates a single entry under
+    /// [`RaftGroupId::default_dc`]. Replaces the prior single
+    /// `raft_instance` field — see ADR-015.
+    pub(super) raft_groups: Arc<ArcSwap<HashMap<RaftGroupId, Arc<FerrosRaft>>>>,
     /// Persistent hint store — holds mutations destined for temporarily
     /// unreachable replicas.  Shared with `ClusterCoordinator`.
     pub(super) hint_store: Arc<HintStore>,
@@ -286,7 +290,7 @@ impl ModeController {
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
-            raft_instance: Arc::new(ArcSwap::from_pointee(None)),
+            raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
@@ -343,7 +347,7 @@ impl ModeController {
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
-            raft_instance: Arc::new(ArcSwap::from_pointee(None)),
+            raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
@@ -400,7 +404,7 @@ impl ModeController {
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
-            raft_instance: Arc::new(ArcSwap::from_pointee(None)),
+            raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
@@ -541,8 +545,68 @@ impl ModeController {
     }
 
     /// Get the Raft instance, if cluster mode initialization has completed.
+    ///
+    /// Backward-compat shim for single-DC callers (see ADR-015): if
+    /// exactly one Raft group exists, return it; otherwise return the
+    /// group bound to the local node's `data_center` (or
+    /// [`RaftGroupId::default_dc`] when no DC was configured). Returns
+    /// `None` when no group has been installed yet (standalone, pair,
+    /// or pre-init cluster mode).
+    ///
+    /// Multi-DC callers should prefer [`Self::raft_for_dc`] or
+    /// [`Self::raft_for_group`] for clarity.
     pub fn raft(&self) -> Option<Arc<FerrosRaft>> {
-        (**self.raft_instance.load()).clone()
+        let groups = self.raft_groups.load();
+        if groups.len() == 1 {
+            return groups.values().next().cloned();
+        }
+        // Multi-DC (or empty): prefer the local DC's group.
+        let local_id = RaftGroupId::for_dc(&self.config.data_center);
+        if let Some(g) = groups.get(&local_id) {
+            return Some(g.clone());
+        }
+        // Last-ditch fallback: the conventional "default" group.
+        groups.get(&RaftGroupId::default_dc()).cloned()
+    }
+
+    /// Look up the Raft group bound to a specific DC name.
+    ///
+    /// Returns `None` if no group has been installed for that DC, or
+    /// if cluster mode initialization has not yet completed.
+    pub fn raft_for_dc(&self, dc_name: &str) -> Option<Arc<FerrosRaft>> {
+        self.raft_for_group(RaftGroupId::for_dc(dc_name))
+    }
+
+    /// Look up the Raft group bound to a specific [`RaftGroupId`].
+    pub fn raft_for_group(&self, id: RaftGroupId) -> Option<Arc<FerrosRaft>> {
+        self.raft_groups.load().get(&id).cloned()
+    }
+
+    /// Snapshot of the current Raft group map.
+    ///
+    /// Returns a fresh `HashMap` (not held under any lock) so callers
+    /// can iterate without touching the live `ArcSwap`.
+    pub fn raft_groups(&self) -> HashMap<RaftGroupId, Arc<FerrosRaft>> {
+        (**self.raft_groups.load()).clone()
+    }
+
+    /// Install a Raft group under the given [`RaftGroupId`].
+    ///
+    /// Idempotent: re-installing the same id replaces the prior entry.
+    /// Used by cluster bootstrap (and tests) to publish the per-DC
+    /// `Arc<FerrosRaft>` once initialization completes. Operator
+    /// surface for W6.7 (`bootstrap-dc`) wraps this.
+    pub fn set_raft_for_group(&self, id: RaftGroupId, raft: Arc<FerrosRaft>) {
+        let current = self.raft_groups.load_full();
+        let mut next: HashMap<RaftGroupId, Arc<FerrosRaft>> = (*current).clone();
+        next.insert(id, raft);
+        self.raft_groups.store(Arc::new(next));
+    }
+
+    /// Convenience wrapper for [`Self::set_raft_for_group`] that derives
+    /// the `RaftGroupId` from a DC name.
+    pub fn set_raft_for_dc(&self, dc_name: &str, raft: Arc<FerrosRaft>) {
+        self.set_raft_for_group(RaftGroupId::for_dc(dc_name), raft);
     }
 
     /// Return a snapshot of the current token ring.

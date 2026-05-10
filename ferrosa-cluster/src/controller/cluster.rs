@@ -618,7 +618,8 @@ impl ModeController {
 
         // Spawn background Raft initialization — Raft::new() is async and
         // must not block the PeerEventListener callback.
-        let raft_instance_swap = self.raft_instance.clone();
+        let raft_groups_swap = self.raft_groups.clone();
+        let local_raft_group_id = crate::raft::RaftGroupId::for_dc(&self.config.data_center);
         let ddl_path = self.ddl_path.clone();
         let mode_swap = self.mode.clone();
         let registry = self.registry.clone();
@@ -1048,11 +1049,24 @@ impl ModeController {
                 );
             }
 
-            // Also publish to the controller's raft_instance so that
+            // Also publish to the controller's raft_groups map so that
             // controller.raft() returns Some() during the election loop.
             // Without this, external callers (tests, DDL) cannot observe
             // the leader until the entire background task completes.
-            raft_instance_swap.store(Arc::new(Some(raft_arc.clone())));
+            //
+            // ADR-015: per-DC Raft groups are keyed by RaftGroupId derived
+            // from the configured data_center. Single-DC deployments install
+            // exactly one group; multi-DC bootstrap (Sprint 6 W6.3) extends
+            // this to one per DC.
+            {
+                let prev = raft_groups_swap.load_full();
+                let mut next: std::collections::HashMap<
+                    crate::raft::RaftGroupId,
+                    Arc<FerrosRaft>,
+                > = (*prev).clone();
+                next.insert(local_raft_group_id, raft_arc.clone());
+                raft_groups_swap.store(Arc::new(next));
+            }
 
             // Spawn the election-storm watchdog (P0-17 fix, path c).
             //
@@ -1759,7 +1773,16 @@ impl ModeController {
             }
 
             // Store the raft instance so it is accessible via controller.raft()
-            raft_instance_swap.store(Arc::new(Some(raft_arc)));
+            // (ADR-015: keyed by per-DC RaftGroupId).
+            {
+                let prev = raft_groups_swap.load_full();
+                let mut next: std::collections::HashMap<
+                    crate::raft::RaftGroupId,
+                    Arc<FerrosRaft>,
+                > = (*prev).clone();
+                next.insert(local_raft_group_id, raft_arc);
+                raft_groups_swap.store(Arc::new(next));
+            }
         });
     }
 }
