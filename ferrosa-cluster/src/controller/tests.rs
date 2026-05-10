@@ -1,5 +1,5 @@
 use super::cluster::{
-    build_recovered_topology_refresh_plan, should_initialize_seed_membership,
+    build_recovered_topology_refresh_plan, drain_ddl_queue, should_initialize_seed_membership,
     should_run_bootstrap_streaming,
 };
 use super::*;
@@ -2120,4 +2120,63 @@ async fn forming_falls_back_to_pair_on_timeout() {
     );
 
     controller.shutdown().await;
+}
+
+/// W1.14 — `drain_ddl_queue` must replay ops sent both BEFORE and
+/// DURING the drain.  The previous `try_recv()`-once-then-quit loop
+/// dropped late arrivals because it observed an empty queue once and
+/// exited; the new helper waits N consecutive empties so in-flight
+/// `Forming` senders can still land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_during_forming_queues_and_replays() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    // Pre-queue two ops (the steady-state "queued during Forming" case).
+    tx.send(1).unwrap();
+    tx.send(2).unwrap();
+
+    // Inject a third op AFTER the drain starts but before its
+    // first try_recv-empty cool-down completes.
+    let tx_for_late = tx.clone();
+    tokio::spawn(async move {
+        // Sleep long enough for drain_ddl_queue to consume the first
+        // two ops and start its first cool-down (50 ms).
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tx_for_late.send(3).unwrap();
+    });
+
+    // Drop the original tx so the channel becomes Disconnected once
+    // every clone has been dropped.  We retain the late-tx via the
+    // spawned task; it's dropped when that task ends.
+    drop(tx);
+
+    let processed_for_closure = processed.clone();
+    let replayed = drain_ddl_queue(rx, |op: u32| {
+        let processed = processed_for_closure.clone();
+        async move {
+            processed.fetch_add(1, Ordering::SeqCst);
+            // The op processor's success/failure must not change
+            // the drain's correctness — assert all ops are seen.
+            let _ = op;
+            Ok(())
+        }
+    })
+    .await;
+
+    assert_eq!(
+        replayed, 3,
+        "expected drain to replay 3 ops (two pre-queued + one in-flight); got {replayed}",
+    );
+    assert_eq!(processed.load(Ordering::SeqCst), 3);
+}
+
+/// Sanity test for the empty-channel case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_ddl_queue_returns_zero_for_empty_channel() {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let replayed = drain_ddl_queue(rx, |_| async { Ok(()) }).await;
+    assert_eq!(replayed, 0);
 }

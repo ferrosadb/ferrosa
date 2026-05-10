@@ -82,6 +82,60 @@ pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool)
     !has_recovered_topology_state
 }
 
+/// Drain a DDL queue (W1.14, P0-1 hazard).
+///
+/// On the leader-elected path of `transition_to_cluster` we replay
+/// every operation queued during the Forming state.  Naive `try_recv`
+/// loops drop ops sent *during* the drain (a sender that loaded the
+/// `DdlPath::Forming` Arc just before the swap to `Cluster` and
+/// hadn't yet completed the send).  This helper waits until the
+/// channel has been observed empty `REQUIRED_CONSECUTIVE_EMPTY` times
+/// in a row, with a `COOL_DOWN` delay between probes, capped by a
+/// hard wall-clock deadline.  This gives in-flight `Forming` senders
+/// up to `COOL_DOWN * REQUIRED_CONSECUTIVE_EMPTY` (= 150 ms) to land.
+///
+/// Generic over the op-processor `F` so unit tests can substitute a
+/// counter without spinning up a Raft.
+pub(super) async fn drain_ddl_queue<Op, F, Fut>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>,
+    mut process: F,
+) -> usize
+where
+    F: FnMut(Op) -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    const COOL_DOWN: std::time::Duration = std::time::Duration::from_millis(50);
+    const REQUIRED_CONSECUTIVE_EMPTY: usize = 3;
+    const HARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut replayed = 0usize;
+    let drain_deadline = tokio::time::Instant::now() + HARD_DEADLINE;
+    let mut consecutive_empty = 0usize;
+
+    while consecutive_empty < REQUIRED_CONSECUTIVE_EMPTY
+        && tokio::time::Instant::now() < drain_deadline
+    {
+        match rx.try_recv() {
+            Ok(op) => {
+                consecutive_empty = 0;
+                if let Err(e) = process(op).await {
+                    tracing::warn!(%e, "drain_ddl_queue: process failed");
+                } else {
+                    replayed += 1;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                consecutive_empty += 1;
+                tokio::time::sleep(COOL_DOWN).await;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+    replayed
+}
+
 pub(super) fn build_recovered_topology_refresh_plan(
     local_host_id: uuid::Uuid,
     local_addr: String,
@@ -1244,20 +1298,19 @@ impl ModeController {
 
 
                     // Drain any DDL operations queued during Forming state.
-                    // Take the receiver outside the lock guard scope to avoid
-                    // holding parking_lot::MutexGuard across an await point.
                     let maybe_rx = ddl_queue_rx.lock().take();
-                    if let Some(mut rx) = maybe_rx {
-                        let mut replayed = 0usize;
-                        while let Ok(op) = rx.try_recv() {
-                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
-                                tracing::warn!(%e, "failed to replay queued DDL operation");
-                            } else {
-                                replayed += 1;
-                            }
-                        }
+                    if let Some(rx) = maybe_rx {
+                        let raft_for_drain = raft_arc.clone();
+                        let replayed = drain_ddl_queue(rx, |op| {
+                            let raft = raft_for_drain.clone();
+                            async move { execute_via_raft(&raft, op).await }
+                        })
+                        .await;
                         if replayed > 0 {
-                            tracing::info!(count = replayed, "replayed queued DDL operations from Forming state");
+                            tracing::info!(
+                                count = replayed,
+                                "replayed queued DDL operations from Forming state",
+                            );
                         }
                     }
 
