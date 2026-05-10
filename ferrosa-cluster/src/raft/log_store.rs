@@ -645,20 +645,29 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
 
         // Remove all entries with index <= log_id.index.
         // Big-endian keys: 0x0000..0000 through index_key(log_id.index) inclusive.
+        // Run sled disk IO on a blocking thread so the async Raft runtime
+        // stays responsive for heartbeat processing — under sustained
+        // AppendEntries traffic, a synchronous purge of a large segment
+        // would stall the lane and miss heartbeat deadlines (W1.20 / I-25).
+        let log = self.log.clone();
         let end_inclusive = Self::index_key(log_id.index);
-        let keys_to_remove: Vec<sled::IVec> = self
-            .log
-            .range(..=end_inclusive)
-            .filter_map(|r| r.ok().map(|(k, _v)| k))
-            .collect();
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+            let keys_to_remove: Vec<sled::IVec> = log
+                .range(..=end_inclusive)
+                .filter_map(|r| r.ok().map(|(k, _v)| k))
+                .collect();
 
-        let mut batch = sled::Batch::default();
-        for key in keys_to_remove {
-            batch.remove(key);
-        }
-        self.log
-            .apply_batch(batch)
-            .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?;
+            let mut batch = sled::Batch::default();
+            for key in keys_to_remove {
+                batch.remove(key);
+            }
+            log.apply_batch(batch)
+                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+        .map_err(|e| *e)?;
 
         Ok(())
     }
@@ -1184,6 +1193,70 @@ mod tests {
         let counts = SledLogStore::reset(dir.path()).expect("reset on empty store must succeed");
         assert_eq!(counts.log_entries, 0);
         assert_eq!(counts.meta_keys, 0);
+    }
+
+    /// W1.20: `purge` must offload sled writes to a blocking thread so the
+    /// async runtime keeps making progress. Acceptance: a current_thread
+    /// runtime executes a 1000-entry purge concurrently with a sibling
+    /// task, and the sibling task's heartbeats keep ticking. If `purge`
+    /// did its sled work synchronously on the runtime thread, the
+    /// heartbeats would stall for the duration of the IO.
+    #[tokio::test(flavor = "current_thread")]
+    async fn purge_does_not_block_heartbeats() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        // Pre-populate 1000 entries.
+        {
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=1000 {
+                let entry = blank_entry(1, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+            store.log.flush().unwrap();
+        }
+
+        // Sibling heartbeat task: increments a counter every yield.
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticks_clone = ticks.clone();
+        let stop = Arc::new(AtomicU64::new(0));
+        let stop_clone = stop.clone();
+        let heartbeat = tokio::spawn(async move {
+            while stop_clone.load(Ordering::Relaxed) == 0 {
+                ticks_clone.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Run the purge. With spawn_blocking inside purge, the
+        // current_thread runtime is free to keep ticking the heartbeat
+        // task while the sled work runs on a blocking thread.
+        let purge_id = LogId::new(CommittedLeaderId::new(1, 0), 1000);
+        store.purge(purge_id).await.unwrap();
+
+        let mid_ticks = ticks.load(Ordering::Relaxed);
+        // Stop the heartbeat and wait for it to finish.
+        stop.store(1, Ordering::Relaxed);
+        let _ = heartbeat.await;
+
+        // The heartbeat must have made progress while purge was in
+        // flight. The exact lower bound is conservative — in CI with
+        // contention, even one tick proves the runtime kept advancing.
+        assert!(
+            mid_ticks > 0,
+            "the sibling task must accumulate ticks while purge is running; \
+             got {mid_ticks} — purge appears to have blocked the runtime"
+        );
+
+        // Verify purge actually purged.
+        let remaining = store.try_get_log_entries(1u64..1001u64).await.unwrap();
+        assert!(remaining.is_empty(), "all 1000 entries should be purged");
     }
 
     #[test]
