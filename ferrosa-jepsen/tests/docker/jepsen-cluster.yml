@@ -68,7 +68,8 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # Node 1 — first seed; no FERROSA_SEED (it IS the seed)
+  # Node 1 — symmetric seed config (Sprint 2 W2.14): every node seeds every
+  # other node so cluster bring-up does not depend on a single bootstrap host.
   # ---------------------------------------------------------------------------
   node1:
     build:
@@ -85,6 +86,7 @@ services:
       FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node1:7000"
+      FERROSA_SEED: "node2:7000,node3:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen"
@@ -122,7 +124,7 @@ services:
       FERROSA_HOST_ID: "22222222-2222-2222-2222-222222222222"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node2:7000"
-      FERROSA_SEED: "node1:7000"
+      FERROSA_SEED: "node1:7000,node3:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen"
@@ -160,7 +162,7 @@ services:
       FERROSA_HOST_ID: "33333333-3333-3333-3333-333333333333"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node3:7000"
-      FERROSA_SEED: "node1:7000"
+      FERROSA_SEED: "node1:7000,node2:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen"
