@@ -60,6 +60,7 @@ hard-to-reproduce flakes.
 | W5.8  | **Done** | feat(sim): W5.8 | 2 (`pre_vote_round_promotes_to_leader`, `pre_vote_blocks_term_advance_in_minority_partition`) | PreVote events + `Role::PreCandidate` path; `with_pre_vote()` builder. `NoTermAdvanceWithoutPreVoteMajority` runtime invariant. TLA+ spec already encodes PreVote. |
 | W5.9  | **Done** | feat(sim): W5.9 | 2 (`joint_consensus_quorum_requires_both_sides`, `joint_consensus_drops_old_voter_at_commit`) | `propose_membership(Cnew)` / `commit_membership` / `is_joint_quorum`. Joint quorum = majority of Cold AND majority of Cnew. `JointConsensusSafety` runtime invariant. TLA+ spec already encodes the joint quorum. |
 | W5.10 | **Done** | feat(sim): W5.10 | 4 (`every_sim_transition_is_tla_permitted`, `refinement_holds_across_1000_seeds`, `refinement_rejects_two_leaders_same_term`, `refinement_rejects_term_regression`) | Rust TLA+ refinement interpreter at `refinement.rs`. Replays each `TlaAction` against `AbstractState`, rejects two-leaders-same-term, term regression, stale grants, etc. **1000-seed sweep passes.** Throughput benchmark: ~86M seeds/min for the protocol-level sim (well above the 10K/min target). |
+| W5.11 | **Done** | ci(sim): W5.11 | 1 (`nightly_sim_workflow_exists`) | `.github/workflows/nightly-sim.yml`: 5 AM UTC cron, runs `seed_throughput -- 100000`, then `refinement_holds_across_1000_seeds`, then `sim_full_bootstrap_seed_sweep`. Auto-files a GitHub issue on failure with tail of the three logs. |
 
 ## Final commit count
 

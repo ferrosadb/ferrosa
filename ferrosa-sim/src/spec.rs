@@ -175,6 +175,21 @@ mod tests {
     use super::*;
     use crate::cluster::SimulatedCluster;
 
+    /// W5.11 RED → GREEN: the nightly sim workflow exists at the
+    /// expected path with the expected job name.
+    #[test]
+    fn nightly_sim_workflow_exists() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".github/workflows/nightly-sim.yml");
+        assert!(path.exists(), "missing workflow at {}", path.display());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("ferrosa-sim 100K-seed sweep"));
+        assert!(body.contains("seed_throughput -- 100000"));
+        assert!(body.contains("refinement_holds_across_1000_seeds"));
+    }
+
     /// W5.7 RED → GREEN: the TLA+ spec exists at the expected path.
     /// This pins the file's location so removing it accidentally
     /// breaks the build.
