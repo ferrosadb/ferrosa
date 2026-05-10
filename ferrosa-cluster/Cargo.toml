@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "m
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 indexmap = "2"

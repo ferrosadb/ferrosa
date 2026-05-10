@@ -6,11 +6,14 @@
 //! `Uuid` node identifiers to openraft's `u64` `NodeId` space.
 
 pub mod election_guard;
+pub mod group_id;
 pub mod handlers;
 pub mod log_store;
 pub mod network;
 pub mod snapshot_pusher;
 pub mod state_machine;
+
+pub use group_id::{RaftGroupId, DEFAULT_DC_NAME};
 
 use std::io::Cursor;
 
