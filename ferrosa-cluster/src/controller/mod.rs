@@ -30,12 +30,13 @@ pub(crate) use token::deterministic_tokens_for_node;
 #[cfg(test)]
 pub(crate) use token::generate_deterministic_token;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Maximum tracked connected peers before eviction (prevents unbounded growth).
 pub(super) const MAX_CONNECTED_PEERS: usize = 1000;
@@ -45,6 +46,8 @@ pub(super) const MAX_PENDING_JOINS: usize = 100;
 /// Maximum seen invite initiators before eviction.
 #[allow(dead_code)]
 pub(super) const MAX_SEEN_INVITE_INITIATORS: usize = 100;
+/// Minimum interval between cluster-mode reconnect invites for the same peer.
+pub(super) const CLUSTER_RECONNECT_INVITE_COOLDOWN: Duration = Duration::from_secs(30);
 
 use parking_lot::Mutex;
 
@@ -208,6 +211,11 @@ pub struct ModeController {
     pub(super) formation_epoch: std::sync::atomic::AtomicU64,
     /// Initiators already seen in this formation epoch. Deduplicates invites.
     pub(super) seen_invite_initiators: Mutex<BTreeSet<Uuid>>,
+    /// Last time this node sent a cluster-mode reconnect invite to a peer.
+    /// Prevents duplicate inbound/outbound reconnect callbacks from swapping
+    /// lanes and destabilising Raft while still allowing a recreated peer to
+    /// receive a fresh invite after startup.
+    pub(super) recent_reconnect_invites: Mutex<BTreeMap<Uuid, std::time::Instant>>,
     /// Tracks all spawned background tasks. Replaces fire-and-forget spawns
     /// so panics are detected and tasks can be cancelled on shutdown.
     pub(super) background_tasks: Mutex<tokio::task::JoinSet<()>>,
@@ -308,6 +316,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
+            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
@@ -366,6 +375,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
+            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
@@ -424,6 +434,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
+            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),

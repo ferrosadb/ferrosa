@@ -262,12 +262,18 @@ impl ModeController {
     /// Checks de-duplication (via `pending_joins`), approval (via `approved_nodes`
     /// or `auto_join`), and spawns an async task to propose `JoinNode` +
     /// `AssignTokens` via Raft.
+    ///
+    /// Returns `true` only when a join/metadata refresh was newly enqueued.
+    /// Cluster-mode reconnect handling uses this to avoid re-sending
+    /// `ClusterInvite` on every duplicate reconnect for an already-known live
+    /// member; unbounded invite storms churn lanes and make LOCAL_QUORUM reads
+    /// time out even while containers look healthy.
     pub(super) fn trigger_cluster_join(
         &self,
         host_id: Uuid,
         addr: std::net::SocketAddr,
         cql_broadcast: Option<String>,
-    ) {
+    ) -> bool {
         let peer_manager = self.peer_manager.load().as_ref().as_ref().cloned();
         let has_outbound_peer = peer_manager
             .as_ref()
@@ -288,7 +294,7 @@ impl ModeController {
                     node_id = peer_node_id,
                     "peer already present in token ring with current metadata, skipping join trigger"
                 );
-                return;
+                return false;
             }
         }
 
@@ -297,7 +303,7 @@ impl ModeController {
             let approved = self.approved_nodes.lock();
             if !approved.contains(&host_id) {
                 tracing::warn!(peer = %host_id, "peer not approved to join cluster, ignoring");
-                return;
+                return false;
             }
         }
 
@@ -309,7 +315,7 @@ impl ModeController {
             let mut pending = pending_joins.lock();
             if pending.contains(&host_id) {
                 tracing::debug!(peer = %host_id, "peer join already pending, skipping duplicate trigger");
-                return;
+                return false;
             }
             if pending.len() >= super::MAX_PENDING_JOINS {
                 tracing::warn!(
@@ -558,5 +564,7 @@ impl ModeController {
                 "peer admitted to cluster via on_peer_connected"
             );
         });
+
+        true
     }
 }

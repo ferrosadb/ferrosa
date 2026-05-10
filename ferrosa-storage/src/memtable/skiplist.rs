@@ -113,6 +113,26 @@ impl Memtable for SkipListMemtable {
             .collect()
     }
 
+    fn snapshot_range_limited(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+    ) -> Vec<Partition> {
+        self.map
+            .iter()
+            .filter(|entry| {
+                let key = entry.key();
+                start.is_none_or(|s| key >= s) && end.is_none_or(|e| key <= e)
+            })
+            .take(limit)
+            .map(|entry| {
+                let guard = entry.value().load();
+                (**guard).clone()
+            })
+            .collect()
+    }
+
     fn size_bytes(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }

@@ -20,8 +20,8 @@ ferrosa-cluster/src/controller/membership.rs:97 # handle_join_request: JoinNode 
 ferrosa-cluster/src/controller/membership.rs:109 # handle_join_request: AssignTokens — Sprint 2
 ferrosa-cluster/src/controller/membership.rs:158 # decommission: SetNodeState{Leaving} — Sprint 2
 ferrosa-cluster/src/controller/membership.rs:247 # decommission: LeaveNode — replace via MembershipChanger::remove_voter (Sprint 2)
-ferrosa-cluster/src/controller/membership.rs:440 # cluster_member_metadata refresh — replace via MembershipChanger::update_metadata (Sprint 2; line shifted)
-ferrosa-cluster/src/controller/membership.rs:527 # late-join JoinNode — Sprint 2 (line shifted by Sprint 4/6 additions)
-ferrosa-cluster/src/controller/membership.rs:546 # late-join AssignTokens — Sprint 2 (line shifted)
-ferrosa-cluster/src/controller/cluster.rs:543 # seed bootstrap: register_node for peers — Sprint 4 (transition_to_cluster rewrite pending; line shifted by Sprint 6)
-ferrosa-cluster/src/controller/cluster.rs:546 # seed bootstrap: register_node for self — Sprint 4 (line shifted by Sprint 6)
+ferrosa-cluster/src/controller/membership.rs:446 # cluster_member_metadata refresh — replace via MembershipChanger::update_metadata (Sprint 2; line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/membership.rs:533 # late-join JoinNode — Sprint 2 (line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/membership.rs:552 # late-join AssignTokens — Sprint 2 (line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/cluster.rs:603 # seed bootstrap: register_node for peers — Sprint 4 (transition_to_cluster rewrite pending; line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/cluster.rs:606 # seed bootstrap: register_node for self — Sprint 4 (line shifted by PR #19 merge)

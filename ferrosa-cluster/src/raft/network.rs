@@ -20,10 +20,21 @@ use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
 use uuid::Uuid;
 
 use ferrosa_net::codec::Lane;
+use ferrosa_net::error::NetError;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 
 use super::FerrosRaftConfig;
+
+/// Delay before handing a transient reconnecting lane back to OpenRaft as
+/// `Unreachable`.
+///
+/// OpenRaft's replication core enters `backoff_drain_events` after an
+/// `Unreachable` error. Returning Ferrosa's local `NetError::Reconnecting`
+/// immediately can turn a transient lane reconnect into a hot event-drain loop
+/// on one runtime worker. Sleeping here makes the Raft network future itself
+/// carry the reconnect backoff instead of fast-failing into OpenRaft.
+const RAFT_RECONNECTING_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // FerrosRaftNetworkFactory
@@ -172,6 +183,12 @@ fn net_error_to_unreachable_snapshot(
     RPCError::Unreachable(Unreachable::new(&e))
 }
 
+async fn backoff_transient_raft_reconnect(e: &NetError) {
+    if matches!(e, NetError::Reconnecting) {
+        tokio::time::sleep(RAFT_RECONNECTING_ERROR_BACKOFF).await;
+    }
+}
+
 impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
     /// Forward an `AppendEntries` RPC to the target node.
     async fn append_entries(
@@ -180,7 +197,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let payload = encode(&rpc)?;
-        let response = self
+        let response = match self
             .peer_manager
             .send(
                 self.target_host_id,
@@ -188,10 +205,14 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
                 Lane::Raft,
             )
             .await
-            .map_err(|e| {
+        {
+            Ok(response) => response,
+            Err(e) => {
                 tracing::warn!(target = %self.target_host_id, %e, "AppendEntries send failed");
-                net_error_to_unreachable(e)
-            })?;
+                backoff_transient_raft_reconnect(&e).await;
+                return Err(net_error_to_unreachable(e));
+            }
+        };
 
         match response {
             Message::RaftAppendResponse(bytes) => decode(&bytes),
@@ -222,7 +243,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         // pushed AppendEntries p99 from ~5 ms to ~600 ms, well over
         // election_timeout_min, causing avoidable elections.
         // See `crate::raft::snapshot_transport::snapshot_lane`.
-        let response = self
+        let response = match self
             .peer_manager
             .send(
                 self.target_host_id,
@@ -230,7 +251,13 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
                 crate::raft::snapshot_transport::snapshot_lane(),
             )
             .await
-            .map_err(net_error_to_unreachable_snapshot)?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                backoff_transient_raft_reconnect(&e).await;
+                return Err(net_error_to_unreachable_snapshot(e));
+            }
+        };
 
         match response {
             // The install-snapshot response is encoded the same way: bincode of
@@ -253,14 +280,18 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let payload = encode(&rpc)?;
-        let response = self
+        let response = match self
             .peer_manager
             .send(self.target_host_id, Message::RaftVote(payload), Lane::Raft)
             .await
-            .map_err(|e| {
+        {
+            Ok(response) => response,
+            Err(e) => {
                 tracing::debug!(target = %self.target_host_id, %e, "Vote send failed");
-                net_error_to_unreachable(e)
-            })?;
+                backoff_transient_raft_reconnect(&e).await;
+                return Err(net_error_to_unreachable(e));
+            }
+        };
 
         match response {
             Message::RaftVoteResponse(bytes) => decode(&bytes),
@@ -323,6 +354,18 @@ mod tests {
             Uuid::new_v4(),
             Arc::new(NoopListener),
         ))
+    }
+
+    // -- reconnecting errors are not fast-failed into OpenRaft -------------
+
+    #[tokio::test]
+    async fn transient_reconnecting_error_is_backed_off_before_openraft_error() {
+        let start = tokio::time::Instant::now();
+        backoff_transient_raft_reconnect(&ferrosa_net::error::NetError::Reconnecting).await;
+        assert!(
+            start.elapsed() >= RAFT_RECONNECTING_ERROR_BACKOFF,
+            "Reconnecting lanes must be delayed before returning Unreachable to OpenRaft"
+        );
     }
 
     // -- factory_creates_network -------------------------------------------

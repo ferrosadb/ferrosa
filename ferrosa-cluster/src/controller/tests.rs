@@ -541,6 +541,97 @@ fn recovered_topology_restart_skips_bootstrap_streaming() {
 }
 
 #[test]
+fn cluster_reconnect_rebroadcasts_invite_even_when_join_is_deduped() {
+    let now = std::time::Instant::now();
+    assert!(
+        super::peer_events::should_send_cluster_invite_after_join_trigger(false, None, now),
+        "a recreated existing member can have current ring metadata, so JoinNode is deduped, \
+         but it still needs ClusterInvite to leave pair mode and register Raft/Bulk handlers"
+    );
+    assert!(
+        super::peer_events::should_send_cluster_invite_after_join_trigger(true, Some(now), now)
+    );
+}
+
+#[test]
+fn cluster_reconnect_invite_is_rate_limited_when_join_is_deduped() {
+    let now = std::time::Instant::now();
+    assert!(
+        !super::peer_events::should_send_cluster_invite_after_join_trigger(false, Some(now), now),
+        "duplicate reconnects for an already-known member must not repeatedly rebroadcast invites"
+    );
+    assert!(
+        super::peer_events::should_send_cluster_invite_after_join_trigger(
+            false,
+            Some(now - super::CLUSTER_RECONNECT_INVITE_COOLDOWN),
+            now
+        )
+    );
+}
+
+#[test]
+fn initial_raft_membership_uses_local_broadcast_address_for_seed() {
+    let local_host_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let peer1_host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let peer2_host_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let peers = vec![
+        (peer1_host_id, "172.20.0.3:7000".parse().unwrap()),
+        (peer2_host_id, "172.20.0.4:7000".parse().unwrap()),
+    ];
+
+    let members = super::cluster::build_initial_raft_members(
+        local_host_id,
+        "172.20.0.5:7000".parse().unwrap(),
+        &peers,
+    );
+
+    assert_eq!(
+        members[&uuid_to_node_id(local_host_id)].addr,
+        "172.20.0.5:7000",
+        "the seed must not commit itself to Raft membership with an empty address"
+    );
+}
+
+#[test]
+fn raft_membership_refresh_plan_uses_topology_addresses() {
+    let node3 = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let plan = vec![crate::raft::NodeInfo {
+        host_id: node3,
+        addr: "172.20.0.5:7000".to_string(),
+        data_center: "dc1".to_string(),
+        rack: "rack1".to_string(),
+        state: crate::raft::NodeState::Normal,
+        cql_broadcast: None,
+    }];
+
+    let members = super::cluster::build_raft_members_from_node_info(&plan);
+
+    assert_eq!(members[&uuid_to_node_id(node3)].addr, "172.20.0.5:7000");
+}
+
+#[test]
+fn raft_membership_repair_detects_empty_committed_node_address() {
+    let node3 = uuid_to_node_id(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
+    let current = std::collections::BTreeMap::from([(
+        node3,
+        openraft::BasicNode {
+            addr: String::new(),
+        },
+    )]);
+    let desired = std::collections::BTreeMap::from([(
+        node3,
+        openraft::BasicNode {
+            addr: "172.20.0.5:7000".to_string(),
+        },
+    )]);
+
+    assert!(
+        super::cluster::membership_addresses_need_repair(&current, &desired),
+        "a committed BasicNode with addr=\"\" must trigger leader-side membership repair"
+    );
+}
+
+#[test]
 fn recovered_topology_refresh_plan_uses_current_live_addresses() {
     let local_host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
     let peer_host_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
@@ -1762,7 +1853,12 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
         }
         let table_id = TableId::new(ks, tbl);
         let partitions = storage
-            .read_range(&table_id, None, None, usize::MAX)
+            .read_range(
+                &table_id,
+                None,
+                None,
+                crate::write_path::DEFAULT_RANGE_READ_LIMIT,
+            )
             .unwrap();
 
         for partition in &partitions {
@@ -2179,4 +2275,25 @@ async fn drain_ddl_queue_returns_zero_for_empty_channel() {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let replayed = drain_ddl_queue(rx, |_| async { Ok(()) }).await;
     assert_eq!(replayed, 0);
+}
+
+#[test]
+fn bootstrap_attempts_sstable_bulk_before_range_materialization() {
+    let source = include_str!("cluster.rs");
+    let bootstrap = source
+        .split("starting bootstrap streaming to new token owners")
+        .nth(1)
+        .expect("bootstrap streaming block exists");
+    let first_read_range = bootstrap
+        .find("read_range(")
+        .expect("bootstrap block still has a row fallback read_range");
+    let first_flush = bootstrap
+        .find("flush_all()")
+        .expect("bootstrap block should flush before SSTable streaming");
+
+    assert!(
+        first_flush < first_read_range,
+        "bootstrap must try flush/SSTable bulk streaming before read_range; \
+         read_range materializes all SSTable partitions before applying its limit and can OOM"
+    );
 }

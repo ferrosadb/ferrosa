@@ -562,7 +562,77 @@ impl FerrosStateMachine {
         self.last_membership = meta.last_membership.clone();
         self.current_snapshot = Some((meta, bytes));
         self.sync_ring();
+        self.sync_schema_and_engine_from_state("Raft snapshot");
         Ok(())
+    }
+
+    fn sync_schema_and_engine_from_state(&self, context: &'static str) {
+        // Propagate full state to local Schema if present.
+        if let Some(schema) = &self.schema {
+            let snap = ferrosa_schema::SchemaSnapshot {
+                version: self.state.schema_version,
+                keyspaces: self
+                    .state
+                    .keyspaces
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                tables: self
+                    .state
+                    .tables
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                roles: self
+                    .state
+                    .roles
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                grants: self
+                    .state
+                    .grants
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                indexes: self
+                    .state
+                    .indexes
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                types: self
+                    .state
+                    .types
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                functions: self
+                    .state
+                    .functions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                aggregates: self
+                    .state
+                    .aggregates
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            };
+            if let Err(e) = schema.apply_snapshot(snap) {
+                tracing::error!(%e, %context, "apply_snapshot to schema failed");
+            }
+        }
+
+        // Re-register all tables with engine if present.
+        if let Some(engine) = &self.engine {
+            for table in self.state.tables.values() {
+                if let Err(e) = engine.register_table(table.to_storage_schema()) {
+                    tracing::error!(%e, %context, "register_table failed");
+                }
+            }
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -1451,73 +1521,6 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
         }
 
-        // Propagate full state to local Schema if present.
-        if let Some(schema) = &self.schema {
-            let snap = ferrosa_schema::SchemaSnapshot {
-                version: self.state.schema_version,
-                keyspaces: self
-                    .state
-                    .keyspaces
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                tables: self
-                    .state
-                    .tables
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                roles: self
-                    .state
-                    .roles
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                grants: self
-                    .state
-                    .grants
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                indexes: self
-                    .state
-                    .indexes
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                types: self
-                    .state
-                    .types
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                functions: self
-                    .state
-                    .functions
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                aggregates: self
-                    .state
-                    .aggregates
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            };
-            if let Err(e) = schema.apply_snapshot(snap) {
-                tracing::error!(%e, "Raft snapshot: apply_snapshot to schema failed");
-            }
-        }
-
-        // Re-register all tables with engine if present.
-        if let Some(engine) = &self.engine {
-            for table in self.state.tables.values() {
-                if let Err(e) = engine.register_table(table.to_storage_schema()) {
-                    tracing::error!(%e, "Raft snapshot: register_table failed");
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -2171,6 +2174,77 @@ mod tests {
             m2.membership().get_joint_config(),
             "membership must survive restart"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_persisted_snapshot_updates_live_schema_and_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("state-machine.snapshot.bin");
+
+        let mut source = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        source
+            .apply(vec![
+                make_entry(
+                    1,
+                    1,
+                    RaftOp::CreateKeyspace(simple_keyspace("agent_memory")),
+                ),
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table(
+                        "agent_memory",
+                        "confidence_scores",
+                    ))),
+                ),
+            ])
+            .await
+            .unwrap();
+        source.build_snapshot().await.unwrap();
+
+        let schema = Arc::new(test_schema_instance());
+        let engine = test_engine(dir.path());
+        assert!(
+            !schema
+                .snapshot()
+                .tables
+                .contains_key(&("agent_memory".to_string(), "confidence_scores".to_string())),
+            "test must start with live Schema missing the Raft-snapshotted table"
+        );
+        assert_eq!(
+            engine.table_count(),
+            0,
+            "test engine starts with no user tables"
+        );
+
+        let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            snapshot_path,
+        );
+        assert!(restarted.recover_from_persisted_snapshot().unwrap());
+
+        assert!(
+            schema
+                .snapshot()
+                .tables
+                .contains_key(&("agent_memory".to_string(), "confidence_scores".to_string())),
+            "recovering a durable Raft snapshot must make its tables visible to CQL prepare"
+        );
+
+        let table_id = TableId::new("agent_memory", "confidence_scores");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"score-key".to_vec(),
+        ));
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+        };
+        engine
+            .write(&table_id, &key, row, 1)
+            .expect("recovered Raft snapshot must also register the table with StorageEngine");
     }
 
     #[tokio::test]

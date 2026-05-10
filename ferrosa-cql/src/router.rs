@@ -48,6 +48,209 @@ use crate::virtual_tables::connections::ConnectionTracker;
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
 const COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
+/// Warn once an arbitrary unbounded ORDER BY would scan at least this many
+/// local SSTable bytes before sorting. The warning is a planner signal: this
+/// query shape should use the spillable temp-sort table path instead of
+/// silently building an unbounded in-memory sort buffer.
+const ORDER_BY_TEMP_SORT_WARN_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderByExecutionPlan {
+    /// ORDER BY is absent, bounded by a literal LIMIT, or follows clustering
+    /// order inside a fully-specified partition.
+    Inline,
+    /// ORDER BY is arbitrary and unbounded; reserve a spillable temp-sort table
+    /// and warn based on local SSTable bytes that would be scanned.
+    SpillableTempTable { estimated_scan_bytes: u64 },
+}
+
+fn has_literal_limit(s: &SelectStatement) -> bool {
+    s.limit.as_ref().and_then(Limit::as_literal).is_some()
+}
+
+fn has_full_partition_key_equality(s: &SelectStatement, table_meta: &TableMetadata) -> bool {
+    table_meta.partition_key.iter().all(|pk| {
+        s.where_clauses
+            .iter()
+            .any(|wc| !wc.token_fn && wc.column == *pk && wc.op == ComparisonOp::Eq)
+    })
+}
+
+fn order_by_matches_clustering_order(s: &SelectStatement, table_meta: &TableMetadata) -> bool {
+    if s.order_by.is_empty() || s.order_by.len() > table_meta.clustering_key.len() {
+        return false;
+    }
+    s.order_by.iter().zip(table_meta.clustering_key.iter()).all(
+        |((order_col, order_dir), (ck_col, ck_order))| {
+            order_col == ck_col
+                && matches!(
+                    (order_dir, ck_order),
+                    (OrderDirection::Asc, SchemaClusteringOrder::Asc)
+                        | (OrderDirection::Desc, SchemaClusteringOrder::Desc)
+                        | (OrderDirection::Asc, SchemaClusteringOrder::None)
+                )
+        },
+    )
+}
+
+fn classify_order_by_execution(
+    state: &SharedState,
+    ks: &str,
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+) -> OrderByExecutionPlan {
+    if s.order_by.is_empty()
+        || has_literal_limit(s)
+        || (has_full_partition_key_equality(s, table_meta)
+            && order_by_matches_clustering_order(s, table_meta))
+    {
+        return OrderByExecutionPlan::Inline;
+    }
+
+    OrderByExecutionPlan::SpillableTempTable {
+        estimated_scan_bytes: state
+            .engine
+            .estimated_table_scan_bytes(ks, &s.table)
+            .unwrap_or_default(),
+    }
+}
+
+fn prepare_order_by_execution(
+    state: &SharedState,
+    ks: &str,
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+) -> Result<Option<ferrosa_storage::TempSortTableReservation>, CqlError> {
+    match classify_order_by_execution(state, ks, s, table_meta) {
+        OrderByExecutionPlan::Inline => Ok(None),
+        OrderByExecutionPlan::SpillableTempTable {
+            estimated_scan_bytes,
+        } => {
+            let reservation = state
+                .engine
+                .reserve_order_by_temp_sort_table(ks, &s.table)
+                .map_err(|e| {
+                    CqlError::ServerError(format!("ORDER BY temp-sort setup failed: {e}"))
+                })?;
+            if estimated_scan_bytes >= ORDER_BY_TEMP_SORT_WARN_BYTES {
+                tracing::warn!(
+                    keyspace = ks,
+                    table = %s.table,
+                    order_by = ?s.order_by,
+                    estimated_scan_bytes,
+                    temp_sort_table = %reservation.path().display(),
+                    "unbounded arbitrary ORDER BY will use a cancellable spillable temp-sort table; consider a materialized view keyed by this order or explicit LIMIT"
+                );
+            } else {
+                tracing::info!(
+                    keyspace = ks,
+                    table = %s.table,
+                    order_by = ?s.order_by,
+                    estimated_scan_bytes,
+                    temp_sort_table = %reservation.path().display(),
+                    "unbounded arbitrary ORDER BY classified for cancellable spillable temp-sort table"
+                );
+            }
+            Ok(Some(reservation))
+        }
+    }
+}
+
+fn is_count_only_select(columns: &[SelectColumn]) -> bool {
+    !columns.is_empty()
+        && columns.iter().all(|c| {
+            matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+        })
+}
+
+fn safe_partition_key_filter_row_limit(
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+    count_only_select: bool,
+) -> Option<usize> {
+    if count_only_select || !s.order_by.is_empty() {
+        return None;
+    }
+    let limit = s.limit.as_ref()?.as_literal()? as usize;
+    if limit == 0 || s.where_clauses.is_empty() {
+        return None;
+    }
+
+    let partition_keys: std::collections::HashSet<&str> = table_meta
+        .partition_key
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    // Safe only when every predicate is an equality on a partition-key
+    // component. For matching partitions, all rows satisfy those predicates,
+    // so returning at most LIMIT rows per partition cannot underfill due to a
+    // row-level post-filter. Non-PK predicates must continue using uncapped
+    // partition rows to avoid dropping the first matching row after the cap.
+    s.where_clauses
+        .iter()
+        .all(|wc| {
+            !wc.token_fn && wc.op == ComparisonOp::Eq && partition_keys.contains(wc.column.as_str())
+        })
+        .then_some(limit)
+}
+
+fn row_matches_select_predicates(
+    row: &[Option<CqlValue>],
+    s: &SelectStatement,
+    all_col_names: &[String],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> bool {
+    evaluate_where_predicates(row, &s.where_clauses, all_col_names, table_meta, ks, schema)
+}
+
+struct PartitionRowContext<'a> {
+    all_col_names: &'a [String],
+    all_col_types: &'a [CqlType],
+    pk_indices: &'a [usize],
+    ck_indices: &'a [usize],
+}
+
+struct SelectPredicateContext<'a> {
+    statement: &'a SelectStatement,
+    table_meta: &'a TableMetadata,
+    keyspace: &'a str,
+    schema: &'a Schema,
+}
+
+async fn count_rows_from_partitions(
+    partitions: &[ferrosa_sstable::types::Partition],
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> i64 {
+    let mut count = 0_i64;
+    for (idx, partition) in partitions.iter().enumerate() {
+        for row in bridge::partition_to_rows(
+            partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.schema,
+            ) {
+                count += 1;
+            }
+        }
+        if should_yield_during_partition_scan(idx + 1, COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS) {
+            tokio::task::yield_now().await;
+        }
+    }
+    count
+}
 
 async fn extend_rows_from_partitions(
     partitions: &[ferrosa_sstable::types::Partition],
@@ -1584,6 +1787,7 @@ async fn route_select_user_table(
     );
 
     let read_strategy = keyspace_strategy(&state.schema, ks);
+    let count_only_select = is_count_only_select(&s.columns);
 
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
@@ -1668,6 +1872,32 @@ async fn route_select_user_table(
                 // the planner still sees Eq predicates on all PK columns.
                 // Fall through to a full scan rather than panicking.
                 let partitions = state.write_path.load().range_read(&table_id).await?;
+                if count_only_select {
+                    let count = count_rows_from_partitions(
+                        &partitions,
+                        PartitionRowContext {
+                            all_col_names: &all_col_names,
+                            all_col_types: &all_col_types,
+                            pk_indices: &pk_indices,
+                            ck_indices: &ck_indices,
+                        },
+                        SelectPredicateContext {
+                            statement: s,
+                            table_meta,
+                            keyspace: ks,
+                            schema: &state.schema,
+                        },
+                    )
+                    .await;
+                    return Ok(SelectRawResult {
+                        column_names: col_names.to_vec(),
+                        column_types: col_types.to_vec(),
+                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                        keyspace: ks.to_string(),
+                        table: s.table.clone(),
+                        paging_state: None,
+                    });
+                }
                 let mut all_rows = Vec::new();
                 extend_rows_from_partitions(
                     &partitions,
@@ -1747,6 +1977,33 @@ async fn route_select_user_table(
                     partitions
                 };
 
+                if count_only_select {
+                    let count = count_rows_from_partitions(
+                        &partitions,
+                        PartitionRowContext {
+                            all_col_names: &all_col_names,
+                            all_col_types: &all_col_types,
+                            pk_indices: &pk_indices,
+                            ck_indices: &ck_indices,
+                        },
+                        SelectPredicateContext {
+                            statement: s,
+                            table_meta,
+                            keyspace: ks,
+                            schema: &state.schema,
+                        },
+                    )
+                    .await;
+                    return Ok(SelectRawResult {
+                        column_names: col_names.to_vec(),
+                        column_types: col_types.to_vec(),
+                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                        keyspace: ks.to_string(),
+                        table: s.table.clone(),
+                        paging_state: None,
+                    });
+                }
+
                 let mut all_rows = Vec::new();
                 extend_rows_from_partitions(
                     &partitions,
@@ -1808,6 +2065,33 @@ async fn route_select_user_table(
                     partitions
                 };
 
+                if count_only_select {
+                    let count = count_rows_from_partitions(
+                        &partitions,
+                        PartitionRowContext {
+                            all_col_names: &all_col_names,
+                            all_col_types: &all_col_types,
+                            pk_indices: &pk_indices,
+                            ck_indices: &ck_indices,
+                        },
+                        SelectPredicateContext {
+                            statement: s,
+                            table_meta,
+                            keyspace: ks,
+                            schema: &state.schema,
+                        },
+                    )
+                    .await;
+                    return Ok(SelectRawResult {
+                        column_names: col_names.to_vec(),
+                        column_types: col_types.to_vec(),
+                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                        keyspace: ks.to_string(),
+                        table: s.table.clone(),
+                        paging_state: None,
+                    });
+                }
+
                 let mut all_rows = Vec::new();
                 extend_rows_from_partitions(
                     &partitions,
@@ -1860,9 +2144,102 @@ async fn route_select_user_table(
                     ));
                 }
 
-                // Use a large scan window — LIMIT is applied *after* filtering,
-                // not before, to avoid cutting off matching rows (FRSA-BUG-003).
-                let partitions = state.write_path.load().range_read(&table_id).await?;
+                // Use a bounded upstream partition cap for unordered,
+                // non-aggregate scans so first pages do not wait behind an
+                // unbounded table materialization.  When ALLOW FILTERING has
+                // post-filter predicates, the SQL LIMIT cannot safely be used
+                // as the storage partition cap: LIMIT 1 may need to inspect
+                // many non-matching partitions before finding the first
+                // matching row.  In that shape, keep the existing hard range
+                // cap and apply LIMIT after filtering.  Ordered and aggregate
+                // queries still materialize their scan window before
+                // sorting/counting.
+                let scan_bound = if s.order_by.is_empty() && !count_only_select {
+                    let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
+                    if has_post_filter {
+                        Some(ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT)
+                    } else {
+                        let page_size = ctx
+                            .paging
+                            .page_size
+                            .and_then(|ps| (ps > 0).then_some(ps as usize));
+                        let limit_size = s
+                            .limit
+                            .as_ref()
+                            .and_then(|l| l.as_literal())
+                            .map(|n| n as usize);
+                        let base = match (page_size, limit_size) {
+                            (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
+                            (Some(ps), None) => Some(ps),
+                            (None, Some(lim)) => Some(lim),
+                            (None, None) => None,
+                        };
+                        let start = ctx
+                            .paging
+                            .paging_state
+                            .as_deref()
+                            .and_then(|bytes| crate::paging::PagingState::decode(bytes).ok())
+                            .and_then(|state| {
+                                (state.partition_key.len() == 8).then(|| {
+                                    u64::from_be_bytes(
+                                        state.partition_key.as_slice().try_into().unwrap(),
+                                    ) as usize
+                                })
+                            })
+                            .unwrap_or(0);
+                        base.map(|n| start.saturating_add(n).max(1))
+                    }
+                } else {
+                    None
+                };
+                let row_limit =
+                    safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
+                        .unwrap_or(0);
+                let partitions = if let Some(bound) = scan_bound {
+                    state
+                        .write_path
+                        .load()
+                        .range_read_limited_rows(&table_id, bound, row_limit)
+                        .await?
+                } else if row_limit > 0 {
+                    state
+                        .write_path
+                        .load()
+                        .range_read_limited_rows(
+                            &table_id,
+                            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
+                            row_limit,
+                        )
+                        .await?
+                } else {
+                    state.write_path.load().range_read(&table_id).await?
+                };
+                if count_only_select {
+                    let count = count_rows_from_partitions(
+                        &partitions,
+                        PartitionRowContext {
+                            all_col_names: &all_col_names,
+                            all_col_types: &all_col_types,
+                            pk_indices: &pk_indices,
+                            ck_indices: &ck_indices,
+                        },
+                        SelectPredicateContext {
+                            statement: s,
+                            table_meta,
+                            keyspace: ks,
+                            schema: &state.schema,
+                        },
+                    )
+                    .await;
+                    return Ok(SelectRawResult {
+                        column_names: col_names.to_vec(),
+                        column_types: col_types.to_vec(),
+                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                        keyspace: ks.to_string(),
+                        table: s.table.clone(),
+                        paging_state: None,
+                    });
+                }
                 let mut all_rows = Vec::new();
                 extend_rows_from_partitions(
                     &partitions,
@@ -1887,6 +2264,11 @@ async fn route_select_user_table(
             }
         }
     };
+
+    // Classify arbitrary unbounded ORDER BY before sorting. The temp-sort
+    // reservation is intentionally held until this SELECT returns; dropping it
+    // on completion or cancellation cleans up the temporary table directory.
+    let _order_by_temp_sort = prepare_order_by_execution(state, ks, s, table_meta)?;
 
     // ANN OF ordering: vector similarity search is deferred — log and fall
     // through to normal result ordering. The query parses successfully but
@@ -8671,6 +9053,42 @@ mod tests {
         i32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
     }
 
+    fn extract_first_bigint_value(buf: &[u8]) -> i64 {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        let row_count = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        assert_eq!(row_count, 1, "expected exactly one aggregate row");
+        off += 4;
+        let value_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        off += 4;
+        assert_eq!(value_len, 8, "expected bigint value length");
+        i64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
+    }
+
     /// Extract column names from a Rows result buffer.
     fn extract_column_names(buf: &[u8]) -> Vec<String> {
         assert_eq!(
@@ -9810,14 +10228,30 @@ mod tests {
             crate::parser::parse("CREATE TABLE afl.t (id int PRIMARY KEY, flag int)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
+        for id in 0..10 {
+            let flag = id % 2;
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO afl.t (id, flag) VALUES ({id}, {flag})"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
         let stmt =
             crate::parser::parse("SELECT * FROM afl.t WHERE flag = 1 LIMIT 2 ALLOW FILTERING")
                 .unwrap();
-        let result = route(&state, &ctx, stmt).await;
-        assert!(
-            result.is_ok(),
-            "ALLOW FILTERING with LIMIT should execute, got: {:?}",
-            result.err()
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), route(&state, &ctx, stmt))
+                .await
+                .expect("ALLOW FILTERING with LIMIT should not wait for an unbounded scan");
+        let result = result.expect("ALLOW FILTERING with LIMIT should execute");
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, 2,
+            "ALLOW FILTERING LIMIT should return the bounded first page"
         );
     }
 
@@ -10000,6 +10434,27 @@ mod tests {
         assert_eq!(
             filtered_count, 2,
             "ALLOW FILTERING on entity_type='person' should return 2 rows, got {filtered_count}"
+        );
+
+        let stmt = crate::parser::parse(&format!(
+            "SELECT entity_id, entity_name FROM agent.entity_store \
+             WHERE tenant_id = {tid} LIMIT 1 ALLOW FILTERING"
+        ))
+        .unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), route(&state, &ctx, stmt))
+                .await
+                .expect(
+                    "tenant-only partition-key LIMIT should not wait for unbounded materialization",
+                )
+                .expect("tenant-only partition-key LIMIT should execute");
+        let limited_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            limited_count, 1,
+            "tenant-only partition-key LIMIT should return exactly one row, got {limited_count}"
         );
     }
 
@@ -10317,6 +10772,91 @@ mod tests {
         assert_eq!(
             rows_desc, sorted_desc,
             "ORDER BY ck DESC should return sorted descending: got {rows_desc:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arbitrary_unbounded_order_by_reserves_and_cleans_temp_sort_table() {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE sortks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE sortks.t (pk int PRIMARY KEY, v int)").unwrap(),
+        )
+        .await
+        .unwrap();
+        for (pk, v) in [(1, 30), (2, 10), (3, 20)] {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!("INSERT INTO sortks.t (pk, v) VALUES ({pk}, {v})"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let stmt = crate::parser::parse("SELECT * FROM sortks.t ORDER BY v ASC").unwrap();
+        let Statement::Select(ref select) = stmt else {
+            panic!("expected SELECT");
+        };
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&("sortks".to_string(), "t".to_string()))
+            .unwrap();
+        assert_eq!(
+            classify_order_by_execution(&state, "sortks", select, table_meta),
+            OrderByExecutionPlan::SpillableTempTable {
+                estimated_scan_bytes: 0,
+            }
+        );
+
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let tmp_root = dir.path().join("tmp_order_by_sort");
+        if tmp_root.exists() {
+            let leftovers = std::fs::read_dir(&tmp_root).unwrap().count();
+            assert_eq!(leftovers, 0, "ORDER BY temp-sort table must be cleaned up");
+        }
+    }
+
+    #[test]
+    fn order_by_temp_sort_reservation_cleans_up_on_drop() {
+        let (state, dir) = setup();
+        let reservation = state
+            .engine
+            .reserve_order_by_temp_sort_table("ks", "t")
+            .unwrap();
+        let path = reservation.path().to_path_buf();
+        assert!(path.exists(), "temp-sort table should be created");
+        drop(reservation);
+        assert!(
+            !path.exists(),
+            "dropping reservation must clean temp-sort table"
+        );
+        assert!(
+            dir.path().join("tmp_order_by_sort").exists(),
+            "cleanup removes the per-query temp table, not the shared temp root"
         );
     }
 
@@ -11690,6 +12230,47 @@ mod tests {
             "COUNT(*) column must be named 'count', got {names:?}"
         );
         assert_eq!(count, 1, "COUNT(*) should return exactly 1 row");
+    }
+
+    #[tokio::test]
+    async fn count_star_allow_filtering_returns_filtered_count_without_result_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cnt_filter WITH REPLICATION =              {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt =
+            crate::parser::parse("CREATE TABLE cnt_filter.t (id int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        for (id, v) in [(1, "keep"), (2, "drop"), (3, "keep")] {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO cnt_filter.t (id, v) VALUES ({id}, '{v}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT COUNT(*) FROM cnt_filter.t WHERE v = 'keep' ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let value = match &result {
+            RouteResult::Result(b) => extract_first_bigint_value(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(value, 2, "COUNT(*) should aggregate matching rows only");
     }
 
     // ── ferrosa_bugs: phonetic match ────────────────────────────────────

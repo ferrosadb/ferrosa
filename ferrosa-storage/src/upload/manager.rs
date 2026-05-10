@@ -281,6 +281,22 @@ impl UploadManager {
             .map_err(|_| ferrosa_common::Error::InvalidFormat("upload channel closed".into()))
     }
 
+    /// Attempts to submit an upload task without waiting for queue capacity.
+    ///
+    /// Startup crash-recovery paths use this to avoid blocking listener binding
+    /// behind slow object-store uploads. Failed submissions leave their
+    /// pending-log entries intact for a later retry.
+    pub fn try_submit(&self, task: UploadTask) -> ferrosa_common::Result<()> {
+        self.task_tx.try_send(task).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                ferrosa_common::Error::InvalidFormat("upload queue full".into())
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                ferrosa_common::Error::InvalidFormat("upload channel closed".into())
+            }
+        })
+    }
+
     /// Shuts down the upload manager, draining the queue.
     pub async fn shutdown(&self) {
         let _ = self.task_tx.send(UploadTask::Shutdown).await;
