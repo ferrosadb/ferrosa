@@ -15,6 +15,15 @@
     nav a { color:var(--text); text-decoration:none; }
     nav .links { display:flex; gap:1rem; flex-wrap:wrap; }
     nav .links a { color:var(--muted); font-size:.92rem; }
+    nav .nav-cta { background:var(--accent); color:#fff; border-radius:8px; padding:.5rem .9rem; font-weight:700; }
+    nav .nav-toggle { display:none; align-items:center; justify-content:center; width:2.5rem; height:2.5rem; border:1px solid var(--border); border-radius:8px; background:var(--card); color:var(--text); cursor:pointer; }
+    nav .nav-toggle span, nav .nav-toggle span::before, nav .nav-toggle span::after { display:block; width:1.1rem; height:2px; border-radius:2px; background:currentColor; content:''; transition:transform .2s, opacity .2s; }
+    nav .nav-toggle span { position:relative; }
+    nav .nav-toggle span::before { position:absolute; transform:translateY(-6px); }
+    nav .nav-toggle span::after { position:absolute; transform:translateY(6px); }
+    nav.open .nav-toggle span { background:transparent; }
+    nav.open .nav-toggle span::before { background:var(--text); transform:rotate(45deg); }
+    nav.open .nav-toggle span::after { background:var(--text); transform:rotate(-45deg); }
     main { max-width:980px; margin:0 auto; padding:3rem 1.5rem 5rem; }
     h1 { font-size:clamp(2.2rem,5vw,4rem); line-height:1.05; letter-spacing:-.04em; margin:2rem 0 1rem; }
     h2 { font-size:1.65rem; margin-top:3rem; border-top:1px solid var(--border); padding-top:2rem; }
@@ -35,9 +44,13 @@
     footer { max-width:980px; margin:0 auto; padding:2rem 1.5rem; color:#6b6b7a; border-top:1px solid var(--border); }
     @media (max-width: 768px) {
       body { overflow-x:hidden; }
-      nav .inner { align-items:flex-start; flex-direction:column; }
-      nav .links { width:100%; display:grid; grid-template-columns:repeat(2,minmax(0,max-content)); gap:.6rem 1rem; padding-bottom:.25rem; }
-      nav .links a { white-space:nowrap; }
+      nav .inner { min-height:64px; padding:1rem; position:relative; }
+      nav .inner > a:first-child { margin-right:auto; }
+      nav .nav-cta { flex-shrink:0; padding:.5rem .75rem; }
+      nav .nav-toggle { display:inline-flex; }
+      nav .links { position:fixed; top:64px; left:0; right:0; display:none; flex-direction:column; gap:0; padding:.5rem 1rem 1rem; background:rgba(10,10,15,.98); border-bottom:1px solid var(--border); box-shadow:0 18px 40px rgba(0,0,0,.35); }
+      nav.open .links { display:flex; }
+      nav .links a { display:block; padding:.75rem 0; white-space:nowrap; }
       main { width:100%; min-width:0; padding-left:1rem; padding-right:1rem; overflow-wrap:anywhere; }
       .hero { width:100%; min-width:0; padding:1.5rem; overflow-wrap:anywhere; }
       h1 { font-size:clamp(2rem, 11vw, 3rem); }
@@ -45,7 +58,7 @@
   </style>
 </head>
 <body>
-<nav><div class="inner"><a href="./"><strong>Ferrosa <span style="color:var(--accent)">Memory</span></strong></a><div class="links"><a href="../database/">Database</a><a href="./">Memory overview</a><a href="#quickstart">Quickstart</a><a href="#examples">Examples</a><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></div></div></nav>
+<nav><div class="inner"><a href="./"><strong>Ferrosa <span style="color:var(--accent)">Memory</span></strong></a><div class="links" id="site-nav-links"><a href="../database/">Database</a><a href="./">Memory overview</a><a href="#quickstart">Quickstart</a><a href="#examples">Examples</a><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></div><a href="#quickstart" class="nav-cta">Get Started</a><button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav-links"><span></span></button></div></nav>
 <main>
   <section class="hero">
     <span class="pill">Developer preview</span>
@@ -223,5 +236,24 @@ docker compose logs --tail=100 node1 node2 node3 ferrosa-memory-mcp</code></pre>
   </ul>
 </main>
 <footer>Ferrosa Suite · Developer preview · <a href="./">Memory overview</a></footer>
+
+<script>
+  document.querySelectorAll('nav').forEach((nav) => {
+    const toggle = nav.querySelector('.nav-toggle');
+    if (!toggle) return;
+    toggle.addEventListener('click', () => {
+      const open = nav.classList.toggle('open');
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+    });
+    nav.querySelectorAll('.links a').forEach((link) => {
+      link.addEventListener('click', () => {
+        nav.classList.remove('open');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-label', 'Open navigation');
+      });
+    });
+  });
+</script>
 </body>
 </html>
