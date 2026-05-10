@@ -28,6 +28,40 @@ endurance --hours 24` once budget is approved.
 
 ## Per–work-item log
 
+### W8.2 — `MembershipChanger::add_learner_only` — DONE
+
+- RED: `add_learner_only_does_not_make_voter` in
+  `ferrosa-cluster/tests/learner_lifecycle.rs` asserts the learner lands as
+  `NodeState::Learner` in `state.members`, openraft sees it as a learner (not a
+  voter), and the voter set size is unchanged.
+- GREEN: introduced `NodeJoinConfig { owns_tokens }` and the
+  `add_learner_only` method on `MembershipChanger`. Refactored peer-setup
+  into the shared `join_as_learner` + `submit_join_node` helpers consumed by
+  both `add_voter` and `add_learner_only`.
+- Gate: 4/4 learner-lifecycle integration tests + 710/710 cluster lib pass.
+  Clippy + fmt clean.
+
+### W8.3 — `promote_learner_to_voter` and `demote_voter_to_learner` — DONE
+
+- RED:
+  - `promote_learner_to_voter_preserves_log_position` — log index strictly
+    advances; openraft promotes to voter; `state.members[N].state == Normal`.
+  - `demote_voter_to_learner_preserves_application_state` — non-leader voter
+    is removed from the voter set, re-added as a learner, and
+    `state.members[N].state` becomes `Learner { .. }`.
+  - `demote_voter_to_learner_transfers_leader_first_if_needed` — when the
+    target is the current leader, the changer transfers leadership and
+    returns `MembershipError::NotLeader`.
+- GREEN: `promote_learner_to_voter` issues
+  `change_membership(AddVoterIds)` followed by `RaftOp::SetNodeState =
+  Normal`. `demote_voter_to_learner` performs leader-self transfer (mirrors
+  W4.14), then `change_membership(RemoveVoters)` + `add_learner` +
+  `RaftOp::SetNodeState = Learner`.
+- Helper added to the harness: `current_leader_id()` and
+  `raft_for_node_id()` so tests can chase leadership into freshly-added
+  voters without panicking.
+- Gate: 4/4 learner-lifecycle integration tests pass; clippy + fmt clean.
+
 ### W8.1 — `NodeState::Learner` lifecycle variant — DONE
 
 - RED: `node_state_learner_distinct_from_voter` in `ferrosa-cluster/src/ring/mod.rs`

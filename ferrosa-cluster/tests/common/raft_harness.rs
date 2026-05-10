@@ -669,6 +669,36 @@ impl TestCluster {
             .expect("leader node_id missing from cluster")
     }
 
+    /// Return the leader's node_id without panicking if the leader
+    /// lives in `extra_nodes`. Returns `None` while no leader is
+    /// elected.
+    pub fn current_leader_id(&self) -> Option<u64> {
+        self.nodes
+            .iter()
+            .find_map(|n| n.raft.metrics().borrow().current_leader)
+            .or_else(|| {
+                self.extra_nodes
+                    .lock()
+                    .expect("extra_nodes lock")
+                    .iter()
+                    .find_map(|n| n.raft.metrics().borrow().current_leader)
+            })
+    }
+
+    /// Get the `Arc<FerrosRaft>` for an arbitrary node_id, searching
+    /// both bootstrap and extra nodes. Useful when leadership has
+    /// moved to a newly-added voter (W8.3).
+    pub fn raft_for_node_id(&self, node_id: u64) -> Option<Arc<FerrosRaft>> {
+        if let Some(n) = self.nodes.iter().find(|n| n.node_id == node_id) {
+            return Some(n.raft.clone());
+        }
+        let extras = self.extra_nodes.lock().expect("extra_nodes lock");
+        extras
+            .iter()
+            .find(|n| n.node_id == node_id)
+            .map(|n| n.raft.clone())
+    }
+
     /// Issue a `client_write` on the current leader.
     pub async fn propose_on_leader(
         &self,

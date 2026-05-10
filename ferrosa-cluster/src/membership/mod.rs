@@ -49,6 +49,31 @@ use crate::raft::{
 use ferrosa_common::{AccordTimestamp, TxnId};
 
 // ---------------------------------------------------------------------------
+// NodeJoinConfig — knobs for `add_learner_only` (W8.2 / ADR-014).
+// ---------------------------------------------------------------------------
+
+/// Optional configuration for [`MembershipChanger::add_learner_only`].
+///
+/// `owns_tokens=true` (default) makes the learner participate in the
+/// ring (read replicas, repair) — appropriate for capacity expansion
+/// and DR replicas. `owns_tokens=false` keeps the learner as a
+/// state-machine-only follower — appropriate for analytics or future
+/// witness roles.
+///
+/// Construct with [`NodeJoinConfig::default`] for typical cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeJoinConfig {
+    /// Whether this learner owns ring tokens.
+    pub owns_tokens: bool,
+}
+
+impl Default for NodeJoinConfig {
+    fn default() -> Self {
+        Self { owns_tokens: true }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MembershipOp — typed payload carried by `Message::ClusterMembershipForward`.
 // ---------------------------------------------------------------------------
 
@@ -498,6 +523,246 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         Ok(())
     }
 
+    // ---------------------------------------------------------------
+    // Internal helper: shared peer-setup for add_voter / add_learner_only.
+    // ---------------------------------------------------------------
+
+    /// Step 1 + 2 of joining a node: register in the network factory
+    /// and call `raft.add_learner`. Used by both [`Self::add_voter`]
+    /// (which then promotes) and [`Self::add_learner_only`] (which
+    /// stops here).
+    async fn join_as_learner(
+        &self,
+        host_id: Uuid,
+        addr: SocketAddr,
+    ) -> Result<u64, MembershipError> {
+        let node_id = uuid_to_node_id(host_id);
+
+        // Network factory map. Idempotent insert.
+        self.network.register_node(node_id, host_id);
+
+        let basic = openraft::BasicNode {
+            addr: addr.to_string(),
+        };
+        retry_on_inprogress("add_learner", || async {
+            self.raft.add_learner(node_id, basic.clone(), true).await
+        })
+        .await?;
+
+        Ok(node_id)
+    }
+
+    /// Submit a `RaftOp::JoinNode(NodeInfo)` so every follower's
+    /// `state.members` reflects the new node. Returns the
+    /// `MembershipError::NotLeader` variant if forwarded.
+    async fn submit_join_node(&self, info: NodeInfo) -> Result<(), MembershipError> {
+        let cmd = RaftCommand {
+            op: RaftOp::JoinNode(info),
+            schema_version: Uuid::new_v4(),
+        };
+        match self.raft.client_write(cmd).await {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
+                Err(MembershipError::NotLeader {
+                    leader_node_id: fwd.leader_id,
+                })
+            }
+            Err(other) => Err(MembershipError::RaftError(format!(
+                "client_write(JoinNode): {other}"
+            ))),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // W8.2 / W8.3 — Learner lifecycle
+    // ---------------------------------------------------------------
+
+    /// W8.2 — Add a node as a long-lived learner. Idempotent.
+    ///
+    /// Steps (per ADR-014):
+    /// 1. register_node in the network factory (map 3).
+    /// 2. `raft.add_learner` — joins openraft consensus as a learner.
+    /// 3. `raft.client_write(RaftOp::JoinNode)` with `state =
+    ///    NodeState::Learner { owns_tokens }` — application metadata
+    ///    (map 1).
+    ///
+    /// Crucially this **omits** the `change_membership(AddVoters)` step
+    /// that [`Self::add_voter`] performs. Quorum size is therefore
+    /// unchanged; the new node receives `AppendEntries` and applies
+    /// log entries but never votes.
+    pub async fn add_learner_only(
+        &self,
+        host_id: Uuid,
+        addr: SocketAddr,
+        config: NodeJoinConfig,
+    ) -> Result<(), MembershipError> {
+        // Steps 1 + 2.
+        self.join_as_learner(host_id, addr).await?;
+
+        // Step 3 — application-level JoinNode with Learner state.
+        let info = NodeInfo {
+            host_id,
+            addr: addr.to_string(),
+            data_center: self.default_dc.clone(),
+            rack: self.default_rack.clone(),
+            state: NodeState::Learner {
+                owns_tokens: config.owns_tokens,
+            },
+            cql_broadcast: None,
+        };
+        self.submit_join_node(info).await?;
+
+        Ok(())
+    }
+
+    /// W8.3 — Promote an existing learner to a voter.
+    ///
+    /// Steps:
+    /// 1. `raft.change_membership(AddVoterIds)` — promotes in openraft
+    ///    (map 2). The learner's log was already replicated; this
+    ///    extends it forward, never rewinds it.
+    /// 2. `raft.client_write(RaftOp::SetNodeState { state: Normal })` —
+    ///    application metadata (map 1).
+    ///
+    /// Idempotent: re-promoting an already-voter is a NoOp (openraft
+    /// returns early).
+    pub async fn promote_learner_to_voter(&self, host_id: Uuid) -> Result<(), MembershipError> {
+        let node_id = uuid_to_node_id(host_id);
+
+        // Step 1 — promote via joint consensus.
+        let mut promote_set = std::collections::BTreeSet::new();
+        promote_set.insert(node_id);
+        retry_on_inprogress("change_membership(AddVoterIds)", || {
+            let promote_set = promote_set.clone();
+            async move {
+                self.raft
+                    .change_membership(ChangeMembers::AddVoterIds(promote_set), true)
+                    .await
+            }
+        })
+        .await?;
+
+        // Step 2 — flip application state to Normal.
+        let cmd = RaftCommand {
+            op: RaftOp::SetNodeState {
+                node_id,
+                state: NodeState::Normal,
+            },
+            schema_version: Uuid::new_v4(),
+        };
+        match self.raft.client_write(cmd).await {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
+                Err(MembershipError::NotLeader {
+                    leader_node_id: fwd.leader_id,
+                })
+            }
+            Err(other) => Err(MembershipError::RaftError(format!(
+                "client_write(SetNodeState=Normal): {other}"
+            ))),
+        }
+    }
+
+    /// W8.3 — Demote a voter back to a learner.
+    ///
+    /// Steps:
+    /// 1. If the target is the current leader, transfer leadership to
+    ///    another voter first (mirrors [`Self::remove_voter`]'s W4.14
+    ///    self-transfer).
+    /// 2. `raft.change_membership(RemoveVoters + AddLearners)` —
+    ///    drops from voter set, adds back as learner (map 2).
+    /// 3. `raft.client_write(RaftOp::SetNodeState { state: Learner
+    ///    { owns_tokens: true } })` — application metadata (map 1).
+    ///
+    /// `owns_tokens=true` is the conservative default: a freshly
+    /// demoted voter still has all the data and the ring should keep
+    /// using it. Operators wanting `owns_tokens=false` should call
+    /// `update_metadata` afterwards.
+    pub async fn demote_voter_to_learner(&self, host_id: Uuid) -> Result<(), MembershipError> {
+        let node_id = uuid_to_node_id(host_id);
+
+        // Step 1 — leader-self transfer if needed.
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.current_leader == Some(node_id) {
+            let target = pick_transfer_target(&metrics, node_id).ok_or_else(|| {
+                MembershipError::RaftError(
+                    "demote_voter_to_learner: no eligible voter for leadership transfer".into(),
+                )
+            })?;
+            self.raft
+                .trigger()
+                .transfer_to(target)
+                .await
+                .map_err(|e| MembershipError::RaftError(format!("transfer_to({target}): {e}")))?;
+            let deadline = std::time::Instant::now()
+                + Duration::from_millis(Self::LEADERSHIP_TRANSFER_OBSERVE_MS);
+            loop {
+                let m = self.raft.metrics().borrow().clone();
+                if m.current_leader.is_some() && m.current_leader != Some(node_id) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(MembershipError::RaftError(
+                        "leadership transfer dispatched but new leader not observed".into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Caller must re-issue the demote on the new leader.
+            return Err(MembershipError::NotLeader {
+                leader_node_id: self.raft.metrics().borrow().current_leader,
+            });
+        }
+
+        // Step 2 — joint-consensus swap.
+        let mut remove_set = std::collections::BTreeSet::new();
+        remove_set.insert(node_id);
+        retry_on_inprogress("change_membership(RemoveVoters)", || {
+            let remove_set = remove_set.clone();
+            async move {
+                self.raft
+                    .change_membership(ChangeMembers::RemoveVoters(remove_set), true)
+                    .await
+            }
+        })
+        .await?;
+
+        // Re-add as learner. openraft tracks learners and voters in the
+        // same node-map; the previous step removed it from voters,
+        // we re-introduce it as a learner via add_learner. This is a
+        // NoOp if openraft already considers it a learner.
+        let basic = metrics
+            .membership_config
+            .nodes()
+            .find(|(id, _)| **id == node_id)
+            .map(|(_, n)| n.clone())
+            .unwrap_or(openraft::BasicNode::default());
+        retry_on_inprogress("add_learner(demote)", || async {
+            self.raft.add_learner(node_id, basic.clone(), true).await
+        })
+        .await?;
+
+        // Step 3 — flip application state to Learner.
+        let cmd = RaftCommand {
+            op: RaftOp::SetNodeState {
+                node_id,
+                state: NodeState::Learner { owns_tokens: true },
+            },
+            schema_version: Uuid::new_v4(),
+        };
+        match self.raft.client_write(cmd).await {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
+                Err(MembershipError::NotLeader {
+                    leader_node_id: fwd.leader_id,
+                })
+            }
+            Err(other) => Err(MembershipError::RaftError(format!(
+                "client_write(SetNodeState=Learner): {other}"
+            ))),
+        }
+    }
+
     /// Add a node as a voter.  Idempotent.
     ///
     /// Steps (per ADR-013):
@@ -511,19 +776,8 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
     /// the same final state.  Concurrent callers retry on
     /// `ChangeMembershipError::InProgress` per the schedule above.
     pub async fn add_voter(&self, host_id: Uuid, addr: SocketAddr) -> Result<(), MembershipError> {
-        let node_id = uuid_to_node_id(host_id);
-
-        // Step 1 — network factory map.  Idempotent insert.
-        self.network.register_node(node_id, host_id);
-
-        // Step 2 — add as learner.
-        let basic = openraft::BasicNode {
-            addr: addr.to_string(),
-        };
-        retry_on_inprogress("add_learner", || async {
-            self.raft.add_learner(node_id, basic.clone(), true).await
-        })
-        .await?;
+        // Steps 1 + 2 — share with add_learner_only.
+        let node_id = self.join_as_learner(host_id, addr).await?;
 
         // Step 3 — promote to voter via joint consensus.
         let mut promote_set = std::collections::BTreeSet::new();
@@ -547,23 +801,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
             state: NodeState::Normal,
             cql_broadcast: None,
         };
-        let cmd = RaftCommand {
-            op: RaftOp::JoinNode(info),
-            schema_version: Uuid::new_v4(),
-        };
-        match self.raft.client_write(cmd).await {
-            Ok(_) => {}
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
-                return Err(MembershipError::NotLeader {
-                    leader_node_id: fwd.leader_id,
-                });
-            }
-            Err(other) => {
-                return Err(MembershipError::RaftError(format!(
-                    "client_write(JoinNode): {other}"
-                )));
-            }
-        }
+        self.submit_join_node(info).await?;
 
         // Step 5 — apply barrier handled by callers (test asserts).
         Ok(())
