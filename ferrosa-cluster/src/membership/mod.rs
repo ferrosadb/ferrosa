@@ -205,6 +205,26 @@ where
     Err(last_err.unwrap_or(MembershipError::InProgress))
 }
 
+/// Pick a deterministic target voter for `transfer_to` (W4.14).
+///
+/// Excludes `self_node_id` (the node being decommissioned).  Returns
+/// the lowest-numbered other voter from the current effective
+/// membership; deterministic for tests, harmless in production where
+/// any voter is fine.  Returns `None` when no other voter exists
+/// (e.g. single-node cluster trying to remove its sole member —
+/// callers must reject that earlier).
+pub(crate) fn pick_transfer_target(
+    metrics: &openraft::RaftMetrics<u64, openraft::BasicNode>,
+    self_node_id: u64,
+) -> Option<u64> {
+    metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .filter(|&id| id != self_node_id)
+        .min()
+}
+
 /// Phantom `MembershipNetwork` used solely so that the
 /// `MembershipChanger::INPROGRESS_BACKOFF` const can be referenced
 /// without picking a concrete `N`.  Never instantiated.
@@ -303,6 +323,13 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         self
     }
 
+    /// Maximum wall-clock to wait for the post-transfer new leader to
+    /// be observable in metrics (W4.14).  openraft's Trigger::transfer_to
+    /// returns once `current_leader` shifts; we pad the
+    /// `election_timeout_max` budget by 2× to absorb engine-tick
+    /// scheduling jitter on a slow CI host.
+    pub(crate) const LEADERSHIP_TRANSFER_OBSERVE_MS: u64 = 5_000;
+
     /// Backoff schedule for `InProgress` retries (W1.3).
     ///
     /// openraft serialises membership changes — a concurrent caller
@@ -392,19 +419,64 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
 
     /// Remove a node from the cluster.
     ///
-    /// Steps (per ADR-013):
-    /// 1. If the target IS the leader, return `TransferFirst` (Sprint 3).
+    /// Steps (per ADR-013, updated for Sprint 4 W4.14):
+    /// 1. If the target IS the current leader, transfer leadership to
+    ///    another voter via `raft.trigger().transfer_to(other)`,
+    ///    awaiting the new leader before proceeding.  No more
+    ///    `TransferFirst` punt onto the operator — the changer drives
+    ///    the transfer itself.
     /// 2. raft.change_membership(RemoveVoters) — drops from openraft (map 2).
     /// 3. raft.client_write(RaftOp::LeaveNode) — drops from state.members (map 1).
     /// 4. network_factory.unregister_node (map 3).
     pub async fn remove_voter(&self, host_id: Uuid) -> Result<(), MembershipError> {
         let node_id = uuid_to_node_id(host_id);
 
-        // Step 1 — leader-self check.  Read the current leader from
-        // metrics; if it's us and we are the leader, return TransferFirst.
+        // Step 1 — leader-self transfer (W4.14).
+        //
+        // If `node_id` is the current leader, transfer leadership to
+        // another voter before issuing change_membership.  This avoids
+        // the in-flight write window that produced
+        // S-07 (decommission of leader without transfer).  The choice
+        // of target is the lowest-numbered other voter — deterministic
+        // for tests, harmless in production where any voter is fine.
         let metrics = self.raft.metrics().borrow().clone();
         if metrics.current_leader == Some(node_id) {
-            return Err(MembershipError::TransferFirst);
+            let target = pick_transfer_target(&metrics, node_id).ok_or_else(|| {
+                MembershipError::RaftError(
+                    "decommission_leader_transfers_first: no eligible voter for leadership transfer"
+                        .into(),
+                )
+            })?;
+            self.raft
+                .trigger()
+                .transfer_to(target)
+                .await
+                .map_err(|e| MembershipError::RaftError(format!("transfer_to({target}): {e}")))?;
+
+            // Wait until our metrics show we are no longer leader.
+            // openraft updates the watch synchronously inside the engine
+            // step that processes TimeoutNow; we observe via current_leader.
+            let deadline = std::time::Instant::now()
+                + Duration::from_millis(Self::LEADERSHIP_TRANSFER_OBSERVE_MS);
+            loop {
+                let m = self.raft.metrics().borrow().clone();
+                if m.current_leader.is_some() && m.current_leader != Some(node_id) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(MembershipError::RaftError(
+                        "leadership transfer dispatched but new leader not observed".into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // After transfer the local node is a follower and Steps
+            // 2-4 below will surface ForwardToLeader.  Caller drives
+            // the forward via Message::ClusterMembershipForward as
+            // for any non-leader change.
+            return Err(MembershipError::NotLeader {
+                leader_node_id: self.raft.metrics().borrow().current_leader,
+            });
         }
 
         // Step 2 — drop from openraft.

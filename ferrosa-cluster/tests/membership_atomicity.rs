@@ -342,14 +342,26 @@ async fn remove_voter_clears_all_four_maps() {
         .members
         .contains_key(&new_node_id));
 
-    // Now remove.  If it would target the leader, we expect TransferFirst.
+    // Now remove.  Two outcomes are valid post-W4.14 (Sprint 4):
+    //   - Target is not the leader: removal completes inline (`Ok(())`).
+    //   - Target IS the leader: the changer auto-transfers leadership
+    //     (W4.14) and surfaces `NotLeader { Some(new_leader) }` so the
+    //     caller can forward the LeaveNode through
+    //     `Message::ClusterMembershipForward`.
     let leader_id = cluster.leader_node().node_id;
     let result = changer.remove_voter(new_host_id).await;
     if leader_id == new_node_id {
-        assert!(
-            matches!(result, Err(MembershipError::TransferFirst)),
-            "leader-self decommission should return TransferFirst, got {result:?}",
-        );
+        match result {
+            Err(MembershipError::NotLeader {
+                leader_node_id: Some(new),
+            }) => assert_ne!(
+                new, new_node_id,
+                "auto-transfer moved leadership off target"
+            ),
+            other => {
+                panic!("post-W4.14 leader-self decommission expected NotLeader, got {other:?}")
+            }
+        }
     } else {
         result.expect("remove_voter should succeed for non-leader target");
     }

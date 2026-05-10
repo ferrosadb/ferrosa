@@ -45,7 +45,7 @@ use openraft::error::{ClientWriteError, NetworkError, RPCError, RaftError, Unrea
 use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    InstallSnapshotResponse, TimeoutNowRequest, TimeoutNowResponse, VoteRequest, VoteResponse,
 };
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
 use openraft::{
@@ -77,6 +77,13 @@ enum RpcEnvelope {
     InstallSnapshot {
         rpc: InstallSnapshotRequest<FerrosRaftConfig>,
         reply: oneshot::Sender<InstallSnapshotResponse<u64>>,
+    },
+    /// W4.14 — leadership transfer directive.  The follower's
+    /// dispatcher invokes `Raft::timeout_now`, which advances its
+    /// term and starts a regular election (skipping PreVote).
+    TimeoutNow {
+        rpc: TimeoutNowRequest<u64>,
+        reply: oneshot::Sender<TimeoutNowResponse<u64>>,
     },
 }
 
@@ -265,6 +272,30 @@ impl RaftNetwork<FerrosRaftConfig> for InProcessNetwork {
             .map_err(|_| self.unreachable("receiver dropped"))?;
         rx.await
             .map_err(|_| RPCError::Network(NetworkError::new(&ChannelClosed("vote reply"))))
+    }
+
+    /// W4.14 — leadership-transfer directive.  Routes through the
+    /// shared NodeRegistry so the target's dispatcher can invoke
+    /// `Raft::timeout_now`.
+    async fn timeout_now(
+        &mut self,
+        rpc: TimeoutNowRequest<u64>,
+        _option: RPCOption,
+    ) -> Result<TimeoutNowResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        if self.registry.is_partitioned(self.self_node_id, self.target) {
+            return Err(self.unreachable("partition"));
+        }
+        let sender = self
+            .registry
+            .sender(self.target)
+            .ok_or_else(|| self.unreachable("no registered receiver"))?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(RpcEnvelope::TimeoutNow { rpc, reply: tx })
+            .await
+            .map_err(|_| self.unreachable("receiver dropped"))?;
+        rx.await
+            .map_err(|_| RPCError::Network(NetworkError::new(&ChannelClosed("timeout_now reply"))))
     }
 }
 
@@ -754,6 +785,14 @@ async fn build_test_node(
                             }
                         }
                     }
+                    RpcEnvelope::TimeoutNow { rpc, reply } => match raft.timeout_now(rpc).await {
+                        Ok(resp) => {
+                            let _ = reply.send(resp);
+                        }
+                        Err(e) => {
+                            tracing::debug!(%e, "harness: timeout_now handler error");
+                        }
+                    },
                 }
             });
         }
