@@ -724,6 +724,17 @@ pub struct RangeReadRequestPayload {
     pub keyspace: String,
     /// Table name.
     pub table: String,
+    /// Maximum partitions to return from this node.
+    #[serde(default = "default_range_read_limit")]
+    pub limit: usize,
+    /// Maximum rows to include from each returned partition.
+    /// 0 means unlimited (backwards-compatible default).
+    #[serde(default)]
+    pub row_limit: usize,
+}
+
+fn default_range_read_limit() -> usize {
+    crate::write_path::DEFAULT_RANGE_READ_LIMIT
 }
 
 /// Payload for a remote range-read response.
@@ -769,7 +780,17 @@ impl RpcHandler for RangeReadHandler {
 
         let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
 
-        let partitions = match self.storage.read_range(&table_id, None, None, 1_000_000) {
+        let range_read_limit = req
+            .limit
+            .clamp(1, crate::write_path::DEFAULT_RANGE_READ_LIMIT);
+        let row_limit = req.row_limit;
+        let partitions = match self.storage.read_range_limited_rows(
+            &table_id,
+            None,
+            None,
+            range_read_limit,
+            row_limit,
+        ) {
             Ok(ps) => ps,
             Err(e) => {
                 tracing::warn!("RangeReadHandler: read_range failed: {e}");
@@ -780,7 +801,7 @@ impl RpcHandler for RangeReadHandler {
             }
         };
 
-        let truncated = partitions.len() >= 1_000_000;
+        let truncated = partitions.len() >= range_read_limit;
         let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
         let payload = RangeReadResponsePayload {
             partitions: wire_partitions,

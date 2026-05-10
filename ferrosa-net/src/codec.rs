@@ -127,6 +127,9 @@ pub enum MsgType {
     // Bootstrap coordination
     BootstrapComplete = 0x80,
     BootstrapCompleteAck = 0x81,
+    // Cluster-mode Raft proposal forwarding (non-leader → leader).
+    ClusterRaftForward = 0x82,
+    ClusterRaftForwardAck = 0x83,
 }
 
 impl MsgType {
@@ -203,6 +206,8 @@ impl TryFrom<u8> for MsgType {
             0x7A => Ok(Self::AccordRecoverOK),
             0x80 => Ok(Self::BootstrapComplete),
             0x81 => Ok(Self::BootstrapCompleteAck),
+            0x82 => Ok(Self::ClusterRaftForward),
+            0x83 => Ok(Self::ClusterRaftForwardAck),
             _ => Err(NetError::UnknownMessageType(value)),
         }
     }

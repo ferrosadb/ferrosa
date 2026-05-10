@@ -109,6 +109,17 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     ///
     /// Returns `Ok(None)` when the reader has reached EOF.
     pub fn read_partition(&mut self) -> Result<Option<Partition>> {
+        self.read_partition_limited_rows(0)
+    }
+
+    /// Read the next partition, retaining at most `row_limit` clustered rows.
+    ///
+    /// A `row_limit` of 0 means unlimited.  When a positive limit is reached,
+    /// remaining rows are skipped using the encoded row-body size instead of
+    /// being fully decoded and materialized.  This keeps range scans with
+    /// per-partition row caps bounded even when individual partitions contain
+    /// many rows.
+    pub fn read_partition_limited_rows(&mut self, row_limit: usize) -> Result<Option<Partition>> {
         let file_len = self.reader.len()?;
         if self.pos >= file_len {
             return Ok(None);
@@ -117,7 +128,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let (key_bytes, deletion) = self.read_partition_header()?;
         let key = DecoratedKey::new(PartitionKey::new(key_bytes));
 
-        let (static_row, rows) = self.read_rows()?;
+        let (static_row, rows) = self.read_rows_limited(row_limit)?;
 
         Ok(Some(Partition {
             key,
@@ -192,8 +203,9 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     // Internal: row reading
     // -----------------------------------------------------------------------
 
-    /// Read all rows (and optionally a static row) until `END_OF_PARTITION`.
-    fn read_rows(&mut self) -> Result<(Option<Row>, Vec<Row>)> {
+    /// Read rows until `END_OF_PARTITION`, retaining at most `row_limit`
+    /// clustered rows while still advancing to the next partition boundary.
+    fn read_rows_limited(&mut self, row_limit: usize) -> Result<(Option<Row>, Vec<Row>)> {
         let mut static_row = None;
         let mut rows = Vec::new();
 
@@ -230,6 +242,11 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             };
 
             let is_static = extended_flags & EXT_IS_STATIC != 0;
+            if !is_static && row_limit > 0 && rows.len() >= row_limit {
+                self.skip_row_body(flags, is_static)?;
+                continue;
+            }
+
             let row = self.read_row(flags, is_static)?;
 
             if is_static {
@@ -240,6 +257,42 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         }
 
         Ok((static_row, rows))
+    }
+
+    /// Skip a row after its flags and extended flags have already been consumed.
+    fn skip_row_body(&mut self, _flags: u8, is_static: bool) -> Result<()> {
+        if !is_static {
+            let num_clustering = self.header.clustering_types.len();
+            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+
+            for i in 0..num_clustering {
+                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+
+                if is_null || is_empty {
+                    continue;
+                }
+
+                let type_name = &self.header.clustering_types[i];
+                let vlen = match marshal::value_length_if_fixed(type_name) {
+                    Some(fixed_len) => fixed_len,
+                    None => {
+                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                        self.pos += n as u64;
+                        len as usize
+                    }
+                };
+                self.pos += vlen as u64;
+            }
+        }
+
+        let (row_body_len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        let (_prev_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        self.pos += row_body_len;
+        Ok(())
     }
 
     /// Read a single row given its already-consumed flags byte.

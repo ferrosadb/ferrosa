@@ -19,6 +19,10 @@ use crate::coordinator::ClusterCoordinator;
 use crate::pair::coordinator::PairCoordinator;
 use crate::ring::strategy::ReplicationStrategy;
 
+/// Default upper bound for unordered range reads when the caller does not
+/// provide a tighter page/limit bound.
+pub const DEFAULT_RANGE_READ_LIMIT: usize = 10_000;
+
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
 ///
@@ -174,15 +178,48 @@ impl WritePath {
     /// empty results on failure causes data loss (see BUG: large-write-causes-
     /// data-loss-in-partition).
     pub async fn range_read(&self, table_id: &TableId) -> crate::error::Result<Vec<Partition>> {
+        self.range_read_limited(table_id, DEFAULT_RANGE_READ_LIMIT)
+            .await
+    }
+
+    /// Read up to `limit` partitions for unordered full-scan consumers.
+    ///
+    /// This lets CQL `LIMIT` and protocol page-size produce the first page
+    /// promptly instead of materializing the full default scan window before
+    /// applying row-level bounds. The hard cap remains
+    /// `DEFAULT_RANGE_READ_LIMIT`; callers cannot request more through this API.
+    pub async fn range_read_limited(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+    ) -> crate::error::Result<Vec<Partition>> {
+        self.range_read_limited_rows(table_id, limit, 0).await
+    }
+
+    /// Read up to `limit` partitions and, when `row_limit > 0`, include at most
+    /// `row_limit` rows from each returned partition. The row cap is intended
+    /// for safe query shapes where predicates are partition-key-only and any row
+    /// from a matching partition satisfies the filter.
+    pub async fn range_read_limited_rows(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+        row_limit: usize,
+    ) -> crate::error::Result<Vec<Partition>> {
+        let limit = limit.clamp(1, DEFAULT_RANGE_READ_LIMIT);
         match self {
             Self::Direct(engine) => engine
-                .read_range(table_id, None, None, 1_000_000)
+                .read_range_limited_rows(table_id, None, None, limit, row_limit)
                 .map_err(crate::error::ClusterError::Storage),
             Self::Pair(coordinator) => coordinator
                 .local_storage()
-                .read_range(table_id, None, None, 1_000_000)
+                .read_range_limited_rows(table_id, None, None, limit, row_limit)
                 .map_err(crate::error::ClusterError::Storage),
-            Self::Cluster(coordinator) => coordinator.coordinate_range_read(table_id).await,
+            Self::Cluster(coordinator) => {
+                coordinator
+                    .coordinate_range_read_limited_rows(table_id, limit, row_limit)
+                    .await
+            }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "range read unavailable: write path is in degraded mode".into(),
             )),
@@ -319,6 +356,11 @@ mod tests {
 
     #[tokio::test]
     async fn direct_write_path_delegates_to_storage() {
+        assert_eq!(
+            DEFAULT_RANGE_READ_LIMIT, 10_000,
+            "cluster range reads must not use the historical 1M materialization window"
+        );
+
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
 

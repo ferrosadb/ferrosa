@@ -193,6 +193,21 @@ pub enum Message {
     },
     /// Leader acknowledges receipt of BootstrapComplete.
     BootstrapCompleteAck,
+
+    // Cluster-mode Raft proposal forwarding
+    /// Forward a serialized [`crate`] `RaftCommand` to the current Raft leader.
+    ///
+    /// Used by non-leader nodes that detect openraft's `ForwardToLeader`
+    /// hint when their local `client_write` is rejected.  The leader
+    /// applies the proposal locally and returns a [`Self::ClusterRaftForwardAck`].
+    ///
+    /// Payload: bincode-serialized `RaftCommand` (interpreted by ferrosa-cluster).
+    ClusterRaftForward(Bytes),
+    /// Acknowledgment for a [`Self::ClusterRaftForward`].
+    ///
+    /// Payload: bincode-serialized status enum (interpreted by ferrosa-cluster);
+    /// empty bytes indicates success on older receivers.
+    ClusterRaftForwardAck(Bytes),
 }
 
 impl Message {
@@ -254,6 +269,8 @@ impl Message {
             Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
             Self::BootstrapComplete { .. } => MsgType::BootstrapComplete,
             Self::BootstrapCompleteAck => MsgType::BootstrapCompleteAck,
+            Self::ClusterRaftForward(_) => MsgType::ClusterRaftForward,
+            Self::ClusterRaftForwardAck(_) => MsgType::ClusterRaftForwardAck,
         }
     }
 
@@ -398,7 +415,9 @@ impl Message {
             | Self::AccordApply(b)
             | Self::AccordApplyOK(b)
             | Self::AccordRecover(b)
-            | Self::AccordRecoverOK(b) => buf.put_slice(b),
+            | Self::AccordRecoverOK(b)
+            | Self::ClusterRaftForward(b)
+            | Self::ClusterRaftForwardAck(b) => buf.put_slice(b),
             Self::BootstrapComplete { node_id } => buf.put_slice(node_id.as_bytes()),
             Self::BootstrapCompleteAck => {} // no payload
         }
@@ -606,6 +625,12 @@ impl Message {
                 }
             }
             MsgType::BootstrapCompleteAck => Self::BootstrapCompleteAck,
+            MsgType::ClusterRaftForward => {
+                Self::ClusterRaftForward(body.split_to(body.remaining()))
+            }
+            MsgType::ClusterRaftForwardAck => {
+                Self::ClusterRaftForwardAck(body.split_to(body.remaining()))
+            }
         })
     }
 }
@@ -855,6 +880,42 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::IndexBuildComplete, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, Message::IndexBuildComplete(payload));
+    }
+
+    #[test]
+    fn cluster_raft_forward_roundtrip() {
+        let payload = Bytes::from_static(b"serialized-raft-command");
+        let msg = Message::ClusterRaftForward(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::ClusterRaftForward);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::ClusterRaftForward, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::ClusterRaftForward(payload));
+    }
+
+    #[test]
+    fn cluster_raft_forward_ack_roundtrip() {
+        let payload = Bytes::from_static(b"forward-ack");
+        let msg = Message::ClusterRaftForwardAck(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::ClusterRaftForwardAck);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::ClusterRaftForwardAck, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::ClusterRaftForwardAck(payload));
+    }
+
+    #[test]
+    fn cluster_raft_forward_msg_types_from_u8() {
+        assert_eq!(
+            MsgType::try_from(0x82).unwrap(),
+            MsgType::ClusterRaftForward
+        );
+        assert_eq!(
+            MsgType::try_from(0x83).unwrap(),
+            MsgType::ClusterRaftForwardAck
+        );
     }
 
     #[test]
