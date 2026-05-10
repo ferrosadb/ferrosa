@@ -1,6 +1,8 @@
 pub mod bank;
 pub mod forward_probe;
+pub mod late_join_flood;
 pub mod lwt;
+pub mod membership_churn;
 pub mod register;
 
 use std::time::Duration;
@@ -86,6 +88,10 @@ impl WorkloadRegistry {
         // Sprint 2 workloads — exercise the membership / forwarding bug
         // classes the structural-invariant checker is designed to catch.
         reg.register(Box::new(forward_probe::ForwardProbeWorkload));
+        reg.register(Box::new(
+            membership_churn::MembershipChurnWorkload::default(),
+        ));
+        reg.register(Box::new(late_join_flood::LateJoinFloodWorkload::default()));
         reg
     }
 }
@@ -183,13 +189,16 @@ mod tests {
     #[test]
     fn workload_registry_phase1() {
         let reg = WorkloadRegistry::phase1();
-        // register + bank + 16 LWT + Sprint 2 workloads (forward-probe).
-        assert_eq!(reg.names().len(), 19);
+        // register + bank + 16 LWT + Sprint 2 workloads
+        // (forward-probe, membership-churn, late-join-flood).
+        assert_eq!(reg.names().len(), 21);
         assert!(reg.get("register").is_some());
         assert!(reg.get("bank").is_some());
         assert!(reg.get("lwt-1-insert-if-not-exists").is_some());
         assert!(reg.get("lwt-16-multi-statement").is_some());
         assert!(reg.get("forward-probe").is_some());
+        assert!(reg.get("membership-churn").is_some());
+        assert!(reg.get("late-join-flood").is_some());
     }
 
     #[tokio::test]
