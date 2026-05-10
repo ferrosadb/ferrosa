@@ -9,6 +9,7 @@ pub mod election_guard;
 pub mod group_id;
 pub mod handlers;
 pub mod log_store;
+pub mod multi_dc_apply;
 pub mod network;
 pub mod snapshot_pusher;
 pub mod snapshot_transport;
@@ -21,7 +22,7 @@ use std::io::Cursor;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use ferrosa_common::CqlType;
+use ferrosa_common::{AccordTimestamp, CqlType, TxnId};
 use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
 use ferrosa_schema::metadata::function::UserFunctionMetadata;
 use ferrosa_schema::metadata::index::IndexMetadata;
@@ -228,6 +229,27 @@ pub enum RaftOp {
     SetNodeState {
         node_id: u64,
         state: NodeState,
+    },
+
+    // ---- Multi-DC Accord (Sprint 7) -------------------------------------
+    /// Cross-DC mutation routed via Accord (CEP-15) and committed
+    /// through this DC's Raft log. Carries the Accord transaction
+    /// identifier (`txn_id`) for idempotent apply (I-28) and the HLC
+    /// timestamp (`hlc`) used by the reorder buffer (I-27) to apply
+    /// cross-DC mutations in timestamp order.
+    ///
+    /// `mutation` is an opaque payload owned by the cross-DC adapter;
+    /// the state-machine layer treats it as bytes today and dispatches
+    /// to higher layers in later sprints.
+    ///
+    /// See `specs/decisions/015-multi-dc-raft-per-dc-accord.md`.
+    AccordApply {
+        /// Accord transaction id (dedupe key).
+        txn_id: TxnId,
+        /// HLC timestamp under which the apply must take effect.
+        hlc: AccordTimestamp,
+        /// Opaque mutation payload — interpreted by higher layers.
+        mutation: Vec<u8>,
     },
 }
 

@@ -22,7 +22,17 @@ use std::time::SystemTime;
 /// `epoch > time > seq > node`, which is the correct priority order for
 /// Accord's consistency guarantees.
 #[derive(
-    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[repr(C)]
 pub struct Timestamp {

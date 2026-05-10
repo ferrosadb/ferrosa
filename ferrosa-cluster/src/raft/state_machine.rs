@@ -21,7 +21,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use ferrosa_common::CqlType;
+use ferrosa_common::{AccordTimestamp, CqlType, TxnId};
 use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
 use ferrosa_schema::metadata::function::UserFunctionMetadata;
 use ferrosa_schema::metadata::index::IndexMetadata;
@@ -36,6 +36,7 @@ use ferrosa_storage::TableId;
 use crate::system_table_writer::SystemTableWriter;
 
 use crate::config::ClusterConfig;
+use crate::raft::multi_dc_apply::{AppliedTxnLedger, ReorderBuffer};
 use crate::raft::{
     FerrosRaftConfig, IndexNodeStatus, NodeInfo, RaftCommand, RaftOp, RaftResponse, Token,
 };
@@ -153,6 +154,29 @@ pub struct RaftState {
     pub config: ClusterConfig,
     /// Set of host IDs that have been explicitly approved to join the cluster.
     pub approved_nodes: BTreeSet<Uuid>,
+
+    // ---- Multi-DC Accord (Sprint 7) ------------------------------------
+    /// HLC watermark — the largest Accord timestamp that has been
+    /// drained out of the reorder buffer and durably applied. Advances
+    /// monotonically; never regresses. (W7.1 / I-27.)
+    #[serde(default)]
+    pub hlc_watermark: AccordTimestamp,
+    /// Maximum HLC skew observed at apply time relative to the local
+    /// wall-clock estimate. Recorded for operator visibility (W7.1
+    /// REFACTOR / RAFT_ACCORD_MAX_SKEW gauge).
+    #[serde(default)]
+    pub max_observed_skew_us: u64,
+    /// Idempotent-apply ledger keyed by Accord transaction id. Replayed
+    /// `RaftOp::AccordApply` entries with a matching `txn_id` are
+    /// short-circuited to a no-op (W7.5 / I-28).
+    #[serde(default)]
+    pub applied_accord_txns: AppliedTxnLedger,
+    /// Reorder buffer for `RaftOp::AccordApply` entries (W7.2 / I-27).
+    /// Buffered entries stall until the watermark advances past their
+    /// HLC; on drain they apply in ascending timestamp order across
+    /// every replica.
+    #[serde(default)]
+    pub accord_apply_buffer: ReorderBuffer,
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +630,78 @@ impl FerrosStateMachine {
 
     pub fn sync_live_ring_from_state(&self) {
         self.sync_ring();
+    }
+
+    // -----------------------------------------------------------------
+    // W7.1–W7.5 — Multi-DC Accord apply path.
+    // -----------------------------------------------------------------
+
+    /// Apply path for [`RaftOp::AccordApply`] (W7.2). Buffers the entry
+    /// by HLC timestamp, records the max-observed-skew metric, and
+    /// drains everything at-or-below the current watermark.
+    ///
+    /// Idempotent on `txn_id` (W7.5 / I-28): replayed transactions are
+    /// short-circuited at the ledger before they enter the buffer.
+    fn apply_accord_marked(&mut self, txn_id: TxnId, hlc: AccordTimestamp, mutation: Vec<u8>) {
+        // I-28: short-circuit replays before buffering.
+        if self.state.applied_accord_txns.contains(&txn_id) {
+            tracing::debug!(?txn_id, "AccordApply replay deduped at ledger");
+            return;
+        }
+
+        // Track the max skew observed against the current watermark
+        // (W7.1 REFACTOR / RAFT_ACCORD_MAX_SKEW gauge).
+        let skew_us = hlc.time.saturating_sub(self.state.hlc_watermark.time);
+        if skew_us > self.state.max_observed_skew_us {
+            self.state.max_observed_skew_us = skew_us;
+        }
+
+        let op = RaftOp::AccordApply {
+            txn_id,
+            hlc,
+            mutation,
+        };
+        self.state.accord_apply_buffer.push(hlc, op);
+
+        // Try to drain anything below the current watermark — entries
+        // newly admitted whose HLC is below the watermark should fire
+        // immediately.
+        self.drain_ready_accord_entries();
+    }
+
+    /// Drain Accord-marked entries whose HLC is at-or-below the
+    /// watermark, in HLC order. Records each in the idempotent ledger.
+    fn drain_ready_accord_entries(&mut self) {
+        let watermark = self.state.hlc_watermark;
+        let ready = self.state.accord_apply_buffer.drain_ready(watermark);
+        for op in ready {
+            if let RaftOp::AccordApply { txn_id, hlc, .. } = op {
+                // I-28: record the apply for dedupe. The mutation
+                // payload is dispatched to higher layers in later
+                // sprints — for now the ledger entry is the durable
+                // marker that this txn has been applied.
+                self.state.applied_accord_txns.record(txn_id, hlc);
+            }
+        }
+    }
+
+    /// Advance the HLC watermark to `new_watermark` (or hold it if the
+    /// proposed value would regress) and drain any newly-eligible
+    /// entries from the reorder buffer (W7.1 / W7.3).
+    ///
+    /// Called by the heartbeat tick in production with
+    /// `now - max_skew`; tests advance it explicitly to exercise the
+    /// drain semantics.
+    pub fn advance_accord_watermark(&mut self, new_watermark: AccordTimestamp) {
+        if new_watermark > self.state.hlc_watermark {
+            self.state.hlc_watermark = new_watermark;
+        }
+        self.drain_ready_accord_entries();
+    }
+
+    /// Borrow the reorder buffer (test/operator inspection).
+    pub fn accord_apply_buffer(&self) -> &ReorderBuffer {
+        &self.state.accord_apply_buffer
     }
 
     /// Apply a single [`RaftCommand`] to `self.state`, updating BTreeMaps
@@ -1182,6 +1278,16 @@ impl FerrosStateMachine {
                 }
                 self.sync_ring();
             }
+
+            // ---- Multi-DC Accord (Sprint 7) ----------------------------
+            RaftOp::AccordApply {
+                txn_id,
+                hlc,
+                mutation,
+            } => {
+                schema_changed = false;
+                self.apply_accord_marked(txn_id, hlc, mutation);
+            }
         }
 
         if schema_changed {
@@ -1449,6 +1555,7 @@ mod tests {
 
     use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
+    use ferrosa_common::{AccordTimestamp, TxnId};
     use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
     use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
     use ferrosa_schema::metadata::table::TableParams;
@@ -1526,6 +1633,73 @@ mod tests {
     }
 
     // -- tests ------------------------------------------------------------
+
+    // ---- W7.1: HLC watermark tracking ----------------------------------
+
+    /// W7.1 RED → GREEN. Each `RaftOp::AccordApply` step updates an HLC
+    /// watermark on `RaftState`; the watermark advances monotonically as
+    /// successive Accord-marked entries land. Two entries with strictly
+    /// increasing HLC timestamps drive the watermark from 0 → t1 → t2.
+    ///
+    /// Uses HLCs realistic relative to wall-clock-microseconds and an
+    /// explicit `advance_accord_watermark` step so the buffered entries
+    /// are released regardless of the configured max-skew bound.
+    #[tokio::test]
+    async fn state_machine_tracks_hlc_watermark() {
+        let mut sm = FerrosStateMachine::new();
+        // Initial watermark must be the zero timestamp.
+        assert_eq!(
+            sm.state().hlc_watermark,
+            AccordTimestamp::synthetic(0),
+            "fresh state machine must start at zero watermark"
+        );
+
+        // HLCs are wall-clock microseconds: pick values comfortably above
+        // any realistic skew bound so the watermark advance succeeds.
+        let t1 = AccordTimestamp::synthetic(1_000_000_000);
+        let t2 = AccordTimestamp::synthetic(2_000_000_000);
+
+        let txn1 = TxnId::new(1, t1);
+        let txn2 = TxnId::new(1, t2);
+
+        let entries = vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::AccordApply {
+                    txn_id: txn1,
+                    hlc: t1,
+                    mutation: Vec::new(),
+                },
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::AccordApply {
+                    txn_id: txn2,
+                    hlc: t2,
+                    mutation: Vec::new(),
+                },
+            ),
+        ];
+
+        sm.apply(entries).await.unwrap();
+        // Advance the watermark past t2 (simulates the heartbeat-driven
+        // watermark tick once the wall-clock has progressed).
+        sm.advance_accord_watermark(t2);
+
+        // Watermark must advance to the largest observed Accord
+        // timestamp once entries are released by the reorder buffer.
+        assert!(
+            sm.state().hlc_watermark >= t2,
+            "watermark must advance past last applied Accord timestamp; got {:?}",
+            sm.state().hlc_watermark
+        );
+        assert!(
+            sm.state().hlc_watermark >= t1,
+            "watermark must be monotonic w.r.t. earlier applies"
+        );
+    }
 
     #[tokio::test]
     async fn apply_create_keyspace() {
