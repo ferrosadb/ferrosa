@@ -123,6 +123,7 @@ sequenceDiagram
 **Invariant violated.** None if successful. I-22 (purge does not block heartbeats) at risk during snapshot install if the snapshot is large.
 **Detection.** `jepsen` — `wipe-and-rejoin` workload from `tests/raft_election_storm.rs`. `runtime` — `INSTALLSNAPSHOT_PUSHES_TOTAL` per `snapshot_pusher`.
 **Mitigation.** Already implemented. Sprint 1 `loosen-follower-log-revert` audit confirms revert fires only here.
+**Sprint 4 retirement note (W4.12).** Sprint 1's `MembershipChanger` ensures every voter is registered atomically (the original P0-20 motivation: "voter not in replication map" is gone). Sprint 3's PreVote+CheckQuorum, combined with openraft's normal snapshot-on-log-inconsistency response, handles this scenario without the proactive `snapshot_pusher` sweep. The `snapshot_pusher` module is therefore scheduled for deletion under the bolt-on retirement gate (`controller/bootstrap/retirement_gate.rs`). Until the 2-week clean Jepsen window manifest lands, the pusher remains in place. Post-retirement detection rolls into openraft's intrinsic `RaftMetrics::snapshot` counters; the dedicated `INSTALLSNAPSHOT_PUSHES_TOTAL` metric is retired alongside.
 
 ### S-05: Approval check disagrees between leader and follower (`auto_join=false`)
 
@@ -414,6 +415,7 @@ sequenceDiagram
 **Sequence.** Suppression in effect; AppendEntries can still arrive (just no new elections); incoming votes dropped via the guard. After 60s, normal election attempts resume.
 **Outcome.** Storm subsides.
 **Invariant violated.** None.
+**Sprint 4 retirement note (W4.11).** With Sprint 3's PreVote enabled, term inflation cannot occur in the steady-state path that motivated S-30; the election guard is therefore scheduled for deletion under the bolt-on retirement gate (`controller/bootstrap/retirement_gate.rs`). Until the 2-week clean Jepsen window manifest lands at `specs/in-process/sprint-04-jepsen-window.json`, the guard remains in place. Post-retirement: this scenario becomes "openraft's PreVote loop converges in O(1) round-trip; no separate suppression layer." Metric `ELECTION_STORM_TERM_JUMPS_TOTAL` stays exposed (zeroed) for one release for downstream dashboards.
 
 ### S-31: Two simultaneous elections
 

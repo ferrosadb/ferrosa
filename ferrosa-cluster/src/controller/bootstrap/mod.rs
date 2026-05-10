@@ -45,6 +45,7 @@ pub mod establish_pools;
 pub mod phase;
 pub mod promote;
 pub mod replay_schema;
+pub mod retirement_gate;
 pub mod util;
 pub mod wait_leader;
 
