@@ -11,6 +11,7 @@
 //!   4. Peer reconnects → auto re-pair, promoted node stays primary
 //!   5. Operator can `switchover()` to swap roles
 
+pub mod bootstrap;
 mod cluster;
 pub mod cluster_rejoin;
 mod membership;

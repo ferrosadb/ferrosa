@@ -23,5 +23,5 @@ ferrosa-cluster/src/controller/membership.rs:247 # decommission: LeaveNode — r
 ferrosa-cluster/src/controller/membership.rs:430 # cluster_member_metadata refresh — replace via MembershipChanger::update_metadata (Sprint 2)
 ferrosa-cluster/src/controller/membership.rs:517 # late-join JoinNode — Sprint 2
 ferrosa-cluster/src/controller/membership.rs:536 # late-join AssignTokens — Sprint 2
-ferrosa-cluster/src/controller/cluster.rs:409 # seed bootstrap: register_node for peers — Sprint 2 (transition_to_cluster rewrite)
-ferrosa-cluster/src/controller/cluster.rs:412 # seed bootstrap: register_node for self — Sprint 2 (transition_to_cluster rewrite)
+ferrosa-cluster/src/controller/cluster.rs:463 # seed bootstrap: register_node for peers — Sprint 4 (transition_to_cluster rewrite, retained pending bootstrap-phase decomposition)
+ferrosa-cluster/src/controller/cluster.rs:466 # seed bootstrap: register_node for self — Sprint 4 (transition_to_cluster rewrite, retained pending bootstrap-phase decomposition)
