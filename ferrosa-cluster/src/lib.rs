@@ -10,6 +10,7 @@ pub mod index_coordination;
 pub mod mode;
 pub mod pair;
 pub mod raft;
+pub mod raft_forward;
 pub mod rebalance;
 pub mod repair;
 pub mod ring;

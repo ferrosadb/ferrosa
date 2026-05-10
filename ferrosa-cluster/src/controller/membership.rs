@@ -331,6 +331,9 @@ impl ModeController {
         let local_host_id = self.local_host_id;
         let raft_runtime = self.raft_runtime.get().cloned();
         let data_runtime = self.data_runtime.get().cloned();
+        // Ring is needed for resolving the Raft leader's u64 NodeId back to a
+        // ferrosa Uuid when openraft asks us to forward a non-leader proposal.
+        let ring_holder = self.ring.clone();
 
         self.spawn_tracked(async move {
             if let Some(pm) = peer_manager.as_ref() {
@@ -423,19 +426,77 @@ impl ModeController {
                     }),
                     schema_version: Uuid::new_v4(),
                 };
-                let refresh_result = raft.client_write(refresh_cmd).await;
-                clear_pending_join(&pending_joins, host_id);
-                if let Err(e) = refresh_result {
-                    tracing::warn!(peer = %host_id, leader, %e, "UpdateNodeInfo proposal failed");
-                    return;
-                }
 
-                tracing::info!(
-                    peer = %host_id,
-                    node_id = peer_node_id,
-                    leader,
-                    "peer metadata refreshed via on_peer_connected"
-                );
+                let refresh_result = raft.client_write(refresh_cmd.clone()).await;
+                clear_pending_join(&pending_joins, host_id);
+
+                let outcome = match refresh_result {
+                    Ok(_) => Ok(()),
+                    Err(raft_err) => {
+                        Err(crate::raft_forward::classify_client_write_error(&raft_err))
+                    }
+                };
+                let was_local_ok = outcome.is_ok();
+
+                let dispatch_pm = peer_manager.clone();
+                let dispatch_ring = ring_holder.clone();
+                let dispatch_result = crate::raft_forward::dispatch_propose_outcome(
+                    outcome,
+                    refresh_cmd,
+                    move |leader_node_id| {
+                        (**dispatch_ring.load())
+                            .as_ref()
+                            .and_then(|ring| ring.get_node(leader_node_id).map(|n| n.host_id))
+                    },
+                    move |leader_uuid, cmd| {
+                        let pm = dispatch_pm.clone();
+                        async move {
+                            match pm.as_ref() {
+                                Some(pm) => {
+                                    crate::raft_forward::forward_raft_command_to_leader(
+                                        pm.as_ref(),
+                                        leader_uuid,
+                                        cmd,
+                                    )
+                                    .await
+                                }
+                                None => Err(crate::error::ClusterError::Internal(
+                                    "raft forward: peer_manager not set, cannot forward to leader"
+                                        .into(),
+                                )),
+                            }
+                        }
+                    },
+                )
+                .await;
+
+                match dispatch_result {
+                    Ok(()) => {
+                        if was_local_ok {
+                            tracing::info!(
+                                peer = %host_id,
+                                node_id = peer_node_id,
+                                leader,
+                                "peer metadata refreshed via on_peer_connected"
+                            );
+                        } else {
+                            tracing::info!(
+                                peer = %host_id,
+                                node_id = peer_node_id,
+                                leader,
+                                "peer metadata refresh forwarded to raft leader"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %host_id,
+                            leader,
+                            %e,
+                            "UpdateNodeInfo refresh did not converge — will retry on next reconnect"
+                        );
+                    }
+                }
                 return;
             }
 

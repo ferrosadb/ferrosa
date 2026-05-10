@@ -1192,6 +1192,21 @@ impl ModeController {
                     ));
                     registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
 
+                    // Register the cluster Raft-forward handler so that when a
+                    // non-leader hits ForwardToLeader on a membership refresh
+                    // (e.g. UpdateNodeInfo from on_peer_connected) it can
+                    // forward the proposal here and the leader proposes it
+                    // locally.  Without this the bug at membership.rs's
+                    // refresh path would silently drop the proposal and the
+                    // joining node's BasicNode addr stays empty forever.
+                    let cluster_raft_forward_handler = Arc::new(
+                        crate::raft_forward::ClusterRaftForwardHandler::new(raft_arc.clone()),
+                    );
+                    registry.register(
+                        MsgType::ClusterRaftForward,
+                        cluster_raft_forward_handler,
+                    );
+
                     ddl_path.store(Arc::new(DdlPath::Cluster {
                         raft: raft_arc.clone(),
                         peer_manager: peer_manager_for_ddl,
