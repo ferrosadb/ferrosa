@@ -126,6 +126,43 @@ mod tests {
         assert_eq!(PairRole::Secondary.opposite(), PairRole::Primary);
     }
 
+    /// Hazard P1-5 (W1.18): role is assigned by TCP connection direction,
+    /// independent of UUID order. The receiver of the connection (inbound)
+    /// is Primary; the initiator (outbound) is Secondary.
+    ///
+    /// This pins the contract `PairRole::elect` violated: under elect(), a
+    /// node could swap roles depending on which side won a UUID race.
+    #[test]
+    fn pair_role_assigned_by_connection_direction() {
+        // Direction-based assignment never consults a UUID — so by
+        // construction it's independent of UUID order. To pin that, this
+        // test asserts both directions produce the documented role and
+        // makes no UUID arguments available to from_connection_direction
+        // (the function signature itself enforces UUID independence).
+
+        // Node receiving the connection (inbound) → Primary.
+        // (If we had used PairRole::elect, this would depend on UUID.)
+        assert_eq!(
+            PairRole::from_connection_direction(true),
+            PairRole::Primary,
+            "the inbound (receiving) side is Primary regardless of UUID"
+        );
+
+        // Node initiating the connection (outbound) → Secondary.
+        assert_eq!(
+            PairRole::from_connection_direction(false),
+            PairRole::Secondary,
+            "the outbound (initiating) side is Secondary regardless of UUID"
+        );
+
+        // Round-trip: a pair that swaps directions also swaps roles.
+        assert_ne!(
+            PairRole::from_connection_direction(true),
+            PairRole::from_connection_direction(false),
+            "the two ends of a connection have opposite roles"
+        );
+    }
+
     #[test]
     fn pair_state_default_not_connected() {
         let state = PairState::new(
