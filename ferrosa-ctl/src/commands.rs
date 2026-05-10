@@ -567,6 +567,56 @@ pub async fn restore(
     }
 }
 
+// ── Raft administration (offline) ─────────────────────────────────────────────
+
+/// W1.11: wipe a stopped node's persisted Raft state (sled `log` and
+/// `meta` trees). The node must be stopped before this runs — sled
+/// holds an exclusive flock(2) on the data directory and reset will
+/// fail if a Ferrosa process is still using it.
+///
+/// On `dry_run = true`, the function opens the trees just to count
+/// what *would* be cleared, prints the counts, and returns without
+/// mutating. (sled does open the trees here, which acquires the lock
+/// briefly, so even dry-run requires the node to be stopped.)
+pub fn raft_reset(
+    data_dir: &std::path::Path,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use ferrosa_cluster::raft::log_store::SledLogStore;
+
+    if dry_run {
+        // Open read-only-ish: we just want to enumerate counts. The
+        // ResetCounts type isn't accessible without calling reset(),
+        // so for dry-run we open and inspect the trees directly.
+        let db = sled::open(data_dir)?;
+        let log = db.open_tree("log")?;
+        let meta = db.open_tree("meta")?;
+        println!(
+            "ferrosa-ctl raft reset --dry-run\n\
+             would clear: log entries = {}, meta keys = {}\n\
+             path: {}",
+            log.len(),
+            meta.len(),
+            data_dir.display()
+        );
+        // Drop is enough — sled flushes on drop.
+        return Ok(());
+    }
+
+    let counts = SledLogStore::reset(data_dir)?;
+    println!(
+        "ferrosa-ctl raft reset\n\
+         cleared: log entries = {}, meta keys = {}\n\
+         path: {}\n\
+         next start: this node will rejoin as a learner; \
+         the leader's snapshot/append will replay committed history.",
+        counts.log_entries,
+        counts.meta_keys,
+        data_dir.display()
+    );
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -574,6 +624,61 @@ mod tests {
     use ferrosa_cql::client::{QueryResult, ResultRow};
 
     use super::*;
+
+    /// W1.11: `ferrosa-ctl raft reset` clears a stopped node's persisted
+    /// Raft state (log + meta), enabling recovery from the runaway-term
+    /// failure mode. The test simulates a node with persisted Raft state,
+    /// runs the reset, and asserts the trees are empty afterward.
+    #[test]
+    fn ferrosa_ctl_raft_reset_recovers_runaway_term_node() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Step 1: simulate a running node by creating a sled DB with
+        // some log entries and meta keys.
+        {
+            let db = sled::open(dir.path()).unwrap();
+            let log = db.open_tree("log").unwrap();
+            let meta = db.open_tree("meta").unwrap();
+            for i in 0u64..5 {
+                log.insert(i.to_be_bytes(), b"entry".to_vec()).unwrap();
+            }
+            meta.insert(b"vote", b"some-vote-bytes".to_vec()).unwrap();
+            db.flush().unwrap();
+        } // drop releases the lock
+
+        // Step 2: run `ferrosa-ctl raft reset` (the underlying function).
+        super::raft_reset(dir.path(), false).expect("raft reset must succeed");
+
+        // Step 3: reopen and confirm the trees are empty — the node will
+        // rejoin as a fresh learner.
+        let db = sled::open(dir.path()).unwrap();
+        let log = db.open_tree("log").unwrap();
+        let meta = db.open_tree("meta").unwrap();
+        assert_eq!(log.len(), 0, "log must be empty after reset");
+        assert_eq!(meta.len(), 0, "meta must be empty after reset");
+    }
+
+    /// W1.11 dry-run: --dry-run reports counts without mutating.
+    #[test]
+    fn ferrosa_ctl_raft_reset_dry_run_does_not_mutate() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = sled::open(dir.path()).unwrap();
+            let log = db.open_tree("log").unwrap();
+            for i in 0u64..3 {
+                log.insert(i.to_be_bytes(), b"entry".to_vec()).unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        super::raft_reset(dir.path(), true).expect("dry-run must succeed");
+
+        // Assert nothing was cleared.
+        let db = sled::open(dir.path()).unwrap();
+        let log = db.open_tree("log").unwrap();
+        assert_eq!(log.len(), 3, "dry-run must not mutate");
+    }
 
     fn make_result(col_names: &[&str], rows: Vec<Vec<Option<&'static [u8]>>>) -> QueryResult {
         QueryResult {

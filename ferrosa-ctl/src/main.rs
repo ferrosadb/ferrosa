@@ -115,6 +115,12 @@ enum Commands {
         action: AuthAction,
     },
 
+    /// Raft administration commands.
+    Raft {
+        #[command(subcommand)]
+        action: RaftAction,
+    },
+
     /// Restore from a snapshot, optionally to a point in time.
     Restore {
         /// Name of the snapshot to restore from.
@@ -200,6 +206,29 @@ enum AuthAction {
         /// Skip the second-prompt confirmation (for scripting).
         #[arg(long)]
         no_confirm: bool,
+    },
+}
+
+/// Raft administration sub-actions (W1.11).
+#[derive(Debug, Subcommand)]
+enum RaftAction {
+    /// Wipe a node's persisted Raft state (log + meta trees) so it
+    /// rejoins the cluster as a fresh learner. The node must be stopped
+    /// before running this — sled holds an exclusive flock(2) on the
+    /// data directory.
+    ///
+    /// Use case: recovery from the disruptor-partition runaway-term
+    /// failure mode (specs/in-process/bug-raft-stale-candidate-runaway-
+    /// term-no-prevote.md). The leader's InstallSnapshot / AppendEntries
+    /// will replay committed history onto the reset node.
+    Reset {
+        /// Path to the node's Raft data directory (e.g. `/var/lib/ferrosa/raft`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+
+        /// Print what would be cleared without actually clearing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -297,6 +326,9 @@ async fn main() {
                 }
                 Ok(())
             }
+        },
+        Commands::Raft { action } => match action {
+            RaftAction::Reset { data_dir, dry_run } => commands::raft_reset(&data_dir, dry_run),
         },
         Commands::Restore {
             snapshot_name,
@@ -438,6 +470,49 @@ mod tests {
     fn web_port_override() {
         let cli = Cli::try_parse_from(["ferrosa-ctl", "--web-port", "8080", "ring"]).unwrap();
         assert_eq!(cli.web_port, 8080);
+    }
+
+    /// W1.11 CLI parsing: `ferrosa-ctl raft reset --data-dir <path>` is
+    /// recognized and produces the expected RaftAction::Reset variant.
+    #[test]
+    fn subcommand_raft_reset_parses() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "reset",
+            "--data-dir",
+            "/var/lib/ferrosa/raft",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action: RaftAction::Reset { data_dir, dry_run },
+            } => {
+                assert_eq!(data_dir, std::path::PathBuf::from("/var/lib/ferrosa/raft"));
+                assert!(!dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// W1.11 CLI parsing: `--dry-run` is supported.
+    #[test]
+    fn subcommand_raft_reset_dry_run_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "reset",
+            "--data-dir",
+            "/tmp/x",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action: RaftAction::Reset { dry_run, .. },
+            } => assert!(dry_run),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
