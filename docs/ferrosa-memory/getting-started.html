@@ -33,6 +33,15 @@
     code { font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace; color:#dcdcf0; }
     .warn { border-left:3px solid var(--accent2); background:rgba(226,114,91,.08); padding:1rem 1.2rem; border-radius:0 12px 12px 0; color:var(--muted); }
     footer { max-width:980px; margin:0 auto; padding:2rem 1.5rem; color:#6b6b7a; border-top:1px solid var(--border); }
+    @media (max-width: 768px) {
+      body { overflow-x:hidden; }
+      nav .inner { align-items:flex-start; flex-direction:column; }
+      nav .links { width:100%; display:grid; grid-template-columns:repeat(2,minmax(0,max-content)); gap:.6rem 1rem; padding-bottom:.25rem; }
+      nav .links a { white-space:nowrap; }
+      main { width:100%; min-width:0; padding-left:1rem; padding-right:1rem; overflow-wrap:anywhere; }
+      .hero { width:100%; min-width:0; padding:1.5rem; overflow-wrap:anywhere; }
+      h1 { font-size:clamp(2rem, 11vw, 3rem); }
+    }
   </style>
 </head>
 <body>
