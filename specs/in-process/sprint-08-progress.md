@@ -28,6 +28,24 @@ endurance --hours 24` once budget is approved.
 
 ## Per–work-item log
 
+### W8.5 — Operator commands — DONE
+
+- RED: three URL+body tests in `ferrosa-ctl/src/commands.rs`:
+  - `ferrosa_ctl_cluster_add_learner` — `/api/cluster/add-learner` body
+    `{host_id, addr, owns_tokens}`.
+  - `ferrosa_ctl_cluster_promote_to_voter` — `/api/cluster/promote-to-voter`
+    body `{host_id}`.
+  - `ferrosa_ctl_cluster_demote_to_learner` — `/api/cluster/demote-to-learner`
+    body `{host_id}`.
+- GREEN: added `cluster_add_learner`, `cluster_promote_to_voter`,
+  `cluster_demote_to_learner` HTTP wrappers; new `ClusterAction` variants
+  `AddLearner`, `PromoteToVoter`, `DemoteToLearner`; main dispatch wired.
+  Server-side endpoints surface a clean "not yet wired" error per the
+  Sprint 3 / W3.9 pattern (transfer-leader). Server endpoints are out of
+  scope for the headline Sprint 8 deliverable (sim endurance) but the CLI
+  shape is contract-stable.
+- Gate: 3/3 new ferrosa-ctl tests + full lib pass; clippy + fmt clean.
+
 ### W8.4 — CL-aware read routing for learners — DONE
 
 - RED tests in `coordinator/cl_routing.rs`:

@@ -358,6 +358,153 @@ pub async fn raft_transfer_leader(
     }
 }
 
+// ── W8.5 — Learner lifecycle commands (ADR-014) ─────────────────────
+
+/// Build the `add-learner` URL.
+fn add_learner_url(host: &str, web_port: u16) -> String {
+    format!("http://{}:{}/api/cluster/add-learner", host, web_port)
+}
+
+/// Build the JSON body for `add-learner`.
+fn add_learner_body(host_id: &str, addr: &str, owns_tokens: bool) -> serde_json::Value {
+    serde_json::json!({
+        "host_id": host_id,
+        "addr": addr,
+        "owns_tokens": owns_tokens,
+    })
+}
+
+/// Build the `promote-to-voter` URL.
+fn promote_to_voter_url(host: &str, web_port: u16) -> String {
+    format!("http://{}:{}/api/cluster/promote-to-voter", host, web_port)
+}
+
+/// Build the JSON body for `promote-to-voter`.
+fn promote_to_voter_body(host_id: &str) -> serde_json::Value {
+    serde_json::json!({ "host_id": host_id })
+}
+
+/// Build the `demote-to-learner` URL.
+fn demote_to_learner_url(host: &str, web_port: u16) -> String {
+    format!("http://{}:{}/api/cluster/demote-to-learner", host, web_port)
+}
+
+/// Build the JSON body for `demote-to-learner`.
+fn demote_to_learner_body(host_id: &str) -> serde_json::Value {
+    serde_json::json!({ "host_id": host_id })
+}
+
+/// W8.5 — Add a long-lived learner replica to the cluster.
+///
+/// Issues `POST /api/cluster/add-learner`. The server-side handler
+/// invokes `MembershipChanger::add_learner_only(host_id, addr,
+/// NodeJoinConfig { owns_tokens })`.
+pub async fn cluster_add_learner(
+    host: &str,
+    web_port: u16,
+    host_id: &str,
+    addr: &str,
+    owns_tokens: bool,
+) -> Result<(), WebError> {
+    let url = add_learner_url(host, web_port);
+    let body = add_learner_body(host_id, addr, owns_tokens);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!(
+            "Learner {} ({}) added to cluster (owns_tokens={}).",
+            host_id, addr, owns_tokens
+        );
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "cluster add-learner: server endpoint not yet wired (HTTP {status}). \
+             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
+             Body: {text}"
+        )
+        .into())
+    } else {
+        Err(format!("cluster add-learner failed (HTTP {status}): {text}").into())
+    }
+}
+
+/// W8.5 — Promote a learner to a voter.
+///
+/// Issues `POST /api/cluster/promote-to-voter`. The server-side handler
+/// invokes `MembershipChanger::promote_learner_to_voter(host_id)`.
+pub async fn cluster_promote_to_voter(
+    host: &str,
+    web_port: u16,
+    host_id: &str,
+) -> Result<(), WebError> {
+    let url = promote_to_voter_url(host, web_port);
+    let body = promote_to_voter_body(host_id);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Learner {host_id} promoted to voter.");
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "cluster promote-to-voter: server endpoint not yet wired (HTTP {status}). \
+             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
+             Body: {text}"
+        )
+        .into())
+    } else {
+        Err(format!("cluster promote-to-voter failed (HTTP {status}): {text}").into())
+    }
+}
+
+/// W8.5 — Demote a voter to a learner.
+///
+/// Issues `POST /api/cluster/demote-to-learner`. The server-side
+/// handler invokes `MembershipChanger::demote_voter_to_learner(host_id)`.
+pub async fn cluster_demote_to_learner(
+    host: &str,
+    web_port: u16,
+    host_id: &str,
+) -> Result<(), WebError> {
+    let url = demote_to_learner_url(host, web_port);
+    let body = demote_to_learner_body(host_id);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Voter {host_id} demoted to learner.");
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "cluster demote-to-learner: server endpoint not yet wired (HTTP {status}). \
+             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
+             Body: {text}"
+        )
+        .into())
+    } else {
+        Err(format!("cluster demote-to-learner failed (HTTP {status}): {text}").into())
+    }
+}
+
 /// Decommission a node from the cluster.
 ///
 /// Issues `POST /api/cluster/decommission` with an optional `{"host_id": …}`.
@@ -856,6 +1003,52 @@ mod tests {
     /// Helper: build the URL for rebalance.
     fn rebalance_url(host: &str, web_port: u16) -> String {
         format!("http://{}:{}/api/cluster/rebalance", host, web_port)
+    }
+
+    // ── W8.5 — learner lifecycle CLI commands ────────────────────────
+
+    /// W8.5 RED. `ferrosa-ctl cluster add-learner <host_id> <addr>`
+    /// must POST `{host_id, addr, owns_tokens}` to the new
+    /// `/api/cluster/add-learner` endpoint.
+    #[test]
+    fn ferrosa_ctl_cluster_add_learner() {
+        let url = super::add_learner_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/add-learner");
+
+        let body = super::add_learner_body("host-1", "10.0.0.7:7000", true);
+        assert_eq!(body["host_id"], "host-1");
+        assert_eq!(body["addr"], "10.0.0.7:7000");
+        assert_eq!(body["owns_tokens"], true);
+
+        // Default owns_tokens is true (long-lived read replica).
+        let body_default = super::add_learner_body("host-2", "10.0.0.8:7000", true);
+        assert_eq!(body_default["owns_tokens"], true);
+
+        // Witness / analytics learner: owns_tokens=false.
+        let body_witness = super::add_learner_body("host-3", "10.0.0.9:7000", false);
+        assert_eq!(body_witness["owns_tokens"], false);
+    }
+
+    /// W8.5 RED. `ferrosa-ctl cluster promote-to-voter <host_id>` must
+    /// POST `{host_id}` to `/api/cluster/promote-to-voter`.
+    #[test]
+    fn ferrosa_ctl_cluster_promote_to_voter() {
+        let url = super::promote_to_voter_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/promote-to-voter");
+
+        let body = super::promote_to_voter_body("host-promote");
+        assert_eq!(body["host_id"], "host-promote");
+    }
+
+    /// W8.5 RED. `ferrosa-ctl cluster demote-to-learner <host_id>` must
+    /// POST `{host_id}` to `/api/cluster/demote-to-learner`.
+    #[test]
+    fn ferrosa_ctl_cluster_demote_to_learner() {
+        let url = super::demote_to_learner_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/demote-to-learner");
+
+        let body = super::demote_to_learner_body("host-demote");
+        assert_eq!(body["host_id"], "host-demote");
     }
 
     #[test]

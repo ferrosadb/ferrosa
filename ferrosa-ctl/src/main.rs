@@ -260,6 +260,38 @@ enum ClusterAction {
         #[arg(long = "seeds", value_delimiter = ',')]
         seeds: Vec<String>,
     },
+
+    /// W8.5 — Add a long-lived learner replica to the cluster (ADR-014).
+    ///
+    /// The learner receives `AppendEntries` and applies log entries but
+    /// does not vote. With `--owns-tokens=true` (the default) it
+    /// participates in the ring as a read replica; with
+    /// `--owns-tokens=false` it is a state-machine-only follower
+    /// (analytics / future witness role).
+    AddLearner {
+        /// Host ID (UUID) of the new learner.
+        host_id: String,
+        /// Internode address `<host>:<port>` for the learner.
+        addr: String,
+        /// Whether the learner owns ring tokens (default: true).
+        #[arg(long = "owns-tokens", default_value_t = true)]
+        owns_tokens: bool,
+    },
+
+    /// W8.5 — Promote a learner to a voter (ADR-014).
+    PromoteToVoter {
+        /// Host ID of the learner to promote.
+        host_id: String,
+    },
+
+    /// W8.5 — Demote a voter to a learner (ADR-014).
+    ///
+    /// If the target is the current Raft leader, leadership is
+    /// transferred first (W4.14 self-transfer pattern).
+    DemoteToLearner {
+        /// Host ID of the voter to demote.
+        host_id: String,
+    },
 }
 
 /// Snapshot sub-actions.
@@ -365,6 +397,20 @@ async fn main() {
         },
         Commands::Cluster { action } => match action {
             ClusterAction::BootstrapDc { dc, seeds } => commands::cluster_bootstrap_dc(&dc, &seeds),
+            ClusterAction::AddLearner {
+                host_id,
+                addr,
+                owns_tokens,
+            } => {
+                commands::cluster_add_learner(&web_host, web_port, &host_id, &addr, owns_tokens)
+                    .await
+            }
+            ClusterAction::PromoteToVoter { host_id } => {
+                commands::cluster_promote_to_voter(&web_host, web_port, &host_id).await
+            }
+            ClusterAction::DemoteToLearner { host_id } => {
+                commands::cluster_demote_to_learner(&web_host, web_port, &host_id).await
+            }
         },
         Commands::Restore {
             snapshot_name,
