@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod bootstrap;
 pub mod cluster;
 pub mod deployment;
 pub mod nemesis;

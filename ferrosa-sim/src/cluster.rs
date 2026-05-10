@@ -222,6 +222,16 @@ impl SimulatedCluster {
         self.nodes.len()
     }
 
+    /// Iterator over voter ids, in ascending order.
+    pub fn voter_ids(&self) -> Vec<NodeId> {
+        self.nodes.keys().copied().collect()
+    }
+
+    /// `true` if a node with the given id is currently a voter.
+    pub fn has_voter(&self, id: NodeId) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
     /// Reference the [`SimulatedNode`] for `id`, panicking if absent.
     pub fn node(&self, id: NodeId) -> &SimulatedNode {
         &self.nodes[&id].node
