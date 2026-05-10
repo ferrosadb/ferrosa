@@ -55,6 +55,16 @@ pub struct ClusterConfig {
     pub raft_election_timeout_min_ms: u64,
     /// Raft maximum election timeout in milliseconds. Default: 2000.
     pub raft_election_timeout_max_ms: u64,
+    /// Whether to enable PreVote (Ongaro §9.6) — ferrosa fork extension per
+    /// ADR-012. Default: `true` (ferrosa default; upstream openraft 0.9 is
+    /// `false`). Override with `FERROSA_RAFT_ENABLE_PRE_VOTE=false` to fall
+    /// back to upstream behavior.
+    pub raft_enable_pre_vote: bool,
+    /// CheckQuorum step-down ratio (Ongaro §6.4) — ferrosa fork extension per
+    /// ADR-012. Default: `0.75` (ferrosa default; upstream openraft 0.9
+    /// effectively has CheckQuorum disabled). Override with
+    /// `FERROSA_RAFT_CHECK_QUORUM_RATIO=<float>`. Set to `0.0` to disable.
+    pub raft_check_quorum_ratio: f64,
 }
 
 impl Default for ClusterConfig {
@@ -75,6 +85,8 @@ impl Default for ClusterConfig {
             raft_heartbeat_ms: 300,
             raft_election_timeout_min_ms: 3000,
             raft_election_timeout_max_ms: 6000,
+            raft_enable_pre_vote: true,
+            raft_check_quorum_ratio: 0.75,
         }
     }
 }
@@ -145,6 +157,35 @@ impl ClusterConfig {
                 config.raft_election_timeout_max_ms = n;
             }
         }
+        if let Ok(val) = std::env::var("FERROSA_RAFT_ENABLE_PRE_VOTE") {
+            // Accept "true"/"false"/"1"/"0".
+            match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => config.raft_enable_pre_vote = true,
+                "false" | "0" | "no" => config.raft_enable_pre_vote = false,
+                other => {
+                    tracing::warn!(
+                        value = %other,
+                        "FERROSA_RAFT_ENABLE_PRE_VOTE: unrecognized value, keeping default"
+                    );
+                }
+            }
+        }
+        if let Ok(val) = std::env::var("FERROSA_RAFT_CHECK_QUORUM_RATIO") {
+            match val.parse::<f64>() {
+                Ok(ratio) if (0.0..=2.0).contains(&ratio) => {
+                    config.raft_check_quorum_ratio = ratio;
+                }
+                Ok(ratio) => {
+                    tracing::warn!(
+                        ratio,
+                        "FERROSA_RAFT_CHECK_QUORUM_RATIO: out of range [0.0, 2.0], keeping default"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(%e, value = %val, "FERROSA_RAFT_CHECK_QUORUM_RATIO: parse error, keeping default");
+                }
+            }
+        }
 
         config
     }
@@ -164,6 +205,20 @@ mod tests {
         assert_eq!(config.default_cl, ConsistencyLevel::Quorum);
         assert_eq!(config.hinted_handoff_max_mb, 1024);
         assert!(config.auto_join);
+    }
+
+    /// W3.12 / ADR-012: ferrosa defaults flip the openraft knobs ON.
+    #[test]
+    fn default_raft_correctness_knobs_match_adr_012() {
+        let config = ClusterConfig::default();
+        assert!(
+            config.raft_enable_pre_vote,
+            "ADR-012: PreVote must be on by default in ferrosa builds"
+        );
+        assert_eq!(
+            config.raft_check_quorum_ratio, 0.75,
+            "ADR-012: CheckQuorum default ratio is 0.75 (not etcd's 1.0)"
+        );
     }
 
     #[test]

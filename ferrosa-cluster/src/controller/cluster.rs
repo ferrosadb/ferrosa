@@ -585,6 +585,9 @@ impl ModeController {
         let raft_heartbeat_ms = self.config.raft_heartbeat_ms;
         let raft_election_min_ms = self.config.raft_election_timeout_min_ms;
         let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
+        // ADR-012: PreVote + CheckQuorum knobs from the ferrosa-cluster config.
+        let raft_enable_pre_vote = self.config.raft_enable_pre_vote;
+        let raft_check_quorum_ratio = self.config.raft_check_quorum_ratio;
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
         let raft_runtime: Option<Arc<tokio::runtime::Runtime>> = self.raft_runtime.get().cloned();
@@ -837,6 +840,12 @@ impl ModeController {
             }
 
             // Build openraft Config
+            //
+            // ADR-012 wires `enable_pre_vote` (Ongaro §9.6) and
+            // `check_quorum_ratio` (Ongaro §6.4). Both fields are ferrosa-fork
+            // extensions exposed by the patched openraft (`correctness/prevote-checkquorum`
+            // branch) and inert against upstream openraft (defaults are
+            // upstream-compatible: pre_vote=false, ratio=0.0).
             let raft_config = match (openraft::Config {
                 cluster_name,
                 heartbeat_interval: raft_heartbeat_ms,
@@ -847,6 +856,8 @@ impl ModeController {
                 election_timeout_max: raft_election_max_ms,
                 max_payload_entries: 5,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
+                enable_pre_vote: raft_enable_pre_vote,
+                check_quorum_ratio: raft_check_quorum_ratio,
                 ..Default::default()
             })
             .validate()

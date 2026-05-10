@@ -128,6 +128,34 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Raft cluster operations (ADR-012).
+    Raft {
+        #[command(subcommand)]
+        action: RaftAction,
+    },
+}
+
+/// Raft sub-actions (ADR-012).
+#[derive(Debug, Subcommand)]
+enum RaftAction {
+    /// Transfer Raft leadership to a target node (Ongaro §3.10).
+    ///
+    /// Useful for graceful drains during DC-aware operations and for
+    /// multi-DC failover. Calls `raft.trigger().transfer_to(target)` on the
+    /// current leader; the target becomes leader within `election_timeout × 2`
+    /// or the command returns `TransferError::Timeout`.
+    ///
+    /// **Status**: this subcommand is wired but the underlying
+    /// `transfer_to` API is not yet implemented in the openraft fork. See
+    /// `specs/in-process/sprint-03-openraft-patches.md` (W3.9). Until the
+    /// engine work lands, the command emits a clear "not yet implemented"
+    /// diagnostic.
+    TransferLeader {
+        /// Host ID of the target node (must currently be a Raft voter).
+        #[arg(long = "to")]
+        to: String,
+    },
 }
 
 /// Auth sub-actions.
@@ -284,6 +312,11 @@ async fn main() {
             )
             .await
         }
+        Commands::Raft { action } => match action {
+            RaftAction::TransferLeader { to } => {
+                commands::raft_transfer_leader(&web_host, web_port, &to).await
+            }
+        },
     };
 
     if let Err(e) = result {
@@ -653,6 +686,28 @@ mod tests {
                 assert_eq!(snapshot_name, "backup-2026");
                 assert_eq!(point_in_time.as_deref(), Some("2026-03-01T00:00:00Z"));
                 assert!(force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    /// W3.13 (ADR-012): `ferrosa-ctl raft transfer-leader --to <host_id>`
+    /// parses correctly. The actual server-side handler is deferred (W3.9).
+    #[test]
+    fn parse_raft_transfer_leader() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "transfer-leader",
+            "--to",
+            "host-uuid-abc",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action: RaftAction::TransferLeader { to },
+            } => {
+                assert_eq!(to, "host-uuid-abc");
             }
             other => panic!("unexpected command: {other:?}"),
         }

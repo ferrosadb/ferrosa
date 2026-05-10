@@ -308,6 +308,53 @@ pub async fn add_node(host: &str, web_port: u16, host_id: &str) -> Result<(), We
     }
 }
 
+/// Transfer Raft leadership to a target node (Ongaro §3.10, ADR-012 W3.13).
+///
+/// Issues `POST /api/cluster/raft/transfer-leader` with `{"to": "<host_id>"}`.
+/// The server-side handler invokes
+/// `raft.trigger().transfer_to(target_node_id).await`. Returns within
+/// `election_timeout × 2` or with `TransferError::Timeout`.
+///
+/// **Status**: this client-side wiring lands in Sprint 3. The server-side
+/// handler and the underlying openraft `transfer_to` API are deferred (see
+/// `specs/in-process/sprint-03-openraft-patches.md` items W3.8/W3.9). Until
+/// the server endpoint exists, this command surfaces the upstream HTTP 404
+/// (or 501 Not Implemented) cleanly so operators see what's missing.
+pub async fn raft_transfer_leader(
+    host: &str,
+    web_port: u16,
+    to_host_id: &str,
+) -> Result<(), WebError> {
+    let url = format!("http://{}:{}/api/cluster/raft/transfer-leader", host, web_port);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "to": to_host_id }))
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Raft leadership transfer to {} initiated.", to_host_id);
+        if !body.is_empty() {
+            println!("{body}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "raft transfer-leader: server endpoint not yet implemented (HTTP {}). \
+             See specs/in-process/sprint-03-openraft-patches.md (W3.8, W3.9). \
+             Body: {}",
+            status, body
+        )
+        .into())
+    } else {
+        Err(format!("raft transfer-leader failed (HTTP {}): {}", status, body).into())
+    }
+}
+
 /// Decommission a node from the cluster.
 ///
 /// Issues `POST /api/cluster/decommission` with an optional `{"host_id": …}`.
