@@ -688,6 +688,13 @@ impl TestCluster {
         self.registry.isolate(id);
     }
 
+    /// Isolate a node by `node_id`.  Works for both bootstrap voters
+    /// and `add_pending_node` additions — useful when the test wants
+    /// to partition a 4th node added post-bootstrap.
+    pub fn isolate_by_node_id(&self, node_id: u64) {
+        self.registry.isolate(node_id);
+    }
+
     /// Heal every recorded partition / isolation.
     pub fn heal(&self) {
         self.registry.heal_all();
