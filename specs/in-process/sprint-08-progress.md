@@ -28,6 +28,28 @@ endurance --hours 24` once budget is approved.
 
 ## Per–work-item log
 
+### W8.6 — Token ownership per learner — DONE
+
+- RED: two tests in `ring/mod.rs`:
+  - `learner_with_owns_tokens_false_excluded_from_replicas` — ring excludes
+    `owns_tokens=false` from `replicas()`; `owns_tokens=true` is included.
+  - `nts_replicas_excludes_witness_learner` — same for NetworkTopologyStrategy.
+- GREEN: `nts_replicas` now consults `info.state` and skips
+  `Learner { owns_tokens: false }` (along with Joining/Leaving/Decommissioned,
+  which the SimpleStrategy path already skipped). `replicas()` was made
+  learner-aware in W8.1.
+- Note on CL=ALL: because the replica list never contains the witness
+  learner, CL=ALL fan-out automatically skips it — no further plumbing needed.
+
+### W8.7 — Repair behaviour for learners — DONE
+
+- RED: `learner_with_owns_tokens_true_participates_in_repair` in
+  `repair/mod.rs` asserts the participant set includes voters and
+  `owns_tokens=true` learners while excluding `owns_tokens=false` learners.
+- GREEN: introduced `pub fn repair_participants(ring, token, rf) -> Vec<u64>`
+  consulting the ring + node states. The repair scheduler will iterate
+  this set when picking peers for Merkle-root exchange.
+
 ### W8.5 — Operator commands — DONE
 
 - RED: three URL+body tests in `ferrosa-ctl/src/commands.rs`:

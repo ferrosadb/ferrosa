@@ -233,6 +233,18 @@ impl TokenRing {
                 Some(i) => i,
                 None => continue,
             };
+            // W8.6: skip nodes that don't own tokens
+            // (NodeState::Learner { owns_tokens: false } and any
+            // non-Normal/Learner state — Joining, Leaving,
+            // Decommissioned).
+            let eligible = matches!(
+                info.state,
+                crate::raft::NodeState::Normal
+                    | crate::raft::NodeState::Learner { owns_tokens: true }
+            );
+            if !eligible {
+                continue;
+            }
             let dc = info.data_center.as_str();
             let rack = info.rack.as_str();
 
@@ -505,6 +517,60 @@ mod tests {
         assert!(
             !replicas.contains(&3),
             "learner with owns_tokens=false must be excluded from replicas(): {replicas:?}"
+        );
+    }
+
+    /// W8.6 RED. A learner with `owns_tokens=false` must not appear in
+    /// `ring.replicas(token)` for any RF; an owns_tokens=true learner
+    /// IS included. Reads at CL=ALL therefore skip the witness because
+    /// it is never in the replica list.
+    #[test]
+    fn learner_with_owns_tokens_false_excluded_from_replicas() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000")); // voter
+        ring.add_node(2, make_node("10.0.0.2:7000")); // voter
+
+        let mut owning_learner = make_node("10.0.0.3:7000");
+        owning_learner.state = NodeState::Learner { owns_tokens: true };
+        ring.add_node(3, owning_learner);
+
+        let mut witness = make_node("10.0.0.4:7000");
+        witness.state = NodeState::Learner { owns_tokens: false };
+        ring.add_node(4, witness);
+
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+        ring.assign_tokens(3, &[150]);
+        ring.assign_tokens(4, &[175]); // witness sits in between
+
+        let replicas = ring.replicas(50, 4);
+        assert!(
+            !replicas.contains(&4),
+            "owns_tokens=false learner must be excluded; got {replicas:?}"
+        );
+        assert_eq!(replicas.len(), 3, "three eligible nodes — got {replicas:?}");
+        assert!(replicas.contains(&3));
+    }
+
+    /// W8.6 RED. NetworkTopologyStrategy must also exclude
+    /// `owns_tokens=false` learners.
+    #[test]
+    fn nts_replicas_excludes_witness_learner() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node_dc("10.0.0.1:7000", "dc1", "rack-a"));
+        ring.add_node(2, make_node_dc("10.0.0.2:7000", "dc1", "rack-b"));
+        let mut witness = make_node_dc("10.0.0.3:7000", "dc1", "rack-c");
+        witness.state = NodeState::Learner { owns_tokens: false };
+        ring.add_node(3, witness);
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+        ring.assign_tokens(3, &[150]);
+
+        let dc_rf: HashMap<String, usize> = HashMap::from([("dc1".to_string(), 3)]);
+        let replicas = ring.nts_replicas(50, &dc_rf);
+        assert!(
+            !replicas.contains(&3),
+            "NTS must exclude owns_tokens=false learner; got {replicas:?}"
         );
     }
 
