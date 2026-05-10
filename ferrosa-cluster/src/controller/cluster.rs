@@ -156,14 +156,17 @@ pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::
 /// non-local peers by DC name. Local-DC voters drive Raft membership;
 /// non-local-DC peers participate in cross-DC routing only (Sprint 7
 /// will plumb them into Accord).
+/// Result of [`partition_peers_by_dc`] — groups peers by DC.
+pub type PeerDcPartition = (
+    Vec<(uuid::Uuid, SocketAddr)>,
+    std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>>,
+);
+
 pub fn partition_peers_by_dc(
     peers: &[(uuid::Uuid, SocketAddr)],
     dcs: &std::collections::HashMap<uuid::Uuid, String>,
     local_dc: &str,
-) -> (
-    Vec<(uuid::Uuid, SocketAddr)>,
-    std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>>,
-) {
+) -> PeerDcPartition {
     let mut local = Vec::new();
     let mut others: std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>> =
         std::collections::BTreeMap::new();

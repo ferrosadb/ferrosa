@@ -347,9 +347,9 @@ mod tests {
         assert_eq!(decoded.node_role, NodeRole::Indexer);
     }
 
-    /// W6.8 RED: per-DC config carries independent raft_data_dir
-    /// + rack overrides. Default node-level fields apply when no
-    /// per-DC override exists.
+    /// W6.8 RED: per-DC config carries independent raft_data_dir +
+    /// rack overrides. Default node-level fields apply when no per-DC
+    /// override exists.
     #[test]
     fn cluster_config_per_dc() {
         let mut overrides = BTreeMap::new();
