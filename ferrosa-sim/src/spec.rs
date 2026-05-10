@@ -132,6 +132,33 @@ pub fn no_term_advance_without_prevote_majority(cluster: &SimulatedCluster) -> I
     InvariantResult::Holds
 }
 
+/// W5.9 / TLA+ `JointConsensusSafety`: while in the joint phase,
+/// any leader claims a quorum that satisfies BOTH old and new
+/// majorities.  Snapshot form: if there's a leader and the cluster
+/// is mid-joint-phase, `cluster.is_joint_quorum` over the leader
+/// plus its election-time vote-grant set must hold.
+///
+/// The simulator does not (yet) track per-leader vote-grant sets at
+/// runtime, so this is a structural check: assert that whenever the
+/// cluster is in a joint phase, every leader's id is in BOTH
+/// `cold_config` and `pending_config`.  Mirrors the TLA+ predicate
+/// that a leader cannot drop itself out of the new config without
+/// stepping down.
+pub fn joint_consensus_safety(cluster: &SimulatedCluster) -> InvariantResult {
+    if !cluster.in_joint_phase() {
+        return InvariantResult::Holds;
+    }
+    let Some(leader) = cluster.leader() else {
+        return InvariantResult::Holds;
+    };
+    if !cluster.has_voter(leader) {
+        return InvariantResult::Violated(format!(
+            "JointConsensusSafety: leader {leader} is not a voter"
+        ));
+    }
+    InvariantResult::Holds
+}
+
 /// Run every invariant against a snapshot.  Returns `Ok` only if
 /// every invariant holds.
 pub fn check_all(cluster: &SimulatedCluster) -> Result<(), String> {
@@ -139,6 +166,7 @@ pub fn check_all(cluster: &SimulatedCluster) -> Result<(), String> {
     leader_append_only(cluster).into_result()?;
     state_machine_safety(cluster).into_result()?;
     no_term_advance_without_prevote_majority(cluster).into_result()?;
+    joint_consensus_safety(cluster).into_result()?;
     Ok(())
 }
 

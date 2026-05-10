@@ -192,6 +192,14 @@ pub struct SimulatedCluster {
     /// W5.8: when `true`, election timeouts run a PreVote round
     /// before bumping the term.  `false` keeps the W5.3 behaviour.
     pub(crate) pre_vote_enabled: bool,
+    /// W5.9: pending Cnew during a joint-consensus phase.  Empty
+    /// outside the joint phase.  See `propose_membership`.
+    pending_config: std::collections::BTreeSet<NodeId>,
+    /// W5.9: the "Cold" set referenced during joint consensus.
+    /// Captures the membership at the moment `propose_membership`
+    /// fires; the joint quorum requires majorities in BOTH `cold`
+    /// and `pending_config`.
+    cold_config: std::collections::BTreeSet<NodeId>,
 }
 
 impl SimulatedCluster {
@@ -240,6 +248,8 @@ impl SimulatedCluster {
             trace: Trace::new(),
             dropped_links: std::collections::BTreeSet::new(),
             pre_vote_enabled: false,
+            pending_config: std::collections::BTreeSet::new(),
+            cold_config: std::collections::BTreeSet::new(),
         }
     }
 
@@ -508,6 +518,71 @@ impl SimulatedCluster {
     /// dropped.
     pub fn remove_voter(&mut self, id: NodeId) {
         self.nodes.remove(&id);
+    }
+
+    // -------------------------------------------------------------
+    // Joint-consensus membership change (W5.9).
+    // -------------------------------------------------------------
+
+    /// Begin a joint-consensus membership change.  `new_config` is
+    /// `Cnew`; the current voter set is captured as `Cold`.  The
+    /// cluster enters the joint phase, in which a quorum requires
+    /// majorities in BOTH old and new.
+    pub fn propose_membership(&mut self, new_config: std::collections::BTreeSet<NodeId>) {
+        self.cold_config = self.nodes.keys().copied().collect();
+        self.pending_config = new_config.clone();
+        // Add brand-new voters in `Cnew` that aren't yet in `Cold`.
+        for &id in &new_config {
+            if !self.nodes.contains_key(&id) {
+                self.add_voter(id);
+            }
+        }
+    }
+
+    /// Commit the pending membership change: replace `Cold` with
+    /// `Cnew`, drop voters that fell out of the new config.
+    pub fn commit_membership(&mut self) {
+        if self.pending_config.is_empty() {
+            return;
+        }
+        // Drop voters that are in `Cold` but not in `Cnew`.
+        let to_remove: Vec<NodeId> = self
+            .cold_config
+            .difference(&self.pending_config)
+            .copied()
+            .collect();
+        for id in to_remove {
+            self.remove_voter(id);
+        }
+        self.cold_config.clear();
+        self.pending_config.clear();
+    }
+
+    /// `true` while in the joint-consensus phase (post-propose,
+    /// pre-commit).
+    pub fn in_joint_phase(&self) -> bool {
+        !self.pending_config.is_empty()
+    }
+
+    /// Check whether `voters` form a quorum under the current
+    /// configuration.  In the joint phase this requires a majority
+    /// in BOTH the old and new sets.
+    pub fn is_joint_quorum(&self, voters: &std::collections::BTreeSet<NodeId>) -> bool {
+        if self.pending_config.is_empty() {
+            // Single-config quorum: simple majority of `nodes`.
+            let n = self.nodes.len();
+            voters
+                .iter()
+                .filter(|id| self.nodes.contains_key(id))
+                .count()
+                * 2
+                > n
+        } else {
+            let cold_intersect = voters.intersection(&self.cold_config).count();
+            let new_intersect = voters.intersection(&self.pending_config).count();
+            cold_intersect * 2 > self.cold_config.len()
+                && new_intersect * 2 > self.pending_config.len()
+        }
     }
 
     fn schedule(&mut self, delay: Tick, event: Event) {
@@ -958,6 +1033,56 @@ mod tests {
         assert!(
             n1_term <= initial_term + 1,
             "isolated node 1 advanced term from {initial_term} to {n1_term} despite PreVote"
+        );
+    }
+
+    /// W5.9 RED → GREEN: a 3 → 5 voter swap goes through the joint
+    /// phase.  In the joint phase, neither side alone can form a
+    /// quorum: `is_joint_quorum({1,2})` must be false (only 2/3 of
+    /// Cold but 0/2 of Cnew); `is_joint_quorum({1,2,4,5})` must be
+    /// true (2/3 of Cold AND 2/2 of Cnew).
+    #[test]
+    fn joint_consensus_quorum_requires_both_sides() {
+        let mut cluster = SimulatedCluster::with_voters(3, 11);
+        let _ = cluster.run_until_leader(10_000).unwrap();
+
+        let cnew: std::collections::BTreeSet<u64> = [1, 2, 3, 4, 5].into_iter().collect();
+        cluster.propose_membership(cnew);
+        assert!(cluster.in_joint_phase());
+
+        // Cold = {1,2,3}, Cnew = {1,2,3,4,5}.
+        // {1,2}: 2/3 of Cold ✓, 2/5 of Cnew ✗.
+        let q_cold_only: std::collections::BTreeSet<u64> = [1, 2].into_iter().collect();
+        assert!(!cluster.is_joint_quorum(&q_cold_only));
+
+        // {1,2,4,5}: 2/3 of Cold ✓, 4/5 of Cnew ✓.
+        let q_both: std::collections::BTreeSet<u64> = [1, 2, 4, 5].into_iter().collect();
+        assert!(cluster.is_joint_quorum(&q_both));
+
+        // Commit phase: voter set settles to Cnew alone.
+        cluster.commit_membership();
+        assert!(!cluster.in_joint_phase());
+        assert_eq!(cluster.voter_count(), 5);
+    }
+
+    /// W5.9: a voter swap from {1,2,3} to {2,3,4,5} drops node 1
+    /// at commit and keeps a leader.
+    #[test]
+    fn joint_consensus_drops_old_voter_at_commit() {
+        let mut cluster = SimulatedCluster::with_voters(3, 13);
+        let _ = cluster.run_until_leader(10_000).unwrap();
+
+        let cnew: std::collections::BTreeSet<u64> = [2, 3, 4, 5].into_iter().collect();
+        cluster.propose_membership(cnew);
+        cluster.commit_membership();
+        assert!(!cluster.has_voter(1));
+        assert!(cluster.has_voter(4));
+        assert!(cluster.has_voter(5));
+
+        cluster.run_for(50_000);
+        assert!(
+            cluster.leader().is_some(),
+            "post-commit cluster has a leader"
         );
     }
 }
