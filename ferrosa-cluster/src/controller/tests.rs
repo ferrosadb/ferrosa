@@ -1888,3 +1888,72 @@ fn bootstrap_silent_failure_counts_exposes_three_counters() {
     assert!(init2 >= init);
     assert!(election2 >= election);
 }
+
+/// W1.15 / hazard P1-1: the controller's mutexes are `parking_lot::Mutex`
+/// rather than `std::sync::Mutex`, so a panic inside a critical section
+/// does NOT poison the lock — subsequent acquisitions succeed and the
+/// controller stays responsive. This is the essential property that the
+/// `parking_lot` migration was supposed to deliver.
+///
+/// Strategy: stand up a fresh ModeController (which holds parking_lot
+/// mutexes for `approved_nodes`, `pending_joins`, `connected_peers`,
+/// etc.). On a separate thread, acquire one of those mutexes and panic.
+/// After the panic-thread joins, re-acquire the same mutex from this
+/// thread and assert it succeeds.
+#[test]
+fn controller_mutex_does_not_propagate_poison() {
+    use std::panic;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    let host_id = Uuid::new_v4();
+    let (controller, _handles) =
+        ModeController::new(config, net_config, host_id, storage, schema, registry);
+
+    // Step 1: panic while holding the `approved_nodes` lock on a worker
+    // thread. With std::sync::Mutex this would poison the lock and
+    // every subsequent .lock() would return a PoisonError. With
+    // parking_lot::Mutex the lock is simply released on unwind.
+    let controller_clone = controller.clone();
+    let join = std::thread::spawn(move || {
+        let _approved = controller_clone.approved_nodes.lock();
+        panic!("intentional panic inside critical section");
+    });
+
+    // Suppress the panic's stderr noise from the harness output.
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let _ = join.join(); // returns Err with the panic payload
+    }));
+
+    // Step 2: subsequent locks must succeed. With std::sync::Mutex this
+    // would .lock().unwrap() panic with a PoisonError; parking_lot has
+    // no Result.
+    let host = Uuid::new_v4();
+    {
+        let mut approved = controller.approved_nodes.lock();
+        approved.insert(host);
+    }
+    assert!(
+        controller.approved_nodes.lock().contains(&host),
+        "parking_lot mutex must remain usable after a panic in a critical section"
+    );
+
+    // Also exercise the other mutexes named in hazard P1-1 to pin the
+    // contract for `pending_joins`, `connected_peers`, etc.
+    {
+        let mut pending = controller.pending_joins.lock();
+        pending.push(host);
+    }
+    assert_eq!(
+        controller.pending_joins.lock().len(),
+        1,
+        "pending_joins remains writable after the panic"
+    );
+}
