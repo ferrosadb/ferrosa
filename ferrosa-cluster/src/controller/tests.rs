@@ -1957,3 +1957,85 @@ fn controller_mutex_does_not_propagate_poison() {
         "pending_joins remains writable after the panic"
     );
 }
+
+/// W1.16 / hazard P1-3: concurrent mode transitions must serialize via
+/// the controller's `transition_guard` so two simultaneous callers
+/// cannot both observe the same starting mode and both apply a
+/// transition. Without serialization, two `on_peer_connected` callbacks
+/// arriving on different threads could each see Standalone and both
+/// call `transition_to_pair`, producing a poisoned state where the
+/// pair_context is overwritten mid-setup.
+#[test]
+fn concurrent_mode_transitions_serialize() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    let host_id = Uuid::new_v4();
+    let (controller, _handles) =
+        ModeController::new(config, net_config, host_id, storage, schema, registry);
+
+    let peer_a = Uuid::new_v4();
+    let peer_b = Uuid::new_v4();
+    let addr_a: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let count = Arc::new(AtomicUsize::new(0));
+
+    let c1 = controller.clone();
+    let b1 = barrier.clone();
+    let n1 = count.clone();
+    let t1 = std::thread::spawn(move || {
+        b1.wait();
+        c1.on_peer_connected((peer_a, addr_a));
+        n1.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let c2 = controller.clone();
+    let b2 = barrier.clone();
+    let n2 = count.clone();
+    let t2 = std::thread::spawn(move || {
+        b2.wait();
+        c2.on_peer_connected((peer_b, addr_b));
+        n2.fetch_add(1, Ordering::SeqCst);
+    });
+
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    // Both calls completed.
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+
+    // The transition_guard mutex's hold count reflects that BOTH
+    // callers acquired it — they did not race past the guard.
+    let acquires = controller
+        .contention_metrics
+        .transition_guard_acquires
+        .load(Ordering::Relaxed);
+    assert!(
+        acquires >= 2,
+        "both peer-connect callers must have acquired the transition guard \
+         (got {acquires} acquires) — concurrent transitions should serialize"
+    );
+
+    // The connected_peers list should contain both peers (both calls
+    // appended through the mutex, no lost updates).
+    let peers = controller.connected_peers.lock();
+    assert_eq!(
+        peers.len(),
+        2,
+        "both peers must be tracked; lost update would suggest a serialization gap"
+    );
+    let ids: Vec<Uuid> = peers.iter().map(|(id, _)| *id).collect();
+    assert!(ids.contains(&peer_a));
+    assert!(ids.contains(&peer_b));
+}
