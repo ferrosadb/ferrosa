@@ -40,7 +40,7 @@ pub struct AbstractState {
 /// One refinement-check failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefinementError {
-    /// Index of the offending [`TraceEntry`] in the trace.
+    /// Index of the offending [`crate::TraceEntry`] in the trace.
     pub step: usize,
     /// Text describing why the action is not a valid TLA+ step.
     pub reason: String,

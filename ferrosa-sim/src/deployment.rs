@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Cluster lifecycle mode mirrored from
-/// [`ferrosa_cluster::mode::DeploymentMode`].
+/// `ferrosa_cluster::mode::DeploymentMode`.
 ///
 /// Only the fields the simulator transitions through are modelled;
 /// the full state machine lives in `ferrosa-cluster`.

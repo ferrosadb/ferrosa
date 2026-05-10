@@ -4,7 +4,7 @@
 //! ~700 lines of imperative orchestration to bring a Forming cluster up
 //! to its first leader-elected, schema-replayed steady state. Sprint 4
 //! decomposes that work into eight typed phases, each with explicit
-//! [`precondition`] and [`postcondition`] checks. Errors carry the
+//! `precondition` and `postcondition` checks. Errors carry the
 //! offending [`BootstrapPhase`], so a caller (today only the spawned
 //! bootstrap task; tomorrow a coordinator-driven phase runner) can log
 //! and recover at the right granularity.

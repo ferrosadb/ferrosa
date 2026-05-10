@@ -43,7 +43,7 @@ pub struct RaftGroupId(pub Uuid);
 impl RaftGroupId {
     /// Derive a deterministic group ID from a DC name.
     ///
-    /// Uses UUID v5 with the [`FERROSA_RAFT_GROUP_NAMESPACE`] namespace
+    /// Uses UUID v5 with the `FERROSA_RAFT_GROUP_NAMESPACE` namespace
     /// so every node that reads `data_center = "<name>"` agrees on the
     /// resulting `RaftGroupId`.
     pub fn for_dc(dc_name: &str) -> Self {

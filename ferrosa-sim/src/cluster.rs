@@ -2,9 +2,11 @@
 //! event loop.
 //!
 //! Sprint 5 W5.3.  The cluster is the unit of test composition: a
-//! seed in, a final state out.  All progress comes from
-//! [`SimulatedCluster::tick`], which advances the simulated clock by
-//! one millisecond and drains every event whose deadline has passed.
+//! seed in, a final state out.  All progress comes from the
+//! event-loop drivers ([`SimulatedCluster::run_for`] and
+//! [`SimulatedCluster::run_until_leader`]), which advance the simulated
+//! clock by one millisecond at a time and drain every event whose
+//! deadline has passed.
 //!
 //! W5.3 implements the smallest event surface that lets a 3-voter
 //! cluster elect a leader:

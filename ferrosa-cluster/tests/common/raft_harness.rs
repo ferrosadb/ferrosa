@@ -745,7 +745,7 @@ impl TestCluster {
         } = self;
         let extras =
             std::mem::take(&mut *extra_nodes.lock().expect("extra_nodes lock at shutdown"));
-        for n in nodes.into_iter().chain(extras.into_iter()) {
+        for n in nodes.into_iter().chain(extras) {
             registry.unregister(n.node_id);
             // openraft 0.9 has `Raft::shutdown` returning a Result; the harness
             // tolerates either Ok (normal) or Err (already shut down).
