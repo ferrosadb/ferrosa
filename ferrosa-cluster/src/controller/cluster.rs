@@ -1090,16 +1090,34 @@ impl ModeController {
                 tracing::info!("non-seed node — skipping raft.initialize(), waiting for leader AppendEntries");
             }
 
-            // Wait for leader election (poll with backoff, max ~30s)
+            // Wait for leader election.
+            //
+            // W1.17 — the deadline is driven by `formation_timeout_secs`
+            // when configured (operator override) so a small test or
+            // failure-mode harness can assert the Forming → Pair
+            // fallback fires deterministically.  Default keeps the
+            // historical ~30 s budget.
+            let formation_deadline_secs = config_for_promotion
+                .formation_timeout_secs
+                .unwrap_or(30);
+            let formation_deadline_secs = formation_deadline_secs.max(1);
+            let election_start = tokio::time::Instant::now();
+            let election_deadline = election_start
+                + std::time::Duration::from_secs(formation_deadline_secs);
             let mut leader = None;
-            for attempt in 0..60 {
+            let mut attempt: u32 = 0;
+            loop {
                 if let Some(lid) = raft_arc.current_leader().await {
                     leader = Some(lid);
+                    break;
+                }
+                if tokio::time::Instant::now() >= election_deadline {
                     break;
                 }
                 let backoff =
                     std::time::Duration::from_millis(if attempt < 10 { 100 } else { 500 });
                 tokio::time::sleep(backoff).await;
+                attempt = attempt.saturating_add(1);
             }
 
             match leader {
@@ -1617,7 +1635,8 @@ impl ModeController {
                     LEADER_ELECTION_TIMEOUTS.fetch_add(1, AtomicOrdering::Relaxed);
                     tracing::error!(
                         peers = peers.len(),
-                        "raft leader election timed out after ~30s — reverting to Pair mode \
+                        deadline_secs = formation_deadline_secs,
+                        "raft leader election timed out — reverting to Pair mode \
                          (this is a fail-loud signal: cluster formation did not complete)"
                     );
                     // Revert to Pair mode — formation failed. The Raft instance

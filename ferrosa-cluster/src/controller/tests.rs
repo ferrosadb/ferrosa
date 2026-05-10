@@ -2039,3 +2039,85 @@ fn concurrent_mode_transitions_serialize() {
     assert!(ids.contains(&peer_a));
     assert!(ids.contains(&peer_b));
 }
+
+/// W1.17 — when `formation_timeout_secs` elapses without a Raft
+/// leader, the node reverts to Pair mode and the DDL path falls
+/// back to Direct so single-node DDL still works.
+///
+/// We drive `transition_to_forming` with one stub peer that the node
+/// cannot reach (the harness has no real network), so the Raft
+/// election poll runs out the budget and the timeout branch fires.
+/// `formation_timeout_secs = 1` keeps the test fast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forming_falls_back_to_pair_on_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        formation_timeout_secs: Some(1),
+        // Aggressive election timing so the per-node tick budget
+        // is exhausted within the formation budget.
+        raft_heartbeat_ms: 50,
+        raft_election_timeout_min_ms: 100,
+        raft_election_timeout_max_ms: 200,
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    // The seed (calls raft.initialize) is the node with the highest
+    // UUID.  Force the local host to be seed so the election path
+    // actually runs.  Without this, the local node would be a passive
+    // non-seed waiting for AppendEntries from an unreachable peer.
+    let host_id = Uuid::from_u128(u128::MAX);
+    let peer_id = Uuid::from_u128(1);
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        host_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        host_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    // Forge a peer entry that the controller will try to contact and
+    // fail (no RPC server bound at 127.0.0.1:1).  This is enough to
+    // drive transition_to_cluster's election poll into its timeout
+    // branch.
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    controller.transition_to_forming(vec![(peer_id, unreachable)]);
+    // transition_to_forming synchronously fans into transition_to_cluster,
+    // which spawns the Raft init task and may flip mode to Cluster
+    // before this assertion runs.  Skip the intermediate check —
+    // what we really care about is the eventual fall-back to Pair.
+
+    // formation_timeout_secs = 1.  But cluster.rs also spends up to
+    // 10 s on `peer_manager.has_live_peer` waiting for connections
+    // before Raft init begins.  Total wall time to observe the
+    // fallback: ~11 s + headroom.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+    let mut observed_mode = controller.mode();
+    while tokio::time::Instant::now() < deadline {
+        observed_mode = controller.mode();
+        if observed_mode == DeploymentMode::Pair {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        observed_mode,
+        DeploymentMode::Pair,
+        "after formation_timeout_secs elapses without a leader, mode must revert to Pair",
+    );
+
+    controller.shutdown().await;
+}
