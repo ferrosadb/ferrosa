@@ -47,11 +47,15 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, InstallSnapshotRequest,
     InstallSnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, Config as RaftLibConfig, RaftMetrics, RaftNetwork, RaftNetworkFactory};
-use tokio::sync::{mpsc, oneshot};
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
+use openraft::{
+    BasicNode, Config as RaftLibConfig, LogId, RaftMetrics, RaftNetwork, RaftNetworkFactory,
+    SnapshotMeta, StorageError, StoredMembership,
+};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
 use ferrosa_cluster::raft::log_store::SledLogStore;
-use ferrosa_cluster::raft::state_machine::FerrosStateMachine;
+use ferrosa_cluster::raft::state_machine::{FerrosStateMachine, RaftState};
 use ferrosa_cluster::raft::{FerrosRaft, FerrosRaftConfig, RaftCommand, RaftResponse};
 
 // ---------------------------------------------------------------------------
@@ -276,12 +280,115 @@ impl std::fmt::Display for ChannelClosed {
 impl std::error::Error for ChannelClosed {}
 
 // ---------------------------------------------------------------------------
+// SharedStateMachine — wraps `FerrosStateMachine` so the harness can read it.
+// ---------------------------------------------------------------------------
+
+/// Adapter that lets the harness retain a handle to the state machine
+/// after openraft moves it into `Raft::new`.  All trait calls forward
+/// to the inner machine under a `tokio::sync::Mutex` so the harness
+/// can hold the lock across the inner `.await`s on the snapshot path.
+///
+/// Production code uses `FerrosStateMachine` directly; this wrapper
+/// is strictly a test affordance.  It serialises `apply` and snapshot
+/// operations the same way openraft already does, so semantics match.
+#[derive(Clone)]
+pub struct SharedStateMachine {
+    inner: Arc<AsyncMutex<FerrosStateMachine>>,
+}
+
+impl SharedStateMachine {
+    fn new(sm: FerrosStateMachine) -> Self {
+        Self {
+            inner: Arc::new(AsyncMutex::new(sm)),
+        }
+    }
+
+    /// Clone the application-level `RaftState` (members, token_map,
+    /// approved_nodes, …) so callers can assert on it without holding
+    /// the lock across other awaits.
+    pub async fn snapshot_state(&self) -> RaftState {
+        self.inner.lock().await.state().clone()
+    }
+
+    /// Synchronous variant of [`Self::snapshot_state`] for use from non-
+    /// async test contexts.  Uses `try_lock` and panics if the state
+    /// machine is currently being mutated by an apply call.
+    pub fn snapshot_state_blocking(&self) -> RaftState {
+        self.inner
+            .try_lock()
+            .map(|sm| sm.state().clone())
+            .expect("state machine busy — call from async context with snapshot_state()")
+    }
+}
+
+impl RaftStateMachine<FerrosRaftConfig> for SharedStateMachine {
+    type SnapshotBuilder = SharedStateMachine;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+        let mut sm = self.inner.lock().await;
+        sm.applied_state().await
+    }
+
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftResponse>, StorageError<u64>>
+    where
+        I: IntoIterator<Item = openraft::Entry<FerrosRaftConfig>> + Send,
+        I::IntoIter: Send,
+    {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let mut sm = self.inner.lock().await;
+        sm.apply(entries).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        // Reuse the same Arc — the SnapshotBuilder impl below also
+        // takes the lock.  This means snapshot building briefly
+        // contends with apply, which is fine for the harness.
+        self.clone()
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
+        Ok(Box::new(std::io::Cursor::new(Vec::new())))
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        snapshot: Box<std::io::Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<u64>> {
+        let mut sm = self.inner.lock().await;
+        sm.install_snapshot(meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<FerrosRaftConfig>>, StorageError<u64>> {
+        let mut sm = self.inner.lock().await;
+        sm.get_current_snapshot().await
+    }
+}
+
+impl RaftSnapshotBuilder<FerrosRaftConfig> for SharedStateMachine {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<FerrosRaftConfig>, StorageError<u64>> {
+        let mut sm = self.inner.lock().await;
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.build_snapshot().await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TestNode
 // ---------------------------------------------------------------------------
 
 pub struct TestNode {
     pub node_id: u64,
     pub raft: Arc<FerrosRaft>,
+    /// Lock-shared handle to the underlying state machine. Use
+    /// `state_machine.snapshot_state()` to read application state.
+    pub state_machine: SharedStateMachine,
     /// Handle to the inbound dispatcher loop; aborted at shutdown.
     dispatcher: tokio::task::JoinHandle<()>,
     /// Held to keep tempdir alive for the lifetime of the test.
@@ -294,6 +401,12 @@ impl TestNode {
     /// Snapshot of the openraft metrics for this node.
     pub fn metrics(&self) -> RaftMetrics<u64, BasicNode> {
         self.raft.metrics().borrow().clone()
+    }
+
+    /// Convenient access to the application-level `RaftState`.
+    /// Awaits the inner async lock — call from a tokio context.
+    pub async fn state_snapshot(&self) -> RaftState {
+        self.state_machine.snapshot_state().await
     }
 }
 
@@ -455,7 +568,8 @@ async fn build_test_node(
     std::fs::create_dir_all(&log_path).expect("create raft log dir");
     let log_store = SledLogStore::new(&log_path).expect("open sled log store");
 
-    let state_machine = FerrosStateMachine::new();
+    let state_machine = SharedStateMachine::new(FerrosStateMachine::new());
+    let state_machine_for_node = state_machine.clone();
 
     // Bound the inbound channel so a stalled node back-pressures
     // its peers rather than buffering unbounded RPC traffic.
@@ -514,6 +628,7 @@ async fn build_test_node(
     TestNode {
         node_id,
         raft,
+        state_machine: state_machine_for_node,
         dispatcher,
         _tempdir: tempdir,
         registry,
