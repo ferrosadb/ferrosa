@@ -12,16 +12,18 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod deployment;
+pub mod node;
+
+pub use deployment::DeploymentMode;
+pub use node::{NodeId, Role, SimulatedNode};
+
 #[cfg(test)]
 mod smoke {
     /// W5.1 RED → GREEN: the crate compiles and `cargo test` reports
-    /// at least one passing test.  The work-item spec calls for a
-    /// "no tests" run, but every cargo crate that ships goes green
-    /// on at least one assertion.
+    /// at least one passing test.
     #[test]
     fn crate_compiles_and_runs_empty_test() {
-        // Trivial assertion: presence of this test proves the crate
-        // builds with the workspace toolchain at all.
         assert_eq!(2 + 2, 4);
     }
 }

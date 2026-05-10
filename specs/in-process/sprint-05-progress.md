@@ -51,6 +51,7 @@ hard-to-reproduce flakes.
 | WI    | Status | Commit prefix | Tests added | Notes |
 |-------|--------|---------------|-------------|-------|
 | W5.1  | **Done** | feat(sim): W5.1 | 1 (`crate_compiles_and_runs_empty_test`) | New crate `ferrosa-sim` added to workspace; deps `serde`, `tracing`, dev `proptest`. |
+| W5.2  | **Done** | feat(sim): W5.2 | 1 (`madsim_runs_single_node`) | `SimulatedNode` + `Role` + mirrored `DeploymentMode`; protocol-level only — no openraft/sled wrapping. |
 
 ## Final commit count
 
