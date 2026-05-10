@@ -56,6 +56,7 @@ hard-to-reproduce flakes.
 | W5.4  | **Done** | feat(sim): W5.4 | 2 (`same_seed_produces_same_trace`, `different_seeds_produce_different_traces`) | `Trace` + `TlaAction` types; trace recorded for every transition. README documents the determinism contract. |
 | W5.5  | **Done** | feat(sim): W5.5 | 3 (`sim_nemesis_partition_halves`, `sim_nemesis_kill_minority`, `sim_nemesis_add_node`) | `Nemesis` trait + `PartitionHalves`, `KillMinority`, `AddNode`. Cluster API: `partition_pair`, `kill`, `add_voter`, `run_for`. |
 | W5.6  | **Done** | feat(sim): W5.6 | 11 (8 phase-level + `sim_full_bootstrap_pipeline` + `sim_full_bootstrap_seed_sweep` (100 seeds) + `seed_37_settles_to_one_leader_two_followers`) | Sim-level mirror of Sprint 4's 8 `BootstrapPhase`s with pre/post-conditions; runtime tests via `run_phase` and `run_full_bootstrap`. |
+| W5.7  | **Done** (spec written, Apalache check is operator follow-up) | docs(tla): W5.7 | 3 (`tla_spec_file_exists`, `safety_invariants_hold_after_election`, `election_safety_catches_two_leaders`) | `specs/tla/raft.tla` + `raft.cfg` covering ElectionSafety, LogMatching, LeaderCompleteness, StateMachineSafety, LeaderAppendOnly. Apalache not installed in the agent env; Rust-side `spec` module re-implements the snapshot invariants for sim-time use. |
 
 ## Final commit count
 

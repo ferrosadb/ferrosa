@@ -18,6 +18,7 @@ pub mod deployment;
 pub mod nemesis;
 pub mod node;
 pub mod rng;
+pub mod spec;
 pub mod trace;
 
 pub use cluster::{Event, SimulatedCluster, Tick};
