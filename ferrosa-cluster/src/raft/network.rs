@@ -217,12 +217,17 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
             .map(Bytes::from)
             .map_err(|e| RPCError::Network(NetworkError::new(&*e)))?;
 
+        // W4.13 (Sprint 4): InstallSnapshot rides on the Bulk lane,
+        // not the Raft lane.  Sending a 100 MB snapshot down Lane::Raft
+        // pushed AppendEntries p99 from ~5 ms to ~600 ms, well over
+        // election_timeout_min, causing avoidable elections.
+        // See `crate::raft::snapshot_transport::snapshot_lane`.
         let response = self
             .peer_manager
             .send(
                 self.target_host_id,
                 Message::RaftInstallSnapshot(payload),
-                Lane::Raft,
+                crate::raft::snapshot_transport::snapshot_lane(),
             )
             .await
             .map_err(net_error_to_unreachable_snapshot)?;

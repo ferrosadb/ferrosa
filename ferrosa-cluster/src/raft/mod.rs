@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod log_store;
 pub mod network;
 pub mod snapshot_pusher;
+pub mod snapshot_transport;
 pub mod state_machine;
 
 pub use group_id::{RaftGroupId, DEFAULT_DC_NAME};
