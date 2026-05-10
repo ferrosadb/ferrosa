@@ -115,10 +115,16 @@ enum Commands {
         action: AuthAction,
     },
 
-    /// Raft administration commands.
+    /// Raft administration commands (ADR-012, W1.11, ADR-015).
     Raft {
         #[command(subcommand)]
         action: RaftAction,
+    },
+
+    /// Cluster operations — multi-DC bootstrap, etc. (ADR-015).
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
     },
 
     /// Restore from a snapshot, optionally to a point in time.
@@ -134,17 +140,35 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-
-    /// Raft cluster operations (ADR-012).
-    Raft {
-        #[command(subcommand)]
-        action: RaftAction,
-    },
 }
 
-/// Raft sub-actions (ADR-012).
+/// Raft administration sub-actions.
+///
+/// Unifies the W1.11 "reset" command with the ADR-012 "transfer-leader"
+/// command. Both share the same Raft-engine entry point, so they live
+/// under one subcommand to avoid clap's "multiple variants with the
+/// same name" error.
 #[derive(Debug, Subcommand)]
 enum RaftAction {
+    /// Wipe a node's persisted Raft state (log + meta trees) so it
+    /// rejoins the cluster as a fresh learner. The node must be stopped
+    /// before running this — sled holds an exclusive flock(2) on the
+    /// data directory.
+    ///
+    /// Use case: recovery from the disruptor-partition runaway-term
+    /// failure mode (specs/in-process/bug-raft-stale-candidate-runaway-
+    /// term-no-prevote.md). The leader's InstallSnapshot / AppendEntries
+    /// will replay committed history onto the reset node.
+    Reset {
+        /// Path to the node's Raft data directory (e.g. `/var/lib/ferrosa/raft`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+
+        /// Print what would be cleared without actually clearing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Transfer Raft leadership to a target node (Ongaro §3.10).
     ///
     /// Useful for graceful drains during DC-aware operations and for
@@ -209,26 +233,32 @@ enum AuthAction {
     },
 }
 
-/// Raft administration sub-actions (W1.11).
+/// Cluster sub-actions (ADR-015).
 #[derive(Debug, Subcommand)]
-enum RaftAction {
-    /// Wipe a node's persisted Raft state (log + meta trees) so it
-    /// rejoins the cluster as a fresh learner. The node must be stopped
-    /// before running this — sled holds an exclusive flock(2) on the
-    /// data directory.
+enum ClusterAction {
+    /// Bootstrap a new per-DC Raft group (W6.7, ADR-015).
     ///
-    /// Use case: recovery from the disruptor-partition runaway-term
-    /// failure mode (specs/in-process/bug-raft-stale-candidate-runaway-
-    /// term-no-prevote.md). The leader's InstallSnapshot / AppendEntries
-    /// will replay committed history onto the reset node.
-    Reset {
-        /// Path to the node's Raft data directory (e.g. `/var/lib/ferrosa/raft`).
-        #[arg(long)]
-        data_dir: std::path::PathBuf,
+    /// Creates a fresh Raft group identified by `RaftGroupId::for_dc(<dc>)`
+    /// with the listed seed nodes as the initial voter set. Existing DC
+    /// groups continue running unchanged. Useful for adding a third DC
+    /// after initial cluster bring-up, or rebuilding a per-DC group
+    /// after a catastrophic failure.
+    ///
+    /// **Status**: in-process scaffolding (Sprint 6). The HTTP wire-up
+    /// to the running node lands alongside the multi-DC formation
+    /// rollout in Sprint 7. Until then, the command computes the
+    /// derived `RaftGroupId` and prints it so operators can verify
+    /// the per-DC namespace before they pull the trigger.
+    BootstrapDc {
+        /// DC name. Must match the `FERROSA_DATA_CENTER` env on the
+        /// seed nodes.
+        #[arg(long = "dc")]
+        dc: String,
 
-        /// Print what would be cleared without actually clearing.
-        #[arg(long)]
-        dry_run: bool,
+        /// Comma-separated list of seed addresses, e.g.
+        /// `node3a:7000,node3b:7000,node3c:7000`.
+        #[arg(long = "seeds", value_delimiter = ',')]
+        seeds: Vec<String>,
     },
 }
 
@@ -329,6 +359,12 @@ async fn main() {
         },
         Commands::Raft { action } => match action {
             RaftAction::Reset { data_dir, dry_run } => commands::raft_reset(&data_dir, dry_run),
+            RaftAction::TransferLeader { to } => {
+                commands::raft_transfer_leader(&web_host, web_port, &to).await
+            }
+        },
+        Commands::Cluster { action } => match action {
+            ClusterAction::BootstrapDc { dc, seeds } => commands::cluster_bootstrap_dc(&dc, &seeds),
         },
         Commands::Restore {
             snapshot_name,
@@ -344,11 +380,6 @@ async fn main() {
             )
             .await
         }
-        Commands::Raft { action } => match action {
-            RaftAction::TransferLeader { to } => {
-                commands::raft_transfer_leader(&web_host, web_port, &to).await
-            }
-        },
     };
 
     if let Err(e) = result {

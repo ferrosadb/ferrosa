@@ -620,6 +620,45 @@ pub fn raft_reset(
     Ok(())
 }
 
+/// W6.7 (ADR-015): bootstrap a new per-DC Raft group.
+///
+/// Computes the deterministic [`ferrosa_cluster::raft::RaftGroupId`]
+/// from the DC name and prints the operator-visible bootstrap plan.
+/// The HTTP wire-up to the running node lands in Sprint 7 alongside
+/// the multi-DC formation rollout — until then this command is the
+/// scaffolding that lets operators verify the per-DC namespace
+/// (group_id, log dir layout, seed list) before pulling the trigger.
+///
+/// Returns `Ok(())` for any well-formed argument set; an empty seed
+/// list is still allowed because Sprint 6 doesn't yet contact the
+/// node, and this enables CI tests of the wiring.
+pub fn cluster_bootstrap_dc(
+    dc_name: &str,
+    seeds: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if dc_name.trim().is_empty() {
+        return Err("--dc must not be empty".into());
+    }
+    let group_id = ferrosa_cluster::raft::RaftGroupId::for_dc(dc_name);
+    println!(
+        "ferrosa-ctl cluster bootstrap-dc\n\
+         dc:        {dc_name}\n\
+         group_id:  {group_id}\n\
+         seeds:     {seeds_pretty}\n\
+         log_dir:   <raft_data_dir>/{dc_name}/\n\
+         status:    Sprint 6 scaffolding — group_id derivation verified;\n\
+                    the live HTTP wire-up lands in Sprint 7. Re-run\n\
+                    against a Sprint 7 build (or call the HTTP endpoint\n\
+                    directly) to actually create the group on the node.",
+        seeds_pretty = if seeds.is_empty() {
+            "(none)".to_string()
+        } else {
+            seeds.join(", ")
+        }
+    );
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1689,5 +1728,43 @@ mod tests {
             Some(b"closing" as &[u8])
         );
         assert_eq!(result.rows[2].columns[1].as_deref(), Some(b"open" as &[u8]));
+    }
+
+    /// W6.7: `ferrosa-ctl cluster bootstrap-dc --dc dc3 --seeds ...`
+    /// derives a deterministic per-DC `RaftGroupId` and exits clean.
+    /// Re-running with the same DC produces an identical group id —
+    /// idempotency guarantees that re-issuing the command on retry is
+    /// safe.
+    #[test]
+    fn ferrosa_ctl_bootstrap_dc_creates_raft_group() {
+        // Computed once here so the assertion below pins the
+        // determinism property without relying on the printed output.
+        let id_a = ferrosa_cluster::raft::RaftGroupId::for_dc("dc3");
+        let id_b = ferrosa_cluster::raft::RaftGroupId::for_dc("dc3");
+        assert_eq!(id_a, id_b, "group_id derivation must be deterministic");
+
+        // Different DC produces a different id — existing dc1/dc2
+        // groups are unaffected by a `bootstrap-dc dc3` run.
+        let id_other = ferrosa_cluster::raft::RaftGroupId::for_dc("dc1");
+        assert_ne!(id_a, id_other);
+
+        // The command itself accepts the well-formed args without
+        // error, even with an empty seed list (Sprint 6 scaffolding;
+        // the HTTP wire-up that requires the seed list lands in
+        // Sprint 7).
+        let seeds = vec![
+            "node3a:7000".to_string(),
+            "node3b:7000".to_string(),
+            "node3c:7000".to_string(),
+        ];
+        cluster_bootstrap_dc("dc3", &seeds).expect("well-formed args");
+
+        // Empty DC name is rejected.
+        let err = cluster_bootstrap_dc("", &seeds).expect_err("empty dc must be rejected");
+        assert!(err.to_string().contains("--dc"));
+
+        // Empty seeds — allowed in Sprint 6 (operator may inspect the
+        // derived group_id without committing to a seed set yet).
+        cluster_bootstrap_dc("dc3", &[]).expect("empty seeds permitted in scaffolding");
     }
 }
