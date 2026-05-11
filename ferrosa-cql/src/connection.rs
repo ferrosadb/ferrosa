@@ -303,14 +303,24 @@ pub async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // CQL v5 framing (CRC24/CRC32 envelopes) is only
-                            // enabled when the client sets USE_BETA (0x10) in
-                            // the STARTUP flags, matching Cassandra's behavior.
-                            // Clients that negotiate v5 without USE_BETA (e.g.,
-                            // Python cassandra-driver) use v5 semantics over
-                            // v4 unframed transport.
-                            if client_protocol_version >= 0x05 && client_use_beta {
-                                debug!("enabling v5 framing for {peer} (USE_BETA set)");
+                            // CQL v5 framing (CRC24/CRC32 envelopes) is the
+                            // wire format for v5 once negotiated — the
+                            // USE_BETA flag was a transitional opt-in while
+                            // v5 was beta in Cassandra 4.0 and is no longer
+                            // required by Cassandra 5.0 / DataStax Java Driver
+                            // 4.x / Python cassandra-driver 3.25+, all of
+                            // which send envelopes without USE_BETA.  Gating
+                            // on USE_BETA caused ferrosa to keep parsing the
+                            // driver's envelope flag byte (e.g. 0xA1) as a v4
+                            // opcode and close the connection.
+                            // See ferrosa-nosqlbench/docs/initial-gaps-found.md
+                            // (Gap 5).
+                            //
+                            // `_client_use_beta` is retained for future
+                            // gating of beta-only opcodes inside v5.
+                            let _ = client_use_beta;
+                            if client_protocol_version >= 0x05 {
+                                debug!("enabling v5 framing for {peer}");
                                 framed.codec_mut().enable_v5_framing();
                             }
                         }
