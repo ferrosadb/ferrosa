@@ -32,7 +32,7 @@ pub(crate) mod sync;
 pub use config::{ArchiveConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
 pub use mutation::Mutation;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,8 +76,8 @@ fn is_zeroed_segment_header(path: &std::path::Path) -> ferrosa_common::Result<bo
 ///
 /// - **Append** is lock-free on the hot path (CAS allocation in the active segment).
 /// - **Rotation** briefly takes the `closed_segments` mutex to move the old segment.
-/// - **Discard** takes both `segment_tracker` and `closed_segments` mutexes to
-///   clean up fully-flushed segments.
+/// - **Discard** takes the `closed_segments` mutex and queries each
+///   segment's own (lock-free) `dirty_tables` map.
 pub struct CommitLog {
     /// Commit log configuration.
     config: Config,
@@ -87,10 +87,6 @@ pub struct CommitLog {
 
     /// Segments that are full but still have dirty (unflushed) tables.
     closed_segments: Mutex<Vec<Arc<Segment>>>,
-
-    /// Per-segment dirty table tracking. Key = segment ID, value = map of
-    /// table ID to the latest position written for that table in that segment.
-    segment_tracker: Mutex<HashMap<u64, HashMap<TableId, CommitLogPosition>>>,
 
     /// Controls when segment buffers are fsynced to disk.
     sync_strategy: Box<dyn SyncStrategy>,
@@ -138,7 +134,6 @@ impl CommitLog {
             config,
             active,
             closed_segments: Mutex::new(Vec::new()),
-            segment_tracker: Mutex::new(HashMap::new()),
             sync_strategy,
             next_segment_id: AtomicU64::new(first_segment_id + 1),
             archived: Mutex::new(HashSet::new()),
@@ -341,24 +336,11 @@ impl CommitLog {
         let position = segment.write_entry(offset, mutation);
         segment.writer_done();
 
-        // Track dirty table in this segment.
+        // Track dirty table in this segment. `dirty_tables` on the segment
+        // is a `DashMap<TableId, AtomicU64>` so this is lock-free in steady
+        // state — no global commit-log-level mutex on the hot path.
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         segment.mark_table_dirty(&table_id, position);
-
-        // Update segment tracker.
-        {
-            let mut tracker = self.segment_tracker.lock();
-            tracker
-                .entry(segment.id)
-                .or_default()
-                .entry(table_id)
-                .and_modify(|existing| {
-                    if position > *existing {
-                        *existing = position;
-                    }
-                })
-                .or_insert(position);
-        }
 
         // Notify sync strategy.
         self.sync_strategy.on_write(&segment, offset);
@@ -379,31 +361,33 @@ impl CommitLog {
     ) -> ferrosa_common::Result<()> {
         let mut segments_to_delete = Vec::new();
 
-        {
-            let mut tracker = self.segment_tracker.lock();
-
-            // For each tracked segment, check if this table's position is dominated.
-            let segment_ids: Vec<u64> = tracker.keys().copied().collect();
-            for seg_id in segment_ids {
-                if let Some(tables) = tracker.get_mut(&seg_id) {
-                    if let Some(table_pos) = tables.get(table_id) {
-                        if *table_pos <= position {
-                            tables.remove(table_id);
-                        }
-                    }
-                    if tables.is_empty() {
-                        // Check archive gate: if archiving is enabled, the segment
-                        // must be archived before it can be deleted from disk.
-                        let dominated_by_archive = match &self.config.archive {
-                            Some(cfg) if cfg.enabled => self.archived.lock().contains(&seg_id),
-                            _ => true, // Archiving disabled — no gate.
-                        };
-
-                        if dominated_by_archive {
-                            tracker.remove(&seg_id);
-                            segments_to_delete.push(seg_id);
-                        }
-                    }
+        // Iterate active + closed segments. Each segment's `dirty_tables`
+        // is a `DashMap` so per-segment removal is lock-free per-shard.
+        //
+        // Ordering: `CommitLogPosition` sorts by `(segment_id, offset)`,
+        // so for a segment whose id is strictly less than `position.segment_id`,
+        // *every* recorded offset is dominated and the entry is removed
+        // unconditionally. When ids match, we compare offsets. Newer
+        // segments (id > position.segment_id) are skipped.
+        let active = self.active.load_full();
+        let active_id = active.id;
+        let closed_snapshot: Vec<Arc<Segment>> = self.closed_segments.lock().clone();
+        let all_segments = std::iter::once(active).chain(closed_snapshot);
+        for segment in all_segments {
+            let now_empty = match segment.id.cmp(&position.segment_id) {
+                std::cmp::Ordering::Less => segment.discard_table_unconditional(table_id),
+                std::cmp::Ordering::Equal => {
+                    segment.discard_table_if_dominated(table_id, position.offset)
+                }
+                std::cmp::Ordering::Greater => false,
+            };
+            if now_empty && segment.id != active_id {
+                let dominated_by_archive = match &self.config.archive {
+                    Some(cfg) if cfg.enabled => self.archived.lock().contains(&segment.id),
+                    _ => true,
+                };
+                if dominated_by_archive {
+                    segments_to_delete.push(segment.id);
                 }
             }
         }
@@ -449,23 +433,18 @@ impl CommitLog {
     pub fn discard_completed_segments(&self) -> ferrosa_common::Result<usize> {
         let mut segments_to_delete = Vec::new();
 
-        {
-            let mut tracker = self.segment_tracker.lock();
-            let segment_ids: Vec<u64> = tracker.keys().copied().collect();
-            for seg_id in segment_ids {
-                if tracker.get(&seg_id).is_some_and(|tables| tables.is_empty()) {
-                    // Check archive gate: if archiving is enabled, the segment
-                    // must be archived before it can be deleted from disk.
-                    let dominated_by_archive = match &self.config.archive {
-                        Some(cfg) if cfg.enabled => self.archived.lock().contains(&seg_id),
-                        _ => true, // Archiving disabled — no gate.
-                    };
-
-                    if dominated_by_archive {
-                        tracker.remove(&seg_id);
-                        segments_to_delete.push(seg_id);
-                    }
-                }
+        // Only look at closed segments — the active one keeps writing.
+        let closed_snapshot: Vec<Arc<Segment>> = self.closed_segments.lock().clone();
+        for segment in closed_snapshot {
+            if !segment.is_dirty_empty() {
+                continue;
+            }
+            let dominated_by_archive = match &self.config.archive {
+                Some(cfg) if cfg.enabled => self.archived.lock().contains(&segment.id),
+                _ => true,
+            };
+            if dominated_by_archive {
+                segments_to_delete.push(segment.id);
             }
         }
 
