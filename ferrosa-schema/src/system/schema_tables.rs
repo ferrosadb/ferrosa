@@ -30,6 +30,12 @@ pub struct TableRow {
     pub table_name: String,
     /// Unique table identifier.
     pub id: Uuid,
+    /// Change-data-capture enabled (Cassandra 3.8+). The DataStax Java
+    /// Driver 4.x `TableParser` calls `row.getBoolean("cdc")` unconditionally,
+    /// so this column must be present and non-null even if ferrosa does not
+    /// implement CDC.  Default `false`.
+    /// See ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 7).
+    pub cdc: bool,
 }
 
 /// A row from `system_schema.columns`.
@@ -69,7 +75,10 @@ pub fn query_keyspaces(snap: &SchemaSnapshot) -> Vec<KeyspaceRow> {
         .values()
         .map(|ks| {
             let mut replication = ks.replication.options.clone();
-            replication.insert("class".to_string(), ks.replication.strategy.clone());
+            replication.insert(
+                "class".to_string(),
+                fully_qualify_strategy(&ks.replication.strategy),
+            );
             KeyspaceRow {
                 keyspace_name: ks.name.clone(),
                 durable_writes: ks.durable_writes,
@@ -92,11 +101,70 @@ pub fn query_keyspaces(snap: &SchemaSnapshot) -> Vec<KeyspaceRow> {
 
 fn system_keyspace_row(name: &str) -> KeyspaceRow {
     let mut replication = HashMap::new();
-    replication.insert("class".to_string(), "LocalStrategy".to_string());
+    replication.insert("class".to_string(), fully_qualify_strategy("LocalStrategy"));
     KeyspaceRow {
         keyspace_name: name.to_string(),
         durable_writes: true,
         replication,
+    }
+}
+
+/// Normalize a replication strategy class name to the fully-qualified
+/// `org.apache.cassandra.locator.*` form that the DataStax Java Driver
+/// 4.x recognises.  Unqualified names like `"SimpleStrategy"` cause the
+/// driver's `DefaultMetadata` token-map refresh to log a warning and skip
+/// the topology, breaking driver-aware routing.  See
+/// ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 8).
+fn fully_qualify_strategy(name: &str) -> String {
+    if name.starts_with("org.apache.cassandra.locator.") {
+        return name.to_string();
+    }
+    match name {
+        "SimpleStrategy" => "org.apache.cassandra.locator.SimpleStrategy".to_string(),
+        "NetworkTopologyStrategy" => {
+            "org.apache.cassandra.locator.NetworkTopologyStrategy".to_string()
+        }
+        "LocalStrategy" => "org.apache.cassandra.locator.LocalStrategy".to_string(),
+        // Unknown strategies pass through — operator may be using a custom
+        // strategy class that they already wrote fully qualified.
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod fully_qualify_strategy_tests {
+    use super::fully_qualify_strategy;
+
+    #[test]
+    fn shortname_becomes_fully_qualified() {
+        assert_eq!(
+            fully_qualify_strategy("SimpleStrategy"),
+            "org.apache.cassandra.locator.SimpleStrategy"
+        );
+        assert_eq!(
+            fully_qualify_strategy("NetworkTopologyStrategy"),
+            "org.apache.cassandra.locator.NetworkTopologyStrategy"
+        );
+        assert_eq!(
+            fully_qualify_strategy("LocalStrategy"),
+            "org.apache.cassandra.locator.LocalStrategy"
+        );
+    }
+
+    #[test]
+    fn already_qualified_passes_through() {
+        assert_eq!(
+            fully_qualify_strategy("org.apache.cassandra.locator.SimpleStrategy"),
+            "org.apache.cassandra.locator.SimpleStrategy"
+        );
+    }
+
+    #[test]
+    fn unknown_strategy_passes_through() {
+        assert_eq!(
+            fully_qualify_strategy("MyCustomStrategy"),
+            "MyCustomStrategy"
+        );
     }
 }
 
@@ -110,6 +178,7 @@ pub fn query_tables(snap: &SchemaSnapshot) -> Vec<TableRow> {
         keyspace_name: t.keyspace.clone(),
         table_name: t.name.clone(),
         id: t.id,
+        cdc: false,
     }));
     rows
 }
@@ -188,6 +257,7 @@ fn system_table_rows() -> Vec<TableRow> {
             keyspace_name: ks.to_string(),
             table_name: tbl.to_string(),
             id: Uuid::new_v4(),
+            cdc: false,
         })
         .collect()
 }
@@ -516,7 +586,7 @@ mod tests {
         assert!(user_rows[0].durable_writes);
         assert_eq!(
             user_rows[0].replication.get("class"),
-            Some(&"SimpleStrategy".to_string())
+            Some(&"org.apache.cassandra.locator.SimpleStrategy".to_string())
         );
     }
 

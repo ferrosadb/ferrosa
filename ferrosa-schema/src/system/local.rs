@@ -45,7 +45,9 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             cluster_name: "ferrosa".to_string(),
-            data_center: "dc1".to_string(),
+            // Cassandra 5.0 / DataStax driver convention.  See
+            // ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 3).
+            data_center: "datacenter1".to_string(),
             rack: "rack1".to_string(),
             rpc_port: 9042,
             host_id: Uuid::new_v4(),
@@ -176,7 +178,11 @@ mod tests {
     fn node_config_defaults() {
         let config = NodeConfig::default();
         assert_eq!(config.cluster_name, "ferrosa");
-        assert_eq!(config.data_center, "dc1");
+        // Cassandra 5.0 / DSE / DataStax driver convention.  Drivers default
+        // `localdc=datacenter1`; reporting anything else makes the driver's
+        // topology probe reject every contact point.  See
+        // ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 3).
+        assert_eq!(config.data_center, "datacenter1");
         assert_eq!(config.rack, "rack1");
         assert_eq!(config.rpc_port, 9042);
     }

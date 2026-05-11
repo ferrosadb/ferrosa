@@ -1280,6 +1280,26 @@ impl FerrosStateMachine {
                 } else {
                     let node_id = super::uuid_to_node_id(node_info.host_id);
                     self.state.members.insert(node_id, node_info);
+                    // Auto-assign deterministic tokens so a late-joining node
+                    // (e.g. the rejoin path via `ClusterDdlForwardHandler`,
+                    // which only proposes `RaftOp::JoinNode` and not
+                    // `RaftOp::AssignTokens`) still appears as a token-owning
+                    // peer in `system.peers`. Without this, the node lands in
+                    // `state.members` but `state.token_map` has no entries for
+                    // it, so `RaftClusterState::peers().tokens` is empty and
+                    // CQL drivers route every key to the seed.
+                    // Use `or_insert` so we never steal a token already owned
+                    // by another node — deterministic generation makes
+                    // collisions astronomically unlikely, but this preserves
+                    // the existing owner if one occurs.
+                    let num_tokens = self.state.config.num_tokens as usize;
+                    if num_tokens > 0 {
+                        for tok in
+                            crate::controller::deterministic_tokens_for_node(node_id, num_tokens)
+                        {
+                            self.state.token_map.entry(tok).or_insert(node_id);
+                        }
+                    }
                     self.sync_ring();
                     // Mark the new node as Building for all existing indexes.
                     for statuses in self.state.index_state_map.values_mut() {
@@ -1962,6 +1982,122 @@ mod tests {
         assert_eq!(sm.state().members[&node_id].addr, "10.0.0.1:7000");
     }
 
+    /// Regression test for the system.peers empty-tokens bug:
+    /// the rejoin / late-join path goes through `ClusterDdlForwardHandler`,
+    /// which proposes `RaftOp::JoinNode` but **not** a follow-up
+    /// `RaftOp::AssignTokens`.  Without auto-assignment inside the
+    /// state machine, the new node lands in `state.members` with no
+    /// entry in `state.token_map`, so `system.peers` reports it with
+    /// empty tokens and cdrs-tokio's `is_peer_row_valid` filter drops
+    /// the row — making the cluster behave as single-owner.
+    #[tokio::test]
+    async fn apply_join_node_auto_assigns_deterministic_tokens() {
+        let mut sm = FerrosStateMachine::new();
+        // Seed a non-zero num_tokens so the assignment is observable.
+        let cfg = ClusterConfig {
+            num_tokens: 8,
+            ..ClusterConfig::default()
+        };
+        sm.apply(vec![make_entry(1, 1, RaftOp::UpdateConfig(cfg))])
+            .await
+            .unwrap();
+
+        let host_id = Uuid::new_v4();
+        let node = NodeInfo {
+            host_id,
+            addr: "10.0.0.1:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+        let node_id = super::super::uuid_to_node_id(host_id);
+
+        sm.apply(vec![make_entry(1, 2, RaftOp::JoinNode(node))])
+            .await
+            .unwrap();
+
+        assert!(sm.state().members.contains_key(&node_id));
+        let owned_tokens: Vec<i64> = sm
+            .state()
+            .token_map
+            .iter()
+            .filter_map(|(&t, &n)| (n == node_id).then_some(t))
+            .collect();
+        assert_eq!(
+            owned_tokens.len(),
+            8,
+            "JoinNode must auto-assign num_tokens deterministic tokens \
+             so the late-joining node is a visible owner in system.peers; \
+             got {} tokens",
+            owned_tokens.len()
+        );
+        // The auto-assigned set must match the deterministic generator.
+        let expected = crate::controller::deterministic_tokens_for_node(node_id, 8);
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        let mut got_sorted = owned_tokens.clone();
+        got_sorted.sort();
+        assert_eq!(
+            got_sorted, expected_sorted,
+            "auto-assigned tokens must match deterministic_tokens_for_node"
+        );
+    }
+
+    /// A follow-up explicit `AssignTokens` with the same deterministic
+    /// token set must be idempotent — the seed-init and
+    /// `MembershipManager::join_node` paths still issue it explicitly,
+    /// so re-application must not break the auto-assigned state.
+    #[tokio::test]
+    async fn apply_join_node_then_explicit_assign_tokens_is_idempotent() {
+        let mut sm = FerrosStateMachine::new();
+        let cfg = ClusterConfig {
+            num_tokens: 4,
+            ..ClusterConfig::default()
+        };
+        sm.apply(vec![make_entry(1, 1, RaftOp::UpdateConfig(cfg))])
+            .await
+            .unwrap();
+
+        let host_id = Uuid::new_v4();
+        let node = NodeInfo {
+            host_id,
+            addr: "10.0.0.2:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+        let node_id = super::super::uuid_to_node_id(host_id);
+        let tokens = crate::controller::deterministic_tokens_for_node(node_id, 4);
+
+        sm.apply(vec![
+            make_entry(1, 2, RaftOp::JoinNode(node)),
+            make_entry(
+                1,
+                3,
+                RaftOp::AssignTokens {
+                    node_id,
+                    tokens: tokens.clone(),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // After both ops, the node still owns exactly the deterministic set.
+        let owned: Vec<i64> = sm
+            .state()
+            .token_map
+            .iter()
+            .filter_map(|(&t, &n)| (n == node_id).then_some(t))
+            .collect();
+        assert_eq!(owned.len(), 4);
+        for t in &tokens {
+            assert_eq!(sm.state().token_map.get(t), Some(&node_id));
+        }
+    }
+
     #[tokio::test]
     async fn apply_assign_tokens() {
         let mut sm = FerrosStateMachine::new();
@@ -2130,7 +2266,15 @@ mod tests {
         let snapshot_path = dir.path().join("state-machine.snapshot.bin");
 
         let mut sm = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        // Disable auto-token-assignment so the explicit `AssignTokens` is
+        // the sole source of tokens — this test exercises snapshot
+        // round-trip, not the auto-assignment policy.
+        let cfg = ClusterConfig {
+            num_tokens: 0,
+            ..ClusterConfig::default()
+        };
         let entries = vec![
+            make_entry(1, 0, RaftOp::UpdateConfig(cfg)),
             make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks1"))),
             make_entry(
                 1,
@@ -2903,7 +3047,15 @@ mod tests {
             cql_broadcast: None,
         };
 
+        // Disable auto-token-assignment so the explicit `AssignTokens`
+        // entry is the sole source of tokens — this test exercises
+        // ring-sync, not the auto-assignment policy.
+        let cfg = ClusterConfig {
+            num_tokens: 0,
+            ..ClusterConfig::default()
+        };
         let entries = vec![
+            make_entry(1, 0, RaftOp::UpdateConfig(cfg)),
             make_entry(1, 1, RaftOp::JoinNode(node)),
             make_entry(
                 1,
@@ -3686,6 +3838,19 @@ mod tests {
         let mut sm = FerrosStateMachine::new();
         let host_id = Uuid::new_v4();
         let node_id = crate::raft::uuid_to_node_id(host_id);
+
+        // Disable auto-token-assignment so the explicit `AssignTokens`
+        // entry is the sole source of tokens — this test exercises that
+        // UpdateNodeInfo refreshes metadata without touching tokens,
+        // orthogonal to the auto-assignment policy.
+        let cfg = ClusterConfig {
+            num_tokens: 0,
+            ..ClusterConfig::default()
+        };
+        sm.apply_command(RaftCommand {
+            op: RaftOp::UpdateConfig(cfg),
+            schema_version: Uuid::new_v4(),
+        });
 
         sm.apply_command(RaftCommand {
             op: RaftOp::JoinNode(NodeInfo {

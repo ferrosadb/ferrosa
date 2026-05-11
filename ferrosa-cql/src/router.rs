@@ -1215,8 +1215,38 @@ async fn route_select(
         ("system_schema", "tables") => {
             let snap = state.schema.snapshot();
             let table_rows = query_tables(&snap);
-            let col_names = vec!["keyspace_name".into(), "table_name".into(), "id".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Uuid];
+            // Cassandra 5.0 `system_schema.tables` has 20 columns; ferrosa
+            // currently advertises four: the three keys the existing schema
+            // introspection paths use (`keyspace_name`, `table_name`, `id`)
+            // plus `cdc` (boolean, default `false`). The DataStax Java
+            // Driver 4.x `TableParser.parseRow` calls
+            // `row.getBoolean("cdc")` unconditionally; without the column
+            // present, `getBoolean` returns null and unboxing throws NPE
+            // during the post-DDL schema refresh.  See
+            // ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 7).
+            // Boolean columns the DataStax driver reads unconditionally
+            // during schema refresh:
+            //   - cdc                 (driver default-ok via ifPresentAndNonNull)
+            //   - allow_auto_snapshot (driver requires column present)
+            //   - incremental_backups (driver requires column present)
+            // Cassandra returns NULL for the latter two on most rows — we do
+            // the same so the column metadata exists but values stay null.
+            let col_names = vec![
+                "keyspace_name".into(),
+                "table_name".into(),
+                "id".into(),
+                "cdc".into(),
+                "allow_auto_snapshot".into(),
+                "incremental_backups".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Uuid,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Boolean,
+            ];
             // Apply WHERE equality filters.
             let filtered: Vec<_> = table_rows
                 .iter()
@@ -1244,6 +1274,10 @@ async fn route_select(
                         Some(CqlValue::Text(t.keyspace_name.clone())),
                         Some(CqlValue::Text(t.table_name.clone())),
                         Some(CqlValue::Uuid(t.id)),
+                        Some(CqlValue::Boolean(t.cdc)),
+                        // Cassandra returns NULL for these on most tables — match.
+                        None,
+                        None,
                     ]
                 })
                 .collect();
@@ -1572,9 +1606,151 @@ async fn route_select(
                 &rows,
             ))
         }
+        // Cassandra 5.0 `system_virtual_schema` keyspace — describes the
+        // virtual tables a node exposes.  DataStax Java Driver 4.x queries
+        // all three of these during connection initialization; returning
+        // ERROR(table not found) leaves the driver's host pool empty and
+        // every subsequent query fails with "No node was available".
+        // See ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 2).
+        //
+        // We currently return well-typed empty result sets — Cassandra's
+        // driver tolerates an empty system_virtual_schema and proceeds to
+        // schema refresh of user keyspaces.  When ferrosa grows a
+        // first-class introspection surface for its virtual tables
+        // (system_observability.*, etc.) we populate these rows.
+        ("system_virtual_schema", "keyspaces") => {
+            let col_names = vec!["keyspace_name".to_string()];
+            let col_types = vec![CqlType::Varchar];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_virtual_schema",
+                "keyspaces",
+                &[],
+            ))
+        }
+        ("system_virtual_schema", "tables") => {
+            let col_names = vec![
+                "keyspace_name".to_string(),
+                "table_name".to_string(),
+                "comment".to_string(),
+            ];
+            let col_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Varchar];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_virtual_schema",
+                "tables",
+                &[],
+            ))
+        }
+        ("system_virtual_schema", "columns") => {
+            let col_names = vec![
+                "keyspace_name".to_string(),
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "clustering_order".to_string(),
+                "column_name_bytes".to_string(),
+                "kind".to_string(),
+                "position".to_string(),
+                "type".to_string(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Blob,
+                CqlType::Varchar,
+                CqlType::Int,
+                CqlType::Varchar,
+            ];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_virtual_schema",
+                "columns",
+                &[],
+            ))
+        }
+        // system_schema.views — empty (ferrosa does not implement
+        // materialized views) but the column metadata must match Cassandra
+        // 5.0 so the DataStax driver's `ViewParser` finds the boolean
+        // columns it expects (`cdc`, `include_all_columns`,
+        // `allow_auto_snapshot`, `incremental_backups`).  Without these in
+        // the column set, `getBoolean(...)` returns null during schema
+        // refresh and unboxing throws NPE.  See
+        // ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 7).
+        ("system_schema", "views") => {
+            let col_names = vec![
+                "keyspace_name".into(),
+                "view_name".into(),
+                "base_table_id".into(),
+                "base_table_name".into(),
+                "cdc".into(),
+                "include_all_columns".into(),
+                "allow_auto_snapshot".into(),
+                "incremental_backups".into(),
+                "id".into(),
+                "where_clause".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Uuid,
+                CqlType::Varchar,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Uuid,
+                CqlType::Varchar,
+            ];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "views",
+                &[],
+            ))
+        }
+        // system_schema.functions — empty, but column metadata mirrors
+        // Cassandra so the Java driver's `FunctionParser` finds the
+        // boolean `called_on_null_input` it expects.  See gap 7 in
+        // ferrosa-nosqlbench/docs/initial-gaps-found.md.
+        ("system_schema", "functions") => {
+            let col_names = vec![
+                "keyspace_name".into(),
+                "function_name".into(),
+                "argument_types".into(),
+                "argument_names".into(),
+                "body".into(),
+                "called_on_null_input".into(),
+                "language".into(),
+                "return_type".into(),
+            ];
+            let list_text = CqlType::List(Box::new(CqlType::Varchar));
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                list_text.clone(),
+                list_text,
+                CqlType::Varchar,
+                CqlType::Boolean,
+                CqlType::Varchar,
+                CqlType::Varchar,
+            ];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "functions",
+                &[],
+            ))
+        }
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
-        ("system_schema", "functions" | "aggregates" | "triggers" | "views") => {
+        ("system_schema", "aggregates" | "triggers") => {
             // p1-37: Stub these tables until they have first-class
             // implementations. Honor the SELECT projection so col_specs
             // match driver-requested shape — every column is advertised
@@ -2714,6 +2890,43 @@ fn route_explain(
     ))
 }
 
+// ── USING TIMESTAMP / TTL helpers (Gap 10) ───────────────────────────────
+//
+// `using_timestamp` and `using_ttl` are now `Option<Term>` so the prepare
+// path can register bind markers (`USING TIMESTAMP ?`).  By the time the
+// router executes, `substitute_in_statement` has replaced any
+// `Term::BindMarker` with the bound literal.  These helpers extract the
+// integer with a clear error if substitution was missed or the literal is
+// out of range.
+
+fn using_timestamp_as_i64(t: &Option<Term>) -> Result<Option<i64>, CqlError> {
+    match t {
+        None => Ok(None),
+        Some(Term::IntegerLiteral(n)) => Ok(Some(*n)),
+        Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
+            "USING TIMESTAMP bind marker was not substituted before execution".into(),
+        )),
+        Some(other) => Err(CqlError::Invalid(format!(
+            "USING TIMESTAMP must be an integer literal or bind marker, got {other:?}"
+        ))),
+    }
+}
+
+fn using_ttl_as_i32(t: &Option<Term>) -> Result<Option<i32>, CqlError> {
+    match t {
+        None => Ok(None),
+        Some(Term::IntegerLiteral(n)) => i32::try_from(*n)
+            .map(Some)
+            .map_err(|_| CqlError::Invalid(format!("USING TTL value {n} out of i32 range"))),
+        Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
+            "USING TTL bind marker was not substituted before execution".into(),
+        )),
+        Some(other) => Err(CqlError::Invalid(format!(
+            "USING TTL must be an integer literal or bind marker, got {other:?}"
+        ))),
+    }
+}
+
 // ── INSERT ───────────────────────────────────────────────────────────────
 
 async fn route_insert(
@@ -2741,7 +2954,7 @@ async fn route_insert(
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    let timestamp = match s.using_timestamp {
+    let timestamp = match using_timestamp_as_i64(&s.using_timestamp)? {
         Some(ts) => ts,
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2781,7 +2994,12 @@ async fn route_insert(
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let table_id = TableId::new(ks, &s.table);
     let strategy = keyspace_strategy(&state.schema, ks);
 
@@ -2925,7 +3143,7 @@ async fn route_update(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = match s.using_timestamp {
+    let timestamp = match using_timestamp_as_i64(&s.using_timestamp)? {
         Some(ts) => ts,
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3174,7 +3392,12 @@ async fn route_update(
         regular_cells.push((col_idx, value));
     }
 
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let strategy = keyspace_strategy(&state.schema, ks);
 
     state
@@ -3299,7 +3522,7 @@ async fn route_delete(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = match s.using_timestamp {
+    let timestamp = match using_timestamp_as_i64(&s.using_timestamp)? {
         Some(ts) => ts,
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3439,7 +3662,7 @@ async fn route_logged_batch(
 ) -> Result<BytesMut, CqlError> {
     use ferrosa_storage::Mutation;
 
-    let batch_timestamp = b.using_timestamp.unwrap_or_else(|| {
+    let batch_timestamp = using_timestamp_as_i64(&b.using_timestamp)?.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3535,7 +3758,7 @@ fn materialize_insert(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+    let timestamp = using_timestamp_as_i64(&s.using_timestamp)?.unwrap_or(batch_timestamp);
 
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
@@ -3572,7 +3795,12 @@ fn materialize_insert(
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let table_id = TableId::new(ks, &s.table);
 
     Ok((table_id, decorated_key, row, timestamp))
@@ -3608,7 +3836,7 @@ fn materialize_update(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+    let timestamp = using_timestamp_as_i64(&s.using_timestamp)?.unwrap_or(batch_timestamp);
 
     let pk_values = extract_pk_values(
         &s.where_clauses,
@@ -3666,7 +3894,12 @@ fn materialize_update(
     }
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let table_id = TableId::new(ks, &s.table);
 
     Ok((table_id, decorated_key, row, timestamp))
@@ -3702,7 +3935,7 @@ fn materialize_delete(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+    let timestamp = using_timestamp_as_i64(&s.using_timestamp)?.unwrap_or(batch_timestamp);
 
     let pk_values = extract_pk_values(
         &s.where_clauses,
@@ -8127,6 +8360,40 @@ mod tests {
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
+        }
+    }
+
+    /// Gap 2 (ferrosa-nosqlbench/docs/initial-gaps-found.md): the DataStax
+    /// Java Driver 4.x queries all three system_virtual_schema tables
+    /// during connection bring-up.  Pre-fix, ferrosa returned
+    /// "table not found" and the driver gave up on every host; post-fix
+    /// each query must succeed with an empty-but-typed result.
+    #[tokio::test]
+    async fn select_system_virtual_schema_keyspaces_returns_empty_ok() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for table in ["keyspaces", "tables", "columns"] {
+            let q = format!("SELECT * FROM system_virtual_schema.{table}");
+            let stmt = crate::parser::parse(&q).unwrap();
+            let result = route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("system_virtual_schema.{table} returned error: {e:?}"));
+            match &result {
+                // Rows kind (0x0002) — schema-typed empty result.
+                RouteResult::Result(b) => assert_eq!(
+                    &b[0..4],
+                    &0x0002i32.to_be_bytes(),
+                    "system_virtual_schema.{table} should return Rows result",
+                ),
+                _ => panic!("expected RouteResult::Result for system_virtual_schema.{table}"),
+            }
         }
     }
 

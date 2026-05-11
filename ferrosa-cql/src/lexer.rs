@@ -427,6 +427,24 @@ impl<'input> Lexer<'input> {
                 continue;
             }
 
+            // Line comment: `//` to end of line (Cassandra accepts both
+            // `--` and `//`; NoSQLBench workload templates such as
+            // `cql_timeseries2.yaml` use `//` to annotate columns inside
+            // `CREATE TABLE`, e.g. `machine_id UUID,     // source machine`.
+            // Without this arm the parser rejects the schema phase with
+            // `unexpected character '/' at position N`.  Gap 9 in
+            // ferrosa-nosqlbench/docs/initial-gaps-found.md.
+            if self.pos + 1 < self.bytes.len()
+                && self.bytes[self.pos] == b'/'
+                && self.bytes[self.pos + 1] == b'/'
+            {
+                self.pos += 2;
+                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                    self.pos += 1;
+                }
+                continue;
+            }
+
             // Block comment: /* ... */
             if self.pos + 1 < self.bytes.len()
                 && self.bytes[self.pos] == b'/'
@@ -1116,6 +1134,29 @@ mod tests {
     fn lex_block_comment() {
         let tokens = lex_all("/* comment */SELECT");
         assert_eq!(tokens, vec![TokenKind::Keyword(Keyword::Select)]);
+    }
+
+    /// `//` line comments are accepted by Cassandra; NoSQLBench bundled
+    /// workloads (e.g. `cql_timeseries2.yaml`) use them inline inside
+    /// `CREATE TABLE` to annotate columns.  See gap 9 in
+    /// `ferrosa-nosqlbench/docs/initial-gaps-found.md`.
+    #[test]
+    fn lex_double_slash_line_comment() {
+        let tokens = lex_all("// comment\nSELECT");
+        assert_eq!(tokens, vec![TokenKind::Keyword(Keyword::Select)]);
+    }
+
+    #[test]
+    fn lex_double_slash_inline_in_create_table_columns() {
+        // Mirrors the failing fragment from cql_timeseries2.yaml:
+        //   machine_id UUID,     // source machine
+        // The token stream should be: id, comma, then SELECT after the
+        // EOL terminating the comment.
+        let tokens = lex_all("machine_id UUID,     // source machine\nSELECT");
+        assert!(
+            matches!(tokens.last(), Some(TokenKind::Keyword(Keyword::Select))),
+            "expected SELECT after `//` comment, got: {tokens:?}"
+        );
     }
 
     #[test]
