@@ -120,11 +120,29 @@ pub async fn handle_connection<S>(
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
 
     // In-flight request limiter: bounds concurrent requests on this connection.
-    let in_flight = tokio::sync::Semaphore::new(max_in_flight);
+    // `Arc<Semaphore>` so spawned per-request tasks can hold owned permits;
+    // see the `dispatch_concurrent` path below.
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(max_in_flight));
+
+    // Channel for responses produced by spawned request handlers (Query /
+    // Execute / Batch) back to this main loop, which owns `framed`. Without
+    // this, every request had to be fully processed before the loop could
+    // even read the next frame — turning CQL's stream-id-multiplexed protocol
+    // into a strictly-serial one-at-a-time channel and capping throughput
+    // at `1 / per_request_latency` per connection regardless of how many
+    // in-flight permits we advertised.
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<SpawnedResponse>(max_in_flight.max(64));
 
     loop {
-        // Use select to handle both client frames and subscription pushes.
+        // Use select to handle client frames, subscription pushes, and
+        // responses from spawned request handlers.
+        //
+        // `biased;` prefers draining responses first so the writer side
+        // doesn't lag the reader side under heavy concurrent load.
         let frame_or_push = tokio::select! {
+            biased;
+            Some(resp) = resp_rx.recv() => FrameOrPush::Response(resp),
             // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
             result = timeout(IDLE_TIMEOUT, framed.next()) => {
                 match result {
@@ -171,6 +189,34 @@ pub async fn handle_connection<S>(
         };
 
         match frame_or_push {
+            FrameOrPush::Response(resp) => {
+                // Apply any keyspace mutation that the spawned handler
+                // observed (e.g. a `USE` statement). Mutations land here in
+                // spawn-completion order, not request-arrival order — same
+                // semantics as Cassandra under concurrent USE issuance.
+                if let Some(ks) = resp.keyspace_after {
+                    current_keyspace = ks;
+                }
+                if resp.bump_request_counter {
+                    state.connection_tracker.increment_requests(&peer);
+                }
+                if !apply_handle_result(
+                    resp.result,
+                    resp.stream_id,
+                    resp.response_version,
+                    &mut framed,
+                    &state,
+                    peer,
+                    &auth_context,
+                    &current_keyspace,
+                    &sub_tx,
+                    &mut subscription_state,
+                )
+                .await
+                {
+                    break;
+                }
+            }
             FrameOrPush::SubscriptionPush(push) => {
                 // Send streaming result frame from a subscription task.
                 let frame = CqlFrame {
@@ -185,12 +231,16 @@ pub async fn handle_connection<S>(
                 let stream_id = maybe_frame.header.stream_id;
 
                 // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
+                // The permit lifetime is tied to the request: held inline
+                // (in `_permit`) for the rare opcodes still handled inline,
+                // and *moved into the spawned task* for Ready-phase
+                // Query/Execute/Batch via the concurrent dispatch path.
                 let is_request = matches!(
                     maybe_frame.header.opcode,
                     Opcode::Query | Opcode::Execute | Opcode::Batch
                 );
-                let _permit = if is_request {
-                    match in_flight.try_acquire() {
+                let acquired_permit: Option<tokio::sync::OwnedSemaphorePermit> = if is_request {
+                    match in_flight.clone().try_acquire_owned() {
                         Ok(permit) => Some(permit),
                         Err(_) => {
                             debug!("in-flight limit reached for {peer}, rejecting request");
@@ -224,6 +274,103 @@ pub async fn handle_connection<S>(
                 }
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
+
+                // Concurrent dispatch path: in `Ready` phase, run the
+                // common request opcodes on spawned tasks so the main
+                // loop can immediately read the next frame. This is what
+                // turns a per-connection serial channel into a real
+                // stream-id-multiplexed one (matching CQL native
+                // protocol semantics).
+                if was_ready
+                    && matches!(
+                        maybe_frame.header.opcode,
+                        Opcode::Query | Opcode::Execute | Opcode::Batch
+                    )
+                {
+                    let permit =
+                        acquired_permit.expect("permit acquired above for Query/Execute/Batch");
+                    let response_version = if client_protocol_version >= 0x05 {
+                        0x85
+                    } else {
+                        VERSION_RESPONSE
+                    };
+                    let opcode = maybe_frame.header.opcode;
+                    let body = maybe_frame.body.clone();
+                    let state_clone = state.clone();
+                    let resp_tx = resp_tx.clone();
+                    let ks_at_spawn = current_keyspace.clone();
+                    let mut auth_for_handler = auth_context.clone();
+                    let mut ks_for_handler = ks_at_spawn.clone();
+                    let peer_addr = peer;
+                    tokio::spawn(async move {
+                        let request_span = tracing::info_span!(
+                            "cql.request",
+                            cql.opcode = ?opcode,
+                            client.address = %peer_addr,
+                        );
+                        let result = (async {
+                            match opcode {
+                                Opcode::Query => {
+                                    handle_query(
+                                        &mut auth_for_handler,
+                                        &mut ks_for_handler,
+                                        &state_clone,
+                                        &body,
+                                        peer_addr,
+                                    )
+                                    .await
+                                }
+                                Opcode::Execute => {
+                                    handle_execute(
+                                        &mut auth_for_handler,
+                                        &mut ks_for_handler,
+                                        &state_clone,
+                                        &body,
+                                        peer_addr,
+                                    )
+                                    .await
+                                }
+                                Opcode::Batch => {
+                                    handle_batch(
+                                        &mut auth_for_handler,
+                                        &mut ks_for_handler,
+                                        &state_clone,
+                                        &body,
+                                        peer_addr,
+                                    )
+                                    .await
+                                }
+                                _ => unreachable!(
+                                    "concurrent dispatch only entered for Query/Execute/Batch"
+                                ),
+                            }
+                        })
+                        .instrument(request_span)
+                        .await;
+                        let keyspace_after = if ks_for_handler != ks_at_spawn {
+                            Some(ks_for_handler)
+                        } else {
+                            None
+                        };
+                        let _ = resp_tx
+                            .send(SpawnedResponse {
+                                stream_id,
+                                result,
+                                response_version,
+                                keyspace_after,
+                                bump_request_counter: true,
+                                _permit: permit,
+                            })
+                            .await;
+                    });
+                    continue;
+                }
+
+                // Inline path: handshake phases and rare Ready opcodes
+                // (Prepare, Register, Options). Keeps mutable connection
+                // state (`phase`, `auth_context`, `pending_compression`)
+                // owned by the main loop.
+                let _permit = acquired_permit;
 
                 debug!(
                     "received {:?} from {peer} stream={} phase={:?}",
@@ -458,10 +605,187 @@ pub async fn handle_connection<S>(
     debug!("connection handler for {peer} finished");
 }
 
-/// Internal enum for the select! loop — either a client frame or a subscription push.
+/// Apply a `HandleResult` from a spawned post-Ready handler to the
+/// connection's outbound side: writes the appropriate frame on `framed`,
+/// kicks off / cancels subscriptions if requested. Returns `false` if the
+/// caller should break out of the connection loop (e.g. socket send
+/// failure or `HandleResult::Close*`).
+///
+/// Only handles cases reachable from `Query` / `Execute` / `Batch` —
+/// handshake-driven codec changes (compression, v5-framing) stay on the
+/// inline path because they only fire for `Opcode::Ready` /
+/// `Opcode::AuthSuccess` and the inline match has the
+/// `client_protocol_version` / `pending_compression` it needs.
+#[allow(clippy::too_many_arguments)]
+async fn apply_handle_result<S>(
+    result: HandleResult,
+    stream_id: i16,
+    response_version: u8,
+    framed: &mut Framed<S, CqlCodec>,
+    state: &Arc<SharedState>,
+    _peer: SocketAddr,
+    auth_context: &Option<AuthContext>,
+    current_keyspace: &Option<String>,
+    sub_tx: &tokio::sync::mpsc::Sender<crate::subscribe::SubscriptionPush>,
+    subscription_state: &mut SubscriptionState,
+) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    match result {
+        HandleResult::Reply(opcode, body) => {
+            let frame = CqlFrame {
+                header: FrameHeader {
+                    version: response_version,
+                    flags: 0,
+                    stream_id,
+                    opcode,
+                    length: 0,
+                },
+                body: body.freeze(),
+            };
+            framed.send(frame).await.is_ok()
+        }
+        HandleResult::StartSubscription {
+            inner,
+            interval,
+            delta,
+        } => {
+            let interval = match interval {
+                Some(d) => d,
+                None => {
+                    let err = CqlError::Invalid(
+                        "SUBSCRIBE without EVERY not yet supported; use SUBSCRIBE ... EVERY <interval>"
+                            .into(),
+                    );
+                    let frame = CqlFrame {
+                        header: FrameHeader {
+                            version: VERSION_RESPONSE,
+                            flags: 0,
+                            stream_id,
+                            opcode: Opcode::Error,
+                            length: 0,
+                        },
+                        body: err.encode_body().freeze(),
+                    };
+                    return framed.send(frame).await.is_ok();
+                }
+            };
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let handle = crate::subscribe::SubscriptionHandle {
+                stream_id: stream_id as u16,
+                cancel: cancel.clone(),
+            };
+            if let Err(msg) = subscription_state.add(handle) {
+                let err = CqlError::Invalid(msg.to_string());
+                let frame = CqlFrame {
+                    header: FrameHeader {
+                        version: VERSION_RESPONSE,
+                        flags: 0,
+                        stream_id,
+                        opcode: Opcode::Error,
+                        length: 0,
+                    },
+                    body: err.encode_body().freeze(),
+                };
+                return framed.send(frame).await.is_ok();
+            }
+            let ack_body = crate::result::encode_void().freeze();
+            let frame = CqlFrame {
+                header: FrameHeader {
+                    version: VERSION_RESPONSE,
+                    flags: 0,
+                    stream_id,
+                    opcode: Opcode::Result,
+                    length: 0,
+                },
+                body: ack_body,
+            };
+            if framed.send(frame).await.is_err() {
+                return false;
+            }
+            let auth = auth_context.clone().unwrap_or(AuthContext {
+                role: "cassandra".to_string(),
+                is_superuser: true,
+                must_change_password: false,
+            });
+            crate::subscribe::spawn_subscription_poll(
+                stream_id,
+                interval,
+                state.clone(),
+                auth,
+                current_keyspace.clone(),
+                *inner,
+                sub_tx.clone(),
+                cancel,
+                delta,
+            );
+            true
+        }
+        HandleResult::CancelSubscription { stream_id: sub_id } => {
+            subscription_state.cancel(sub_id);
+            let frame = CqlFrame {
+                header: FrameHeader {
+                    version: VERSION_RESPONSE,
+                    flags: 0,
+                    stream_id,
+                    opcode: Opcode::Result,
+                    length: 0,
+                },
+                body: crate::result::encode_void().freeze(),
+            };
+            framed.send(frame).await.is_ok()
+        }
+        HandleResult::Close(opcode, body) => {
+            let frame = CqlFrame {
+                header: FrameHeader {
+                    version: VERSION_RESPONSE,
+                    flags: 0,
+                    stream_id,
+                    opcode,
+                    length: 0,
+                },
+                body: body.freeze(),
+            };
+            let _ = framed.send(frame).await;
+            false
+        }
+        HandleResult::CloseNow => false,
+    }
+}
+
+/// Internal enum for the select! loop — either a client frame, a subscription
+/// push, or a response from a spawned request handler.
 enum FrameOrPush {
     ClientFrame(CqlFrame),
     SubscriptionPush(crate::subscribe::SubscriptionPush),
+    Response(SpawnedResponse),
+}
+
+/// Response produced by a spawned request handler, carrying back to the
+/// main loop everything it needs to (1) update connection-local state and
+/// (2) write the response frame.
+pub(crate) struct SpawnedResponse {
+    /// Stream id of the original request frame — echoed in the response
+    /// so the client can correlate.
+    stream_id: i16,
+    /// Whatever the handler produced; the main loop matches on this just
+    /// like the inline path.
+    result: HandleResult,
+    /// Response frame version (`0x84` for v4, `0x85` for v5). Captured at
+    /// dispatch time because `client_protocol_version` is per-connection
+    /// state owned by the main loop.
+    response_version: u8,
+    /// New keyspace value if the handler observed a `USE` statement.
+    /// `None` means unchanged; `Some(x)` is the new value.
+    keyspace_after: Option<Option<String>>,
+    /// `true` for spawned post-Ready requests so the main loop bumps the
+    /// per-connection request counter — matching the inline path's
+    /// `was_ready` bookkeeping.
+    bump_request_counter: bool,
+    /// Held until the handler responds so the in-flight permit is only
+    /// released after the response is buffered on the channel.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Outcome of processing a single frame.

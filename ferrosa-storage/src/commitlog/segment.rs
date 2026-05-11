@@ -46,12 +46,12 @@
 #![allow(dead_code)]
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
 
 use super::config::{CommitLogPosition, TableId};
@@ -98,7 +98,15 @@ pub struct Segment {
     path: PathBuf,
 
     /// Tables with uncommitted data in this segment.
-    dirty_tables: Mutex<HashMap<TableId, CommitLogPosition>>,
+    ///
+    /// Stores only the **offset** — `segment_id` is implicit in `self.id`.
+    /// Using `DashMap<TableId, AtomicU64>` keeps the hot-path update
+    /// (`mark_table_dirty`, called on every write) lock-free in steady
+    /// state: a `get(table_id)` returns a shard-read-locked `Ref` and
+    /// `fetch_max` advances the offset atomically. The previous
+    /// `Mutex<HashMap<...>>` was a global serialization point for every
+    /// append into the active segment.
+    pub(crate) dirty_tables: DashMap<TableId, AtomicU64>,
 
     /// Number of writers currently between `allocate()` and `write_entry()`
     /// completion. `flush_to_disk()` waits for this to reach zero before
@@ -159,7 +167,7 @@ impl Segment {
             capacity: size,
             created_at: Instant::now(),
             path,
-            dirty_tables: Mutex::new(HashMap::new()),
+            dirty_tables: DashMap::new(),
             in_flight_writers: AtomicU64::new(0),
             file_handle: Mutex::new(None),
             last_flushed: AtomicU64::new(INITIAL_POSITION),
@@ -466,16 +474,72 @@ impl Segment {
     }
 
     /// Marks a table as having dirty (unflushed) data in this segment.
+    ///
+    /// Lock-free in steady state: hits `DashMap::get` (per-shard read
+    /// lock) and `AtomicU64::fetch_max`. Only the first write per
+    /// (segment, table) pair pays the shard-write-lock cost of insert.
     pub fn mark_table_dirty(&self, table_id: &TableId, position: CommitLogPosition) {
-        let mut dirty = self.dirty_tables.lock();
-        dirty
+        debug_assert_eq!(
+            position.segment_id, self.id,
+            "mark_table_dirty called with foreign segment_id"
+        );
+        if let Some(existing) = self.dirty_tables.get(table_id) {
+            existing.fetch_max(position.offset, Ordering::Relaxed);
+            return;
+        }
+        // First-time insert for this table — pays a one-shot shard write lock.
+        // `or_insert_with` is atomic-enough: if a racing thread inserted
+        // between our `get` and `entry`, we still `fetch_max` the existing
+        // entry, never overwriting a higher offset.
+        let entry = self
+            .dirty_tables
             .entry(table_id.clone())
-            .and_modify(|existing| {
-                if position > *existing {
-                    *existing = position;
-                }
+            .or_insert_with(|| AtomicU64::new(0));
+        entry.fetch_max(position.offset, Ordering::Relaxed);
+    }
+
+    /// Removes a table's entry if its recorded offset is ≤ `up_to_offset`.
+    /// Returns whether the segment is now empty of dirty tables.
+    pub fn discard_table_if_dominated(&self, table_id: &TableId, up_to_offset: u64) -> bool {
+        if let Some(entry) = self.dirty_tables.get(table_id) {
+            if entry.load(Ordering::Relaxed) <= up_to_offset {
+                drop(entry);
+                self.dirty_tables.remove(table_id);
+            }
+        }
+        self.dirty_tables.is_empty()
+    }
+
+    /// Unconditionally drop the table from the dirty set. Used by the
+    /// commit-log discard path when the discard threshold's `segment_id`
+    /// is strictly greater than this segment's id — meaning every offset
+    /// here is dominated.
+    pub fn discard_table_unconditional(&self, table_id: &TableId) -> bool {
+        self.dirty_tables.remove(table_id);
+        self.dirty_tables.is_empty()
+    }
+
+    /// Returns `true` when this segment has no dirty tables left.
+    pub fn is_dirty_empty(&self) -> bool {
+        self.dirty_tables.is_empty()
+    }
+
+    /// Returns a snapshot of (table, latest-position) pairs currently
+    /// recorded as dirty in this segment.
+    pub fn dirty_table_positions(&self) -> Vec<(TableId, CommitLogPosition)> {
+        self.dirty_tables
+            .iter()
+            .map(|kv| {
+                let offset = kv.value().load(Ordering::Relaxed);
+                (
+                    kv.key().clone(),
+                    CommitLogPosition {
+                        segment_id: self.id,
+                        offset,
+                    },
+                )
             })
-            .or_insert(position);
+            .collect()
     }
 
     /// Returns `true` if this segment is older than `max_age`.
@@ -759,8 +823,9 @@ mod tests {
         segment.mark_table_dirty(&table, pos1);
         segment.mark_table_dirty(&table, pos2);
 
-        let dirty = segment.dirty_tables.lock();
-        assert_eq!(dirty[&table], pos2);
+        let dirty = segment.dirty_table_positions();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0], (table.clone(), pos2));
     }
 
     #[test]
@@ -871,11 +936,9 @@ mod tests {
             segment.path().file_name().unwrap().to_str().unwrap(),
             "commitlog-42.log"
         );
-        let dirty = segment.dirty_tables.lock();
-        assert_eq!(
-            dirty[&table], pos,
-            "dirty_tables must survive release_buffer"
-        );
+        let dirty = segment.dirty_table_positions();
+        assert_eq!(dirty.len(), 1, "dirty_tables must survive release_buffer");
+        assert_eq!(dirty[0], (table.clone(), pos));
     }
 
     #[test]
