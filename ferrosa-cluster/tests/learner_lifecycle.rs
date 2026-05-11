@@ -333,17 +333,86 @@ async fn demote_voter_to_learner_transfers_leader_first_if_needed() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // Transfer leadership to the new voter.
+    // Wait for the new voter to be caught up in replication on the leader.
+    // `Normal` membership is set as soon as the joint-config commits; the
+    // target's `matched_idx` may still trail the leader's `last_log_index`.
+    // openraft's `transfer_to` has an internal catch-up budget of
+    // `election_timeout_max × 2` which can run short under contention
+    // (this was a CI flake before the explicit pre-wait — see Sprint 8
+    // W8.3 follow-up). Block until either the indices align or 4s elapse.
+    {
+        let leader = cluster.leader_node();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let m = leader.metrics();
+            let leader_last = m.last_log_index.unwrap_or(0);
+            let matched = m
+                .replication
+                .as_ref()
+                .and_then(|r| r.get(&node_id).cloned().flatten())
+                .map(|lid| lid.index);
+            if matched.map(|i| i >= leader_last).unwrap_or(false) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "new voter did not catch up: leader_last={leader_last}, matched={matched:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // Transfer leadership to the new voter. The post-dispatch deadline
+    // (election_timeout_max × 2) is probabilistic: the target may win its
+    // election just after `transfer_to` returns `Timeout`, OR an earlier
+    // attempt may have already succeeded by the time we retry. Treat both
+    // `Ok` and `Timeout-followed-by-target-becoming-leader` as success;
+    // only fail if the target hasn't become leader within an outer 4s.
     let new_voter_raft = cluster
         .raft_for_node_id(node_id)
         .expect("raft handle for new voter");
-    cluster
-        .leader_node()
-        .raft
-        .trigger()
-        .transfer_to(node_id)
-        .await
-        .expect("transfer to new node");
+    {
+        let outer_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut succeeded = false;
+        while std::time::Instant::now() < outer_deadline {
+            if cluster.current_leader_id() == Some(node_id) {
+                succeeded = true;
+                break;
+            }
+            // Only attempt transfer if a leader is currently elected.
+            let Some(leader_id) = cluster.current_leader_id() else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            if leader_id == node_id {
+                succeeded = true;
+                break;
+            }
+            let Some(leader_raft) = cluster.raft_for_node_id(leader_id) else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            match leader_raft.trigger().transfer_to(node_id).await {
+                Ok(()) => {
+                    succeeded = true;
+                    break;
+                }
+                Err(openraft::error::TransferError::Timeout) => {
+                    // Race: target may have just become leader. Loop to re-check.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(openraft::error::TransferError::NotLeader) => {
+                    // Some other node became leader (possibly our target). Re-check.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("transfer to new node: {e:?}"),
+            }
+        }
+        if !succeeded {
+            panic!("transfer to new node: target never became leader within 15s");
+        }
+    }
 
     // Wait for the new node to become leader.
     let mut new_leader_seen = false;
