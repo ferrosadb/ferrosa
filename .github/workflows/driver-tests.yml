@@ -8,6 +8,21 @@ name: Driver Smoke Tests
 #   CONTAINER_RUNTIME=podman ./tests/drivers/run-all.sh
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    # Path filter keeps cheap PRs (docs-only, specs-only) from spending
+    # ~15 min of CI on the multi-language driver matrix.
+    paths:
+      - 'ferrosa-cql/**'
+      - 'ferrosa-schema/**'
+      - 'ferrosa-net/**'
+      - 'ferrosa/**'
+      - 'tests/drivers/**'
+      - 'Dockerfile'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/driver-tests.yml'
   schedule:
     - cron: '30 3 * * *'  # 3:30 AM UTC daily (after nightly-fuzz at 3:00)
   workflow_dispatch:  # manual trigger
