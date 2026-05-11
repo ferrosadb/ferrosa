@@ -352,16 +352,27 @@ async fn lane_actor_loop(
                 timeout,
                 reply,
             } => {
-                let result = handle_send(&mut state, &ctx, lane, msg, timeout).await;
-                let _ = reply.send(result);
+                // Dispatch the RPC on a spawned task so the actor loop
+                // can immediately process the next command. Without this,
+                // every Send was awaited inline and the actor handled
+                // one in-flight RPC per peer-lane at a time — turning
+                // the underlying multiplexed transport (per-stream IDs
+                // + DashMap of pending responses inside RpcClient) into
+                // a single-pipelined channel. On a 32-thread NoSQLBench
+                // workload this capped throughput at ~1 / RTT per peer.
+                //
+                // Connection failures are detected by the alive_watcher
+                // attached on Connected and propagated via SwapClient /
+                // MarkFailed — no need to mutate state from the spawned
+                // task.
+                dispatch_send(&state, lane, msg, timeout, reply);
             }
             LaneCommand::Fire {
                 msg,
                 timeout,
                 reply,
             } => {
-                let result = handle_fire(&mut state, &ctx, lane, msg, timeout).await;
-                let _ = reply.send(result);
+                dispatch_fire(&state, lane, msg, timeout, reply);
             }
             LaneCommand::SwapClient(new_client) => {
                 // If we were dormant, decrement the dormant counter.
@@ -491,66 +502,58 @@ async fn lane_actor_loop(
     }
 }
 
-/// Handle a Send command: perform the RPC with timeout, trigger reconnect on error.
-async fn handle_send(
-    state: &mut LaneState,
-    ctx: &ActorReconnectContext,
+/// Dispatch a Send command non-blocking: clone the client and spawn the
+/// RPC + reply on a task so the actor loop returns immediately.
+///
+/// Connection-error reconnect is handled by the alive_watcher attached on
+/// `LaneState::Connected`, not by mutating state from the spawned task.
+fn dispatch_send(
+    state: &LaneState,
     lane: Lane,
     msg: Message,
     timeout: Duration,
-) -> Result<Message> {
-    match state {
-        LaneState::Connected(client) => {
-            let result = tokio::time::timeout(timeout, client.send(msg, lane)).await;
-            match result {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(e)) => {
-                    if matches!(&e, NetError::Io(_) | NetError::Protocol(_)) {
-                        tracing::warn!(?lane, error = %e, "connection error, triggering reconnect");
-                        *state = LaneState::Reconnecting {
-                            attempt: 0,
-                            exhaustion_count: 0,
-                        };
-                        ctx.spawn_reconnect(0);
-                    }
-                    Err(e)
-                }
-                Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane send timeout"))),
-            }
+    reply: oneshot::Sender<Result<Message>>,
+) {
+    let client = match state {
+        LaneState::Connected(c) => c.clone(),
+        LaneState::Reconnecting { .. } | LaneState::Dormant => {
+            let _ = reply.send(Err(NetError::Reconnecting));
+            return;
         }
-        LaneState::Reconnecting { .. } | LaneState::Dormant => Err(NetError::Reconnecting),
-    }
+    };
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(timeout, client.send(msg, lane)).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane send timeout"))),
+        };
+        let _ = reply.send(result);
+    });
 }
 
-/// Handle a Fire command: send fire-and-forget with timeout, trigger reconnect on error.
-async fn handle_fire(
-    state: &mut LaneState,
-    ctx: &ActorReconnectContext,
+/// Dispatch a Fire command non-blocking. See `dispatch_send` for rationale.
+fn dispatch_fire(
+    state: &LaneState,
     lane: Lane,
     msg: Message,
     timeout: Duration,
-) -> Result<()> {
-    match state {
-        LaneState::Connected(client) => {
-            let result = tokio::time::timeout(timeout, client.fire(msg, lane)).await;
-            match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => {
-                    if matches!(&e, NetError::Io(_) | NetError::Protocol(_)) {
-                        tracing::warn!(?lane, error = %e, "connection error, triggering reconnect");
-                        *state = LaneState::Reconnecting {
-                            attempt: 0,
-                            exhaustion_count: 0,
-                        };
-                        ctx.spawn_reconnect(0);
-                    }
-                    Err(e)
-                }
-                Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane fire timeout"))),
-            }
+    reply: oneshot::Sender<Result<()>>,
+) {
+    let client = match state {
+        LaneState::Connected(c) => c.clone(),
+        LaneState::Reconnecting { .. } | LaneState::Dormant => {
+            let _ = reply.send(Err(NetError::Reconnecting));
+            return;
         }
-        LaneState::Reconnecting { .. } | LaneState::Dormant => Err(NetError::Reconnecting),
-    }
+    };
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(timeout, client.fire(msg, lane)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane fire timeout"))),
+        };
+        let _ = reply.send(result);
+    });
 }
 
 #[cfg(test)]

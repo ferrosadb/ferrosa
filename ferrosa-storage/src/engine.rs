@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use ferrosa_common::key::DecoratedKey;
@@ -448,19 +449,34 @@ struct TableState {
     /// SSTable IDs that are currently pinned on NVMe, in oldest-first order.
     /// Each entry is `(sstable_id, size_bytes)`.
     pinned_sstables: Vec<(String, u64)>,
-    /// Timestamp of the first write to the current (unflushed) memtable.
-    /// Reset to `None` after each flush. Used by `flush_if_needed` to trigger
-    /// time-based flushes for small, infrequently-updated tables.
-    /// Behind `Mutex` so writers can update it under a read lock on `tables`.
-    first_unflushed_write_at: parking_lot::Mutex<Option<std::time::Instant>>,
-    /// Latest commit log position written for this table. Updated on every
+    /// Nanoseconds since [`REFERENCE_INSTANT`] of the first write to the
+    /// current (unflushed) memtable. `0` means "memtable is clean". Used by
+    /// `flush_if_needed` to trigger time-based flushes for small, infrequently-
+    /// updated tables.  `AtomicI64` so the write hot path is lock-free: a
+    /// `compare_exchange(0, now)` that succeeds at most once per memtable
+    /// epoch, no contention thereafter.
+    first_unflushed_write_at_nanos: std::sync::atomic::AtomicI64,
+    /// Latest commit-log position written for this table. Updated on every
     /// write; passed to `commit_log.discard_completed()` after flush so that
-    /// fully-flushed segments can be GC'd. Without this, closed segments
-    /// accumulate indefinitely and leak file descriptors.
+    /// fully-flushed segments can be GC'd.
     ///
-    /// Wrapped in `Mutex` so writers can update it under a read lock on the
-    /// `tables` map (the hot path). The lock protects only two `u64`s.
-    last_commit_log_position: parking_lot::Mutex<Option<CommitLogPosition>>,
+    /// `ArcSwap` keeps the hot-path update lock-free — one `Arc::new` (~30ns)
+    /// plus an atomic pointer swap, with no mutex contention even when
+    /// many threads write to the same table concurrently.
+    last_commit_log_position: ArcSwap<Option<CommitLogPosition>>,
+}
+
+/// Process-wide reference instant used as the base for
+/// `first_unflushed_write_at_nanos`. Captured lazily on first access so
+/// that `now() - REFERENCE_INSTANT` always fits in an i64 (~292 years).
+static REFERENCE_INSTANT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn reference_instant() -> std::time::Instant {
+    *REFERENCE_INSTANT.get_or_init(std::time::Instant::now)
+}
+
+fn now_nanos_since_reference() -> i64 {
+    reference_instant().elapsed().as_nanos() as i64
 }
 
 /// SSTable reader type alias for file-backed SSTables.
@@ -1263,8 +1279,8 @@ impl StorageEngine {
             store,
             pin_config: None,
             pinned_sstables: Vec::new(),
-            first_unflushed_write_at: parking_lot::Mutex::new(None),
-            last_commit_log_position: parking_lot::Mutex::new(None),
+            first_unflushed_write_at_nanos: std::sync::atomic::AtomicI64::new(0),
+            last_commit_log_position: ArcSwap::from_pointee(None),
         })
     }
 
@@ -1883,7 +1899,10 @@ impl StorageEngine {
         row: Row,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
-        let _span = tracing::info_span!(
+        // Per-write span emitted at DEBUG level so it is free at the
+        // default INFO subscriber filter — every span allocation was
+        // measurable on a 50k ops/s workload.
+        let _span = tracing::debug_span!(
             "storage.write",
             table = %table_id,
         )
@@ -1904,11 +1923,22 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
         state.store.write(key, row)?;
-        *state.last_commit_log_position.lock() = Some(cl_pos);
-        state
-            .first_unflushed_write_at
-            .lock()
-            .get_or_insert_with(std::time::Instant::now);
+        state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
+        // Set the first-unflushed timestamp via CAS — succeeds at most once
+        // per memtable epoch, no contention after the first write.
+        if state
+            .first_unflushed_write_at_nanos
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            let now = now_nanos_since_reference();
+            let _ = state.first_unflushed_write_at_nanos.compare_exchange(
+                0,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         drop(tables);
 
         // 3. Notify observers after successful commit log + memtable write.
@@ -1954,11 +1984,20 @@ impl StorageEngine {
                     ))
                 })?;
                 state.store.write(&key, row)?;
-                *state.last_commit_log_position.lock() = Some(cl_pos);
-                state
-                    .first_unflushed_write_at
-                    .lock()
-                    .get_or_insert_with(std::time::Instant::now);
+                state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
+                if state
+                    .first_unflushed_write_at_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 0
+                {
+                    let now = now_nanos_since_reference();
+                    let _ = state.first_unflushed_write_at_nanos.compare_exchange(
+                        0,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
 
             // Notify observers after successful commit log + memtable write.
@@ -2007,11 +2046,20 @@ impl StorageEngine {
                 state.store.write(&m.key, row.clone())?;
             }
             if let Some(&cl_pos) = positions.get(&table_id) {
-                *state.last_commit_log_position.lock() = Some(cl_pos);
-                state
-                    .first_unflushed_write_at
-                    .lock()
-                    .get_or_insert_with(std::time::Instant::now);
+                state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
+                if state
+                    .first_unflushed_write_at_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 0
+                {
+                    let now = now_nanos_since_reference();
+                    let _ = state.first_unflushed_write_at_nanos.compare_exchange(
+                        0,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
         }
         drop(tables);
@@ -2562,13 +2610,15 @@ impl StorageEngine {
 
             // Snapshot the commit log position before flushing. All mutations
             // up to this position are in the memtable we're about to flush.
-            let cl_position = *state.last_commit_log_position.lock();
+            let cl_position = **state.last_commit_log_position.load();
 
             state.store.flush()?;
 
             // Reset the unflushed-write timestamp so the next write starts a
             // fresh age window. This must happen after flush() succeeds.
-            *state.first_unflushed_write_at.lock() = None;
+            state
+                .first_unflushed_write_at_nanos
+                .store(0, std::sync::atomic::Ordering::Relaxed);
 
             // Eager index build: submit high-priority index rebuild for the newly
             // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
@@ -2675,8 +2725,9 @@ impl StorageEngine {
     /// trigger prevents one cold dirty memtable from pinning closed segments
     /// after hotter tables have already flushed.
     pub fn flush_if_needed(&self) -> ferrosa_common::Result<()> {
-        let now = std::time::Instant::now();
         let max_age = std::time::Duration::from_secs(self.config.flush_max_age_secs);
+        let max_age_nanos = max_age.as_nanos() as i64;
+        let now_nanos = now_nanos_since_reference();
         let retention_pressure = self.commit_log.closed_segment_count() > 0;
         let tables = self.tables.read();
         let to_flush: Vec<TableId> = tables
@@ -2684,10 +2735,10 @@ impl StorageEngine {
             .filter(|(_, state)| {
                 let memtable_size = state.store.memtable_size();
                 let size_exceeded = memtable_size as u64 >= self.config.flush_threshold_bytes;
-                let age_exceeded = state
-                    .first_unflushed_write_at
-                    .lock()
-                    .is_some_and(|t| now.duration_since(t) >= max_age);
+                let first = state
+                    .first_unflushed_write_at_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let age_exceeded = first > 0 && now_nanos.saturating_sub(first) >= max_age_nanos;
                 memtable_size > 0 && (size_exceeded || age_exceeded || retention_pressure)
             })
             .map(|(id, _)| id.clone())
