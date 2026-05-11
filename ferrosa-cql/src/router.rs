@@ -1572,6 +1572,73 @@ async fn route_select(
                 &rows,
             ))
         }
+        // Cassandra 5.0 `system_virtual_schema` keyspace — describes the
+        // virtual tables a node exposes.  DataStax Java Driver 4.x queries
+        // all three of these during connection initialization; returning
+        // ERROR(table not found) leaves the driver's host pool empty and
+        // every subsequent query fails with "No node was available".
+        // See ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 2).
+        //
+        // We currently return well-typed empty result sets — Cassandra's
+        // driver tolerates an empty system_virtual_schema and proceeds to
+        // schema refresh of user keyspaces.  When ferrosa grows a
+        // first-class introspection surface for its virtual tables
+        // (system_observability.*, etc.) we populate these rows.
+        ("system_virtual_schema", "keyspaces") => {
+            let col_names = vec!["keyspace_name".to_string()];
+            let col_types = vec![CqlType::Varchar];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_virtual_schema",
+                "keyspaces",
+                &[],
+            ))
+        }
+        ("system_virtual_schema", "tables") => {
+            let col_names = vec![
+                "keyspace_name".to_string(),
+                "table_name".to_string(),
+                "comment".to_string(),
+            ];
+            let col_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Varchar];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_virtual_schema",
+                "tables",
+                &[],
+            ))
+        }
+        ("system_virtual_schema", "columns") => {
+            let col_names = vec![
+                "keyspace_name".to_string(),
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "clustering_order".to_string(),
+                "column_name_bytes".to_string(),
+                "kind".to_string(),
+                "position".to_string(),
+                "type".to_string(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Blob,
+                CqlType::Varchar,
+                CqlType::Int,
+                CqlType::Varchar,
+            ];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_virtual_schema",
+                "columns",
+                &[],
+            ))
+        }
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
         ("system_schema", "functions" | "aggregates" | "triggers" | "views") => {
@@ -8127,6 +8194,40 @@ mod tests {
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
+        }
+    }
+
+    /// Gap 2 (ferrosa-nosqlbench/docs/initial-gaps-found.md): the DataStax
+    /// Java Driver 4.x queries all three system_virtual_schema tables
+    /// during connection bring-up.  Pre-fix, ferrosa returned
+    /// "table not found" and the driver gave up on every host; post-fix
+    /// each query must succeed with an empty-but-typed result.
+    #[tokio::test]
+    async fn select_system_virtual_schema_keyspaces_returns_empty_ok() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for table in ["keyspaces", "tables", "columns"] {
+            let q = format!("SELECT * FROM system_virtual_schema.{table}");
+            let stmt = crate::parser::parse(&q).unwrap();
+            let result = route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("system_virtual_schema.{table} returned error: {e:?}"));
+            match &result {
+                // Rows kind (0x0002) — schema-typed empty result.
+                RouteResult::Result(b) => assert_eq!(
+                    &b[0..4],
+                    &0x0002i32.to_be_bytes(),
+                    "system_virtual_schema.{table} should return Rows result",
+                ),
+                _ => panic!("expected RouteResult::Result for system_virtual_schema.{table}"),
+            }
         }
     }
 

@@ -46,6 +46,20 @@ fn config_val(
     })
 }
 
+/// Like `config_val` but returns `None` when neither the env var nor the
+/// config file set the key.  Needed to distinguish "operator did not say"
+/// from "operator wrote `false`" for the deprecated `FERROSA_AUTH_DISABLED`
+/// override path.
+fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(env_key) {
+        return Some(v);
+    }
+    config
+        .get(section)
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
+}
+
 /// Load TOML configuration from disk. Returns an empty table if the file does not exist.
 fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     if std::path::Path::new(path).exists() {
@@ -601,13 +615,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "0.0.0.0:9042",
     )
     .parse()?;
-    let auth_disabled_str = config_val(
+    // Deprecated direct override: prefer driving auth from FERROSA_AUTH_ENABLED.
+    // Set to None when neither env nor file specifies; resolver below
+    // defaults to `!storage_auth_enabled` in that case.
+    let auth_disabled_override: Option<bool> = config_val_opt(
         "FERROSA_AUTH_DISABLED",
         &file_config,
         "cql",
         "auth_disabled",
-        "false",
-    );
+    )
+    .map(|s| {
+        tracing::warn!(
+            "FERROSA_AUTH_DISABLED (or [cql].auth_disabled in config file) is \
+                 deprecated; use FERROSA_AUTH_ENABLED as the single source of truth. \
+                 Honoring the override for this release."
+        );
+        s == "true" || s == "1"
+    });
     let cql_tls_cert = config_val("FERROSA_CQL_TLS_CERT", &file_config, "cql", "tls_cert", "");
     let cql_tls_key = config_val("FERROSA_CQL_TLS_KEY", &file_config, "cql", "tls_key", "");
     let cql_require_tls = config_val(
@@ -635,7 +659,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .parse()?;
     let cql_config = ferrosa_cql::server::ServerConfig {
         bind_addr: cql_bind,
-        auth_disabled: auth_disabled_str == "true" || auth_disabled_str == "1",
+        auth_disabled: ferrosa_cql::server::resolve_auth_disabled(
+            storage_auth_enabled,
+            auth_disabled_override,
+        ),
         max_connections: cql_max_connections,
         max_connections_per_ip: cql_max_connections_per_ip,
         tls_cert_path: if cql_tls_cert.is_empty() {
@@ -1217,6 +1244,56 @@ mod tests {
 
     fn empty_config() -> toml::Value {
         toml::Value::Table(toml::map::Map::new())
+    }
+
+    /// Gap 1: with no auth env vars set and the storage default
+    /// (`auth_enabled=false`), the CQL server must NOT advertise an
+    /// authenticator — otherwise DataStax-style drivers refuse to connect.
+    /// See ferrosa-nosqlbench/docs/initial-gaps-found.md.
+    #[test]
+    fn config_val_opt_returns_none_when_unset() {
+        let key = "FERROSA_TEST_CFG_OPT_e7c1";
+        std::env::remove_var(key);
+        let result = config_val_opt(key, &empty_config(), "cql", "auth_disabled");
+        assert!(result.is_none(), "expected None for unset, got {result:?}");
+    }
+
+    #[test]
+    fn config_val_opt_reads_env_when_set() {
+        let key = "FERROSA_TEST_CFG_OPT_b2f4";
+        std::env::set_var(key, "true");
+        let result = config_val_opt(key, &empty_config(), "cql", "auth_disabled");
+        std::env::remove_var(key);
+        assert_eq!(result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn config_val_opt_reads_file_when_env_unset() {
+        let key = "FERROSA_TEST_CFG_OPT_f9a3";
+        std::env::remove_var(key);
+        let cfg: toml::Value = toml::from_str("[cql]\nauth_disabled = true\n").unwrap();
+        let result = config_val_opt(key, &cfg, "cql", "auth_disabled");
+        assert_eq!(result.as_deref(), Some("true"));
+    }
+
+    /// End-to-end of the Gap 1 resolution chain: storage default is
+    /// `auth_enabled=false`, no explicit override → resolver returns
+    /// `auth_disabled=true` (CQL server sends READY, not AUTHENTICATE).
+    #[test]
+    fn auth_disabled_default_chain_matches_storage_default() {
+        // Storage default for `auth_enabled` is `false` (see
+        // StorageEngineConfig::default in ferrosa-storage); no override set.
+        let storage_default_auth_enabled = false;
+        let override_unset = None;
+        let auth_disabled = ferrosa_cql::server::resolve_auth_disabled(
+            storage_default_auth_enabled,
+            override_unset,
+        );
+        assert!(
+            auth_disabled,
+            "with storage auth_enabled=false (default) and no explicit override, \
+             CQL server must send READY (auth_disabled=true) so drivers connect"
+        );
     }
 
     fn sample_config() -> toml::Value {

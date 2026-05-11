@@ -59,6 +59,51 @@ impl Default for ServerConfig {
     }
 }
 
+/// Resolve the CQL server's `auth_disabled` flag from the storage-side
+/// `auth_enabled` flag, with an optional explicit override.
+///
+/// Cassandra has a single `authenticator:` setting; ferrosa historically
+/// had two (`FERROSA_AUTH_ENABLED` for storage, `FERROSA_AUTH_DISABLED`
+/// for the CQL server) which could drift out of sync — and did, in the
+/// default case: storage said "auth off, accepts everything" while the
+/// CQL server still sent `AUTHENTICATE`, breaking standard drivers
+/// (DataStax Java Driver, NoSQLBench).  See
+/// ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 1).
+///
+/// New contract: `storage_auth_enabled` is the single source of truth.
+/// `FERROSA_AUTH_DISABLED` (or the equivalent file-config key) is a
+/// **deprecated override**: when set, it wins, and main logs a
+/// deprecation warning pointing at this function.
+///
+/// # Returns
+///
+/// - `Some(override_value)` if explicit_override is set (deprecated path).
+/// - `!storage_auth_enabled` otherwise.
+pub fn resolve_auth_disabled(storage_auth_enabled: bool, explicit_override: Option<bool>) -> bool {
+    explicit_override.unwrap_or(!storage_auth_enabled)
+}
+
+#[cfg(test)]
+mod resolve_auth_disabled_tests {
+    use super::resolve_auth_disabled;
+
+    #[test]
+    fn defaults_to_inverse_of_storage_auth_enabled() {
+        // Storage auth off → CQL server sends READY (auth_disabled=true).
+        assert!(resolve_auth_disabled(false, None));
+        // Storage auth on → CQL server sends AUTHENTICATE (auth_disabled=false).
+        assert!(!resolve_auth_disabled(true, None));
+    }
+
+    #[test]
+    fn explicit_override_wins() {
+        // Explicit override beats storage flag in both directions (deprecated
+        // but supported for one release to ease migration).
+        assert!(resolve_auth_disabled(true, Some(true)));
+        assert!(!resolve_auth_disabled(false, Some(false)));
+    }
+}
+
 /// Tracks per-IP connection counts for rate limiting.
 #[derive(Debug, Default)]
 struct IpConnectionTracker {
