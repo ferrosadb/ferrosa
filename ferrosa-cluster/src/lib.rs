@@ -7,6 +7,7 @@ pub mod ddl_path;
 pub mod error;
 pub mod hints;
 pub mod index_coordination;
+pub mod membership;
 pub mod mode;
 pub mod pair;
 pub mod raft;
@@ -21,7 +22,7 @@ pub mod system_table_writer;
 pub mod telemetry;
 pub mod write_path;
 
-pub use config::ClusterConfig;
+pub use config::{ClusterConfig, PerDcOverride};
 pub use consistency::ConsistencyLevel;
 pub use controller::{
     bootstrap_silent_failure_counts, cluster_rejoin_attempts_total, cluster_rejoin_failures_total,

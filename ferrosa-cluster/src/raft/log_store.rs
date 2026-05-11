@@ -279,6 +279,15 @@ pub struct SledLogStore {
     meta: sled::Tree,
 }
 
+/// Counts of entries cleared by [`SledLogStore::reset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetCounts {
+    /// Entries removed from the `log` tree.
+    pub log_entries: u64,
+    /// Keys removed from the `meta` tree (vote / committed / last_purged).
+    pub meta_keys: u64,
+}
+
 #[allow(clippy::result_large_err)] // StorageIOError is 224 bytes — dictated by openraft
 impl SledLogStore {
     /// Open (or create) a log store at the given filesystem `path`.
@@ -289,17 +298,147 @@ impl SledLogStore {
         Ok(Self { db, log, meta })
     }
 
+    /// Internal helper for `append` that does the actual sled work. Split
+    /// out so the public `append` can route both success and failure
+    /// through `LogFlushed::log_io_completed` (W1.19a). Test code can
+    /// also exercise the error path here directly without needing to
+    /// construct a `LogFlushed` callback (which has a `pub(crate)`
+    /// constructor inside openraft).
+    async fn append_inner<I>(&mut self, entries: I) -> Result<(), StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
+        I::IntoIter: Send,
+    {
+        let mut batch = sled::Batch::default();
+        for entry in entries {
+            let key = Self::index_key(entry.log_id.index);
+            let val = Self::serialize_entry(&entry)?;
+            batch.insert(&key, val);
+        }
+
+        // Run sled disk IO on a blocking thread so the async Raft runtime
+        // stays responsive for heartbeat processing.
+        let log = self.log.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+            log.apply_batch(batch)
+                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+        .map_err(|e| *e)?;
+
+        Ok(())
+    }
+
+    /// Wipe a node's persisted Raft state at `path`.
+    ///
+    /// Clears the `log` and `meta` trees so the node rejoins the cluster as
+    /// an empty learner: no persisted vote/term, no log entries, no purge
+    /// marker. The leader's `InstallSnapshot` / `AppendEntries` will replay
+    /// committed history onto the reset node.
+    ///
+    /// # When to use
+    ///
+    /// Recovery for the disruptor-partition failure mode (see
+    /// `specs/in-process/bug-raft-stale-candidate-runaway-term-no-prevote.md`):
+    /// a node whose term has run away past the live quorum and whose log is
+    /// behind cannot self-recover, because peers reject its votes (its log
+    /// is too short) AND it rejects the leader's heartbeats (its term is too
+    /// high). Wiping local Raft state and rejoining is the only escape.
+    ///
+    /// # Lock contention
+    ///
+    /// Sled holds an exclusive lock on the database directory. If a Ferrosa
+    /// process is still using `path`, this call returns
+    /// `sled::Error::Io(...)` from `flock(2)`. Stop the node before reset.
+    ///
+    /// # Safety
+    ///
+    /// Only uncommitted writes — those Raft never replicated to a quorum —
+    /// can be lost. By Raft's durability guarantee, committed writes survive
+    /// on the remaining majority and are replayed back to this node.
+    pub fn reset(path: &Path) -> Result<ResetCounts, sled::Error> {
+        let db = sled::open(path)?;
+        let log = db.open_tree("log")?;
+        let meta = db.open_tree("meta")?;
+
+        let log_entries = log.len() as u64;
+        let meta_keys = meta.len() as u64;
+
+        log.clear()?;
+        meta.clear()?;
+        log.flush()?;
+        meta.flush()?;
+        db.flush()?;
+
+        Ok(ResetCounts {
+            log_entries,
+            meta_keys,
+        })
+    }
+
     // -- helpers ----------------------------------------------------------
 
     fn index_key(index: u64) -> [u8; 8] {
         index.to_be_bytes()
     }
 
+    /// Magic prefix that disambiguates log-entry framings (W1.19c).
+    ///
+    /// Legacy entries (pre-Sprint-1) are bare bincoded `Entry`s that
+    /// start with a `LogId.term: u64` little-endian byte.  A bincoded
+    /// term value of `0x46` (chr 'F') is theoretically possible but
+    /// vanishingly unlikely in steady state — and the second byte of
+    /// 'F' would have to be 'R' (`0x52`), then 'E' (`0x45`), which
+    /// would require term equal to `0x3145_5246` (little-endian
+    /// `0x31 0x45 0x52 0x46`), a value above 800 million.  No real
+    /// cluster reaches this.  We use the four magic bytes as a
+    /// definitive "current-format" marker.
+    const ENTRY_MAGIC: [u8; 4] = *b"FRE1";
+
+    /// Tag for the current entry format (after the magic).  Bumping
+    /// this signals a forward-compatible payload schema change.
+    const ENTRY_FORMAT_VERSION: u8 = 1;
+
     fn serialize_entry(entry: &Entry<FerrosRaftConfig>) -> Result<Vec<u8>, StorageIOError<u64>> {
-        bincode::serialize(entry).map_err(|e| StorageIOError::write_logs(to_any_error(e)))
+        let payload =
+            bincode::serialize(entry).map_err(|e| StorageIOError::write_logs(to_any_error(e)))?;
+        let mut out = Vec::with_capacity(payload.len() + 5);
+        out.extend_from_slice(&Self::ENTRY_MAGIC);
+        out.push(Self::ENTRY_FORMAT_VERSION);
+        out.extend_from_slice(&payload);
+        Ok(out)
     }
 
     fn deserialize_entry(bytes: &[u8]) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
+        // Tagged path: bytes start with FRE1 + version byte.
+        if bytes.len() >= 5 && bytes[..4] == Self::ENTRY_MAGIC {
+            let version = bytes[4];
+            if version != Self::ENTRY_FORMAT_VERSION {
+                // Unknown format version — fail loud.
+                #[derive(Debug)]
+                struct UnsupportedVersion(String);
+                impl std::fmt::Display for UnsupportedVersion {
+                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str(&self.0)
+                    }
+                }
+                impl std::error::Error for UnsupportedVersion {}
+                return Err(StorageIOError::read_logs(to_any_error(UnsupportedVersion(
+                    format!(
+                        "unsupported entry format version {version}; expected {}",
+                        Self::ENTRY_FORMAT_VERSION
+                    ),
+                ))));
+            }
+            return bincode::deserialize(&bytes[5..])
+                .map_err(|e| StorageIOError::read_logs(to_any_error(e)));
+        }
+
+        // Legacy path: bare bincoded Entry, with a fall-through to the
+        // pre-UpdateNodeInfo schema for entries written by older
+        // ferrosa builds.
         match bincode::deserialize(bytes) {
             Ok(entry) => Ok(entry),
             Err(current_err) => {
@@ -520,7 +659,21 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
+        // W1.19b: persist + fsync so an OS crash between save_committed and
+        // the next vote does not lose the committed marker. sled flushes
+        // its WAL on drop, but in a hard-crash scenario the in-memory
+        // index would be lost; an explicit flush turns this insert into a
+        // durability barrier.
         Self::save_meta(&self.meta, META_COMMITTED, &committed)?;
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+            meta.flush()
+                .map_err(|e| Box::new(StorageIOError::write(to_any_error(e))))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageIOError::write(to_any_error(e)))?
+        .map_err(|e| *e)?;
         Ok(())
     }
 
@@ -537,28 +690,21 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
-        let mut batch = sled::Batch::default();
-        for entry in entries {
-            let key = Self::index_key(entry.log_id.index);
-            let val = Self::serialize_entry(&entry)?;
-            batch.insert(&key, val);
+        // W1.19a: any error path in `append` must still fire the LogFlushed
+        // callback (with Err) so openraft's Raft loop sees the failure
+        // synchronously instead of waiting on a oneshot that never sends.
+        // Build the batch first; serialization errors are surfaced by the
+        // helper below so they reach the callback too.
+        let result = self.append_inner(entries).await;
+
+        match &result {
+            Ok(()) => callback.log_io_completed(Ok(())),
+            Err(e) => callback.log_io_completed(Err(std::io::Error::other(format!(
+                "log append failed: {e}"
+            )))),
         }
 
-        // Run sled disk IO on a blocking thread so the async Raft runtime
-        // stays responsive for heartbeat processing.
-        let log = self.log.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-            log.apply_batch(batch)
-                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
-        .map_err(|e| *e)?;
-
-        callback.log_io_completed(Ok(()));
-
-        Ok(())
+        result
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
@@ -589,20 +735,29 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
 
         // Remove all entries with index <= log_id.index.
         // Big-endian keys: 0x0000..0000 through index_key(log_id.index) inclusive.
+        // Run sled disk IO on a blocking thread so the async Raft runtime
+        // stays responsive for heartbeat processing — under sustained
+        // AppendEntries traffic, a synchronous purge of a large segment
+        // would stall the lane and miss heartbeat deadlines (W1.20 / I-25).
+        let log = self.log.clone();
         let end_inclusive = Self::index_key(log_id.index);
-        let keys_to_remove: Vec<sled::IVec> = self
-            .log
-            .range(..=end_inclusive)
-            .filter_map(|r| r.ok().map(|(k, _v)| k))
-            .collect();
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+            let keys_to_remove: Vec<sled::IVec> = log
+                .range(..=end_inclusive)
+                .filter_map(|r| r.ok().map(|(k, _v)| k))
+                .collect();
 
-        let mut batch = sled::Batch::default();
-        for key in keys_to_remove {
-            batch.remove(key);
-        }
-        self.log
-            .apply_batch(batch)
-            .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?;
+            let mut batch = sled::Batch::default();
+            for key in keys_to_remove {
+                batch.remove(key);
+            }
+            log.apply_batch(batch)
+                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+        .map_err(|e| *e)?;
 
         Ok(())
     }
@@ -800,6 +955,83 @@ mod tests {
         assert_eq!(state.last_purged_log_id, None);
         assert!(state.last_log_id.is_some());
         assert_eq!(state.last_log_id.unwrap().index, 3);
+    }
+
+    /// W1.19c — round-trip an entry through the new
+    /// magic-prefix framing.  The bytes must start with `FRE1` + the
+    /// version tag, and decode back into the same entry.
+    #[test]
+    fn entry_with_magic_prefix_roundtrips() {
+        let entry = normal_entry(
+            3,
+            7,
+            RaftOp::LeaveNode {
+                node_id: 0xDEAD_BEEFu64,
+            },
+        );
+        let bytes = SledLogStore::serialize_entry(&entry).unwrap();
+        assert_eq!(
+            &bytes[..4],
+            &SledLogStore::ENTRY_MAGIC,
+            "tagged entry must start with the magic prefix",
+        );
+        assert_eq!(
+            bytes[4],
+            SledLogStore::ENTRY_FORMAT_VERSION,
+            "fifth byte is the format version tag",
+        );
+        let decoded = SledLogStore::deserialize_entry(&bytes).unwrap();
+        match decoded.payload {
+            EntryPayload::Normal(RaftCommand {
+                op: RaftOp::LeaveNode { node_id },
+                ..
+            }) => assert_eq!(node_id, 0xDEAD_BEEFu64),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// W1.19c — legacy entries (no magic prefix) still decode.
+    /// Asserts the back-compat fallthrough remains in place.
+    #[test]
+    fn legacy_log_decode_unambiguous() {
+        // Hand-craft a bare bincoded Entry — legacy on-disk form.
+        let entry = normal_entry(
+            5,
+            11,
+            RaftOp::AssignTokens {
+                node_id: 42,
+                tokens: vec![100, 200, 300],
+            },
+        );
+        let bare = bincode::serialize(&entry).unwrap();
+        // Untagged decode goes through the legacy fallthrough.
+        let decoded = SledLogStore::deserialize_entry(&bare).unwrap();
+        match decoded.payload {
+            EntryPayload::Normal(RaftCommand {
+                op: RaftOp::AssignTokens { node_id, tokens },
+                ..
+            }) => {
+                assert_eq!(node_id, 42);
+                assert_eq!(tokens, vec![100, 200, 300]);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// W1.19c — an unknown future format version is rejected loudly
+    /// instead of being silently reinterpreted as legacy data.
+    #[test]
+    fn entry_with_unknown_version_fails_loud() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SledLogStore::ENTRY_MAGIC);
+        bytes.push(0xFF); // version we do not understand
+        bytes.extend_from_slice(&[0u8; 64]);
+        let err = SledLogStore::deserialize_entry(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported entry format version"),
+            "expected unknown-version error, got: {msg}",
+        );
     }
 
     #[test]
@@ -1062,5 +1294,186 @@ mod tests {
         let entries = store.try_get_log_entries(3u64..4u64).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].log_id.index, 3);
+    }
+
+    // -- reset ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reset_clears_log_and_meta_and_counts_what_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Pre-populate: 3 log entries + a vote + a committed marker.
+        {
+            let mut store = SledLogStore::new(dir.path()).unwrap();
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=3 {
+                let entry = blank_entry(7, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+
+            let vote = Vote::new(7, 99);
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_vote(
+                &mut store, &vote,
+            )
+            .await
+            .unwrap();
+
+            let committed = Some(LogId::new(CommittedLeaderId::new(7, 0), 3));
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_committed(
+                &mut store, committed,
+            )
+            .await
+            .unwrap();
+
+            store.db.flush().unwrap();
+        } // drop releases sled lock
+
+        let counts = SledLogStore::reset(dir.path()).expect("reset must succeed on a free dir");
+        assert_eq!(counts.log_entries, 3, "all 3 log entries should be cleared");
+        assert_eq!(
+            counts.meta_keys, 2,
+            "vote + committed keys should be cleared"
+        );
+
+        // Reopen and confirm trees are empty.
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let remaining = store.try_get_log_entries(0u64..100u64).await.unwrap();
+        assert!(remaining.is_empty(), "log tree must be empty after reset");
+        let vote_after =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::read_vote(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert!(vote_after.is_none(), "vote must be cleared after reset");
+    }
+
+    #[test]
+    fn reset_on_empty_store_is_a_noop_with_zero_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Touch a store so the on-disk layout exists, then drop.
+        let _ = SledLogStore::new(dir.path()).unwrap();
+
+        let counts = SledLogStore::reset(dir.path()).expect("reset on empty store must succeed");
+        assert_eq!(counts.log_entries, 0);
+        assert_eq!(counts.meta_keys, 0);
+    }
+
+    /// W1.19b: save_committed must flush the meta tree so the committed
+    /// marker survives an OS crash between save and the next vote. We
+    /// simulate the durability barrier by saving the marker, then dropping
+    /// and reopening the store, and asserting the marker round-trips. (A
+    /// stronger crash-injection test would require process kill; this is
+    /// the strongest test feasible without that infra.)
+    #[tokio::test]
+    async fn save_committed_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let committed = Some(LogId::new(CommittedLeaderId::new(11, 0), 42));
+
+        {
+            let mut store = SledLogStore::new(dir.path()).unwrap();
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_committed(
+                &mut store, committed,
+            )
+            .await
+            .unwrap();
+            // Drop without an extra db.flush() — save_committed must have
+            // flushed the meta tree itself.
+        }
+
+        // Reopen and read back.
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let read_back =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::read_committed(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_back, committed,
+            "save_committed must persist + flush before returning"
+        );
+    }
+
+    /// W1.20: `purge` must offload sled writes to a blocking thread so the
+    /// async runtime keeps making progress. Acceptance: a current_thread
+    /// runtime executes a 1000-entry purge concurrently with a sibling
+    /// task, and the sibling task's heartbeats keep ticking. If `purge`
+    /// did its sled work synchronously on the runtime thread, the
+    /// heartbeats would stall for the duration of the IO.
+    #[tokio::test(flavor = "current_thread")]
+    async fn purge_does_not_block_heartbeats() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        // Pre-populate 1000 entries.
+        {
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=1000 {
+                let entry = blank_entry(1, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+            store.log.flush().unwrap();
+        }
+
+        // Sibling heartbeat task: increments a counter every yield.
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticks_clone = ticks.clone();
+        let stop = Arc::new(AtomicU64::new(0));
+        let stop_clone = stop.clone();
+        let heartbeat = tokio::spawn(async move {
+            while stop_clone.load(Ordering::Relaxed) == 0 {
+                ticks_clone.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Run the purge. With spawn_blocking inside purge, the
+        // current_thread runtime is free to keep ticking the heartbeat
+        // task while the sled work runs on a blocking thread.
+        let purge_id = LogId::new(CommittedLeaderId::new(1, 0), 1000);
+        store.purge(purge_id).await.unwrap();
+
+        let mid_ticks = ticks.load(Ordering::Relaxed);
+        // Stop the heartbeat and wait for it to finish.
+        stop.store(1, Ordering::Relaxed);
+        let _ = heartbeat.await;
+
+        // The heartbeat must have made progress while purge was in
+        // flight. The exact lower bound is conservative — in CI with
+        // contention, even one tick proves the runtime kept advancing.
+        assert!(
+            mid_ticks > 0,
+            "the sibling task must accumulate ticks while purge is running; \
+             got {mid_ticks} — purge appears to have blocked the runtime"
+        );
+
+        // Verify purge actually purged.
+        let remaining = store.try_get_log_entries(1u64..1001u64).await.unwrap();
+        assert!(remaining.is_empty(), "all 1000 entries should be purged");
+    }
+
+    #[test]
+    fn reset_fails_if_sled_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hold an open store: this keeps sled's flock on the dir.
+        let _live = SledLogStore::new(dir.path()).unwrap();
+
+        let err = SledLogStore::reset(dir.path())
+            .expect_err("reset must refuse while a Ferrosa node still holds the sled lock");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("lock") || msg.to_lowercase().contains("io"),
+            "expected lock/io error, got: {msg}"
+        );
     }
 }

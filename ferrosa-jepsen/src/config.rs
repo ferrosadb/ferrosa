@@ -13,6 +13,11 @@ pub enum Tier {
     Full,
     /// 24-hour continuous cycling on T4
     Endurance,
+    /// Sprint 7 W7.11: 1-hour multi-DC bank workload at QUORUM under
+    /// `dc-partition + dc-slow` composed nemesis on the T3 (3+3
+    /// dual-DC) topology. Nightly CI tier — exercises the cross-DC
+    /// Accord apply path end-to-end.
+    MultiDc,
 }
 
 /// Cluster topology.
@@ -127,6 +132,9 @@ impl RunConfig {
             Tier::Standard => vec![Topology::T1, Topology::T2],
             Tier::Full => vec![Topology::T1, Topology::T2, Topology::T3, Topology::T4],
             Tier::Endurance => vec![Topology::T4],
+            // W7.11: T3 (3+3 dual-DC) is the topology multi-DC
+            // exercises end-to-end.
+            Tier::MultiDc => vec![Topology::T3],
         }
     }
 
@@ -141,6 +149,10 @@ impl RunConfig {
             Tier::Full | Tier::Endurance => {
                 vec![Concurrency::Low, Concurrency::Medium, Concurrency::High]
             }
+            // W7.11: medium concurrency over a 1-hour run hits the
+            // sweet spot for cross-DC Accord drift detection without
+            // saturating the Accord coordinator.
+            Tier::MultiDc => vec![Concurrency::Medium],
         }
     }
 
@@ -163,6 +175,9 @@ impl RunConfig {
             Tier::Standard => 30,
             Tier::Full => 60,
             Tier::Endurance => 86_400,
+            // W7.11: 1-hour multi-DC bank workload (per the Sprint 7
+            // headline acceptance criterion).
+            Tier::MultiDc => 3_600,
         }
     }
 }
@@ -213,5 +228,39 @@ mod tests {
         };
         let tops = config.topologies();
         assert_eq!(tops, vec![Topology::T1, Topology::T2]);
+    }
+
+    /// W7.11 — the `MultiDc` tier resolves to T3 only, medium
+    /// concurrency, and a 1-hour run duration.
+    #[test]
+    fn multi_dc_tier_resolves_to_t3_one_hour() {
+        let config = RunConfig {
+            tier: Tier::MultiDc,
+            topology: None,
+            nemesis: None,
+            pattern: None,
+            driver: None,
+            concurrency: None,
+            run_id: "multidc".into(),
+            output_dir: PathBuf::from("/tmp"),
+            fly_regions: vec![],
+            alert_webhook: None,
+            output_json: false,
+        };
+        assert_eq!(
+            config.topologies(),
+            vec![Topology::T3],
+            "MultiDc tier must run on T3 (3+3 dual-DC)"
+        );
+        assert_eq!(
+            config.concurrency_levels(),
+            vec![Concurrency::Medium],
+            "MultiDc tier uses medium concurrency"
+        );
+        assert_eq!(
+            config.run_duration_secs(),
+            3_600,
+            "MultiDc tier is the 1-hour run"
+        );
     }
 }

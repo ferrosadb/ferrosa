@@ -283,7 +283,13 @@ impl ClusterCoordinator {
         rf: usize,
     ) -> crate::error::Result<Option<Vec<Row>>> {
         let ring = self.ring.load();
-        let replicas = ring.replicas(key.token.0, rf);
+        let raw_replicas = ring.replicas(key.token.0, rf);
+
+        // W8.4: filter the replica list by the CL's role policy.
+        // Voter-quorum CLs drop learners; ONE / LOCAL_ONE keep them.
+        let replicas =
+            crate::coordinator::cl_routing::eligible_replicas_for_cl(cl, &raw_replicas, &ring);
+
         let required = cl.block_for(rf);
 
         {
@@ -291,6 +297,7 @@ impl ClusterCoordinator {
                 "cluster.read",
                 cl = %cl,
                 replicas = replicas.len(),
+                raw_replicas = raw_replicas.len(),
             );
             let _enter = span.enter();
         }

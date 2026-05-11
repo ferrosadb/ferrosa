@@ -828,6 +828,17 @@ async fn route_select(
 
     // Helper: filter system table columns to match the SELECT list.
     // If the SELECT list is `*`, return everything unchanged.
+    //
+    // Each `SelectColumn` is one of three shapes:
+    //   - Star (`SELECT *`)              — return all columns unchanged.
+    //   - Column(name)                   — project the named source column.
+    //   - FunctionCall { name, args, .. } — materialise a value (zero-arg
+    //     built-ins only: `now()`, `currenttimestamp()`, `uuid()`).
+    //
+    // Before this fix, the FunctionCall arm fell through silently and the
+    // resulting projection had zero columns, which crashes both cdrs-tokio
+    // and python cassandra-driver on `rows[0][0]`. See
+    // specs/in-process/bug-cql-system-local-empty-columns.md.
     fn filter_system_columns(
         select_cols: &[SelectColumn],
         all_names: &[String],
@@ -838,21 +849,76 @@ async fn route_select(
         if is_star || select_cols.is_empty() {
             return (all_names.to_vec(), all_types.to_vec(), all_rows.to_vec());
         }
-        // Build index of requested columns by name.
-        let mut indices = Vec::new();
+
+        // Each output column is either a (source-row index) projection or a
+        // (per-row value generator) for builtin function calls. Encoding both
+        // as `enum ProjOp` keeps the row-build loop simple.
+        enum ProjOp<'a> {
+            FromRow(usize),
+            ConstFn(&'a str), // "now" | "currenttimestamp" | "uuid"
+        }
+
+        let mut names: Vec<String> = Vec::new();
+        let mut types: Vec<CqlType> = Vec::new();
+        let mut ops: Vec<ProjOp> = Vec::new();
+
         for sc in select_cols {
-            if let SelectColumn::Column(name) = sc {
-                if let Some(pos) = all_names.iter().position(|n| n == name) {
-                    indices.push(pos);
+            match sc {
+                SelectColumn::Column(name) => {
+                    if let Some(pos) = all_names.iter().position(|n| n == name) {
+                        names.push(all_names[pos].clone());
+                        types.push(all_types[pos].clone());
+                        ops.push(ProjOp::FromRow(pos));
+                    }
                 }
+                SelectColumn::FunctionCall { name, alias, .. } => {
+                    let fn_lower = name.to_lowercase();
+                    let display = alias.clone().unwrap_or_else(|| fn_lower.clone());
+                    match fn_lower.as_str() {
+                        "now" => {
+                            names.push(display);
+                            types.push(CqlType::Timeuuid);
+                            ops.push(ProjOp::ConstFn("now"));
+                        }
+                        "currenttimestamp" => {
+                            names.push(display);
+                            types.push(CqlType::Timestamp);
+                            ops.push(ProjOp::ConstFn("currenttimestamp"));
+                        }
+                        "uuid" => {
+                            names.push(display);
+                            types.push(CqlType::Uuid);
+                            ops.push(ProjOp::ConstFn("uuid"));
+                        }
+                        // Any other function call against system.* is not
+                        // supported here. Skip silently to preserve prior
+                        // behaviour for non-zero-arg or unrecognised names.
+                        _ => {}
+                    }
+                }
+                SelectColumn::Star => unreachable!("handled above"),
             }
         }
-        let names: Vec<String> = indices.iter().map(|&i| all_names[i].clone()).collect();
-        let types: Vec<CqlType> = indices.iter().map(|&i| all_types[i].clone()).collect();
+
         let rows: Vec<Vec<Option<CqlValue>>> = all_rows
             .iter()
-            .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+            .map(|row| {
+                ops.iter()
+                    .map(|op| match op {
+                        ProjOp::FromRow(i) => row[*i].clone(),
+                        ProjOp::ConstFn(fn_name) => match *fn_name {
+                            "now" => Some(bridge::eval_now()),
+                            "currenttimestamp" => {
+                                Some(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
+                            }
+                            "uuid" => Some(CqlValue::Uuid(uuid::Uuid::new_v4())),
+                            _ => None,
+                        },
+                    })
+                    .collect()
+            })
             .collect();
+
         (names, types, rows)
     }
 
@@ -7568,6 +7634,43 @@ mod tests {
                 // release_version, schema_version, rpc_port, listen_address,
                 // broadcast_address, rpc_address, bootstrapped, tokens
                 assert_eq!(col_count, 16);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_now_from_system_local_returns_one_timeuuid_column() {
+        // Regression: `SELECT now() FROM system.local` previously returned a
+        // row-set with one row and ZERO columns, because `filter_system_columns`
+        // only handled `SelectColumn::Star` and `SelectColumn::Column(name)` —
+        // any `FunctionCall` projection silently produced no columns.
+        // Both cdrs-tokio and python cassandra-driver crash on the empty
+        // column shape (see specs/in-process/bug-cql-system-local-empty-columns.md).
+        //
+        // Fix: filter_system_columns must materialise zero-arg builtin function
+        // calls (`now()`, `currenttimestamp()`, `uuid()`) as a one-column
+        // projection with the appropriate value + type.
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse("SELECT now() FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes(), "kind=Rows");
+                let col_count = i32::from_be_bytes(b[8..12].try_into().unwrap());
+                assert_eq!(
+                    col_count, 1,
+                    "SELECT now() FROM system.local must produce exactly 1 column, \
+                     got {col_count} (zero-column rows crash drivers)"
+                );
             }
             _ => panic!("expected Result"),
         }

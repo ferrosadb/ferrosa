@@ -112,7 +112,10 @@ pub fn build_router(state: WebAppState) -> Router {
             auth::auth_middleware,
         ));
 
-    api.route("/metrics", get(api::get_metrics))
+    // /admin/* is not behind auth — it exposes read-only diagnostics used by
+    // the Jepsen verification harness (Sprint 2 W2.3).
+    api.nest("/admin", api::admin_routes())
+        .route("/metrics", get(api::get_metrics))
         .fallback(static_files::static_handler)
         .with_state(state)
 }

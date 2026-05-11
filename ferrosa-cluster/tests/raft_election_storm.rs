@@ -1028,3 +1028,158 @@ async fn election_storm_guard_fires_at_production_cadence() {
     n2.shutdown().await.ok();
     n3.shutdown().await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// W3.12 — ferrosa_partitioned_node_does_not_advance_term (ADR-012)
+// ---------------------------------------------------------------------------
+
+/// Build a Config that mirrors the sprint-03 ferrosa defaults: PreVote enabled,
+/// CheckQuorum ratio 0.75. Mirrors the wiring in
+/// `controller/cluster.rs:840`. See ADR-012.
+#[cfg(feature = "sprint-03-engine-prevote")]
+fn prevote_checkquorum_raft_config() -> Arc<Config> {
+    Arc::new(
+        Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 200,
+            election_timeout_max: 400,
+            snapshot_policy: SnapshotPolicy::LogsSinceLast(10),
+            // ADR-012 ferrosa defaults (turned ON for this test).
+            enable_pre_vote: true,
+            check_quorum_ratio: 0.75,
+            ..Config::default()
+        }
+        .validate()
+        .expect("prevote+checkquorum config must validate"),
+    )
+}
+
+/// **W3.12 — Sprint 3 acceptance test (ADR-012).**
+///
+/// 3-node ferrosa cluster with PreVote+CheckQuorum enabled (the new fork
+/// knobs from `correctness/prevote-checkquorum`). Partition node3 from
+/// {node1, node2}, then heal. Assert node3's persisted term advanced by **at
+/// most 0** during the partition window — the protocol-level fix for
+/// `bug-raft-stale-candidate-runaway-term-no-prevote.md`.
+///
+/// # Gating
+///
+/// Gated on `#[cfg(feature = "sprint-03-engine-prevote")]` because the
+/// engine-side `handle_pre_vote_req` is not yet wired in the openraft fork
+/// (see `specs/in-process/sprint-03-openraft-patches.md` items W3.3 and
+/// W3.7-engine). Without that wire-up the test fails — node3's term still
+/// advances by 5–10 over the partition window because openraft's existing
+/// election path increments the term unconditionally on election-timer fire.
+///
+/// To run the test (and watch it fail until the engine lands):
+///   `cargo test -p ferrosa-cluster --features sprint-03-engine-prevote
+///    --test raft_election_storm ferrosa_partitioned_node_does_not_advance_term`
+///
+/// When the engine wire-up lands, the feature flag is removed and this test
+/// joins the default test suite.
+#[cfg(feature = "sprint-03-engine-prevote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ferrosa_partitioned_node_does_not_advance_term() {
+    ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);
+
+    let router = InProcessRouter::new();
+    let cfg = prevote_checkquorum_raft_config();
+    let (n1, n2, n3) = build_3_node_cluster_with_config(router.clone(), cfg, 15).await;
+
+    // Phase 1: cluster is healthy. Pick a non-node3 leader so node3 is a
+    // follower we can partition.
+    let leader = ensure_non_node3_leader(&n1, &n2, &n3).await;
+    write_entries(&leader, 5).await;
+
+    // Wait for node3 to fully replicate.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let a3 = n3
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        if a3 >= 5 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial convergence timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let initial_node3_term = n3.metrics().borrow().current_term;
+    let initial_leader_term = leader.metrics().borrow().current_term;
+
+    // Phase 2: partition node3 from {n1, n2}.
+    //
+    // Symmetric isolation: block both AppendEntries TO node3 (so it stops
+    // hearing from leader and its lease times out) and outgoing votes FROM
+    // node3 (so other nodes never see its inflated term — modeling the
+    // production failure mode where a partitioned candidate disrupts on heal).
+    router.block_node3_append.store(true, Ordering::Relaxed);
+    router
+        .block_node3_outgoing_votes
+        .store(true, Ordering::Relaxed);
+
+    // Hold the partition for ~5 election-timeouts so node3 would have
+    // attempted multiple election rounds without PreVote.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    let partitioned_node3_term = n3.metrics().borrow().current_term;
+    let term_advance = partitioned_node3_term.saturating_sub(initial_node3_term);
+
+    // Phase 3: heal partition.
+    router
+        .block_node3_outgoing_votes
+        .store(false, Ordering::Relaxed);
+    router.block_node3_append.store(false, Ordering::Relaxed);
+
+    // Wait for the cluster to re-converge.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let leader_term_now = leader.metrics().borrow().current_term;
+        let n3_term_now = n3.metrics().borrow().current_term;
+        if n3_term_now <= leader_term_now + 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "post-heal convergence timeout: leader_term={leader_term_now} n3_term={n3_term_now}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let final_leader_term = leader.metrics().borrow().current_term;
+
+    // ADR-012 W3.12 assertion: with PreVote enabled, the partitioned node
+    // does not advance its persisted term during the partition window.
+    //
+    // The exact bound:
+    //   - With PreVote (target state, after engine wire-up):
+    //         term_advance == 0
+    //   - Without PreVote (current state of the local fork, types-only):
+    //         term_advance >> 0 (typically 5-12 over 2.5s with our timeouts)
+    //
+    // We assert the strict-zero invariant. If the engine handler is not
+    // wired yet, the test fails with a clear message pointing back to the
+    // ADR and the deferred work item.
+    assert_eq!(
+        term_advance, 0,
+        "ADR-012 W3.12: PreVote did not suppress term advance during partition. \
+         node3 term advanced from {initial_node3_term} to {partitioned_node3_term} \
+         (delta {term_advance}). Cluster final leader_term={final_leader_term}, \
+         initial_leader_term={initial_leader_term}. \
+         If `enable_pre_vote: true` is in Config but the engine still increments \
+         the term on election timeout, the engine-side `handle_pre_vote_req` \
+         and `ServerState::PreCandidate` are not yet wired in the openraft fork \
+         (see specs/in-process/sprint-03-openraft-patches.md, items W3.3 and \
+         W3.7-engine)."
+    );
+
+    n1.shutdown().await.ok();
+    n2.shutdown().await.ok();
+    n3.shutdown().await.ok();
+}

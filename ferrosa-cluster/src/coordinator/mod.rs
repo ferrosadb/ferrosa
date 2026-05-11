@@ -2,6 +2,7 @@
 //! with tunable consistency level enforcement.
 
 pub mod batch;
+pub mod cl_routing;
 pub mod metrics;
 pub mod read;
 pub mod truncate;

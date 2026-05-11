@@ -115,6 +115,18 @@ enum Commands {
         action: AuthAction,
     },
 
+    /// Raft administration commands (ADR-012, W1.11, ADR-015).
+    Raft {
+        #[command(subcommand)]
+        action: RaftAction,
+    },
+
+    /// Cluster operations — multi-DC bootstrap, etc. (ADR-015).
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+
     /// Restore from a snapshot, optionally to a point in time.
     Restore {
         /// Name of the snapshot to restore from.
@@ -127,6 +139,52 @@ enum Commands {
         /// Skip confirmation prompt and proceed even if data will be overwritten.
         #[arg(long)]
         force: bool,
+    },
+}
+
+/// Raft administration sub-actions.
+///
+/// Unifies the W1.11 "reset" command with the ADR-012 "transfer-leader"
+/// command. Both share the same Raft-engine entry point, so they live
+/// under one subcommand to avoid clap's "multiple variants with the
+/// same name" error.
+#[derive(Debug, Subcommand)]
+enum RaftAction {
+    /// Wipe a node's persisted Raft state (log + meta trees) so it
+    /// rejoins the cluster as a fresh learner. The node must be stopped
+    /// before running this — sled holds an exclusive flock(2) on the
+    /// data directory.
+    ///
+    /// Use case: recovery from the disruptor-partition runaway-term
+    /// failure mode (specs/in-process/bug-raft-stale-candidate-runaway-
+    /// term-no-prevote.md). The leader's InstallSnapshot / AppendEntries
+    /// will replay committed history onto the reset node.
+    Reset {
+        /// Path to the node's Raft data directory (e.g. `/var/lib/ferrosa/raft`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+
+        /// Print what would be cleared without actually clearing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Transfer Raft leadership to a target node (Ongaro §3.10).
+    ///
+    /// Useful for graceful drains during DC-aware operations and for
+    /// multi-DC failover. Calls `raft.trigger().transfer_to(target)` on the
+    /// current leader; the target becomes leader within `election_timeout × 2`
+    /// or the command returns `TransferError::Timeout`.
+    ///
+    /// **Status**: this subcommand is wired but the underlying
+    /// `transfer_to` API is not yet implemented in the openraft fork. See
+    /// `specs/in-process/sprint-03-openraft-patches.md` (W3.9). Until the
+    /// engine work lands, the command emits a clear "not yet implemented"
+    /// diagnostic.
+    TransferLeader {
+        /// Host ID of the target node (must currently be a Raft voter).
+        #[arg(long = "to")]
+        to: String,
     },
 }
 
@@ -172,6 +230,67 @@ enum AuthAction {
         /// Skip the second-prompt confirmation (for scripting).
         #[arg(long)]
         no_confirm: bool,
+    },
+}
+
+/// Cluster sub-actions (ADR-015).
+#[derive(Debug, Subcommand)]
+enum ClusterAction {
+    /// Bootstrap a new per-DC Raft group (W6.7, ADR-015).
+    ///
+    /// Creates a fresh Raft group identified by `RaftGroupId::for_dc(<dc>)`
+    /// with the listed seed nodes as the initial voter set. Existing DC
+    /// groups continue running unchanged. Useful for adding a third DC
+    /// after initial cluster bring-up, or rebuilding a per-DC group
+    /// after a catastrophic failure.
+    ///
+    /// **Status**: in-process scaffolding (Sprint 6). The HTTP wire-up
+    /// to the running node lands alongside the multi-DC formation
+    /// rollout in Sprint 7. Until then, the command computes the
+    /// derived `RaftGroupId` and prints it so operators can verify
+    /// the per-DC namespace before they pull the trigger.
+    BootstrapDc {
+        /// DC name. Must match the `FERROSA_DATA_CENTER` env on the
+        /// seed nodes.
+        #[arg(long = "dc")]
+        dc: String,
+
+        /// Comma-separated list of seed addresses, e.g.
+        /// `node3a:7000,node3b:7000,node3c:7000`.
+        #[arg(long = "seeds", value_delimiter = ',')]
+        seeds: Vec<String>,
+    },
+
+    /// W8.5 — Add a long-lived learner replica to the cluster (ADR-014).
+    ///
+    /// The learner receives `AppendEntries` and applies log entries but
+    /// does not vote. With `--owns-tokens=true` (the default) it
+    /// participates in the ring as a read replica; with
+    /// `--owns-tokens=false` it is a state-machine-only follower
+    /// (analytics / future witness role).
+    AddLearner {
+        /// Host ID (UUID) of the new learner.
+        host_id: String,
+        /// Internode address `<host>:<port>` for the learner.
+        addr: String,
+        /// Whether the learner owns ring tokens (default: true).
+        #[arg(long = "owns-tokens", default_value_t = true)]
+        owns_tokens: bool,
+    },
+
+    /// W8.5 — Promote a learner to a voter (ADR-014).
+    PromoteToVoter {
+        /// Host ID of the learner to promote.
+        host_id: String,
+    },
+
+    /// W8.5 — Demote a voter to a learner (ADR-014).
+    ///
+    /// If the target is the current Raft leader, leadership is
+    /// transferred first (W4.14 self-transfer pattern).
+    DemoteToLearner {
+        /// Host ID of the voter to demote.
+        host_id: String,
     },
 }
 
@@ -268,6 +387,29 @@ async fn main() {
                     process::exit(e.exit_code());
                 }
                 Ok(())
+            }
+        },
+        Commands::Raft { action } => match action {
+            RaftAction::Reset { data_dir, dry_run } => commands::raft_reset(&data_dir, dry_run),
+            RaftAction::TransferLeader { to } => {
+                commands::raft_transfer_leader(&web_host, web_port, &to).await
+            }
+        },
+        Commands::Cluster { action } => match action {
+            ClusterAction::BootstrapDc { dc, seeds } => commands::cluster_bootstrap_dc(&dc, &seeds),
+            ClusterAction::AddLearner {
+                host_id,
+                addr,
+                owns_tokens,
+            } => {
+                commands::cluster_add_learner(&web_host, web_port, &host_id, &addr, owns_tokens)
+                    .await
+            }
+            ClusterAction::PromoteToVoter { host_id } => {
+                commands::cluster_promote_to_voter(&web_host, web_port, &host_id).await
+            }
+            ClusterAction::DemoteToLearner { host_id } => {
+                commands::cluster_demote_to_learner(&web_host, web_port, &host_id).await
             }
         },
         Commands::Restore {
@@ -405,6 +547,49 @@ mod tests {
     fn web_port_override() {
         let cli = Cli::try_parse_from(["ferrosa-ctl", "--web-port", "8080", "ring"]).unwrap();
         assert_eq!(cli.web_port, 8080);
+    }
+
+    /// W1.11 CLI parsing: `ferrosa-ctl raft reset --data-dir <path>` is
+    /// recognized and produces the expected RaftAction::Reset variant.
+    #[test]
+    fn subcommand_raft_reset_parses() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "reset",
+            "--data-dir",
+            "/var/lib/ferrosa/raft",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action: RaftAction::Reset { data_dir, dry_run },
+            } => {
+                assert_eq!(data_dir, std::path::PathBuf::from("/var/lib/ferrosa/raft"));
+                assert!(!dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// W1.11 CLI parsing: `--dry-run` is supported.
+    #[test]
+    fn subcommand_raft_reset_dry_run_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "reset",
+            "--data-dir",
+            "/tmp/x",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action: RaftAction::Reset { dry_run, .. },
+            } => assert!(dry_run),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -653,6 +838,28 @@ mod tests {
                 assert_eq!(snapshot_name, "backup-2026");
                 assert_eq!(point_in_time.as_deref(), Some("2026-03-01T00:00:00Z"));
                 assert!(force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    /// W3.13 (ADR-012): `ferrosa-ctl raft transfer-leader --to <host_id>`
+    /// parses correctly. The actual server-side handler is deferred (W3.9).
+    #[test]
+    fn parse_raft_transfer_leader() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "transfer-leader",
+            "--to",
+            "host-uuid-abc",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action: RaftAction::TransferLeader { to },
+            } => {
+                assert_eq!(to, "host-uuid-abc");
             }
             other => panic!("unexpected command: {other:?}"),
         }

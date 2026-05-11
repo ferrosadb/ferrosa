@@ -308,6 +308,203 @@ pub async fn add_node(host: &str, web_port: u16, host_id: &str) -> Result<(), We
     }
 }
 
+/// Transfer Raft leadership to a target node (Ongaro §3.10, ADR-012 W3.13).
+///
+/// Issues `POST /api/cluster/raft/transfer-leader` with `{"to": "<host_id>"}`.
+/// The server-side handler invokes
+/// `raft.trigger().transfer_to(target_node_id).await`. Returns within
+/// `election_timeout × 2` or with `TransferError::Timeout`.
+///
+/// **Status**: this client-side wiring lands in Sprint 3. The server-side
+/// handler and the underlying openraft `transfer_to` API are deferred (see
+/// `specs/in-process/sprint-03-openraft-patches.md` items W3.8/W3.9). Until
+/// the server endpoint exists, this command surfaces the upstream HTTP 404
+/// (or 501 Not Implemented) cleanly so operators see what's missing.
+pub async fn raft_transfer_leader(
+    host: &str,
+    web_port: u16,
+    to_host_id: &str,
+) -> Result<(), WebError> {
+    let url = format!(
+        "http://{}:{}/api/cluster/raft/transfer-leader",
+        host, web_port
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "to": to_host_id }))
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Raft leadership transfer to {} initiated.", to_host_id);
+        if !body.is_empty() {
+            println!("{body}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "raft transfer-leader: server endpoint not yet implemented (HTTP {}). \
+             See specs/in-process/sprint-03-openraft-patches.md (W3.8, W3.9). \
+             Body: {}",
+            status, body
+        )
+        .into())
+    } else {
+        Err(format!("raft transfer-leader failed (HTTP {}): {}", status, body).into())
+    }
+}
+
+// ── W8.5 — Learner lifecycle commands (ADR-014) ─────────────────────
+
+/// Build the `add-learner` URL.
+fn add_learner_url(host: &str, web_port: u16) -> String {
+    format!("http://{}:{}/api/cluster/add-learner", host, web_port)
+}
+
+/// Build the JSON body for `add-learner`.
+fn add_learner_body(host_id: &str, addr: &str, owns_tokens: bool) -> serde_json::Value {
+    serde_json::json!({
+        "host_id": host_id,
+        "addr": addr,
+        "owns_tokens": owns_tokens,
+    })
+}
+
+/// Build the `promote-to-voter` URL.
+fn promote_to_voter_url(host: &str, web_port: u16) -> String {
+    format!("http://{}:{}/api/cluster/promote-to-voter", host, web_port)
+}
+
+/// Build the JSON body for `promote-to-voter`.
+fn promote_to_voter_body(host_id: &str) -> serde_json::Value {
+    serde_json::json!({ "host_id": host_id })
+}
+
+/// Build the `demote-to-learner` URL.
+fn demote_to_learner_url(host: &str, web_port: u16) -> String {
+    format!("http://{}:{}/api/cluster/demote-to-learner", host, web_port)
+}
+
+/// Build the JSON body for `demote-to-learner`.
+fn demote_to_learner_body(host_id: &str) -> serde_json::Value {
+    serde_json::json!({ "host_id": host_id })
+}
+
+/// W8.5 — Add a long-lived learner replica to the cluster.
+///
+/// Issues `POST /api/cluster/add-learner`. The server-side handler
+/// invokes `MembershipChanger::add_learner_only(host_id, addr,
+/// NodeJoinConfig { owns_tokens })`.
+pub async fn cluster_add_learner(
+    host: &str,
+    web_port: u16,
+    host_id: &str,
+    addr: &str,
+    owns_tokens: bool,
+) -> Result<(), WebError> {
+    let url = add_learner_url(host, web_port);
+    let body = add_learner_body(host_id, addr, owns_tokens);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!(
+            "Learner {} ({}) added to cluster (owns_tokens={}).",
+            host_id, addr, owns_tokens
+        );
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "cluster add-learner: server endpoint not yet wired (HTTP {status}). \
+             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
+             Body: {text}"
+        )
+        .into())
+    } else {
+        Err(format!("cluster add-learner failed (HTTP {status}): {text}").into())
+    }
+}
+
+/// W8.5 — Promote a learner to a voter.
+///
+/// Issues `POST /api/cluster/promote-to-voter`. The server-side handler
+/// invokes `MembershipChanger::promote_learner_to_voter(host_id)`.
+pub async fn cluster_promote_to_voter(
+    host: &str,
+    web_port: u16,
+    host_id: &str,
+) -> Result<(), WebError> {
+    let url = promote_to_voter_url(host, web_port);
+    let body = promote_to_voter_body(host_id);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Learner {host_id} promoted to voter.");
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "cluster promote-to-voter: server endpoint not yet wired (HTTP {status}). \
+             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
+             Body: {text}"
+        )
+        .into())
+    } else {
+        Err(format!("cluster promote-to-voter failed (HTTP {status}): {text}").into())
+    }
+}
+
+/// W8.5 — Demote a voter to a learner.
+///
+/// Issues `POST /api/cluster/demote-to-learner`. The server-side
+/// handler invokes `MembershipChanger::demote_voter_to_learner(host_id)`.
+pub async fn cluster_demote_to_learner(
+    host: &str,
+    web_port: u16,
+    host_id: &str,
+) -> Result<(), WebError> {
+    let url = demote_to_learner_url(host, web_port);
+    let body = demote_to_learner_body(host_id);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Voter {host_id} demoted to learner.");
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        Ok(())
+    } else if status.as_u16() == 404 || status.as_u16() == 501 {
+        Err(format!(
+            "cluster demote-to-learner: server endpoint not yet wired (HTTP {status}). \
+             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
+             Body: {text}"
+        )
+        .into())
+    } else {
+        Err(format!("cluster demote-to-learner failed (HTTP {status}): {text}").into())
+    }
+}
+
 /// Decommission a node from the cluster.
 ///
 /// Issues `POST /api/cluster/decommission` with an optional `{"host_id": …}`.
@@ -520,6 +717,95 @@ pub async fn restore(
     }
 }
 
+// ── Raft administration (offline) ─────────────────────────────────────────────
+
+/// W1.11: wipe a stopped node's persisted Raft state (sled `log` and
+/// `meta` trees). The node must be stopped before this runs — sled
+/// holds an exclusive flock(2) on the data directory and reset will
+/// fail if a Ferrosa process is still using it.
+///
+/// On `dry_run = true`, the function opens the trees just to count
+/// what *would* be cleared, prints the counts, and returns without
+/// mutating. (sled does open the trees here, which acquires the lock
+/// briefly, so even dry-run requires the node to be stopped.)
+pub fn raft_reset(
+    data_dir: &std::path::Path,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use ferrosa_cluster::raft::log_store::SledLogStore;
+
+    if dry_run {
+        // Open read-only-ish: we just want to enumerate counts. The
+        // ResetCounts type isn't accessible without calling reset(),
+        // so for dry-run we open and inspect the trees directly.
+        let db = sled::open(data_dir)?;
+        let log = db.open_tree("log")?;
+        let meta = db.open_tree("meta")?;
+        println!(
+            "ferrosa-ctl raft reset --dry-run\n\
+             would clear: log entries = {}, meta keys = {}\n\
+             path: {}",
+            log.len(),
+            meta.len(),
+            data_dir.display()
+        );
+        // Drop is enough — sled flushes on drop.
+        return Ok(());
+    }
+
+    let counts = SledLogStore::reset(data_dir)?;
+    println!(
+        "ferrosa-ctl raft reset\n\
+         cleared: log entries = {}, meta keys = {}\n\
+         path: {}\n\
+         next start: this node will rejoin as a learner; \
+         the leader's snapshot/append will replay committed history.",
+        counts.log_entries,
+        counts.meta_keys,
+        data_dir.display()
+    );
+    Ok(())
+}
+
+/// W6.7 (ADR-015): bootstrap a new per-DC Raft group.
+///
+/// Computes the deterministic [`ferrosa_cluster::raft::RaftGroupId`]
+/// from the DC name and prints the operator-visible bootstrap plan.
+/// The HTTP wire-up to the running node lands in Sprint 7 alongside
+/// the multi-DC formation rollout — until then this command is the
+/// scaffolding that lets operators verify the per-DC namespace
+/// (group_id, log dir layout, seed list) before pulling the trigger.
+///
+/// Returns `Ok(())` for any well-formed argument set; an empty seed
+/// list is still allowed because Sprint 6 doesn't yet contact the
+/// node, and this enables CI tests of the wiring.
+pub fn cluster_bootstrap_dc(
+    dc_name: &str,
+    seeds: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if dc_name.trim().is_empty() {
+        return Err("--dc must not be empty".into());
+    }
+    let group_id = ferrosa_cluster::raft::RaftGroupId::for_dc(dc_name);
+    println!(
+        "ferrosa-ctl cluster bootstrap-dc\n\
+         dc:        {dc_name}\n\
+         group_id:  {group_id}\n\
+         seeds:     {seeds_pretty}\n\
+         log_dir:   <raft_data_dir>/{dc_name}/\n\
+         status:    Sprint 6 scaffolding — group_id derivation verified;\n\
+                    the live HTTP wire-up lands in Sprint 7. Re-run\n\
+                    against a Sprint 7 build (or call the HTTP endpoint\n\
+                    directly) to actually create the group on the node.",
+        seeds_pretty = if seeds.is_empty() {
+            "(none)".to_string()
+        } else {
+            seeds.join(", ")
+        }
+    );
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -527,6 +813,61 @@ mod tests {
     use ferrosa_cql::client::{QueryResult, ResultRow};
 
     use super::*;
+
+    /// W1.11: `ferrosa-ctl raft reset` clears a stopped node's persisted
+    /// Raft state (log + meta), enabling recovery from the runaway-term
+    /// failure mode. The test simulates a node with persisted Raft state,
+    /// runs the reset, and asserts the trees are empty afterward.
+    #[test]
+    fn ferrosa_ctl_raft_reset_recovers_runaway_term_node() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Step 1: simulate a running node by creating a sled DB with
+        // some log entries and meta keys.
+        {
+            let db = sled::open(dir.path()).unwrap();
+            let log = db.open_tree("log").unwrap();
+            let meta = db.open_tree("meta").unwrap();
+            for i in 0u64..5 {
+                log.insert(i.to_be_bytes(), b"entry".to_vec()).unwrap();
+            }
+            meta.insert(b"vote", b"some-vote-bytes".to_vec()).unwrap();
+            db.flush().unwrap();
+        } // drop releases the lock
+
+        // Step 2: run `ferrosa-ctl raft reset` (the underlying function).
+        super::raft_reset(dir.path(), false).expect("raft reset must succeed");
+
+        // Step 3: reopen and confirm the trees are empty — the node will
+        // rejoin as a fresh learner.
+        let db = sled::open(dir.path()).unwrap();
+        let log = db.open_tree("log").unwrap();
+        let meta = db.open_tree("meta").unwrap();
+        assert_eq!(log.len(), 0, "log must be empty after reset");
+        assert_eq!(meta.len(), 0, "meta must be empty after reset");
+    }
+
+    /// W1.11 dry-run: --dry-run reports counts without mutating.
+    #[test]
+    fn ferrosa_ctl_raft_reset_dry_run_does_not_mutate() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = sled::open(dir.path()).unwrap();
+            let log = db.open_tree("log").unwrap();
+            for i in 0u64..3 {
+                log.insert(i.to_be_bytes(), b"entry".to_vec()).unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        super::raft_reset(dir.path(), true).expect("dry-run must succeed");
+
+        // Assert nothing was cleared.
+        let db = sled::open(dir.path()).unwrap();
+        let log = db.open_tree("log").unwrap();
+        assert_eq!(log.len(), 3, "dry-run must not mutate");
+    }
 
     fn make_result(col_names: &[&str], rows: Vec<Vec<Option<&'static [u8]>>>) -> QueryResult {
         QueryResult {
@@ -662,6 +1003,52 @@ mod tests {
     /// Helper: build the URL for rebalance.
     fn rebalance_url(host: &str, web_port: u16) -> String {
         format!("http://{}:{}/api/cluster/rebalance", host, web_port)
+    }
+
+    // ── W8.5 — learner lifecycle CLI commands ────────────────────────
+
+    /// W8.5 RED. `ferrosa-ctl cluster add-learner <host_id> <addr>`
+    /// must POST `{host_id, addr, owns_tokens}` to the new
+    /// `/api/cluster/add-learner` endpoint.
+    #[test]
+    fn ferrosa_ctl_cluster_add_learner() {
+        let url = super::add_learner_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/add-learner");
+
+        let body = super::add_learner_body("host-1", "10.0.0.7:7000", true);
+        assert_eq!(body["host_id"], "host-1");
+        assert_eq!(body["addr"], "10.0.0.7:7000");
+        assert_eq!(body["owns_tokens"], true);
+
+        // Default owns_tokens is true (long-lived read replica).
+        let body_default = super::add_learner_body("host-2", "10.0.0.8:7000", true);
+        assert_eq!(body_default["owns_tokens"], true);
+
+        // Witness / analytics learner: owns_tokens=false.
+        let body_witness = super::add_learner_body("host-3", "10.0.0.9:7000", false);
+        assert_eq!(body_witness["owns_tokens"], false);
+    }
+
+    /// W8.5 RED. `ferrosa-ctl cluster promote-to-voter <host_id>` must
+    /// POST `{host_id}` to `/api/cluster/promote-to-voter`.
+    #[test]
+    fn ferrosa_ctl_cluster_promote_to_voter() {
+        let url = super::promote_to_voter_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/promote-to-voter");
+
+        let body = super::promote_to_voter_body("host-promote");
+        assert_eq!(body["host_id"], "host-promote");
+    }
+
+    /// W8.5 RED. `ferrosa-ctl cluster demote-to-learner <host_id>` must
+    /// POST `{host_id}` to `/api/cluster/demote-to-learner`.
+    #[test]
+    fn ferrosa_ctl_cluster_demote_to_learner() {
+        let url = super::demote_to_learner_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/demote-to-learner");
+
+        let body = super::demote_to_learner_body("host-demote");
+        assert_eq!(body["host_id"], "host-demote");
     }
 
     #[test]
@@ -1534,5 +1921,43 @@ mod tests {
             Some(b"closing" as &[u8])
         );
         assert_eq!(result.rows[2].columns[1].as_deref(), Some(b"open" as &[u8]));
+    }
+
+    /// W6.7: `ferrosa-ctl cluster bootstrap-dc --dc dc3 --seeds ...`
+    /// derives a deterministic per-DC `RaftGroupId` and exits clean.
+    /// Re-running with the same DC produces an identical group id —
+    /// idempotency guarantees that re-issuing the command on retry is
+    /// safe.
+    #[test]
+    fn ferrosa_ctl_bootstrap_dc_creates_raft_group() {
+        // Computed once here so the assertion below pins the
+        // determinism property without relying on the printed output.
+        let id_a = ferrosa_cluster::raft::RaftGroupId::for_dc("dc3");
+        let id_b = ferrosa_cluster::raft::RaftGroupId::for_dc("dc3");
+        assert_eq!(id_a, id_b, "group_id derivation must be deterministic");
+
+        // Different DC produces a different id — existing dc1/dc2
+        // groups are unaffected by a `bootstrap-dc dc3` run.
+        let id_other = ferrosa_cluster::raft::RaftGroupId::for_dc("dc1");
+        assert_ne!(id_a, id_other);
+
+        // The command itself accepts the well-formed args without
+        // error, even with an empty seed list (Sprint 6 scaffolding;
+        // the HTTP wire-up that requires the seed list lands in
+        // Sprint 7).
+        let seeds = vec![
+            "node3a:7000".to_string(),
+            "node3b:7000".to_string(),
+            "node3c:7000".to_string(),
+        ];
+        cluster_bootstrap_dc("dc3", &seeds).expect("well-formed args");
+
+        // Empty DC name is rejected.
+        let err = cluster_bootstrap_dc("", &seeds).expect_err("empty dc must be rejected");
+        assert!(err.to_string().contains("--dc"));
+
+        // Empty seeds — allowed in Sprint 6 (operator may inspect the
+        // derived group_id without committing to a seed set yet).
+        cluster_bootstrap_dc("dc3", &[]).expect("empty seeds permitted in scaffolding");
     }
 }

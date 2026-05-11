@@ -6,11 +6,47 @@ use serde::{Deserialize, Serialize};
 use crate::chaos::NemesisRegistry;
 use crate::checker::{check_linearizability, CheckResult};
 use crate::config::{Concurrency, RunConfig, Tier, Topology};
+use crate::cql_session::ScyllaCqlSession;
 use crate::docker_provision::{provision_docker_cluster, teardown_docker_cluster, ClusterInfo};
 use crate::driver::DriverRegistry;
 use crate::history::HistoryRecorder;
 use crate::report::RunReport;
-use crate::workload::{MockCqlSession, WorkloadRegistry};
+use crate::workload::{CqlSession, MockCqlSession, WorkloadRegistry};
+
+/// Where the CQL session for a single combination came from.
+///
+/// Used by the orchestrator to decide whether to dial the real cluster or
+/// the in-process mock. The variant is exposed for unit tests so they can
+/// assert the wiring without spinning a Docker cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionSource {
+    /// In-process mock — no I/O. Used when no cluster has been provisioned
+    /// or when running unit-style combinations.
+    Mock,
+    /// Real CQL session against the contact points listed.
+    Real(Vec<String>),
+}
+
+/// Resolve the session source for a single combination.
+///
+/// When a real cluster has been provisioned (`cluster.is_some()`), we route
+/// queries through `ScyllaCqlSession` against the cluster's contact points.
+/// Otherwise (unit-level invocations, in-process orchestrator runs without
+/// containers), we fall back to `MockCqlSession`.
+///
+/// Prior to Sprint 2, this function did not exist: `run_single_combination`
+/// took an `Option<&ClusterInfo>` argument that it ignored, so the real
+/// cluster path was unreachable. See `specs/in-process/sprint-02-jepsen-reactivation.md`
+/// W2.1 / W2.2.
+pub(crate) fn resolve_session_source(cluster: Option<&ClusterInfo>) -> SessionSource {
+    match cluster {
+        Some(c) => {
+            let addrs: Vec<String> = c.nodes.iter().map(|n| n.cql_address()).collect();
+            SessionSource::Real(addrs)
+        }
+        None => SessionSource::Mock,
+    }
+}
 
 /// Result of a single test combination (one workload + one nemesis).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +186,10 @@ fn resolve_nemesis_registry(tier: Tier) -> NemesisRegistry {
         Tier::Smoke => NemesisRegistry::phase1(),
         Tier::Standard => NemesisRegistry::phase2(),
         Tier::Full | Tier::Endurance => NemesisRegistry::full(),
+        // Sprint 7 W7.11: tier-multi-dc uses the full registry
+        // which includes the W7.11 dc-partition+dc-slow composed
+        // nemesis required by the headline run.
+        Tier::MultiDc => NemesisRegistry::full(),
     }
 }
 
@@ -179,7 +219,7 @@ async fn run_single_combination(
     driver_name: &str,
     concurrency: Concurrency,
     config: &RunConfig,
-    _cluster: Option<&crate::docker_provision::ClusterInfo>,
+    cluster: Option<&crate::docker_provision::ClusterInfo>,
 ) -> Result<CombinationResult> {
     let start = Instant::now();
 
@@ -198,17 +238,29 @@ async fn run_single_combination(
         .get(workload_name)
         .ok_or_else(|| anyhow::anyhow!("unknown workload: {workload_name}"))?;
 
-    // Use mock session (unit tests / no-cluster path).
-    // Real CQL sessions are injected by the container E2E path (future C3.7 full wire).
-    let session = MockCqlSession;
+    // Resolve session source: real cluster when provisioned, mock otherwise.
+    // Sprint 2 W2.2 — formerly the cluster argument was discarded and
+    // `MockCqlSession` was used unconditionally.
+    let session: Box<dyn CqlSession> = match resolve_session_source(cluster) {
+        SessionSource::Real(addrs) => {
+            tracing::info!(?addrs, "dialing real CQL cluster");
+            Box::new(ScyllaCqlSession::connect(&addrs).await?)
+        }
+        SessionSource::Mock => {
+            tracing::debug!("using MockCqlSession (no cluster provisioned)");
+            Box::new(MockCqlSession)
+        }
+    };
 
     // Set up schema.
-    workload.setup(&session).await?;
+    workload.setup(session.as_ref()).await?;
 
     // Run workload for configured duration.
     let run_duration = Duration::from_secs(config.run_duration_secs());
     let mut recorder = HistoryRecorder::new(&format!("{driver_name}-{workload_name}"));
-    workload.run(&session, &mut recorder, run_duration).await?;
+    workload
+        .run(session.as_ref(), &mut recorder, run_duration)
+        .await?;
     let history = recorder.finish();
 
     // Write history JSONL to output directory.
@@ -275,6 +327,65 @@ mod tests {
         assert!(!names.is_empty());
         assert!(names.contains(&"register".to_string()));
         assert!(names.contains(&"bank".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // W2.1 / W2.2 — orchestrator must wire the real cluster when one is provided.
+    //
+    // Before Sprint 2 the orchestrator discarded its `_cluster` argument and
+    // always used `MockCqlSession`, even when callers had spun up a real
+    // Docker cluster. The bug lived at `orchestrator.rs:203`. The two tests
+    // below pin the resolution helper that drives the wiring.
+    // -----------------------------------------------------------------------
+
+    /// W2.2: when a cluster is provided, the orchestrator must dial it.
+    #[test]
+    fn orchestrator_uses_real_cluster_when_provided() {
+        use crate::docker_provision::NodeInfo as JepsenNodeInfo;
+
+        let cluster = ClusterInfo {
+            nodes: vec![
+                JepsenNodeInfo {
+                    host: "localhost",
+                    cql_port: 49042,
+                },
+                JepsenNodeInfo {
+                    host: "localhost",
+                    cql_port: 49043,
+                },
+                JepsenNodeInfo {
+                    host: "localhost",
+                    cql_port: 49044,
+                },
+            ],
+            compose_file: std::path::PathBuf::from("/tmp/fake.yml"),
+        };
+
+        let source = resolve_session_source(Some(&cluster));
+        match source {
+            SessionSource::Real(addrs) => {
+                assert_eq!(
+                    addrs,
+                    vec![
+                        "localhost:49042".to_string(),
+                        "localhost:49043".to_string(),
+                        "localhost:49044".to_string(),
+                    ],
+                    "real session must use the cluster's CQL contact points"
+                );
+            }
+            SessionSource::Mock => panic!(
+                "orchestrator must NOT use MockCqlSession when a real cluster is provided \
+                 (Sprint 2 W2.2 — see specs/in-process/sprint-02-jepsen-reactivation.md)"
+            ),
+        }
+    }
+
+    /// W2.1: when no cluster is provided, the orchestrator falls back to mock.
+    #[test]
+    fn orchestrator_uses_mock_when_no_cluster_provided() {
+        let source = resolve_session_source(None);
+        assert_eq!(source, SessionSource::Mock);
     }
 
     #[tokio::test]

@@ -85,6 +85,19 @@ pub fn dc_slow_and_disk() -> ComposedNemesis {
     )
 }
 
+/// W7.11 — DC partition + DC slow composed nemesis. The
+/// Sprint 7 acceptance test runs the bank workload at QUORUM under
+/// this composed fault for 1 simulated hour on the T3 topology.
+pub fn dc_partition_and_slow() -> ComposedNemesis {
+    ComposedNemesis::new(
+        "dc-partition+dc-slow",
+        vec![
+            Box::new(super::wan_bridge::DcPartition),
+            Box::new(super::wan_bridge::DcSlow),
+        ],
+    )
+}
+
 /// Pre-defined composed nemesis: jitter + clock skew + pause.
 pub fn everything() -> ComposedNemesis {
     ComposedNemesis::new(
