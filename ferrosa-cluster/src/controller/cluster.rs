@@ -1422,6 +1422,58 @@ impl ModeController {
                         // races with leader election and yields
                         // "has to forward request to: None, None" on the seed.
                         let seed_num_tokens = config_for_promotion.num_tokens as usize;
+
+                        // Propose JoinNode + AssignTokens for the seed
+                        // itself, so the seed's identity replicates to every
+                        // follower's `state.members` / `state.token_map`.
+                        // Without this, follower state machines only learn
+                        // about *peers* and never about the seed — meaning
+                        // their `system.peers` view reports zero tokens for
+                        // the seed and writes coordinated through followers
+                        // never land on the seed's token range.  Cassandra
+                        // load tests then see roughly N-1 owners instead of
+                        // N, and the "diabolical" single-owner pattern
+                        // persists from the follower side.
+                        let local_node_info = crate::raft::NodeInfo {
+                            host_id: local_host_id_for_refresh,
+                            addr: local_addr_for_refresh.clone(),
+                            data_center: config_for_promotion.data_center.clone(),
+                            rack: config_for_promotion.rack.clone(),
+                            state: crate::raft::NodeState::Normal,
+                            cql_broadcast: local_cql_broadcast_for_refresh.clone(),
+                        };
+                        let self_join_cmd = crate::raft::RaftCommand {
+                            op: crate::raft::RaftOp::JoinNode(local_node_info),
+                            schema_version: Uuid::new_v4(),
+                        };
+                        if let Err(e) = raft_arc.client_write(self_join_cmd).await {
+                            tracing::warn!(
+                                local = local_node_id,
+                                leader = lid,
+                                %e,
+                                "seed: JoinNode for self failed after leader election"
+                            );
+                        }
+                        let self_tokens = crate::controller::token::deterministic_tokens_for_node(
+                            local_node_id,
+                            seed_num_tokens,
+                        );
+                        let self_assign_cmd = crate::raft::RaftCommand {
+                            op: crate::raft::RaftOp::AssignTokens {
+                                node_id: local_node_id,
+                                tokens: self_tokens,
+                            },
+                            schema_version: Uuid::new_v4(),
+                        };
+                        if let Err(e) = raft_arc.client_write(self_assign_cmd).await {
+                            tracing::warn!(
+                                local = local_node_id,
+                                leader = lid,
+                                %e,
+                                "seed: AssignTokens for self failed after leader election"
+                            );
+                        }
+
                         for (peer_uuid, addr) in &peers {
                             let peer_node_id = uuid_to_node_id(*peer_uuid);
                             let node_info = crate::raft::NodeInfo {
