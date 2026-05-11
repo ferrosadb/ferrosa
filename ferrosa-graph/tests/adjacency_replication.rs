@@ -30,6 +30,8 @@ use std::time::Duration;
 use indexmap::IndexMap;
 use tempfile::tempdir;
 
+use async_trait::async_trait;
+
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_graph::engine::{GraphEngine, GraphSchemaCoordinator, LocalGraphSchemaCoordinator};
 use ferrosa_graph::executor::expand::GraphEngineConfig;
@@ -71,21 +73,25 @@ impl RecordingCoordinator {
     }
 }
 
+#[async_trait]
 impl GraphSchemaCoordinator for RecordingCoordinator {
-    fn apply_create_keyspace(&self, ks: KeyspaceMetadata) -> ferrosa_graph::error::Result<()> {
+    async fn apply_create_keyspace(
+        &self,
+        ks: KeyspaceMetadata,
+    ) -> ferrosa_graph::error::Result<()> {
         self.events
             .lock()
             .unwrap()
             .push(DdlEvent::CreateKeyspace(ks.name.clone()));
-        self.inner.apply_create_keyspace(ks)
+        self.inner.apply_create_keyspace(ks).await
     }
 
-    fn apply_create_table(&self, table: TableMetadata) -> ferrosa_graph::error::Result<()> {
+    async fn apply_create_table(&self, table: TableMetadata) -> ferrosa_graph::error::Result<()> {
         self.events.lock().unwrap().push(DdlEvent::CreateTable(
             table.keyspace.clone(),
             table.name.clone(),
         ));
-        self.inner.apply_create_table(table)
+        self.inner.apply_create_table(table).await
     }
 }
 
@@ -228,8 +234,20 @@ fn test_storage_engine(dir: &std::path::Path) -> StorageEngine {
 /// coordinator captures the operation; pre-fix the engine called
 /// `Schema::create_*_internal` directly and bypassed the coordinator
 /// entirely, leaving cluster replicas with no idea the table exists.
-#[test]
-fn graph_engine_startup_routes_adjacency_ddl_through_coordinator() {
+/// The graph engine's lazy adjacency-registration path (invoked from
+/// every `execute_with_params`) must route DDL through the injected
+/// `GraphSchemaCoordinator`. On a multi-node cluster the coordinator
+/// goes through Raft so every replica's state machine applies the DDL;
+/// if the engine bypasses it (calling `Schema::create_*_internal`
+/// directly, as it used to), replicas reject `MutationForward` writes
+/// against the unregistered adjacency table and edge mutations hang.
+///
+/// A recording coordinator captures every DDL op the engine issues
+/// through the trait. Pre-fix the engine made direct schema calls and
+/// recorded events is empty; post-fix both `apply_create_keyspace` and
+/// `apply_create_table` are observed.
+#[tokio::test]
+async fn graph_engine_lazy_adjacency_registration_routes_through_coordinator() {
     let schema = Arc::new(test_schema());
     schema
         .create_keyspace_internal(KeyspaceMetadata {
@@ -261,7 +279,7 @@ fn graph_engine_startup_routes_adjacency_ddl_through_coordinator() {
 
     let recorder = Arc::new(RecordingCoordinator::new(Arc::clone(&schema)));
 
-    let _engine = GraphEngine::new_with_coordinator(
+    let engine = GraphEngine::new_with_coordinator(
         Arc::clone(&schema),
         Arc::clone(&storage),
         Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::direct(
@@ -272,14 +290,27 @@ fn graph_engine_startup_routes_adjacency_ddl_through_coordinator() {
         recorder.clone(),
     );
 
+    // Construction alone must not register adjacency — the lazy path
+    // owns that responsibility now.
+    assert!(
+        recorder.events().is_empty(),
+        "constructor must not emit DDL; recorded: {:?}",
+        recorder.events()
+    );
+
+    // Trigger the lazy path the way a graph query does.
+    engine
+        .ensure_adjacency_storage_for_keyspace_for_test("agent_memory")
+        .await
+        .expect("lazy adjacency registration should succeed against the local coordinator");
+
     let events = recorder.events();
     assert!(
         events.iter().any(
             |e| matches!(e, DdlEvent::CreateKeyspace(name) if name == "system_graph_agent_memory")
         ),
-        "graph engine startup must route adjacency-keyspace DDL through the \
-         GraphSchemaCoordinator so cluster replicas can register it; \
-         recorded events: {events:?}",
+        "lazy adjacency registration must route the keyspace DDL through the \
+         GraphSchemaCoordinator; recorded events: {events:?}",
     );
     assert!(
         events.iter().any(|e| matches!(
@@ -287,7 +318,7 @@ fn graph_engine_startup_routes_adjacency_ddl_through_coordinator() {
             DdlEvent::CreateTable(ks, tbl)
                 if ks == "system_graph_agent_memory" && tbl == "adjacency"
         )),
-        "graph engine startup must route adjacency-table DDL through the \
+        "lazy adjacency registration must route the table DDL through the \
          GraphSchemaCoordinator; recorded events: {events:?}",
     );
 }

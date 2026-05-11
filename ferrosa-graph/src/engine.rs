@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
-use ferrosa_storage::{ObserverMode, StorageEngine, WriteObserver};
+use ferrosa_storage::StorageEngine;
 
 use tokio_util::sync::CancellationToken;
 
@@ -92,40 +93,41 @@ fn empty_match_result(statement: &Statement) -> GraphResult {
 /// Cluster-aware schema-mutation sink for graph-engine-driven DDL.
 ///
 /// The graph engine auto-creates `system_graph_<keyspace>.adjacency`
-/// when it first sees an edge table for a keyspace. On a single node
-/// this is straightforward — call `Schema::create_*_internal` and
-/// `StorageEngine::register_table`. On a multi-node cluster, those
-/// local mutations need to propagate to every replica via the cluster's
-/// DDL replication path (pair mode, Raft, etc.) so that follower nodes
-/// can apply `MutationForward` writes to the adjacency table.
+/// when it first sees an edge table for a keyspace. The DDL must take
+/// the same path as regular CQL `CREATE TABLE`: through `DdlPath`, so
+/// that the cluster state machine applies it on every replica (schema
+/// + `StorageEngine::register_table`). Direct calls to
+/// `Schema::create_*_internal` skip the cluster apply and leave
+/// replicas unable to accept `MutationForward` writes against the
+/// system table.
 ///
 /// Implementations:
 /// - `LocalGraphSchemaCoordinator`: single-node / unit-test default.
-///   Writes directly to the provided `Schema` instance only.
-/// - Production cluster wiring should pass a coordinator that routes
-///   the DDL operation through the same path regular CQL DDL takes
-///   (see ferrosa-cluster ddl_path / pair::ddl).
+///   Applies DDL to the provided `Schema` only (matches `DdlPath::Direct`).
+/// - `ClusterGraphSchemaCoordinator`: production wiring. Holds the same
+///   `Arc<ArcSwap<DdlPath>>` regular CQL uses, so adjacency DDL goes
+///   through `DdlPath::execute(...)` and reaches every replica.
+#[async_trait]
 pub trait GraphSchemaCoordinator: Send + Sync {
     /// Idempotently create the adjacency keyspace cluster-wide.
-    /// Must be a no-op (returning Ok(())) if the keyspace already exists.
-    fn apply_create_keyspace(
+    /// Must be a no-op (returning `Ok(())`) if the keyspace already exists.
+    async fn apply_create_keyspace(
         &self,
         ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
     ) -> Result<()>;
 
     /// Idempotently create the adjacency table cluster-wide.
-    /// Must be a no-op (returning Ok(())) if the table already exists.
-    fn apply_create_table(
+    /// Must be a no-op (returning `Ok(())`) if the table already exists.
+    async fn apply_create_table(
         &self,
         table: ferrosa_schema::metadata::table::TableMetadata,
     ) -> Result<()>;
 }
 
-/// Local-only coordinator. Backwards-compatible single-node default —
-/// applies DDL to the provided Schema instance and nothing else.
-/// Cluster deployments should pass a coordinator that fans the DDL
-/// out via the cluster's replication path (Raft / pair sync) so all
-/// peers register the adjacency table in their local StorageEngine.
+/// Local-only coordinator. Single-node / unit-test default — applies
+/// DDL to the provided Schema instance and nothing else. The trait is
+/// async for symmetry with the cluster coordinator; the local impl
+/// completes synchronously.
 pub struct LocalGraphSchemaCoordinator {
     schema: Arc<Schema>,
 }
@@ -136,8 +138,9 @@ impl LocalGraphSchemaCoordinator {
     }
 }
 
+#[async_trait]
 impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
-    fn apply_create_keyspace(
+    async fn apply_create_keyspace(
         &self,
         ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
     ) -> Result<()> {
@@ -146,13 +149,57 @@ impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
             .map_err(|e| GraphError::Validation(format!("create_keyspace_internal: {e}")))
     }
 
-    fn apply_create_table(
+    async fn apply_create_table(
         &self,
         table: ferrosa_schema::metadata::table::TableMetadata,
     ) -> Result<()> {
         self.schema
             .create_table_internal(table)
             .map_err(|e| GraphError::Validation(format!("create_table_internal: {e}")))
+    }
+}
+
+/// Cluster-aware coordinator. Routes adjacency DDL through the same
+/// `DdlPath` regular CQL `CREATE TABLE` uses, so every replica's state
+/// machine applies the DDL — registering the adjacency table in its
+/// local schema and storage engine.
+///
+/// `Direct` (standalone) and `Pair` modes are handled by `DdlPath::execute`
+/// itself; the cluster coordinator doesn't special-case them.
+pub struct ClusterGraphSchemaCoordinator {
+    ddl_path: Arc<ArcSwap<ferrosa_cluster::ddl_path::DdlPath>>,
+}
+
+impl ClusterGraphSchemaCoordinator {
+    pub fn new(ddl_path: Arc<ArcSwap<ferrosa_cluster::ddl_path::DdlPath>>) -> Self {
+        Self { ddl_path }
+    }
+}
+
+#[async_trait]
+impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
+    async fn apply_create_keyspace(
+        &self,
+        ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
+    ) -> Result<()> {
+        let guard = self.ddl_path.load();
+        guard
+            .execute(ferrosa_cluster::pair::ddl::DdlOperation::CreateKeyspace(ks))
+            .await
+            .map_err(|e| GraphError::Validation(format!("cluster DDL CreateKeyspace: {e}")))
+    }
+
+    async fn apply_create_table(
+        &self,
+        table: ferrosa_schema::metadata::table::TableMetadata,
+    ) -> Result<()> {
+        let guard = self.ddl_path.load();
+        guard
+            .execute(ferrosa_cluster::pair::ddl::DdlOperation::CreateTable(
+                Box::new(table),
+            ))
+            .await
+            .map_err(|e| GraphError::Validation(format!("cluster DDL CreateTable: {e}")))
     }
 }
 
@@ -200,6 +247,11 @@ pub struct GraphEngine {
     /// Use `GraphEngine::new_with_coordinator` to inject a cluster-aware
     /// implementation so all replicas register the adjacency table.
     schema_coordinator: Arc<dyn GraphSchemaCoordinator>,
+    /// Cached at construction so the lazy adjacency-registration path
+    /// (`ensure_adjacency_storage_for_keyspace`) can spawn the
+    /// reconciliation loop with the configured cadence on first use of
+    /// each keyspace.
+    reconciliation_interval: std::time::Duration,
 }
 
 /// Information about a vertex or edge label in the graph schema.
@@ -260,142 +312,46 @@ impl GraphEngine {
         reconciliation_interval: std::time::Duration,
         schema_coordinator: Arc<dyn GraphSchemaCoordinator>,
     ) -> Self {
-        let snap = schema.snapshot();
-
-        // Discover keyspaces that have edge tables.
-        let mut edge_keyspaces = std::collections::HashSet::new();
-        for ((ks, _), meta) in &snap.tables {
-            if meta.extensions.get("graph.type") == Some(&"edge".to_string()) {
-                edge_keyspaces.insert(ks.clone());
-            }
-        }
-
-        // Register an adjacency observer and start reconciliation for each keyspace.
-        let mut reconciliation_handles = Vec::new();
-        let reconciliation_cancel = CancellationToken::new();
-        for ks in &edge_keyspaces {
-            // Ensure the adjacency keyspace + table are registered with both
-            // schema and storage BEFORE wiring the observer. Without this the
-            // observer produces derived mutations targeting a table that
-            // StorageEngine has never seen, and `apply_derived_mutation` logs
-            // "target table not registered — derived mutation dropped" for
-            // every edge write — silent data loss for hop queries.
-            let adj_ks = adjacency_keyspace_name(ks);
-            let adj_meta = adjacency_keyspace_metadata(&snap, ks);
-            if let Some(existing) = snap.keyspaces.get(&adj_ks) {
-                if replication_needs_repair(&existing.replication) {
-                    if let Err(e) = schema.alter_keyspace_internal(
-                        &adj_ks,
-                        ferrosa_schema::metadata::keyspace::KeyspaceUpdates {
-                            replication: Some(adj_meta.replication.clone()),
-                            durable_writes: Some(adj_meta.durable_writes),
-                        },
-                    ) {
-                        tracing::error!(
-                            keyspace = %adj_ks,
-                            error = %e,
-                            "graph engine: failed to repair adjacency keyspace replication"
-                        );
-                        continue;
-                    }
-                }
-            } else if let Err(e) = schema_coordinator.apply_create_keyspace(adj_meta) {
-                tracing::error!(
-                    keyspace = %adj_ks,
-                    error = %e,
-                    "graph engine: failed to register adjacency keyspace — \
-                     derived mutations will be dropped for {ks}; refusing to \
-                     register observer"
-                );
-                continue;
-            }
-            let adj_meta = adjacency_table_metadata(ks);
-            if let Err(e) = schema_coordinator.apply_create_table(adj_meta.clone()) {
-                tracing::error!(
-                    keyspace = %adj_ks,
-                    error = %e,
-                    "graph engine: failed to register adjacency table in schema — \
-                     derived mutations and graph traversals will be unavailable for {ks}"
-                );
-                continue;
-            }
-            let adj_schema = adj_meta.to_storage_schema();
-            if let Err(e) = storage.register_table(adj_schema) {
-                // Already-registered is fine (another edge table in the same
-                // keyspace shares the adjacency table). Any other error means
-                // derived mutations would drop — refuse to start the observer.
-                let msg = e.to_string();
-                let already = msg.contains("already registered") || msg.contains("already exists");
-                if !already {
-                    tracing::error!(
-                        keyspace = %adj_ks,
-                        error = %e,
-                        "graph engine: failed to register adjacency table with \
-                         StorageEngine — refusing to register observer for {ks}"
-                    );
-                    continue;
-                }
-            }
-
-            let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
-
-            match observer.mode() {
-                ObserverMode::Sync => {
-                    // Sync observers apply derived adjacency mutations inline on
-                    // the write path, so follow-up MATCH queries can see the
-                    // relationship immediately after MERGE returns.
-                    storage.register_observer(observer);
-                }
-                ObserverMode::Async => {
-                    if tokio::runtime::Handle::try_current().is_ok() {
-                        // Runtime available: register the observer with an engine-side
-                        // drain task. The drain task applies derived adjacency mutations
-                        // through the full write path and catches observer panics loudly.
-                        storage.register_async_observer_with_drain(
-                            observer as Arc<dyn ferrosa_storage::WriteObserver>,
-                            Arc::clone(&storage),
-                        );
-                    } else {
-                        // No runtime available (e.g., proptest sync context): fall back
-                        // to register_observer. Async observers registered this way will
-                        // drop derived writes because nothing drains the channel, but the
-                        // engine still comes up without panicking.
-                        storage.register_observer(observer);
-                    }
-                }
-            }
-
-            // spawn_reconciliation requires a tokio runtime. In test
-            // contexts (e.g., proptest without #[tokio::test]), there may
-            // be no runtime. Check before spawning.
-            if background_reconciliation_enabled(reconciliation_interval)
-                && tokio::runtime::Handle::try_current().is_ok()
-            {
-                let handle = spawn_reconciliation(
-                    Arc::clone(&schema),
-                    Arc::new(WritePath::direct(Arc::clone(&storage))),
-                    ks.clone(),
-                    reconciliation_interval,
-                    reconciliation_cancel.child_token(),
-                );
-                reconciliation_handles.push(handle);
-            }
-        }
-
+        // Adjacency-keyspace registration is done lazily on the first
+        // graph query that touches the keyspace (see
+        // `ensure_adjacency_storage_for_keyspace`), so the constructor
+        // doesn't need to walk edge tables here. The lazy path is the
+        // only path that creates the system_graph_<ks>.adjacency table
+        // — and it goes through the cluster DDL coordinator, which
+        // means every replica's state machine applies the DDL and
+        // registers the table in its local schema + StorageEngine.
+        //
+        // Repair of an existing adjacency keyspace's replication
+        // settings (a no-op unless schema is out of date) also moves to
+        // the lazy path; nothing here is so urgent that it can't wait
+        // for the first query.
         Self {
             schema,
             storage,
             write_path,
             config,
-            reconciliation_handles,
-            reconciliation_cancel,
+            reconciliation_handles: Vec::new(),
+            reconciliation_cancel: CancellationToken::new(),
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
-            registered_adjacency_keyspaces: Mutex::new(edge_keyspaces),
+            registered_adjacency_keyspaces: Mutex::new(HashSet::new()),
             schema_coordinator,
+            reconciliation_interval,
         }
     }
 
-    fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<bool> {
+    /// Test-visible alias for the lazy adjacency-registration path.
+    /// Production callers go through `execute_with_params`; the test
+    /// suite exercises this directly to pin the coordinator-routing
+    /// contract without spinning up a full query pipeline.
+    #[doc(hidden)]
+    pub async fn ensure_adjacency_storage_for_keyspace_for_test(
+        &self,
+        keyspace: &str,
+    ) -> Result<bool> {
+        self.ensure_adjacency_storage_for_keyspace(keyspace).await
+    }
+
+    async fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<bool> {
         let snap = self.schema.snapshot();
         let has_edge_table = snap.tables.iter().any(|((ks, _), meta)| {
             ks == keyspace && meta.extensions.get("graph.type") == Some(&"edge".to_string())
@@ -404,11 +360,41 @@ impl GraphEngine {
             return Ok(false);
         }
 
+        // Fast path: already registered. We check the in-process set
+        // before doing any DDL work; the DDL coordinator's operations
+        // are idempotent but submitting them through Raft on every
+        // query just to discover "no-op" would be wasteful.
+        {
+            let registered = self.registered_adjacency_keyspaces.lock().map_err(|_| {
+                GraphError::Internal("graph adjacency keyspace registry lock poisoned".to_string())
+            })?;
+            if registered.contains(keyspace) {
+                return Ok(false);
+            }
+        }
+
         let adj_ks = adjacency_keyspace_name(keyspace);
         let adj_meta = adjacency_keyspace_metadata(&snap, keyspace);
-        if !snap.keyspaces.contains_key(&adj_ks) {
+        if let Some(existing) = snap.keyspaces.get(&adj_ks) {
+            if replication_needs_repair(&existing.replication) {
+                if let Err(e) = self.schema.alter_keyspace_internal(
+                    &adj_ks,
+                    ferrosa_schema::metadata::keyspace::KeyspaceUpdates {
+                        replication: Some(adj_meta.replication.clone()),
+                        durable_writes: Some(adj_meta.durable_writes),
+                    },
+                ) {
+                    tracing::error!(
+                        keyspace = %adj_ks,
+                        error = %e,
+                        "graph engine: failed to repair adjacency keyspace replication"
+                    );
+                }
+            }
+        } else {
             self.schema_coordinator
                 .apply_create_keyspace(adj_meta)
+                .await
                 .map_err(|e| {
                     GraphError::Validation(format!(
                         "failed to register graph adjacency keyspace {adj_ks}: {e}"
@@ -423,6 +409,7 @@ impl GraphEngine {
         {
             self.schema_coordinator
                 .apply_create_table(adjacency_table_metadata(keyspace))
+                .await
                 .map_err(|e| {
                     GraphError::Validation(format!(
                         "failed to register graph adjacency table {adj_ks}.adjacency: {e}"
@@ -450,6 +437,24 @@ impl GraphEngine {
                     Arc::clone(&self.schema),
                     keyspace.to_string(),
                 )));
+
+            // Background reconciliation for this keyspace. Same gating
+            // the old startup-time path used: a configured non-zero
+            // interval + a tokio runtime available.
+            if background_reconciliation_enabled(self.reconciliation_interval)
+                && tokio::runtime::Handle::try_current().is_ok()
+            {
+                // Cancellation is via `self.reconciliation_cancel` (child
+                // token), so the JoinHandle is intentionally dropped —
+                // we don't await individual reconcile tasks at shutdown.
+                drop(spawn_reconciliation(
+                    Arc::clone(&self.schema),
+                    Arc::new(WritePath::direct(Arc::clone(&self.storage))),
+                    keyspace.to_string(),
+                    self.reconciliation_interval,
+                    self.reconciliation_cancel.child_token(),
+                ));
+            }
         }
 
         Ok(should_register_observer)
@@ -473,7 +478,7 @@ impl GraphEngine {
         auth: &AuthContext,
         params: &HashMap<String, Value>,
     ) -> Result<GraphResult> {
-        let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace)?;
+        let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
         if adjacency_registered {
             let wp = self.write_path.load();
             let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
@@ -1423,8 +1428,8 @@ mod tests {
         assert!(replication_needs_repair(&broken));
     }
 
-    #[test]
-    fn engine_startup_re_registers_adjacency_table_in_schema() {
+    #[tokio::test]
+    async fn engine_lazy_path_re_registers_adjacency_table_in_schema() {
         use std::collections::{HashMap, HashSet};
 
         use ferrosa_schema::{
@@ -1555,7 +1560,7 @@ mod tests {
             )
             .unwrap();
 
-        let _engine = GraphEngine::new(
+        let engine = GraphEngine::new(
             Arc::clone(&schema),
             storage.clone(),
             Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -1565,17 +1570,27 @@ mod tests {
             std::time::Duration::from_secs(60),
         );
 
+        // Adjacency registration is lazy now — the constructor doesn't
+        // create it. The first query (or the test hook below, which
+        // mirrors the lazy path) is what materialises the system
+        // adjacency keyspace + table on every replica via the
+        // GraphSchemaCoordinator.
+        engine
+            .ensure_adjacency_storage_for_keyspace_for_test("agent_memory")
+            .await
+            .expect("lazy adjacency registration");
+
         let snap = schema.snapshot();
         assert!(
             snap.keyspaces.contains_key("system_graph_agent_memory"),
-            "graph engine startup must restore the adjacency keyspace into the live schema"
+            "graph engine lazy path must register the adjacency keyspace in the live schema"
         );
         assert!(
             snap.tables.contains_key(&(
                 "system_graph_agent_memory".to_string(),
                 "adjacency".to_string()
             )),
-            "graph engine startup must restore the adjacency table into the live schema"
+            "graph engine lazy path must register the adjacency table in the live schema"
         );
     }
 }

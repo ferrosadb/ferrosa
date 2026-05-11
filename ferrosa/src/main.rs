@@ -868,8 +868,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register stub virtual tables for deferred observability features.
     ferrosa_cql::virtual_tables::register_all_stubs(schema.virtual_tables());
 
-    // Clone write_path before shared_state is moved into the CQL server.
+    // Clone write_path and ddl_path before shared_state is moved into the CQL server.
     let cluster_write_path = shared_state.write_path.clone();
+    let cluster_ddl_path = shared_state.ddl_path.clone();
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
@@ -909,12 +910,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let http_config = graph_config.http.clone();
         let graph_write_path = cluster_write_path.clone();
-        let graph_engine = Arc::new(ferrosa_graph::engine::GraphEngine::new(
+        // Route graph-engine-driven DDL (auto-created
+        // system_graph_<ks>.adjacency keyspace + table) through the
+        // same DdlPath that regular CQL DDL uses. The cluster state
+        // machine then applies the DDL on every replica, so the
+        // adjacency table is registered in each node's local schema
+        // and StorageEngine — without this, MutationForward writes
+        // against the adjacency table are rejected on followers and
+        // every graph-edge mutation times out at the coordinator. See
+        // specs/in-process/bug-system-graph-ks-not-replicated-on-write-path.md.
+        let graph_schema_coordinator: Arc<dyn ferrosa_graph::engine::GraphSchemaCoordinator> =
+            Arc::new(ferrosa_graph::engine::ClusterGraphSchemaCoordinator::new(
+                cluster_ddl_path.clone(),
+            ));
+        let graph_engine = Arc::new(ferrosa_graph::engine::GraphEngine::new_with_coordinator(
             schema.clone(),
             storage.clone(),
             graph_write_path,
             graph_config.engine,
             graph_config.reconciliation_interval,
+            graph_schema_coordinator,
         ));
 
         // 10a. Graph HTTP server (port 7474)
