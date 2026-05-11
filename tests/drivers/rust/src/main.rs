@@ -108,6 +108,65 @@ async fn main() {
     })
     .await;
 
+    // Regression for the views-projection bug introduced by the NoSQLBench
+    // gap-closure work (PR #21 Gap 7).  scylla 0.15 issues this exact
+    // 3-column SELECT during its internal metadata fetch on every
+    // `SessionBuilder::build()` and after every schema-altering DDL.  When
+    // the router hardcoded the 10-column DataStax shape, the driver's
+    // tuple type-check rejected the result with
+    // `WrongColumnCount { rust_cols: 3, cql_cols: 10 }` and every DDL
+    // surfaced "Bad views metadata" at schema-agreement time.  This test
+    // pins both behaviours: a 3-column projection decodes as
+    // `(String, String, String)`, and `SELECT *` still returns the full
+    // Cassandra-5.0 shape that DataStax/NoSQLBench needs.
+    run_test("system_schema_views_projection_3col", || async {
+        let res = session
+            .query_unpaged(
+                "SELECT keyspace_name, view_name, base_table_name FROM system_schema.views",
+                &[],
+            )
+            .await?;
+        let rows_result = res.into_rows_result()?;
+        // Empty result is fine — type-check must still succeed.
+        let _rows: Vec<(String, String, String)> = rows_result
+            .rows::<(String, String, String)>()?
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    })
+    .await;
+
+    run_test("system_schema_views_select_star_full_shape", || async {
+        let res = session
+            .query_unpaged("SELECT * FROM system_schema.views", &[])
+            .await?;
+        let rows_result = res.into_rows_result()?;
+        // Cassandra-5.0 columns required for DataStax Java Driver 4.x.
+        // The driver itself looks these up by name via
+        // `AdminRow.getBoolean(...)`, so the columns must be advertised in
+        // the metadata even when the result set is empty.
+        let col_specs = rows_result.column_specs();
+        let names: Vec<&str> = col_specs.iter().map(|c| c.name()).collect();
+        for expected in [
+            "keyspace_name",
+            "view_name",
+            "base_table_id",
+            "base_table_name",
+            "cdc",
+            "include_all_columns",
+            "allow_auto_snapshot",
+            "incremental_backups",
+            "id",
+            "where_clause",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "SELECT * must advertise `{expected}` column for Cassandra-5.0 driver compat (got {names:?})",
+            );
+        }
+        Ok(())
+    })
+    .await;
+
     // ---- DDL ----------------------------------------------------------------
 
     run_test("create_keyspace", || async {

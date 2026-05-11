@@ -1674,38 +1674,57 @@ async fn route_select(
             ))
         }
         // system_schema.views — empty (ferrosa does not implement
-        // materialized views) but the column metadata must match Cassandra
-        // 5.0 so the DataStax driver's `ViewParser` finds the boolean
-        // columns it expects (`cdc`, `include_all_columns`,
-        // `allow_auto_snapshot`, `incremental_backups`).  Without these in
-        // the column set, `getBoolean(...)` returns null during schema
-        // refresh and unboxing throws NPE.  See
-        // ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 7).
+        // materialized views).  Two driver shapes must work:
+        //   * DataStax Java 4.x / NoSQLBench `SELECT *` — needs the full
+        //     Cassandra-5.0 column set so `ViewParser.getBoolean(...)`
+        //     finds `cdc`, `include_all_columns`, `allow_auto_snapshot`,
+        //     `incremental_backups` (NPE otherwise — Gap 7).
+        //   * scylla 0.15 `SELECT keyspace_name, view_name, base_table_name`
+        //     — driver tuple type-check rejects extra columns
+        //     ("statement operates on 10 columns, but given rust types
+        //     contains 3" — p1-37 regression after Gap 7).
+        // Honor SELECT projection like aggregates/triggers does so both
+        // drivers see the column count they expect; type the canonical
+        // columns by name, fall back to text for unknown names.
         ("system_schema", "views") => {
-            let col_names = vec![
-                "keyspace_name".into(),
-                "view_name".into(),
-                "base_table_id".into(),
-                "base_table_name".into(),
-                "cdc".into(),
-                "include_all_columns".into(),
-                "allow_auto_snapshot".into(),
-                "incremental_backups".into(),
-                "id".into(),
-                "where_clause".into(),
+            let canonical: [(&str, CqlType); 10] = [
+                ("keyspace_name", CqlType::Varchar),
+                ("view_name", CqlType::Varchar),
+                ("base_table_id", CqlType::Uuid),
+                ("base_table_name", CqlType::Varchar),
+                ("cdc", CqlType::Boolean),
+                ("include_all_columns", CqlType::Boolean),
+                ("allow_auto_snapshot", CqlType::Boolean),
+                ("incremental_backups", CqlType::Boolean),
+                ("id", CqlType::Uuid),
+                ("where_clause", CqlType::Varchar),
             ];
-            let col_types = vec![
-                CqlType::Varchar,
-                CqlType::Varchar,
-                CqlType::Uuid,
-                CqlType::Varchar,
-                CqlType::Boolean,
-                CqlType::Boolean,
-                CqlType::Boolean,
-                CqlType::Boolean,
-                CqlType::Uuid,
-                CqlType::Varchar,
-            ];
+            let select_all = s.columns.is_empty()
+                || s.columns
+                    .iter()
+                    .any(|c| matches!(c, crate::ast::SelectColumn::Star));
+            let (col_names, col_types): (Vec<String>, Vec<CqlType>) = if select_all {
+                canonical
+                    .iter()
+                    .map(|(n, t)| (String::from(*n), t.clone()))
+                    .unzip()
+            } else {
+                s.columns
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::ast::SelectColumn::Column(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .map(|name| {
+                        let ty = canonical
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, t)| t.clone())
+                            .unwrap_or(CqlType::Varchar);
+                        (name, ty)
+                    })
+                    .unzip()
+            };
             Ok(result::encode_rows(
                 &col_names,
                 &col_types,
@@ -8361,6 +8380,58 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Regression: PR#21 (Gap 7) hardcoded the 10-col Cassandra-5.0 shape
+    /// for system_schema.views to satisfy the DataStax driver's `ViewParser`
+    /// boolean lookups.  The scylla 0.15 driver issues
+    /// `SELECT keyspace_name, view_name, base_table_name FROM
+    /// system_schema.views` and tuple-type-checks the result; ferrosa was
+    /// returning 10 columns and the driver rejected metadata with
+    /// "statement operates on 10 columns, but given rust types contains 3".
+    ///
+    /// Post-fix the views arm honors SELECT projection (3 cols requested →
+    /// 3 cols back) while still returning the full canonical 10-col shape
+    /// for `SELECT *`.
+    #[tokio::test]
+    async fn select_system_schema_views_honors_projection() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // SELECT * → 10 columns (DataStax/NoSQLBench path).
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.views").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result for SELECT *");
+        };
+        assert_eq!(&body[0..4], &0x0002i32.to_be_bytes());
+        // [0..4]=kind, [4..8]=flags, [8..12]=col_count
+        let col_count = i32::from_be_bytes(body[8..12].try_into().unwrap());
+        assert_eq!(
+            col_count, 10,
+            "SELECT * must return all 10 canonical columns"
+        );
+
+        // SELECT specific cols → only those columns (scylla path).
+        let stmt = crate::parser::parse(
+            "SELECT keyspace_name, view_name, base_table_name FROM system_schema.views",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result for SELECT-projected");
+        };
+        assert_eq!(&body[0..4], &0x0002i32.to_be_bytes());
+        let col_count = i32::from_be_bytes(body[8..12].try_into().unwrap());
+        assert_eq!(
+            col_count, 3,
+            "SELECT-projected must return only requested columns",
+        );
     }
 
     /// Gap 2 (ferrosa-nosqlbench/docs/initial-gaps-found.md): the DataStax
