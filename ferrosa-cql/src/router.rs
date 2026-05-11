@@ -1215,8 +1215,38 @@ async fn route_select(
         ("system_schema", "tables") => {
             let snap = state.schema.snapshot();
             let table_rows = query_tables(&snap);
-            let col_names = vec!["keyspace_name".into(), "table_name".into(), "id".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Uuid];
+            // Cassandra 5.0 `system_schema.tables` has 20 columns; ferrosa
+            // currently advertises four: the three keys the existing schema
+            // introspection paths use (`keyspace_name`, `table_name`, `id`)
+            // plus `cdc` (boolean, default `false`). The DataStax Java
+            // Driver 4.x `TableParser.parseRow` calls
+            // `row.getBoolean("cdc")` unconditionally; without the column
+            // present, `getBoolean` returns null and unboxing throws NPE
+            // during the post-DDL schema refresh.  See
+            // ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 7).
+            // Boolean columns the DataStax driver reads unconditionally
+            // during schema refresh:
+            //   - cdc                 (driver default-ok via ifPresentAndNonNull)
+            //   - allow_auto_snapshot (driver requires column present)
+            //   - incremental_backups (driver requires column present)
+            // Cassandra returns NULL for the latter two on most rows — we do
+            // the same so the column metadata exists but values stay null.
+            let col_names = vec![
+                "keyspace_name".into(),
+                "table_name".into(),
+                "id".into(),
+                "cdc".into(),
+                "allow_auto_snapshot".into(),
+                "incremental_backups".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Uuid,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Boolean,
+            ];
             // Apply WHERE equality filters.
             let filtered: Vec<_> = table_rows
                 .iter()
@@ -1244,6 +1274,10 @@ async fn route_select(
                         Some(CqlValue::Text(t.keyspace_name.clone())),
                         Some(CqlValue::Text(t.table_name.clone())),
                         Some(CqlValue::Uuid(t.id)),
+                        Some(CqlValue::Boolean(t.cdc)),
+                        // Cassandra returns NULL for these on most tables — match.
+                        None,
+                        None,
                     ]
                 })
                 .collect();
@@ -1639,9 +1673,84 @@ async fn route_select(
                 &[],
             ))
         }
+        // system_schema.views — empty (ferrosa does not implement
+        // materialized views) but the column metadata must match Cassandra
+        // 5.0 so the DataStax driver's `ViewParser` finds the boolean
+        // columns it expects (`cdc`, `include_all_columns`,
+        // `allow_auto_snapshot`, `incremental_backups`).  Without these in
+        // the column set, `getBoolean(...)` returns null during schema
+        // refresh and unboxing throws NPE.  See
+        // ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 7).
+        ("system_schema", "views") => {
+            let col_names = vec![
+                "keyspace_name".into(),
+                "view_name".into(),
+                "base_table_id".into(),
+                "base_table_name".into(),
+                "cdc".into(),
+                "include_all_columns".into(),
+                "allow_auto_snapshot".into(),
+                "incremental_backups".into(),
+                "id".into(),
+                "where_clause".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Uuid,
+                CqlType::Varchar,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Boolean,
+                CqlType::Uuid,
+                CqlType::Varchar,
+            ];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "views",
+                &[],
+            ))
+        }
+        // system_schema.functions — empty, but column metadata mirrors
+        // Cassandra so the Java driver's `FunctionParser` finds the
+        // boolean `called_on_null_input` it expects.  See gap 7 in
+        // ferrosa-nosqlbench/docs/initial-gaps-found.md.
+        ("system_schema", "functions") => {
+            let col_names = vec![
+                "keyspace_name".into(),
+                "function_name".into(),
+                "argument_types".into(),
+                "argument_names".into(),
+                "body".into(),
+                "called_on_null_input".into(),
+                "language".into(),
+                "return_type".into(),
+            ];
+            let list_text = CqlType::List(Box::new(CqlType::Varchar));
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                list_text.clone(),
+                list_text,
+                CqlType::Varchar,
+                CqlType::Boolean,
+                CqlType::Varchar,
+                CqlType::Varchar,
+            ];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "functions",
+                &[],
+            ))
+        }
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
-        ("system_schema", "functions" | "aggregates" | "triggers" | "views") => {
+        ("system_schema", "aggregates" | "triggers") => {
             // p1-37: Stub these tables until they have first-class
             // implementations. Honor the SELECT projection so col_specs
             // match driver-requested shape — every column is advertised
