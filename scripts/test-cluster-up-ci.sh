@@ -40,7 +40,7 @@ docker build \
 
 # ── Bring up cluster (no --build; uses the pre-built image via image: tag) ──
 echo "Starting Ferrosa CI test cluster (profile: ${PROFILE}, project: ${PROJECT_NAME})..." >&2
-echo "Ports: CQL 9042/9043/9044, RustFS 9000/9001" >&2
+echo "Ports: CQL 9042/9043/9044 on host (RustFS is internal-only on the compose network)" >&2
 
 docker compose \
     -f "${COMPOSE_BASE}" \
