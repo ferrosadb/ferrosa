@@ -1226,8 +1226,23 @@ fn analyze_prepared_columns(
                     }
                 }
             }
+            // USING TIMESTAMP ? / USING TTL ?  — Gap 10.  CQL syntactic
+            // order: VALUES first, then USING.
+            if matches!(i.using_timestamp, Some(Term::BindMarker(_))) {
+                bound_columns.push(("[timestamp]".into(), CqlType::Bigint));
+            }
+            if matches!(i.using_ttl, Some(Term::BindMarker(_))) {
+                bound_columns.push(("[ttl]".into(), CqlType::Int));
+            }
         }
         Statement::Update(u) => {
+            // UPDATE syntactic order: USING TIMESTAMP/TTL, then SET, then WHERE, then IF.
+            if matches!(u.using_timestamp, Some(Term::BindMarker(_))) {
+                bound_columns.push(("[timestamp]".into(), CqlType::Bigint));
+            }
+            if matches!(u.using_ttl, Some(Term::BindMarker(_))) {
+                bound_columns.push(("[ttl]".into(), CqlType::Int));
+            }
             // Bind markers in SET assignments
             for assignment in &u.assignments {
                 match assignment {
@@ -1276,6 +1291,10 @@ fn analyze_prepared_columns(
             }
         }
         Statement::Delete(d) => {
+            // DELETE syntactic order: USING TIMESTAMP, then WHERE, then IF.
+            if matches!(d.using_timestamp, Some(Term::BindMarker(_))) {
+                bound_columns.push(("[timestamp]".into(), CqlType::Bigint));
+            }
             // Bind markers in WHERE clauses
             for wc in &d.where_clauses {
                 if matches!(wc.value, Term::BindMarker(_)) {
@@ -1351,8 +1370,24 @@ fn count_bind_markers(stmt: &Statement) -> usize {
             };
             where_count + ann_count + limit_count
         }
-        Statement::Insert(i) => i.values.iter().filter(|v| is_bind(v)).count(),
+        Statement::Insert(i) => {
+            let values = i.values.iter().filter(|v| is_bind(v)).count();
+            let ts = i
+                .using_timestamp
+                .as_ref()
+                .filter(|t| is_bind(t))
+                .map_or(0, |_| 1);
+            let ttl = i.using_ttl.as_ref().filter(|t| is_bind(t)).map_or(0, |_| 1);
+            values + ts + ttl
+        }
         Statement::Update(u) => {
+            // UPDATE syntactic order: USING TIMESTAMP/TTL, then SET, then WHERE, then IF.
+            let ts = u
+                .using_timestamp
+                .as_ref()
+                .filter(|t| is_bind(t))
+                .map_or(0, |_| 1);
+            let ttl = u.using_ttl.as_ref().filter(|t| is_bind(t)).map_or(0, |_| 1);
             let set_count = u
                 .assignments
                 .iter()
@@ -1369,13 +1404,23 @@ fn count_bind_markers(stmt: &Statement) -> usize {
                 .filter(|wc| is_bind(&wc.value))
                 .count();
             let if_count = u.if_conditions.iter().filter(|c| is_bind(&c.value)).count();
-            set_count + where_count + if_count
+            ts + ttl + set_count + where_count + if_count
         }
-        Statement::Delete(d) => d
-            .where_clauses
-            .iter()
-            .filter(|wc| is_bind(&wc.value))
-            .count(),
+        Statement::Delete(d) => {
+            // DELETE syntactic order: USING TIMESTAMP, then WHERE, then IF.
+            let ts = d
+                .using_timestamp
+                .as_ref()
+                .filter(|t| is_bind(t))
+                .map_or(0, |_| 1);
+            let where_count = d
+                .where_clauses
+                .iter()
+                .filter(|wc| is_bind(&wc.value))
+                .count();
+            let if_count = d.if_conditions.iter().filter(|c| is_bind(&c.value)).count();
+            ts + where_count + if_count
+        }
         _ => 0,
     }
 }
@@ -1590,13 +1635,28 @@ fn substitute_in_statement(stmt: &Statement, terms: &[Term], idx: &mut usize) ->
         }
         Statement::Insert(i) => {
             let mut i = i.clone();
+            // VALUES first, then USING TIMESTAMP/TTL — must match
+            // `count_bind_markers` and `analyze_prepared_columns` order.
             for val in &mut i.values {
                 substitute_in_term(val, terms, idx);
+            }
+            if let Some(t) = i.using_timestamp.as_mut() {
+                substitute_in_term(t, terms, idx);
+            }
+            if let Some(t) = i.using_ttl.as_mut() {
+                substitute_in_term(t, terms, idx);
             }
             Statement::Insert(i)
         }
         Statement::Update(u) => {
             let mut u = u.clone();
+            // UPDATE syntactic order: USING TIMESTAMP/TTL, then SET, then WHERE, then IF.
+            if let Some(t) = u.using_timestamp.as_mut() {
+                substitute_in_term(t, terms, idx);
+            }
+            if let Some(t) = u.using_ttl.as_mut() {
+                substitute_in_term(t, terms, idx);
+            }
             for assignment in &mut u.assignments {
                 match assignment {
                     Assignment::Simple { value, .. } => substitute_in_term(value, terms, idx),
@@ -1611,12 +1671,22 @@ fn substitute_in_statement(stmt: &Statement, terms: &[Term], idx: &mut usize) ->
             for wc in &mut u.where_clauses {
                 substitute_in_term(&mut wc.value, terms, idx);
             }
+            for cond in &mut u.if_conditions {
+                substitute_in_term(&mut cond.value, terms, idx);
+            }
             Statement::Update(u)
         }
         Statement::Delete(d) => {
             let mut d = d.clone();
+            // DELETE syntactic order: USING TIMESTAMP, then WHERE, then IF.
+            if let Some(t) = d.using_timestamp.as_mut() {
+                substitute_in_term(t, terms, idx);
+            }
             for wc in &mut d.where_clauses {
                 substitute_in_term(&mut wc.value, terms, idx);
+            }
+            for cond in &mut d.if_conditions {
+                substitute_in_term(&mut cond.value, terms, idx);
             }
             Statement::Delete(d)
         }
@@ -2430,6 +2500,52 @@ mod tests {
             count_bind_markers(&stmt),
             8,
             "INSERT with 8 ? placeholders must count as 8"
+        );
+    }
+
+    /// Gap 10: `INSERT ... USING TIMESTAMP ?` must register the timestamp
+    /// placeholder so the driver and server agree on bind count.  Without
+    /// this fix, ferrosa silently dropped the `USING TIMESTAMP ?` marker
+    /// and the DataStax driver got `Too many variables (expected N, got
+    /// N+1)` at execute time — see
+    /// `ferrosa-nosqlbench/docs/initial-gaps-found.md`.
+    #[test]
+    fn count_bind_markers_insert_with_using_timestamp_bind() {
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.iot (machine_id, sensor_name, time, sensor_value, station_id, data) \
+             VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+        )
+        .unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            7,
+            "6 value markers + 1 USING TIMESTAMP marker = 7"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_insert_with_using_timestamp_and_ttl_bind() {
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.t (a, b) VALUES (?, ?) USING TIMESTAMP ? AND TTL ?",
+        )
+        .unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            4,
+            "2 value markers + USING TIMESTAMP ? + USING TTL ? = 4"
+        );
+    }
+
+    #[test]
+    fn count_bind_markers_insert_with_literal_using_does_not_add_placeholder() {
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.t (a, b) VALUES (?, ?) USING TIMESTAMP 12345 AND TTL 60",
+        )
+        .unwrap();
+        assert_eq!(
+            count_bind_markers(&stmt),
+            2,
+            "literal USING clauses must NOT count as placeholders"
         );
     }
 

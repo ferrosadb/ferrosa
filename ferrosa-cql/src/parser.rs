@@ -2275,7 +2275,7 @@ impl<'input> Parser<'input> {
     // USING clause
     // ---------------------------------------------------------------
 
-    fn parse_using_clause(&mut self) -> Result<(Option<i64>, Option<i32>), CqlError> {
+    fn parse_using_clause(&mut self) -> Result<(Option<Term>, Option<Term>), CqlError> {
         if self.lexer.eat(&TokenKind::Keyword(Keyword::Using))? {
             self.parse_using_clause_body()
         } else {
@@ -2283,9 +2283,13 @@ impl<'input> Parser<'input> {
         }
     }
 
-    fn parse_using_clause_body(&mut self) -> Result<(Option<i64>, Option<i32>), CqlError> {
-        let mut timestamp = None;
-        let mut ttl = None;
+    /// Parse the body of a `USING` clause. Each value is captured as a
+    /// `Term` (literal or bind marker) so the prepare path can register
+    /// `USING TIMESTAMP ?` / `USING TTL ?` placeholders correctly
+    /// (Gap 10 in `ferrosa-nosqlbench/docs/initial-gaps-found.md`).
+    fn parse_using_clause_body(&mut self) -> Result<(Option<Term>, Option<Term>), CqlError> {
+        let mut timestamp: Option<Term> = None;
+        let mut ttl: Option<Term> = None;
         loop {
             let tok = self.lexer.peek()?;
             match &tok.kind {
@@ -2293,14 +2297,15 @@ impl<'input> Parser<'input> {
                     self.lexer.next_token()?;
                     let val_tok = self.lexer.next_token()?;
                     match val_tok.kind {
-                        TokenKind::IntegerLiteral(n) => timestamp = Some(n),
-                        // Bind marker: USING TIMESTAMP ? — treat as 0 (resolved at execute time)
-                        TokenKind::QuestionMark | TokenKind::NamedBind(_) => {
-                            timestamp = Some(0);
+                        TokenKind::IntegerLiteral(n) => timestamp = Some(Term::IntegerLiteral(n)),
+                        TokenKind::QuestionMark => timestamp = Some(Term::BindMarker(None)),
+                        TokenKind::NamedBind(name) => {
+                            timestamp = Some(Term::BindMarker(Some(name.to_string())))
                         }
                         _ => {
                             return Err(CqlError::SyntaxError(format!(
-                                "expected integer after TIMESTAMP, got {:?} at position {}",
+                                "expected integer or bind marker after TIMESTAMP, \
+                                 got {:?} at position {}",
                                 val_tok.kind, val_tok.pos
                             )))
                         }
@@ -2310,19 +2315,15 @@ impl<'input> Parser<'input> {
                     self.lexer.next_token()?;
                     let val_tok = self.lexer.next_token()?;
                     match val_tok.kind {
-                        TokenKind::IntegerLiteral(n) => {
-                            let n = i32::try_from(n).map_err(|_| {
-                                CqlError::SyntaxError(format!("TTL value out of range: {n}"))
-                            })?;
-                            ttl = Some(n);
-                        }
-                        // Bind marker: USING TTL ? — treat as 0 (resolved at execute time)
-                        TokenKind::QuestionMark | TokenKind::NamedBind(_) => {
-                            ttl = Some(0);
+                        TokenKind::IntegerLiteral(n) => ttl = Some(Term::IntegerLiteral(n)),
+                        TokenKind::QuestionMark => ttl = Some(Term::BindMarker(None)),
+                        TokenKind::NamedBind(name) => {
+                            ttl = Some(Term::BindMarker(Some(name.to_string())))
                         }
                         _ => {
                             return Err(CqlError::SyntaxError(format!(
-                                "expected integer after TTL, got {:?} at position {}",
+                                "expected integer or bind marker after TTL, \
+                                 got {:?} at position {}",
                                 val_tok.kind, val_tok.pos
                             )))
                         }
@@ -2733,8 +2734,8 @@ mod tests {
             .unwrap();
         match stmt {
             Statement::Insert(s) => {
-                assert_eq!(s.using_timestamp, Some(12345));
-                assert_eq!(s.using_ttl, Some(3600));
+                assert_eq!(s.using_timestamp, Some(Term::IntegerLiteral(12345)));
+                assert_eq!(s.using_ttl, Some(Term::IntegerLiteral(3600)));
             }
             other => panic!("expected Insert, got {:?}", other),
         }
@@ -3678,8 +3679,8 @@ mod tests {
             parse("UPDATE t USING TIMESTAMP 1234 AND TTL 60 SET v = 'x' WHERE k = 1").unwrap();
         match stmt {
             Statement::Update(s) => {
-                assert_eq!(s.using_timestamp, Some(1234));
-                assert_eq!(s.using_ttl, Some(60));
+                assert_eq!(s.using_timestamp, Some(Term::IntegerLiteral(1234)));
+                assert_eq!(s.using_ttl, Some(Term::IntegerLiteral(60)));
             }
             other => panic!("expected Update, got {:?}", other),
         }

@@ -2890,6 +2890,43 @@ fn route_explain(
     ))
 }
 
+// ── USING TIMESTAMP / TTL helpers (Gap 10) ───────────────────────────────
+//
+// `using_timestamp` and `using_ttl` are now `Option<Term>` so the prepare
+// path can register bind markers (`USING TIMESTAMP ?`).  By the time the
+// router executes, `substitute_in_statement` has replaced any
+// `Term::BindMarker` with the bound literal.  These helpers extract the
+// integer with a clear error if substitution was missed or the literal is
+// out of range.
+
+fn using_timestamp_as_i64(t: &Option<Term>) -> Result<Option<i64>, CqlError> {
+    match t {
+        None => Ok(None),
+        Some(Term::IntegerLiteral(n)) => Ok(Some(*n)),
+        Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
+            "USING TIMESTAMP bind marker was not substituted before execution".into(),
+        )),
+        Some(other) => Err(CqlError::Invalid(format!(
+            "USING TIMESTAMP must be an integer literal or bind marker, got {other:?}"
+        ))),
+    }
+}
+
+fn using_ttl_as_i32(t: &Option<Term>) -> Result<Option<i32>, CqlError> {
+    match t {
+        None => Ok(None),
+        Some(Term::IntegerLiteral(n)) => i32::try_from(*n)
+            .map(Some)
+            .map_err(|_| CqlError::Invalid(format!("USING TTL value {n} out of i32 range"))),
+        Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
+            "USING TTL bind marker was not substituted before execution".into(),
+        )),
+        Some(other) => Err(CqlError::Invalid(format!(
+            "USING TTL must be an integer literal or bind marker, got {other:?}"
+        ))),
+    }
+}
+
 // ── INSERT ───────────────────────────────────────────────────────────────
 
 async fn route_insert(
@@ -2917,7 +2954,7 @@ async fn route_insert(
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    let timestamp = match s.using_timestamp {
+    let timestamp = match using_timestamp_as_i64(&s.using_timestamp)? {
         Some(ts) => ts,
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2957,7 +2994,12 @@ async fn route_insert(
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let table_id = TableId::new(ks, &s.table);
     let strategy = keyspace_strategy(&state.schema, ks);
 
@@ -3101,7 +3143,7 @@ async fn route_update(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = match s.using_timestamp {
+    let timestamp = match using_timestamp_as_i64(&s.using_timestamp)? {
         Some(ts) => ts,
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3350,7 +3392,12 @@ async fn route_update(
         regular_cells.push((col_idx, value));
     }
 
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let strategy = keyspace_strategy(&state.schema, ks);
 
     state
@@ -3475,7 +3522,7 @@ async fn route_delete(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = match s.using_timestamp {
+    let timestamp = match using_timestamp_as_i64(&s.using_timestamp)? {
         Some(ts) => ts,
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3615,7 +3662,7 @@ async fn route_logged_batch(
 ) -> Result<BytesMut, CqlError> {
     use ferrosa_storage::Mutation;
 
-    let batch_timestamp = b.using_timestamp.unwrap_or_else(|| {
+    let batch_timestamp = using_timestamp_as_i64(&b.using_timestamp)?.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3711,7 +3758,7 @@ fn materialize_insert(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+    let timestamp = using_timestamp_as_i64(&s.using_timestamp)?.unwrap_or(batch_timestamp);
 
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
@@ -3748,7 +3795,12 @@ fn materialize_insert(
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let table_id = TableId::new(ks, &s.table);
 
     Ok((table_id, decorated_key, row, timestamp))
@@ -3784,7 +3836,7 @@ fn materialize_update(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+    let timestamp = using_timestamp_as_i64(&s.using_timestamp)?.unwrap_or(batch_timestamp);
 
     let pk_values = extract_pk_values(
         &s.where_clauses,
@@ -3842,7 +3894,12 @@ fn materialize_update(
     }
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let row = bridge::build_row(
+        &regular_cells,
+        &ck_values,
+        timestamp,
+        using_ttl_as_i32(&s.using_ttl)?,
+    );
     let table_id = TableId::new(ks, &s.table);
 
     Ok((table_id, decorated_key, row, timestamp))
@@ -3878,7 +3935,7 @@ fn materialize_delete(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+    let timestamp = using_timestamp_as_i64(&s.using_timestamp)?.unwrap_or(batch_timestamp);
 
     let pk_values = extract_pk_values(
         &s.where_clauses,

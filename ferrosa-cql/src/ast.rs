@@ -259,8 +259,13 @@ pub struct InsertStatement {
     pub columns: Vec<String>,
     pub values: Vec<Term>,
     pub if_not_exists: bool,
-    pub using_timestamp: Option<i64>,
-    pub using_ttl: Option<i32>,
+    /// `USING TIMESTAMP <term>` — term is either a literal int or a bind marker.
+    /// Gap 10 in ferrosa-nosqlbench/docs/initial-gaps-found.md: prior shape
+    /// `Option<i64>` silently dropped bind markers, breaking
+    /// `INSERT ... USING TIMESTAMP ?` from NoSQLBench's cql_timeseries2.
+    pub using_timestamp: Option<Term>,
+    /// `USING TTL <term>` — same shape as `using_timestamp`.
+    pub using_ttl: Option<Term>,
 }
 
 /// An assignment in an UPDATE SET clause.
@@ -309,8 +314,13 @@ pub struct UpdateStatement {
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
     pub if_conditions: Vec<IfCondition>,
-    pub using_timestamp: Option<i64>,
-    pub using_ttl: Option<i32>,
+    /// `USING TIMESTAMP <term>` — term is either a literal int or a bind marker.
+    /// Gap 10 in ferrosa-nosqlbench/docs/initial-gaps-found.md: prior shape
+    /// `Option<i64>` silently dropped bind markers, breaking
+    /// `INSERT ... USING TIMESTAMP ?` from NoSQLBench's cql_timeseries2.
+    pub using_timestamp: Option<Term>,
+    /// `USING TTL <term>` — same shape as `using_timestamp`.
+    pub using_ttl: Option<Term>,
 }
 
 /// A column target in a DELETE statement — either a whole column or a map element.
@@ -340,7 +350,7 @@ pub struct DeleteStatement {
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
     pub if_conditions: Vec<IfCondition>,
-    pub using_timestamp: Option<i64>,
+    pub using_timestamp: Option<Term>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,7 +364,7 @@ pub enum BatchType {
 pub struct BatchStatement {
     pub batch_type: BatchType,
     pub statements: Vec<Statement>,
-    pub using_timestamp: Option<i64>,
+    pub using_timestamp: Option<Term>,
 }
 
 /// CQL type name as written in CREATE TABLE.
