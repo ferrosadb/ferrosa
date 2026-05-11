@@ -123,15 +123,6 @@ impl ClusterCoordinator {
             });
         }
 
-        let mutation = Mutation::new(
-            table_id.keyspace.clone(),
-            table_id.table.clone(),
-            key.clone(),
-            vec![row.clone()],
-            timestamp,
-        );
-        let body = encode_mutation(&mutation);
-
         // Collect (replica_id, Option<host_id>) before dropping the ring guard
         // so the futures we build don't hold a reference to the guard.
         let replica_targets: Vec<(u64, Option<(uuid::Uuid, String)>)> = replicas
@@ -144,6 +135,29 @@ impl ClusterCoordinator {
             })
             .collect();
         drop(ring);
+
+        // Lazy mutation encoding: only serialise the mutation if at least
+        // one replica is remote.  With cqld4 token-aware routing, every
+        // write lands on a coordinator that is also the owning replica
+        // (RF=1), so `body` was wasted ~50k allocations/s before this
+        // short-circuit.  `encode_mutation` does a heap allocation plus
+        // memcpy of the mutation bytes; skipping it for fully-local
+        // writes saves both CPU and allocator pressure.
+        let has_remote = replica_targets
+            .iter()
+            .any(|(replica_id, _)| *replica_id != self.local_node_id);
+        let body = if has_remote {
+            let mutation = Mutation::new(
+                table_id.keyspace.clone(),
+                table_id.table.clone(),
+                key.clone(),
+                vec![row.clone()],
+                timestamp,
+            );
+            Some(encode_mutation(&mutation))
+        } else {
+            None
+        };
 
         // Build concurrent futures for each replica.
         let mut fan_out: FuturesUnordered<_> = replica_targets
@@ -177,11 +191,24 @@ impl ClusterCoordinator {
                                 ReplicaResult::Failure { host_id: None }
                             }
                             Some((hid, addr)) => {
+                                // `body` is `Some` here because at least one
+                                // replica was non-local (we set it above when
+                                // `has_remote` was true).
+                                let forward_body = match body {
+                                    Some(b) => b,
+                                    None => {
+                                        tracing::error!(
+                                            replica_id,
+                                            "internal: missing body for remote replica"
+                                        );
+                                        return ReplicaResult::Failure { host_id: Some(hid) };
+                                    }
+                                };
                                 match coordinator
                                     .send_remote_write_with_reconnect(
                                         hid,
                                         &addr,
-                                        Message::MutationForward(body),
+                                        Message::MutationForward(forward_body),
                                     )
                                     .await
                                 {
@@ -231,7 +258,22 @@ impl ClusterCoordinator {
         // means anti-entropy repair must eventually fix divergence.
         if !failed_replicas.is_empty() {
             if let Some(ref hint_store) = self.hint_store {
-                let hint_row = body.to_vec();
+                // Hints only get stored for remote-replica failures (see
+                // the `Failure { host_id: Some(hid) }` arm above), which
+                // means we already computed `body` for forwarding.  If
+                // it's `None` here, hints simply can't be saved — fall
+                // through to the error branch below.
+                let hint_row = match body.as_ref() {
+                    Some(b) => b.to_vec(),
+                    None => {
+                        tracing::error!(
+                            failed_count = failed_replicas.len(),
+                            "internal: failed remote replicas with no encoded body — \
+                             divergent replicas will require anti-entropy repair"
+                        );
+                        Vec::new()
+                    }
+                };
                 let hint_key = key.key.as_bytes().to_vec();
                 for peer_id in &failed_replicas {
                     if let Err(e) = hint_store.store(
