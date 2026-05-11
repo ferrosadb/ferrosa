@@ -109,17 +109,17 @@ mod tests {
     use crate::workload::CqlSession;
 
     /// Verify that ScyllaCqlSession connects to a real cluster and can execute a
-    /// system query. Requires FERROSA_TEST_CONTAINERS=1 and a cluster on port 19042.
+    /// system query. Requires FERROSA_TEST_CONTAINERS=1 and a cluster on port 49042.
     #[tokio::test]
     async fn rust_driver_connects_to_cluster() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
             panic!(
                 "FERROSA_TEST_CONTAINERS not set — \
-                 start a Cassandra-compatible cluster on port 19042 first \
+                 start a Cassandra-compatible cluster on port 49042 first \
                  (e.g. via docker-compose in ferrosa-jepsen/docker)"
             );
         }
-        let session = ScyllaCqlSession::connect(&["localhost:19042".to_string()])
+        let session = ScyllaCqlSession::connect(&["localhost:49042".to_string()])
             .await
             .expect("connect to cluster");
         let rows = session

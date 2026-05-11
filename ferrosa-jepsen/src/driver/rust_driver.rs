@@ -174,13 +174,13 @@ mod tests {
 
     /// Connect to a real ferrosa cluster and run a system query.
     ///
-    /// Requires FERROSA_TEST_CONTAINERS=1 and a cluster on port 19042.
+    /// Requires FERROSA_TEST_CONTAINERS=1 and a cluster on port 49042.
     #[tokio::test]
     async fn rust_driver_connects_to_cluster() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
             panic!(
                 "FERROSA_TEST_CONTAINERS not set — \
-                 start a Cassandra-compatible cluster on port 19042 first \
+                 start a Cassandra-compatible cluster on port 49042 first \
                  (e.g. via docker-compose in ferrosa-jepsen/docker)"
             );
         }
@@ -188,7 +188,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = DriverConfig {
             kind: DriverKind::Rust,
-            contact_points: vec!["localhost:19042".into()],
+            contact_points: vec!["localhost:49042".into()],
             workload: "register".into(),
             duration: Duration::from_secs(5),
             threads: 1,

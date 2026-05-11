@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-cluster = { path = "../ferrosa-cluster" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tabled = "0.20"
@@ -21,10 +22,10 @@ ratatui = "0.29"
 crossterm = "0.28"
 rpassword = "7"
 async-trait = "0.1"
+sled = "0.34"
 
 [dev-dependencies]
 arc-swap = "1.7"
-ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-udf = { path = "../ferrosa-udf" }

@@ -1,5 +1,16 @@
 //! Election-storm watchdog — P0-17 fix (path c), P0-19 cadence fix.
 //!
+//! # Deprecation status (Sprint 4)
+//!
+//! Per ADR-012, this module is scheduled for deletion in W4.11 once
+//! the bolt-on retirement gate fires green (see
+//! [`crate::controller::bootstrap::retirement_gate`]).  The gate
+//! requires a 2-week clean Jepsen window against the Sprint 3
+//! PreVote+CheckQuorum build.  Until the manifest at
+//! `specs/in-process/sprint-04-jepsen-window.json` is populated and
+//! reports a clean run set, this module continues to provide the
+//! safety net.  **Do not add new dependencies on it.**
+//!
 //! ## Problem
 //!
 //! When a Raft follower's log diverges from the cluster (e.g. after a

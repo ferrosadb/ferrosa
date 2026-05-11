@@ -1,0 +1,27 @@
+# W1.9 audit allowlist — call sites that bypass MembershipChanger and
+# are scheduled for migration in the post-Sprint-1 follow-up.
+#
+# Format: one `<path>:<line> <comment>` entry per allowed violation.
+# Lines starting with `#` are ignored.
+#
+# When migrating a site, REMOVE the entry from this file in the same
+# commit as the migration.  The CI gate
+# `scripts/ci-gates/no-raw-client-write.sh` reads this file and only
+# fails on violations not listed here.
+#
+# Each entry MUST cite a follow-up issue / spec section.  No naked
+# allowlist additions.
+#
+# Sprint 1 baseline (from sprint-01-progress.md, "Items not started"):
+
+ferrosa-cluster/src/ddl_path.rs:465 # ClusterDdlForwardHandler — Sprint 2 (W2.x), needs MembershipChanger::propose_ddl
+ferrosa-cluster/src/rebalance.rs:308 # rebalance::propose_token_reassignment — Sprint 2
+ferrosa-cluster/src/controller/membership.rs:97 # handle_join_request: JoinNode — replace via MembershipChanger::add_voter (Sprint 2)
+ferrosa-cluster/src/controller/membership.rs:109 # handle_join_request: AssignTokens — Sprint 2
+ferrosa-cluster/src/controller/membership.rs:158 # decommission: SetNodeState{Leaving} — Sprint 2
+ferrosa-cluster/src/controller/membership.rs:247 # decommission: LeaveNode — replace via MembershipChanger::remove_voter (Sprint 2)
+ferrosa-cluster/src/controller/membership.rs:446 # cluster_member_metadata refresh — replace via MembershipChanger::update_metadata (Sprint 2; line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/membership.rs:533 # late-join JoinNode — Sprint 2 (line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/membership.rs:552 # late-join AssignTokens — Sprint 2 (line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/cluster.rs:603 # seed bootstrap: register_node for peers — Sprint 4 (transition_to_cluster rewrite pending; line shifted by PR #19 merge)
+ferrosa-cluster/src/controller/cluster.rs:606 # seed bootstrap: register_node for self — Sprint 4 (line shifted by PR #19 merge)

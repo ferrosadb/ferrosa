@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "m
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 indexmap = "2"
@@ -35,3 +35,13 @@ rand = "0.10"
 serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+default = []
+# Sprint 3 (ADR-012): enable W3.12 / W3.13 acceptance tests that depend on
+# engine-side PreVote/TimeoutNow handling in the openraft fork. Off by default
+# until the corresponding engine wire-up lands (W3.3, W3.7-engine, W3.8-engine,
+# W3.9 in `specs/in-process/sprint-03-openraft-patches.md`). When the engine
+# work lands, remove this gate and these tests join the default suite.
+sprint-03-engine-prevote = []
+sprint-03-engine-transfer = []

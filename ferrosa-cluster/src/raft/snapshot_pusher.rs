@@ -1,5 +1,16 @@
 //! Leader-side snapshot-push sweep — P0-20 fix.
 //!
+//! # Deprecation status (Sprint 4)
+//!
+//! Per ADR-012 and ADR-013, this module is scheduled for deletion in
+//! W4.12.  Sprint 1's `MembershipChanger` ensures every voter is
+//! registered atomically (eliminating the original P0-20 motivation:
+//! "voter not in replication map"); Sprint 3's PreVote+CheckQuorum
+//! makes the wiped-rebootstrap path (S-04) handled by openraft's
+//! normal snapshot-on-log-inconsistency response.  Deletion is
+//! gated by [`crate::controller::bootstrap::retirement_gate`] (a
+//! 2-week clean Jepsen window).  **Do not add new dependencies on it.**
+//!
 //! ## Problem
 //!
 //! When a Raft follower is wiped (persistent state cleared) and restarted, its

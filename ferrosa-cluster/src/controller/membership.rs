@@ -328,7 +328,8 @@ impl ModeController {
         }
 
         // Capture state needed by the spawned task.
-        let raft_instance = self.raft_instance.clone();
+        let raft_groups = self.raft_groups.clone();
+        let local_raft_group_id = crate::raft::RaftGroupId::for_dc(&self.config.data_center);
         let config_clone = self.config.clone();
         let existing_member = existing_member.clone();
         let cql_broadcast = cql_broadcast.clone();
@@ -384,10 +385,19 @@ impl ModeController {
 
             let mut raft = None;
             for attempt in 0..60 {
-                if let Some(r) = &**raft_instance.load() {
+                let groups = raft_groups.load();
+                if let Some(r) = groups.get(&local_raft_group_id) {
                     raft = Some(r.clone());
                     break;
                 }
+                // Backward-compat: when only one group is installed, accept it
+                // regardless of DC name (covers single-DC tests where the
+                // configured `data_center` may differ from what bootstrap used).
+                if groups.len() == 1 {
+                    raft = groups.values().next().cloned();
+                    break;
+                }
+                drop(groups);
                 let backoff =
                     std::time::Duration::from_millis(if attempt < 10 { 100 } else { 500 });
                 tokio::time::sleep(backoff).await;

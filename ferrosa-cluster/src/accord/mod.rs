@@ -8,6 +8,7 @@ pub mod chaos_minority_kill;
 pub mod clock;
 pub mod clock_validation;
 pub mod coordinator;
+pub mod cross_dc_adapter;
 pub mod cross_shard;
 pub mod ddl_drain;
 pub mod dep_wait;
@@ -42,6 +43,9 @@ pub use clock_validation::{
 pub use coordinator::{
     fast_quorum_size, slow_quorum_size, AccordCoordinator, AccordCoordinatorDriver,
     AccordDriverError, CoordinatorDecision, CoordinatorPhase,
+};
+pub use cross_dc_adapter::{
+    cross_dc_vote_commit_count, CrossDcAccordAdapter, CROSS_DC_VOTE_COMMITS,
 };
 pub use cross_shard::{CrossShardCoordinator, CrossShardOutcome, ShardId, ShardResult};
 pub use ddl_drain::{DdlDrainGuard, DrainError};

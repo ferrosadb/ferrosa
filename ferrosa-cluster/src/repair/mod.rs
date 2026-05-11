@@ -24,6 +24,38 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
 use crate::error::Result;
+use crate::raft::NodeState;
+use crate::ring::TokenRing;
+
+/// W8.7 — Compute the set of nodes that participate in repair for a
+/// given token (per ADR-014 § "Token ownership").
+///
+/// Includes:
+/// - Every voter (`NodeState::Normal`) that owns the token via
+///   `ring.replicas(token, rf)`.
+/// - Every learner with `owns_tokens=true` that owns the token.
+///
+/// Excludes:
+/// - Learners with `owns_tokens=false` (analytics / witness — their
+///   data converges via AppendEntries on the state machine, not via
+///   anti-entropy on the ring).
+/// - Joining / Leaving / Decommissioned nodes.
+///
+/// The repair scheduler iterates this set when deciding which peers to
+/// exchange Merkle roots with for a given range.
+pub fn repair_participants(ring: &TokenRing, token: i64, rf: usize) -> Vec<u64> {
+    let candidates = ring.replicas(token, rf);
+    candidates
+        .into_iter()
+        .filter(|&n| {
+            ring.get_node(n).is_some_and(|info| match info.state {
+                NodeState::Normal => true,
+                NodeState::Learner { owns_tokens } => owns_tokens,
+                _ => false,
+            })
+        })
+        .collect()
+}
 
 /// Depth of the Merkle tree. 2^DEPTH = number of leaves (sub-ranges).
 /// Depth 15 → 32768 leaves, giving fine-grained diffing.
@@ -184,5 +216,72 @@ mod tests {
 
         let diffs = diff_trees(&t1, &t2);
         assert!(diffs.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // W8.7 — repair includes owns_tokens=true learner; excludes
+    // owns_tokens=false learner.
+    // -----------------------------------------------------------------
+
+    use crate::raft::NodeInfo;
+    use uuid::Uuid;
+
+    fn node_with(addr: &str, state: crate::raft::NodeState) -> NodeInfo {
+        NodeInfo {
+            host_id: Uuid::new_v4(),
+            addr: addr.to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state,
+            cql_broadcast: None,
+        }
+    }
+
+    /// W8.7 RED. A learner with `owns_tokens=true` is included in the
+    /// repair-participant set for a token it owns; a learner with
+    /// `owns_tokens=false` is excluded; voters are always included.
+    /// The learner's data converges via repair into agreement with
+    /// the voters.
+    #[test]
+    fn learner_with_owns_tokens_true_participates_in_repair() {
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            1,
+            node_with("10.0.0.1:7000", crate::raft::NodeState::Normal),
+        );
+        ring.add_node(
+            2,
+            node_with("10.0.0.2:7000", crate::raft::NodeState::Normal),
+        );
+        ring.add_node(
+            3,
+            node_with(
+                "10.0.0.3:7000",
+                crate::raft::NodeState::Learner { owns_tokens: true },
+            ),
+        );
+        ring.add_node(
+            4,
+            node_with(
+                "10.0.0.4:7000",
+                crate::raft::NodeState::Learner { owns_tokens: false },
+            ),
+        );
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+        ring.assign_tokens(3, &[150]);
+        ring.assign_tokens(4, &[175]);
+
+        let participants = super::repair_participants(&ring, 50, 4);
+        assert!(
+            participants.contains(&3),
+            "owns_tokens=true learner must participate in repair: {participants:?}",
+        );
+        assert!(
+            !participants.contains(&4),
+            "owns_tokens=false learner must NOT participate in repair: {participants:?}",
+        );
+        assert!(participants.contains(&1));
+        assert!(participants.contains(&2));
     }
 }

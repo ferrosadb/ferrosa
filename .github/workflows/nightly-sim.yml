@@ -1,0 +1,82 @@
+name: Nightly Sim 100K-Seed Sweep
+
+# Sprint 5 W5.11.  Runs the deterministic Raft simulator across
+# 100 000 seeds nightly.  Failure auto-files a GitHub issue tagged
+# with the offending seed so an operator can replay it locally with
+# `cargo test -p ferrosa-sim --release -- --seed <N>`.
+
+on:
+  schedule:
+    - cron: '0 5 * * *' # 5 AM UTC daily
+  workflow_dispatch: # manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sim-100k:
+    name: ferrosa-sim 100K-seed sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run 100 000-seed sim sweep
+        id: sim
+        run: |
+          cargo run --release -p ferrosa-sim \
+            --example seed_throughput -- 100000 2>&1 | tee sim-output.log
+
+      - name: Run TLA+ refinement check across 1000 seeds
+        run: |
+          cargo test --release -p ferrosa-sim \
+            refinement_holds_across_1000_seeds -- --nocapture 2>&1 | tee refinement.log
+
+      - name: Run full bootstrap-phase sweep across 100 seeds
+        run: |
+          cargo test --release -p ferrosa-sim \
+            sim_full_bootstrap_seed_sweep -- --nocapture 2>&1 | tee bootstrap.log
+
+      - name: Upload sim logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sim-logs
+          path: |
+            sim-output.log
+            refinement.log
+            bootstrap.log
+          retention-days: 30
+
+      - name: File issue on failure
+        if: failure()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let body = '## Nightly sim sweep failed\n\n';
+            for (const f of ['sim-output.log', 'refinement.log', 'bootstrap.log']) {
+              if (fs.existsSync(f)) {
+                const txt = fs.readFileSync(f, 'utf8').slice(-2000);
+                body += '### ' + f + '\n```\n' + txt + '\n```\n';
+              }
+            }
+            body += '\n[Workflow run](' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId + ')\n';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Nightly sim sweep failed (' + new Date().toISOString().slice(0, 10) + ')',
+              body,
+              labels: ['bug', 'testing', 'sprint-5']
+            });

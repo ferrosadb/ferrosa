@@ -18,10 +18,17 @@ members = [
     "ferrosa-loadgen",
     "ferrosa-sparql",
     "ferrosa-index-builder",
+    "ferrosa-sim",
 ]
 
 [patch.crates-io]
-openraft = { git = "https://github.com/ferrosadb/openraft.git", branch = "fix/separate-replication-timeout" }
+# Sprint 3 (ADR-012): the ferrosadb/openraft fork carries PreVote +
+# CheckQuorum + Leadership Transfer + the separate-replication-timeout
+# patch on top of upstream 0.9.24. Pinned to the fork's default branch
+# (`main`) so we pick up rebases automatically; for reproducible builds
+# switch to a specific `rev = "..."` tag. Fork README and rationale:
+#   https://github.com/ferrosadb/openraft/blob/main/README-FERROSADB.md
+openraft = { git = "https://github.com/ferrosadb/openraft.git", branch = "main" }
 
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.

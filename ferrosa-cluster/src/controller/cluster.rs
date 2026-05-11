@@ -82,6 +82,108 @@ pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool)
     !has_recovered_topology_state
 }
 
+/// Drain a DDL queue (W1.14, P0-1 hazard).
+///
+/// On the leader-elected path of `transition_to_cluster` we replay
+/// every operation queued during the Forming state.  Naive `try_recv`
+/// loops drop ops sent *during* the drain (a sender that loaded the
+/// `DdlPath::Forming` Arc just before the swap to `Cluster` and
+/// hadn't yet completed the send).  This helper waits until the
+/// channel has been observed empty `REQUIRED_CONSECUTIVE_EMPTY` times
+/// in a row, with a `COOL_DOWN` delay between probes, capped by a
+/// hard wall-clock deadline.  This gives in-flight `Forming` senders
+/// up to `COOL_DOWN * REQUIRED_CONSECUTIVE_EMPTY` (= 150 ms) to land.
+///
+/// Generic over the op-processor `F` so unit tests can substitute a
+/// counter without spinning up a Raft.
+pub(super) async fn drain_ddl_queue<Op, F, Fut>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>,
+    mut process: F,
+) -> usize
+where
+    F: FnMut(Op) -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    const COOL_DOWN: std::time::Duration = std::time::Duration::from_millis(50);
+    const REQUIRED_CONSECUTIVE_EMPTY: usize = 3;
+    const HARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut replayed = 0usize;
+    let drain_deadline = tokio::time::Instant::now() + HARD_DEADLINE;
+    let mut consecutive_empty = 0usize;
+
+    while consecutive_empty < REQUIRED_CONSECUTIVE_EMPTY
+        && tokio::time::Instant::now() < drain_deadline
+    {
+        match rx.try_recv() {
+            Ok(op) => {
+                consecutive_empty = 0;
+                if let Err(e) = process(op).await {
+                    tracing::warn!(%e, "drain_ddl_queue: process failed");
+                } else {
+                    replayed += 1;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                consecutive_empty += 1;
+                tokio::time::sleep(COOL_DOWN).await;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+    replayed
+}
+
+/// W6.3: per-DC log directory layout.
+///
+/// Each DC's Raft log lives in `raft_data_dir/<dc-name>/`, isolated
+/// from any other DC running on the same physical disk. Single-DC
+/// deployments transparently land under
+/// `raft_data_dir/<DEFAULT_DC_NAME>/` — readers tolerant to legacy
+/// `raft_data_dir/` layouts must migrate at upgrade (ADR-015 R3).
+pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::PathBuf {
+    base.join(dc_name)
+}
+
+/// W6.3: partition a `(host_id, addr)` peer list by DC, given a lookup
+/// table from `host_id` to DC name. Peers not present in `dcs` default
+/// to `local_dc` — this preserves single-DC behavior when no per-peer
+/// DC metadata has been published.
+///
+/// Returns `(local_dc_peers, other_dcs)` where `other_dcs` groups
+/// non-local peers by DC name. Local-DC voters drive Raft membership;
+/// non-local-DC peers participate in cross-DC routing only (Sprint 7
+/// will plumb them into Accord).
+/// Result of [`partition_peers_by_dc`] — groups peers by DC.
+pub type PeerDcPartition = (
+    Vec<(uuid::Uuid, SocketAddr)>,
+    std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>>,
+);
+
+pub fn partition_peers_by_dc(
+    peers: &[(uuid::Uuid, SocketAddr)],
+    dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    local_dc: &str,
+) -> PeerDcPartition {
+    let mut local = Vec::new();
+    let mut others: std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>> =
+        std::collections::BTreeMap::new();
+    for (uuid, addr) in peers {
+        let dc = dcs.get(uuid).map(String::as_str).unwrap_or(local_dc);
+        if dc == local_dc {
+            local.push((*uuid, *addr));
+        } else {
+            others
+                .entry(dc.to_string())
+                .or_default()
+                .push((*uuid, *addr));
+        }
+    }
+    (local, others)
+}
+
 pub(super) fn build_recovered_topology_refresh_plan(
     local_host_id: uuid::Uuid,
     local_addr: String,
@@ -302,6 +404,26 @@ impl ModeController {
             .into_iter()
             .map(|(peer_uuid, addr)| (peer_uuid, self.normalize_cluster_peer_addr(addr)))
             .collect();
+
+        // W6.3 (ADR-015): partition the peer set by DC. Only same-DC
+        // peers participate in this node's Raft group; cross-DC peers
+        // are tracked in the controller's connected_peers map for
+        // future Accord routing (Sprint 7) but are not voters here.
+        //
+        // Backward-compat: peers with no recorded DC default to the
+        // local DC, so existing single-DC clusters keep their full
+        // peer list as voters unchanged.
+        let local_dc = self.config.data_center.clone();
+        let peer_dc_map = self.peer_dcs_snapshot();
+        let (peers, cross_dc_peers) = partition_peers_by_dc(&peers, &peer_dc_map, &local_dc);
+        if !cross_dc_peers.is_empty() {
+            tracing::info!(
+                local_dc = %local_dc,
+                local_voters = peers.len(),
+                cross_dc_count = cross_dc_peers.values().map(|v| v.len()).sum::<usize>(),
+                "transition_to_cluster: cross-DC peers excluded from local Raft group (Sprint 6 scaffolding; Accord cross-DC arrives in Sprint 7)"
+            );
+        }
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {
@@ -372,14 +494,26 @@ impl ModeController {
             }
         }
 
-        // 1. Create sled log store
-        let raft_dir = if let Some(ref dir) = self.config.raft_data_dir {
-            dir.clone()
+        // 1. Create sled log store. W6.3 (ADR-015): per-DC subdir so a
+        // node hosting multiple DCs (operator command `bootstrap-dc`,
+        // W6.7) keeps each DC's log isolated. Single-DC deployments
+        // land under `<base>/<local_dc>/`; on upgrade, an installer or
+        // operator must migrate any existing flat-layout `raft_data_dir`
+        // (ADR-015 R3). W6.8: a per-DC override
+        // (`FERROSA_RAFT_DATA_DIR_<DC>`) takes precedence over the
+        // node-level default.
+        let raft_base = if let Some(dir) = self.config.raft_data_dir_for_dc(&local_dc) {
+            dir
         } else {
             let data_dir =
                 std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
             std::path::Path::new(&data_dir).join("raft")
         };
+        let raft_dir = raft_log_dir_for_dc(&raft_base, &local_dc);
+        if let Err(e) = std::fs::create_dir_all(&raft_dir) {
+            tracing::error!(%e, dir = %raft_dir.display(), "failed to create per-DC raft log dir");
+            return;
+        }
         let mut log_store = match SledLogStore::new(&raft_dir) {
             Ok(s) => s,
             Err(e) => {
@@ -625,7 +759,8 @@ impl ModeController {
 
         // Spawn background Raft initialization — Raft::new() is async and
         // must not block the PeerEventListener callback.
-        let raft_instance_swap = self.raft_instance.clone();
+        let raft_groups_swap = self.raft_groups.clone();
+        let local_raft_group_id = crate::raft::RaftGroupId::for_dc(&self.config.data_center);
         let ddl_path = self.ddl_path.clone();
         let mode_swap = self.mode.clone();
         let registry = self.registry.clone();
@@ -646,6 +781,9 @@ impl ModeController {
         let raft_heartbeat_ms = self.config.raft_heartbeat_ms;
         let raft_election_min_ms = self.config.raft_election_timeout_min_ms;
         let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
+        // ADR-012: PreVote + CheckQuorum knobs from the ferrosa-cluster config.
+        let raft_enable_pre_vote = self.config.raft_enable_pre_vote;
+        let raft_check_quorum_ratio = self.config.raft_check_quorum_ratio;
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
         let raft_runtime: Option<Arc<tokio::runtime::Runtime>> = self.raft_runtime.get().cloned();
@@ -898,6 +1036,12 @@ impl ModeController {
             }
 
             // Build openraft Config
+            //
+            // ADR-012 wires `enable_pre_vote` (Ongaro §9.6) and
+            // `check_quorum_ratio` (Ongaro §6.4). Both fields are ferrosa-fork
+            // extensions exposed by the patched openraft (`correctness/prevote-checkquorum`
+            // branch) and inert against upstream openraft (defaults are
+            // upstream-compatible: pre_vote=false, ratio=0.0).
             let raft_config = match (openraft::Config {
                 cluster_name,
                 heartbeat_interval: raft_heartbeat_ms,
@@ -908,6 +1052,8 @@ impl ModeController {
                 election_timeout_max: raft_election_max_ms,
                 max_payload_entries: 5,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
+                enable_pre_vote: raft_enable_pre_vote,
+                check_quorum_ratio: raft_check_quorum_ratio,
                 ..Default::default()
             })
             .validate()
@@ -1044,11 +1190,24 @@ impl ModeController {
                 );
             }
 
-            // Also publish to the controller's raft_instance so that
+            // Also publish to the controller's raft_groups map so that
             // controller.raft() returns Some() during the election loop.
             // Without this, external callers (tests, DDL) cannot observe
             // the leader until the entire background task completes.
-            raft_instance_swap.store(Arc::new(Some(raft_arc.clone())));
+            //
+            // ADR-015: per-DC Raft groups are keyed by RaftGroupId derived
+            // from the configured data_center. Single-DC deployments install
+            // exactly one group; multi-DC bootstrap (Sprint 6 W6.3) extends
+            // this to one per DC.
+            {
+                let prev = raft_groups_swap.load_full();
+                let mut next: std::collections::HashMap<
+                    crate::raft::RaftGroupId,
+                    Arc<FerrosRaft>,
+                > = (*prev).clone();
+                next.insert(local_raft_group_id, raft_arc.clone());
+                raft_groups_swap.store(Arc::new(next));
+            }
 
             // Spawn the election-storm watchdog (P0-17 fix, path c).
             //
@@ -1131,16 +1290,34 @@ impl ModeController {
                 tracing::info!("non-seed node — skipping raft.initialize(), waiting for leader AppendEntries");
             }
 
-            // Wait for leader election (poll with backoff, max ~30s)
+            // Wait for leader election.
+            //
+            // W1.17 — the deadline is driven by `formation_timeout_secs`
+            // when configured (operator override) so a small test or
+            // failure-mode harness can assert the Forming → Pair
+            // fallback fires deterministically.  Default keeps the
+            // historical ~30 s budget.
+            let formation_deadline_secs = config_for_promotion
+                .formation_timeout_secs
+                .unwrap_or(30);
+            let formation_deadline_secs = formation_deadline_secs.max(1);
+            let election_start = tokio::time::Instant::now();
+            let election_deadline = election_start
+                + std::time::Duration::from_secs(formation_deadline_secs);
             let mut leader = None;
-            for attempt in 0..60 {
+            let mut attempt: u32 = 0;
+            loop {
                 if let Some(lid) = raft_arc.current_leader().await {
                     leader = Some(lid);
+                    break;
+                }
+                if tokio::time::Instant::now() >= election_deadline {
                     break;
                 }
                 let backoff =
                     std::time::Duration::from_millis(if attempt < 10 { 100 } else { 500 });
                 tokio::time::sleep(backoff).await;
+                attempt = attempt.saturating_add(1);
             }
 
             match leader {
@@ -1315,10 +1492,10 @@ impl ModeController {
                     // refresh path would silently drop the proposal and the
                     // joining node's BasicNode addr stays empty forever.
                     let cluster_raft_forward_handler = Arc::new(
-                        crate::raft_forward::ClusterRaftForwardHandler::new(raft_arc.clone()),
+                        crate::raft_forward::ClusterMembershipForwardHandler::new(raft_arc.clone()),
                     );
                     registry.register(
-                        MsgType::ClusterRaftForward,
+                        MsgType::ClusterMembershipForward,
                         cluster_raft_forward_handler,
                     );
 
@@ -1330,20 +1507,19 @@ impl ModeController {
 
 
                     // Drain any DDL operations queued during Forming state.
-                    // Take the receiver outside the lock guard scope to avoid
-                    // holding parking_lot::MutexGuard across an await point.
                     let maybe_rx = ddl_queue_rx.lock().take();
-                    if let Some(mut rx) = maybe_rx {
-                        let mut replayed = 0usize;
-                        while let Ok(op) = rx.try_recv() {
-                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
-                                tracing::warn!(%e, "failed to replay queued DDL operation");
-                            } else {
-                                replayed += 1;
-                            }
-                        }
+                    if let Some(rx) = maybe_rx {
+                        let raft_for_drain = raft_arc.clone();
+                        let replayed = drain_ddl_queue(rx, |op| {
+                            let raft = raft_for_drain.clone();
+                            async move { execute_via_raft(&raft, op).await }
+                        })
+                        .await;
                         if replayed > 0 {
-                            tracing::info!(count = replayed, "replayed queued DDL operations from Forming state");
+                            tracing::info!(
+                                count = replayed,
+                                "replayed queued DDL operations from Forming state",
+                            );
                         }
                     }
 
@@ -1729,7 +1905,8 @@ impl ModeController {
                     LEADER_ELECTION_TIMEOUTS.fetch_add(1, AtomicOrdering::Relaxed);
                     tracing::error!(
                         peers = peers.len(),
-                        "raft leader election timed out after ~30s — reverting to Pair mode \
+                        deadline_secs = formation_deadline_secs,
+                        "raft leader election timed out — reverting to Pair mode \
                          (this is a fail-loud signal: cluster formation did not complete)"
                     );
                     // Revert to Pair mode — formation failed. The Raft instance
@@ -1799,7 +1976,16 @@ impl ModeController {
             }
 
             // Store the raft instance so it is accessible via controller.raft()
-            raft_instance_swap.store(Arc::new(Some(raft_arc)));
+            // (ADR-015: keyed by per-DC RaftGroupId).
+            {
+                let prev = raft_groups_swap.load_full();
+                let mut next: std::collections::HashMap<
+                    crate::raft::RaftGroupId,
+                    Arc<FerrosRaft>,
+                > = (*prev).clone();
+                next.insert(local_raft_group_id, raft_arc);
+                raft_groups_swap.store(Arc::new(next));
+            }
         });
     }
 }

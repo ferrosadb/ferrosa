@@ -1,5 +1,6 @@
 pub mod elle;
 pub mod knossos;
+pub mod membership;
 
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -256,35 +257,102 @@ fn backtrack(
 /// Unified checker that can run Rust-native, Knossos, and Elle checkers.
 pub struct UnifiedChecker {
     pub jepsen_dir: Option<std::path::PathBuf>,
+    /// Membership snapshots collected from each node, used by Sprint 2 W2.4
+    /// structural-invariant checks. Empty when the orchestrator did not
+    /// expose the `/admin/membership-snapshot` endpoint (pre-W2.3 setups).
+    pub membership_snapshots: Vec<membership::MembershipSnapshot>,
 }
 
 impl UnifiedChecker {
     pub fn new() -> Self {
-        Self { jepsen_dir: None }
+        Self {
+            jepsen_dir: None,
+            membership_snapshots: Vec::new(),
+        }
     }
 
     pub fn with_jepsen_dir(jepsen_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             jepsen_dir: Some(jepsen_dir.into()),
+            membership_snapshots: Vec::new(),
         }
     }
 
+    /// Attach membership snapshots collected from `/admin/membership-snapshot`.
+    /// Sprint 2 W2.4 — fed by the orchestrator after a workload completes.
+    pub fn with_membership_snapshots(
+        mut self,
+        snapshots: Vec<membership::MembershipSnapshot>,
+    ) -> Self {
+        self.membership_snapshots = snapshots;
+        self
+    }
+
     /// Run all applicable checkers on a history.
+    ///
+    /// Sprint 2 W2.12: when `jepsen_dir` is set AND a Knossos history file
+    /// has been written via [`Self::check_all_with_history_file`], the
+    /// Clojure-based Knossos checker is invoked via `lein run`. The
+    /// in-process check does not shell out — `check_all` is intended for
+    /// fast unit-level invocations that don't have a written history.
     pub fn check_all(&self, history: &History) -> AllCheckResults {
+        self.check_all_with_history_file(history, None)
+    }
+
+    /// Run all checkers, optionally pointing at a written history JSONL
+    /// for the Knossos subprocess. Sprint 2 W2.12.
+    pub fn check_all_with_history_file(
+        &self,
+        history: &History,
+        history_path: Option<&std::path::Path>,
+    ) -> AllCheckResults {
         let linear = check_linearizability(history);
 
-        // Knossos and Elle require a running Jepsen cluster with lein;
-        // return None when the subprocess checkers are not available.
-        let knossos_result: Option<knossos::KnossosResult> = None;
+        // Sprint 2 W2.12 — invoke Knossos when configured.
+        let knossos_result: Option<knossos::KnossosResult> = match (&self.jepsen_dir, history_path)
+        {
+            (Some(dir), Some(path)) => {
+                let checker = knossos::KnossosChecker::new(dir.clone());
+                match checker.check(path) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        // Surface as an explicit anomaly so the operator
+                        // sees the failure (per the fail-loud philosophy)
+                        // — never silently swallow a checker error.
+                        tracing::error!(error = %e, "Knossos checker failed; treating as anomaly");
+                        Some(knossos::KnossosResult {
+                            valid: false,
+                            model: "cas-register".into(),
+                            algorithm: "wgl".into(),
+                            ok_count: 0,
+                            fail_count: 0,
+                            info_count: 0,
+                            anomalies: vec![knossos::KnossosAnomaly {
+                                anomaly_type: "checker-error".into(),
+                                description: format!("Knossos invocation failed: {e}"),
+                            }],
+                        })
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        // Elle requires a running Jepsen cluster with lein; not yet wired.
         let elle_result: Option<elle::ElleResult> = None;
 
-        // Acknowledge jepsen_dir for future use.
-        let _ = &self.jepsen_dir;
+        // Run Sprint 2 W2.4 structural-invariant checks if snapshots present.
+        let membership_violations = if self.membership_snapshots.is_empty() {
+            Vec::new()
+        } else {
+            membership::check_membership_invariants(&self.membership_snapshots)
+        };
 
         AllCheckResults {
             linearizability: linear,
             knossos: knossos_result,
             elle: elle_result,
+            membership_violations,
         }
     }
 }
@@ -301,6 +369,21 @@ pub struct AllCheckResults {
     pub linearizability: Vec<CheckResult>,
     pub knossos: Option<knossos::KnossosResult>,
     pub elle: Option<elle::ElleResult>,
+    /// Sprint 2 W2.4 — structural-invariant violations across the
+    /// membership snapshots collected from each node. Empty when no
+    /// snapshots were attached.
+    #[serde(default)]
+    pub membership_violations: Vec<membership::InvariantViolation>,
+}
+
+impl AllCheckResults {
+    /// True when every checker that ran reports clean.
+    pub fn all_passed(&self) -> bool {
+        self.linearizability.iter().all(|r| r.valid)
+            && self.knossos.as_ref().is_none_or(|r| r.valid)
+            && self.elle.as_ref().is_none_or(|r| r.valid)
+            && self.membership_violations.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -645,10 +728,12 @@ mod tests {
             linearizability: vec![],
             knossos: None,
             elle: None,
+            membership_violations: vec![],
         };
         let json = serde_json::to_string(&results).unwrap();
         let back: AllCheckResults = serde_json::from_str(&json).unwrap();
         assert!(back.linearizability.is_empty());
+        assert!(back.membership_violations.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1227,6 +1312,94 @@ mod tests {
         let results = checker.check_all(&history);
         assert_eq!(results.linearizability.len(), 1);
         assert!(results.linearizability[0].valid);
+    }
+
+    /// Sprint 2 W2.4: UnifiedChecker runs the membership invariants and surfaces
+    /// violations through `AllCheckResults.membership_violations`.
+    #[test]
+    fn unified_checker_runs_membership_invariants() {
+        use crate::checker::membership::{MembershipSnapshot, NodeStateLabel, NodeView};
+
+        // Construct a snapshot with a deliberate I-07 (empty addr) violation.
+        let mut state_members = std::collections::BTreeMap::new();
+        state_members.insert(
+            "node1".to_string(),
+            NodeView {
+                host_id: "node1".into(),
+                addr: String::new(), // I-07 violation
+                state: NodeStateLabel::Normal,
+            },
+        );
+        let voters: std::collections::BTreeSet<String> =
+            ["node1".to_string()].into_iter().collect();
+        let snap = MembershipSnapshot {
+            reporter_host_id: "node1".into(),
+            state_members,
+            openraft_voters: voters.clone(),
+            openraft_learners: Default::default(),
+            node_map: voters.clone(),
+            peer_manager_peers: voters,
+            committed_cluster_size: 1,
+            live_peer_count: 1,
+        };
+
+        let checker = UnifiedChecker::new().with_membership_snapshots(vec![snap]);
+        let results = checker.check_all(&History { operations: vec![] });
+        assert!(
+            !results.membership_violations.is_empty(),
+            "UnifiedChecker must surface membership violations"
+        );
+        assert!(
+            !results.all_passed(),
+            "all_passed must be false when membership_violations are present"
+        );
+    }
+
+    /// W2.12: when `jepsen_dir` is set but no history file is provided,
+    /// Knossos is not invoked and the result remains `None`.
+    #[test]
+    fn unified_checker_skips_knossos_without_history_file() {
+        let checker = UnifiedChecker::with_jepsen_dir("/tmp/nonexistent");
+        let history = History { operations: vec![] };
+        let results = checker.check_all(&history);
+        assert!(
+            results.knossos.is_none(),
+            "Knossos must not be invoked without a written history"
+        );
+    }
+
+    /// W2.12: when both `jepsen_dir` and `history_path` are set BUT the
+    /// jepsen project doesn't exist, the wrapper returns a checker-error
+    /// anomaly rather than panicking — fail-loud per CLAUDE.md.
+    #[test]
+    fn unified_checker_surfaces_knossos_invocation_failure() {
+        let checker = UnifiedChecker::with_jepsen_dir("/nonexistent/jepsen/dir");
+        let dir = tempfile::tempdir().unwrap();
+        let history_path = dir.path().join("history.jsonl");
+        std::fs::write(&history_path, "[]").unwrap();
+        let history = History { operations: vec![] };
+
+        let results = checker.check_all_with_history_file(&history, Some(&history_path));
+        let kn = results
+            .knossos
+            .expect("must surface a Knossos result, even on invocation failure");
+        assert!(!kn.valid, "invocation failure must be reported as invalid");
+        assert!(
+            !kn.anomalies.is_empty()
+                && kn
+                    .anomalies
+                    .iter()
+                    .any(|a| a.anomaly_type == "checker-error"),
+            "must include a checker-error anomaly so the operator knows the harness broke"
+        );
+    }
+
+    /// `all_passed` is true on a fully clean run.
+    #[test]
+    fn unified_checker_all_passed_on_clean_run() {
+        let checker = UnifiedChecker::new();
+        let results = checker.check_all(&History { operations: vec![] });
+        assert!(results.all_passed());
     }
 
     /// UnifiedChecker with_jepsen_dir stores the path for future use.

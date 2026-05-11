@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# W8.9 — sim-equivalent endurance path (ADR-016).
+ferrosa-sim = { path = "../ferrosa-sim" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,4 +36,5 @@ dirs-next = "2"
 scylla = "1.5.0"
 
 [dev-dependencies]
+serde_yaml = "0.9"
 tempfile = "3"

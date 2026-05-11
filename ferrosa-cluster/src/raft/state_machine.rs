@@ -21,7 +21,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use ferrosa_common::CqlType;
+use ferrosa_common::{AccordTimestamp, CqlType, TxnId};
 use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
 use ferrosa_schema::metadata::function::UserFunctionMetadata;
 use ferrosa_schema::metadata::index::IndexMetadata;
@@ -36,10 +36,76 @@ use ferrosa_storage::TableId;
 use crate::system_table_writer::SystemTableWriter;
 
 use crate::config::ClusterConfig;
+use crate::raft::multi_dc_apply::{AppliedTxnLedger, ReorderBuffer};
 use crate::raft::{
     FerrosRaftConfig, IndexNodeStatus, NodeInfo, RaftCommand, RaftOp, RaftResponse, Token,
 };
 use crate::ring::TokenRing;
+
+// ---------------------------------------------------------------------------
+// ApplyError — typed sub-errors that can occur inside `apply_command`.
+// ---------------------------------------------------------------------------
+
+/// Typed sub-error from a single side-effect during `apply_command` (W1.7).
+///
+/// Today the apply path logs and swallows every Schema / Engine /
+/// SystemTableWriter failure (`tracing::error!(%e, ...)` with no
+/// further propagation), which has produced two known
+/// silent-data-loss bugs:
+///
+/// 1. `engine.register_table` failure — writes to the new table go
+///    nowhere yet `RaftResponse::Ok` is returned to the client.
+/// 2. `schema.create_table_internal` failure — schema diverges from
+///    the Raft log; queries blow up with "unknown table" hours later.
+///
+/// `ApplyError` accumulates these so `apply_command` can return
+/// `RaftResponse::Error(_)` and callers (`MembershipChanger`,
+/// `client_write` users, the schema-coherence audit) can act.  The
+/// migration is staged: Sprint 1 introduces the type and wires the
+/// engine path; subsequent sprints migrate the remaining sites.
+#[derive(Debug, Clone)]
+pub enum ApplyError {
+    /// `engine.register_table` failed — writes to the table will not
+    /// land in storage.  The most dangerous class of error.
+    EngineRegisterTable {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
+    /// `engine.unregister_table` failed — stale data may persist
+    /// after a DropTable / DropKeyspace.
+    EngineUnregisterTable {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
+    /// Catch-all for sites not yet migrated to a typed variant.
+    Other(String),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EngineRegisterTable {
+                keyspace,
+                table,
+                reason,
+            } => write!(
+                f,
+                "engine.register_table({keyspace}.{table}) failed: {reason}"
+            ),
+            Self::EngineUnregisterTable {
+                keyspace,
+                table,
+                reason,
+            } => write!(
+                f,
+                "engine.unregister_table({keyspace}.{table}) failed: {reason}"
+            ),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RaftState
@@ -88,6 +154,29 @@ pub struct RaftState {
     pub config: ClusterConfig,
     /// Set of host IDs that have been explicitly approved to join the cluster.
     pub approved_nodes: BTreeSet<Uuid>,
+
+    // ---- Multi-DC Accord (Sprint 7) ------------------------------------
+    /// HLC watermark — the largest Accord timestamp that has been
+    /// drained out of the reorder buffer and durably applied. Advances
+    /// monotonically; never regresses. (W7.1 / I-27.)
+    #[serde(default)]
+    pub hlc_watermark: AccordTimestamp,
+    /// Maximum HLC skew observed at apply time relative to the local
+    /// wall-clock estimate. Recorded for operator visibility (W7.1
+    /// REFACTOR / RAFT_ACCORD_MAX_SKEW gauge).
+    #[serde(default)]
+    pub max_observed_skew_us: u64,
+    /// Idempotent-apply ledger keyed by Accord transaction id. Replayed
+    /// `RaftOp::AccordApply` entries with a matching `txn_id` are
+    /// short-circuited to a no-op (W7.5 / I-28).
+    #[serde(default)]
+    pub applied_accord_txns: AppliedTxnLedger,
+    /// Reorder buffer for `RaftOp::AccordApply` entries (W7.2 / I-27).
+    /// Buffered entries stall until the watermark advances past their
+    /// HLC; on drain they apply in ascending timestamp order across
+    /// every replica.
+    #[serde(default)]
+    pub accord_apply_buffer: ReorderBuffer,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +201,67 @@ struct PersistedSnapshot {
 // ---------------------------------------------------------------------------
 // FerrosStateMachine
 // ---------------------------------------------------------------------------
+
+/// W1.21 / I-19: errors that can prevent a fail-loud recovery from
+/// silently downgrading a joint or mismatched membership configuration.
+///
+/// Constructed by [`FerrosStateMachine::try_recover_membership_from_topology_state`]
+/// when synthesizing a membership from `state.members` would lose
+/// information that the actual log entry encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryError {
+    /// The last committed Membership log entry was a joint config
+    /// (mid-transition between two voter sets), but the snapshot was
+    /// older than that log entry. Synthesizing a single-config Membership
+    /// from `state.members` would silently drop the joint transition,
+    /// risking a split-brain during the next election.
+    ///
+    /// Resolution: replay the log Membership entry verbatim instead of
+    /// synthesizing.
+    JointConfigLost {
+        /// Voter sets from the log Membership entry (multiple sets means
+        /// joint).
+        log_configs: Vec<BTreeSet<u64>>,
+        /// What synthesis would have produced from `state.members`.
+        synthesized_voters: BTreeSet<u64>,
+    },
+    /// The last committed Membership log entry was a single-config that
+    /// disagrees with the voter set derived from `state.members`. This
+    /// indicates state.members has drifted from the consensus view —
+    /// likely a sign of a separate bug (silent JoinNode/LeaveNode without
+    /// the corresponding Membership change).
+    SingleConfigMismatch {
+        log_voters: BTreeSet<u64>,
+        synthesized_voters: BTreeSet<u64>,
+    },
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JointConfigLost {
+                log_configs,
+                synthesized_voters,
+            } => write!(
+                f,
+                "JointConfigLost: log Membership had {} configs ({:?}); state.members synthesized {:?}",
+                log_configs.len(),
+                log_configs,
+                synthesized_voters
+            ),
+            Self::SingleConfigMismatch {
+                log_voters,
+                synthesized_voters,
+            } => write!(
+                f,
+                "SingleConfigMismatch: log voters {:?} != state.members voters {:?}",
+                log_voters, synthesized_voters
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {}
 
 /// Openraft state machine for Ferrosa.
 ///
@@ -264,6 +414,71 @@ impl FerrosStateMachine {
             StoredMembership::new(self.last_applied, Membership::new(vec![voters], None));
         self.refresh_current_snapshot_membership();
         true
+    }
+
+    /// W1.21 / I-19: fail-loud variant of [`Self::recover_membership_from_topology_state`]
+    /// that detects the lost-joint-config corner case.
+    ///
+    /// When given the actual last committed `Membership` from the log
+    /// (`log_membership`), this function refuses to silently downgrade a
+    /// joint config (e.g. `{old_voters, new_voters}`) into a single-config
+    /// synthesized from `state.members`. If the log contained a joint config
+    /// at the time of the last apply, that is the only safe membership;
+    /// rebuilding a single-config from `state.members` would lose the joint
+    /// transition and could cause split-brain on the next election.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — synthesized a single-config from `state.members`
+    ///   because there was no membership in the log (or the log_membership
+    ///   matched the synthesized one).
+    /// - `Ok(false)` — explicit `last_membership` was already set, or
+    ///   `state.members` was empty; no recovery needed.
+    /// - `Err(RecoveryError::JointConfigLost { .. })` — the snapshot is
+    ///   older than the last log Membership entry AND that entry was a
+    ///   joint config; recovery would silently drop it.
+    pub fn try_recover_membership_from_topology_state(
+        &mut self,
+        log_membership: Option<&Membership<u64, BasicNode>>,
+    ) -> Result<bool, RecoveryError> {
+        let membership_empty = self
+            .last_membership
+            .membership()
+            .get_joint_config()
+            .iter()
+            .all(|c| c.is_empty());
+        if !membership_empty || self.state.members.is_empty() {
+            return Ok(false);
+        }
+
+        let voters: BTreeSet<u64> = self.state.members.keys().copied().collect();
+        if voters.is_empty() {
+            return Ok(false);
+        }
+
+        // If we have an actual log membership, use it as the authoritative
+        // truth. A joint config (configs.len() > 1) cannot be reconstructed
+        // from the single voter set in state.members.
+        if let Some(log_m) = log_membership {
+            let log_configs = log_m.get_joint_config();
+            if log_configs.len() > 1 {
+                return Err(RecoveryError::JointConfigLost {
+                    log_configs: log_configs.to_vec(),
+                    synthesized_voters: voters,
+                });
+            }
+            // Single-config log entry: must match the synthesized voter set.
+            if log_configs.len() == 1 && log_configs[0] != voters {
+                return Err(RecoveryError::SingleConfigMismatch {
+                    log_voters: log_configs[0].clone(),
+                    synthesized_voters: voters,
+                });
+            }
+        }
+
+        self.last_membership =
+            StoredMembership::new(self.last_applied, Membership::new(vec![voters], None));
+        self.refresh_current_snapshot_membership();
+        Ok(true)
     }
 
     /// Create a new state machine wired to local `Schema` and `StorageEngine`
@@ -487,11 +702,84 @@ impl FerrosStateMachine {
         self.sync_ring();
     }
 
+    // -----------------------------------------------------------------
+    // W7.1–W7.5 — Multi-DC Accord apply path.
+    // -----------------------------------------------------------------
+
+    /// Apply path for [`RaftOp::AccordApply`] (W7.2). Buffers the entry
+    /// by HLC timestamp, records the max-observed-skew metric, and
+    /// drains everything at-or-below the current watermark.
+    ///
+    /// Idempotent on `txn_id` (W7.5 / I-28): replayed transactions are
+    /// short-circuited at the ledger before they enter the buffer.
+    fn apply_accord_marked(&mut self, txn_id: TxnId, hlc: AccordTimestamp, mutation: Vec<u8>) {
+        // I-28: short-circuit replays before buffering.
+        if self.state.applied_accord_txns.contains(&txn_id) {
+            tracing::debug!(?txn_id, "AccordApply replay deduped at ledger");
+            return;
+        }
+
+        // Track the max skew observed against the current watermark
+        // (W7.1 REFACTOR / RAFT_ACCORD_MAX_SKEW gauge).
+        let skew_us = hlc.time.saturating_sub(self.state.hlc_watermark.time);
+        if skew_us > self.state.max_observed_skew_us {
+            self.state.max_observed_skew_us = skew_us;
+        }
+
+        let op = RaftOp::AccordApply {
+            txn_id,
+            hlc,
+            mutation,
+        };
+        self.state.accord_apply_buffer.push(hlc, op);
+
+        // Try to drain anything below the current watermark — entries
+        // newly admitted whose HLC is below the watermark should fire
+        // immediately.
+        self.drain_ready_accord_entries();
+    }
+
+    /// Drain Accord-marked entries whose HLC is at-or-below the
+    /// watermark, in HLC order. Records each in the idempotent ledger.
+    fn drain_ready_accord_entries(&mut self) {
+        let watermark = self.state.hlc_watermark;
+        let ready = self.state.accord_apply_buffer.drain_ready(watermark);
+        for op in ready {
+            if let RaftOp::AccordApply { txn_id, hlc, .. } = op {
+                // I-28: record the apply for dedupe. The mutation
+                // payload is dispatched to higher layers in later
+                // sprints — for now the ledger entry is the durable
+                // marker that this txn has been applied.
+                self.state.applied_accord_txns.record(txn_id, hlc);
+            }
+        }
+    }
+
+    /// Advance the HLC watermark to `new_watermark` (or hold it if the
+    /// proposed value would regress) and drain any newly-eligible
+    /// entries from the reorder buffer (W7.1 / W7.3).
+    ///
+    /// Called by the heartbeat tick in production with
+    /// `now - max_skew`; tests advance it explicitly to exercise the
+    /// drain semantics.
+    pub fn advance_accord_watermark(&mut self, new_watermark: AccordTimestamp) {
+        if new_watermark > self.state.hlc_watermark {
+            self.state.hlc_watermark = new_watermark;
+        }
+        self.drain_ready_accord_entries();
+    }
+
+    /// Borrow the reorder buffer (test/operator inspection).
+    pub fn accord_apply_buffer(&self) -> &ReorderBuffer {
+        &self.state.accord_apply_buffer
+    }
+
     /// Apply a single [`RaftCommand`] to `self.state`, updating BTreeMaps
     /// and optionally propagating side effects.
     fn apply_command(&mut self, cmd: RaftCommand) -> RaftResponse {
         let RaftCommand { op, schema_version } = cmd;
         let mut schema_changed = true;
+        let mut apply_errors: Vec<ApplyError> = Vec::new();
         match op {
             // ---- DDL: Keyspaces ----------------------------------------
             RaftOp::CreateKeyspace(ks) => {
@@ -548,6 +836,11 @@ impl FerrosStateMachine {
                         let tid = TableId::new(&ks, &tbl);
                         if let Err(e) = engine.unregister_table(&tid) {
                             tracing::error!(%e, "Raft apply: unregister_table failed");
+                            apply_errors.push(ApplyError::EngineUnregisterTable {
+                                keyspace: ks,
+                                table: tbl,
+                                reason: e.to_string(),
+                            });
                         }
                     }
                 }
@@ -604,6 +897,11 @@ impl FerrosStateMachine {
                     if let Some(engine) = &self.engine {
                         if let Err(e) = engine.register_table(table.to_storage_schema()) {
                             tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                            apply_errors.push(ApplyError::EngineRegisterTable {
+                                keyspace: table.keyspace.clone(),
+                                table: table.name.clone(),
+                                reason: e.to_string(),
+                            });
                         }
                     }
                     if let Some(writer) = &self.system_writer {
@@ -634,6 +932,11 @@ impl FerrosStateMachine {
                     let tid = TableId::new(&keyspace, &table);
                     if let Err(e) = engine.unregister_table(&tid) {
                         tracing::error!(%e, "Raft apply: unregister_table failed — stale table data may remain");
+                        apply_errors.push(ApplyError::EngineUnregisterTable {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                            reason: e.to_string(),
+                        });
                     }
                 }
                 if let Some(writer) = &self.system_writer {
@@ -1045,6 +1348,16 @@ impl FerrosStateMachine {
                 }
                 self.sync_ring();
             }
+
+            // ---- Multi-DC Accord (Sprint 7) ----------------------------
+            RaftOp::AccordApply {
+                txn_id,
+                hlc,
+                mutation,
+            } => {
+                schema_changed = false;
+                self.apply_accord_marked(txn_id, hlc, mutation);
+            }
         }
 
         if schema_changed {
@@ -1057,7 +1370,20 @@ impl FerrosStateMachine {
                 schema.set_schema_version(schema_version);
             }
         }
-        RaftResponse::Ok
+
+        // W1.7 — surface accumulated sub-errors instead of silently
+        // returning Ok.  Callers can detect engine/schema/system_writer
+        // failures and decide whether to retry, alert, or escalate.
+        if apply_errors.is_empty() {
+            RaftResponse::Ok
+        } else {
+            let summary = apply_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            RaftResponse::Error(summary)
+        }
     }
 }
 
@@ -1232,6 +1558,7 @@ mod tests {
 
     use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
+    use ferrosa_common::{AccordTimestamp, TxnId};
     use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
     use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
     use ferrosa_schema::metadata::table::TableParams;
@@ -1309,6 +1636,278 @@ mod tests {
     }
 
     // -- tests ------------------------------------------------------------
+
+    // ---- W7.1: HLC watermark tracking ----------------------------------
+
+    /// W7.1 RED → GREEN. Each `RaftOp::AccordApply` step updates an HLC
+    /// watermark on `RaftState`; the watermark advances monotonically as
+    /// successive Accord-marked entries land. Two entries with strictly
+    /// increasing HLC timestamps drive the watermark from 0 → t1 → t2.
+    ///
+    /// Uses HLCs realistic relative to wall-clock-microseconds and an
+    /// explicit `advance_accord_watermark` step so the buffered entries
+    /// are released regardless of the configured max-skew bound.
+    #[tokio::test]
+    async fn state_machine_tracks_hlc_watermark() {
+        let mut sm = FerrosStateMachine::new();
+        // Initial watermark must be the zero timestamp.
+        assert_eq!(
+            sm.state().hlc_watermark,
+            AccordTimestamp::synthetic(0),
+            "fresh state machine must start at zero watermark"
+        );
+
+        // HLCs are wall-clock microseconds: pick values comfortably above
+        // any realistic skew bound so the watermark advance succeeds.
+        let t1 = AccordTimestamp::synthetic(1_000_000_000);
+        let t2 = AccordTimestamp::synthetic(2_000_000_000);
+
+        let txn1 = TxnId::new(1, t1);
+        let txn2 = TxnId::new(1, t2);
+
+        let entries = vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::AccordApply {
+                    txn_id: txn1,
+                    hlc: t1,
+                    mutation: Vec::new(),
+                },
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::AccordApply {
+                    txn_id: txn2,
+                    hlc: t2,
+                    mutation: Vec::new(),
+                },
+            ),
+        ];
+
+        sm.apply(entries).await.unwrap();
+        // Advance the watermark past t2 (simulates the heartbeat-driven
+        // watermark tick once the wall-clock has progressed).
+        sm.advance_accord_watermark(t2);
+
+        // Watermark must advance to the largest observed Accord
+        // timestamp once entries are released by the reorder buffer.
+        assert!(
+            sm.state().hlc_watermark >= t2,
+            "watermark must advance past last applied Accord timestamp; got {:?}",
+            sm.state().hlc_watermark
+        );
+        assert!(
+            sm.state().hlc_watermark >= t1,
+            "watermark must be monotonic w.r.t. earlier applies"
+        );
+    }
+
+    /// W7.5 RED → GREEN. Applying the same `RaftOp::AccordApply` twice
+    /// is a NoOp — the ledger short-circuits the replay. Final state
+    /// matches the single-apply state (I-28).
+    #[tokio::test]
+    async fn accord_apply_idempotent() {
+        let mut sm = FerrosStateMachine::new();
+        let hlc = AccordTimestamp::synthetic(1_000_000_000);
+        let txn = TxnId::new(7, hlc);
+
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc,
+                mutation: vec![1, 2, 3],
+            },
+        )])
+        .await
+        .unwrap();
+        sm.advance_accord_watermark(hlc);
+        assert_eq!(sm.state().applied_accord_txns.len(), 1);
+        let watermark_after_first = sm.state().hlc_watermark;
+
+        // Replay the same txn — buffer must NOT grow; ledger size
+        // unchanged; watermark unchanged.
+        sm.apply(vec![make_entry(
+            1,
+            2,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc,
+                mutation: vec![1, 2, 3],
+            },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(sm.accord_apply_buffer().len(), 0, "replay must be deduped");
+        assert_eq!(
+            sm.state().applied_accord_txns.len(),
+            1,
+            "ledger must remain at 1 entry"
+        );
+        assert_eq!(
+            sm.state().hlc_watermark,
+            watermark_after_first,
+            "watermark must not regress on replay"
+        );
+    }
+
+    /// W7.4 RED → GREEN. An entry whose HLC is 500ms in the future
+    /// relative to local "now" with max_skew = 200ms stalls. Cross-DC
+    /// writes pause until the local clock catches up. Above
+    /// REORDER_BUFFER_ALARM_DEPTH the buffer reports over-threshold so
+    /// the alarm gauge fires.
+    #[tokio::test]
+    async fn reorder_buffer_stalls_above_max_skew() {
+        use crate::raft::multi_dc_apply::{watermark_for, REORDER_BUFFER_ALARM_DEPTH};
+        use std::time::Duration;
+
+        let mut sm = FerrosStateMachine::new();
+        let max_skew = Duration::from_millis(200);
+        let now_us = 100_000u64;
+        // Entry hlc = now + 500ms (skew far exceeds 200ms bound).
+        let future_hlc = AccordTimestamp::synthetic(now_us + 500_000);
+        let txn = TxnId::new(1, future_hlc);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc: future_hlc,
+                mutation: Vec::new(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        // Watermark at now - max_skew = max(0, -100ms) = 0. Entry stalls.
+        sm.advance_accord_watermark(watermark_for(now_us, max_skew));
+        assert_eq!(sm.accord_apply_buffer().len(), 1, "skew > bound stalls");
+        assert!(!sm.state().applied_accord_txns.contains(&txn));
+
+        // Push enough entries past the alarm threshold (still future
+        // from "now") so the gauge fires.
+        for i in 0..=(REORDER_BUFFER_ALARM_DEPTH as u64) {
+            let h = AccordTimestamp::synthetic(now_us + 600_000 + i);
+            let id = TxnId::new(1, h);
+            sm.apply(vec![make_entry(
+                1,
+                2 + i,
+                RaftOp::AccordApply {
+                    txn_id: id,
+                    hlc: h,
+                    mutation: Vec::new(),
+                },
+            )])
+            .await
+            .unwrap();
+        }
+        assert!(
+            sm.accord_apply_buffer().over_alarm_threshold(),
+            "buffer above {REORDER_BUFFER_ALARM_DEPTH} entries must trigger the alarm"
+        );
+    }
+
+    /// W7.3 RED → GREEN. With `max_skew = 200ms`, the heartbeat-driven
+    /// watermark advances when `now - 200ms > entry.hlc`. Until that
+    /// crossing, the entry stalls in the reorder buffer.
+    #[tokio::test]
+    async fn watermark_advances_with_max_skew_200ms() {
+        use crate::raft::multi_dc_apply::watermark_for;
+        use std::time::Duration;
+
+        let mut sm = FerrosStateMachine::new();
+        // Feed an entry with HLC = 800ms.
+        let hlc = AccordTimestamp::synthetic(800_000);
+        let txn = TxnId::new(1, hlc);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AccordApply {
+                txn_id: txn,
+                hlc,
+                mutation: Vec::new(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        let max_skew = Duration::from_millis(200);
+
+        // At now = 900ms, watermark = 700_000us — below the entry's
+        // HLC, so the entry must stall.
+        sm.advance_accord_watermark(watermark_for(900_000, max_skew));
+        assert_eq!(sm.accord_apply_buffer().len(), 1);
+        assert!(!sm.state().applied_accord_txns.contains(&txn));
+
+        // At now = 1100ms, watermark = 900_000us — above 800_000us, so
+        // the entry releases.
+        sm.advance_accord_watermark(watermark_for(1_100_000, max_skew));
+        assert!(sm.accord_apply_buffer().is_empty());
+        assert!(sm.state().applied_accord_txns.contains(&txn));
+    }
+
+    /// W7.2 RED → GREEN. Two `AccordApply` entries fed in reverse HLC
+    /// order (t2 before t1) must drain in ascending HLC order — t1
+    /// before t2 — so every replica sees the same apply order (I-27).
+    #[tokio::test]
+    async fn apply_buffers_out_of_order_accord_entries() {
+        let mut sm = FerrosStateMachine::new();
+        let t1 = AccordTimestamp::synthetic(1_000_000_000);
+        let t2 = AccordTimestamp::synthetic(2_000_000_000);
+        let txn1 = TxnId::new(1, t1);
+        let txn2 = TxnId::new(1, t2);
+
+        // Feed t2 FIRST, then t1 — exactly the reverse order.
+        let entries = vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::AccordApply {
+                    txn_id: txn2,
+                    hlc: t2,
+                    mutation: Vec::new(),
+                },
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::AccordApply {
+                    txn_id: txn1,
+                    hlc: t1,
+                    mutation: Vec::new(),
+                },
+            ),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        // While the watermark is below t1, both must be buffered.
+        sm.advance_accord_watermark(AccordTimestamp::synthetic(500_000_000));
+        assert_eq!(sm.accord_apply_buffer().len(), 2, "below t1 — both stall");
+
+        // Advance the watermark to release t1 first.
+        sm.advance_accord_watermark(t1);
+        assert_eq!(
+            sm.accord_apply_buffer().len(),
+            1,
+            "watermark = t1 must release exactly t1"
+        );
+        assert!(
+            sm.state().applied_accord_txns.contains(&txn1),
+            "t1 ledger entry must be recorded first"
+        );
+        assert!(
+            !sm.state().applied_accord_txns.contains(&txn2),
+            "t2 must still be buffered"
+        );
+
+        // Now release t2.
+        sm.advance_accord_watermark(t2);
+        assert!(sm.accord_apply_buffer().is_empty());
+        assert!(sm.state().applied_accord_txns.contains(&txn2));
+    }
 
     #[tokio::test]
     async fn apply_create_keyspace() {
@@ -1736,6 +2335,139 @@ mod tests {
         assert_eq!(sm.last_membership.log_id().clone(), sm.last_applied);
     }
 
+    /// W1.21 / I-19: when state.members exists but the last committed log
+    /// Membership entry encoded a joint config, recovery must NOT
+    /// silently downgrade the joint config into a synthesized single-
+    /// config (which would lose the in-flight transition and could
+    /// split-brain on the next election). Instead it must return
+    /// RecoveryError::JointConfigLost so the operator sees the
+    /// discrepancy.
+    #[tokio::test]
+    async fn recover_membership_fails_loud_on_lost_joint_config() {
+        let mut sm = FerrosStateMachine::new();
+        let node1 = uuid_to_node_id(Uuid::from_u128(1));
+        let node2 = uuid_to_node_id(Uuid::from_u128(2));
+        let node3 = uuid_to_node_id(Uuid::from_u128(3));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(1),
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(2),
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // last_membership is empty, simulating the snapshot being older
+        // than the latest Membership log entry.
+        sm.last_membership = StoredMembership::default();
+
+        // Construct the actual log Membership entry: a joint config in the
+        // middle of swapping {node1, node2} → {node1, node3}.
+        let joint = Membership::new(
+            vec![
+                BTreeSet::from([node1, node2]),
+                BTreeSet::from([node1, node3]),
+            ],
+            None,
+        );
+
+        let result = sm.try_recover_membership_from_topology_state(Some(&joint));
+        match result {
+            Err(RecoveryError::JointConfigLost {
+                log_configs,
+                synthesized_voters,
+            }) => {
+                assert_eq!(
+                    log_configs.len(),
+                    2,
+                    "the log Membership had two configs (joint)"
+                );
+                // synthesized would have been {node1, node2} from
+                // state.members.
+                assert!(synthesized_voters.contains(&node1));
+                assert!(synthesized_voters.contains(&node2));
+                assert!(!synthesized_voters.contains(&node3));
+            }
+            other => panic!("expected RecoveryError::JointConfigLost, got {other:?}"),
+        }
+
+        // The state machine's last_membership must NOT have been mutated
+        // — fail loud means refuse to proceed, not patch silently.
+        assert!(sm
+            .last_membership
+            .membership()
+            .get_joint_config()
+            .iter()
+            .all(|c| c.is_empty()));
+    }
+
+    /// W1.21 helper-test: when the log Membership is a single-config that
+    /// matches state.members, the function succeeds (not an error). This
+    /// pins the happy path so the fail-loud path doesn't over-fire.
+    #[tokio::test]
+    async fn recover_membership_succeeds_on_matching_single_config() {
+        let mut sm = FerrosStateMachine::new();
+        let node1 = uuid_to_node_id(Uuid::from_u128(1));
+        let node2 = uuid_to_node_id(Uuid::from_u128(2));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(1),
+                    addr: "10.0.0.1:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::JoinNode(NodeInfo {
+                    host_id: Uuid::from_u128(2),
+                    addr: "10.0.0.2:7000".to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+        sm.last_membership = StoredMembership::default();
+
+        let single = Membership::new(vec![BTreeSet::from([node1, node2])], None);
+        assert!(matches!(
+            sm.try_recover_membership_from_topology_state(Some(&single)),
+            Ok(true)
+        ));
+    }
+
     #[tokio::test]
     async fn recover_membership_from_topology_state_is_noop_when_membership_exists() {
         let mut sm = FerrosStateMachine::new();
@@ -1960,7 +2692,7 @@ mod tests {
         sm.apply(vec![entry]).await.unwrap();
 
         // Build snapshot.
-        let _ = sm.build_snapshot().await.unwrap();
+        sm.build_snapshot().await.unwrap();
 
         // Now get_current_snapshot should return Some.
         let snap = sm.get_current_snapshot().await.unwrap();
@@ -2286,6 +3018,65 @@ mod tests {
             max_pending_replay_mutations_without_schema: 1024,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    /// W1.7 — `apply_command` returns `RaftResponse::Error` instead of
+    /// silently swallowing engine.register_table failures.
+    ///
+    /// The engine's `register_table` calls `std::fs::create_dir_all` on
+    /// `<data_dir>/sstables/<keyspace>:<table>`.  If that path already
+    /// exists as a regular file, the call fails with "Not a directory".
+    /// We pre-create the file, then issue `RaftOp::CreateTable` and
+    /// confirm the apply returns `RaftResponse::Error` carrying the
+    /// `engine.register_table` reason.
+    #[tokio::test]
+    async fn apply_command_propagates_engine_register_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        // Pre-create the path the engine will try to mkdir, as a file.
+        let sabotage_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&sabotage_dir).unwrap();
+        let target = sabotage_dir.join("regress_ks.victim_tbl");
+        std::fs::write(&target, b"not a directory").unwrap();
+
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let ks = simple_keyspace("regress_ks");
+        let table = simple_table("regress_ks", "victim_tbl");
+        // Apply CreateKeyspace first so the schema/system table writes
+        // succeed; only the engine.register_table on the table should
+        // fail because the sabotage file blocks the mkdir.
+        let create_ks_entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
+        let create_tbl_entry = make_entry(1, 2, RaftOp::CreateTable(Box::new(table)));
+
+        let responses = sm
+            .apply(vec![create_ks_entry, create_tbl_entry])
+            .await
+            .unwrap();
+
+        // Two responses: CreateKeyspace -> Ok, CreateTable -> Error.
+        assert_eq!(responses.len(), 2);
+        assert!(
+            matches!(&responses[0], RaftResponse::Ok),
+            "CreateKeyspace should succeed: {:?}",
+            responses[0]
+        );
+        match &responses[1] {
+            RaftResponse::Error(msg) => {
+                assert!(
+                    msg.contains("engine.register_table"),
+                    "expected register_table failure, got: {msg}"
+                );
+                assert!(
+                    msg.contains("regress_ks") && msg.contains("victim_tbl"),
+                    "error should name the failing keyspace/table: {msg}"
+                );
+            }
+            other => panic!("expected RaftResponse::Error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

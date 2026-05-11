@@ -1,5 +1,5 @@
 use super::cluster::{
-    build_recovered_topology_refresh_plan, should_initialize_seed_membership,
+    build_recovered_topology_refresh_plan, drain_ddl_queue, should_initialize_seed_membership,
     should_run_bootstrap_streaming,
 };
 use super::*;
@@ -1983,6 +1983,298 @@ fn bootstrap_silent_failure_counts_exposes_three_counters() {
     assert!(publish2 >= publish);
     assert!(init2 >= init);
     assert!(election2 >= election);
+}
+
+/// W1.15 / hazard P1-1: the controller's mutexes are `parking_lot::Mutex`
+/// rather than `std::sync::Mutex`, so a panic inside a critical section
+/// does NOT poison the lock — subsequent acquisitions succeed and the
+/// controller stays responsive. This is the essential property that the
+/// `parking_lot` migration was supposed to deliver.
+///
+/// Strategy: stand up a fresh ModeController (which holds parking_lot
+/// mutexes for `approved_nodes`, `pending_joins`, `connected_peers`,
+/// etc.). On a separate thread, acquire one of those mutexes and panic.
+/// After the panic-thread joins, re-acquire the same mutex from this
+/// thread and assert it succeeds.
+#[test]
+fn controller_mutex_does_not_propagate_poison() {
+    use std::panic;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    let host_id = Uuid::new_v4();
+    let (controller, _handles) =
+        ModeController::new(config, net_config, host_id, storage, schema, registry);
+
+    // Step 1: panic while holding the `approved_nodes` lock on a worker
+    // thread. With std::sync::Mutex this would poison the lock and
+    // every subsequent .lock() would return a PoisonError. With
+    // parking_lot::Mutex the lock is simply released on unwind.
+    let controller_clone = controller.clone();
+    let join = std::thread::spawn(move || {
+        let _approved = controller_clone.approved_nodes.lock();
+        panic!("intentional panic inside critical section");
+    });
+
+    // Suppress the panic's stderr noise from the harness output.
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let _ = join.join(); // returns Err with the panic payload
+    }));
+
+    // Step 2: subsequent locks must succeed. With std::sync::Mutex this
+    // would .lock().unwrap() panic with a PoisonError; parking_lot has
+    // no Result.
+    let host = Uuid::new_v4();
+    {
+        let mut approved = controller.approved_nodes.lock();
+        approved.insert(host);
+    }
+    assert!(
+        controller.approved_nodes.lock().contains(&host),
+        "parking_lot mutex must remain usable after a panic in a critical section"
+    );
+
+    // Also exercise the other mutexes named in hazard P1-1 to pin the
+    // contract for `pending_joins`, `connected_peers`, etc.
+    {
+        let mut pending = controller.pending_joins.lock();
+        pending.push(host);
+    }
+    assert_eq!(
+        controller.pending_joins.lock().len(),
+        1,
+        "pending_joins remains writable after the panic"
+    );
+}
+
+/// W1.16 / hazard P1-3: concurrent mode transitions must serialize via
+/// the controller's `transition_guard` so two simultaneous callers
+/// cannot both observe the same starting mode and both apply a
+/// transition. Without serialization, two `on_peer_connected` callbacks
+/// arriving on different threads could each see Standalone and both
+/// call `transition_to_pair`, producing a poisoned state where the
+/// pair_context is overwritten mid-setup.
+#[test]
+fn concurrent_mode_transitions_serialize() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    let host_id = Uuid::new_v4();
+    let (controller, _handles) =
+        ModeController::new(config, net_config, host_id, storage, schema, registry);
+
+    let peer_a = Uuid::new_v4();
+    let peer_b = Uuid::new_v4();
+    let addr_a: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let count = Arc::new(AtomicUsize::new(0));
+
+    let c1 = controller.clone();
+    let b1 = barrier.clone();
+    let n1 = count.clone();
+    let t1 = std::thread::spawn(move || {
+        b1.wait();
+        c1.on_peer_connected((peer_a, addr_a));
+        n1.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let c2 = controller.clone();
+    let b2 = barrier.clone();
+    let n2 = count.clone();
+    let t2 = std::thread::spawn(move || {
+        b2.wait();
+        c2.on_peer_connected((peer_b, addr_b));
+        n2.fetch_add(1, Ordering::SeqCst);
+    });
+
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    // Both calls completed.
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+
+    // The transition_guard mutex's hold count reflects that BOTH
+    // callers acquired it — they did not race past the guard.
+    let acquires = controller
+        .contention_metrics
+        .transition_guard_acquires
+        .load(Ordering::Relaxed);
+    assert!(
+        acquires >= 2,
+        "both peer-connect callers must have acquired the transition guard \
+         (got {acquires} acquires) — concurrent transitions should serialize"
+    );
+
+    // The connected_peers list should contain both peers (both calls
+    // appended through the mutex, no lost updates).
+    let peers = controller.connected_peers.lock();
+    assert_eq!(
+        peers.len(),
+        2,
+        "both peers must be tracked; lost update would suggest a serialization gap"
+    );
+    let ids: Vec<Uuid> = peers.iter().map(|(id, _)| *id).collect();
+    assert!(ids.contains(&peer_a));
+    assert!(ids.contains(&peer_b));
+}
+
+/// W1.17 — when `formation_timeout_secs` elapses without a Raft
+/// leader, the node reverts to Pair mode and the DDL path falls
+/// back to Direct so single-node DDL still works.
+///
+/// We drive `transition_to_forming` with one stub peer that the node
+/// cannot reach (the harness has no real network), so the Raft
+/// election poll runs out the budget and the timeout branch fires.
+/// `formation_timeout_secs = 1` keeps the test fast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forming_falls_back_to_pair_on_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        formation_timeout_secs: Some(1),
+        // Aggressive election timing so the per-node tick budget
+        // is exhausted within the formation budget.
+        raft_heartbeat_ms: 50,
+        raft_election_timeout_min_ms: 100,
+        raft_election_timeout_max_ms: 200,
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    // The seed (calls raft.initialize) is the node with the highest
+    // UUID.  Force the local host to be seed so the election path
+    // actually runs.  Without this, the local node would be a passive
+    // non-seed waiting for AppendEntries from an unreachable peer.
+    let host_id = Uuid::from_u128(u128::MAX);
+    let peer_id = Uuid::from_u128(1);
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        host_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        host_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    // Forge a peer entry that the controller will try to contact and
+    // fail (no RPC server bound at 127.0.0.1:1).  This is enough to
+    // drive transition_to_cluster's election poll into its timeout
+    // branch.
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    controller.transition_to_forming(vec![(peer_id, unreachable)]);
+    // transition_to_forming synchronously fans into transition_to_cluster,
+    // which spawns the Raft init task and may flip mode to Cluster
+    // before this assertion runs.  Skip the intermediate check —
+    // what we really care about is the eventual fall-back to Pair.
+
+    // formation_timeout_secs = 1.  But cluster.rs also spends up to
+    // 10 s on `peer_manager.has_live_peer` waiting for connections
+    // before Raft init begins.  Total wall time to observe the
+    // fallback: ~11 s + headroom.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+    let mut observed_mode = controller.mode();
+    while tokio::time::Instant::now() < deadline {
+        observed_mode = controller.mode();
+        if observed_mode == DeploymentMode::Pair {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        observed_mode,
+        DeploymentMode::Pair,
+        "after formation_timeout_secs elapses without a leader, mode must revert to Pair",
+    );
+
+    controller.shutdown().await;
+}
+
+/// W1.14 — `drain_ddl_queue` must replay ops sent both BEFORE and
+/// DURING the drain.  The previous `try_recv()`-once-then-quit loop
+/// dropped late arrivals because it observed an empty queue once and
+/// exited; the new helper waits N consecutive empties so in-flight
+/// `Forming` senders can still land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_during_forming_queues_and_replays() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    // Pre-queue two ops (the steady-state "queued during Forming" case).
+    tx.send(1).unwrap();
+    tx.send(2).unwrap();
+
+    // Inject a third op AFTER the drain starts but before its
+    // first try_recv-empty cool-down completes.
+    let tx_for_late = tx.clone();
+    tokio::spawn(async move {
+        // Sleep long enough for drain_ddl_queue to consume the first
+        // two ops and start its first cool-down (50 ms).
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tx_for_late.send(3).unwrap();
+    });
+
+    // Drop the original tx so the channel becomes Disconnected once
+    // every clone has been dropped.  We retain the late-tx via the
+    // spawned task; it's dropped when that task ends.
+    drop(tx);
+
+    let processed_for_closure = processed.clone();
+    let replayed = drain_ddl_queue(rx, |op: u32| {
+        let processed = processed_for_closure.clone();
+        async move {
+            processed.fetch_add(1, Ordering::SeqCst);
+            // The op processor's success/failure must not change
+            // the drain's correctness — assert all ops are seen.
+            let _ = op;
+            Ok(())
+        }
+    })
+    .await;
+
+    assert_eq!(
+        replayed, 3,
+        "expected drain to replay 3 ops (two pre-queued + one in-flight); got {replayed}",
+    );
+    assert_eq!(processed.load(Ordering::SeqCst), 3);
+}
+
+/// Sanity test for the empty-channel case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_ddl_queue_returns_zero_for_empty_channel() {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let replayed = drain_ddl_queue(rx, |_| async { Ok(()) }).await;
+    assert_eq!(replayed, 0);
 }
 
 #[test]

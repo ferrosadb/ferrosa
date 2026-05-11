@@ -18,7 +18,7 @@ use tracing::{debug, info};
 use crate::config::Topology;
 
 // CQL ports assigned to each of the three Jepsen cluster nodes on localhost.
-const NODE_CQL_PORTS: [u16; 3] = [19042, 19043, 19044];
+const NODE_CQL_PORTS: [u16; 3] = [49042, 49043, 49044];
 
 /// Detect whether `docker` or `podman` is available and return the binary name.
 ///
@@ -75,7 +75,7 @@ pub struct ClusterInfo {
     /// The nodes in this cluster, in order.
     pub nodes: Vec<NodeInfo>,
     /// Compose file used to provision the cluster.
-    compose_file: PathBuf,
+    pub(crate) compose_file: PathBuf,
 }
 
 impl ClusterInfo {
@@ -90,6 +90,77 @@ impl ClusterInfo {
             self.nodes.len()
         );
     }
+}
+
+/// Parse a docker-compose file and extract each `nodeN` service's
+/// `FERROSA_SEED` environment variable (or `None` if unset).
+///
+/// Used by Sprint 2 W2.14 to assert seed-list symmetry: every node must
+/// list every other node in its seed env so cluster bring-up does not
+/// depend on a single bootstrap host.
+///
+/// Implementation is a simple line-oriented parser because we don't need
+/// a full YAML dependency for this one assertion.
+pub(crate) fn parse_seeds_from_compose(
+    yaml: &str,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    use std::collections::BTreeMap;
+    let mut result: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut current_node: Option<String> = None;
+    let mut in_environment = false;
+
+    for raw in yaml.lines() {
+        let trimmed = raw.trim();
+        // Skip comments and blanks.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Service-level header: `node1:` etc., indented exactly two spaces.
+        // (services: header lives at column 0; service entries at column 2.)
+        let leading_spaces = raw.len() - raw.trim_start().len();
+        if leading_spaces == 2 && trimmed.ends_with(':') {
+            let name = trimmed.trim_end_matches(':').to_string();
+            if name.starts_with("node") {
+                current_node = Some(name);
+                result.entry(current_node.clone().unwrap()).or_default();
+                in_environment = false;
+            } else {
+                current_node = None;
+                in_environment = false;
+            }
+            continue;
+        }
+
+        // Environment block opener.
+        if current_node.is_some() && trimmed == "environment:" {
+            in_environment = true;
+            continue;
+        }
+
+        // Reset on a sibling at column 4 that isn't an env entry.
+        if leading_spaces == 4 && trimmed.ends_with(':') && in_environment {
+            in_environment = false;
+        }
+
+        if in_environment && trimmed.starts_with("FERROSA_SEED:") {
+            if let Some(node) = &current_node {
+                let value = trimmed
+                    .trim_start_matches("FERROSA_SEED:")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                let seeds: Vec<String> = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                result.insert(node.clone(), seeds);
+            }
+        }
+    }
+
+    result
 }
 
 /// Locate the compose file relative to the Cargo workspace root.
@@ -265,9 +336,9 @@ mod tests {
     fn node_info_cql_address() {
         let node = NodeInfo {
             host: "localhost",
-            cql_port: 19042,
+            cql_port: 49042,
         };
-        assert_eq!(node.cql_address(), "localhost:19042");
+        assert_eq!(node.cql_address(), "localhost:49042");
     }
 
     #[test]
@@ -276,21 +347,118 @@ mod tests {
             nodes: vec![
                 NodeInfo {
                     host: "localhost",
-                    cql_port: 19042,
+                    cql_port: 49042,
                 },
                 NodeInfo {
                     host: "localhost",
-                    cql_port: 19043,
+                    cql_port: 49043,
                 },
                 NodeInfo {
                     host: "localhost",
-                    cql_port: 19044,
+                    cql_port: 49044,
                 },
             ],
             compose_file: PathBuf::from("/tmp/fake.yml"),
         };
         // T1 = 3 nodes — should not panic.
         cluster.assert_node_count(Topology::T1);
+    }
+
+    /// Sanity check the FERROSA_SEED parser on a hand-crafted snippet.
+    #[test]
+    fn parse_seeds_from_compose_extracts_per_node_lists() {
+        let yaml = r#"
+services:
+  rustfs:
+    image: rustfs
+  node1:
+    environment:
+      FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
+      FERROSA_SEED: "node2:7000,node3:7000"
+  node2:
+    environment:
+      FERROSA_SEED: "node1:7000,node3:7000"
+  node3:
+    environment:
+      FERROSA_SEED: "node1:7000,node2:7000"
+"#;
+        let map = parse_seeds_from_compose(yaml);
+        assert_eq!(
+            map.get("node1").map(|v| v.as_slice()),
+            Some(["node2:7000".to_string(), "node3:7000".to_string()].as_slice())
+        );
+        assert_eq!(
+            map.get("node2").map(|v| v.as_slice()),
+            Some(["node1:7000".to_string(), "node3:7000".to_string()].as_slice())
+        );
+        assert_eq!(
+            map.get("node3").map(|v| v.as_slice()),
+            Some(["node1:7000".to_string(), "node2:7000".to_string()].as_slice())
+        );
+    }
+
+    /// Parser must record nodes that have no FERROSA_SEED entry as having an
+    /// empty seed list (used to detect the asymmetric pre-Sprint-2 config).
+    #[test]
+    fn parse_seeds_from_compose_records_missing_seed_as_empty() {
+        let yaml = r#"
+services:
+  node1:
+    environment:
+      FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
+  node2:
+    environment:
+      FERROSA_SEED: "node1:7000"
+"#;
+        let map = parse_seeds_from_compose(yaml);
+        assert_eq!(map.get("node1"), Some(&Vec::<String>::new()));
+        assert_eq!(
+            map.get("node2").map(|v| v.as_slice()),
+            Some(["node1:7000".to_string()].as_slice())
+        );
+    }
+
+    /// W2.14: every nodeN service in jepsen-cluster.yml must list every other
+    /// node in its FERROSA_SEED env. Asymmetric seed config (node1 with no seed,
+    /// node2/node3 seeded only by node1) is the pre-Sprint-2 baseline and is
+    /// exactly what causes "random startup order" formation flakes.
+    #[test]
+    fn cluster_yml_seed_list_is_symmetric() {
+        let path = compose_file_path()
+            .expect("jepsen-cluster.yml must be discoverable from CARGO_MANIFEST_DIR");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let seeds = parse_seeds_from_compose(&yaml);
+
+        assert!(
+            !seeds.is_empty(),
+            "expected at least one nodeN service in the compose file"
+        );
+
+        let node_names: std::collections::BTreeSet<String> = seeds.keys().cloned().collect();
+        assert!(
+            node_names.len() >= 3,
+            "Jepsen compose must declare at least 3 ferrosa nodes for a meaningful raft cluster; \
+             got {node_names:?}"
+        );
+
+        for (node, declared_seeds) in &seeds {
+            // Build the set of expected seeds: every other node's `nodeX:7000`.
+            let expected: std::collections::BTreeSet<String> = node_names
+                .iter()
+                .filter(|n| n.as_str() != node.as_str())
+                .map(|n| format!("{n}:7000"))
+                .collect();
+
+            let actual: std::collections::BTreeSet<String> =
+                declared_seeds.iter().cloned().collect();
+
+            assert_eq!(
+                actual, expected,
+                "node {node} must seed every other node (symmetric seed config — Sprint 2 W2.14). \
+                 expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     #[test]

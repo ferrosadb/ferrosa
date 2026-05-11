@@ -1,0 +1,100 @@
+name: Nightly Multi-DC Jepsen Tier
+
+# Sprint 7 W7.11. Brings up the T3 (3+3 dual-DC) topology and runs
+# the bank workload at QUORUM under `dc-partition + dc-slow` for
+# 1 hour. Failure files a GitHub issue tagged sprint-7.
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # 6 AM UTC daily — staggered against nightly-sim
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  tier-multi-dc:
+    name: tier-multi-dc 1h bank workload (T3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Validate tier-multi-dc wiring (config-only)
+        run: |
+          cargo test --release -p ferrosa-jepsen \
+            --test tier_multi_dc \
+            -- tier_multi_dc_resolves_to_t3 \
+               dc_partition_plus_dc_slow_nemesis_registered \
+            2>&1 | tee tier-config.log
+
+      - name: Bring up T3 (3+3 dual-DC) topology
+        run: |
+          docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \
+            up -d --build
+          # Wait for both DCs to reach Cluster mode.
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:29090/health && \
+            curl -sf http://localhost:29190/health && break
+            sleep 2
+          done
+
+      - name: Run tier-multi-dc 1h bank workload
+        env:
+          FERROSA_TEST_CONTAINERS: '1'
+        run: |
+          cargo run --release -p ferrosa-jepsen -- \
+            --tier multi-dc \
+            --run-id "multi-dc-$(date -u +%Y%m%d)" \
+            --output-dir ./jepsen-out \
+            2>&1 | tee tier-multi-dc.log
+
+      - name: Upload Jepsen logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tier-multi-dc-logs
+          path: |
+            tier-config.log
+            tier-multi-dc.log
+            jepsen-out/
+          retention-days: 30
+
+      - name: Tear down compose
+        if: always()
+        run: |
+          docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \
+            down -v || true
+
+      - name: File issue on failure
+        if: failure()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let body = '## Nightly tier-multi-dc Jepsen run failed\n\n';
+            for (const f of ['tier-config.log', 'tier-multi-dc.log']) {
+              if (fs.existsSync(f)) {
+                const txt = fs.readFileSync(f, 'utf8').slice(-3000);
+                body += '### ' + f + '\n```\n' + txt + '\n```\n';
+              }
+            }
+            body += '\n[Workflow run](' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId + ')\n';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Nightly tier-multi-dc Jepsen failed (' + new Date().toISOString().slice(0, 10) + ')',
+              body,
+              labels: ['bug', 'testing', 'sprint-7']
+            });
