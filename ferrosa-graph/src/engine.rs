@@ -179,6 +179,110 @@ fn background_reconciliation_enabled(interval: std::time::Duration) -> bool {
     !interval.is_zero()
 }
 
+/// Reconciler poll cadence. Short enough that CI cluster bring-up
+/// (migrate finishes ~30s after node startup) doesn't have to wait
+/// long for adjacency registration; large enough that the scan loop
+/// is invisible cost in steady state.
+const ADJACENCY_RECONCILER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Background task: scan the local schema for graph.type=edge tables
+/// whose keyspace has no adjacency registered yet on this node, and
+/// route the registration through the engine's `GraphSchemaCoordinator`.
+///
+/// This closes the case where edge-table DDL lands in the local
+/// schema *after* the engine's startup scan ran (e.g. a follower node
+/// receiving Raft-replicated DDL after the leader applied it). Without
+/// this loop, that node never gets its `StorageEngine` notified about
+/// `system_graph_<ks>.adjacency` and rejects all derived adjacency
+/// mutations forwarded by the coordinator.
+fn spawn_adjacency_keyspace_reconciler(
+    schema: Arc<Schema>,
+    schema_coordinator: Arc<dyn GraphSchemaCoordinator>,
+    storage: Arc<StorageEngine>,
+    registered: Arc<Mutex<HashSet<String>>>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(ADJACENCY_RECONCILER_INTERVAL) => {}
+            }
+
+            let snap = schema.snapshot();
+            let edge_keyspaces: HashSet<String> = snap
+                .tables
+                .iter()
+                .filter(|(_, meta)| {
+                    meta.extensions.get("graph.type") == Some(&"edge".to_string())
+                })
+                .map(|((ks, _), _)| ks.clone())
+                .collect();
+
+            let pending: Vec<String> = {
+                let registered = registered.lock().unwrap();
+                edge_keyspaces
+                    .into_iter()
+                    .filter(|ks| !registered.contains(ks))
+                    .collect()
+            };
+            if pending.is_empty() {
+                continue;
+            }
+
+            for ks in pending {
+                let adj_ks = adjacency_keyspace_name(&ks);
+                let snap = schema.snapshot();
+                let adj_meta = adjacency_keyspace_metadata(&snap, &ks);
+                if !snap.keyspaces.contains_key(&adj_ks) {
+                    if let Err(e) = schema_coordinator.apply_create_keyspace(adj_meta) {
+                        tracing::warn!(
+                            keyspace = %adj_ks,
+                            error = %e,
+                            "adjacency reconciler: create_keyspace failed; will retry"
+                        );
+                        continue;
+                    }
+                }
+                let adj_table = adjacency_table_metadata(&ks);
+                let snap = schema.snapshot();
+                if !snap
+                    .tables
+                    .contains_key(&(adj_ks.clone(), "adjacency".to_string()))
+                {
+                    if let Err(e) = schema_coordinator.apply_create_table(adj_table.clone()) {
+                        tracing::warn!(
+                            keyspace = %adj_ks,
+                            error = %e,
+                            "adjacency reconciler: create_table failed; will retry"
+                        );
+                        continue;
+                    }
+                }
+                if let Err(e) = storage.register_table(adj_table.to_storage_schema()) {
+                    let msg = e.to_string();
+                    let already =
+                        msg.contains("already registered") || msg.contains("already exists");
+                    if !already {
+                        tracing::warn!(
+                            keyspace = %adj_ks,
+                            error = %e,
+                            "adjacency reconciler: storage.register_table failed; will retry"
+                        );
+                        continue;
+                    }
+                }
+                tracing::info!(
+                    keyspace = %ks,
+                    adjacency = %adj_ks,
+                    "adjacency reconciler: registered new edge keyspace"
+                );
+                registered.lock().unwrap().insert(ks);
+            }
+        }
+    })
+}
+
 /// Default per-connection subscription limit (FMEA F5).
 const DEFAULT_MAX_SUBSCRIPTIONS: usize = 8;
 
@@ -193,7 +297,7 @@ pub struct GraphEngine {
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
     reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
-    registered_adjacency_keyspaces: Mutex<HashSet<String>>,
+    registered_adjacency_keyspaces: Arc<Mutex<HashSet<String>>>,
     /// Routes adjacency-keyspace and adjacency-table DDL through the
     /// cluster's replication path. Defaults to a local-only coordinator
     /// (`LocalGraphSchemaCoordinator`) when `GraphEngine::new` is used.
@@ -382,6 +486,28 @@ impl GraphEngine {
             }
         }
 
+        let registered_adjacency_keyspaces = Arc::new(Mutex::new(edge_keyspaces));
+
+        // Background reconciler: every cluster node applies Raft-replicated
+        // DDL to its local schema independently, and the migrate step often
+        // lands *after* GraphEngine startup (in CI especially). Without this
+        // task, edge tables added post-startup never get an adjacency
+        // registration on the node that missed them at startup, and
+        // MutationForward writes to system_graph_<ks>.adjacency are rejected
+        // with "table not registered" — the bug captured by
+        // public_graph_write_round_trip_for_co_occurs_edges. The reconciler
+        // periodically scans the local schema for graph.type=edge tables
+        // and ensures adjacency is registered for each, idempotently.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            spawn_adjacency_keyspace_reconciler(
+                Arc::clone(&schema),
+                Arc::clone(&schema_coordinator),
+                Arc::clone(&storage),
+                Arc::clone(&registered_adjacency_keyspaces),
+                reconciliation_cancel.child_token(),
+            );
+        }
+
         Self {
             schema,
             storage,
@@ -390,7 +516,7 @@ impl GraphEngine {
             reconciliation_handles,
             reconciliation_cancel,
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
-            registered_adjacency_keyspaces: Mutex::new(edge_keyspaces),
+            registered_adjacency_keyspaces,
             schema_coordinator,
         }
     }

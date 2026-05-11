@@ -291,3 +291,82 @@ fn graph_engine_startup_routes_adjacency_ddl_through_coordinator() {
          GraphSchemaCoordinator; recorded events: {events:?}",
     );
 }
+
+/// Each cluster node applies Raft-replicated DDL to its local schema
+/// independently. If an edge-typed table is added to a node's schema
+/// *after* `GraphEngine::new_with_coordinator` ran (the common case in
+/// CI: nodes start before the migrate step), the engine's startup scan
+/// missed it. Pre-fix, no further trigger registered adjacency on that
+/// node until a graph query happened to hit it as coordinator. Post-fix,
+/// the engine reconciles its adjacency registrations against the
+/// current schema in the background, so every node ends up with the
+/// adjacency table registered shortly after the edge table appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_engine_registers_adjacency_for_edge_keyspaces_added_after_startup() {
+    let schema = Arc::new(test_schema());
+    // Engine starts with an empty schema — no edge tables visible yet.
+    let dir = tempdir().unwrap();
+    let storage = Arc::new(test_storage_engine(dir.path()));
+    let recorder = Arc::new(RecordingCoordinator::new(Arc::clone(&schema)));
+
+    let _engine = GraphEngine::new_with_coordinator(
+        Arc::clone(&schema),
+        Arc::clone(&storage),
+        Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::direct(
+            Arc::clone(&storage),
+        ))),
+        GraphEngineConfig::default(),
+        Duration::from_secs(60),
+        recorder.clone(),
+    );
+
+    // Startup scan recorded nothing — no edge tables existed yet.
+    assert!(
+        recorder.events().is_empty(),
+        "engine startup should not register adjacency before any edge table \
+         exists; recorded: {:?}",
+        recorder.events()
+    );
+
+    // Simulate Raft-replicated DDL: an edge-typed table appears in the
+    // local schema after the engine has already started.
+    schema
+        .create_keyspace_internal(KeyspaceMetadata {
+            name: "agent_memory".to_string(),
+            durable_writes: true,
+            replication: simple_strategy_rf1(),
+        })
+        .unwrap();
+    schema
+        .create_table_internal(build_edge_table_metadata(
+            "agent_memory",
+            "typed_edges",
+            "TYPED_EDGE",
+        ))
+        .unwrap();
+
+    // The engine should pick it up within a bounded interval. Poll up to
+    // 5 seconds — generous so flaky CI runners don't false-fail.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = recorder.events();
+        let saw_keyspace = events.iter().any(
+            |e| matches!(e, DdlEvent::CreateKeyspace(name) if name == "system_graph_agent_memory"),
+        );
+        let saw_table = events.iter().any(|e| matches!(
+            e,
+            DdlEvent::CreateTable(ks, tbl) if ks == "system_graph_agent_memory" && tbl == "adjacency"
+        ));
+        if saw_keyspace && saw_table {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "engine should have registered adjacency for agent_memory after \
+                 the edge table appeared in schema, but didn't within 5s; \
+                 recorded events: {events:?}",
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
