@@ -3565,7 +3565,7 @@ mod tests {
         );
         assert_eq!(
             auth_rows[0].replication.get("class"),
-            Some(&"NetworkTopologyStrategy".to_string()),
+            Some(&"org.apache.cassandra.locator.NetworkTopologyStrategy".to_string()),
             "cqlsh-facing view of system_auth must advertise \
              NetworkTopologyStrategy"
         );

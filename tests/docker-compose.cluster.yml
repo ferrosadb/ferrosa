@@ -36,9 +36,12 @@ services:
     depends_on:
       volume-permissions:
         condition: service_completed_successfully
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    # No host port mappings — ferrosa nodes reach rustfs via the
+    # compose-internal docker network only.  Host 9000/9001 may be in use
+    # by other dev tools (e.g. local minio).
+    expose:
+      - "9000"
+      - "9001"
     environment:
       RUSTFS_VOLUMES: /data/rustfs0
       RUSTFS_ADDRESS: "0.0.0.0:9000"

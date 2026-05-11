@@ -202,10 +202,30 @@ impl<R: ReadAt> SSTableReader<R> {
     /// Read all partitions from this SSTable in storage order.
     ///
     /// Scans the Data.db file sequentially from position 0, reading each
-    /// partition until EOF. Used by the compaction executor to merge
-    /// multiple SSTables.
+    /// partition until EOF. **Materializes the entire SSTable into memory.**
+    ///
+    /// Prefer [`Self::partitions_iter`] for compaction and other large-scan
+    /// callers — full materialization here was OOM-ing the compaction
+    /// executor on tombstone-heavy workloads (`cql_timeseries2`, IoT TTL
+    /// patterns).  See `specs/in-process/streaming-compaction.md`.
     pub fn read_all_partitions(&self) -> Result<Vec<crate::types::Partition>> {
         self.read_partitions_limited(usize::MAX)
+    }
+
+    /// Stream partitions from this SSTable in storage (token) order, one at
+    /// a time, without materializing the whole file into memory.
+    ///
+    /// The returned iterator borrows this `SSTableReader` for its lifetime
+    /// and decompresses the Data.db once up-front (for compressed
+    /// SSTables) or reads directly from the underlying [`ReadAt`] (for
+    /// uncompressed). Each call to [`PartitionIter::next_partition`] yields
+    /// at most one partition; the iterator returns `Ok(None)` at EOF.
+    ///
+    /// Memory: `O(decompressed_data_size)` for compressed SSTables (single
+    /// pre-decompressed buffer held for the iterator's lifetime), `O(1)`
+    /// for uncompressed.  Independent of partition count.
+    pub fn partitions_iter(&self) -> Result<PartitionIter<'_, R>> {
+        PartitionIter::new(self)
     }
 
     /// Scan partitions sequentially, stopping once `limit` partitions have
@@ -249,6 +269,55 @@ impl<R: ReadAt> SSTableReader<R> {
             }
         }
         Ok(partitions)
+    }
+}
+
+/// Streaming partition iterator over an SSTable.
+///
+/// Returned by [`SSTableReader::partitions_iter`]. Yields partitions in
+/// storage (token) order, one at a time. Decompression happens once at
+/// construction time for compressed SSTables; the decompressed buffer is
+/// held for the iterator's lifetime and freed on drop.
+///
+/// Memory cost is constant in the number of partitions — only the
+/// currently-yielded `Partition` is materialized.
+pub struct PartitionIter<'a, R: ReadAt> {
+    sst: &'a SSTableReader<R>,
+    pos: u64,
+    /// Decompressed Data.db for compressed SSTables. `None` for
+    /// uncompressed, where the iterator reads directly from `sst.data`.
+    decompressed: Option<Vec<u8>>,
+}
+
+impl<'a, R: ReadAt> PartitionIter<'a, R> {
+    fn new(sst: &'a SSTableReader<R>) -> Result<Self> {
+        let decompressed = match &sst.compression_info {
+            Some(ci) => Some(decompress_data(&sst.data, ci)?),
+            None => None,
+        };
+        Ok(Self {
+            sst,
+            pos: 0,
+            decompressed,
+        })
+    }
+
+    /// Yield the next partition in storage order. Returns `Ok(None)` when
+    /// the iterator has reached EOF.
+    pub fn next_partition(&mut self) -> Result<Option<crate::types::Partition>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition()?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
     }
 }
 
@@ -615,5 +684,53 @@ mod tests {
 
         // Verify compression_info is None
         assert!(reader.compression_info().is_none());
+    }
+
+    /// Parity: streaming `partitions_iter()` yields the same sequence as
+    /// the materializing `read_all_partitions()`.  This is the regression
+    /// guard for the streaming-compaction refactor.
+    #[test]
+    fn partitions_iter_matches_read_all_partitions() {
+        let header = test_header();
+        let dks: Vec<_> = (0..7u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        let materialized = reader.read_all_partitions().expect("read_all");
+        let mut streamed = Vec::new();
+        let mut iter = reader.partitions_iter().expect("partitions_iter");
+        while let Some(p) = iter.next_partition().expect("next") {
+            streamed.push(p);
+        }
+
+        assert_eq!(materialized.len(), streamed.len(), "same partition count");
+        for (m, s) in materialized.iter().zip(streamed.iter()) {
+            assert_eq!(m.key, s.key);
+            assert_eq!(m.rows.len(), s.rows.len());
+        }
+        // EOF stays at EOF
+        assert!(iter.next_partition().unwrap().is_none());
+        assert!(iter.next_partition().unwrap().is_none());
     }
 }
