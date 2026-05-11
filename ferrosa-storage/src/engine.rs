@@ -1899,7 +1899,10 @@ impl StorageEngine {
         row: Row,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
-        let _span = tracing::info_span!(
+        // Per-write span emitted at DEBUG level so it is free at the
+        // default INFO subscriber filter — every span allocation was
+        // measurable on a 50k ops/s workload.
+        let _span = tracing::debug_span!(
             "storage.write",
             table = %table_id,
         )

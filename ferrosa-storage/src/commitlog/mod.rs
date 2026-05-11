@@ -293,7 +293,8 @@ impl CommitLog {
     /// 3. If the segment is full, rotate and retry.
     /// 4. Write the entry, update dirty tracking, notify sync strategy.
     pub fn append(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
-        let _span = tracing::info_span!(
+        // DEBUG-level span so it costs nothing at the default INFO filter.
+        let _span = tracing::debug_span!(
             "commitlog.write",
             table = %mutation.table,
             keyspace = %mutation.keyspace,
