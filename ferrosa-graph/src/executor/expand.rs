@@ -14,7 +14,7 @@ use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_schema::{Schema, VirtualTableRegistry};
-use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 use ferrosa_storage::{Mutation, TableId};
 
 use crate::adjacency::observer::derive_adjacency_mutations;
@@ -702,53 +702,97 @@ async fn execute_expand(
         );
     }
 
-    let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
-    let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
-    let anchor_partitions = if let Some(meta) = anchor_meta.as_ref() {
-        if let Some((key, _clustering)) =
-            build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
-        {
-            let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
-            write_path
-                .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
-                .await?
-                .into_iter()
-                .collect()
+    let (mut current_states, traversal_hops): (Vec<ExpandState>, &[Hop]) = if let Some(states) =
+        try_edge_anchored_initial_states(
+            write_path,
+            anchor,
+            hops,
+            optional_hops,
+            schema,
+            &mut stats,
+        )
+        .await?
+    {
+        check_timeout(start, config.query_timeout)?;
+        (states, &hops[1..])
+    } else {
+        let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
+        let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
+        let anchor_partitions = if let Some(meta) = anchor_meta.as_ref() {
+            if let Some((key, _clustering)) =
+                build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
+            {
+                let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
+                write_path
+                    .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
+                    .await?
+                    .into_iter()
+                    .collect()
+            } else {
+                write_path.range_read(&anchor_table_id).await?
+            }
         } else {
             write_path.range_read(&anchor_table_id).await?
-        }
-    } else {
-        write_path.range_read(&anchor_table_id).await?
-    };
-    stats.vertices_read += anchor_partitions.len();
-    check_timeout(start, config.query_timeout)?;
+        };
+        stats.vertices_read += anchor_partitions.len();
+        check_timeout(start, config.query_timeout)?;
 
-    // Resolve column names from schema for property mapping.
-    let anchor_col_names =
-        column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
+        // Resolve column names from schema for property mapping.
+        let anchor_col_names =
+            column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
 
-    // Apply WHERE filters to anchor partitions using the expression evaluator.
-    // Skip partitions that are fully tombstoned (no live cells in any row
-    // and no live static row) — these represent deleted vertices whose
-    // tombstones have not yet been purged by compaction.
-    let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-    let mut current_states: Vec<ExpandState> = Vec::with_capacity(anchor_partitions.len());
-    for partition in &anchor_partitions {
-        if is_partition_dead(partition) {
-            continue;
-        }
+        // Apply WHERE filters to anchor partitions using the expression evaluator.
+        // Skip partitions that are fully tombstoned (no live cells in any row
+        // and no live static row) — these represent deleted vertices whose
+        // tombstones have not yet been purged by compaction.
+        let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
+        let mut states: Vec<ExpandState> = Vec::with_capacity(anchor_partitions.len());
+        for partition in &anchor_partitions {
+            if is_partition_dead(partition) {
+                continue;
+            }
 
-        if let Some(meta) = anchor_meta.as_ref() {
-            for row in &partition.rows {
-                let row_json = row_to_json(meta, partition, row);
-                if !prop_map_passes(anchor_var, &anchor.props, &row_json)? {
-                    continue;
+            if let Some(meta) = anchor_meta.as_ref() {
+                for row in &partition.rows {
+                    let row_json = row_to_json(meta, partition, row);
+                    if !prop_map_passes(anchor_var, &anchor.props, &row_json)? {
+                        continue;
+                    }
+
+                    let mut bindings = HashMap::new();
+                    bindings.insert(anchor_var.to_string(), row_json);
+                    let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)
+                        .unwrap_or_else(|| partition.key.clone());
+
+                    let mut passes = true;
+                    for filter in &anchor.filters {
+                        if !graph_filter_passes(
+                            filter,
+                            write_path,
+                            keyspace,
+                            schema,
+                            &bindings,
+                            anchor_var,
+                            &current_key,
+                        )
+                        .await?
+                        {
+                            passes = false;
+                            break;
+                        }
+                    }
+                    if passes {
+                        states.push(ExpandState {
+                            current_key,
+                            bindings,
+                        });
+                    }
                 }
-
+            } else {
+                let hex_id = hex::encode(partition.key.key.as_bytes());
+                let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
                 let mut bindings = HashMap::new();
                 bindings.insert(anchor_var.to_string(), row_json);
-                let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)
-                    .unwrap_or_else(|| partition.key.clone());
 
                 let mut passes = true;
                 for filter in &anchor.filters {
@@ -759,7 +803,7 @@ async fn execute_expand(
                         schema,
                         &bindings,
                         anchor_var,
-                        &current_key,
+                        &partition.key,
                     )
                     .await?
                     {
@@ -768,49 +812,21 @@ async fn execute_expand(
                     }
                 }
                 if passes {
-                    current_states.push(ExpandState {
-                        current_key,
+                    states.push(ExpandState {
+                        current_key: partition.key.clone(),
                         bindings,
                     });
                 }
             }
-        } else {
-            let hex_id = hex::encode(partition.key.key.as_bytes());
-            let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
-            let mut bindings = HashMap::new();
-            bindings.insert(anchor_var.to_string(), row_json);
-
-            let mut passes = true;
-            for filter in &anchor.filters {
-                if !graph_filter_passes(
-                    filter,
-                    write_path,
-                    keyspace,
-                    schema,
-                    &bindings,
-                    anchor_var,
-                    &partition.key,
-                )
-                .await?
-                {
-                    passes = false;
-                    break;
-                }
-            }
-            if passes {
-                current_states.push(ExpandState {
-                    current_key: partition.key.clone(),
-                    bindings,
-                });
-            }
         }
-    }
+        (states, hops)
+    };
 
     // Step 2: For each hop, traverse adjacency index.
     let adj_ks = adjacency_keyspace_name(keyspace);
     let adj_table_id = TableId::new(&adj_ks, "adjacency");
 
-    for hop in hops {
+    for hop in traversal_hops {
         check_timeout(start, config.query_timeout)?;
 
         let mut next_states = Vec::new();
@@ -878,6 +894,9 @@ async fn execute_expand(
                             if let Some(value) = state.bindings.get(var_name) {
                                 target_bindings.insert(var_name.clone(), value.clone());
                             }
+                        }
+                        if let Some(edge_match) = edge_match.as_ref() {
+                            target_bindings.insert("_edge".to_string(), edge_match.json.clone());
                         }
 
                         let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
@@ -1221,6 +1240,9 @@ async fn execute_optional_hops(
                             target_bindings.insert(var_name.clone(), value.clone());
                         }
                     }
+                    if let Some(edge_match) = edge_match.as_ref() {
+                        target_bindings.insert("_edge".to_string(), edge_match.json.clone());
+                    }
                     let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
                         hop.vertex_table
                             .as_ref()
@@ -1303,6 +1325,192 @@ async fn execute_optional_hops(
     Ok(current_states)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn try_edge_anchored_initial_states(
+    write_path: &WritePath,
+    anchor: &Anchor,
+    hops: &[Hop],
+    optional_hops: &[Hop],
+    schema: Option<&Schema>,
+    stats: &mut QueryStats,
+) -> Result<Option<Vec<ExpandState>>> {
+    let Some(hop) = hops.first() else {
+        return Ok(None);
+    };
+    let Some(edge_table) = hop.edge_table.as_ref() else {
+        return Ok(None);
+    };
+    let Some(edge_meta) = table_metadata_for(schema, &edge_table.keyspace, &edge_table.table)
+    else {
+        return Ok(None);
+    };
+    let Some(source_col) = edge_meta.extensions.get("graph.source") else {
+        return Ok(None);
+    };
+    let Some(target_col) = edge_meta.extensions.get("graph.target") else {
+        return Ok(None);
+    };
+
+    // Keep this fast path deliberately narrow: it replaces the pathological
+    // unanchored vertex-table scan for `MATCH (a)-[r {prop}]->(b)` with a
+    // single relationship-table scan filtered by edge properties. Anchored
+    // node patterns and anchor WHERE filters still use the general executor.
+    if !anchor.props.is_empty()
+        || !anchor.filters.is_empty()
+        || hop.prop_filters.is_empty()
+        || matches!(hop.direction, Direction::Both)
+        || !optional_hops.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let edge_tid = TableId::new(&edge_table.keyspace, &edge_table.table);
+    let strategy = graph_replication_strategy(schema, &edge_table.keyspace)?;
+    let edge_partitions: Vec<Partition> = if let Some((key, _clustering)) =
+        build_direct_lookup_shape(
+            &edge_meta,
+            &HashMap::new(),
+            &hop.prop_filters,
+            &HashMap::new(),
+        )? {
+        write_path
+            .pk_read(&edge_tid, &key, ConsistencyLevel::One, &strategy)
+            .await?
+            .into_iter()
+            .collect()
+    } else {
+        write_path.range_read(&edge_tid).await?
+    };
+    let source_vertex_tid = TableId::new(&anchor.table.keyspace, &anchor.table.table);
+    let source_vertex_meta =
+        table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
+    let target_vertex = hop.vertex_table.as_ref();
+    let target_vertex_tid = target_vertex.map(|vt| TableId::new(&vt.keyspace, &vt.table));
+    let target_vertex_meta =
+        target_vertex.and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
+
+    let mut states = Vec::new();
+    for partition in edge_partitions {
+        if is_partition_dead(&partition) {
+            continue;
+        }
+        stats.edges_read += partition.rows.len();
+        for row in &partition.rows {
+            let edge_json = row_to_json(&edge_meta, &partition, row);
+            let edge_match = MatchedTableRow {
+                key: partition.key.clone(),
+                clustering: row.clustering.clone(),
+                json: edge_json.clone(),
+            };
+            if !edge_row_passes_filters(Some(&edge_match), &hop.prop_filters) {
+                continue;
+            }
+
+            let Some(raw_source_id) = extract_column_bytes_from_row(
+                &edge_meta,
+                partition.key.key.as_bytes(),
+                row,
+                source_col,
+            ) else {
+                continue;
+            };
+            let Some(raw_target_id) = extract_column_bytes_from_row(
+                &edge_meta,
+                partition.key.key.as_bytes(),
+                row,
+                target_col,
+            ) else {
+                continue;
+            };
+            let (source_id, target_id) = match hop.direction {
+                Direction::Out => (raw_source_id, raw_target_id),
+                Direction::In => (raw_target_id, raw_source_id),
+                Direction::Both => unreachable!("Both is rejected above"),
+            };
+
+            let mut edge_bindings = HashMap::new();
+            edge_bindings.insert("_edge".to_string(), edge_json.clone());
+
+            let source_json = if let Some(meta) = source_vertex_meta.as_ref() {
+                find_vertex_match(
+                    write_path,
+                    &source_vertex_tid,
+                    meta,
+                    &edge_bindings,
+                    &source_id,
+                    anchor.props.as_slice(),
+                    anchor.var.as_deref().unwrap_or("_anchor"),
+                    schema,
+                )
+                .await?
+                .map(|matched| matched.json)
+            } else {
+                None
+            };
+            if source_vertex_meta.is_some() && source_json.is_none() {
+                continue;
+            }
+
+            let target_json = if let (Some(vertex_tid), Some(meta)) =
+                (target_vertex_tid.as_ref(), target_vertex_meta.as_ref())
+            {
+                find_vertex_match(
+                    write_path,
+                    vertex_tid,
+                    meta,
+                    &edge_bindings,
+                    &target_id,
+                    hop.target_props.as_slice(),
+                    hop.var.as_deref().unwrap_or("_hop"),
+                    schema,
+                )
+                .await?
+                .map(|matched| matched.json)
+            } else {
+                None
+            };
+            if target_vertex_meta.is_some() && target_json.is_none() {
+                continue;
+            }
+
+            let mut bindings = HashMap::new();
+            if let Some(anchor_var) = &anchor.var {
+                bindings.insert(
+                    anchor_var.clone(),
+                    source_json
+                        .unwrap_or_else(|| serde_json::Value::String(hex::encode(&source_id))),
+                );
+            }
+            if let Some(target_var) = &hop.var {
+                bindings.insert(
+                    target_var.clone(),
+                    target_json
+                        .unwrap_or_else(|| serde_json::Value::String(hex::encode(&target_id))),
+                );
+            }
+            if let Some(rel_var) = &hop.rel_var {
+                bindings.insert(
+                    rel_var.clone(),
+                    edge_binding_json(
+                        row,
+                        Some(&edge_match),
+                        hop.edge_label.as_deref(),
+                        &partition.key,
+                        &target_id,
+                    ),
+                );
+            }
+
+            states.push(ExpandState {
+                current_key: DecoratedKey::new(PartitionKey::new(target_id)),
+                bindings,
+            });
+        }
+    }
+
+    Ok(Some(states))
+}
+
 /// Check whether an edge row passes all property filters.
 ///
 /// Looks up the edge row in the given edge partition by matching the
@@ -1349,6 +1557,14 @@ fn edge_binding_json(
     }
 
     if let Some(edge_match) = edge_match {
+        map.insert(
+            "__ferrosa_key".to_string(),
+            serde_json::Value::String(hex::encode(edge_match.key.key.as_bytes())),
+        );
+        map.insert(
+            "__ferrosa_clustering".to_string(),
+            serde_json::Value::String(hex::encode(&edge_match.clustering)),
+        );
         if let serde_json::Value::Object(obj) = &edge_match.json {
             map.extend(obj.clone());
         }
@@ -1708,7 +1924,7 @@ async fn find_vertex_match(
     schema: Option<&Schema>,
 ) -> Result<Option<MatchedTableRow>> {
     if let Some((key, clustering)) =
-        build_direct_lookup_shape(meta, bindings, target_props, &HashMap::new())?
+        build_neighbor_vertex_lookup_shape(meta, bindings, target_props, neighbor_id)?
     {
         let strategy = graph_replication_strategy(schema, &table_id.keyspace)?;
         if let Some(partition) = write_path
@@ -1759,6 +1975,24 @@ async fn find_vertex_match(
     }
 
     Ok(None)
+}
+
+fn build_neighbor_vertex_lookup_shape(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    bindings: &HashMap<String, serde_json::Value>,
+    target_props: &[(String, Expr)],
+    neighbor_id: &[u8],
+) -> Result<Option<(DecoratedKey, Vec<u8>)>> {
+    let mut direct_components = HashMap::new();
+    if let Some((column_name, _)) = meta
+        .clustering_key
+        .iter()
+        .find(|(name, _)| name == "id" || name.ends_with("_id") || name.ends_with("_uuid"))
+    {
+        direct_components.insert(column_name.clone(), neighbor_id.to_vec());
+    }
+
+    build_direct_lookup_shape(meta, bindings, target_props, &direct_components)
 }
 
 fn build_direct_lookup_shape(
@@ -3197,15 +3431,45 @@ async fn execute_set(
             };
 
             if let Some(hex_id) = hex_id {
-                let key_bytes = hex::decode(hex_id)
-                    .map_err(|e| GraphError::Internal(format!("invalid hex vertex ID: {e}")))?;
-                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-
                 let table_name = variable_tables
                     .get(col_name)
                     .map(String::as_str)
                     .unwrap_or(col_name);
                 let table_id = TableId::new(keyspace, table_name);
+                let table_meta = table_metadata_for(schema, keyspace, table_name);
+                let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
+                    meta.extensions
+                        .get("graph.type")
+                        .is_some_and(|graph_type| graph_type == "edge")
+                });
+                let key_hex = if is_edge_table {
+                    row_values
+                        .get(col_idx)
+                        .and_then(|value| value.as_object())
+                        .and_then(|map| map.get("__ferrosa_key"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(hex_id)
+                } else {
+                    hex_id
+                };
+                let key_bytes = hex::decode(key_hex)
+                    .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
+                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+                let clustering = if is_edge_table {
+                    row_values
+                        .get(col_idx)
+                        .and_then(|value| value.as_object())
+                        .and_then(|map| map.get("__ferrosa_clustering"))
+                        .and_then(|value| value.as_str())
+                        .map(hex::decode)
+                        .transpose()
+                        .map_err(|e| {
+                            GraphError::Internal(format!("invalid hex storage clustering: {e}"))
+                        })?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
 
                 let mut cells = Vec::with_capacity(matching_assignments.len());
                 for (_var, prop, val) in matching_assignments {
@@ -3236,7 +3500,7 @@ async fn execute_set(
                 }
 
                 let update_row = Row {
-                    clustering: vec![],
+                    clustering,
                     cells,
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::NONE,
@@ -3324,10 +3588,6 @@ async fn execute_delete(
             };
 
             if let Some(hex_id) = hex_id {
-                let key_bytes = hex::decode(&hex_id)
-                    .map_err(|e| GraphError::Internal(format!("invalid hex vertex ID: {e}")))?;
-                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-
                 // Use the resolved table name (e.g. "Person") rather than
                 // the Cypher variable name (e.g. "n") so the tombstone is
                 // written to the same table that the vertex lives in.
@@ -3336,10 +3596,44 @@ async fn execute_delete(
                     .map(String::as_str)
                     .unwrap_or(col_name);
                 let table_id = TableId::new(keyspace, table_name);
+                let table_meta = table_metadata_for(schema, keyspace, table_name);
+                let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
+                    meta.extensions
+                        .get("graph.type")
+                        .is_some_and(|graph_type| graph_type == "edge")
+                });
+                let key_hex = if is_edge_table {
+                    row_values
+                        .get(col_idx)
+                        .and_then(|value| value.as_object())
+                        .and_then(|map| map.get("__ferrosa_key"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(hex_id.as_str())
+                } else {
+                    hex_id.as_str()
+                };
+                let key_bytes = hex::decode(key_hex)
+                    .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
+                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+                let clustering = if is_edge_table {
+                    row_values
+                        .get(col_idx)
+                        .and_then(|value| value.as_object())
+                        .and_then(|map| map.get("__ferrosa_clustering"))
+                        .and_then(|value| value.as_str())
+                        .map(hex::decode)
+                        .transpose()
+                        .map_err(|e| {
+                            GraphError::Internal(format!("invalid hex storage clustering: {e}"))
+                        })?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
 
                 // Write a row-level tombstone.
                 let tombstone_row = Row {
-                    clustering: vec![],
+                    clustering,
                     cells: vec![],
                     deletion: DeletionTime::new(timestamp, local_deletion_time),
                     primary_key_liveness: LivenessInfo::NONE,
@@ -4356,6 +4650,37 @@ mod tests {
             build_direct_lookup_shape(&meta, &bindings, &props, &HashMap::new())
                 .unwrap()
                 .expect("scoped bindings should produce a direct vertex lookup");
+
+        assert_eq!(
+            key.key.as_bytes(),
+            encode_partition_components(&[
+                tenant_id.as_bytes().to_vec(),
+                session_id.as_bytes().to_vec(),
+            ])
+        );
+        assert_eq!(clustering, entity_id.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn build_neighbor_vertex_lookup_shape_uses_edge_scope_and_neighbor_id() {
+        let meta = scoped_entity_meta();
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let entity_id = uuid::Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "_edge".to_string(),
+            serde_json::json!({
+                "tenant_id": tenant_id.to_string(),
+                "session_id": session_id.to_string()
+            }),
+        );
+
+        let (key, clustering) =
+            build_neighbor_vertex_lookup_shape(&meta, &bindings, &[], entity_id.as_bytes())
+                .unwrap()
+                .expect("edge scope plus neighbor id should produce a direct vertex lookup");
 
         assert_eq!(
             key.key.as_bytes(),

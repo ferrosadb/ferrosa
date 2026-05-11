@@ -108,33 +108,36 @@ impl Drop for CompactionExecutor {
 
 impl CompactionExecutor {
     /// Execute a single compaction task by merging input SSTables into one output.
+    ///
+    /// **Streaming compaction**: this function uses a k-way streaming merge
+    /// across the input SSTables instead of materializing them all into
+    /// `BTreeMap<key, Vec<Partition>>` + `Vec<merged>` (which OOM'd on
+    /// tombstone-heavy workloads with wide partitions — see
+    /// `cql_timeseries2` and IoT TTL patterns).
+    ///
+    /// Memory cost is now O(N_input_sstables × 1 partition) at any moment,
+    /// independent of the total dataset size. The output's serialization
+    /// header is built from the inputs' headers (bounded compute) rather
+    /// than from a full data scan.
     fn execute_task(task: &CompactionTask) -> std::result::Result<SSTableMetadata, String> {
-        use crate::flush::{self, FileFlushTarget, FlushTarget};
+        use crate::flush::{FileFlushTarget, FlushTarget};
         use crate::merge;
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
         use ferrosa_sstable::writer::SSTableWriter;
         use ferrosa_sstable::WriteOptions;
-        use std::collections::BTreeMap;
+        use std::collections::BinaryHeap;
 
         tracing::info!(
             table_id = %task.table_id,
             inputs = task.inputs.len(),
-            "compaction: starting task"
+            "compaction: starting streaming task"
         );
 
-        // 1. Read all partitions from each input SSTable.
-        //
-        // CRITICAL: If ANY input SSTable fails to read, the entire compaction
-        // must abort. Previously, unreadable SSTables were silently skipped
-        // while the task succeeded. This caused data loss because
-        // swap_compacted_sstables removes ALL input SSTables (including the
-        // skipped unreadable ones) and replaces them with the output — which
-        // only contains data from the successfully-read inputs.
-        let mut all_partitions: BTreeMap<Vec<u8>, Vec<ferrosa_sstable::types::Partition>> =
-            BTreeMap::new();
-        let mut total_input_rows: usize = 0;
-
+        // 1. Open every input SSTable.  ANY missing/corrupt input aborts the
+        //    whole compaction — silent skipping previously caused data loss
+        //    because swap_compacted_sstables removes all inputs.
+        let mut readers: Vec<SSTableReader<FileReadAt>> = Vec::with_capacity(task.inputs.len());
         for input in &task.inputs {
             let gen = &input.id;
             let dir = &input.path;
@@ -145,7 +148,7 @@ impl CompactionExecutor {
                 %gen,
                 data_file_size,
                 path = ?data_path,
-                "compaction: reading input SSTable"
+                "compaction: opening input SSTable"
             );
             match std::fs::metadata(&data_path) {
                 Ok(meta) if meta.len() == 0 => {
@@ -185,48 +188,164 @@ impl CompactionExecutor {
             })
             .map_err(|e| format!("aborting compaction: SSTable {gen} corrupt: {e}"))?;
 
-            let partitions = reader
-                .read_all_partitions()
-                .map_err(|e| format!("aborting compaction: SSTable {gen} read failed: {e}"))?;
+            readers.push(reader);
+        }
 
-            let input_row_count: usize = partitions.iter().map(|p| p.rows.len()).sum();
-            total_input_rows += input_row_count;
-            tracing::info!(
-                %gen,
-                partitions = partitions.len(),
-                rows = input_row_count,
-                "compaction: input SSTable stats"
+        if readers.is_empty() {
+            return Err("no input SSTables to compact".into());
+        }
+
+        // 2. Build the output serialization header by combining the inputs'
+        //    own headers.  Each input header records the min/max ts and
+        //    ldt observed in that SSTable; the union is correct for the
+        //    output (it's a strict superset of what's actually written
+        //    because deletions can drop cells, but conservative is fine —
+        //    drivers don't depend on it being tight).  Picking ferrosa's
+        //    column model from the schema mirrors the legacy
+        //    `flush::build_serialization_header` behaviour.
+        let header = combine_input_headers(&task.schema, &readers);
+        let header_min_ts = header.min_timestamp;
+        let header_max_ts = header.max_timestamp;
+        tracing::info!(
+            min_ts = header_min_ts,
+            max_ts = header_max_ts,
+            "compaction: combined output serialization header"
+        );
+
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+
+        // 3. K-way streaming merge across the input partition iterators.
+        //
+        // Min-heap (custom `Ord` flips the comparison) yields the
+        // smallest partition key.  For each minimum key we drain every
+        // reader currently exposing that key (replenishing as we go),
+        // run `merge::merge_partitions`, write the result, and free it.
+        let mut iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, FileReadAt>> =
+            Vec::with_capacity(readers.len());
+        for r in &readers {
+            iters.push(
+                r.partitions_iter()
+                    .map_err(|e| format!("partitions_iter: {e}"))?,
             );
+        }
 
-            for p in partitions {
-                all_partitions
-                    .entry(p.key.key.as_bytes().to_vec())
-                    .or_default()
-                    .push(p);
+        // Heap entry: the Partition is moved into the heap (no key
+        // clones), with a custom `Ord` that sorts by the partition's
+        // own DecoratedKey in token-comparable order.  This eliminates
+        // the O(N) key-allocation pressure the previous (key.clone(),
+        // idx) design caused.
+        struct HeapEntry {
+            partition: ferrosa_sstable::types::Partition,
+            reader_idx: usize,
+        }
+        impl PartialEq for HeapEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.partition.key == other.partition.key
+            }
+        }
+        impl Eq for HeapEntry {}
+        impl PartialOrd for HeapEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for HeapEntry {
+            // BinaryHeap is a max-heap; we want a min-heap, so flip the
+            // comparison (smaller DecoratedKey "wins" the pop).
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.partition.key.cmp(&self.partition.key)
             }
         }
 
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(iters.len());
+        for (idx, it) in iters.iter_mut().enumerate() {
+            if let Some(partition) = it.next_partition().map_err(|e| format!("iter init: {e}"))? {
+                heap.push(HeapEntry {
+                    partition,
+                    reader_idx: idx,
+                });
+            }
+        }
+
+        let mut total_input_rows: usize = 0;
+        let mut merged_partition_count: u64 = 0;
+        let mut merged_row_count: usize = 0;
+        // Track min/max token across all merged output partitions so the
+        // emitted SSTableMetadata can be filled without a second scan.
+        let mut min_token: i64 = i64::MAX;
+        let mut max_token: i64 = i64::MIN;
+
+        while let Some(top) = heap.pop() {
+            // Drain all heap entries that share this key (multiple inputs
+            // wrote the same partition).
+            let HeapEntry {
+                partition: first_partition,
+                reader_idx: first_idx,
+            } = top;
+            // We need to compare future heap tops against this key to
+            // collect duplicates. The partition itself moves into the
+            // group; cheap to compare via a reference into `group`
+            // afterward.
+            total_input_rows += first_partition.rows.len();
+            let mut group: Vec<ferrosa_sstable::types::Partition> = Vec::with_capacity(1);
+            group.push(first_partition);
+            // Advance reader first_idx.
+            if let Some(next) = iters[first_idx]
+                .next_partition()
+                .map_err(|e| format!("iter advance: {e}"))?
+            {
+                heap.push(HeapEntry {
+                    partition: next,
+                    reader_idx: first_idx,
+                });
+            }
+            // Drain other readers sitting at the same key.
+            while heap.peek().map(|h| h.partition.key == group[0].key) == Some(true) {
+                let HeapEntry {
+                    partition,
+                    reader_idx,
+                } = heap.pop().expect("peek implies pop");
+                total_input_rows += partition.rows.len();
+                group.push(partition);
+                if let Some(next) = iters[reader_idx]
+                    .next_partition()
+                    .map_err(|e| format!("iter advance: {e}"))?
+                {
+                    heap.push(HeapEntry {
+                        partition: next,
+                        reader_idx,
+                    });
+                }
+            }
+
+            let merged = merge::merge_partitions(group);
+            merged_row_count += merged.rows.len();
+            merged_partition_count += 1;
+            let token = merged.key.token.0;
+            if token < min_token {
+                min_token = token;
+            }
+            if token > max_token {
+                max_token = token;
+            }
+            writer
+                .add_partition(&merged)
+                .map_err(|e| format!("write partition: {e}"))?;
+        }
+
+        if merged_partition_count == 0 {
+            return Err("no partitions to compact".into());
+        }
+
         tracing::info!(
-            unique_keys = all_partitions.len(),
-            total_input_rows,
-            "compaction: total input summary"
-        );
-
-        // 2. Merge partitions with the same key.
-        let mut merged: Vec<ferrosa_sstable::types::Partition> = all_partitions
-            .into_values()
-            .map(merge::merge_partitions)
-            .collect();
-
-        // 3. Sort by key (SSTableWriter requires token order).
-        merged.sort_by(|a, b| a.key.cmp(&b.key));
-
-        let merged_row_count: usize = merged.iter().map(|p| p.rows.len()).sum();
-        tracing::info!(
-            partitions = merged.len(),
+            partitions = merged_partition_count,
             merged_row_count,
             total_input_rows,
-            "compaction: after merge"
+            "compaction: streaming merge complete"
         );
         if merged_row_count < total_input_rows {
             tracing::warn!(
@@ -237,70 +356,56 @@ impl CompactionExecutor {
             );
         }
 
-        if merged.is_empty() {
-            return Err("no partitions to compact".into());
-        }
-
-        // 4. Build serialization header and write output SSTable.
-        let header = flush::build_serialization_header(&task.schema, &merged);
-        tracing::info!(
-            min_ts = header.min_timestamp,
-            max_ts = header.max_timestamp,
-            "compaction: serialization header"
-        );
-        let header_min_ts = header.min_timestamp;
-        let header_max_ts = header.max_timestamp;
-        let options = WriteOptions {
-            compression: None,
-            ..WriteOptions::default()
-        };
-        let mut writer = SSTableWriter::new(options, header);
-        for p in &merged {
-            writer
-                .add_partition(p)
-                .map_err(|e| format!("write partition: {e}"))?;
-        }
         let output = writer.finish().map_err(|e| format!("finish: {e}"))?;
 
-        // 5. Write to output directory via FileFlushTarget.
+        // 4. Write to output directory via FileFlushTarget.
         let flush_target = FileFlushTarget::new_starting_at(task.output_dir.clone())
             .map_err(|e| format!("flush target: {e}"))?;
         let reader = flush_target
             .flush(output)
             .map_err(|e| format!("flush output: {e}"))?;
 
-        // Readback verification: immediately re-read the output to ensure
-        // the SSTable roundtrip is lossless.
-        let readback_partitions = reader
-            .read_all_partitions()
-            .map_err(|e| format!("CORRUPTION: output SSTable readback failed: {e}"))?;
-        let readback_row_count: usize = readback_partitions.iter().map(|p| p.rows.len()).sum();
-        if readback_partitions.len() != merged.len() || readback_row_count != merged_row_count {
+        // 5. Streaming readback verification — count partitions and rows
+        //    without materializing the output back into a Vec.  Catches
+        //    Data.db / Partitions.db inconsistencies that would corrupt
+        //    later reads.
+        let mut readback_partitions: u64 = 0;
+        let mut readback_rows: usize = 0;
+        {
+            let mut iter = reader
+                .partitions_iter()
+                .map_err(|e| format!("CORRUPTION: output partitions_iter failed: {e}"))?;
+            while let Some(p) = iter
+                .next_partition()
+                .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
+            {
+                readback_partitions += 1;
+                readback_rows += p.rows.len();
+            }
+        }
+        if readback_partitions != merged_partition_count || readback_rows != merged_row_count {
             tracing::error!(
-                written_partitions = merged.len(),
+                written_partitions = merged_partition_count,
                 written_rows = merged_row_count,
-                readback_partitions = readback_partitions.len(),
-                readback_rows = readback_row_count,
+                readback_partitions,
+                readback_rows,
                 "compaction: CORRUPTION DETECTED in output SSTable"
             );
             return Err(format!(
                 "compaction output SSTable is corrupt: expected {} partitions/{} rows, \
                  readback got {} partitions/{} rows",
-                merged.len(),
-                merged_row_count,
-                readback_partitions.len(),
-                readback_row_count
+                merged_partition_count, merged_row_count, readback_partitions, readback_rows
             ));
         }
         tracing::info!(
-            partitions = readback_partitions.len(),
-            rows = readback_row_count,
-            "compaction: output verified (matches merge)"
+            partitions = readback_partitions,
+            rows = readback_rows,
+            "compaction: output verified (streaming readback matches merge)"
         );
 
         let gen = flush_target.generation();
         let output_id = format!("{gen}");
-        let partition_count = merged.len() as u64;
+        let partition_count = merged_partition_count;
 
         let total_size: u64 = [
             format!("{gen}-Data.db"),
@@ -317,12 +422,12 @@ impl CompactionExecutor {
         })
         .sum();
 
-        let min_token = merged.first().map(|p| p.key.token.0).unwrap_or(0);
-        let max_token = merged.last().map(|p| p.key.token.0).unwrap_or(0);
+        // min/max token tracked inline during the streaming merge; if the
+        // merge produced zero partitions we'd have returned above.
 
-        // Use the actual header timestamps from the merged data, not the
-        // input metadata. Input metadata may have stale/incorrect values
-        // that propagate to future compactions.
+        // Use the combined-header timestamps (from input headers) for the
+        // output metadata. Input metadata may have stale/incorrect values
+        // that would propagate; the header values are authoritative.
         Ok(SSTableMetadata {
             id: output_id,
             path: task.output_dir.clone(),
@@ -333,6 +438,69 @@ impl CompactionExecutor {
             max_timestamp: header_max_ts,
             partition_count,
         })
+    }
+}
+
+/// Build an output `SerializationHeader` from the inputs' own headers
+/// plus the (current) table schema, in `O(N_inputs)` time and without
+/// scanning Data.db.
+///
+/// Each input header already records the timestamp / ldt / ttl ranges
+/// observed when that SSTable was written; the output is the union of
+/// those ranges. The column model (key type, clustering, statics,
+/// regular columns) comes from the schema — same convention as the
+/// flush path used to use via `flush::build_serialization_header`.
+fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
+    schema: &ferrosa_common::schema::TableSchema,
+    readers: &[ferrosa_sstable::reader::SSTableReader<R>],
+) -> ferrosa_sstable::statistics::SerializationHeader {
+    use ferrosa_common::{NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
+    use ferrosa_sstable::statistics::SerializationHeader;
+
+    // Use the first reader's column model as the template; the schema
+    // shape is identical across all inputs by definition (compaction
+    // never mixes SSTables from different tables).
+    let template = readers
+        .first()
+        .map(|r| r.header().clone())
+        .unwrap_or_else(|| crate::flush::build_serialization_header(schema, &[]));
+
+    let mut min_timestamp = NO_TIMESTAMP;
+    let mut max_timestamp = i64::MIN;
+    let mut min_local_deletion_time = NO_DELETION_TIME;
+    let mut min_ttl = NO_TTL;
+
+    for r in readers {
+        let h = r.header();
+        if h.min_timestamp != NO_TIMESTAMP
+            && (min_timestamp == NO_TIMESTAMP || h.min_timestamp < min_timestamp)
+        {
+            min_timestamp = h.min_timestamp;
+        }
+        if h.max_timestamp > max_timestamp {
+            max_timestamp = h.max_timestamp;
+        }
+        if h.min_local_deletion_time != NO_DELETION_TIME
+            && (min_local_deletion_time == NO_DELETION_TIME
+                || h.min_local_deletion_time < min_local_deletion_time)
+        {
+            min_local_deletion_time = h.min_local_deletion_time;
+        }
+        if h.min_ttl != NO_TTL && (min_ttl == NO_TTL || h.min_ttl < min_ttl) {
+            min_ttl = h.min_ttl;
+        }
+    }
+
+    if max_timestamp == i64::MIN {
+        max_timestamp = NO_TIMESTAMP;
+    }
+
+    SerializationHeader {
+        min_timestamp,
+        max_timestamp,
+        min_local_deletion_time,
+        min_ttl,
+        ..template
     }
 }
 
