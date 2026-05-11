@@ -105,10 +105,18 @@ impl ClusterCoordinator {
         let replicas = ring.replicas(key.token.0, rf);
         let required = cl.block_for(rf);
 
-        // No span here: the prior `info_span!{...}.enter()` was scoped to a
-        // bare block so it enclosed zero work — pure allocation cost on
-        // every write at INFO level (the default).  If finer-grained
-        // tracing is needed, instrument the surrounding handler instead.
+        // DEBUG-level span so it costs nothing at the default INFO filter.
+        // Keep the span construction outside the awaited fan-out below: a
+        // synchronous `entered()` guard must not be held across `.await`.
+        {
+            let span = tracing::debug_span!(
+                "cluster.write",
+                cl = %cl,
+                rf = rf,
+                replicas = replicas.len(),
+            );
+            let _enter = span.enter();
+        }
 
         if replicas.len() < required {
             return Err(ClusterError::Unavailable {
