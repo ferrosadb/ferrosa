@@ -3966,6 +3966,102 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_str(), Some(src_id.to_string().as_str()));
     assert_eq!(rows[0][1].as_str(), Some(dst_id.to_string().as_str()));
+
+    let set_query = format!(
+        "MATCH (a:Entity)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}', entity_a: '{src_id}', entity_b: '{dst_id}'}}]->(b:Entity) \
+         SET r.strength = 0.25"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": set_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("edge-keyed fmem CO_OCCURS SET must return immediately")
+        .unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "SET response body: {body:#}");
+
+    let match_query = format!(
+        "MATCH (a:Entity)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}'}}]->(b:Entity) \
+         RETURN a.entity_id AS src_id, b.entity_id AS dst_id, r.strength AS strength"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": match_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("updated tiny fmem CO_OCCURS list MATCH must return immediately")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"]
+        .as_array()
+        .expect("MATCH response must include rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_str(), Some(src_id.to_string().as_str()));
+    assert_eq!(rows[0][1].as_str(), Some(dst_id.to_string().as_str()));
+    assert_eq!(rows[0][2].as_f64(), Some(0.25));
+
+    let delete_query = format!(
+        "MATCH (a:Entity)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}', entity_a: '{src_id}', entity_b: '{dst_id}'}}]->(b:Entity) \
+         DELETE r"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": delete_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("edge-keyed fmem CO_OCCURS DELETE must return immediately")
+        .unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "DELETE response body: {body:#}");
+
+    let match_query = format!(
+        "MATCH (a:Entity)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}'}}]->(b:Entity) \
+         RETURN a.entity_id AS src_id, b.entity_id AS dst_id, r.strength AS strength"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": match_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+        .await
+        .expect("deleted tiny fmem CO_OCCURS list MATCH must return immediately")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"]
+        .as_array()
+        .expect("MATCH response must include rows");
+    assert!(
+        rows.is_empty(),
+        "DELETE must remove the matched edge: {rows:#?}"
+    );
 }
 
 #[tokio::test]
