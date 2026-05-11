@@ -26,7 +26,7 @@ pub use cluster_rejoin::{
     CLUSTER_REJOIN_FAILURES_TOTAL,
 };
 
-pub(crate) use token::deterministic_tokens_for_node;
+pub use token::deterministic_tokens_for_node;
 #[cfg(test)]
 pub(crate) use token::generate_deterministic_token;
 

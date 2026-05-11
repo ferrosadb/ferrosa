@@ -535,6 +535,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FERROSA_HINTED_HANDOFF_DIR").ok().as_deref(),
     );
     let cluster_config = Arc::new(cluster_config);
+    // Capture num_tokens locally before cluster_config is consumed by
+    // ModeController — needed downstream when populating system.local.tokens.
+    let num_tokens = cluster_config.num_tokens as usize;
     let net_config = Arc::new(ferrosa_net::config::NetConfig::from_env());
 
     // Build handler registry — shared between RPC server and ModeController.
@@ -686,8 +689,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cql_broadcast_addr, cql_broadcast_port) = match std::env::var("FERROSA_CQL_BROADCAST") {
         Ok(addr_str) => cql_broadcast::parse_cql_broadcast(&addr_str, cql_bind.port()),
         Err(_) => {
+            // Gap 11: when CQL bind is 0.0.0.0 (the normal containerised
+            // case), the broadcast address must be the externally reachable
+            // IP so cluster peers and drivers can distinguish nodes.  Fall
+            // back to the internode-broadcast IP (which the operator already
+            // set to a reachable hostname/IP for gossip), not localhost —
+            // localhost made every node in a docker-compose cluster report
+            // `127.0.0.1` and load balancers / drivers couldn't tell them
+            // apart.  See ferrosa-nosqlbench/docs/initial-gaps-found.md.
             let ip = if cql_bind.ip().is_unspecified() {
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                net_config.broadcast_addr.ip()
             } else {
                 cql_bind.ip()
             };
@@ -718,13 +729,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "CQL topology view policy: matching clients receive internal addresses"
         );
     }
+    // Gap 11: populate system.local with this node's actual tokens and
+    // gossip broadcast address.  Pre-fix, every node reported
+    // `tokens=['0']` (the NodeConfig::default sentinel) and
+    // `broadcast_address=127.0.0.1`, so a 3-node docker cluster looked
+    // to drivers like a single host with two duplicates — driving the
+    // 5x throughput gap NoSQLBench observed against Cassandra.
+    let local_node_id = ferrosa_cluster::raft::uuid_to_node_id(host_id);
+    let tokens: Vec<String> =
+        ferrosa_cluster::controller::deterministic_tokens_for_node(local_node_id, num_tokens)
+            .into_iter()
+            .map(|t| t.to_string())
+            .collect();
     let node_config = Arc::new(ferrosa_schema::NodeConfig {
         rpc_address: cql_broadcast_addr,
         rpc_port: cql_broadcast_port,
         internal_rpc_address: net_config.broadcast_addr.ip(),
         internal_rpc_port: cql_bind.port(),
         host_id,
+        broadcast_address: net_config.broadcast_addr.ip(),
+        broadcast_port: net_config.broadcast_addr.port(),
+        listen_address: net_config.broadcast_addr.ip(),
         listen_port: internode_addr.port(),
+        tokens,
         ..ferrosa_schema::NodeConfig::default()
     });
     let connection_tracker =

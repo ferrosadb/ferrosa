@@ -64,7 +64,7 @@ pub(crate) fn generate_deterministic_token(node_id: u64, index: usize) -> i64 {
 /// each other.
 ///
 /// See `specs/in-process/bug-token-ring-inconsistency-causes-data-scatter.md`.
-pub(crate) fn deterministic_tokens_for_node(node_id: u64, num_tokens: usize) -> Vec<i64> {
+pub fn deterministic_tokens_for_node(node_id: u64, num_tokens: usize) -> Vec<i64> {
     (0..num_tokens)
         .map(|i| generate_deterministic_token(node_id, i))
         .collect()
