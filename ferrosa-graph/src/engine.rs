@@ -89,6 +89,73 @@ fn empty_match_result(statement: &Statement) -> GraphResult {
     }
 }
 
+/// Cluster-aware schema-mutation sink for graph-engine-driven DDL.
+///
+/// The graph engine auto-creates `system_graph_<keyspace>.adjacency`
+/// when it first sees an edge table for a keyspace. On a single node
+/// this is straightforward — call `Schema::create_*_internal` and
+/// `StorageEngine::register_table`. On a multi-node cluster, those
+/// local mutations need to propagate to every replica via the cluster's
+/// DDL replication path (pair mode, Raft, etc.) so that follower nodes
+/// can apply `MutationForward` writes to the adjacency table.
+///
+/// Implementations:
+/// - `LocalGraphSchemaCoordinator`: single-node / unit-test default.
+///   Writes directly to the provided `Schema` instance only.
+/// - Production cluster wiring should pass a coordinator that routes
+///   the DDL operation through the same path regular CQL DDL takes
+///   (see ferrosa-cluster ddl_path / pair::ddl).
+pub trait GraphSchemaCoordinator: Send + Sync {
+    /// Idempotently create the adjacency keyspace cluster-wide.
+    /// Must be a no-op (returning Ok(())) if the keyspace already exists.
+    fn apply_create_keyspace(
+        &self,
+        ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
+    ) -> Result<()>;
+
+    /// Idempotently create the adjacency table cluster-wide.
+    /// Must be a no-op (returning Ok(())) if the table already exists.
+    fn apply_create_table(
+        &self,
+        table: ferrosa_schema::metadata::table::TableMetadata,
+    ) -> Result<()>;
+}
+
+/// Local-only coordinator. Backwards-compatible single-node default —
+/// applies DDL to the provided Schema instance and nothing else.
+/// Cluster deployments should pass a coordinator that fans the DDL
+/// out via the cluster's replication path (Raft / pair sync) so all
+/// peers register the adjacency table in their local StorageEngine.
+pub struct LocalGraphSchemaCoordinator {
+    schema: Arc<Schema>,
+}
+
+impl LocalGraphSchemaCoordinator {
+    pub fn new(schema: Arc<Schema>) -> Self {
+        Self { schema }
+    }
+}
+
+impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
+    fn apply_create_keyspace(
+        &self,
+        ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
+    ) -> Result<()> {
+        self.schema
+            .create_keyspace_internal(ks)
+            .map_err(|e| GraphError::Validation(format!("create_keyspace_internal: {e}")))
+    }
+
+    fn apply_create_table(
+        &self,
+        table: ferrosa_schema::metadata::table::TableMetadata,
+    ) -> Result<()> {
+        self.schema
+            .create_table_internal(table)
+            .map_err(|e| GraphError::Validation(format!("create_table_internal: {e}")))
+    }
+}
+
 /// Composite configuration for the graph engine.
 pub struct GraphConfig {
     pub engine: GraphEngineConfig,
@@ -127,6 +194,12 @@ pub struct GraphEngine {
     reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
     registered_adjacency_keyspaces: Mutex<HashSet<String>>,
+    /// Routes adjacency-keyspace and adjacency-table DDL through the
+    /// cluster's replication path. Defaults to a local-only coordinator
+    /// (`LocalGraphSchemaCoordinator`) when `GraphEngine::new` is used.
+    /// Use `GraphEngine::new_with_coordinator` to inject a cluster-aware
+    /// implementation so all replicas register the adjacency table.
+    schema_coordinator: Arc<dyn GraphSchemaCoordinator>,
 }
 
 /// Information about a vertex or edge label in the graph schema.
@@ -162,6 +235,30 @@ impl GraphEngine {
         write_path: Arc<ArcSwap<WritePath>>,
         config: GraphEngineConfig,
         reconciliation_interval: std::time::Duration,
+    ) -> Self {
+        let coordinator: Arc<dyn GraphSchemaCoordinator> =
+            Arc::new(LocalGraphSchemaCoordinator::new(Arc::clone(&schema)));
+        Self::new_with_coordinator(
+            schema,
+            storage,
+            write_path,
+            config,
+            reconciliation_interval,
+            coordinator,
+        )
+    }
+
+    /// Like `new`, but routes graph-engine-driven DDL (adjacency keyspace +
+    /// adjacency table creation) through the provided coordinator. Use this
+    /// in multi-node cluster wiring so every replica registers the adjacency
+    /// table; `new` defaults to a local-only coordinator.
+    pub fn new_with_coordinator(
+        schema: Arc<Schema>,
+        storage: Arc<StorageEngine>,
+        write_path: Arc<ArcSwap<WritePath>>,
+        config: GraphEngineConfig,
+        reconciliation_interval: std::time::Duration,
+        schema_coordinator: Arc<dyn GraphSchemaCoordinator>,
     ) -> Self {
         let snap = schema.snapshot();
 
@@ -202,20 +299,18 @@ impl GraphEngine {
                         continue;
                     }
                 }
-            } else {
-                if let Err(e) = schema.create_keyspace_internal(adj_meta) {
-                    tracing::error!(
-                        keyspace = %adj_ks,
-                        error = %e,
-                        "graph engine: failed to register adjacency keyspace — \
-                         derived mutations will be dropped for {ks}; refusing to \
-                         register observer"
-                    );
-                    continue;
-                }
+            } else if let Err(e) = schema_coordinator.apply_create_keyspace(adj_meta) {
+                tracing::error!(
+                    keyspace = %adj_ks,
+                    error = %e,
+                    "graph engine: failed to register adjacency keyspace — \
+                     derived mutations will be dropped for {ks}; refusing to \
+                     register observer"
+                );
+                continue;
             }
             let adj_meta = adjacency_table_metadata(ks);
-            if let Err(e) = schema.create_table_internal(adj_meta.clone()) {
+            if let Err(e) = schema_coordinator.apply_create_table(adj_meta.clone()) {
                 tracing::error!(
                     keyspace = %adj_ks,
                     error = %e,
@@ -296,6 +391,7 @@ impl GraphEngine {
             reconciliation_cancel,
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
             registered_adjacency_keyspaces: Mutex::new(edge_keyspaces),
+            schema_coordinator,
         }
     }
 
@@ -311,8 +407,8 @@ impl GraphEngine {
         let adj_ks = adjacency_keyspace_name(keyspace);
         let adj_meta = adjacency_keyspace_metadata(&snap, keyspace);
         if !snap.keyspaces.contains_key(&adj_ks) {
-            self.schema
-                .create_keyspace_internal(adj_meta)
+            self.schema_coordinator
+                .apply_create_keyspace(adj_meta)
                 .map_err(|e| {
                     GraphError::Validation(format!(
                         "failed to register graph adjacency keyspace {adj_ks}: {e}"
@@ -325,8 +421,8 @@ impl GraphEngine {
             .tables
             .contains_key(&(adj_ks.clone(), "adjacency".to_string()))
         {
-            self.schema
-                .create_table_internal(adjacency_table_metadata(keyspace))
+            self.schema_coordinator
+                .apply_create_table(adjacency_table_metadata(keyspace))
                 .map_err(|e| {
                     GraphError::Validation(format!(
                         "failed to register graph adjacency table {adj_ks}.adjacency: {e}"
