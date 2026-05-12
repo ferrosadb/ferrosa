@@ -226,8 +226,18 @@ fn background_reconciliation_enabled(interval: std::time::Duration) -> bool {
     !interval.is_zero()
 }
 
-/// Default per-connection subscription limit (FMEA F5).
-const DEFAULT_MAX_SUBSCRIPTIONS: usize = 8;
+/// Default per-connection subscription limit (FMEA F5). Operators
+/// can tune via `FERROSA_GRAPH_MAX_SUBSCRIPTIONS`; zero or unparseable
+/// values fall back to this default.
+pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 8;
+
+fn max_subscriptions() -> usize {
+    std::env::var("FERROSA_GRAPH_MAX_SUBSCRIPTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_SUBSCRIPTIONS)
+}
 
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
@@ -332,7 +342,7 @@ impl GraphEngine {
             config,
             reconciliation_handles: Vec::new(),
             reconciliation_cancel: CancellationToken::new(),
-            subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
+            subscription_registry: Arc::new(SubscriptionRegistry::new(max_subscriptions())),
             registered_adjacency_keyspaces: Mutex::new(HashSet::new()),
             schema_coordinator,
             reconciliation_interval,

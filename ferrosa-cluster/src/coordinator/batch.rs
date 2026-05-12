@@ -19,9 +19,22 @@ use ferrosa_storage::Mutation;
 
 use super::ClusterCoordinator;
 
-/// Maximum concurrent mutations within a single batch. Lower than the global
-/// write semaphore (128) to prevent one large batch from consuming all capacity.
-const BATCH_CONCURRENCY: usize = 32;
+/// Default maximum concurrent mutations within a single batch. Lower
+/// than the global write semaphore (128) to prevent one large batch
+/// from consuming all capacity. Operators can tune via
+/// `FERROSA_BATCH_CONCURRENCY`; zero or unparseable values fall back
+/// to the default.
+pub const DEFAULT_BATCH_CONCURRENCY: usize = 32;
+
+/// Resolved batch concurrency. Re-read on each batch so a runtime
+/// env-var change takes effect at the next batch boundary.
+fn batch_concurrency() -> usize {
+    std::env::var("FERROSA_BATCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
+}
 
 impl ClusterCoordinator {
     /// Coordinate a logged batch across the cluster.
@@ -58,7 +71,7 @@ impl ClusterCoordinator {
         // a large batch from blocking the coordinator for the full serial
         // duration, while the semaphore cap prevents one batch from consuming
         // all write capacity.
-        let sem = Arc::new(Semaphore::new(BATCH_CONCURRENCY));
+        let sem = Arc::new(Semaphore::new(batch_concurrency()));
         let mut futs = FuturesUnordered::new();
 
         for m in &mutations {
