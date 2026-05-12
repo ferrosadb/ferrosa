@@ -1052,28 +1052,30 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
 
         let mut positions: Vec<RowPosition> = Vec::new();
+        let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
+            if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "secondary index query exceeded {} row limit; \
+                     use ALLOW FILTERING for unbounded scans",
+                    INDEX_RESULT_CAP
+                )));
+            }
+            positions.extend(batch);
+            Ok(())
+        };
 
         // 1. Query memtable index
         if let Some(idx) = guard.indexes.get(index_name) {
-            positions.extend(idx.lookup(key));
+            append_positions(idx.lookup(key))?;
         }
 
         // 2. Query SSTable sidecar indexes
         for sidecar in guard.sidecar_indexes.iter() {
             if let Some(reader) = sidecar.get(index_name) {
                 if let Ok(results) = reader.lookup(key) {
-                    positions.extend(results);
+                    append_positions(results)?;
                 }
             }
-        }
-
-        // 3. Enforce result cap before dedup to bound memory usage
-        if positions.len() > INDEX_RESULT_CAP {
-            return Err(ferrosa_common::Error::InvalidFormat(format!(
-                "secondary index query exceeded {} row limit; \
-                 use ALLOW FILTERING for unbounded scans",
-                INDEX_RESULT_CAP
-            )));
         }
 
         // 4. Deduplicate by (partition_key, clustering_key)
