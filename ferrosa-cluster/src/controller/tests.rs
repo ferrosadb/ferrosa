@@ -1,6 +1,6 @@
 use super::cluster::{
-    build_recovered_topology_refresh_plan, drain_ddl_queue, should_initialize_seed_membership,
-    should_run_bootstrap_streaming,
+    build_recovered_topology_refresh_plan, drain_ddl_queue, keyspace_needs_cluster_replay,
+    should_initialize_seed_membership, should_run_bootstrap_streaming,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -2297,4 +2297,49 @@ fn bootstrap_attempts_sstable_bulk_before_range_materialization() {
         "bootstrap must try flush/SSTable bulk streaming before read_range; \
          read_range materializes all SSTable partitions before applying its limit and can OOM"
     );
+}
+
+#[test]
+fn keyspace_needs_cluster_replay_includes_system_graph_keyspaces() {
+    // The graph engine builds `system_graph_<user_ks>` keyspaces lazily on
+    // the first graph query. If that first query happens before the local
+    // node has transitioned to Cluster mode, the keyspace + adjacency table
+    // get registered locally only. Phase A of transition_to_cluster must
+    // re-fire those DDLs through Raft so every replica's state machine
+    // registers them too — otherwise followers reject every adjacency
+    // MutationForward with "table not registered". Regression guard for
+    // ferrosa-memory PR#4 cluster-int failure mode B.
+    assert!(
+        keyspace_needs_cluster_replay("system_graph_agent_memory"),
+        "system_graph_* keyspaces must replay through Raft on cluster transition"
+    );
+    assert!(
+        keyspace_needs_cluster_replay("system_graph_app_a"),
+        "every system_graph_<user_ks> must replay"
+    );
+    assert!(
+        keyspace_needs_cluster_replay("agent_memory"),
+        "regular user keyspaces must replay"
+    );
+}
+
+#[test]
+fn keyspace_needs_cluster_replay_excludes_builtin_system_keyspaces() {
+    // The Cassandra-style built-in system keyspaces are hardcoded on every
+    // node at startup and must NOT be re-fired through Raft (proposing
+    // CreateKeyspace("system") would either no-op noisily or fail).
+    for ks in [
+        "system",
+        "system_schema",
+        "system_auth",
+        "system_distributed",
+        "system_traces",
+        "system_virtual_schema",
+        "system_observability",
+    ] {
+        assert!(
+            !keyspace_needs_cluster_replay(ks),
+            "built-in system keyspace {ks} must NOT replay through Raft"
+        );
+    }
 }
