@@ -22,7 +22,33 @@ use super::Memtable;
 
 /// Default number of shards. 64 gives good contention distribution on
 /// modern multi-core systems without excessive overhead.
-const DEFAULT_NUM_SHARDS: usize = 64;
+pub const DEFAULT_NUM_SHARDS: usize = 64;
+
+/// Process-wide override for the default shard count. Set once at
+/// `StorageEngine` construction from `StorageEngineConfig.memtable_num_shards`
+/// (which honors `FERROSA_MEMTABLE_NUM_SHARDS` and falls back to 64).
+/// `with_default_shards` reads this; explicit `new(num_shards)` callers
+/// (mostly tests that want low-shard counts) ignore it.
+static CONFIGURED_NUM_SHARDS: AtomicUsize = AtomicUsize::new(DEFAULT_NUM_SHARDS);
+
+/// Set the process-wide default shard count. Called once at
+/// `StorageEngine` construction. Idempotent; later calls overwrite,
+/// but in practice the engine is constructed once per process.
+/// Values of 0 are ignored so a misconfigured env var never wedges
+/// every new memtable; the previous value (default 64) wins.
+pub fn set_configured_num_shards(n: usize) {
+    if n == 0 {
+        return;
+    }
+    CONFIGURED_NUM_SHARDS.store(n, Ordering::Relaxed);
+}
+
+/// Read the process-wide default shard count. `with_default_shards`
+/// uses this so a runtime config change is picked up by every memtable
+/// allocated after the override is set.
+pub fn configured_num_shards() -> usize {
+    CONFIGURED_NUM_SHARDS.load(Ordering::Relaxed)
+}
 
 /// Sharded BTreeMap-based memtable.
 ///
@@ -59,9 +85,11 @@ impl ShardedBTreeMemtable {
         }
     }
 
-    /// Create a new sharded memtable with the default 64 shards.
+    /// Create a new sharded memtable with the configured default shard
+    /// count (`FERROSA_MEMTABLE_NUM_SHARDS`, falling back to
+    /// `DEFAULT_NUM_SHARDS`). Use `new(num_shards)` to override.
     pub fn with_default_shards() -> Self {
-        Self::new(DEFAULT_NUM_SHARDS)
+        Self::new(configured_num_shards())
     }
 
     /// Determine which shard a key belongs to.
@@ -338,6 +366,39 @@ mod tests {
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
     use ferrosa_common::schema::ColumnDefinition;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+
+    /// The configured-num-shards override is what
+    /// `with_default_shards()` reads. Pin both directions of the
+    /// contract: a valid override changes the shard count of newly-
+    /// created memtables; a zero override is ignored so a
+    /// misconfigured env var can't wedge every memtable.
+    #[test]
+    fn with_default_shards_honors_configured_override() {
+        // Capture the current value so this test stays hermetic in
+        // the presence of FERROSA_MEMTABLE_NUM_SHARDS or earlier
+        // `set_configured_num_shards` calls in the same process.
+        let original = configured_num_shards();
+
+        set_configured_num_shards(128);
+        let mem = ShardedBTreeMemtable::with_default_shards();
+        assert_eq!(mem.shards.len(), 128);
+
+        set_configured_num_shards(8);
+        let mem = ShardedBTreeMemtable::with_default_shards();
+        assert_eq!(mem.shards.len(), 8);
+
+        // Zero override is rejected — the prior value (8) stands.
+        set_configured_num_shards(0);
+        let mem = ShardedBTreeMemtable::with_default_shards();
+        assert_eq!(
+            mem.shards.len(),
+            8,
+            "set_configured_num_shards(0) must not wedge memtable creation",
+        );
+
+        // Restore so adjacent tests see the original value.
+        set_configured_num_shards(original);
+    }
 
     fn test_schema() -> TableSchema {
         TableSchema {

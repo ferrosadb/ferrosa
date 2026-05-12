@@ -23,6 +23,11 @@ data_dir = "/var/lib/ferrosa"
 flush_threshold_bytes = 67108864  # 64 MB
 flush_interval_secs = 30          # How often to flush memtables + sync to S3
 commit_log_segment_size = 33554432  # 32 MB
+# Number of sharded memtable buckets. Each bucket has its own RwLock,
+# so writes to different shards never contend. Default 64 fits modern
+# multi-core servers; raise for higher core counts, lower for very
+# small VMs. Honors FERROSA_MEMTABLE_NUM_SHARDS env var.
+memtable_num_shards = 64
 
 [s3]
 # endpoint = "https://s3.amazonaws.com"

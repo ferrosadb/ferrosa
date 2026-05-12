@@ -45,9 +45,35 @@ use crate::types::{CqlType, CqlValue};
 use crate::virtual_tables::active_queries::QueryTracker;
 use crate::virtual_tables::connections::ConnectionTracker;
 
-/// Maximum number of statements allowed in a BATCH (security mitigation M12).
-const MAX_BATCH_STATEMENTS: usize = 500;
-const COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
+/// Default maximum number of statements allowed in a BATCH (security
+/// mitigation M12). Operators can tune via
+/// `FERROSA_CQL_MAX_BATCH_STATEMENTS`; zero or unparseable values fall
+/// back to the default. Raising this lets larger batched writes
+/// through; lowering it tightens the M12 cap for environments that
+/// have to absorb adversarial clients.
+pub const DEFAULT_MAX_BATCH_STATEMENTS: usize = 500;
+
+fn max_batch_statements() -> usize {
+    std::env::var("FERROSA_CQL_MAX_BATCH_STATEMENTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_BATCH_STATEMENTS)
+}
+
+/// Default cooperative-yield cadence for long partition scans. Larger
+/// values reduce yield overhead but increase tail latency on competing
+/// tasks; smaller values do the opposite. Tune via
+/// `FERROSA_CQL_SCAN_YIELD_EVERY_PARTITIONS`.
+pub const DEFAULT_COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
+
+fn cooperative_scan_yield_every_partitions() -> usize {
+    std::env::var("FERROSA_CQL_SCAN_YIELD_EVERY_PARTITIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS)
+}
 /// Warn once an arbitrary unbounded ORDER BY would scan at least this many
 /// local SSTable bytes before sorting. The warning is a planner signal: this
 /// query shape should use the spillable temp-sort table path instead of
@@ -245,7 +271,7 @@ async fn count_rows_from_partitions(
                 count += 1;
             }
         }
-        if should_yield_during_partition_scan(idx + 1, COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS) {
+        if should_yield_during_partition_scan(idx + 1, cooperative_scan_yield_every_partitions()) {
             tokio::task::yield_now().await;
         }
     }
@@ -269,7 +295,7 @@ async fn extend_rows_from_partitions(
             ck_indices,
         );
         all_rows.append(&mut prows);
-        if should_yield_during_partition_scan(idx + 1, COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS) {
+        if should_yield_during_partition_scan(idx + 1, cooperative_scan_yield_every_partitions()) {
             tokio::task::yield_now().await;
         }
     }
@@ -3625,11 +3651,12 @@ async fn route_batch(
     b: BatchStatement,
 ) -> Result<BytesMut, CqlError> {
     // Security mitigation M12: batch size limit
-    if b.statements.len() > MAX_BATCH_STATEMENTS {
+    let max_batch = max_batch_statements();
+    if b.statements.len() > max_batch {
         return Err(CqlError::Invalid(format!(
             "batch too large: {} statements (max {})",
             b.statements.len(),
-            MAX_BATCH_STATEMENTS
+            max_batch
         )));
     }
 
@@ -7561,6 +7588,7 @@ mod tests {
             auth_enabled: false,
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
 
@@ -12312,6 +12340,7 @@ mod tests {
             auth_enabled: false,
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
         };
         let engine = StorageEngine::new(engine_config, None).unwrap();
 

@@ -27,6 +27,7 @@ fn setup_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
         auth_enabled: false,
         auth_warn: false,
         max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
     };
     let engine = Arc::new(StorageEngine::new(config, None).unwrap());
 
@@ -251,6 +252,7 @@ fn bootstrap_empty_sstables_uses_raft() {
         auth_enabled: false,
         auth_warn: false,
         max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
     };
     let engine = Arc::new(StorageEngine::new(config, None).unwrap());
 

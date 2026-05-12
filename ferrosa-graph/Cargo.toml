@@ -29,9 +29,9 @@ tower-http = { version = "0.6", features = ["catch-panic", "limit"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 blake3 = "1"
+async-trait = "0.1"
 
 [dev-dependencies]
-async-trait = "0.1"
 bincode = "1"
 base64 = "0.22"
 bytes = "1"
