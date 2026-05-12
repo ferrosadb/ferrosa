@@ -5812,4 +5812,285 @@ mod tests {
     fn graph_write_consistency_is_quorum() {
         assert_eq!(graph_write_consistency(), ConsistencyLevel::Quorum);
     }
+
+    /// Mirrors the ferrosa-memory `co_occurs_with` schema after migrations
+    /// 003 (create), 010 (add strength + last_reinforced), and 031 (add
+    /// first_seen). All regular columns have position=0 because both CQL
+    /// CREATE TABLE and ALTER TABLE ADD pin them to 0 in the live registry
+    /// (router.rs:4300, router.rs:4572).
+    fn co_occurs_with_meta_after_alters() -> TableMetadata {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "entity_a".to_string(),
+            test_column(
+                "entity_a",
+                ColumnKind::PartitionKey,
+                0,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "entity_b".to_string(),
+            test_column(
+                "entity_b",
+                ColumnKind::Clustering,
+                0,
+                "uuid",
+                ClusteringOrder::Asc,
+            ),
+        );
+        columns.insert(
+            "session_id".to_string(),
+            test_column(
+                "session_id",
+                ColumnKind::Regular,
+                0,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "tenant_id".to_string(),
+            test_column(
+                "tenant_id",
+                ColumnKind::Regular,
+                0,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "created_at".to_string(),
+            test_column(
+                "created_at",
+                ColumnKind::Regular,
+                0,
+                "timestamp",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "strength".to_string(),
+            test_column(
+                "strength",
+                ColumnKind::Regular,
+                0,
+                "float",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "last_reinforced".to_string(),
+            test_column(
+                "last_reinforced",
+                ColumnKind::Regular,
+                0,
+                "timestamp",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "first_seen".to_string(),
+            test_column(
+                "first_seen",
+                ColumnKind::Regular,
+                0,
+                "timestamp",
+                ClusteringOrder::None,
+            ),
+        );
+        TableMetadata {
+            keyspace: "agent_memory".to_string(),
+            name: "co_occurs_with".to_string(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["entity_a".to_string()],
+            clustering_key: vec![("entity_b".to_string(), ClusteringOrder::Asc)],
+            params: TableParams::default(),
+            flags: HashSet::from([TableFlag::Compound]),
+            extensions: HashMap::from([
+                ("graph.type".to_string(), "edge".to_string()),
+                ("graph.label".to_string(), "CO_OCCURS_WITH".to_string()),
+                ("graph.source".to_string(), "entity_a".to_string()),
+                ("graph.target".to_string(), "entity_b".to_string()),
+                ("graph.source_label".to_string(), "Entity".to_string()),
+                ("graph.target_label".to_string(), "Entity".to_string()),
+            ]),
+            is_system: false,
+        }
+    }
+
+    /// Repro for ferrosa-memory PR#4 cluster-int failure: when a partial SET
+    /// (e.g. only `r.strength`) is encoded by `build_schema_aware_merge_shape`,
+    /// every produced cell `(col_idx, bytes)` must be decodable by the
+    /// receiver as `regular_columns[col_idx]` in the same TableMetadata's
+    /// `to_storage_schema()`. Otherwise replicas reject the
+    /// MutationForward with `expects N raw bytes but value provided M`.
+    #[test]
+    fn merge_write_shape_cell_indices_match_storage_schema_regular_columns() {
+        use ferrosa_common::schema::{fixed_width_for_marshal_type, validate_cell_bytes};
+
+        let meta = co_occurs_with_meta_after_alters();
+        let storage_schema = meta.to_storage_schema();
+
+        // Build a live Schema and register the keyspace + table so that
+        // build_schema_aware_merge_shape can resolve it via Schema::snapshot.
+        let schema = Schema::new(ferrosa_schema::SchemaConfig {
+            hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+            auth_method: ferrosa_schema::AuthMethod::Password,
+            rate_limit: ferrosa_schema::RateLimitConfig::default(),
+            audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: ferrosa_schema::DeploymentMode::Development,
+        })
+        .unwrap();
+        let auth = ferrosa_schema::auth::role::AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        schema
+            .create_keyspace(
+                ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                    name: meta.keyspace.clone(),
+                    durable_writes: true,
+                    replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: HashMap::from([(
+                            "replication_factor".to_string(),
+                            "1".to_string(),
+                        )]),
+                    },
+                },
+                &auth,
+            )
+            .unwrap();
+        // CO_OCCURS_WITH's graph.source_label points at "Entity"; the
+        // validator requires the vertex label to already exist.
+        let mut entity_meta = scoped_entity_meta();
+        entity_meta
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        entity_meta
+            .extensions
+            .insert("graph.label".to_string(), "Entity".to_string());
+        schema.create_table(entity_meta, &auth).unwrap();
+        schema.create_table(meta.clone(), &auth).unwrap();
+
+        // Mirror the warm-up probe query:
+        //   MERGE (a)-[r:CO_OCCURS_WITH {tenant_id, session_id}]->(b)
+        //   SET r.strength = 0.5 RETURN r
+        let tenant = Expr::Literal(Literal::String(
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        ));
+        let session = Expr::Literal(Literal::String(
+            "11111111-1111-1111-1111-111111111111".to_string(),
+        ));
+        let entity_a = Expr::Literal(Literal::String(
+            "22222222-2222-2222-2222-222222222222".to_string(),
+        ));
+        let entity_b = Expr::Literal(Literal::String(
+            "33333333-3333-3333-3333-333333333333".to_string(),
+        ));
+
+        let op = MergeOp {
+            var: Some("r".to_string()),
+            table: crate::planner::ResolvedTable {
+                keyspace: meta.keyspace.clone(),
+                table: meta.name.clone(),
+                label: "CO_OCCURS_WITH".to_string(),
+                graph_type: "edge".to_string(),
+            },
+            match_props: vec![
+                ("tenant_id".to_string(), tenant.clone()),
+                ("session_id".to_string(), session.clone()),
+            ],
+            create_props: vec![],
+            src_match_props: Some(vec![("entity_a".to_string(), entity_a)]),
+            src_var: Some("a".to_string()),
+            dst_match_props: Some(vec![("entity_b".to_string(), entity_b)]),
+            dst_var: Some("b".to_string()),
+        };
+
+        let set_props = vec![("strength".to_string(), Expr::Literal(Literal::Float(0.5)))];
+
+        let shape = build_schema_aware_merge_shape(&op, &set_props, Some(&schema), 1000)
+            .expect("build_schema_aware_merge_shape ok")
+            .expect("schema-aware shape produced");
+
+        // For each cell the encoder emits, the receiver maps col_idx → name
+        // and runs validate_cell_bytes against the column's marshal type.
+        // If our cell_idx and storage_schema.regular_columns ordering drift,
+        // this is where the live cluster sees:
+        //   "TimestampType expects 8 raw bytes but value provided 4".
+        let static_count = storage_schema.static_columns.len();
+        for (col_idx, cell) in &shape.create_cells {
+            let Some(bytes) = &cell.value else { continue };
+            let idx = *col_idx as usize;
+            assert!(
+                idx >= static_count,
+                "encoder used static-column slot {idx} but co_occurs_with has no statics"
+            );
+            let regular_idx = idx - static_count;
+            let column = storage_schema
+                .regular_columns
+                .get(regular_idx)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cell col_idx={col_idx} out of range for {} regular columns",
+                        storage_schema.regular_columns.len()
+                    )
+                });
+            // The receiver only knows column.type_name, so any drift between
+            // encoder ordering (IndexMap iteration) and storage ordering
+            // (position-stable-sort in to_storage_schema) surfaces as
+            // bytes.len() vs the type's fixed width.
+            if let Err(reason) = validate_cell_bytes(&column.type_name, bytes) {
+                let expected = fixed_width_for_marshal_type(&column.type_name)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "variable".to_string());
+                panic!(
+                    "encoder produced cell col_idx={col_idx} with {} bytes for \
+                     receiver-side column \"{}\" ({}, expects {} bytes): {}",
+                    bytes.len(),
+                    column.name,
+                    column.type_name,
+                    expected,
+                    reason
+                );
+            }
+            // Defensive: the cell at col_idx must be the column the encoder
+            // intended (strength, in this case). If the receiver decodes
+            // col_idx 3 as first_seen but the encoder meant strength, the
+            // bytes/type check above already catches it — but assert the
+            // identity here for clarity.
+            if column.name == "strength" {
+                assert_eq!(
+                    bytes.len(),
+                    4,
+                    "strength must round-trip as f32 (4 bytes), got {}",
+                    bytes.len()
+                );
+            }
+        }
+
+        // The encoder must populate strength somewhere — otherwise the SET
+        // silently dropped the property and the test is moot.
+        let mut strength_idx = None;
+        for (col_idx, _) in &shape.create_cells {
+            let regular_idx = *col_idx as usize - static_count;
+            if let Some(c) = storage_schema.regular_columns.get(regular_idx) {
+                if c.name == "strength" {
+                    strength_idx = Some(*col_idx);
+                    break;
+                }
+            }
+        }
+        strength_idx.expect(
+            "SET r.strength must produce a cell whose col_idx maps to the strength column \
+             on the receiver's TableSchema",
+        );
+    }
 }

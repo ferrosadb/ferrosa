@@ -1308,7 +1308,17 @@ impl StorageEngine {
     }
 
     /// Internal: create a `TableStore` for a table, loading existing SSTables
-    /// and sidecar files from disk. Idempotent: skips already-registered tables.
+    /// and sidecar files from disk.
+    ///
+    /// When the table is already registered, the supplied `schema` is applied
+    /// in place (mirroring `update_table_schema`). This is important for the
+    /// Raft state machine's `sync_schema_and_engine_from_state`, which calls
+    /// `register_table` for every table after snapshot install / log replay:
+    /// without an in-place update, the stale `TableSchema` (and its derived
+    /// `regular_columns` ordering) would survive every ALTER applied via
+    /// snapshot, and the receiver-side memtable validator would reject
+    /// otherwise-valid mutations whose cell indices match the live `Schema`
+    /// metadata used by the writer.
     fn register_table_inner(
         &self,
         schema: TableSchema,
@@ -1319,6 +1329,7 @@ impl StorageEngine {
             let tables = self.tables.read();
             if tables.contains_key(&table_id) {
                 drop(tables);
+                self.update_table_schema(&table_id, schema)?;
                 self.replay_deferred_mutations_for_table(&table_id);
                 return Ok(());
             }
@@ -4565,6 +4576,76 @@ mod tests {
         // Write should now fail — table is no longer registered.
         let result = engine.write(&tid, &make_key("after"), make_row(b"v", 2), 2);
         assert!(result.is_err(), "write to unregistered table should fail");
+    }
+
+    /// Repro for the cluster-int failure in ferrosa-memory PR#4 (CO_OCCURS_WITH
+    /// MutationForward write rejection):
+    ///   `register_table` is idempotent and skips when the table is
+    ///   already present. The Raft state machine's
+    ///   `sync_schema_and_engine_from_state` calls `register_table` after
+    ///   snapshot install / log replay — so if a stale `TableSchema` was
+    ///   ever registered for this table (e.g. via a prior path), every
+    ///   subsequent sync silently keeps the old column layout while
+    ///   `Schema` metadata (used by the graph encoder) moves on.
+    ///
+    /// The receiver then validates incoming mutation cells against its
+    /// stale `regular_columns` and rejects mutations whose cell at
+    /// `col_idx N` doesn't match the *current* type at that index —
+    /// e.g. "TimestampType expects 8 raw bytes but value provided 4"
+    /// when the new schema put a `float` column at the slot that used
+    /// to hold a `timestamp`.
+    #[test]
+    fn register_table_after_alter_updates_schema_for_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+
+        // "Old" schema: one regular column declared as a TimestampType.
+        // Memtable validation will reject any cell at idx 0 whose payload
+        // is not exactly 8 bytes.
+        let old_schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.TimestampType".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        // "New" schema: same slot, retyped to Int32 (4 bytes).
+        let mut new_schema = old_schema.clone();
+        new_schema.regular_columns[0].type_name =
+            "org.apache.cassandra.db.marshal.Int32Type".to_string();
+
+        engine.register_table(old_schema).unwrap();
+        // Second register_table mirrors the post-snapshot resync path on a
+        // replica. The fail-loud invariant is that the engine's view of
+        // this table must now use the *new* schema for validation, not
+        // the stale one.
+        engine.register_table(new_schema).unwrap();
+
+        // A 4-byte cell is valid for the new Int32 type and invalid for
+        // the old TimestampType. If the engine kept the stale schema,
+        // memtable validation rejects this write.
+        let key = make_key("k");
+        let row = Row {
+            clustering: 1i32.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(7i32.to_be_bytes().to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).expect(
+            "engine.register_table must update an already-registered table's schema; \
+             otherwise mutation validation runs against a stale TableSchema and \
+             rejects cells the live Schema metadata says are valid",
+        );
     }
 
     #[test]
