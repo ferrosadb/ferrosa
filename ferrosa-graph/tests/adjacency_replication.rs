@@ -225,6 +225,7 @@ fn test_storage_engine(dir: &std::path::Path) -> StorageEngine {
         auth_enabled: false,
         auth_warn: false,
         max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
     };
     StorageEngine::new(config, None).unwrap()
 }
@@ -320,5 +321,117 @@ async fn graph_engine_lazy_adjacency_registration_routes_through_coordinator() {
         )),
         "lazy adjacency registration must route the table DDL through the \
          GraphSchemaCoordinator; recorded events: {events:?}",
+    );
+}
+
+/// Cluster mode transitions: the graph engine's adjacency DDL must
+/// follow whatever `DdlPath` variant is currently active. The cluster
+/// orchestrator swaps the variant via `ArcSwap::store` when the
+/// deployment mode changes (standalone → pair → cluster, and back);
+/// `ClusterGraphSchemaCoordinator` holds the same `Arc<ArcSwap<DdlPath>>`
+/// regular CQL uses, so each `.load()` picks up the current variant.
+///
+/// This test covers the round-trip path through the variants we can
+/// construct without standing up real Raft or a PeerManager:
+/// `Direct → Forming → Unavailable → Direct`. The full
+/// `Direct → Pair → Cluster → Pair → Direct` path is exercised by the
+/// existing pair / cluster integration suites in `ferrosa-cluster/tests/`
+/// (where Raft and the pair `DdlCoordinator` are stood up properly).
+/// The contract pinned here is the engine-side property: whichever
+/// variant is loaded at call time, the engine surfaces the result of
+/// `DdlPath::execute` without inventing its own path. Pre-fix the
+/// engine bypassed `DdlPath` entirely and applied DDL directly to the
+/// local schema, so transitions were invisible to the client but other
+/// replicas saw nothing.
+#[tokio::test]
+async fn cluster_graph_schema_coordinator_follows_ddl_path_transitions() {
+    use ferrosa_cluster::ddl_path::DdlPath;
+    use ferrosa_graph::engine::{ClusterGraphSchemaCoordinator, GraphSchemaCoordinator};
+
+    let schema = Arc::new(test_schema());
+    schema
+        .create_keyspace_internal(KeyspaceMetadata {
+            name: "agent_memory".to_string(),
+            durable_writes: true,
+            replication: simple_strategy_rf1(),
+        })
+        .unwrap();
+
+    let dir = tempdir().unwrap();
+    let storage = Arc::new(test_storage_engine(dir.path()));
+
+    // Standalone (Direct).
+    let ddl_swap = Arc::new(arc_swap::ArcSwap::from_pointee(DdlPath::Direct {
+        schema: Arc::clone(&schema),
+        engine: Arc::clone(&storage),
+    }));
+    let coordinator = ClusterGraphSchemaCoordinator::new(Arc::clone(&ddl_swap));
+
+    let adj_ks = "system_graph_standalone_test".to_string();
+    coordinator
+        .apply_create_keyspace(KeyspaceMetadata {
+            name: adj_ks.clone(),
+            durable_writes: true,
+            replication: simple_strategy_rf1(),
+        })
+        .await
+        .expect("Direct variant: apply_create_keyspace should succeed");
+    assert!(
+        schema.snapshot().keyspaces.contains_key(&adj_ks),
+        "Direct variant must apply DDL to the local schema"
+    );
+
+    // Standalone → Forming. The orchestrator swaps the path during
+    // cluster formation; in-flight graph DDL gets a retriable error
+    // (the operation is queued for replay after election).
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    ddl_swap.store(Arc::new(DdlPath::Forming { queue: tx }));
+    let res = coordinator
+        .apply_create_keyspace(KeyspaceMetadata {
+            name: "system_graph_forming_test".into(),
+            durable_writes: true,
+            replication: simple_strategy_rf1(),
+        })
+        .await;
+    assert!(
+        res.is_err(),
+        "Forming variant must surface a retriable error to the engine, got: {res:?}"
+    );
+
+    // Forming → Unavailable. Peer-lost / degraded; DDL must error out
+    // until the operator promotes.
+    ddl_swap.store(Arc::new(DdlPath::Unavailable));
+    let res = coordinator
+        .apply_create_keyspace(KeyspaceMetadata {
+            name: "system_graph_unavailable_test".into(),
+            durable_writes: true,
+            replication: simple_strategy_rf1(),
+        })
+        .await;
+    assert!(
+        res.is_err(),
+        "Unavailable variant must surface an error, got: {res:?}"
+    );
+
+    // Unavailable → Direct (downgrade back to standalone after the
+    // operator resolves the degraded mode). DDL must succeed again via
+    // the new variant — no rewiring of the coordinator needed because
+    // the ArcSwap load on each call picks up the new variant.
+    ddl_swap.store(Arc::new(DdlPath::Direct {
+        schema: Arc::clone(&schema),
+        engine: Arc::clone(&storage),
+    }));
+    let adj_ks_2 = "system_graph_standalone_after_unavailable".to_string();
+    coordinator
+        .apply_create_keyspace(KeyspaceMetadata {
+            name: adj_ks_2.clone(),
+            durable_writes: true,
+            replication: simple_strategy_rf1(),
+        })
+        .await
+        .expect("Direct variant after Unavailable: apply_create_keyspace should succeed");
+    assert!(
+        schema.snapshot().keyspaces.contains_key(&adj_ks_2),
+        "Direct variant after Unavailable must apply DDL to the local schema"
     );
 }

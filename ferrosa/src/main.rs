@@ -357,7 +357,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host_id = load_or_generate_host_id(Path::new(&data_dir));
 
     // 3. Create StorageEngine — use open() on restart to replay commit log
-    let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
+    let mut storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
+    // Allow TOML to override the memtable shard count. `from_env`
+    // already honored FERROSA_MEMTABLE_NUM_SHARDS; the TOML knob lets
+    // operators tune without setting env vars. Env var takes
+    // precedence (the `from_env` parse above already saw it); the
+    // TOML value is only applied when the env var was unset OR
+    // unparseable, leaving from_env's default (64) in place to be
+    // overwritten.
+    if std::env::var("FERROSA_MEMTABLE_NUM_SHARDS").is_err() {
+        if let Some(n) = file_config
+            .get("storage")
+            .and_then(|s| s.get("memtable_num_shards"))
+            .and_then(|v| v.as_integer())
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+        {
+            storage_config.memtable_num_shards = n;
+        }
+    }
     let storage_auth_warn = storage_config.auth_warn;
     // Capture auth enablement before the config is consumed by `new`/`open`.
     // Used below to gate the seed-role bootstrap and the 5-minute
