@@ -82,6 +82,28 @@ pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool)
     !has_recovered_topology_state
 }
 
+/// Keyspaces that should be re-proposed through Raft during the
+/// post-Raft-init schema-convergence pass (`transition_to_cluster`
+/// Phase A).
+///
+/// The built-in Cassandra system keyspaces (`system`, `system_schema`,
+/// `system_auth`, etc.) are hardcoded on every node and never need
+/// replay. **The graph engine's `system_graph_<user_ks>` keyspaces are
+/// NOT built-in** — they are constructed lazily on the first graph
+/// query, often while the local node's `DdlPath` is still `Direct` or
+/// `Forming`. If that happens, the adjacency keyspace + table get
+/// registered locally only; followers never learn about them and
+/// reject every adjacency `MutationForward` with
+/// "table not registered: system_graph_<ks>.adjacency".
+///
+/// Including `system_graph_*` here lets the leader re-fire those
+/// `CreateKeyspace` + `CreateTable` ops through Raft on Cluster-mode
+/// transition, which propagates them to every replica's state
+/// machine and storage engine.
+pub(super) fn keyspace_needs_cluster_replay(name: &str) -> bool {
+    !ferrosa_schema::is_system_keyspace(name)
+}
+
 /// Drain a DDL queue (W1.14, P0-1 hazard).
 ///
 /// On the leader-elected path of `transition_to_cluster` we replay
@@ -1583,15 +1605,20 @@ impl ModeController {
                     // leader via the existing PairDdlForward RPC.
                     {
                         let schema_snap = schema_for_replay.snapshot();
+                        // See `keyspace_needs_cluster_replay` for why we
+                        // use exact-match `is_system_keyspace` here
+                        // instead of a `starts_with("system")` prefix
+                        // check: `system_graph_<user_ks>` keyspaces are
+                        // user-data-derived and MUST replicate.
                         let user_ks: Vec<_> = schema_snap
                             .keyspaces
                             .iter()
-                            .filter(|(name, _)| !name.starts_with("system"))
+                            .filter(|(name, _)| keyspace_needs_cluster_replay(name))
                             .collect();
                         let user_tables: Vec<_> = schema_snap
                             .tables
                             .iter()
-                            .filter(|((ks, _), _)| !ks.starts_with("system"))
+                            .filter(|((ks, _), _)| keyspace_needs_cluster_replay(ks))
                             .collect();
 
                         if !user_ks.is_empty() || !user_tables.is_empty() {
