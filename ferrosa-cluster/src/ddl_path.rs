@@ -439,21 +439,99 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
     }
 }
 
-/// Brief wait after a Raft DDL commit to give followers time to apply
-/// the log entry. Raft guarantees that committed entries will eventually
-/// be applied by all live nodes; this covers the typical apply lag so
-/// that a subsequent DML routed to a follower doesn't fail with "schema
-/// may still be propagating".
+/// Maximum time to wait for every live follower to replicate a DDL log entry
+/// before this node returns success to the CQL client.
 ///
-/// Matches Cassandra's schema-agreement barrier concept. A proper
-/// implementation would poll each node's applied log index; this is a
-/// pragmatic fixed wait that covers the 99th-percentile apply lag.
-const DDL_SCHEMA_AGREEMENT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+/// The leader's state machine applies on commit, but followers apply
+/// *asynchronously* after their replication stream catches up. If the CQL
+/// client moves on before followers apply, a subsequent DML routed to a
+/// lagging follower validates against a stale `TableSchema` — the exact
+/// failure mode that caused the
+/// `MutationForward write failed e=invalid data: ... (column "first_seen",
+/// index 3): TimestampType expects 8 raw bytes but value provided 4`
+/// rejection during ferrosa-memory's cluster-int warm-up.
+///
+/// The barrier polls each voter's replication progress (the leader's view of
+/// follower `matched` index) and returns as soon as everyone catches up. The
+/// cap is just a safety bound — if a voter is genuinely unreachable, we don't
+/// block DDL forever.
+const DDL_AGREEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Polling interval inside [`wait_for_replication_to_catch_up`].
+const DDL_AGREEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Final settle wait after every follower has *replicated* (appended) the
+/// committed entry. Replication lands a few ms before the follower's state
+/// machine actually `apply`s it, so we sleep a hair to drain the apply queue.
+const DDL_AGREEMENT_APPLY_DRAIN: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Wait until every voter in the current membership has replicated up to
+/// `committed_index`, then sleep [`DDL_AGREEMENT_APPLY_DRAIN`] to cover the
+/// apply-after-append window. Returns `Ok` either when everyone catches up
+/// or when [`DDL_AGREEMENT_TIMEOUT`] expires (caller logs the partial
+/// agreement and proceeds — the eventual-consistency guarantee still holds).
+async fn wait_for_replication_to_catch_up(raft: &FerrosRaft, committed_index: u64) {
+    let deadline = tokio::time::Instant::now() + DDL_AGREEMENT_TIMEOUT;
+    loop {
+        let metrics = raft.metrics().borrow().clone();
+        let local_id = metrics.id;
+        let voters: Vec<u64> = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .filter(|id| *id != local_id)
+            .collect();
+        // Single-node clusters have no followers to wait on.
+        if voters.is_empty() {
+            break;
+        }
+        let replication = match &metrics.replication {
+            Some(r) => r,
+            // Not leader, or replication not yet initialised. No way to drive
+            // this barrier from here — fall back to the apply-drain sleep so
+            // the caller doesn't immediately race the followers.
+            None => break,
+        };
+        let everyone_caught_up = voters.iter().all(|voter_id| {
+            replication
+                .get(voter_id)
+                .and_then(|matched| matched.as_ref().map(|lid| lid.index))
+                .is_some_and(|matched_index| matched_index >= committed_index)
+        });
+        if everyone_caught_up {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Log so an operator can correlate a downstream "schema still
+            // propagating"-style write failure with a slow follower.
+            let lag: Vec<(u64, u64)> = voters
+                .iter()
+                .map(|voter_id| {
+                    let matched = replication
+                        .get(voter_id)
+                        .and_then(|m| m.as_ref().map(|lid| lid.index))
+                        .unwrap_or(0);
+                    (*voter_id, committed_index.saturating_sub(matched))
+                })
+                .filter(|(_, lag)| *lag > 0)
+                .collect();
+            tracing::warn!(
+                committed_index,
+                ?lag,
+                "ddl_agreement: timed out waiting for all voters to replicate the DDL log entry; \
+                 a follower may serve a stale TableSchema for a brief window"
+            );
+            break;
+        }
+        tokio::time::sleep(DDL_AGREEMENT_POLL_INTERVAL).await;
+    }
+    tokio::time::sleep(DDL_AGREEMENT_APPLY_DRAIN).await;
+}
 
 /// Propose a DDL operation through Raft consensus.
 ///
 /// On success the state machine has applied the command on all live nodes
-/// (subject to [`DDL_SCHEMA_AGREEMENT_WAIT`]).
+/// (subject to [`DDL_AGREEMENT_TIMEOUT`]).
 ///
 /// On `ForwardToLeader` the caller receives [`ClusterError::NotLeader`] with
 /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
@@ -463,13 +541,14 @@ pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Res
     let cmd = ddl_op_to_raft_command(op);
 
     match raft.client_write(cmd).await {
-        Ok(_resp) => {
-            // Brief wait for follower state machines to apply the entry.
-            // The leader applies immediately on commit; followers apply
-            // asynchronously and typically catch up within a few ms. This
-            // wait covers the gap so a subsequent DML on another node
-            // doesn't race the apply.
-            tokio::time::sleep(DDL_SCHEMA_AGREEMENT_WAIT).await;
+        Ok(resp) => {
+            // Schema-agreement barrier: openraft's `client_write` returns once
+            // the leader applies, not when followers do. Without this wait, a
+            // CQL client that runs DDL → DML in quick succession will route
+            // the DML to a follower that has not yet applied the ALTER and
+            // get a memtable-validator rejection (see ferrosa-memory cluster-
+            // int "co_occurs_with column first_seen index 3" symptom).
+            wait_for_replication_to_catch_up(raft, resp.log_id.index).await;
             Ok(())
         }
         Err(raft_err) => {
