@@ -100,8 +100,8 @@ Nomic embeddings disabled; semantic/vector search is degraded.
 mkdir -p ~/src/ferrosa-suite
 cd ~/src/ferrosa-suite
 
-git clone https://github.com/bkearns/ferrosa.git ferrosa
-git clone https://github.com/bkearns/ferrosa-memory.git ferrosa-memory
+git clone https://github.com/ferrosadb/ferrosa.git ferrosa
+git clone https://github.com/ferrosadb/ferrosa-memory.git ferrosa-memory
 ```
 
 If you already have the repositories:
@@ -127,7 +127,11 @@ Use repository config examples or `setup-memory.sh`/`ONBOARDING.md` to choose po
 
 ## Full Compose development stack
 
-The Compose stack is for local cluster/operator testing. It expects a local Ferrosa node image named `ferrosa-memory-node:latest`.
+The Compose stack is for local cluster/operator testing. It expects a local Ferrosa node image named `ferrosa-memory-node:latest`, a local MCP binary staged in `target-podman-linux/`, and generated runtime config under `.runtime/`.
+
+The MCP service runs with `network_mode: host`, so the documented loopback HTTP smoke tests are valid for this compose deployment. Do not switch the MCP service to bridge networking without also changing the runtime config and smoke tests to TLS-aware `https://` checks.
+
+Before starting Compose, ensure `~/data/ferrosa-memory/` is writable and that your Docker/Podman engine can mount paths under `$HOME`. The compose file bind-mounts `~/data/ferrosa-memory/{minio,node1,node2,node3}` for persistent data.
 
 ```bash
 cd ~/src/ferrosa-suite/ferrosa
@@ -135,6 +139,8 @@ docker build -t ferrosa-memory-node:latest .
 # or: podman build -t ferrosa-memory-node:latest .
 
 cd ~/src/ferrosa-suite/ferrosa-memory
+scripts/init-runtime.sh
+make build-podman-binary
 docker compose up -d
 # or: podman compose up -d
 
