@@ -6,9 +6,9 @@ set -euo pipefail
 # and optionally clones/updates repos. It never deletes data or volumes.
 
 FERROSA_SUITE_DIR="${FERROSA_SUITE_DIR:-$HOME/src/ferrosa-suite}"
-FERROSA_MEMORY_REPO="${FERROSA_MEMORY_REPO:-https://github.com/bkearns/ferrosa-memory.git}"
-FERROSA_REPO="${FERROSA_REPO:-https://github.com/bkearns/ferrosa.git}"
-ONBOARDING_URL="${ONBOARDING_URL:-https://raw.githubusercontent.com/bkearns/ferrosa-memory/main/ONBOARDING.md}"
+FERROSA_MEMORY_REPO="${FERROSA_MEMORY_REPO:-https://github.com/ferrosadb/ferrosa-memory.git}"
+FERROSA_REPO="${FERROSA_REPO:-https://github.com/ferrosadb/ferrosa.git}"
+ONBOARDING_URL="${ONBOARDING_URL:-https://raw.githubusercontent.com/ferrosadb/ferrosa-memory/main/ONBOARDING.md}"
 ONBOARDING_PATH="${ONBOARDING_PATH:-$FERROSA_SUITE_DIR/ferrosa-memory/ONBOARDING.md}"
 NOMIC_MODEL="${NOMIC_MODEL:-nomic-embed-text-v2-moe}"
 
