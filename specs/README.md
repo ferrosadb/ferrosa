@@ -73,6 +73,7 @@ Keep unsupported engineering topics in `proposed/`, `todo/`, or
 | [SPARQL Endpoint](sparql-endpoint-architecture.md) | SPARQL 1.1 query endpoint over graph data | Active |
 | [Jepsen E2E](jepsen-e2e-test-plan.md) | Verification plan for distributed behavior | Test plan, not completed evidence |
 | [UCS Load Test](ucs-load-test-architecture.md) | Load testing framework for UCS compaction | Proposed/active |
+| [PITR Branch/Copy](pitr-branch-copy-architecture.md) | Copy-on-write object-store branches from PITR checkpoints | Draft |
 
 ## Threat Models
 
@@ -114,6 +115,24 @@ Keep unsupported engineering topics in `proposed/`, `todo/`, or
 | [implemented/](implemented/) | Implementation evidence awaiting verification/archive |
 | [verified-test-plan/](verified-test-plan/) | Verification plans for ambiguous claims/fixes |
 | [archive/bugs-verified/](archive/bugs-verified/) | Fixed bugs retained with repro/evidence notes |
+
+## Architecture Decision Records
+
+| ADR | Decision |
+|-----|----------|
+| [001](decisions/001-write-behind-s3.md) | Write-behind async S3 storage model |
+| [002](decisions/002-cql-only-compat.md) | CQL client compat only, own internode protocol |
+| [003](decisions/003-raft-metadata.md) | Raft for metadata, tunable CL for data |
+| [004](decisions/004-layered-sstable.md) | Layered SSTable: read Big+BTI, write BTI, future native |
+| [005](decisions/005-rust-native-crates.md) | Rust-native crates + Java as behavioral oracle |
+| [006](decisions/006-auth-first-schema.md) | Auth-first schema design |
+| [006b](decisions/006-cql-architecture.md) | CQL architecture |
+| [007](decisions/007-configurable-password-hashing.md) | Configurable password hashing (bcrypt/argon2id) |
+| [008](decisions/008-audit-first-schema.md) | Audit-first schema design |
+| [009](decisions/009-pluggable-secrets-provider.md) | Pluggable secrets provider (env/AWS SM/Vault) |
+| [010](decisions/010-production-mode.md) | Production mode — mandatory encryption, fail-closed |
+| [011](decisions/011-s3-native-pitr.md) | S3-native PITR — metadata snapshots + commit log archiving |
+| [012](decisions/012-pitr-branches-copy-on-write.md) | PITR branches — copy-on-write object references |
 
 ## Archive
 
