@@ -4591,6 +4591,33 @@ async fn route_alter_table(
     match ddl {
         DdlPath::Direct { .. } => {
             state.schema.alter_table(ks, &s.table, updates, ctx.auth)?;
+            // Propagate the post-ALTER column set to the storage engine,
+            // mirroring what CreateTable's Direct arm does. Without this,
+            // standalone/Direct nodes leave their TableSchema stuck at the
+            // CREATE-TABLE column set; every subsequent write produces a
+            // cell whose col_idx (computed from the live Schema metadata)
+            // exceeds the storage TableSchema's num_columns. The flush
+            // path's fail-loud assertion at writer.rs:496 then panics:
+            //   "cell col_idx N is out of range (num_columns=M)"
+            // and the row is silently dropped. The cluster-mode path
+            // already calls engine.update_table_schema via the RaftOp
+            // AlterTable apply (state_machine.rs:995) — the Direct
+            // path was simply missing the equivalent local update.
+            let snap = state.schema.snapshot();
+            if let Some(tbl) = snap.tables.get(&(ks.to_string(), s.table.clone())) {
+                let tid = ferrosa_storage::TableId::new(ks, &s.table);
+                if let Err(e) = state
+                    .engine
+                    .update_table_schema(&tid, tbl.to_storage_schema())
+                {
+                    tracing::error!(
+                        %e,
+                        keyspace = %ks,
+                        table = %s.table,
+                        "Direct ALTER: engine.update_table_schema failed — future flushes may panic on stale column count"
+                    );
+                }
+            }
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::AlterTable {
@@ -9791,6 +9818,90 @@ mod tests {
             "INSERT into added column must succeed, got: {:?}",
             result.err()
         );
+    }
+
+    /// Direct repro for ferrosa-memory PR#4 cluster-int third-layer
+    /// failure: `live_run_three_step_scenario` panicked the test-cluster
+    /// node1 at flush time with
+    ///   "SSTable writer: cell col_idx 3 is out of range (num_columns=3)"
+    /// because `route_alter_table`'s Direct arm only updated the Schema
+    /// registry — never `engine.update_table_schema`. The encoder used
+    /// the post-ALTER column set (via Schema metadata) and produced a
+    /// cell at the new column's index, but the storage TableSchema was
+    /// still stuck at the CREATE-TABLE column count. The mismatch goes
+    /// undetected on the write (memtable validation skips out-of-range
+    /// indices) and only fails loud at flush time, dropping the row.
+    ///
+    /// Without the fix in `route_alter_table` this test panics at the
+    /// `engine.flush` call. With the fix it succeeds.
+    #[tokio::test]
+    async fn alter_table_direct_propagates_schema_to_storage_for_flush() {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("ALTER TABLE ks.t ADD new_col text").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.t (k, v, new_col) VALUES (1, 'hello', 'world')")
+                .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // The bug: storage TableSchema is stuck at CREATE-time num_columns=1
+        // (just `v`). The INSERT for `new_col` writes a cell at col_idx=1.
+        // memtable validation accepts it (silently skipped on out-of-range
+        // index), but flush panics at writer.rs:496. With the fix in
+        // route_alter_table, this flush completes cleanly.
+        let table_id = ferrosa_storage::TableId::new("ks", "t");
+        state
+            .engine
+            .flush(&table_id)
+            .expect("flush after ALTER + INSERT must not panic; storage TableSchema must reflect post-ALTER column count");
+
+        // Belt and suspenders: re-issue another ALTER + INSERT + flush so
+        // we catch the regression even if some lazy refresh path
+        // accidentally covered the first ALTER.
+        let stmt = crate::parser::parse("ALTER TABLE ks.t ADD third_col text").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.t (k, v, new_col, third_col) VALUES (2, 'h2', 'w2', 't2')",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        state
+            .engine
+            .flush(&table_id)
+            .expect("flush after second ALTER + INSERT must not panic");
+
+        // Keep `dir` alive for the duration of the test so tempdir
+        // doesn't drop and unlink the SSTable directory underneath us.
+        drop(dir);
     }
 
     /// Temporal schema migrations use ALTER TABLE DROP.
