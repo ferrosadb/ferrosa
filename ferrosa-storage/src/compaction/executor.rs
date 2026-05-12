@@ -107,6 +107,17 @@ impl Drop for CompactionExecutor {
 }
 
 impl CompactionExecutor {
+    #[cfg(test)]
+    fn execute_task_observing<F>(
+        task: &CompactionTask,
+        observe_group_width: F,
+    ) -> std::result::Result<SSTableMetadata, String>
+    where
+        F: FnMut(usize),
+    {
+        Self::execute_task_inner(task, observe_group_width)
+    }
+
     /// Execute a single compaction task by merging input SSTables into one output.
     ///
     /// **Streaming compaction**: this function uses a k-way streaming merge
@@ -120,6 +131,16 @@ impl CompactionExecutor {
     /// header is built from the inputs' headers (bounded compute) rather
     /// than from a full data scan.
     fn execute_task(task: &CompactionTask) -> std::result::Result<SSTableMetadata, String> {
+        Self::execute_task_inner(task, |_| {})
+    }
+
+    fn execute_task_inner<F>(
+        task: &CompactionTask,
+        mut observe_group_width: F,
+    ) -> std::result::Result<SSTableMetadata, String>
+    where
+        F: FnMut(usize),
+    {
         use crate::flush::{FileFlushTarget, FlushTarget};
         use crate::merge;
         use ferrosa_sstable::io::FileReadAt;
@@ -321,6 +342,8 @@ impl CompactionExecutor {
                     });
                 }
             }
+
+            observe_group_width(group.len());
 
             let merged = merge::merge_partitions(group);
             merged_row_count += merged.rows.len();
@@ -829,6 +852,55 @@ mod tests {
             output_partitions.len(),
             10,
             "all 10 partitions must be readable from output SSTable"
+        );
+    }
+
+    #[test]
+    fn compaction_streaming_merge_only_holds_one_partition_per_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+
+        let inputs: Vec<_> = (0..3)
+            .map(|sstable_idx| {
+                let dir = tmp.path().join(format!("sstable_{sstable_idx}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                let partitions: Vec<_> = (0..200)
+                    .map(|i| {
+                        // Every SSTable has the same key sequence. The streaming
+                        // compactor may group duplicate keys across inputs, but
+                        // it must never materialize all 600 partitions at once.
+                        make_test_partition(
+                            &format!("shared_key_{i:04}"),
+                            &format!("value_{sstable_idx}_{i}"),
+                            1000 + sstable_idx,
+                        )
+                    })
+                    .collect();
+                write_sstable_to_dir(&dir, &partitions, &schema)
+            })
+            .collect();
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: inputs.clone(),
+            output_dir,
+            schema,
+            table_id: test_table_id(),
+        };
+
+        let mut max_group_width = 0;
+        let result = CompactionExecutor::execute_task_observing(&task, |width| {
+            max_group_width = max_group_width.max(width);
+        });
+
+        assert!(result.is_ok(), "compaction should succeed: {result:?}");
+        let meta = result.unwrap();
+        assert_eq!(meta.partition_count, 200);
+        assert_eq!(
+            max_group_width,
+            inputs.len(),
+            "streaming compaction may hold at most one partition per input for a key"
         );
     }
 }

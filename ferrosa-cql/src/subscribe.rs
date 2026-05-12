@@ -208,7 +208,10 @@ pub fn spawn_subscription_poll(
                         current_keyspace: &keyspace,
                         consistency: ferrosa_cluster::consistency::ConsistencyLevel::One,
                         serial_consistency: None,
-                        paging: crate::paging::PagingParams::default(),
+                        paging: crate::paging::PagingParams {
+                            page_size: Some(1_000),
+                            paging_state: None,
+                        },
                         client_address: String::new(),
                     };
 
