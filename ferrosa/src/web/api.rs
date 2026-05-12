@@ -584,6 +584,7 @@ mod tests {
             auth_enabled: false,
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
         };
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
         let registry = Arc::new(HandlerRegistry::new());
@@ -1136,6 +1137,7 @@ mod tests {
                 auth_enabled: false,
                 auth_warn: false,
                 max_pending_replay_mutations_without_schema: 1024,
+                memtable_num_shards: 64,
             };
             let storage = Arc::new(
                 ferrosa_storage::StorageEngine::new(storage_config, None).expect("storage engine"),

@@ -141,6 +141,14 @@ pub struct StorageEngineConfig {
     /// compatibility paths; exceeding it fails closed instead of rebuilding the
     /// original unbounded pending `Vec<Mutation>` OOM bug.
     pub max_pending_replay_mutations_without_schema: usize,
+    /// Number of memtable shards. Each shard is an independently-locked
+    /// `BTreeMap<DecoratedKey, Arc<Partition>>`; shard selection is
+    /// `key.token.0 as u64 % num_shards`, so writes to different shards
+    /// never contend. Increase on high-core-count nodes to reduce write
+    /// contention; decrease for very small VMs to save the per-shard
+    /// overhead. **Default: 64.** Honors `FERROSA_MEMTABLE_NUM_SHARDS`.
+    /// Must be > 0; values <= 0 in the env var fall back to the default.
+    pub memtable_num_shards: usize,
 }
 
 impl StorageEngineConfig {
@@ -228,6 +236,12 @@ impl StorageEngineConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1024);
 
+        let memtable_num_shards = std::env::var("FERROSA_MEMTABLE_NUM_SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64);
+
         Ok(Self {
             commit_log,
             compaction,
@@ -241,6 +255,7 @@ impl StorageEngineConfig {
             auth_enabled,
             auth_warn,
             max_pending_replay_mutations_without_schema,
+            memtable_num_shards,
         })
     }
 
@@ -271,6 +286,7 @@ impl StorageEngineConfig {
             // must flip this to true themselves.
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
         }
     }
 }
@@ -501,6 +517,13 @@ impl StorageEngine {
         config: StorageEngineConfig,
         runtime: Option<&tokio::runtime::Handle>,
     ) -> ferrosa_common::Result<Self> {
+        // Pin the process-wide memtable shard count from config. The
+        // sharded memtable's `with_default_shards()` reads this
+        // atomic, so every memtable created after this point honors
+        // FERROSA_MEMTABLE_NUM_SHARDS (or the explicit field on
+        // `StorageEngineConfig`).
+        crate::memtable::sharded::set_configured_num_shards(config.memtable_num_shards);
+
         // Ensure data directories exist.
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
@@ -10106,6 +10129,7 @@ mod tests {
 
         let config = StorageEngineConfig {
             max_pending_replay_mutations_without_schema: 1,
+            memtable_num_shards: 64,
             ..StorageEngineConfig::test_config(dir.path())
         };
         let err = match StorageEngine::open(config, None) {

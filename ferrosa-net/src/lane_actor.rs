@@ -42,8 +42,25 @@ use crate::reconnect::{
 };
 use crate::rpc::client::RpcClient;
 
-/// Channel capacity for lane actor commands.
-const LANE_CHANNEL_CAPACITY: usize = 256;
+/// Default channel capacity for lane actor commands. Read via
+/// `lane_channel_capacity()` so operators can tune via
+/// `FERROSA_LANE_CHANNEL_CAPACITY` without recompiling — the value was
+/// raised 64 → 256 to fix the Raft starvation bug
+/// (specs/in-process/bug-bulk-write-raft-starvation.md), and any
+/// future workload-specific tuning shouldn't require another rebuild.
+pub const DEFAULT_LANE_CHANNEL_CAPACITY: usize = 256;
+
+/// Resolved channel capacity. Looks up
+/// `FERROSA_LANE_CHANNEL_CAPACITY` once per call; any value that
+/// fails to parse or is zero falls back to
+/// `DEFAULT_LANE_CHANNEL_CAPACITY`.
+pub fn lane_channel_capacity() -> usize {
+    std::env::var("FERROSA_LANE_CHANNEL_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_LANE_CHANNEL_CAPACITY)
+}
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -288,7 +305,7 @@ pub fn spawn_lane_actor(
     initial_state: LaneState,
     ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext,
 ) -> LaneHandle {
-    let (tx, rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel(lane_channel_capacity());
     let handle = LaneHandle { tx, lane };
     let ctx = ctx_builder(handle.clone());
     tokio::spawn(lane_actor_loop(lane, initial_state, rx, ctx));
@@ -307,7 +324,7 @@ pub(crate) fn spawn_raft_lane_actor(
     peer_label: String,
     ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext + Send + 'static,
 ) -> LaneHandle {
-    let (tx, rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel(lane_channel_capacity());
     let handle = LaneHandle { tx, lane };
     let ctx = ctx_builder(handle.clone());
 

@@ -1317,6 +1317,7 @@ mod tests {
             auth_warn: false,
             write_verify: false,
             max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
     }

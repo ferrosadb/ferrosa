@@ -77,6 +77,7 @@ fn setup() -> (Arc<Schema>, Arc<StorageEngine>, TempDir) {
         auth_enabled: false,
         auth_warn: false,
         max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
     };
     let storage = Arc::new(StorageEngine::new(config, None).unwrap());
     let schema = Arc::new(

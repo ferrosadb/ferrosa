@@ -224,6 +224,7 @@ mod tests {
             auth_enabled: false,
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
         };
         let engine = StorageEngine::new(config, None).unwrap();
         engine.register_table(load_test_schema()).unwrap();
