@@ -100,22 +100,41 @@ impl ReorderBuffer {
     ///
     /// Returns messages sorted by `t0` (ascending). Messages whose
     /// `deadline(t0) <= now` are released.
+    ///
+    /// `deadline(t0)` is monotone in `t0` (the formula adds a constant), so
+    /// the ready prefix is contiguous. We locate the first non-ready key
+    /// and `split_off` once — O(log N + R) instead of O(N log N) per-key
+    /// removes, which matters when all entries are eligible (the hot path)
+    /// and the per-key remove fan-out otherwise dominates a benchmark.
     pub fn drain_ready(&mut self, now: Timestamp) -> Vec<Message> {
-        let mut ready = Vec::new();
-        // Collect keys whose deadline has passed.
-        let cutoff_keys: Vec<Timestamp> = self
+        // Locate the first key whose deadline has NOT yet passed. Everything
+        // strictly less than this key is releasable.
+        let first_not_ready = self
             .entries
             .keys()
             .copied()
-            .take_while(|&t0| self.timing.deadline(t0) <= now)
-            .collect();
+            .find(|&t0| self.timing.deadline(t0) > now);
 
-        for key in cutoff_keys {
-            if let Some(msgs) = self.entries.remove(&key) {
-                self.len -= msgs.len();
-                ready.extend(msgs);
+        let ready_entries = match first_not_ready {
+            // All keys are ready — take the whole map in one move.
+            None => std::mem::take(&mut self.entries),
+            // Split: `self.entries` keeps keys < cut (ready), `kept` holds
+            // keys >= cut (still pending). Swap so `self.entries` becomes
+            // the pending half.
+            Some(cut) => {
+                let kept = self.entries.split_off(&cut);
+                std::mem::replace(&mut self.entries, kept)
             }
+        };
+
+        // Flatten in t0 order. BTreeMap iterates ascending, so the resulting
+        // vector is sorted by t0; per-key arrival order is preserved within
+        // each bucket.
+        let mut ready = Vec::with_capacity(ready_entries.values().map(Vec::len).sum());
+        for (_t0, msgs) in ready_entries {
+            ready.extend(msgs);
         }
+        self.len -= ready.len();
         ready
     }
 
