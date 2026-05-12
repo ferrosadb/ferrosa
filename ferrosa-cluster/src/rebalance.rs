@@ -206,11 +206,11 @@ pub async fn execute_rebalance(
                 }
             };
 
-            // Group partitions by target node based on which tokens are
-            // being reassigned. A partition belongs to a reassignment if
-            // the token ring currently maps it to the local node AND its
-            // token is in the set being moved to a target.
-            let mut mutations_by_target: BTreeMap<u64, Vec<StreamedMutation>> = BTreeMap::new();
+            // Stream partitions directly to each target instead of grouping
+            // the whole table into a map-of-Vec first. A partition belongs to
+            // a reassignment if the token ring currently maps it to the local
+            // node AND its token is in the set being moved to a target.
+            let mut streamed_for_table = 0usize;
 
             for partition in &partitions {
                 let token = partition.key.token.0; // Token(i64) -> i64
@@ -244,52 +244,46 @@ pub async fn execute_rebalance(
                         .map(|(_, cv)| cv.timestamp)
                         .unwrap_or(0);
 
-                    mutations_by_target
-                        .entry(target_node_id)
-                        .or_default()
-                        .push(StreamedMutation {
-                            keyspace: ks.clone(),
-                            table: tbl.clone(),
-                            key: partition.key.key.as_bytes().to_vec(),
-                            row: row_bytes,
-                            timestamp: ts,
-                        });
+                    let target_uuid = ring
+                        .get_node(target_node_id)
+                        .map(|n| n.host_id)
+                        .unwrap_or_default();
+                    session_counter += 1;
+                    let mutation = StreamedMutation {
+                        keyspace: ks.clone(),
+                        table: tbl.clone(),
+                        key: partition.key.key.as_bytes().to_vec(),
+                        row: row_bytes,
+                        timestamp: ts,
+                    };
+
+                    if let Err(e) = StreamSender::send_stream(
+                        vec![mutation],
+                        peer_manager,
+                        target_uuid,
+                        session_counter,
+                        (i64::MIN, i64::MAX),
+                        local_node_id,
+                        &config,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %e,
+                            target = target_node_id,
+                            "rebalance: streaming failed for {ks}.{tbl}"
+                        );
+                    } else {
+                        streamed_for_table += 1;
+                    }
                 }
             }
 
-            // Send accumulated mutations to each target node.
-            for (target_node_id, mutations) in mutations_by_target {
-                let target_uuid = ring
-                    .get_node(target_node_id)
-                    .map(|n| n.host_id)
-                    .unwrap_or_default();
-
-                session_counter += 1;
-                let count = mutations.len();
-
-                if let Err(e) = StreamSender::send_stream(
-                    mutations,
-                    peer_manager,
-                    target_uuid,
-                    session_counter,
-                    (i64::MIN, i64::MAX),
-                    local_node_id,
-                    &config,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        %e,
-                        target = target_node_id,
-                        "rebalance: streaming failed for {ks}.{tbl}"
-                    );
-                } else {
-                    tracing::info!(
-                        target = target_node_id,
-                        count,
-                        "rebalance: streamed {ks}.{tbl} to node {target_node_id}"
-                    );
-                }
+            if streamed_for_table > 0 {
+                tracing::info!(
+                    count = streamed_for_table,
+                    "rebalance: streamed {ks}.{tbl} partition mutations"
+                );
             }
         }
 
