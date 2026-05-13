@@ -39,11 +39,11 @@ The fix list is large enough that we want to bundle it as a correctness program 
 | `hazards-cluster-formation.md` | Most P0/P1 hazards landed. P0-1 (DDL queueing during Forming), P1-1 (Mutex poison), P1-3 (mode CAS), P1-4 (Forming timeout), P1-5 (connection-direction roles) are still open and **roll into Sprint 1**. |
 | `jepsen-e2e-test-plan.md` | The plan stays. We add: (a) a one-line orchestrator wiring fix; (b) the six structural invariants in `raft-invariants.md`; (c) topology-mutating nemeses; (d) CI integration. Sprint 2. |
 | `decisions/003-raft-metadata.md` | Stands. ADR-014 (this plan, learner replicas) elaborates the "learners" sentence. |
-| `in-process/bug-raft-stale-candidate-runaway-term-no-prevote.md` | Subsumed by ADR-012 + Sprint 3. |
+| `archive/bugs-verified/bug-raft-stale-candidate-runaway-term-no-prevote.md` | Subsumed by ADR-012 + Sprint 3. |
 | Recovery-saga bugs in `implemented/` | Closed but inform invariant 9 in `raft-invariants.md`. |
 | Worktree `ferrosa-raft-fix` (uncommitted `SledLogStore::reset(path) -> ResetCounts`) | Lands in Sprint 1 alongside the runaway-term recovery story. |
 
-Read this document, then `raft-failure-mode-matrix.md`, then `raft-invariants.md`. ADRs 012-018 cover the design forks. Sprint scope files in `specs/in-process/sprint-NN-*` are written **after** this umbrella is reviewed.
+Read this document, then `raft-failure-mode-matrix.md`, then `raft-invariants.md`. ADRs 012-018 cover the design forks. Sprint scope files archived under `specs/archive/project-plans/raft-correctness-sprints/sprint-NN-*` are written **after** this umbrella is reviewed.
 
 ## Current state in one paragraph
 

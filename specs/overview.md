@@ -77,9 +77,9 @@ graph TB
 
 ## Design Principles
 
-1. **S3 as source of truth** — nodes are ephemeral, SSTables and index artifacts live in object storage
+1. **S3 as source of truth** — nodes are ephemeral, SSTables live in object storage
 1. **Bounded NVMe cache** — local disk improves performance but must not be required to hold full table or vector-index volume
-1. **CQL compatibility** — existing drivers and tools work unchanged
+1. **CQL compatibility target** — common drivers and tools are supported incrementally
 1. **Rust-native** — idiomatic Rust with clean ownership, not a Java transliteration
 1. **Cassandra's consistency model** — tunable CL (ONE, QUORUM, ALL) preserved
 1. **Serializable transactions** — Accord consensus for LWT and multi-statement transactions
@@ -119,7 +119,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: All 12 crates are implemented and functional. **Accord consensus transactions** are fully implemented (7 sprints, 2,808 tests): AccordStateMachine, AccordCoordinator (fast/slow path), LWT (INSERT IF NOT EXISTS, IF conditions on UPDATE/DELETE), BEGIN TRANSACTION/COMMIT/ROLLBACK, cross-shard conflict detection, Jepsen-style linearizability testing, electorate reconfiguration, crash recovery, and 9 observability metrics. The production cluster sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance), reconnection, and integration tests. The graph engine is fully complete: Cypher parser, expression evaluator, aggregation framework, variable-length paths, SUBSCRIBE/UNSUBSCRIBE with SSE streaming, leapfrog triejoin, and Bolt v5 wire protocol. UDF/UDA with WASM sandboxing is complete and integrated with Accord transactions (18 tests). Secondary and vector indexes are consolidated with a full query planner pipeline, including transactional index reads (READ_2I, 5-layer merge). Point-in-time recovery is implemented: commit log archiving to S3, snapshot management, point-in-time restoration, CLI tooling, and web console integration. CQL driver compatibility is verified with cdrs-tokio, supporting protocol v4 and v5 negotiation. The `vector<float, N>` type enables embedding storage for AI/ML workloads. Phonetic indexes with Double Metaphone support fuzzy text search. The `system_observability` virtual tables expose live system state for monitoring. The `ferrosa` binary composes everything into a cluster-mode database with background maintenance, graceful shutdown, per-connection backpressure, PITR archiving, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases.
+**Current progress**: Ferrosa is a developer-preview 18-crate workspace. Core storage/CQL, Raft metadata, graph/SPARQL experiments, index paths, PITR building blocks, and Accord transaction components exist in source and specs. Public production-readiness, Jepsen-verified behavior, complete observability backing, arbitrary `SUBSCRIBE` delivery, and full CQL/query conformance remain verification or open work. Current public docs should describe supported developer-preview paths and link unsupported topics to `todo/`, `proposed/`, or `verified-test-plan/` instead of presenting them as guarantees.
 
 ## Key Architectural Decisions
 
@@ -128,7 +128,7 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 | Deployment | AWS-first, flag lock-in | Start concrete, stay portable |
 | Storage | Write-behind async S3 | Minimal write latency, quorum mitigates loss window |
 | SSTable | Phased: BTI read+write first, Big read later | Focus on modern format, migration path preserved |
-| Protocol | CQL client compat, own internode | Apps work unchanged, clean internal design |
+| Protocol | CQL client compatibility target, own internode | Common driver paths work; full conformance remains tracked work |
 | Consensus | Raft metadata, tunable CL | Proven Rust libs + Cassandra semantics |
 | Transactions | Accord consensus (serializable) | Cassandra 5.x compatible, no dedicated coordinator |
 | Partitioner | Murmur3Partitioner | Cassandra SSTable compatibility |
@@ -176,7 +176,7 @@ The ferrosa binary hosts an Axum web server on port 9090 (`web/` module) that pr
 
 Two new CQL commands support real-time push-based monitoring:
 
-- **`SUBSCRIBE`** — register for streaming updates on virtual table changes (backed by `subscribe.rs` in ferrosa-cql)
+- **`SUBSCRIBE`** — parser/storage observer pieces exist; arbitrary-query streaming delivery remains open/partly covered
 - **`UNSUBSCRIBE`** — cancel an active subscription
 
 The `subscription_observer.rs` in ferrosa-storage bridges storage events into the subscription system, pushing updates to connected clients as state changes occur.
@@ -194,7 +194,7 @@ Deferred but tracked for future investigation:
 
 | Area | Options | Status |
 |------|---------|--------|
-| Distributed transactions | Accord consensus | **Implemented** — 7 sprints (A1-A7), 2,808 tests, Jepsen-verified |
+| Distributed transactions | Accord consensus | Implementation exists; public Jepsen verification remains a test-plan/evidence item |
 | Clock synchronization | HLC (Hybrid Logical Clock) | **Implemented** — HLC timestamps for Accord transaction ordering |
 | Transport protocol | QUIC (`quinn` crate) | Research — better for multi-DC, built-in multiplexing |
 | Native SSTable format | S3-optimized: larger blocks, content-addressed, embedded metadata | Research — behind feature flag, after BTI is solid |
@@ -215,5 +215,5 @@ Deferred but tracked for future investigation:
 - [Components](components.md) — crate architecture details
 - [SSTable](sstable.md) — BTI format, trie encoding, I/O traits, compression
 - [Data Flow](data-flow.md) — write/read paths, Accord transaction flow, and S3 lifecycle
-- [Accord](accord.md) — Accord consensus protocol specification
+- [Accord](archive/accord.md) — Accord consensus protocol specification
 - [Testing](testing.md) — test infrastructure and suites

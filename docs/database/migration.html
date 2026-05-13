@@ -313,7 +313,7 @@
   </table>
 
   <div class="note">
-    <strong>Important:</strong> Ferrosa is <em>client-compatible</em> (CQL drivers work unchanged)
+    <strong>Important:</strong> Ferrosa targets CQL client compatibility for common driver paths
     but <em>not cluster-compatible</em> (a Ferrosa node cannot join an existing Cassandra ring).
     Migration is done by importing data, not by mixed-version rolling upgrades.
   </div>
@@ -546,7 +546,7 @@ stmt_f = ferro.prepare(query)
       <tr>
         <td>Real-time pub/sub</td>
         <td>CDC (requires Kafka/Debezium)</td>
-        <td>Built-in SUBSCRIBE with EVERY/DELTA modes</td>
+        <td>Experimental SUBSCRIBE syntax with EVERY/DELTA modes</td>
       </tr>
       <tr>
         <td>Graph queries</td>

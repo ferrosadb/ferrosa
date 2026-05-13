@@ -32,7 +32,7 @@ in CI.
 
 ## Sprint 5 status
 
-See `specs/in-process/sprint-05-progress.md` for per-WI status and
+See `specs/archive/project-plans/raft-correctness-sprints/sprint-05-progress.md` for per-WI status and
 the `specs/tla/raft.tla` spec the refinement check (W5.10) verifies
 the simulator against.
 

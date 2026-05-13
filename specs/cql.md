@@ -784,5 +784,5 @@ ferrosa-cql/
 - [Overview](overview.md) — system overview
 - [Components](components.md) — crate architecture
 - [Storage](storage.md) — storage engine (StorageStatsProvider, SubscriptionObserver)
-- [Accord](accord.md) — Accord consensus protocol (LWT and transaction routing)
+- [Accord](archive/accord.md) — Accord consensus protocol (LWT and transaction routing)
 - [ADR-006](decisions/006-cql-architecture.md) — CQL architectural decisions

@@ -1,10 +1,10 @@
 # Ferrosa Suite Documentation
 
-User-facing documentation for Ferrosa Database and Ferrosa Memory.
+Public developer-preview documentation for Ferrosa Database and Ferrosa Memory. These pages describe install and getting-started flows; implementation specs stay in the repository-level `specs/` tree.
 
 ## Products
 
-- [Ferrosa Database](database/) — distributed database docs, examples, CQL, Cypher, SPARQL, and migration guides.
+- [Ferrosa Database](database/) — developer-preview database docs, examples, CQL/Cypher/SPARQL notes, and migration guidance.
 - [Ferrosa Memory](ferrosa-memory/) — developer-preview long-context linked memory for agents.
 - [Ferrosa Memory Getting Started](ferrosa-memory/getting-started.html) — run the local stack, connect MCP clients, and try memory examples.
 
@@ -17,4 +17,4 @@ User-facing documentation for Ferrosa Database and Ferrosa Memory.
 
 ## For Developers
 
-Technical implementation specs live in [`specs/`](../specs/README.md).
+Internal architecture specs, TODOs, verification plans, and historical analyses live in [`specs/`](../specs/README.md). They are not public release guarantees.

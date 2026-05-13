@@ -103,7 +103,7 @@ graph BT
 - **Key interfaces**: Two trait APIs — secondary indexes use `IndexFactory`/`IndexBuilder`/`IndexReader` with partition/clustering key addressing; vector indexes use their own trait set in `vector::` module with byte-offset `RowPosition` and `nearest(query, k, ef_search)` for ANN queries. Storage-attached design — indexes are per-SSTable companion files built asynchronously after flush. HVQ will add an object-backed artifact reader whose row identity includes SSTable generation/build id so `.qvec` pages can be read from S3 without local full-file residency.
 - **Vector index type**: `IndexType::Vector` registered in the factory for `CREATE INDEX ... USING 'vector'` DDL.
 - **Phonetic encoder public API**: `PhoneticEncoder` trait and Double Metaphone algorithm are public, usable outside of index builds.
-- **Spec**: [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
+- **Spec**: Secondary Indexes Design was imported from the historical `superpowers/specs/2026-03-14-secondary-indexes-design.md` notes; current implementation evidence is in [Secondary Index Pipeline](secondary-index-pipeline.md).
 
 ### ferrosa-index-builder
 
@@ -425,4 +425,4 @@ gantt
 - [Data Flow](data-flow.md) — write/read paths, Accord transaction flow
 - [Storage](storage.md) — storage engine details
 - [CQL](cql.md) — CQL native protocol v4/v5
-- [Accord](accord.md) — Accord consensus protocol specification
+- [Accord](archive/accord.md) — Accord consensus protocol specification

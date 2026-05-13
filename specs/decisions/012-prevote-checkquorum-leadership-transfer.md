@@ -150,7 +150,7 @@ Total Sprint 3 budget: 1 sprint (~10 working days) by one engineer plus review.
 - CockroachDB issue #92088, PR #104042.
 - etcd PR #9352 (Raft Pre-Vote enablement).
 - openraft discussion #15 ("get rid of pre-vote RPC").
-- `specs/in-process/bug-raft-stale-candidate-runaway-term-no-prevote.md`.
+- `specs/archive/bugs-verified/bug-raft-stale-candidate-runaway-term-no-prevote.md`.
 - `specs/raft-correctness-plan.md` Sprint 3.
 - `specs/raft-invariants.md` I-04, I-31.
 - `specs/raft-failure-mode-matrix.md` S-15, S-19, S-20, S-21, S-27.

@@ -4,7 +4,7 @@ Guidance for Claude Code working in this repository.
 
 ## Project Overview
 
-Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed storage. All 13 core crates are complete. Current work focuses on correctness sprints, cluster formation, UCS compaction, and the remote index builder.
+Ferrosa is a developer-preview Rust reimplementation of an Apache-Cassandra-shaped database with S3-backed storage. The workspace currently has 18 crates. Current work focuses on correctness evidence, cluster formation hardening, UCS compaction, and the remote index builder.
 
 ## Workspace
 
@@ -39,9 +39,12 @@ cargo fmt --check                    # Format check
 ## Directory Layout
 
 - **`docs/`** — PUBLIC marketing site (ferrosadb.com) via GitHub Pages. HTML/CSS/SVG only. **Never put specs, rustdoc, or internal content here.**
-- **`specs/`** — Architecture specs, threat models, active project plans. See [specs/README.md](specs/README.md).
-- **`specs/todo/`** — Work items awaiting implementation (bugs + features).
-- **`specs/in-process/`** — Active work items.
+- **`specs/`** — Internal architecture specs, threat models, plans, proposed/open work, and evidence indexes. See [specs/README.md](specs/README.md).
+- **`specs/proposed/`** — Design proposals and investigations, not implemented release claims.
+- **`specs/todo/`** — Open work items awaiting implementation or triage.
+- **`specs/in-process/`** — Only actively owned work items.
+- **`specs/implemented/`** — Implementation evidence awaiting final verification/archive.
+- **`specs/verified-test-plan/`** — Ambiguous items that need a live verification run before being declared fixed.
 - **`specs/archive/`** — Completed plans, fixed bugs, historical analysis.
 - **`specs/decisions/`** — Architecture Decision Records (ADRs).
 - **`cassandra/`** — Git submodule of Apache Cassandra 5.1 (behavioral reference only).
@@ -64,7 +67,7 @@ Active work areas:
 - **Cluster formation**: state machine, formation protocol ([specs/cluster-formation-architecture.md](specs/cluster-formation-architecture.md))
 - **UCS compaction**: unified compaction strategy ([specs/ucs-compaction-architecture.md](specs/ucs-compaction-architecture.md))
 - **Remote index builder**: standalone binary, engine backend modes ([specs/remote-index-build-backend.md](specs/remote-index-build-backend.md))
-- **Correctness**: 5 bugs in [specs/in-process/](specs/in-process/), C4/C8 sprints remaining
+- **Correctness**: open work in [specs/todo/](specs/todo/) and verification-only items in [specs/verified-test-plan/](specs/verified-test-plan/)
 
 ## Development Process
 

@@ -3,7 +3,7 @@
 > Created: 2026-04-02
 > Status: S1-S3 Complete, S4 Active
 > Focus: Fix all remaining hazards, complete NTS support, close correctness gaps
-> Predecessor: [project-plan-cluster-formation.md](project-plan-cluster-formation.md), [project-plan-correctness-sprints.md](project-plan-correctness-sprints.md)
+> Predecessor: [project-plan-cluster-formation.md](project-plan-cluster-formation.md), [project-plan-correctness-sprints.md](archive/project-plans/project-plan-correctness-sprints.md)
 
 ---
 

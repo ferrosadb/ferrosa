@@ -913,7 +913,7 @@ CQL connections use RAII `IpSlotGuard` — per-IP connection slots are released 
 
 - [Overview](overview.md) — system overview
 - [Components](components.md) — crate architecture
-- [Accord](accord.md) — Accord consensus protocol specification
+- [Accord](archive/accord.md) — Accord consensus protocol specification
 - [Cluster Formation Architecture](cluster-formation-architecture.md) — detailed formation spec
 - [Cluster Formation State Machine](cluster-formation-state-machine.md) — state machine design
 - [Testing](testing.md) — data integrity and chaos tests
