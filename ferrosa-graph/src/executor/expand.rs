@@ -2760,8 +2760,9 @@ async fn adjacency_write_with_retry(
     // Total budget is ~3 seconds across 6 attempts: 100, 200, 400, 800,
     // 1600 ms. Picks up where DDL_AGREEMENT_APPLY_DRAIN (50 ms) stops.
     const BACKOFFS_MS: &[u64] = &[100, 200, 400, 800, 1600];
-    let mut last_err: Option<ferrosa_common::Error> = None;
-    for attempt in 0..=BACKOFFS_MS.len() {
+    let mut attempt = 0usize;
+    let mut backoffs = BACKOFFS_MS.iter().copied();
+    loop {
         match write_path
             .write(
                 adj_table_id,
@@ -2784,7 +2785,7 @@ async fn adjacency_write_with_retry(
                 return Ok(());
             }
             Err(e) => {
-                if !is_transient_replica_lag(&e) || attempt == BACKOFFS_MS.len() {
+                if !is_transient_replica_lag(&e) {
                     return Err(GraphError::Storage(ferrosa_common::Error::InvalidData(
                         format!(
                             "failed to write derived adjacency row for {}.{}: {e}",
@@ -2792,7 +2793,17 @@ async fn adjacency_write_with_retry(
                         ),
                     )));
                 }
-                let backoff_ms = BACKOFFS_MS[attempt];
+                let Some(backoff_ms) = backoffs.next() else {
+                    // Retry budget exhausted — surface the last transient error
+                    // so the operator sees the actual cluster state.
+                    return Err(GraphError::Storage(ferrosa_common::Error::InvalidData(
+                        format!(
+                            "failed to write derived adjacency row for {}.{} after \
+                             {attempt} retries: {e}",
+                            edge_table_id.keyspace, edge_table_id.table
+                        ),
+                    )));
+                };
                 tracing::warn!(
                     adj_table = %adj_table_id,
                     attempt = attempt + 1,
@@ -2800,23 +2811,11 @@ async fn adjacency_write_with_retry(
                     %e,
                     "adjacency write hit replica schema lag — retrying"
                 );
-                last_err = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                attempt += 1;
             }
         }
     }
-    // Unreachable: the loop returns on the last attempt either way, but keep
-    // a fail-loud branch in case BACKOFFS_MS is ever set to empty.
-    Err(GraphError::Storage(ferrosa_common::Error::InvalidData(
-        format!(
-            "failed to write derived adjacency row for {}.{}: {}",
-            edge_table_id.keyspace,
-            edge_table_id.table,
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        ),
-    )))
 }
 
 /// Distinguish a transient replica-schema-lag write timeout (retryable) from

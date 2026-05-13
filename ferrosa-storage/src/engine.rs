@@ -3585,11 +3585,25 @@ impl StorageEngine {
                         uploaded += 1;
                     }
                     Ok(Err(msg)) => {
-                        tracing::error!(
-                            table = table_id_str,
-                            sstable = gen_str,
-                            "S3 upload failed — NOT adding to manifest: {msg}"
-                        );
+                        // "skipped: source compacted away before upload" is the
+                        // race signal from the upload worker: the SSTable was
+                        // already merged into a successor by compaction
+                        // between the scan and the read, and the new file gets
+                        // uploaded under its own generation. Log INFO and
+                        // skip — this is normal operation, not a failure.
+                        if msg.starts_with("skipped: source compacted away") {
+                            tracing::info!(
+                                table = table_id_str,
+                                sstable = gen_str,
+                                "S3 upload skipped — SSTable compacted away before sync"
+                            );
+                        } else {
+                            tracing::error!(
+                                table = table_id_str,
+                                sstable = gen_str,
+                                "S3 upload failed — NOT adding to manifest: {msg}"
+                            );
+                        }
                     }
                     Err(_) => {
                         tracing::error!(
