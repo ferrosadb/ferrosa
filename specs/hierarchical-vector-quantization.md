@@ -1,13 +1,15 @@
-# Hierarchical Vector Quantization for NVMe-Resident ANN
+# Hierarchical Vector Quantization for S3-Durable, NVMe-Cached ANN
 
-> Last updated: 2026-05-12
+> Last updated: 2026-05-13
 > Status: Draft / design investigation
 
 ## Executive Summary
 
-Ferrosa currently stores flushed vector indexes as per-SSTable JSON sidecars that contain full `f32` vectors for HNSW and IVFFlat. That is correct for small sidecars, but it does not scale to a 100B-vector target: every searched sidecar must be read and decoded as full precision before it can narrow the candidate set.
+Ferrosa currently stores flushed vector indexes as per-SSTable JSON sidecars that contain full `f32` vectors for HNSW. `ferrosa-index` also has an IVFFlat implementation with the same whole-file/full-vector shape, but `ferrosa-storage`'s flushed vector sidecar path currently builds and searches HNSW only. That is correct for small sidecars, but it does not scale to a 100B-vector target: every searched sidecar must be read and decoded as full precision before it can narrow the candidate set.
 
-This spec proposes a hierarchical quantized vector index: store progressively more precise vector representations (`Q1 -> Q2 -> Q4 -> Q8 -> F32` or residual/PQ equivalents) in NVMe-resident sidecar pages, use coarse tiers to eliminate most candidates with bounded reads, then fetch finer tiers only for survivors. The first implementation should be an additive index method (`quantized_hnsw` or `hnsw_quantized`) rather than a rewrite of existing HNSW/IVFFlat.
+This spec proposes a hierarchical quantized vector index: store progressively more precise vector representations (`Q1 -> Q2 -> Q4 -> Q8 -> F32` or residual/PQ equivalents) in S3-durable, page-addressable `.qvec` objects, use bounded NVMe cache only for hot manifests/routing/pages, eliminate most candidates with bounded object-range reads, then fetch finer tiers only for survivors. The first implementation should be an additive index method (`quantized_ivf_flat` first, then `quantized_hnsw`) rather than a rewrite of existing HNSW/IVFFlat.
+
+Important invariant: local compute-node disk is not assumed to hold the full vector index. S3-compatible object storage is authoritative and durable; NVMe is a bounded, evictable cache.
 
 ## Current Codebase Findings
 
@@ -32,10 +34,8 @@ This spec proposes a hierarchical quantized vector index: store progressively mo
 ### Current flush/search path
 
 - `TableStore::flush()` drains each `VectorMemtableIndex` and writes one `{gen}-VEC-{index_name}.db` sidecar per SSTable generation.
-- Persistent vector sidecar method dispatch currently supports:
-  - `IndexMethod::Hnsw { m, ef_construction }`
-  - `IndexMethod::IvfFlat { lists }`
-- `TableStore::ann_search()` searches the active memtable, then loops all SSTable generation IDs, reads each vector sidecar with `flush_target.read_vector_sidecar(gen, index_name)`, dispatches to HNSW or IVFFlat decoder, merges by `position.offset`, sorts by score, and truncates to `k`.
+- Persistent vector sidecar dispatch in `ferrosa-storage` currently builds and searches HNSW sidecars only. `ferrosa-index` has IVFFlat code, but the storage flush/search path does not currently persist IVFFlat vector sidecars.
+- `TableStore::ann_search()` searches the active memtable, then loops all SSTable generation IDs, reads each vector sidecar with `flush_target.read_vector_sidecar(gen, index_name)`, dispatches to the HNSW decoder, merges by `position.offset`, sorts by score, and truncates to `k`. This is a correctness and scale seam: offsets can collide across generations, and the current file-backed `FlushTarget` writes vector sidecars but does not provide a matching remote/object-range read path.
 - `FlushTarget::write_vector_sidecar/read_vector_sidecar` currently treat the whole sidecar as one byte blob. File-based sidecars are named `{generation}-VEC-{index_name}.db`.
 
 ### Hotspots
@@ -59,25 +59,33 @@ At 100B vectors, full precision sidecars are untenable:
   - 100B x 1536 dims x 4 bytes = 614.4 TB before metadata.
 - JSON adds unacceptable overhead and decode CPU.
 - Existing `ann_search()` reads per-SSTable whole sidecars, which becomes an O(number-of-SSTables * sidecar-size) anti-pattern.
+- Data volume can exceed the local disk capacity of any compute node. A correct design cannot require all quantized sidecars, F32 rerank pages, or candidate tiers to be locally resident before query execution.
+- Existing storage architecture is S3-first/write-behind; vector index sidecars must follow the same durability model rather than becoming a local-only exception.
 - HNSW and IVFFlat both currently store full vectors at their leaf/candidate layer.
 
-The design goal is not merely smaller storage. It is fewer NVMe reads per query by matching representation precision to search phase.
+The design goal is not merely smaller storage. It is bounded bytes read per query across a two-tier storage model: S3/object storage as durable backing, NVMe as a bounded cache, and representation precision matched to search phase.
 
 ## Design Goals
 
 1. Keep all existing vector index methods working.
-1. Add a new method whose on-disk format is page-addressable, binary, and versioned.
+1. Add a new method whose durable format is page-addressable, binary, versioned, and S3/object-store addressable.
+1. Make every quantized index artifact S3-durable before it is advertised in table/index manifests.
+1. Support object-range reads for manifests, page tables, routing pages, quantized tiers, and optional F32/residual pages.
+1. Treat NVMe as an optional bounded cache, not a correctness requirement.
+1. Continue serving queries when total index data exceeds compute-node disk by fetching cold pages from S3 on demand.
+1. Define cache admission, eviction, rehydration, and fail-loud behavior for cache misses and S3 read failures.
 1. Store coarse quantized representations in upper/coarse routing nodes.
 1. Fetch more precise representations only after candidate narrowing.
 1. Keep exact `f32` vectors optional and cold; use them only for final rerank when configured.
 1. Make cost/recall tunable per query and per index.
-1. Avoid global in-memory graph requirements. The reader may cache manifests, routing summaries, and hot top-level pages, but not all vectors.
+1. Avoid global in-memory graph requirements. The reader may cache manifests, routing summaries, and hot top-level pages in NVMe/RAM, but must never require all vectors or all tier pages to fit locally.
 1. Preserve fail-loud behavior: unknown format, missing tier page, dimension mismatch, or corrupted checksum returns an error and records telemetry.
 
 ## Non-Goals for First Implementation
 
 - No mutation-in-place of an existing quantized sidecar. Build immutable sidecars during flush or remote index build.
-- No global 100B index across all SSTables in v1. The first cut remains per-SSTable sidecars, then adds a higher-level manifest/fanout layer later.
+- No global 100B index across all SSTables in v1. The first cut remains per-SSTable artifacts, then adds a higher-level manifest/fanout layer later.
+- No assumption that one node's NVMe can contain all sidecars for its assigned SSTables. Even v1 per-SSTable artifacts must be readable from S3 object ranges with local caching.
 - No GPU requirement.
 - No approximate delete handling beyond current SSTable/tombstone semantics.
 - No replacement of scalar secondary index machinery.
@@ -89,19 +97,26 @@ flowchart TD
     W[Writes] --> M[VectorMemtableIndex<br/>brute-force bounded RAM]
     M --> F[Flush / remote index build]
     F --> B[Quantized builder]
-    B --> MAN[manifest.qvec]
-    B --> T1[Q1/Q2 routing pages<br/>NVMe hot]
-    B --> T4[Q4 candidate pages<br/>NVMe warm]
-    B --> T8[Q8 refine pages<br/>NVMe cold]
-    B --> FP[F32 residual/final pages<br/>optional cold]
+    B --> S3MAN[S3 .qvec manifest/page table]
+    B --> S3T1[S3 Q1/Q2 routing pages]
+    B --> S3T4[S3 Q4 candidate pages]
+    B --> S3T8[S3 Q8 refine pages]
+    B --> S3FP[S3 F32/residual pages<br/>optional]
+
+    S3MAN --> CACHE[Bounded NVMe cache]
+    S3T1 --> CACHE
+    S3T4 --> CACHE
+    S3T8 --> CACHE
+    S3FP --> CACHE
 
     Q[ANN query] --> R[Quantized reader]
-    R --> MAN
-    R --> T1
-    R --> T4
-    R --> T8
-    R --> FP
-    R --> OUT[top-k RowPosition]
+    R --> CACHE
+    CACHE -->|miss: Range GET| S3MAN
+    CACHE -->|miss: Range GET| S3T1
+    CACHE -->|miss: Range GET| S3T4
+    CACHE -->|miss: Range GET| S3T8
+    CACHE -->|miss: Range GET| S3FP
+    R --> OUT[top-k VectorRowRef]
 ```
 
 ### Components
@@ -129,10 +144,20 @@ struct QuantizedVectorManifest {
     dimensions: u16,
     metric: DistanceMetric,
     method: QuantizedMethod,     // HNSW, IVFFlat, IVF_HNSW, future
+    storage: QuantizedStorageDescriptor,
     tiers: Vec<QuantizedTier>,
     routing_root: PageId,
     row_count: u64,
+    manifest_generation: u64,
     checksum: u32,
+}
+
+struct QuantizedStorageDescriptor {
+    durable_backend: DurableBackend, // S3-compatible object store in production
+    object_key: String,              // canonical .qvec object key
+    object_etag: Option<String>,
+    object_size: u64,
+    local_cache_policy: CachePolicyId,
 }
 
 struct QuantizedTier {
@@ -140,15 +165,88 @@ struct QuantizedTier {
     page_size: u32,              // e.g. 4 KiB, 16 KiB, 64 KiB
     page_count: u64,
     codec: CodecId,
+    object_key: String,
     byte_range: ByteRange,
+    page_index_range: Range<u64>,
+    checksum: u32,
 }
 ```
 
 #### `QuantizedPageStore`
 
-A page-addressable sidecar reader/writer abstraction. It should not require reading the entire sidecar into memory.
+A page-addressable reader/writer abstraction over durable object storage plus an optional local NVMe cache. It must not require reading the entire sidecar into memory or materializing the full sidecar on local disk.
 
-First version can wrap local files under the existing flush target directory. Later versions can map the same page API to S3 object ranges or an NVMe cache manager.
+Required backends:
+
+- `ObjectRangePageStore`: reads `.qvec` page byte ranges from S3-compatible object storage using ranged GETs.
+- `NvmeCachePageStore`: wraps the object-range store with bounded local cache admission and eviction.
+- `FilePageStore`: test/prototype backend only; implements the same range-read contract.
+
+Cache misses are normal. A miss should issue an object-range read, verify checksum, optionally admit the page to NVMe cache, and return the page. S3/object read failure, checksum mismatch, short read, wrong object generation, or missing page must fail loudly; never return partial or empty results as success.
+
+#### S3 durability and object layout
+
+S3-compatible object storage is the durable source of truth for `.qvec` artifacts. Local files and NVMe pages are cache entries only.
+
+Requirements:
+
+1. A quantized index is not visible to query planning until object upload completes, object checksum/metadata is recorded, and the table/index manifest publish succeeds.
+1. Upload must be atomic from the reader perspective: readers either see the old index generation or the fully uploaded new generation.
+1. `.qvec` objects must support HTTP/S3 Range GET for the manifest/header, page table, routing pages, tier pages, and optional F32/residual pages.
+1. Object metadata should include checksum, format version, table/index/generation identity, and build id.
+1. Compaction must publish replacement `.qvec` objects before removing old objects from the live manifest.
+1. Garbage collection of old quantized objects must follow the same manifest/liveness rules as SSTable components.
+
+The implementation should align with existing storage primitives:
+
+- `object_store::ObjectStore` for durable remote reads/writes.
+- `ferrosa-storage/src/upload/manager.rs` `UploadTask::IndexFiles` for uploading index artifacts.
+- `hex_prefix_for` and `sstable_object_key` path conventions for object distribution.
+- `ferrosa_sstable::io::ReadAt` for range-addressable data access.
+- `LocalCache` as cache bookkeeping to extend for vector artifacts.
+- `IndexBuildBackend`, `RemoteBackend`, and `IndexBuildResult::sidecar_written_to_s3` for remote builder integration.
+
+Suggested logical object key:
+
+```text
+{s3_prefix}/indexes/{table_id}/{sstable_generation}/{index_name}/{build_id}.qvec
+```
+
+#### NVMe cache and eviction requirements
+
+NVMe is a bounded cache, not durability.
+
+Requirements:
+
+1. Correctness must not depend on any page remaining cached.
+1. Cache keys must include object key, generation/build id, byte range/page id, tier, and checksum/version.
+1. Admission policy should prefer manifests/page tables, top-level routing pages, frequently hit Q2/Q4 pages, and only selectively admit Q8/F32 pages.
+1. Eviction policy must be deterministic and observable; LRU or TinyLFU is acceptable for v1.
+1. Rehydration must fetch the required byte range, not the whole object.
+1. Cache must expose metrics for hit/miss/eviction/fill bytes and S3 range-read latency.
+
+#### Index artifact manifest
+
+The existing SSTable manifest/discovery paths focus on SSTable components. Quantized vector artifacts need explicit manifest entries or an equivalent index-artifact manifest so remote-built sidecars are durable and discoverable without scanning local directories.
+
+Suggested fields:
+
+```rust
+struct IndexArtifactManifestEntry {
+    table_id: TableId,
+    sstable_generation: u64,
+    index_name: String,
+    artifact_kind: IndexArtifactKind, // vector_hnsw, hvq_qvec, fti, future
+    object_key: String,
+    format_version: u16,
+    object_size: u64,
+    checksum: u32,
+    build_id: BuildId,
+    build_epoch: u64,
+}
+```
+
+This manifest is the bridge that makes `sidecar_written_to_s3 = true` safe: the query path must be able to resolve and range-read the S3 artifact even when no local file exists.
 
 #### Query planner
 
@@ -213,7 +311,7 @@ This is the easier first target than HNSW because it minimizes graph traversal e
 
 ## Sidecar Layout
 
-Replace one JSON blob with a small manifest plus binary tier pages. One physical file is simplest for atomicity; multiple files are simpler for debugging. Suggested v1: one `.qvec` file with internal byte ranges.
+Replace one JSON blob with a small manifest plus binary tier pages. Suggested v1: one logical `.qvec` object per SSTable/index generation with internal byte ranges. The object may be cached partially or wholly on NVMe, but the canonical copy is S3-durable. Multiple physical objects per tier can be considered later if S3 range-read behavior, object size limits, or independent tier lifecycle justify it.
 
 ```text
 {gen}-VEC-{index_name}.qvec
@@ -230,6 +328,12 @@ Replace one JSON blob with a small manifest plus binary tier pages. One physical
 
 The existing `{gen}-VEC-{index_name}.db` can remain for JSON HNSW/IVFFlat. New method should use `.qvec` or a magic header so decode never guesses.
 
+Canonical object layout should be manifest-addressable rather than local-directory-scanned. A v1 path can use:
+
+```text
+{s3_prefix}/indexes/{table_id}/{sstable_generation}/{index_name}/{build_id}.qvec
+```
+
 ## Query Flow
 
 ```mermaid
@@ -237,18 +341,25 @@ sequenceDiagram
     participant CQL as CQL executor
     participant Store as TableStore::ann_search
     participant Reader as QuantizedReader
-    participant NVMe as NVMe/PageStore
+    participant Cache as NVMe Cache
+    participant S3 as S3 Object Store
 
     CQL->>Store: ANN query, k, ef_search
     Store->>Reader: nearest(query, budget)
-    Reader->>NVMe: read manifest + hot routing pages
+    Reader->>Cache: read manifest + hot routing pages
+    Cache->>S3: Range GET on cache miss
+    S3-->>Cache: page bytes + metadata
+    Cache->>Cache: verify checksum and admit/evict
     Reader->>Reader: coarse search with Q1/Q2
-    Reader->>NVMe: fetch Q4 pages for survivors
+    Reader->>Cache: fetch Q4 pages for survivors
+    Cache->>S3: Range GET on cache miss
     Reader->>Reader: prune candidate set
-    Reader->>NVMe: fetch Q8 pages
+    Reader->>Cache: fetch Q8 pages
+    Cache->>S3: Range GET on cache miss
     Reader->>Reader: refine candidates
     alt exact_rerank
-        Reader->>NVMe: fetch F32/residual pages
+        Reader->>Cache: fetch F32/residual pages
+        Cache->>S3: Range GET on cache miss
         Reader->>Reader: exact score top candidates
     end
     Reader-->>Store: top-k positions + scores
@@ -270,6 +381,10 @@ enum IndexMethod {
         m: Option<usize>,          // for HNSW
         ef_construction: Option<usize>,
         exact_rerank: bool,
+        storage: QuantizedStorageMode, // s3_backed | local_test_only
+        cache_policy: CachePolicy,
+        max_local_cache_bytes: Option<u64>,
+        max_object_range_bytes_per_query: Option<u64>,
     },
 }
 ```
@@ -284,7 +399,10 @@ CREATE INDEX idx_embed ON docs (embedding) USING 'vector'
         'metric': 'cosine',
         'tiers': 'q2,q4,q8,f32',
         'lists': '65536',
-        'exact_rerank': 'true'
+        'exact_rerank': 'true',
+        'storage': 's3_backed',
+        'cache_policy': 'routing_hot_lru',
+        'max_page_reads': '512'
     };
 ```
 
@@ -303,12 +421,13 @@ Questions before locking the public DDL:
 1. Establish recall@k and latency baselines for full precision.
 1. Add instrumentation for candidates scanned, sidecar bytes read, page reads, and rerank count.
 
-### Phase 1 — Binary Page Container
+### Phase 1 — S3-Durable Binary Page Container
 
-1. Implement a versioned binary `.qvec` container with manifest, page table, and checksums.
-1. Add `QuantizedPageStore` with file-backed read ranges.
-1. Add golden encode/decode tests and corruption tests.
-1. Add fail-loud errors for magic/version/checksum/dimension mismatch.
+1. Implement a versioned binary `.qvec` container with manifest, page table, object keys, byte ranges, and checksums.
+1. Add `QuantizedPageStore` with object-range reads, checksum verification, and a file-backed test backend using the same range-read contract.
+1. Add `NvmeCachePageStore` wrapper semantics for cache miss/fill/evict behavior.
+1. Add golden encode/decode tests, corruption tests, short-read tests, and missing-object tests.
+1. Add fail-loud errors for magic/version/checksum/dimension/object-generation mismatch.
 
 ### Phase 2 — Quantization Codecs
 
@@ -335,14 +454,18 @@ Questions before locking the public DDL:
 
 1. Extend `IndexMethod::from_options` for `quantized`.
 1. Add dispatch in `TableStore::flush()` and `ann_search()`.
-1. Update `FlushTarget` docs and file-backed range read support.
+1. Add vector artifact upload through `UploadTask::IndexFiles` and publish manifest entries only after durable upload verification.
+1. Add cache-backed object-range reads for quantized query path; keep whole-blob reads only for legacy JSON sidecars.
+1. Update `FlushTarget` docs to clarify it is local materialization, not S3 durability.
 1. Preserve old `.db` sidecars for existing HNSW/IVFFlat methods.
 
-### Phase 6 — Remote Index Builder / NVMe Cache
+### Phase 6 — Remote Index Builder / Production Tuning
 
 1. Move large quantized builds to `ferrosa-index-builder` for production-sized SSTables.
+1. Have the builder read SSTable/object artifacts from S3 and write `.qvec` artifacts back to S3 through the object-store/index-artifact path.
 1. Add page prefetch and admission policy for hot routing pages.
-1. Add compaction merge behavior: rebuild quantized sidecars for compacted SSTables.
+1. Add compaction merge behavior: publish replacement quantized sidecars for compacted SSTables before old-object GC.
+1. Tune page clustering and range-read budgets to control S3 latency and request amplification.
 
 ## Test Strategy
 
@@ -356,10 +479,14 @@ Questions before locking the public DDL:
   - staged search never returns more than `k`
   - exact rerank score ordering equals full `f32` scoring for survivor set
 - Integration tests:
-  - flush writes `.qvec` sidecar
-  - restart/read path opens sidecar without full decode
+  - flush/build uploads `.qvec` artifact to S3/MinIO before manifest publish
+  - restart/read path opens sidecar without full decode or full local materialization
+  - deleting local cache still allows query by S3 range reads
+  - cache size smaller than total index size still allows correct queries
+  - cache eviction during repeated queries does not change correctness
+  - missing S3 object, short range read, checksum mismatch, or stale object generation fails loudly
   - `ann_search()` merges active memtable + quantized SSTable results
-  - compaction removes/replaces old quantized sidecars
+  - compaction publishes replacement quantized sidecars and prevents stale cached pages from being used
 - Benchmarks:
   - bytes read/query
   - p50/p95 latency
@@ -374,9 +501,14 @@ Questions before locking the public DDL:
 | Low-bit traversal breaks HNSW recall | Bad results despite fast search | Start with IVFFlat; keep HNSW exact/rerank pages; benchmark recall before enabling by default |
 | JSON compatibility churn | Existing sidecars fail to decode | New magic/versioned `.qvec`; no change to old `.db` readers |
 | `RowPosition { offset }` insufficient | Cannot uniquely identify rows across SSTables/pages | Keep generation context at `TableStore` merge layer initially; consider future `VectorRowRef { generation, offset }` in quantized sidecar internals |
-| Whole-sidecar `read_vector_sidecar` API | Destroys NVMe page-read goal | Add page/range read API for quantized method; keep old blob API for old formats |
+| Whole-sidecar `read_vector_sidecar` API | Destroys object-range and cache-read goal | Add page/range read API for quantized method; keep old blob API only for legacy formats |
 | Large builder RAM use | Cannot build production-size indexes during flush | Use remote index builder and streaming/page-spilling builder before production use |
 | Quantization calibration drift | Poor recall on skewed embedding distributions | Store per-block/per-list scales; benchmark on real corpus embeddings |
+| Spec assumes local NVMe contains full index | Production cannot handle index volume > compute disk | Make S3 durable backing mandatory; test with cache smaller than index |
+| S3 range-read amplification | High latency/cost under scattered candidate pages | Page clustering, query read budgets, prefetch, tier-aware layout |
+| Cache eviction removes needed pages | Query failure/perf cliff if cache is treated as source of truth | Cache is non-authoritative; rehydrate from S3 by object range |
+| Stale cached pages after compaction | Wrong nearest-neighbor results | Cache key includes generation/build/checksum; manifest controls liveness |
+| Partial upload visible to readers | Corrupt/incomplete query results | Publish-after-upload CAS; checksum and object-size validation |
 
 
 ## Blueprint Expansion
@@ -391,8 +523,8 @@ Until the grill-me answers below are resolved, use these defaults for planning:
 |---|---|---|
 | First base algorithm | IVFFlat | IVFFlat has explicit centroid/list phases, so low-bit approximation is easier to bound than HNSW graph traversal error. |
 | HNSW scope | Research/prototype after IVFFlat | HNSW can still use tiered payload pages, but low-bit vectors can corrupt greedy routing decisions. |
-| First storage format | New `.qvec` container | Avoids changing existing JSON `.db` sidecars and makes version/magic/checksum checks fail loud. |
-| First durability model | Immutable per-SSTable sidecar | Matches current flush/compaction semantics and avoids mutable quantized trees. |
+| First storage format | New `.qvec` object | Avoids changing existing JSON `.db` sidecars and makes version/magic/checksum checks fail loud. |
+| First durability model | Immutable S3-durable per-SSTable object, NVMe cached | Matches current flush/compaction semantics, avoids mutable quantized trees, and supports data volume greater than compute-node disk. |
 | First precision ladder | Q2 -> Q4 -> Q8 -> optional F32 | Q1 should be benchmark-gated; it is attractive for routing but high-risk for recall. |
 | First query guarantee | Approximate narrow + exact survivor rerank | Keeps correctness understandable while storage and recall are measured. |
 | First build path | Local prototype builder, remote production builder later | Local keeps tests simple; remote builder is required before production-scale flushes. |
@@ -403,6 +535,8 @@ Until the grill-me answers below are resolved, use these defaults for planning:
 - Existing vector implementations are concentrated in `ferrosa-index/src/vector/{mod,hnsw,ivfflat}.rs`.
 - Existing persistence/search integration is concentrated in `ferrosa-storage/src/{store,flush}.rs` and `ferrosa-storage/src/memtable/vector_index.rs`.
 - `store.rs` is the main churn hotspot, so quantized search should add one dispatch seam there and keep page format/search logic inside `ferrosa-index`.
+- Existing sidecar upload/bootstrap paths handle standard SSTable components first; vector/FTI sidecars need explicit object-store artifact manifest/discovery.
+- `UploadTask::IndexFiles` and remote index-builder `sidecar_written_to_s3` are the right write-side seams, but the read-side resolver/materializer is missing.
 - `ferrosa-index-builder` is already the natural production path for large index construction; this design should not assume flush-time training at production scale.
 
 ### Phase 2 — Architecture Boundary
@@ -412,18 +546,18 @@ Split the work into five stable seams:
 | Seam | Owns | Should not own |
 |---|---|---|
 | Quantized codecs | Bit-packing, scale/zero-point metadata, distance kernels | SSTable generation, CQL parsing, compaction policy |
-| `.qvec` container | Manifest, page table, checksums, range reads | Search algorithm policy |
+| `.qvec` container | Manifest, object keys, page table, checksums, range reads | Search algorithm policy |
 | Quantized ANN reader/builder | IVFFlat/HNSW staged narrowing and rerank | Flush target implementation details |
-| Storage dispatch | Method selection, sidecar naming, per-generation merge | Codec internals |
+| Storage dispatch | Method selection, artifact manifest publish, per-generation merge | Codec internals |
 | Benchmark harness | Recall/latency/bytes-read gates | Production query execution |
 
 The critical dependency direction should be:
 
 ```text
-ferrosa-storage -> ferrosa-index::vector::quantized -> quantized codecs/container
+ferrosa-storage -> vector artifact resolver -> ferrosa-index::vector::quantized -> quantized codecs/container
 ```
 
-Do not let codec/container code depend back on storage, table schema, or CQL executor types. Pass plain row positions and byte-range abstractions.
+Do not let codec/container code depend back on storage, table schema, or CQL executor types. Pass durable vector row references and object-key/byte-range abstractions.
 
 ### Phase 3 — Threat / Data Integrity Model
 
@@ -470,7 +604,7 @@ RPN >= 180 items should be treated as gating work before any production/default 
 | S3 Quantized IVFFlat | Tiered list pages, staged narrowing, exact rerank | Recall@10 gate met against exact/f32 baseline on synthetic and real embeddings. |
 | S4 Storage integration | New index method dispatch in flush/search; old methods unchanged | Restart/read and memtable+SSTable merge tests pass. |
 | S5 HNSW research | Split adjacency/payload and quantized traversal prototype | Recall regression characterized before product decision. |
-| S6 Productionization | Remote builder, NVMe cache policy, compaction rebuild | Build memory bounded; bytes-read/query telemetry available. |
+| S6 Productionization | Remote builder, S3 artifact manifest, NVMe cache policy, compaction rebuild | Build memory bounded; S3 range-read/cache telemetry available. |
 
 ### Phase 7 — Test Specification
 
@@ -490,23 +624,32 @@ Add metrics before tuning:
 
 - `vector_quantized_page_reads_total{tier,index}`
 - `vector_quantized_bytes_read_total{tier,index}`
+- `vector_quantized_cache_hit_total{tier,index}`
+- `vector_quantized_cache_miss_total{tier,index}`
+- `vector_quantized_cache_evictions_total{tier,reason}`
+- `vector_quantized_cache_fill_bytes_total{tier,index}`
+- `vector_quantized_s3_range_reads_total{tier,index}`
+- `vector_quantized_s3_range_read_bytes_total{tier,index}`
+- `vector_quantized_s3_range_read_latency_seconds{tier,index}`
+- `vector_quantized_object_generation_mismatch_total`
+- `vector_quantized_cache_resident_bytes{tier,index}`
 - `vector_quantized_candidates_total{stage,index}`
 - `vector_quantized_exact_rerank_total{index}`
 - `vector_quantized_recall_benchmark{tier,corpus}` for offline benchmark output, not runtime production metrics
 - `vector_quantized_decode_errors_total{reason}`
 
-Operational rule: a decode/checksum/dimension failure should fail the query/index read loudly and emit telemetry. It should not fall back to a plausible empty result set.
+Operational rule: a decode/checksum/dimension/object-read failure should fail the query/index read loudly and emit telemetry. It should not fall back to a plausible empty result set.
 
 ### Phase 9 — Compiled Implementation DAG
 
-1. `container-types`: define manifest/page table structs and binary encoding.
-1. `container-reader-writer`: implement file-backed range reads/writes and checksum checks.
+1. `container-types`: define manifest/page table structs, object-key/byte-range fields, and binary encoding.
+1. `container-reader-writer`: implement object-range and file-backed test range reads/writes plus checksum checks.
 1. `codec-q8-q4`: implement and test higher-precision scalar codecs first.
 1. `codec-q2-q1`: add lower-bit codecs after Q8/Q4 gates are stable.
 1. `bench-baseline`: measure current f32 HNSW/IVFFlat before comparing new code.
 1. `ivf-builder`: write quantized inverted-list pages.
 1. `ivf-reader`: staged scan Q2/Q4/Q8/F32 survivor rerank.
-1. `storage-dispatch`: add `IndexMethod::Quantized` and sidecar naming/range-read API.
+1. `storage-dispatch`: add `IndexMethod::Quantized`, S3 artifact publish, artifact manifest entries, and cache-backed object-range API.
 1. `integration-tests`: flush/restart/search/compaction coverage.
 1. `hnsw-prototype`: only after IVFFlat gates pass.
 
@@ -530,8 +673,18 @@ These are the decisions that need owner input before implementation starts:
    - Recommended: expose precision tiers generically, benchmark scalar Q tiers and PQ before freezing the format.
 1. Exact rerank: Must final top-k be reranked against full `f32` vectors, or is approximate `Q8` final scoring acceptable?
    - Recommended: default exact rerank for correctness-sensitive workloads; allow approximate-only for cost-sensitive workloads.
-1. Storage target: Should cold `F32`/residual pages live on local NVMe only, S3 object ranges, or both?
-   - Recommended: manifest + routing pages hot on NVMe; cold full/residual pages recoverable from S3 or rebuilt by remote index builder.
+1. Storage invariant: Confirm that S3-compatible object storage is the durable source of truth and NVMe is only a bounded cache. Are there any deployments where `local_test_only` should be allowed outside unit/integration tests?
+   - Recommended: no; production index artifacts are S3-durable, and local-only is a test/prototype mode.
+1. Cache sizing: What max local cache fraction should benchmarks assume: 1%, 5%, or 10% of total vector index bytes?
+   - Recommended: test at 1% and 5% so the design proves it works with data larger than disk.
+1. S3 budget: What S3 range-read budget/latency SLO is acceptable per ANN query?
+   - Recommended: expose `max_page_reads` and `max_object_range_bytes_per_query`, then tune per corpus.
+1. F32/residual cache policy: Should F32/residual pages default to S3-only with cache admission disabled unless explicitly configured?
+   - Recommended: yes; route/cache coarse tiers first.
+1. Object layout: Is one `.qvec` object per SSTable/index generation acceptable for v1, or do we need multi-object tier layout now to reduce range-read scatter?
+   - Recommended: one object for v1, but keep tier `object_key` fields so multi-object layout is compatible.
+1. Remote builder upload path: Should the remote index builder upload `.qvec` directly to S3, or return artifacts to the engine for upload?
+   - Recommended: remote builder uploads directly and returns manifest metadata; engine publishes only after validation.
 1. Query contract: Should CQL continue using `ef_search`, or add explicit ANN budget knobs?
    - Recommended: keep `ef_search` for compatibility now; add internal budget mapping and later expose explicit options.
 1. Build path: Is synchronous flush-time build acceptable for v1 prototypes?
