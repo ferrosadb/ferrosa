@@ -2714,26 +2714,119 @@ async fn write_explicit_adjacency_entries(
         let adj_table_id = TableId::new(&derived.keyspace, &derived.table);
         let strategy = graph_replication_strategy(Some(schema), &derived.keyspace)?;
         for derived_row in derived.rows {
-            write_path
-                .write(
-                    &adj_table_id,
-                    &derived.key,
-                    derived_row,
-                    derived.timestamp,
-                    graph_write_consistency(),
-                    &strategy,
-                )
-                .await
-                .map_err(|e| {
-                    GraphError::Storage(ferrosa_common::Error::InvalidData(format!(
-                        "failed to write derived adjacency row for {}.{}: {e}",
-                        table_id.keyspace, table_id.table
-                    )))
-                })?;
+            adjacency_write_with_retry(
+                write_path,
+                &adj_table_id,
+                &derived.key,
+                derived_row,
+                derived.timestamp,
+                &strategy,
+                table_id,
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+/// Write a derived adjacency row, retrying on transient failures that arise
+/// when the `system_graph_<ks>.adjacency` table was just created via Raft DDL
+/// and a follower hasn't yet finished applying the CREATE TABLE on its own
+/// state machine.
+///
+/// The window is narrow — openraft commits once a majority has replicated the
+/// log entry, but each follower's `apply` to the local StorageEngine happens
+/// in a separate task and can lag a few hundred ms behind on a busy CI
+/// runner. When the coordinator immediately fans out the first derived
+/// adjacency write at CL=QUORUM, lagging followers reject it with
+/// `table not registered: system_graph_<ks>.adjacency` (logged as
+/// `MutationForward write failed — not sending ACK`), the coordinator
+/// returns `WriteTimeout(received=1, required=2)`, and the graph HTTP
+/// request hangs until the client's read timeout.
+///
+/// Retrying with exponential backoff lets the followers catch up. The write
+/// is content-addressed and idempotent (LWW with monotonic timestamps), so
+/// duplicate forwards to replicas that already applied are safe.
+async fn adjacency_write_with_retry(
+    write_path: &WritePath,
+    adj_table_id: &TableId,
+    key: &DecoratedKey,
+    row: Row,
+    timestamp: i64,
+    strategy: &ReplicationStrategy,
+    edge_table_id: &TableId,
+) -> Result<()> {
+    // Total budget is ~3 seconds across 6 attempts: 100, 200, 400, 800,
+    // 1600 ms. Picks up where DDL_AGREEMENT_APPLY_DRAIN (50 ms) stops.
+    const BACKOFFS_MS: &[u64] = &[100, 200, 400, 800, 1600];
+    let mut last_err: Option<ferrosa_common::Error> = None;
+    for attempt in 0..=BACKOFFS_MS.len() {
+        match write_path
+            .write(
+                adj_table_id,
+                key,
+                row.clone(),
+                timestamp,
+                graph_write_consistency(),
+                strategy,
+            )
+            .await
+        {
+            Ok(()) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        adj_table = %adj_table_id,
+                        attempt,
+                        "adjacency write succeeded after retries (follower apply lag)"
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if !is_transient_replica_lag(&e) || attempt == BACKOFFS_MS.len() {
+                    return Err(GraphError::Storage(ferrosa_common::Error::InvalidData(
+                        format!(
+                            "failed to write derived adjacency row for {}.{}: {e}",
+                            edge_table_id.keyspace, edge_table_id.table
+                        ),
+                    )));
+                }
+                let backoff_ms = BACKOFFS_MS[attempt];
+                tracing::warn!(
+                    adj_table = %adj_table_id,
+                    attempt = attempt + 1,
+                    backoff_ms,
+                    %e,
+                    "adjacency write hit replica schema lag — retrying"
+                );
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    // Unreachable: the loop returns on the last attempt either way, but keep
+    // a fail-loud branch in case BACKOFFS_MS is ever set to empty.
+    Err(GraphError::Storage(ferrosa_common::Error::InvalidData(
+        format!(
+            "failed to write derived adjacency row for {}.{}: {}",
+            edge_table_id.keyspace,
+            edge_table_id.table,
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+    )))
+}
+
+/// Distinguish a transient replica-schema-lag write timeout (retryable) from
+/// a real cluster failure (not retryable). The cluster coordinator surfaces
+/// `WriteTimeout` as `Error::InvalidData("cluster: write timeout: CL=…,
+/// received=N, required=M")` — that exact wrapping is the contract we match
+/// against. Any other error (unavailable, validation, storage I/O) is final.
+fn is_transient_replica_lag(e: &ferrosa_common::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("cluster: write timeout") || msg.contains("table not registered")
 }
 
 fn build_merge_write_shape(
