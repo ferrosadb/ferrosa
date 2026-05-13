@@ -40,6 +40,7 @@ specs/
 | [Secondary Index Pipeline](secondary-index-pipeline.md) | Query integration, sidecar persistence, vector indexes | Implemented |
 | [Full-Text Indexing](fulltext-index-architecture.md) | Inverted index sidecars, analyzer pipeline, BM25, fts_match() | Implemented |
 | [Remote Index Build Backend](remote-index-build-backend.md) | Standalone `ferrosa-index-builder` binary, engine backend modes (local/remote/off) | Draft |
+| [Hierarchical Vector Quantization](hierarchical-vector-quantization.md) | NVMe-resident tiered Q1/Q2/Q4/Q8/F32 vector search design for HNSW/IVFFlat | Draft |
 | [UCS Compaction](ucs-compaction-architecture.md) | Unified Compaction Strategy: density-based levels, fan factor, per-table DDL | New |
 | [Cluster Formation](cluster-formation-architecture.md) | Cluster formation state machine and protocol | Active |
 | [Observability](observability-architecture.md) | Metrics, tracing, telemetry pipeline | Active |
