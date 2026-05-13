@@ -22,8 +22,8 @@
 set -euo pipefail
 
 LIMA="${LIMA_INSTANCE:-mvm}"
-FC_KERNEL="${FC_KERNEL:-/home/bkearns.guest/firecracker-assets/vmlinux-6.1.bin}"
-FC_ROOTFS="${FC_ROOTFS:-/home/bkearns.guest/firecracker-assets/rootfs-ssh.ext4}"
+FC_KERNEL="${FC_KERNEL:-${HOME}/firecracker-assets/vmlinux-6.1.bin}"
+FC_ROOTFS="${FC_ROOTFS:-${HOME}/firecracker-assets/rootfs-ssh.ext4}"
 FC_TAP="${FC_TAP:-tap0}"
 FC_GUEST_IP="${FC_GUEST_IP:-172.16.0.2}"
 FC_GATEWAY="${FC_GATEWAY:-172.16.0.1}"
