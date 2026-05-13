@@ -27,6 +27,7 @@ graph TB
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
         Accord[Accord Consensus<br/>Transactions, LWT]
         Index[ferrosa-index<br/>Secondary + Vector Indexes]
+        Builder[ferrosa-index-builder<br/>Remote Index Builder]
         UDF[ferrosa-udf<br/>WASM Sandbox]
         Storage[ferrosa-storage<br/>Memtable, Cache, Compaction, PITR]
         SST[ferrosa-sstable<br/>BTI Read + Write]
@@ -53,6 +54,8 @@ graph TB
     CQL --> Cluster
     CQL --> Accord
     CQL --> Index
+    Index --> Builder
+    Builder -.->|publish sidecars + .qvec artifacts| S3
     CQL --> UDF
     Graph --> Schema
     Graph --> Storage
@@ -74,7 +77,8 @@ graph TB
 
 ## Design Principles
 
-1. **S3 as source of truth** — nodes are ephemeral, SSTables live in object storage
+1. **S3 as source of truth** — nodes are ephemeral, SSTables and index artifacts live in object storage
+1. **Bounded NVMe cache** — local disk improves performance but must not be required to hold full table or vector-index volume
 1. **CQL compatibility** — existing drivers and tools work unchanged
 1. **Rust-native** — idiomatic Rust with clean ownership, not a Java transliteration
 1. **Cassandra's consistency model** — tunable CL (ONE, QUORUM, ALL) preserved

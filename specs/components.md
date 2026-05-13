@@ -88,7 +88,7 @@ graph BT
 - **Purpose**: Pluggable secondary index framework with multiple index type implementations
 - **Location**: `ferrosa-index/`
 - **Dependencies**: `ferrosa-common`, `serde`, `serde_json`, `rand`, `tracing`
-- **Status**: Implemented — 8 index types with build/read/factory trait system
+- **Status**: Implemented — 8 index types with build/read/factory trait system; HVQ S3 spill tier planned as additive vector artifact path
 - **Modules**:
   - `lib.rs` — Core types (`IndexType`, `IndexKey`, `RowPosition`, `IndexFiles`, `IndexConfig`, `IndexCapabilities`, `FilterPredicate`), traits (`IndexBuilder`, `IndexReader`, `IndexFactory`), error types
   - `btree.rs` — B-tree index (sorted key → row position, binary search lookup, range scan)
@@ -99,10 +99,27 @@ graph BT
   - `vector/mod.rs` — Distance functions (L2, cosine, inner product), dimension constants (4096 f32 / 8192 f16)
   - `vector/hnsw.rs` — HNSW graph index (multi-layer navigable small world, beam search)
   - `vector/ivfflat.rs` — IVFFlat index (k-means clustering, inverted list probing)
-- **Key interfaces**: Two trait APIs — secondary indexes use `IndexFactory`/`IndexBuilder`/`IndexReader` with partition/clustering key addressing; vector indexes use their own trait set in `vector::` module with byte-offset `RowPosition` and `nearest(query, k, ef_search)` for ANN queries. Storage-attached design — indexes are per-SSTable companion files built asynchronously after flush.
+  - `vector/quantized.rs` (planned) — `.qvec` page-addressable Q4/Q8/F32 tier codec and reader API for S3-backed HVQ
+- **Key interfaces**: Two trait APIs — secondary indexes use `IndexFactory`/`IndexBuilder`/`IndexReader` with partition/clustering key addressing; vector indexes use their own trait set in `vector::` module with byte-offset `RowPosition` and `nearest(query, k, ef_search)` for ANN queries. Storage-attached design — indexes are per-SSTable companion files built asynchronously after flush. HVQ will add an object-backed artifact reader whose row identity includes SSTable generation/build id so `.qvec` pages can be read from S3 without local full-file residency.
 - **Vector index type**: `IndexType::Vector` registered in the factory for `CREATE INDEX ... USING 'vector'` DDL.
 - **Phonetic encoder public API**: `PhoneticEncoder` trait and Double Metaphone algorithm are public, usable outside of index builds.
 - **Spec**: [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
+
+### ferrosa-index-builder
+
+- **Purpose**: Remote index construction service for scalar sidecars and planned
+  `.qvec` vector artifacts, keeping heavy build work off the serving node.
+- **Location**: `ferrosa-index-builder/`
+- **Dependencies**: `ferrosa-storage`, `ferrosa-sstable`, `ferrosa-index`,
+  `ferrosa-common`, `object_store`, HTTP server/runtime dependencies.
+- **Key interfaces**: `POST /internal/index/build`, pull-mode manifest watcher,
+  object-store upload contract.
+- **HVQ contract**: for `quantized_ivf_flat` and future `quantized_hnsw`, the
+  builder returns artifact manifest entries with object keys, sizes, checksums,
+  dimensions, metric, format version, tier summaries, and build id. It must
+  stream/range-read input and fail loud on scratch-budget exhaustion; it must
+  not make partial `.qvec` uploads visible.
+- **Spec**: [Remote Index Build Backend](remote-index-build-backend.md)
 
 ### ferrosa-udf
 

@@ -138,6 +138,31 @@ No versioned protocols between in-process modules — they share Rust types dire
 | Commit log segments | B | Segment header with descriptor (version, id, compression) | Implemented |
 | `manifest.json` (S3) | C | `"format_version": 1` field in JSON | Implemented |
 | `checkpoint.json` | B | `"format_version"` field in JSON | Implemented |
+| `.qvec` vector artifacts | D/HVQ | Binary magic + format version + page table + per-page checksum + manifest object refs | Planned |
+
+### HVQ S3 Spill-Tier Storage Contract
+
+Hierarchical vector quantization must not reuse the legacy local sidecar
+contract as its durable model. S3-compatible object storage is authoritative for
+`.qvec` artifacts; local NVMe is only a bounded, evictable page cache.
+
+Required storage semantics:
+
+1. `.qvec` artifacts are uploaded and checksum/object-size validated before
+   any table or index manifest advertises them.
+1. Reader discovery is manifest/object-ref driven, not local directory driven.
+1. Cache keys include object key, SSTable generation or build id, byte range or
+   page id, tier, checksum, and format version.
+1. Cache eviction removes only local copies after remote durability is proven.
+   Eviction must never delete the only copy of a vector artifact.
+1. Missing pages, short range reads, stale etags, dimension mismatch, codec
+   mismatch, and checksum failures return typed errors and increment telemetry.
+1. Query-time readers fetch cold pages through object-range reads and must not
+   require the full vector artifact to fit on the compute node.
+
+This contract deliberately differs from current `FlushTarget::read_vector_sidecar`
+behavior, which treats a vector sidecar as one `Vec<u8>` blob. The HVQ path
+requires a page/range-readable artifact resolver.
 
 ## Components
 
