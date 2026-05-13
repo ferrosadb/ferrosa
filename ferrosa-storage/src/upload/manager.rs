@@ -148,6 +148,30 @@ impl UploadManager {
                             );
                             let data = match std::fs::read(&file.path) {
                                 Ok(data) => Bytes::from(data),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    // The SSTable was compacted away (or
+                                    // explicitly deleted) between the scan that
+                                    // produced `files` and this read. Not a real
+                                    // upload error — the compacted output is the
+                                    // authoritative copy and will be uploaded
+                                    // separately. Mark the task as "compacted
+                                    // away" so the caller doesn't add it to the
+                                    // manifest, but don't surface a tracing
+                                    // ERROR for a benign race.
+                                    let msg = format!(
+                                        "skipped: source compacted away before upload \
+                                         ({path}: {})",
+                                        file.path.display()
+                                    );
+                                    tracing::info!(
+                                        path = %file.path.display(),
+                                        "s3 upload skipped — SSTable file compacted away before upload"
+                                    );
+                                    if upload_err.is_none() {
+                                        upload_err = Some(msg);
+                                    }
+                                    continue;
+                                }
                                 Err(e) => {
                                     let msg = format!(
                                         "upload failed for {path}: failed to read {}: {e}",
@@ -573,7 +597,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_sstable_component_reports_upload_failure() {
+    fn missing_sstable_component_reports_compacted_away_skip() {
+        // A source SSTable file disappearing between scan and read is the
+        // compaction-vs-S3-sync race the upload manager treats as benign:
+        // the compacted output of the merge will be uploaded under its own
+        // generation, and the manifest should NOT pick up a partial copy of
+        // the obsolete generation. The completion channel surfaces the
+        // "skipped: source compacted away" sentinel so the caller can route
+        // the outcome to INFO instead of ERROR.
         let rt = make_runtime();
         rt.block_on(async {
             let dir = tempfile::tempdir().unwrap();
@@ -603,8 +634,8 @@ mod tests {
 
             let err = rx.await.unwrap().unwrap_err();
             assert!(
-                err.contains("failed to read"),
-                "missing component should report a read failure, got: {err}"
+                err.starts_with("skipped: source compacted away"),
+                "missing component should surface the compacted-away skip sentinel, got: {err}"
             );
             manager.shutdown().await;
 

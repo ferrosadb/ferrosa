@@ -371,11 +371,24 @@ impl CompactionExecutor {
             "compaction: streaming merge complete"
         );
         if merged_row_count < total_input_rows {
-            tracing::warn!(
+            // Reduction is the expected outcome whenever two input SSTables
+            // touch the same (partition_key, clustering) tuple — that pair
+            // collapses to a single output row via cell-level LWW (see
+            // `merge::merge_partitions`). Tombstones suppressing older data
+            // also reduce the count. Both are correct, normal compaction
+            // semantics, not data loss.
+            //
+            // The actual data-loss check is the streaming readback below
+            // (step 5): if the SSTable we just wrote disagrees with the
+            // counts we computed in-memory, *that* is the ERROR we want
+            // surfaced. This collapse signal is INFO so it stays useful for
+            // post-mortems (e.g., "compaction collapsed N rows on table X
+            // at time T") without polluting steady-state cluster logs.
+            tracing::info!(
                 total_input_rows,
                 merged_row_count,
-                lost = total_input_rows - merged_row_count,
-                "compaction: merge reduced rows (may be deletions or LWW overwrites)"
+                collapsed = total_input_rows - merged_row_count,
+                "compaction: rows collapsed by LWW or tombstone suppression (expected)"
             );
         }
 
