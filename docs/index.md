@@ -1,6 +1,6 @@
 # Ferrosa Suite Documentation
 
-Public developer-preview documentation for Ferrosa Database and Ferrosa Memory. These pages describe install and getting-started flows; implementation specs stay in the repository-level `specs/` tree.
+Public developer-preview documentation for Ferrosa Database and Ferrosa Memory. These pages describe install and getting-started flows; engineering plans and verification notes are tracked separately from the public site.
 
 ## Products
 
@@ -14,7 +14,3 @@ Public developer-preview documentation for Ferrosa Database and Ferrosa Memory. 
 - [Migration](database/migration.html) — migrating from Apache Cassandra
 - [CQL Compatibility](database/cql-compatibility.html) — supported CQL features and driver compatibility
 - [Examples](database/examples/) — generated database examples
-
-## For Developers
-
-Internal architecture specs, TODOs, verification plans, and historical analyses live in [`specs/`](../specs/README.md). They are not public release guarantees.

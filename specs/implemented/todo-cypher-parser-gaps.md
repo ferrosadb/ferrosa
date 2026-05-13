@@ -1,10 +1,10 @@
-# TODO: Cypher Parser — Negative Patterns and DISTINCT Ignored
+# Implemented Evidence: Cypher Parser — Negative Patterns and DISTINCT
 
 **Severity:** Medium
 **Component:** ferrosa-graph
 **Files:** `ferrosa-graph/src/parser/parse_impl.rs:598,811`
 
-## Issue
+## Original Issue
 
 Two Cypher features are parsed but silently ignored:
 
@@ -16,6 +16,22 @@ Two Cypher features are parsed but silently ignored:
 
 Queries silently return incorrect results. No error or warning to the user.
 
-## Fix
+## Implementation Evidence
 
-Wire the negation flag into the executor's filter evaluation. Implement dedup in the result projection step.
+- `ferrosa-graph/src/executor/expand.rs` evaluates `Expr::PatternPredicate`
+  with the parsed `negated` flag and returns `!exists` for negative pattern
+  predicates.
+- `ferrosa-graph/src/executor/expand.rs`, `executor/leapfrog.rs`, and
+  `executor/varpath.rs` apply `ReturnClause::distinct` by sorting and
+  deduplicating projected rows.
+- `ferrosa-graph/tests/graph_http_integration.rs` includes
+  `return_distinct_deduplicates_projected_rows` and
+  `negative_pattern_predicate_filters_existing_relationships`, which verify
+  projected-row deduplication for `RETURN DISTINCT` and filtering for
+  `WHERE NOT (a)-[:REL]->(...)`.
+
+## Verification Plan Before Archive
+
+Run the graph HTTP integration tests that cover `RETURN DISTINCT` and negative
+pattern predicates on a clean checkout. Archive this item only after attaching
+the command output, including the exact test filters and pass/fail summary.
