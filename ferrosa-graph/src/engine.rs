@@ -90,6 +90,166 @@ fn empty_match_result(statement: &Statement) -> GraphResult {
     }
 }
 
+fn pattern_requires_adjacency(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Rel { .. } => true,
+        Pattern::Path(parts) => parts.iter().any(pattern_requires_adjacency),
+        Pattern::Node { props, .. } => prop_map_requires_adjacency(props),
+    }
+}
+
+fn prop_map_requires_adjacency(props: &[(String, Expr)]) -> bool {
+    props.iter().any(|(_, expr)| expr_requires_adjacency(expr))
+}
+
+fn expr_requires_adjacency(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function { args, .. } | Expr::List(args) => args.iter().any(expr_requires_adjacency),
+        Expr::Distinct(inner) | Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_requires_adjacency(inner)
+        }
+        Expr::Comparison { left, right, .. }
+        | Expr::In {
+            value: left,
+            list: right,
+        }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Index {
+            target: left,
+            index: right,
+        } => expr_requires_adjacency(left) || expr_requires_adjacency(right),
+        Expr::ListPredicate {
+            list, predicate, ..
+        } => expr_requires_adjacency(list) || expr_requires_adjacency(predicate),
+        Expr::Map(props) => prop_map_requires_adjacency(props),
+        Expr::Slice { target, start, end } => {
+            expr_requires_adjacency(target)
+                || start.as_deref().is_some_and(expr_requires_adjacency)
+                || end.as_deref().is_some_and(expr_requires_adjacency)
+        }
+        Expr::PatternPredicate { hops, .. } => !hops.is_empty(),
+        Expr::Var(_) | Expr::Property { .. } | Expr::Literal(_) | Expr::Parameter(_) => false,
+    }
+}
+
+fn return_clause_requires_adjacency(return_clause: &ReturnClause) -> bool {
+    return_clause
+        .items
+        .iter()
+        .any(|item| expr_requires_adjacency(&item.expr))
+        || return_clause
+            .order_by
+            .iter()
+            .any(|item| expr_requires_adjacency(&item.expr))
+}
+
+fn with_pipeline_requires_adjacency(with_pipeline: &WithPipeline) -> bool {
+    return_clause_requires_adjacency(&with_pipeline.clause)
+        || with_pipeline
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_requires_adjacency)
+}
+
+fn statement_requires_adjacency(statement: &Statement) -> bool {
+    match statement {
+        Statement::Match {
+            pattern,
+            where_clause,
+            return_clause,
+        } => {
+            pattern.iter().any(pattern_requires_adjacency)
+                || where_clause.as_ref().is_some_and(expr_requires_adjacency)
+                || return_clause_requires_adjacency(return_clause)
+        }
+        Statement::MatchWith {
+            pattern,
+            where_clause,
+            with_pipeline,
+            return_clause,
+        } => {
+            pattern.iter().any(pattern_requires_adjacency)
+                || where_clause.as_ref().is_some_and(expr_requires_adjacency)
+                || with_pipeline_requires_adjacency(with_pipeline)
+                || return_clause_requires_adjacency(return_clause)
+        }
+        Statement::Return { return_clause } => return_clause_requires_adjacency(return_clause),
+        Statement::Unwind {
+            expr,
+            with_pipeline,
+            return_clause,
+            ..
+        } => {
+            expr_requires_adjacency(expr)
+                || with_pipeline
+                    .as_ref()
+                    .is_some_and(with_pipeline_requires_adjacency)
+                || return_clause_requires_adjacency(return_clause)
+        }
+        Statement::Union { arms, .. } => arms.iter().any(statement_requires_adjacency),
+        Statement::MatchWithOptional {
+            pattern,
+            where_clause,
+            optional_pattern,
+            optional_where_clause,
+            return_clause,
+        } => {
+            pattern.iter().any(pattern_requires_adjacency)
+                || optional_pattern.iter().any(pattern_requires_adjacency)
+                || where_clause.as_ref().is_some_and(expr_requires_adjacency)
+                || optional_where_clause
+                    .as_ref()
+                    .is_some_and(expr_requires_adjacency)
+                || return_clause_requires_adjacency(return_clause)
+        }
+        Statement::Create {
+            patterns,
+            return_clause,
+        } => {
+            patterns.iter().any(pattern_requires_adjacency)
+                || return_clause
+                    .as_ref()
+                    .is_some_and(return_clause_requires_adjacency)
+        }
+        Statement::Set {
+            pattern,
+            where_clause,
+            assignments,
+        } => {
+            pattern.iter().any(pattern_requires_adjacency)
+                || where_clause.as_ref().is_some_and(expr_requires_adjacency)
+                || assignments
+                    .iter()
+                    .any(|assignment| expr_requires_adjacency(&assignment.value))
+        }
+        Statement::Delete {
+            pattern,
+            where_clause,
+            ..
+        } => {
+            pattern.iter().any(pattern_requires_adjacency)
+                || where_clause.as_ref().is_some_and(expr_requires_adjacency)
+        }
+        Statement::Subscribe { inner, .. } => statement_requires_adjacency(inner),
+        Statement::Unsubscribe { .. } => false,
+        Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        } => {
+            patterns.iter().any(pattern_requires_adjacency)
+                || set_clause
+                    .iter()
+                    .any(|assignment| expr_requires_adjacency(&assignment.value))
+                || return_clause
+                    .as_ref()
+                    .is_some_and(return_clause_requires_adjacency)
+        }
+    }
+}
+
 /// Cluster-aware schema-mutation sink for graph-engine-driven DDL.
 ///
 /// The graph engine auto-creates `system_graph_<keyspace>.adjacency`
@@ -488,18 +648,20 @@ impl GraphEngine {
         auth: &AuthContext,
         params: &HashMap<String, Value>,
     ) -> Result<GraphResult> {
-        let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
-        if adjacency_registered {
-            let wp = self.write_path.load();
-            let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
-            tracing::info!(
-                keyspace,
-                entries_checked = metrics.entries_checked,
-                entries_repaired = metrics.entries_repaired,
-                "graph engine: reconciled newly registered adjacency keyspace"
-            );
-        }
         let statement = bind_statement_params(parse(query)?, params)?;
+        if statement_requires_adjacency(&statement) {
+            let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
+            if adjacency_registered {
+                let wp = self.write_path.load();
+                let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
+                tracing::info!(
+                    keyspace,
+                    entries_checked = metrics.entries_checked,
+                    entries_repaired = metrics.entries_repaired,
+                    "graph engine: reconciled newly registered adjacency keyspace"
+                );
+            }
+        }
         let snap = self.schema.snapshot();
         let logical = match validate(&snap, auth, keyspace, statement.clone()) {
             Ok(logical) => logical,
@@ -1233,6 +1395,7 @@ fn format_plan(plan: &PhysicalPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn graph_config_defaults() {
@@ -1299,6 +1462,179 @@ mod tests {
             mode: DeploymentMode::Development,
         })
         .unwrap()
+    }
+
+    fn superuser_auth() -> AuthContext {
+        AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
+    struct CountingGraphSchemaCoordinator {
+        keyspaces: AtomicUsize,
+        tables: AtomicUsize,
+    }
+
+    impl CountingGraphSchemaCoordinator {
+        fn new() -> Self {
+            Self {
+                keyspaces: AtomicUsize::new(0),
+                tables: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.keyspaces.load(Ordering::SeqCst) + self.tables.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl GraphSchemaCoordinator for CountingGraphSchemaCoordinator {
+        async fn apply_create_keyspace(
+            &self,
+            _ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
+        ) -> Result<()> {
+            self.keyspaces.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn apply_create_table(
+            &self,
+            _table: ferrosa_schema::metadata::table::TableMetadata,
+        ) -> Result<()> {
+            self.tables.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn register_minimal_edge_table(schema: &Schema, keyspace: &str) {
+        use std::collections::{HashMap, HashSet};
+
+        use ferrosa_schema::{
+            ClusteringOrder, ColumnKind, ColumnMetadata, TableFlag, TableMetadata, TableParams,
+        };
+        use indexmap::IndexMap;
+
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: keyspace.to_string(),
+                durable_writes: true,
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            })
+            .unwrap();
+
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "src_id".to_string(),
+            ColumnMetadata {
+                name: "src_id".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "dst_id".to_string(),
+            ColumnMetadata {
+                name: "dst_id".to_string(),
+                kind: ColumnKind::Clustering,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::Asc,
+                mask: None,
+            },
+        );
+
+        let mut extensions = HashMap::new();
+        extensions.insert("graph.type".to_string(), "edge".to_string());
+        extensions.insert("graph.label".to_string(), "KNOWS".to_string());
+        extensions.insert("graph.source".to_string(), "src_id".to_string());
+        extensions.insert("graph.target".to_string(), "dst_id".to_string());
+        extensions.insert("graph.source_label".to_string(), "Person".to_string());
+        extensions.insert("graph.target_label".to_string(), "Person".to_string());
+
+        schema
+            .create_table_internal(TableMetadata {
+                keyspace: keyspace.to_string(),
+                name: "knows_e".to_string(),
+                id: uuid::Uuid::new_v4(),
+                columns,
+                partition_key: vec!["src_id".to_string()],
+                clustering_key: vec![("dst_id".to_string(), ClusteringOrder::Asc)],
+                params: TableParams::default(),
+                flags: HashSet::from([TableFlag::Compound]),
+                extensions,
+                is_system: false,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scalar_return_does_not_touch_lazy_adjacency_registration() {
+        let schema = Arc::new(test_schema());
+        register_minimal_edge_table(&schema, "agent_memory");
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(test_storage_engine(dir.path()));
+        storage
+            .register_table(
+                schema
+                    .snapshot()
+                    .tables
+                    .get(&("agent_memory".to_string(), "knows_e".to_string()))
+                    .unwrap()
+                    .to_storage_schema(),
+            )
+            .unwrap();
+
+        let coordinator = Arc::new(CountingGraphSchemaCoordinator::new());
+        let engine = GraphEngine::new_with_coordinator(
+            Arc::clone(&schema),
+            Arc::clone(&storage),
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                ferrosa_cluster::write_path::WritePath::direct(storage),
+            )),
+            GraphEngineConfig::default(),
+            std::time::Duration::ZERO,
+            coordinator.clone(),
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            engine.execute("RETURN 1", "agent_memory", &superuser_auth()),
+        )
+        .await
+        .expect("scalar RETURN should complete without adjacency DDL/reconcile")
+        .expect("scalar RETURN should succeed");
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            coordinator.calls(),
+            0,
+            "scalar RETURN must not force lazy adjacency registration for unrelated edge tables"
+        );
+    }
+
+    #[test]
+    fn relationship_patterns_still_require_lazy_adjacency_registration() {
+        let relationship_query = parse("MATCH (:Person)-[:KNOWS]->(:Person) RETURN 1").unwrap();
+        assert!(
+            statement_requires_adjacency(&relationship_query),
+            "relationship traversals must still materialize adjacency storage"
+        );
+
+        let scalar_query = parse("RETURN 1").unwrap();
+        assert!(
+            !statement_requires_adjacency(&scalar_query),
+            "scalar queries must stay independent from adjacency storage"
+        );
     }
 
     #[test]

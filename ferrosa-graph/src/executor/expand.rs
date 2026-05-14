@@ -2088,6 +2088,11 @@ async fn find_table_row_by_props(
                 }
             }
         }
+
+        // A complete primary-key shape is terminal: if that exact row is absent
+        // or fails the property predicates, scanning the whole graph table cannot
+        // produce the same identity and can overload live multi-tenant tables.
+        return Ok(None);
     }
 
     for partition in write_path.range_read(table_id).await? {
@@ -2509,23 +2514,41 @@ async fn execute_merge(
         let key = shape.key.clone();
         let clustering = shape.clustering.clone();
 
-        // Step 2: read-before-write — check for existing row.
-        let existing = write_path.read(&table_id, &key).await.map_err(|e| {
-            tracing::error!(
-                file = file!(),
-                line = line!(),
-                error = %e,
-                table = %op.table.table,
-                "execute_merge: read failed"
-            );
-            e
-        })?;
-        let row_exists = existing.as_ref().is_some_and(|partition| {
-            partition
-                .rows
-                .iter()
-                .any(|row| row.clustering == clustering)
-        });
+        let skip_partition_read = merge_can_bind_schema_key_only_vertex_without_read(op, &shape);
+
+        // Step 2: read-before-write — check for existing row unless this is a
+        // schema-aware key-only vertex MERGE. Scoped graph vertex tables can have
+        // very large partitions (for example agent_memory.entity_store is keyed
+        // by (tenant_id, session_id) and clustered by entity_id); materializing
+        // the whole partition just to bind one primary-key row can OOM the graph
+        // service. A key-only MERGE has all storage-key bytes already in `shape`
+        // and no regular cells to preserve from an existing row, so it can bind
+        // from the deterministic key shape and write an idempotent liveness row
+        // without a partition read.
+        let existing = if skip_partition_read {
+            None
+        } else {
+            write_path.read(&table_id, &key).await.map_err(|e| {
+                tracing::error!(
+                    file = file!(),
+                    line = line!(),
+                    error = %e,
+                    table = %op.table.table,
+                    "execute_merge: read failed"
+                );
+                e
+            })?
+        };
+        let row_exists = if skip_partition_read {
+            true
+        } else {
+            existing.as_ref().is_some_and(|partition| {
+                partition
+                    .rows
+                    .iter()
+                    .any(|row| row.clustering == clustering)
+            })
+        };
         let existing_row_json = schema.and_then(|schema_ref| {
             let meta = table_metadata_for(Some(schema_ref), &op.table.keyspace, &op.table.table)?;
             let partition = existing.as_ref()?;
@@ -2911,6 +2934,16 @@ fn build_merge_write_shape(
         create_cells,
         used_schema_layout: false,
     })
+}
+
+fn merge_can_bind_schema_key_only_vertex_without_read(
+    op: &MergeOp,
+    shape: &MergeWriteShape,
+) -> bool {
+    op.table.graph_type == "vertex"
+        && shape.used_schema_layout
+        && shape.create_cells.is_empty()
+        && !shape.clustering.is_empty()
 }
 
 fn build_schema_aware_merge_shape(

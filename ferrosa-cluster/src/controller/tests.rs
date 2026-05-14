@@ -1,6 +1,7 @@
 use super::cluster::{
-    build_recovered_topology_refresh_plan, drain_ddl_queue, keyspace_needs_cluster_replay,
-    should_initialize_seed_membership, should_run_bootstrap_streaming,
+    build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
+    drain_ddl_queue, keyspace_needs_cluster_replay, should_initialize_seed_membership,
+    should_run_bootstrap_streaming,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -658,6 +659,39 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
     assert_eq!(plan[1].host_id, peer_host_id);
     assert_eq!(plan[1].addr, "10.89.5.18:7000");
     assert_eq!(plan[1].cql_broadcast.as_deref(), Some("127.0.0.1:38043"));
+}
+
+#[test]
+fn recovered_topology_refresh_plan_repairs_tokens_for_every_voter() {
+    let local_host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let peer_host_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let peers = vec![(peer_host_id, "10.89.5.18:7000".parse().unwrap())];
+    let peer_cql_broadcasts = std::collections::HashMap::new();
+    let num_tokens = 4;
+
+    let refresh_plan = build_recovered_topology_refresh_plan(
+        local_host_id,
+        "10.89.5.17:7000".to_string(),
+        Some("127.0.0.1:38042".to_string()),
+        "dc1",
+        "rack1",
+        &peers,
+        &peer_cql_broadcasts,
+    );
+    let token_plan = build_recovered_topology_token_repair_plan(&refresh_plan, num_tokens);
+
+    assert_eq!(
+        token_plan.len(),
+        refresh_plan.len(),
+        "recovered topology must re-author token assignments for every recovered voter"
+    );
+    for (node_id, tokens) in token_plan {
+        assert_eq!(
+            tokens.len(),
+            num_tokens,
+            "node {node_id} should receive deterministic token ownership on recovered topology refresh"
+        );
+    }
 }
 
 #[tokio::test]

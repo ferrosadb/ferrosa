@@ -237,6 +237,22 @@ pub(super) fn build_recovered_topology_refresh_plan(
     plan
 }
 
+pub(super) fn build_recovered_topology_token_repair_plan(
+    refresh_plan: &[crate::raft::NodeInfo],
+    num_tokens: usize,
+) -> Vec<(u64, Vec<crate::raft::Token>)> {
+    refresh_plan
+        .iter()
+        .map(|node_info| {
+            let node_id = uuid_to_node_id(node_info.host_id);
+            (
+                node_id,
+                crate::controller::token::deterministic_tokens_for_node(node_id, num_tokens),
+            )
+        })
+        .collect()
+}
+
 pub(super) fn build_initial_raft_members(
     local_host_id: uuid::Uuid,
     local_addr: SocketAddr,
@@ -1421,6 +1437,10 @@ impl ModeController {
                             &peers,
                             &peer_cql_broadcasts,
                         );
+                        let token_repair_plan = build_recovered_topology_token_repair_plan(
+                            &refresh_plan,
+                            config_for_promotion.num_tokens as usize,
+                        );
                         for node_info in refresh_plan {
                             if let Err(e) = raft_arc
                                 .client_write(crate::raft::RaftCommand {
@@ -1434,6 +1454,22 @@ impl ModeController {
                                     leader = lid,
                                     %e,
                                     "leader failed to refresh recovered topology metadata"
+                                );
+                            }
+                        }
+                        for (node_id, tokens) in token_repair_plan {
+                            if let Err(e) = raft_arc
+                                .client_write(crate::raft::RaftCommand {
+                                    op: crate::raft::RaftOp::AssignTokens { node_id, tokens },
+                                    schema_version: Uuid::new_v4(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    node_id,
+                                    leader = lid,
+                                    %e,
+                                    "leader failed to refresh recovered topology token assignment"
                                 );
                             }
                         }

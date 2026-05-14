@@ -3674,11 +3674,13 @@ impl StorageEngine {
             "TOC.txt",
         ];
 
-        for entry in entries {
+        'entry_loop: for entry in entries {
             let hex = crate::upload::manager::hex_prefix_for(&entry.id);
             let mut wrote_any = false;
 
-            // Required components: return an error on NotFound.
+            // Required components: skip stale manifest entries whose required
+            // data is neither local nor in object storage, but keep restoring
+            // other entries. If none are restorable, fail closed below.
             for component in &required_components {
                 let s3_path = crate::upload::manager::sstable_object_key(
                     &prefix,
@@ -3710,9 +3712,13 @@ impl StorageEngine {
                         wrote_any = true;
                     }
                     Err(object_store::Error::NotFound { .. }) => {
-                        return Err(ferrosa_common::Error::InvalidFormat(format!(
-                            "required SSTable component not found in S3: {s3_path}"
-                        )));
+                        tracing::warn!(
+                            sstable = entry.id,
+                            component,
+                            path = %s3_path,
+                            "required SSTable component absent in S3 and local disk — skipping stale manifest entry"
+                        );
+                        continue 'entry_loop;
                     }
                     Err(e) => {
                         return Err(ferrosa_common::Error::InvalidFormat(format!(
@@ -3772,6 +3778,12 @@ impl StorageEngine {
             if wrote_any {
                 downloaded += 1;
             }
+        }
+
+        if downloaded == 0 && !entries.is_empty() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "no SSTables for table {table_id} could be restored from local disk or S3"
+            )));
         }
 
         Ok(downloaded)
@@ -11007,6 +11019,85 @@ mod tests {
     // =========================================================================
     // P0-13: SSTable upload→S3→download round-trip
     // =========================================================================
+
+    #[test]
+    fn download_sstables_from_s3_skips_stale_manifest_entries_when_other_sstables_restore() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-stale-manifest-entry".to_string();
+            let tid = table_id();
+            let table_id_str = tid.to_string();
+
+            let engine = StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir.path()),
+                Arc::clone(&store),
+                prefix.clone(),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+
+            let mut manifest = crate::manifest::Manifest::new();
+            for id in ["1", "2"] {
+                manifest.add_sstable(
+                    &table_id_str,
+                    crate::manifest::ManifestEntry {
+                        id: id.to_string(),
+                        size: 4,
+                        min_token: 0,
+                        max_token: 0,
+                        min_timestamp: 0,
+                        max_timestamp: 0,
+                    },
+                );
+            }
+
+            // Only generation 1 is actually present in object storage. Generation
+            // 2 models a stale manifest entry left behind by interrupted
+            // compaction/upload cleanup. Bootstrap should restore the usable
+            // SSTable instead of failing the whole table on the stale entry.
+            let hex = crate::upload::manager::hex_prefix_for("1");
+            let path = crate::upload::manager::sstable_object_key(
+                &prefix,
+                &hex,
+                &table_id_str,
+                "1",
+                "Data.db",
+            );
+            store
+                .put(
+                    &path,
+                    object_store::PutPayload::from(bytes::Bytes::from_static(b"data")),
+                )
+                .await
+                .unwrap();
+
+            let downloaded = engine
+                .download_sstables_from_s3(&tid, &manifest)
+                .await
+                .expect("stale missing SSTable entries must not fail partial restore");
+
+            assert_eq!(downloaded, 1);
+            assert!(dir
+                .path()
+                .join("sstables")
+                .join(&table_id_str)
+                .join("1-Data.db")
+                .exists());
+            assert!(!dir
+                .path()
+                .join("sstables")
+                .join(&table_id_str)
+                .join("2-Data.db")
+                .exists());
+        });
+    }
 
     /// Round-trip test: write rows → flush SSTables → upload to mock S3 →
     /// delete local SSTable files → call download_sstables_from_s3 →
