@@ -1,14 +1,16 @@
 # Cluster Recovery + Storage OOM Seam Refactor Plan
 
-> **For Hermes:** Use strict TDD. Work card-by-card, commit after each verified GREEN/refactor slice, and keep behavior changes behind focused regression tests.
+> Use strict TDD. Work card-by-card, commit after each verified GREEN/refactor slice, and keep behavior changes behind focused regression tests.
 
 **Goal:** Make the fmem/Ferrosa LOCAL_QUORUM read-timeout/OOM recovery path debuggable and correct by extracting pure decision seams from cluster recovery, bootstrap, and storage replay/compaction hot paths.
 
 **Architecture:** Do not add another direct fix into `transition_to_cluster` or peer callbacks. First extract pure planners/phase seams with RED tests, then move side-effect execution behind small typed actions. Storage work should test forbidden intermediate behavior such as unbounded row materialization, startup upload replay blocking, compaction fan-in, and descriptor/resource pressure.
 
-**Tech Stack:** Rust workspace (`ferrosa-cluster`, `ferrosa-storage`), Cargo tests, Hermes Kanban board `ferrosa`.
+**Tech Stack:** Rust workspace (`ferrosa-cluster`, `ferrosa-storage`) and Cargo tests.
 
 **Scratch saved:** `specs/in-process/scratch-peer-recovery-invite-reservation.patch` contains the aborted invite-reservation attempt. It is not applied to source.
+
+**Current status:** Cards 1–6 are implemented and committed. Cards 5–6 established the named bootstrap phase seam (`deliver_invites`, `establish_pools`, `create_raft`, `wait_leader`, `replay_schema`, `bootstrap_stream`, `promote`, `drain_queue`) and bounded `bootstrap_stream` row materialization. Cards 7–9 now continue from that seam into storage startup replay, compaction finalization, and a non-destructive fmem smoke.
 
 ---
 
@@ -185,6 +187,8 @@ git commit -m "refactor: extract cluster invite planning"
 
 ## Card 5: Split `transition_to_cluster` into phase runner skeleton
 
+**Status:** Implemented and committed. The bootstrap phase runner exposes the canonical phase order and phase-name errors, giving the storage follow-through an explicit boundary after `bootstrap_stream`.
+
 **Objective:** Introduce a typed `ClusterBootstrapPlan`/`ClusterBootstrapContext` and move phase boundaries out of the god-function without changing behavior.
 
 **Files:**
@@ -216,6 +220,8 @@ git commit -m "refactor: add cluster bootstrap phase runner"
 ---
 
 ## Card 6: Extract bounded bootstrap streaming planner
+
+**Status:** Implemented and committed. Bootstrap streaming now prefers SSTable-backed streaming, rejects unbounded row fallback after SSTable-stream failure, and bounds small-table row fallback.
 
 **Objective:** Make row materialization budget and SSTable-first behavior explicit and tested.
 
@@ -249,6 +255,8 @@ git commit -m "refactor: bound bootstrap streaming materialization"
 
 ## Card 7: Extract pending upload replay backpressure seam
 
+**Continuation from bootstrap:** After `bootstrap_stream` and promotion complete, startup recovery must still replay durable upload work without materializing or queueing more work than the upload lane can accept. This card moves the next OOM seam from cluster bootstrap into storage pending-upload replay.
+
 **Objective:** Ensure startup upload replay never blocks startup or drops durable pending work when queue capacity is exhausted.
 
 **Files:**
@@ -280,6 +288,8 @@ git commit -m "refactor: isolate pending upload replay backpressure"
 ---
 
 ## Card 8: Extract compaction finalization seam
+
+**Continuation from replay:** Once pending uploads can be replayed with bounded queue pressure, compaction completion needs the same explicit seam for upload confirmation, pending-log retention/removal, manifest update, and best-effort deletion enqueue.
 
 **Objective:** Split `poll_compactions` around output swap, upload confirmation, pending-log handling, manifest update, and deletion enqueue.
 
@@ -313,6 +323,8 @@ git commit -m "refactor: isolate compaction finalization"
 ---
 
 ## Card 9: Non-destructive local roll + fmem smoke
+
+**Continuation from storage seams:** After pending-upload replay and compaction finalization are isolated, run the original fmem read-timeout/OOM smoke without deleting volumes or data. This proves the bootstrap and storage seams compose under a rebuild/roll rather than only in focused unit tests.
 
 **Objective:** Verify the refactor/fixes against the original symptom without wiping Ferrosa/fmem data.
 
