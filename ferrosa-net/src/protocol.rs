@@ -14,8 +14,9 @@ use uuid::Uuid;
 use crate::codec::{MsgType, WireFrameFormat};
 use crate::message::Message;
 use crate::protocol::envelope_capnp::{
-    cluster_control, envelope, error_frame, legacy_payload, node_identity, recovery_control,
-    ErrorCode, MessageFamily,
+    bootstrap_control, bootstrap_stream_plan, cluster_control, envelope, error_frame,
+    legacy_payload, node_identity, recovery_control, stream_chunk, stream_chunk_metadata,
+    stream_control, stream_end, stream_start, ErrorCode, MessageFamily,
 };
 
 capnp::generated_code!(pub mod envelope_capnp);
@@ -154,6 +155,88 @@ pub enum RecoveryControlMessage {
     },
 }
 
+pub const MAX_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapStreamPlan {
+    SstableBulk { sstable_dir_count: u32 },
+    BoundedRows { row_fallback_limit: u32 },
+    RetryRequired,
+}
+
+impl BootstrapStreamPlan {
+    pub fn row_materialization_limit(self) -> Option<u32> {
+        match self {
+            Self::BoundedRows { row_fallback_limit } => Some(row_fallback_limit),
+            Self::SstableBulk { .. } | Self::RetryRequired => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapControlMessage {
+    Plan {
+        plan_id: Uuid,
+        table_id: String,
+        plan: BootstrapStreamPlan,
+    },
+    Progress {
+        plan_id: Uuid,
+        completed_chunks: u64,
+        total_chunks: u64,
+        bytes_streamed: u64,
+    },
+    Complete {
+        plan_id: Uuid,
+        host: NodeIdentity,
+        bytes_streamed: u64,
+    },
+    Error {
+        plan_id: Uuid,
+        failed_plan: BootstrapStreamPlan,
+        retryable: bool,
+        safe_message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Unknown,
+    Sstable,
+    RowFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamChunkMetadata {
+    pub plan_id: Uuid,
+    pub kind: StreamKind,
+    pub chunk_index: u64,
+    pub byte_offset: u64,
+    pub payload_bytes: u32,
+    pub crc32c: u32,
+    pub is_last: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamControlMessage {
+    Start {
+        plan_id: Uuid,
+        kind: StreamKind,
+        total_chunks: u64,
+        max_chunk_bytes: u32,
+    },
+    Chunk {
+        metadata: StreamChunkMetadata,
+        data: Vec<u8>,
+    },
+    End {
+        plan_id: Uuid,
+        kind: StreamKind,
+        chunks_sent: u64,
+        bytes_sent: u64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapnpErrorCode {
     MalformedFrame,
@@ -212,6 +295,8 @@ pub struct DecodedMessageEnvelope {
 pub enum CapnpPayload {
     Cluster(ClusterControlMessage),
     Recovery(RecoveryControlMessage),
+    Bootstrap(BootstrapControlMessage),
+    Stream(StreamControlMessage),
     Error(CapnpErrorFrame),
     Legacy(LegacyPayload),
 }
@@ -319,6 +404,14 @@ pub fn encode_envelope(envelope: &CapnpEnvelope) -> Result<Vec<u8>, CapnpDecodeE
                 root.set_message_family(MessageFamily::Recovery);
                 write_recovery(recovery, root.init_payload().init_recovery())?;
             }
+            CapnpPayload::Bootstrap(bootstrap) => {
+                root.set_message_family(MessageFamily::Bootstrap);
+                write_bootstrap(bootstrap, root.init_payload().init_bootstrap())?;
+            }
+            CapnpPayload::Stream(stream) => {
+                root.set_message_family(MessageFamily::Stream);
+                write_stream(stream, root.init_payload().init_stream())?;
+            }
             CapnpPayload::Error(error) => {
                 root.set_message_family(error.failed_family);
                 root.set_message_kind(error.failed_kind);
@@ -368,6 +461,12 @@ pub fn decode_envelope(mut bytes: &[u8]) -> Result<CapnpEnvelope, CapnpDecodeErr
         }
         envelope::payload::Recovery(recovery) => {
             CapnpPayload::Recovery(read_recovery(recovery.map_err(CapnpDecodeError::from)?)?)
+        }
+        envelope::payload::Bootstrap(bootstrap) => {
+            CapnpPayload::Bootstrap(read_bootstrap(bootstrap.map_err(CapnpDecodeError::from)?)?)
+        }
+        envelope::payload::Stream(stream) => {
+            CapnpPayload::Stream(read_stream(stream.map_err(CapnpDecodeError::from)?)?)
         }
         envelope::payload::Error(error) => {
             CapnpPayload::Error(read_error(error.map_err(CapnpDecodeError::from)?)?)
@@ -521,14 +620,16 @@ fn base_envelope(correlation_id: Uuid, stream_id: u64, payload: CapnpPayload) ->
 
 fn validate_envelope(envelope: &CapnpEnvelope) -> Result<(), CapnpDecodeError> {
     match &envelope.payload {
-        CapnpPayload::Cluster(_) | CapnpPayload::Recovery(_) => {
+        CapnpPayload::Cluster(_) | CapnpPayload::Recovery(_) | CapnpPayload::Bootstrap(_) => {
             validate_node("sender", &envelope.sender)?;
         }
-        CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => {}
+        CapnpPayload::Stream(_) | CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => {}
     }
     match &envelope.payload {
         CapnpPayload::Cluster(msg) => validate_cluster(msg),
         CapnpPayload::Recovery(msg) => validate_recovery(msg),
+        CapnpPayload::Bootstrap(msg) => validate_bootstrap(msg),
+        CapnpPayload::Stream(msg) => validate_stream(msg),
         CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => Ok(()),
     }
 }
@@ -584,6 +685,74 @@ fn validate_recovery(msg: &RecoveryControlMessage) -> Result<(), CapnpDecodeErro
     }
     if let RecoveryControlMessage::Complete { host, .. } = msg {
         validate_node("host", host)?;
+    }
+    Ok(())
+}
+
+fn validate_bootstrap(msg: &BootstrapControlMessage) -> Result<(), CapnpDecodeError> {
+    match msg {
+        BootstrapControlMessage::Plan {
+            plan_id, table_id, ..
+        } => {
+            validate_uuid("plan_id", *plan_id)?;
+            if table_id.is_empty() {
+                return Err(CapnpDecodeError::InvalidRequiredField(
+                    "table_id".to_string(),
+                ));
+            }
+        }
+        BootstrapControlMessage::Progress { plan_id, .. } => validate_uuid("plan_id", *plan_id)?,
+        BootstrapControlMessage::Complete { plan_id, host, .. } => {
+            validate_uuid("plan_id", *plan_id)?;
+            validate_node("host", host)?;
+        }
+        BootstrapControlMessage::Error {
+            plan_id,
+            safe_message,
+            ..
+        } => {
+            validate_uuid("plan_id", *plan_id)?;
+            if safe_message.is_empty() {
+                return Err(CapnpDecodeError::InvalidRequiredField(
+                    "safe_message".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_stream(msg: &StreamControlMessage) -> Result<(), CapnpDecodeError> {
+    match msg {
+        StreamControlMessage::Start {
+            plan_id,
+            max_chunk_bytes,
+            ..
+        } => {
+            validate_uuid("plan_id", *plan_id)?;
+            if (*max_chunk_bytes as usize) > MAX_STREAM_CHUNK_BYTES {
+                return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                    "stream chunk max {max_chunk_bytes} exceeds {MAX_STREAM_CHUNK_BYTES}"
+                )));
+            }
+        }
+        StreamControlMessage::Chunk { metadata, data } => {
+            validate_uuid("metadata.plan_id", metadata.plan_id)?;
+            if metadata.payload_bytes as usize != data.len() {
+                return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                    "payload_bytes {} does not match data length {}",
+                    metadata.payload_bytes,
+                    data.len()
+                )));
+            }
+            if data.len() > MAX_STREAM_CHUNK_BYTES {
+                return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                    "stream chunk {} exceeds {MAX_STREAM_CHUNK_BYTES}",
+                    data.len()
+                )));
+            }
+        }
+        StreamControlMessage::End { plan_id, .. } => validate_uuid("plan_id", *plan_id)?,
     }
     Ok(())
 }
@@ -917,6 +1086,285 @@ fn read_recovery(
     })
 }
 
+fn write_bootstrap(
+    msg: &BootstrapControlMessage,
+    builder: bootstrap_control::Builder<'_>,
+) -> Result<(), CapnpDecodeError> {
+    match msg {
+        BootstrapControlMessage::Plan {
+            plan_id,
+            table_id,
+            plan,
+        } => {
+            let mut out = builder.init_op().init_plan();
+            out.set_plan_id(plan_id.as_bytes());
+            out.set_table_id(table_id);
+            write_bootstrap_stream_plan(plan, out.reborrow().init_stream_plan());
+        }
+        BootstrapControlMessage::Progress {
+            plan_id,
+            completed_chunks,
+            total_chunks,
+            bytes_streamed,
+        } => {
+            let mut out = builder.init_op().init_progress();
+            out.set_plan_id(plan_id.as_bytes());
+            out.set_completed_chunks(*completed_chunks);
+            out.set_total_chunks(*total_chunks);
+            out.set_bytes_streamed(*bytes_streamed);
+        }
+        BootstrapControlMessage::Complete {
+            plan_id,
+            host,
+            bytes_streamed,
+        } => {
+            let mut out = builder.init_op().init_complete();
+            out.set_plan_id(plan_id.as_bytes());
+            fill_node(out.reborrow().init_host(), host);
+            out.set_bytes_streamed(*bytes_streamed);
+        }
+        BootstrapControlMessage::Error {
+            plan_id,
+            failed_plan,
+            retryable,
+            safe_message,
+        } => {
+            let mut out = builder.init_op().init_error();
+            out.set_plan_id(plan_id.as_bytes());
+            write_bootstrap_stream_plan(failed_plan, out.reborrow().init_failed_plan());
+            out.set_retryable(*retryable);
+            out.set_safe_message(safe_message);
+        }
+    }
+    Ok(())
+}
+
+fn write_bootstrap_stream_plan(
+    plan: &BootstrapStreamPlan,
+    builder: envelope_capnp::bootstrap_stream_plan::Builder<'_>,
+) {
+    match plan {
+        BootstrapStreamPlan::SstableBulk { sstable_dir_count } => builder
+            .init_mode()
+            .init_sstable_bulk()
+            .set_sstable_dir_count(*sstable_dir_count),
+        BootstrapStreamPlan::BoundedRows { row_fallback_limit } => builder
+            .init_mode()
+            .init_bounded_rows()
+            .set_row_fallback_limit(*row_fallback_limit),
+        BootstrapStreamPlan::RetryRequired => {
+            builder.init_mode().init_retry_required();
+        }
+    }
+}
+
+fn read_bootstrap(
+    reader: bootstrap_control::Reader<'_>,
+) -> Result<BootstrapControlMessage, CapnpDecodeError> {
+    Ok(match reader.get_op().which().map_err(not_in_schema)? {
+        bootstrap_control::op::Plan(plan) => {
+            let plan = plan?;
+            BootstrapControlMessage::Plan {
+                plan_id: read_required_uuid("plan_id", plan.get_plan_id()?)?,
+                table_id: plan.get_table_id()?.to_string()?,
+                plan: read_bootstrap_stream_plan(plan.get_stream_plan()?)?,
+            }
+        }
+        bootstrap_control::op::Progress(progress) => {
+            let progress = progress?;
+            BootstrapControlMessage::Progress {
+                plan_id: read_required_uuid("plan_id", progress.get_plan_id()?)?,
+                completed_chunks: progress.get_completed_chunks(),
+                total_chunks: progress.get_total_chunks(),
+                bytes_streamed: progress.get_bytes_streamed(),
+            }
+        }
+        bootstrap_control::op::Complete(complete) => {
+            let complete = complete?;
+            BootstrapControlMessage::Complete {
+                plan_id: read_required_uuid("plan_id", complete.get_plan_id()?)?,
+                host: read_node(complete.get_host()?)?,
+                bytes_streamed: complete.get_bytes_streamed(),
+            }
+        }
+        bootstrap_control::op::Error(error) => {
+            let error = error?;
+            BootstrapControlMessage::Error {
+                plan_id: read_required_uuid("plan_id", error.get_plan_id()?)?,
+                failed_plan: read_bootstrap_stream_plan(error.get_failed_plan()?)?,
+                retryable: error.get_retryable(),
+                safe_message: error.get_safe_message()?.to_string()?,
+            }
+        }
+    })
+}
+
+fn read_bootstrap_stream_plan(
+    reader: envelope_capnp::bootstrap_stream_plan::Reader<'_>,
+) -> Result<BootstrapStreamPlan, CapnpDecodeError> {
+    Ok(match reader.get_mode().which().map_err(not_in_schema)? {
+        bootstrap_stream_plan::mode::SstableBulk(plan) => BootstrapStreamPlan::SstableBulk {
+            sstable_dir_count: plan?.get_sstable_dir_count(),
+        },
+        bootstrap_stream_plan::mode::BoundedRows(plan) => BootstrapStreamPlan::BoundedRows {
+            row_fallback_limit: plan?.get_row_fallback_limit(),
+        },
+        bootstrap_stream_plan::mode::RetryRequired(_) => BootstrapStreamPlan::RetryRequired,
+    })
+}
+
+fn write_stream(
+    msg: &StreamControlMessage,
+    builder: stream_control::Builder<'_>,
+) -> Result<(), CapnpDecodeError> {
+    match msg {
+        StreamControlMessage::Start {
+            plan_id,
+            kind,
+            total_chunks,
+            max_chunk_bytes,
+        } => {
+            let mut out = builder.init_op().init_start();
+            write_stream_start(
+                plan_id,
+                *kind,
+                *total_chunks,
+                *max_chunk_bytes,
+                out.reborrow(),
+            );
+        }
+        StreamControlMessage::Chunk { metadata, data } => {
+            let mut out = builder.init_op().init_chunk();
+            write_stream_chunk(metadata, data, out.reborrow());
+        }
+        StreamControlMessage::End {
+            plan_id,
+            kind,
+            chunks_sent,
+            bytes_sent,
+        } => {
+            let mut out = builder.init_op().init_end();
+            write_stream_end(plan_id, *kind, *chunks_sent, *bytes_sent, out.reborrow());
+        }
+    }
+    Ok(())
+}
+
+fn write_stream_start(
+    plan_id: &Uuid,
+    kind: StreamKind,
+    total_chunks: u64,
+    max_chunk_bytes: u32,
+    mut builder: stream_start::Builder<'_>,
+) {
+    builder.set_plan_id(plan_id.as_bytes());
+    builder.set_kind(kind.into());
+    builder.set_total_chunks(total_chunks);
+    builder.set_max_chunk_bytes(max_chunk_bytes);
+}
+
+fn write_stream_chunk(
+    metadata: &StreamChunkMetadata,
+    data: &[u8],
+    mut builder: stream_chunk::Builder<'_>,
+) {
+    write_stream_chunk_metadata(metadata, builder.reborrow().init_metadata());
+    builder.set_data(data);
+}
+
+fn write_stream_chunk_metadata(
+    metadata: &StreamChunkMetadata,
+    mut builder: stream_chunk_metadata::Builder<'_>,
+) {
+    builder.set_plan_id(metadata.plan_id.as_bytes());
+    builder.set_kind(metadata.kind.into());
+    builder.set_chunk_index(metadata.chunk_index);
+    builder.set_byte_offset(metadata.byte_offset);
+    builder.set_payload_bytes(metadata.payload_bytes);
+    builder.set_crc32c(metadata.crc32c);
+    builder.set_is_last(metadata.is_last);
+}
+
+fn write_stream_end(
+    plan_id: &Uuid,
+    kind: StreamKind,
+    chunks_sent: u64,
+    bytes_sent: u64,
+    mut builder: stream_end::Builder<'_>,
+) {
+    builder.set_plan_id(plan_id.as_bytes());
+    builder.set_kind(kind.into());
+    builder.set_chunks_sent(chunks_sent);
+    builder.set_bytes_sent(bytes_sent);
+}
+
+fn read_stream(
+    reader: stream_control::Reader<'_>,
+) -> Result<StreamControlMessage, CapnpDecodeError> {
+    Ok(match reader.get_op().which().map_err(not_in_schema)? {
+        stream_control::op::Start(start) => {
+            let start = start?;
+            StreamControlMessage::Start {
+                plan_id: read_required_uuid("plan_id", start.get_plan_id()?)?,
+                kind: start
+                    .get_kind()
+                    .map(StreamKind::from)
+                    .unwrap_or(StreamKind::Unknown),
+                total_chunks: start.get_total_chunks(),
+                max_chunk_bytes: start.get_max_chunk_bytes(),
+            }
+        }
+        stream_control::op::Chunk(chunk) => {
+            let chunk = chunk?;
+            let data = chunk.get_data()?.to_vec();
+            if data.len() > MAX_STREAM_CHUNK_BYTES {
+                return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                    "stream chunk {} exceeds {MAX_STREAM_CHUNK_BYTES}",
+                    data.len()
+                )));
+            }
+            let metadata = read_stream_chunk_metadata(chunk.get_metadata()?)?;
+            if metadata.payload_bytes as usize != data.len() {
+                return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                    "payload_bytes {} does not match data length {}",
+                    metadata.payload_bytes,
+                    data.len()
+                )));
+            }
+            StreamControlMessage::Chunk { metadata, data }
+        }
+        stream_control::op::End(end) => {
+            let end = end?;
+            StreamControlMessage::End {
+                plan_id: read_required_uuid("plan_id", end.get_plan_id()?)?,
+                kind: end
+                    .get_kind()
+                    .map(StreamKind::from)
+                    .unwrap_or(StreamKind::Unknown),
+                chunks_sent: end.get_chunks_sent(),
+                bytes_sent: end.get_bytes_sent(),
+            }
+        }
+    })
+}
+
+fn read_stream_chunk_metadata(
+    reader: stream_chunk_metadata::Reader<'_>,
+) -> Result<StreamChunkMetadata, CapnpDecodeError> {
+    Ok(StreamChunkMetadata {
+        plan_id: read_required_uuid("metadata.plan_id", reader.get_plan_id()?)?,
+        kind: reader
+            .get_kind()
+            .map(StreamKind::from)
+            .unwrap_or(StreamKind::Unknown),
+        chunk_index: reader.get_chunk_index(),
+        byte_offset: reader.get_byte_offset(),
+        payload_bytes: reader.get_payload_bytes(),
+        crc32c: reader.get_crc32c(),
+        is_last: reader.get_is_last(),
+    })
+}
+
 fn read_nodes(
     reader: capnp::struct_list::Reader<'_, node_identity::Owned>,
 ) -> Result<Vec<NodeIdentity>, CapnpDecodeError> {
@@ -1219,6 +1667,26 @@ impl From<envelope_capnp::RecoveryAction> for RecoveryAction {
             envelope_capnp::RecoveryAction::ReplayRaft => Self::ReplayRaft,
             envelope_capnp::RecoveryAction::RunBootstrap => Self::RunBootstrap,
             envelope_capnp::RecoveryAction::FullBootstrapRequired => Self::FullBootstrapRequired,
+        }
+    }
+}
+
+impl From<StreamKind> for envelope_capnp::StreamKind {
+    fn from(value: StreamKind) -> Self {
+        match value {
+            StreamKind::Unknown => Self::Unknown,
+            StreamKind::Sstable => Self::Sstable,
+            StreamKind::RowFallback => Self::RowFallback,
+        }
+    }
+}
+
+impl From<envelope_capnp::StreamKind> for StreamKind {
+    fn from(value: envelope_capnp::StreamKind) -> Self {
+        match value {
+            envelope_capnp::StreamKind::Unknown => Self::Unknown,
+            envelope_capnp::StreamKind::Sstable => Self::Sstable,
+            envelope_capnp::StreamKind::RowFallback => Self::RowFallback,
         }
     }
 }

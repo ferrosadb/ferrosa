@@ -183,3 +183,155 @@ fn invalid_required_semantics_fail_closed() {
         Err(CapnpDecodeError::InvalidRequiredField(field)) if field.contains("host.host_id")
     ));
 }
+
+#[test]
+fn bootstrap_row_fallback_limit_is_explicit_on_the_wire() {
+    use ferrosa_net::protocol::{BootstrapControlMessage, BootstrapStreamPlan};
+
+    let plan_id = uuid(0x90);
+    let msg = envelope(CapnpPayload::Bootstrap(BootstrapControlMessage::Plan {
+        plan_id,
+        table_id: "ks.tbl".to_string(),
+        plan: BootstrapStreamPlan::BoundedRows {
+            row_fallback_limit: 64,
+        },
+    }));
+
+    let decoded = decode_envelope(&encode_envelope(&msg).expect("bounded row plan encodes"))
+        .expect("bounded row plan decodes");
+
+    assert_eq!(decoded, msg);
+    match decoded.payload {
+        CapnpPayload::Bootstrap(BootstrapControlMessage::Plan {
+            plan: BootstrapStreamPlan::BoundedRows { row_fallback_limit },
+            ..
+        }) => assert_eq!(row_fallback_limit, 64),
+        other => panic!("expected bounded row fallback plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn bootstrap_progress_and_completion_are_explicit_on_the_wire() {
+    use ferrosa_net::protocol::BootstrapControlMessage;
+
+    let plan_id = uuid(0x95);
+    let progress = envelope(CapnpPayload::Bootstrap(BootstrapControlMessage::Progress {
+        plan_id,
+        completed_chunks: 8,
+        total_chunks: 13,
+        bytes_streamed: 65_536,
+    }));
+    assert_eq!(
+        decode_envelope(&encode_envelope(&progress).expect("progress encodes"))
+            .expect("progress decodes"),
+        progress
+    );
+
+    let complete = envelope(CapnpPayload::Bootstrap(BootstrapControlMessage::Complete {
+        plan_id,
+        host: node(5, "127.0.0.5:7000"),
+        bytes_streamed: 131_072,
+    }));
+    assert_eq!(
+        decode_envelope(&encode_envelope(&complete).expect("complete encodes"))
+            .expect("complete decodes"),
+        complete
+    );
+}
+
+#[test]
+fn failed_sstable_stream_serializes_retry_not_row_materialization() {
+    use ferrosa_net::protocol::{BootstrapControlMessage, BootstrapStreamPlan};
+
+    let msg = envelope(CapnpPayload::Bootstrap(BootstrapControlMessage::Error {
+        plan_id: uuid(0x91),
+        failed_plan: BootstrapStreamPlan::SstableBulk {
+            sstable_dir_count: 3,
+        },
+        retryable: true,
+        safe_message: "sstable stream failed; retry required".to_string(),
+    }));
+
+    let decoded = decode_envelope(&encode_envelope(&msg).expect("stream error encodes"))
+        .expect("stream error decodes");
+
+    match decoded.payload {
+        CapnpPayload::Bootstrap(BootstrapControlMessage::Error { failed_plan, .. }) => {
+            assert_eq!(
+                failed_plan,
+                BootstrapStreamPlan::SstableBulk {
+                    sstable_dir_count: 3,
+                }
+            );
+            assert!(
+                failed_plan.row_materialization_limit().is_none(),
+                "SSTable failures must not imply any row materialization limit or unbounded row fallback"
+            );
+        }
+        other => panic!("expected bootstrap error, got {other:?}"),
+    }
+}
+
+#[test]
+fn stream_chunk_metadata_is_fixed_and_bounded() {
+    use ferrosa_net::protocol::{StreamChunkMetadata, StreamControlMessage, StreamKind};
+
+    let chunk = envelope(CapnpPayload::Stream(StreamControlMessage::Chunk {
+        metadata: StreamChunkMetadata {
+            plan_id: uuid(0x92),
+            kind: StreamKind::Sstable,
+            chunk_index: 7,
+            byte_offset: 8192,
+            payload_bytes: 4,
+            crc32c: 0xAABB_CCDD,
+            is_last: false,
+        },
+        data: vec![1, 2, 3, 4],
+    }));
+
+    let decoded = decode_envelope(&encode_envelope(&chunk).expect("stream chunk encodes"))
+        .expect("stream chunk decodes");
+
+    assert_eq!(decoded, chunk);
+}
+
+#[test]
+fn malformed_or_oversized_stream_chunks_fail_closed() {
+    use ferrosa_net::protocol::{
+        StreamChunkMetadata, StreamControlMessage, StreamKind, MAX_STREAM_CHUNK_BYTES,
+    };
+
+    let malformed = envelope(CapnpPayload::Stream(StreamControlMessage::Chunk {
+        metadata: StreamChunkMetadata {
+            plan_id: uuid(0x93),
+            kind: StreamKind::Sstable,
+            chunk_index: 0,
+            byte_offset: 0,
+            payload_bytes: 3,
+            crc32c: 0,
+            is_last: true,
+        },
+        data: vec![1, 2],
+    }));
+    assert!(matches!(
+        encode_envelope(&malformed),
+        Err(CapnpDecodeError::InvalidRequiredField(field)) if field.contains("payload_bytes")
+    ));
+
+    let oversized = envelope(CapnpPayload::Stream(StreamControlMessage::Chunk {
+        metadata: StreamChunkMetadata {
+            plan_id: uuid(0x94),
+            kind: StreamKind::Sstable,
+            chunk_index: 1,
+            byte_offset: 0,
+            payload_bytes: (MAX_STREAM_CHUNK_BYTES + 1) as u32,
+            crc32c: 0,
+            is_last: false,
+        },
+        data: vec![0; MAX_STREAM_CHUNK_BYTES + 1],
+    }));
+    assert!(matches!(
+        encode_envelope(&oversized),
+        Err(CapnpDecodeError::InvalidRequiredField(field)) if field.contains("stream chunk")
+    ));
+}

@@ -37,6 +37,8 @@ struct Envelope {
     cluster @25 :ClusterControl;
     recovery @26 :RecoveryControl;
     legacy @27 :LegacyPayload;
+    bootstrap @28 :BootstrapControl;
+    stream @29 :StreamControl;
   }
 }
 
@@ -117,6 +119,102 @@ struct ErrorFrame {
 struct LegacyPayload {
   msgType @0 :UInt16;
   body @1 :Data;
+}
+
+struct BootstrapControl {
+  op :union {
+    plan @0 :BootstrapPlan;
+    progress @1 :BootstrapProgress;
+    complete @2 :BootstrapComplete;
+    error @3 :BootstrapError;
+  }
+}
+
+struct BootstrapPlan {
+  planId @0 :Data;
+  tableId @1 :Text;
+  streamPlan @2 :BootstrapStreamPlan;
+}
+
+struct BootstrapStreamPlan {
+  mode :union {
+    sstableBulk @0 :SstableBulkPlan;
+    boundedRows @1 :BoundedRowsPlan;
+    retryRequired @2 :RetryRequiredPlan;
+  }
+}
+
+struct SstableBulkPlan {
+  sstableDirCount @0 :UInt32;
+}
+
+struct BoundedRowsPlan {
+  rowFallbackLimit @0 :UInt32;
+}
+
+struct RetryRequiredPlan {}
+
+struct BootstrapProgress {
+  planId @0 :Data;
+  completedChunks @1 :UInt64;
+  totalChunks @2 :UInt64;
+  bytesStreamed @3 :UInt64;
+}
+
+struct BootstrapComplete {
+  planId @0 :Data;
+  host @1 :NodeIdentity;
+  bytesStreamed @2 :UInt64;
+}
+
+struct BootstrapError {
+  planId @0 :Data;
+  failedPlan @1 :BootstrapStreamPlan;
+  retryable @2 :Bool;
+  safeMessage @3 :Text;
+}
+
+struct StreamControl {
+  op :union {
+    start @0 :StreamStart;
+    chunk @1 :StreamChunk;
+    end @2 :StreamEnd;
+  }
+}
+
+enum StreamKind {
+  unknown @0;
+  sstable @1;
+  rowFallback @2;
+}
+
+struct StreamStart {
+  planId @0 :Data;
+  kind @1 :StreamKind;
+  totalChunks @2 :UInt64;
+  maxChunkBytes @3 :UInt32;
+}
+
+struct StreamChunkMetadata {
+  planId @0 :Data;
+  kind @1 :StreamKind;
+  chunkIndex @2 :UInt64;
+  byteOffset @3 :UInt64;
+  payloadBytes @4 :UInt32;
+  crc32c @5 :UInt32;
+  isLast @6 :Bool;
+}
+
+struct StreamChunk {
+  metadata @0 :StreamChunkMetadata;
+  data @1 :Data;
+}
+
+struct StreamEnd {
+  planId @0 :Data;
+  kind @1 :StreamKind;
+  chunksSent @2 :UInt64;
+  bytesSent @3 :UInt64;
 }
 
 enum ErrorCode {
