@@ -36,6 +36,7 @@ struct Envelope {
     health @24 :HealthFrame;
     cluster @25 :ClusterControl;
     recovery @26 :RecoveryControl;
+    legacy @27 :LegacyPayload;
   }
 }
 
@@ -111,6 +112,11 @@ struct ErrorFrame {
   minSupportedTransportVersion @8 :UInt16;
   maxSupportedTransportVersion @9 :UInt16;
   missingFeatures @10 :UInt64;
+}
+
+struct LegacyPayload {
+  msgType @0 :UInt16;
+  body @1 :Data;
 }
 
 enum ErrorCode {

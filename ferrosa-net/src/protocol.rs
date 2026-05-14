@@ -1,16 +1,21 @@
 //! Generated Cap'n Proto protocol modules and adapters for internode messages.
 //!
-//! Live networking still uses the legacy [`crate::message::Message`] enum.  The
-//! adapter types below are an explicit domain-facing seam for the Cap'n Proto
-//! envelope/body contract so callers do not depend on generated wire structs.
+//! Adapter types below provide an explicit domain-facing seam for the Cap'n
+//! Proto envelope/body contract so callers do not depend on generated wire
+//! structs. The legacy message body remains available as an append-only envelope
+//! payload until live peers negotiate the CapnProto frame format.
 
 use std::fmt;
 
+use bytes::{Bytes, BytesMut};
 use capnp::{message, serialize};
 use uuid::Uuid;
 
+use crate::codec::{MsgType, WireFrameFormat};
+use crate::message::Message;
 use crate::protocol::envelope_capnp::{
-    cluster_control, envelope, node_identity, recovery_control, MessageFamily,
+    cluster_control, envelope, error_frame, legacy_payload, node_identity, recovery_control,
+    ErrorCode, MessageFamily,
 };
 
 capnp::generated_code!(pub mod envelope_capnp);
@@ -149,10 +154,66 @@ pub enum RecoveryControlMessage {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapnpErrorCode {
+    MalformedFrame,
+    UnsupportedVersion,
+    UnsupportedFeature,
+    Unauthenticated,
+    Unauthorized,
+    ClusterMismatch,
+    UnknownMessage,
+    NoHandler,
+    Timeout,
+    Overloaded,
+    NotLeader,
+    StaleEpoch,
+    Conflict,
+    RetryRequired,
+    FullBootstrapRequired,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapnpErrorFrame {
+    pub code: CapnpErrorCode,
+    pub retryable: bool,
+    pub safe_message: String,
+    pub detail_code: String,
+    pub failed_family: MessageFamily,
+    pub failed_kind: u16,
+    pub failed_correlation_id: Option<Uuid>,
+    pub min_supported_transport_version: u16,
+    pub max_supported_transport_version: u16,
+    pub missing_features: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyPayload {
+    pub msg_type: u16,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapnpTransportMode {
+    LegacyOnly,
+    PreferCapnp,
+    RequireCapnp,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedMessageEnvelope {
+    pub stream_id: u64,
+    pub correlation_id: Uuid,
+    pub message: Message,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapnpPayload {
     Cluster(ClusterControlMessage),
     Recovery(RecoveryControlMessage),
+    Error(CapnpErrorFrame),
+    Legacy(LegacyPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +319,16 @@ pub fn encode_envelope(envelope: &CapnpEnvelope) -> Result<Vec<u8>, CapnpDecodeE
                 root.set_message_family(MessageFamily::Recovery);
                 write_recovery(recovery, root.init_payload().init_recovery())?;
             }
+            CapnpPayload::Error(error) => {
+                root.set_message_family(error.failed_family);
+                root.set_message_kind(error.failed_kind);
+                write_error(error, root.init_payload().init_error())?;
+            }
+            CapnpPayload::Legacy(legacy) => {
+                root.set_message_family(message_family_for_kind(legacy.msg_type));
+                root.set_message_kind(legacy.msg_type);
+                write_legacy(legacy, root.init_payload().init_legacy())?;
+            }
         }
     }
 
@@ -298,6 +369,12 @@ pub fn decode_envelope(mut bytes: &[u8]) -> Result<CapnpEnvelope, CapnpDecodeErr
         envelope::payload::Recovery(recovery) => {
             CapnpPayload::Recovery(read_recovery(recovery.map_err(CapnpDecodeError::from)?)?)
         }
+        envelope::payload::Error(error) => {
+            CapnpPayload::Error(read_error(error.map_err(CapnpDecodeError::from)?)?)
+        }
+        envelope::payload::Legacy(legacy) => {
+            CapnpPayload::Legacy(read_legacy(legacy.map_err(CapnpDecodeError::from)?)?)
+        }
         _ => {
             return Err(CapnpDecodeError::UnknownPayload(
                 "non-adapter payload".to_string(),
@@ -327,11 +404,132 @@ pub fn decode_envelope(mut bytes: &[u8]) -> Result<CapnpEnvelope, CapnpDecodeErr
     })
 }
 
+pub fn negotiate_capnp_transport(
+    mode: CapnpTransportMode,
+    peer_min_supported_transport_version: u16,
+    peer_transport_version: u16,
+) -> Result<WireFrameFormat, CapnpDecodeError> {
+    let peer_supports_current = peer_min_supported_transport_version <= CURRENT_TRANSPORT_VERSION
+        && peer_transport_version >= CURRENT_TRANSPORT_VERSION;
+    match mode {
+        CapnpTransportMode::LegacyOnly => Ok(WireFrameFormat::Legacy),
+        CapnpTransportMode::PreferCapnp if peer_supports_current => {
+            Ok(WireFrameFormat::CapnpEnvelope)
+        }
+        CapnpTransportMode::PreferCapnp => Ok(WireFrameFormat::Legacy),
+        CapnpTransportMode::RequireCapnp if peer_supports_current => {
+            Ok(WireFrameFormat::CapnpEnvelope)
+        }
+        CapnpTransportMode::RequireCapnp => Err(CapnpDecodeError::UnsupportedVersion {
+            transport_version: peer_transport_version,
+            min_supported_transport_version: peer_min_supported_transport_version,
+        }),
+    }
+}
+
+pub fn encode_message_envelope(
+    message: &Message,
+    stream_id: u64,
+    correlation_id: Uuid,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    let mut body = BytesMut::new();
+    message.encode(&mut body).map_err(|err| {
+        CapnpDecodeError::MalformedFrame(format!("legacy message encode failed: {err}"))
+    })?;
+    let envelope = base_envelope(
+        correlation_id,
+        stream_id,
+        CapnpPayload::Legacy(LegacyPayload {
+            msg_type: message.msg_type() as u16,
+            body: body.to_vec(),
+        }),
+    );
+    encode_envelope(&envelope)
+}
+
+pub fn decode_message_envelope(bytes: &[u8]) -> Result<DecodedMessageEnvelope, CapnpDecodeError> {
+    let envelope = decode_envelope(bytes)?;
+    let CapnpPayload::Legacy(payload) = envelope.payload else {
+        return Err(CapnpDecodeError::UnknownPayload(
+            "expected legacy message payload".to_string(),
+        ));
+    };
+    let msg_type = MsgType::try_from(u8::try_from(payload.msg_type).map_err(|_| {
+        CapnpDecodeError::UnknownPayload(format!("message kind out of range: {}", payload.msg_type))
+    })?)
+    .map_err(|err| CapnpDecodeError::UnknownPayload(err.to_string()))?;
+    let message = Message::decode(msg_type, &mut Bytes::from(payload.body)).map_err(|err| {
+        CapnpDecodeError::MalformedFrame(format!("legacy message body decode failed: {err}"))
+    })?;
+    Ok(DecodedMessageEnvelope {
+        stream_id: envelope.stream_id,
+        correlation_id: envelope.correlation_id,
+        message,
+    })
+}
+
+pub fn encode_error_envelope(
+    code: CapnpErrorCode,
+    retryable: bool,
+    safe_message: &str,
+    failed_msg_type: MsgType,
+    failed_correlation_id: Uuid,
+    min_supported_transport_version: u16,
+    max_supported_transport_version: u16,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    let error = CapnpErrorFrame {
+        code,
+        retryable,
+        safe_message: safe_message.to_string(),
+        detail_code: String::new(),
+        failed_family: message_family_for_kind(failed_msg_type as u16),
+        failed_kind: failed_msg_type as u16,
+        failed_correlation_id: Some(failed_correlation_id),
+        min_supported_transport_version,
+        max_supported_transport_version,
+        missing_features: 0,
+    };
+    encode_envelope(&base_envelope(
+        failed_correlation_id,
+        0,
+        CapnpPayload::Error(error),
+    ))
+}
+
+fn base_envelope(correlation_id: Uuid, stream_id: u64, payload: CapnpPayload) -> CapnpEnvelope {
+    CapnpEnvelope {
+        transport_version: CURRENT_TRANSPORT_VERSION,
+        min_supported_transport_version: MIN_SUPPORTED_TRANSPORT_VERSION,
+        schema_version: CURRENT_SCHEMA_VERSION,
+        required_features: 0,
+        optional_features: 0,
+        sender: NodeIdentity::minimal(Uuid::from_bytes([1; 16]), "0.0.0.0:0"),
+        recipient: None,
+        cluster_id: Uuid::nil(),
+        epoch: 0,
+        correlation_id,
+        causation_id: None,
+        stream_id,
+        sequence: 0,
+        deadline_unix_nanos: None,
+        trace_id: [0; 16],
+        span_id: [0; 8],
+        trace_flags: 0,
+        payload,
+    }
+}
+
 fn validate_envelope(envelope: &CapnpEnvelope) -> Result<(), CapnpDecodeError> {
-    validate_node("sender", &envelope.sender)?;
+    match &envelope.payload {
+        CapnpPayload::Cluster(_) | CapnpPayload::Recovery(_) => {
+            validate_node("sender", &envelope.sender)?;
+        }
+        CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => {}
+    }
     match &envelope.payload {
         CapnpPayload::Cluster(msg) => validate_cluster(msg),
         CapnpPayload::Recovery(msg) => validate_recovery(msg),
+        CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => Ok(()),
     }
 }
 
@@ -727,6 +925,56 @@ fn read_nodes(
         .collect()
 }
 
+fn write_error(
+    msg: &CapnpErrorFrame,
+    mut builder: error_frame::Builder<'_>,
+) -> Result<(), CapnpDecodeError> {
+    builder.set_code(msg.code.into());
+    builder.set_retryable(msg.retryable);
+    builder.set_safe_message(&msg.safe_message);
+    builder.set_detail_code(&msg.detail_code);
+    builder.set_failed_family(msg.failed_family);
+    builder.set_failed_kind(msg.failed_kind);
+    if let Some(id) = msg.failed_correlation_id {
+        builder.set_failed_correlation_id(id.as_bytes());
+    }
+    builder.set_min_supported_transport_version(msg.min_supported_transport_version);
+    builder.set_max_supported_transport_version(msg.max_supported_transport_version);
+    builder.set_missing_features(msg.missing_features);
+    Ok(())
+}
+
+fn read_error(reader: error_frame::Reader<'_>) -> Result<CapnpErrorFrame, CapnpDecodeError> {
+    Ok(CapnpErrorFrame {
+        code: reader.get_code().map_err(not_in_schema)?.into(),
+        retryable: reader.get_retryable(),
+        safe_message: reader.get_safe_message()?.to_string()?,
+        detail_code: reader.get_detail_code()?.to_string()?,
+        failed_family: reader.get_failed_family().map_err(not_in_schema)?,
+        failed_kind: reader.get_failed_kind(),
+        failed_correlation_id: read_optional_uuid(reader.get_failed_correlation_id()?)?,
+        min_supported_transport_version: reader.get_min_supported_transport_version(),
+        max_supported_transport_version: reader.get_max_supported_transport_version(),
+        missing_features: reader.get_missing_features(),
+    })
+}
+
+fn write_legacy(
+    payload: &LegacyPayload,
+    mut builder: legacy_payload::Builder<'_>,
+) -> Result<(), CapnpDecodeError> {
+    builder.set_msg_type(payload.msg_type);
+    builder.set_body(&payload.body);
+    Ok(())
+}
+
+fn read_legacy(reader: legacy_payload::Reader<'_>) -> Result<LegacyPayload, CapnpDecodeError> {
+    Ok(LegacyPayload {
+        msg_type: reader.get_msg_type(),
+        body: reader.get_body()?.to_vec(),
+    })
+}
+
 fn read_required_uuid(field: &str, data: &[u8]) -> Result<Uuid, CapnpDecodeError> {
     let id = read_optional_uuid(data)?.ok_or_else(|| {
         CapnpDecodeError::InvalidRequiredField(format!("{field} must be 16 bytes"))
@@ -764,6 +1012,82 @@ fn text_optional(text: capnp::text::Reader<'_>) -> Result<Option<String>, CapnpD
     Ok(if text.is_empty() { None } else { Some(text) })
 }
 
+fn message_family_for_kind(kind: u16) -> MessageFamily {
+    let Ok(kind) = u8::try_from(kind) else {
+        return MessageFamily::Lifecycle;
+    };
+    match MsgType::try_from(kind) {
+        Ok(MsgType::ClusterInvite | MsgType::ClusterInviteAck) => MessageFamily::ClusterControl,
+        Ok(
+            MsgType::RaftAppendEntries
+            | MsgType::RaftAppendResponse
+            | MsgType::RaftVote
+            | MsgType::RaftVoteResponse
+            | MsgType::RaftInstallSnapshot,
+        ) => MessageFamily::Raft,
+        Ok(
+            MsgType::MutationForward
+            | MsgType::MutationAck
+            | MsgType::ReadRequest
+            | MsgType::ReadResponse
+            | MsgType::RepairWrite
+            | MsgType::RangeReadRequest
+            | MsgType::RangeReadResponse
+            | MsgType::TruncateForward
+            | MsgType::TruncateAck,
+        ) => MessageFamily::Data,
+        Ok(
+            MsgType::StreamStart
+            | MsgType::StreamChunk
+            | MsgType::StreamEnd
+            | MsgType::SstableStreamStart
+            | MsgType::SstableStreamChunk
+            | MsgType::SstableStreamEnd,
+        ) => MessageFamily::Stream,
+        Ok(
+            MsgType::PairWriteForward
+            | MsgType::PairWriteAck
+            | MsgType::PairCatchUp
+            | MsgType::PairCatchUpResponse
+            | MsgType::RoleSwap
+            | MsgType::PairSchemaSync
+            | MsgType::PairDdlForward
+            | MsgType::PairDdlAck
+            | MsgType::PairBatchForward
+            | MsgType::PairBatchAck,
+        ) => MessageFamily::Pair,
+        Ok(MsgType::BatchlogWrite | MsgType::BatchlogDelete | MsgType::BatchlogReplay) => {
+            MessageFamily::Batchlog
+        }
+        Ok(
+            MsgType::IndexBuildRequest
+            | MsgType::IndexBuildComplete
+            | MsgType::IndexReadRequest
+            | MsgType::IndexReadResponse,
+        ) => MessageFamily::Index,
+        Ok(
+            MsgType::AccordPreAccept
+            | MsgType::AccordPreAcceptOK
+            | MsgType::AccordAccept
+            | MsgType::AccordAcceptOK
+            | MsgType::AccordCommit
+            | MsgType::AccordRead
+            | MsgType::AccordReadOK
+            | MsgType::AccordApply
+            | MsgType::AccordApplyOK
+            | MsgType::AccordRecover
+            | MsgType::AccordRecoverOK,
+        ) => MessageFamily::Accord,
+        Ok(MsgType::BootstrapComplete | MsgType::BootstrapCompleteAck) => MessageFamily::Bootstrap,
+        Ok(MsgType::ClusterMembershipForward | MsgType::ClusterMembershipForwardAck) => {
+            MessageFamily::Membership
+        }
+        Ok(MsgType::Handshake | MsgType::HandshakeAck | MsgType::Ping | MsgType::Pong) | Err(_) => {
+            MessageFamily::Lifecycle
+        }
+    }
+}
+
 fn nonzero(value: u64) -> Option<u64> {
     if value == 0 {
         None
@@ -774,6 +1098,53 @@ fn nonzero(value: u64) -> Option<u64> {
 
 fn not_in_schema(err: capnp::NotInSchema) -> CapnpDecodeError {
     CapnpDecodeError::UnknownPayload(err.to_string())
+}
+
+impl From<CapnpErrorCode> for ErrorCode {
+    fn from(value: CapnpErrorCode) -> Self {
+        match value {
+            CapnpErrorCode::MalformedFrame => Self::MalformedFrame,
+            CapnpErrorCode::UnsupportedVersion => Self::UnsupportedVersion,
+            CapnpErrorCode::UnsupportedFeature => Self::UnsupportedFeature,
+            CapnpErrorCode::Unauthenticated => Self::Unauthenticated,
+            CapnpErrorCode::Unauthorized => Self::Unauthorized,
+            CapnpErrorCode::ClusterMismatch => Self::ClusterMismatch,
+            CapnpErrorCode::UnknownMessage => Self::UnknownMessage,
+            CapnpErrorCode::NoHandler => Self::NoHandler,
+            CapnpErrorCode::Timeout => Self::Timeout,
+            CapnpErrorCode::Overloaded => Self::Overloaded,
+            CapnpErrorCode::NotLeader => Self::NotLeader,
+            CapnpErrorCode::StaleEpoch => Self::StaleEpoch,
+            CapnpErrorCode::Conflict => Self::Conflict,
+            CapnpErrorCode::RetryRequired => Self::RetryRequired,
+            CapnpErrorCode::FullBootstrapRequired => Self::FullBootstrapRequired,
+            CapnpErrorCode::Internal => Self::Internal,
+        }
+    }
+}
+
+impl From<ErrorCode> for CapnpErrorCode {
+    fn from(value: ErrorCode) -> Self {
+        match value {
+            ErrorCode::Ok => Self::Internal,
+            ErrorCode::MalformedFrame => Self::MalformedFrame,
+            ErrorCode::UnsupportedVersion => Self::UnsupportedVersion,
+            ErrorCode::UnsupportedFeature => Self::UnsupportedFeature,
+            ErrorCode::Unauthenticated => Self::Unauthenticated,
+            ErrorCode::Unauthorized => Self::Unauthorized,
+            ErrorCode::ClusterMismatch => Self::ClusterMismatch,
+            ErrorCode::UnknownMessage => Self::UnknownMessage,
+            ErrorCode::NoHandler => Self::NoHandler,
+            ErrorCode::Timeout => Self::Timeout,
+            ErrorCode::Overloaded => Self::Overloaded,
+            ErrorCode::NotLeader => Self::NotLeader,
+            ErrorCode::StaleEpoch => Self::StaleEpoch,
+            ErrorCode::Conflict => Self::Conflict,
+            ErrorCode::RetryRequired => Self::RetryRequired,
+            ErrorCode::FullBootstrapRequired => Self::FullBootstrapRequired,
+            ErrorCode::Internal => Self::Internal,
+        }
+    }
 }
 
 impl From<NodeLifecycleState> for envelope_capnp::NodeLifecycleState {
