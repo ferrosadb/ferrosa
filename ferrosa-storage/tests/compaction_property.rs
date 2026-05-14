@@ -16,6 +16,7 @@ fn default_config() -> CompactionConfig {
     CompactionConfig {
         min_threshold: 4,
         max_threshold: 32,
+        max_compaction_bytes: 512 * 1024 * 1024,
         bucket_low: 0.5,
         bucket_high: 1.5,
         output_dir: PathBuf::from("/tmp/compaction"),
