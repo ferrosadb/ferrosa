@@ -1,9 +1,9 @@
-//! Bolt-on retirement gate (Sprint 4 W4.10).
+//! Bolt-on retirement gate.
 //!
-//! Per ADR-012 and the sprint spec, the bolt-on subsystems
+//! Per ADR-012, the bolt-on subsystems
 //! [`crate::raft::election_guard`] and
 //! [`crate::raft::snapshot_pusher`] may only be retired after a
-//! 2-week clean Jepsen window against the Sprint 3 build.  The gate
+//! 2-week clean Jepsen window against the current stable build.  The gate
 //! has two prerequisites:
 //!
 //! 1. **`ELECTION_STORM_TERM_JUMPS_TOTAL == 0`** for every Jepsen run
@@ -15,7 +15,7 @@
 //! a manifest of past runs from `specs/in-process/sprint-04-jepsen-window.json`
 //! when present.  When the file is absent (today's situation) the
 //! test asserts the gate is **not yet satisfied** so that
-//! W4.11/W4.12 (delete the bolt-on modules) cannot ship by accident.
+//! bolt-on module removal cannot ship by accident.
 //!
 //! When the file is populated and reports a clean window, the test
 //! flips green: `prerequisite_satisfied()` returns `Ok(())`, the
@@ -60,7 +60,7 @@ impl JepsenWindowSummary {
 ///
 /// The path is resolved relative to the workspace root at compile time
 /// using `CARGO_MANIFEST_DIR`.  Production builds never read this
-/// file; only the W4.10 test below consumes it.
+/// file; only the retirement-gate test below consumes it.
 pub fn manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -164,9 +164,9 @@ pub fn parse_manifest(text: &str) -> Result<JepsenWindowSummary, BootstrapError>
 mod tests {
     use super::*;
 
-    /// W4.10 RED → GREEN: the gate test reads the manifest if present;
+    /// The gate test reads the manifest if present;
     /// if absent (today), the gate asserts NOT-YET-SATISFIED so that
-    /// W4.11/W4.12 cannot ship by accident.  Once a clean 2-week
+    /// bolt-on module removal cannot ship by accident.  Once a clean 2-week
     /// Jepsen window lands, populate the manifest and the same test
     /// flips to passing without any code change.
     #[test]
@@ -176,13 +176,13 @@ mod tests {
             Ok(text) => parse_manifest(&text).expect("manifest is valid"),
             Err(_) => {
                 // No manifest → no runway yet → gate must report
-                // not-satisfied. This branch fails W4.11/W4.12 cleanly.
+                // not-satisfied. This branch fails premature removal cleanly.
                 let summary = JepsenWindowSummary::default();
                 assert!(prerequisite_satisfied(&summary).is_err());
                 eprintln!(
-                    "W4.10: bolt-on retirement gate not yet satisfied — \
-                     no Jepsen window manifest at {}.  W4.11 (delete election_guard) \
-                     and W4.12 (delete snapshot_pusher) remain deferred.",
+                    "bolt-on retirement gate not yet satisfied — \
+                     no Jepsen window manifest at {}.  election_guard \
+                     and snapshot_pusher removal remain deferred.",
                     path.display()
                 );
                 return;

@@ -1,8 +1,8 @@
-//! Bootstrap phase decomposition (Sprint 4 W4.1–W4.9).
+//! Bootstrap phase decomposition.
 //!
 //! `transition_to_cluster` (in `controller/cluster.rs`) historically ran
 //! ~700 lines of imperative orchestration to bring a Forming cluster up
-//! to its first leader-elected, schema-replayed steady state. Sprint 4
+//! to its first leader-elected, schema-replayed steady state. This module
 //! decomposes that work into eight typed phases, each with explicit
 //! `precondition` and `postcondition` checks. Errors carry the
 //! offending [`BootstrapPhase`], so a caller (today only the spawned
@@ -11,10 +11,11 @@
 //!
 //! ## Why a separate module
 //!
-//! Sprint 6 plans to extend `transition_to_cluster` for multi-Raft (one
-//! Raft per DC). Sprint 4 keeps the existing in-place implementation
-//! operational and exposes the phase types and pure helpers from this
-//! module. A subsequent sprint will rewire the imperative path to
+//! A future multi-DC topology will extend `transition_to_cluster` for
+//! multiple Raft groups (one Raft group per DC). For now, the existing
+//! in-place implementation stays operational while this module exposes
+//! the phase types and pure helpers. A subsequent refactor will rewire
+//! the imperative path to
 //! consume the typed phases. The decomposition is therefore additive
 //! today: every phase is unit-testable in isolation, the
 //! pre/post-condition signature is fixed, and `controller/cluster.rs`
@@ -34,8 +35,8 @@
 //! | 8 | `DrainQueue`      | Replay queued DDL operations through cluster path |
 //!
 //! The matrix in `specs/raft-failure-mode-matrix.md` indexes failure
-//! modes that touch each phase; the W4.15 integration tests exercise
-//! S-01 through S-37 against the live `transition_to_cluster`.
+//! modes that touch each phase; the integration tests exercise those
+//! scenarios against the live `transition_to_cluster`.
 
 pub mod bootstrap_stream;
 pub mod create_raft;

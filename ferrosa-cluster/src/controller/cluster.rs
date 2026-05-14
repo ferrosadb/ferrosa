@@ -84,7 +84,7 @@ pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool)
 
 /// Keyspaces that should be re-proposed through Raft during the
 /// post-Raft-init schema-convergence pass (`transition_to_cluster`
-/// Phase A).
+/// `ReplaySchema` phase).
 ///
 /// The built-in Cassandra system keyspaces (`system`, `system_schema`,
 /// `system_auth`, etc.) are hardcoded on every node and never need
@@ -447,10 +447,10 @@ impl ModeController {
             "transition_to_cluster: bootstrap phase runner selected"
         );
 
-        // W6.3 (ADR-015): partition the peer set by DC. Only same-DC
+        // ADR-015: partition the peer set by DC. Only same-DC
         // peers participate in this node's Raft group; cross-DC peers
         // are tracked in the controller's connected_peers map for
-        // future Accord routing (Sprint 7) but are not voters here.
+        // future Accord routing but are not voters here.
         //
         // Backward-compat: peers with no recorded DC default to the
         // local DC, so existing single-DC clusters keep their full
@@ -463,7 +463,7 @@ impl ModeController {
                 local_dc = %local_dc,
                 local_voters = peers.len(),
                 cross_dc_count = cross_dc_peers.values().map(|v| v.len()).sum::<usize>(),
-                "transition_to_cluster: cross-DC peers excluded from local Raft group (Sprint 6 scaffolding; Accord cross-DC arrives in Sprint 7)"
+                "transition_to_cluster: cross-DC peers excluded from local Raft group; Accord cross-DC routing is deferred"
             );
         }
         let peer_manager = match &**self.peer_manager.load() {
@@ -1637,7 +1637,7 @@ impl ModeController {
                         }
                     }
 
-                    // --- Phase A: Schema convergence (all nodes) ---
+                    // --- ReplaySchema phase: schema convergence (all nodes) ---
                     //
                     // Every node replays its local schema so that all peers
                     // learn about user-created keyspaces/tables. The leader
@@ -1724,7 +1724,7 @@ impl ModeController {
                     }
 
                     if should_run_bootstrap_streaming(has_recovered_topology_state) {
-                        // --- Phase B: Bootstrap streaming (all nodes) ---
+                        // --- BootstrapStream phase: data streaming (all nodes) ---
                         //
                         // Every node reads from its local storage and streams
                         // partitions that belong to other nodes per the new ring.

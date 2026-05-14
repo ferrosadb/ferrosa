@@ -1,4 +1,4 @@
-//! Phase 6 — BootstrapStream (W4.7).
+//! Phase 6 — BootstrapStream.
 //!
 //! Pre-condition: schema replay complete on every node.
 //! Post-condition: every owning replica has streamed its share of the

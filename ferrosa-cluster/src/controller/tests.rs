@@ -2122,7 +2122,7 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
         ring.assign_tokens(nid, &tokens);
     }
 
-    // --- This is the bootstrap streaming logic (Phase B from the fix) ---
+    // --- This is the bootstrap streaming logic. ---
     // Iterate schema tables, read from storage, group by target node.
     let schema_snap = schema.snapshot();
     let mut total_remote_mutations = 0usize;
@@ -2584,7 +2584,7 @@ fn keyspace_needs_cluster_replay_includes_system_graph_keyspaces() {
     // The graph engine builds `system_graph_<user_ks>` keyspaces lazily on
     // the first graph query. If that first query happens before the local
     // node has transitioned to Cluster mode, the keyspace + adjacency table
-    // get registered locally only. Phase A of transition_to_cluster must
+    // get registered locally only. ReplaySchema in transition_to_cluster must
     // re-fire those DDLs through Raft so every replica's state machine
     // registers them too — otherwise followers reject every adjacency
     // MutationForward with "table not registered". Regression guard for
