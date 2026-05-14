@@ -38,6 +38,35 @@ Important invariant: local compute-node disk is not assumed to hold the full vec
 - `TableStore::ann_search()` searches the active memtable, then loops all SSTable generation IDs, reads each vector sidecar with `flush_target.read_vector_sidecar(gen, index_name)`, dispatches to the HNSW decoder, merges by `position.offset`, sorts by score, and truncates to `k`. This is a correctness and scale seam: offsets can collide across generations, and the current file-backed `FlushTarget` writes vector sidecars but does not provide a matching remote/object-range read path.
 - `FlushTarget::write_vector_sidecar/read_vector_sidecar` currently treat the whole sidecar as one byte blob. File-based sidecars are named `{generation}-VEC-{index_name}.db`.
 
+### Spill-safety review findings
+
+Parallel review of vector, storage, and remote-builder code found these seams
+that must be closed before production HVQ:
+
+- HNSW and IVFFlat both serialize monolithic JSON blobs containing graph/list
+  structures plus full `f32` vectors. Query code must not copy this pattern for
+  `.qvec`; it needs page-addressable graph/list/vector tiers.
+- `FileFlushTarget` writes vector sidecars locally, while the query seam is
+  `FlushTarget::read_vector_sidecar() -> Option<Vec<u8>>`. HVQ requires an
+  artifact resolver with S3 range reads and cache-backed page fetches instead
+  of whole-sidecar byte loading.
+- `LocalCache` tracks only local paths and sizes. It has no object key,
+  generation/build id, page id, checksum, range-fetch callback, or partial
+  residency state.
+- Engine bootstrap and `register_table()` currently discover SSTables and
+  sidecars through local directory scans. HVQ must make manifests/object refs
+  authoritative so a node can query before local full-file materialization.
+- `ferrosa-index-builder` currently downloads full SSTable components into temp
+  disk and uses local builder paths. HVQ builders must stream/range-read input,
+  reserve scratch before fetch, spill bounded work pages, and publish `.qvec`
+  manifest entries only after validation.
+- `RemoteBackend` local fallback is unsafe for HVQ-scale jobs. If builders are
+  down, the safe behavior is stale-index serving, queueing, or fail-loud status,
+  not unbounded local build.
+- Candidate identity must evolve from `RowPosition { offset }` to a row ref that
+  includes SSTable generation/object identity; offsets can collide across
+  generations.
+
 ### Hotspots
 
 Git churn over the last year for the vector-relevant paths:

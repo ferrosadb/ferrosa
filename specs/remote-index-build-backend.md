@@ -41,6 +41,13 @@ graph LR
 | `remote` | `RemoteBackend` sends jobs via HTTP to builder, circuit breaker fallback to local | Required — receives push jobs | Scale tier, mixed workloads |
 | `off` | `IndexBuildScheduler` not started, no worker threads, no `EagerIndexBuilder` hook | Required — pull mode, discovers work via manifest/S3 | Enterprise tier, dedicated hot-path serving |
 
+HVQ constraint: quantized vector jobs must not silently fall back to local
+full-resident builds when remote builders are unavailable. The allowed fallback
+policies are `fail_loud`, `queue`, or `local_if_capacity_reserved`; `local` is
+only valid when the engine has reserved enough scratch space for the declared
+input and output artifact budgets. The default for `quantized_ivf_flat` and
+future `quantized_hnsw` is `fail_loud` or stale-index serving, not local build.
+
 ---
 
 ## Architecture
@@ -158,6 +165,75 @@ Content-Type: application/json
   "elapsed_ms": 1200
 }
 ```
+
+### HVQ `.qvec` Build Contract
+
+Hierarchical vector quantization extends the scalar sidecar API because a single
+`sidecar_s3_path` is insufficient for page-addressable vector artifacts.
+
+Example request fields for HVQ jobs:
+
+```json
+{
+  "sstable_id": "gen-42",
+  "index_name": "idx_embedding",
+  "index_type": "quantized_ivf_flat",
+  "artifact_kind": "hvq_qvec",
+  "build_id": "gen-42-idx_embedding-0001",
+  "dimensions": 1536,
+  "metric": "cosine",
+  "tiers": ["q4", "q8", "f32_rerank"],
+  "exact_rerank": true,
+  "max_temp_bytes": 10737418240,
+  "max_build_memory_bytes": 4294967296,
+  "s3_prefix": "prod/a7/ks.users/gen-42"
+}
+```
+
+Example success response:
+
+```json
+{
+  "status": "completed",
+  "artifact_kind": "hvq_qvec",
+  "artifact_manifest_entry": {
+    "format_version": 1,
+    "build_id": "gen-42-idx_embedding-0001",
+    "index_name": "idx_embedding",
+    "index_type": "quantized_ivf_flat",
+    "row_count": 42000,
+    "dimensions": 1536,
+    "metric": "cosine",
+    "objects": [
+      {
+        "tier": "q4",
+        "object_key": "prod/a7/ks.users/gen-42/idx_embedding/q4.qvec",
+        "size_bytes": 8388608,
+        "checksum": "sha256:..."
+      },
+      {
+        "tier": "q8",
+        "object_key": "prod/a7/ks.users/gen-42/idx_embedding/q8.qvec",
+        "size_bytes": 16777216,
+        "checksum": "sha256:..."
+      }
+    ],
+    "page_table_checksum": "sha256:..."
+  },
+  "elapsed_ms": 1200
+}
+```
+
+Publish semantics:
+
+1. The builder may upload temporary objects, but the engine must not mark the
+   index current until every object key, size, checksum, tier, dimension, and
+   metric validates.
+1. A builder crash during upload leaves no visible manifest entry.
+1. Pull mode discovers missing `.qvec` artifact manifest entries, not fixed
+   `{sstable_id}-{index_name}.sidecar` paths.
+1. Temp-disk or memory-budget exhaustion is a typed build failure; it must not
+   degrade into an unbounded local build.
 
 **Response (failure)**:
 

@@ -66,6 +66,25 @@ flowchart TD
 - p50, p99, p999 latency
 - S3 upload lag (Ferrosa-specific)
 - Cache hit ratio (Ferrosa-specific)
+- HVQ S3 range GETs per query, bytes read per query, vector cache hit/miss
+  bytes, checksum failures, and recall@k against exact `f32` baseline
+
+### HVQ S3 Spill-Tier Gates
+
+Hierarchical vector quantization adds test gates because vector indexes may be
+larger than any compute node's local disk. These gates are required before
+`quantized_ivf_flat` or `quantized_hnsw` can become production defaults.
+
+| Test | Validates | Method |
+|------|-----------|--------|
+| Exact baseline | Quantized recall is measured against truth | Brute-force `f32` top-k corpus |
+| Codec properties | Q8/Q4/Q2/Q1 decode error stays bounded | `proptest` generated vectors/dimensions |
+| S3 publish | `.qvec` manifest is visible only after checksum validation | MinIO integration, kill builder mid-upload |
+| Cold read-through | Query works with no local vector pages | Wipe NVMe cache, query via S3 Range GET |
+| Cache smaller than index | Correctness does not depend on full local residency | Set cache cap below `.qvec` size |
+| Corrupt remote page | Missing/short/stale/checksum-bad object fails loud | Inject object-store faults |
+| Compaction replacement | New `.qvec` is published before old artifact GC | Compact, query, reject stale cached pages |
+| Budget enforcement | Query and build stay within declared limits | Assert bytes/query, range gets/query, temp bytes |
 
 ## Suite 1: Data Integrity
 

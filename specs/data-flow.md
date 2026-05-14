@@ -61,6 +61,24 @@ When `pin_config.is_pinned()` returns true for a table, flushed SSTables remain 
 
 After an SSTable is written during flush, for each registered FullText index on the table, a `FullTextIndexBuilder` processes the flushed partitions and writes a sidecar file named `{generation}-FTI-{index_name}.db` alongside the SSTable. These sidecars follow the same locality rules as the parent SSTable (pinned or uploaded to S3).
 
+### HVQ Vector Artifact Publishing
+
+For `quantized_ivf_flat` and future `quantized_hnsw`, vector index build output
+is not a local-only sidecar. The flush path or remote builder writes immutable
+`.qvec` objects to S3-compatible storage, validates object size/checksum/page
+metadata, then publishes an index artifact manifest entry. A node may cache hot
+pages on NVMe, but manifest visibility is the durable source of truth.
+
+Publish order:
+
+1. Build from `f32` vectors so graph/list quality is not degraded by low-bit
+   edge selection.
+1. Write `.qvec` tier objects or pages to object storage.
+1. Validate every object key, size, checksum, dimension, metric, tier, and page
+   table entry.
+1. CAS-update the table/index manifest to make the artifact query-visible.
+1. Admit selected hot pages to the local NVMe cache.
+
 ## Read Path
 
 ```mermaid
@@ -120,6 +138,36 @@ sequenceDiagram
 **Sidecar files** are per-SSTable companion files written during flush. They contain sorted `(indexed_value, RowPosition)` entries with a CRC32-checksummed header. Missing sidecars trigger a fallback to full scan for that SSTable, with startup rebuild.
 
 **IndexIntersection**: When multiple indexed columns appear in WHERE, the planner collects RowPositions from each index and intersects them before row fetch, reducing I/O.
+
+### HVQ ANN Read-Through Flow
+
+ANN queries over `.qvec` artifacts use multi-fidelity read-through instead of
+whole-sidecar reads:
+
+```mermaid
+sequenceDiagram
+    participant P as Planner
+    participant M as Artifact Manifest
+    participant C as NVMe Page Cache
+    participant S3 as S3 Range GET
+    participant R as Quantized Reader
+
+    P->>M: Resolve index artifact for SSTable generations
+    P->>R: Start staged ANN search with page/byte budgets
+    R->>C: Read routing/page table pages
+    alt Cache miss
+        C->>S3: Range GET page
+        S3-->>C: Page bytes + etag
+        C->>C: Verify checksum/version/tier
+    end
+    R->>C: Read Q4/Q8 survivor pages
+    R->>C: Optionally read F32/residual rerank pages
+    R-->>P: Top-k VectorRowRef values
+```
+
+Low-bit tiers act like map tiles: they route to a smaller candidate set, then
+higher-bit tiers or exact `f32` pages refine survivors. A cache miss fetches a
+bounded byte range from S3; it must not trigger full artifact materialization.
 
 ## Accord Transaction Flow
 
