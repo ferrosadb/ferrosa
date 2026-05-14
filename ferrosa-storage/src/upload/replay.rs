@@ -125,7 +125,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let compaction_dir = dir.path().join("compaction");
-        let table_id = "agent_memory.entity_store";
+        let table_id = "test_keyspace.test_table";
         for sstable_id in ["1", "2", "3"] {
             write_component(&data_dir.join("sstables"), table_id, sstable_id);
         }
@@ -160,7 +160,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let compaction_dir = dir.path().join("compaction");
-        let table_id = "agent_memory.entity_store";
+        let table_id = "test_keyspace.test_table";
         for sstable_id in ["1", "2"] {
             write_component(&data_dir.join("sstables"), table_id, sstable_id);
         }
@@ -183,7 +183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let compaction_dir = dir.path().join("compaction");
-        let entries = vec![("agent_memory.entity_store".to_string(), "99".to_string())];
+        let entries = vec![("test_keyspace.test_table".to_string(), "99".to_string())];
         let mut submitted = 0;
 
         let report = replay_pending_upload_entries(&entries, &data_dir, &compaction_dir, |_task| {
@@ -202,7 +202,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let compaction_dir = dir.path().join("compaction");
-        let table_id = "agent_memory.entity_store";
+        let table_id = "test_keyspace.test_table";
         write_component(&compaction_dir, table_id, "7");
         let entries = vec![(table_id.to_string(), "7".to_string())];
         let mut submitted_file_names = Vec::new();
