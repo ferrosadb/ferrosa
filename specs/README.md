@@ -40,7 +40,7 @@ specs/
 | [Secondary Index Pipeline](secondary-index-pipeline.md) | Query integration, sidecar persistence, vector indexes | Implemented |
 | [Full-Text Indexing](fulltext-index-architecture.md) | Inverted index sidecars, analyzer pipeline, BM25, fts_match() | Implemented |
 | [Remote Index Build Backend](remote-index-build-backend.md) | Standalone `ferrosa-index-builder` binary, engine backend modes (local/remote/off) | Draft |
-| [Hierarchical Vector Quantization](hierarchical-vector-quantization.md) | NVMe-resident tiered Q1/Q2/Q4/Q8/F32 vector search design for HNSW/IVFFlat | Draft |
+| [Hierarchical Vector Quantization](hierarchical-vector-quantization.md) | S3-durable, NVMe-cached tiered Q1/Q2/Q4/Q8/F32 vector search design for HNSW/IVFFlat | Draft |
 | [UCS Compaction](ucs-compaction-architecture.md) | Unified Compaction Strategy: density-based levels, fan factor, per-table DDL | New |
 | [Cluster Formation](cluster-formation-architecture.md) | Cluster formation state machine and protocol | Active |
 | [Observability](observability-architecture.md) | Metrics, tracing, telemetry pipeline | Active |
@@ -65,6 +65,7 @@ specs/
 | Spec | Scope |
 |------|-------|
 | [Cluster Formation](fmea-cluster-formation.md) | Formation protocol failure modes |
+| [HVQ S3 Spill Tier](fmea-hvq-s3-spill-tier.md) | Quantized vector artifact persistence, read-through cache, remote builder failures |
 | [Observability](observability-fmea.md) | Telemetry pipeline failure modes |
 
 ## DSM Analysis
@@ -80,6 +81,7 @@ specs/
 | Plan | Scope | Status |
 |------|-------|--------|
 | [Next Sprints](project-plan-next-sprints.md) | S1-S4: hazard fixes, NTS read, correctness, repair, Jepsen | Active |
+| [HVQ S3 Spill Tier](project-plan-hvq-s3-spill-tier.md) | S3-durable hierarchical vector quantization with bounded NVMe cache | Draft |
 | [UCS Compaction](project-plan-ucs-compaction.md) | 4 sprints: metadata, UCS strategy, integration, equivalence | New |
 | [Cluster Formation](project-plan-cluster-formation.md) | Formation state machine implementation | Active |
 | [Unified Roadmap](project-plan-unified.md) | Ferrosa ecosystem: core DB, memory, dbaas, Temporal | Active |
