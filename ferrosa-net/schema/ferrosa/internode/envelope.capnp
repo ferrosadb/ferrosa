@@ -1,7 +1,7 @@
 @0xf36f6f73615f0190;
 
-# Minimal first slice of ADR-019: stable envelope/common fields plus one
-# representative cluster-control family. Append-only: do not reuse ordinals.
+# ADR-019 envelope/common fields plus cluster invite/rejoin and recovery
+# controller families. Append-only: do not reuse ordinals.
 
 struct Envelope {
   magic @0 :UInt32;
@@ -35,6 +35,7 @@ struct Envelope {
     error @23 :ErrorFrame;
     health @24 :HealthFrame;
     cluster @25 :ClusterControl;
+    recovery @26 :RecoveryControl;
   }
 }
 
@@ -136,6 +137,9 @@ struct ClusterControl {
   op :union {
     invite @0 :ClusterInvite;
     inviteAck @1 :ClusterInviteAck;
+    rejoinRequest @2 :RejoinRequest;
+    rejoinPlan @3 :RejoinPlan;
+    formationEpochBump @4 :FormationEpochBump;
   }
 }
 
@@ -154,6 +158,70 @@ struct ClusterInviteAck {
   reason @3 :Text;
 }
 
+struct RejoinRequest {
+  host @0 :NodeIdentity;
+  lastKnownMembershipEpoch @1 :UInt64;
+  lastAppliedRaftIndex @2 :UInt64;
+  localGeneration @3 :UInt64;
+  wantsBootstrapPlan @4 :Bool;
+}
+
+struct RejoinPlan {
+  membershipEpoch @0 :UInt64;
+  state @1 :NodeLifecycleState;
+  requiredBootstrap @2 :Bool;
+  bootstrapPlanId @3 :Data;
+  peers @4 :List(NodeIdentity);
+  reason @5 :Text;
+}
+
+struct FormationEpochBump {
+  previous @0 :UInt64;
+  next @1 :UInt64;
+  reason @2 :Text;
+}
+
+struct RecoveryControl {
+  op :union {
+    request @0 :RecoveryRequest;
+    plan @1 :RecoveryPlan;
+    progress @2 :RecoveryProgress;
+    complete @3 :RecoveryComplete;
+  }
+}
+
+struct RecoveryRequest {
+  host @0 :NodeIdentity;
+  reason @1 :RecoveryReason;
+  lastMembershipEpoch @2 :UInt64;
+  lastAppliedRaftIndex @3 :UInt64;
+  lastDurableCommitLogSegment @4 :UInt64;
+  localGeneration @5 :UInt64;
+}
+
+struct RecoveryPlan {
+  planId @0 :Data;
+  membershipEpoch @1 :UInt64;
+  action @2 :RecoveryAction;
+  bootstrapPlanId @3 :Data;
+  leader @4 :NodeIdentity;
+  safeMessage @5 :Text;
+}
+
+struct RecoveryProgress {
+  planId @0 :Data;
+  phase @1 :Text;
+  completedUnits @2 :UInt64;
+  totalUnits @3 :UInt64;
+}
+
+struct RecoveryComplete {
+  planId @0 :Data;
+  host @1 :NodeIdentity;
+  finalMembershipEpoch @2 :UInt64;
+  finalAppliedRaftIndex @3 :UInt64;
+}
+
 enum NodeLifecycleState {
   unknown @0;
   joining @1;
@@ -161,4 +229,21 @@ enum NodeLifecycleState {
   leaving @3;
   left @4;
   degraded @5;
+}
+
+enum RecoveryReason {
+  unknown @0;
+  peerReconnected @1;
+  staleGeneration @2;
+  lostLocalState @3;
+  raftLogGap @4;
+  streamRetry @5;
+}
+
+enum RecoveryAction {
+  noOp @0;
+  refreshMetadata @1;
+  replayRaft @2;
+  runBootstrap @3;
+  fullBootstrapRequired @4;
 }
