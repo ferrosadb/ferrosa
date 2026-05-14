@@ -284,6 +284,12 @@ pub enum CapnpTransportMode {
     RequireCapnp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapnpCapabilityNegotiation {
+    pub frame_format: WireFrameFormat,
+    pub enabled_features: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedMessageEnvelope {
     pub stream_id: u64,
@@ -330,6 +336,9 @@ pub enum CapnpDecodeError {
         transport_version: u16,
         min_supported_transport_version: u16,
     },
+    UnsupportedFeature {
+        missing_features: u64,
+    },
     InvalidRequiredField(String),
     UnknownPayload(String),
 }
@@ -344,6 +353,10 @@ impl fmt::Display for CapnpDecodeError {
             } => write!(
                 f,
                 "unsupported CapnProto transport version {transport_version} (min {min_supported_transport_version})"
+            ),
+            Self::UnsupportedFeature { missing_features } => write!(
+                f,
+                "unsupported CapnProto required features: 0x{missing_features:016x}"
             ),
             Self::InvalidRequiredField(field) => write!(f, "invalid required field: {field}"),
             Self::UnknownPayload(payload) => write!(f, "unknown CapnProto payload: {payload}"),
@@ -428,9 +441,9 @@ pub fn encode_envelope(envelope: &CapnpEnvelope) -> Result<Vec<u8>, CapnpDecodeE
     Ok(serialize::write_message_to_words(&message))
 }
 
-pub fn decode_envelope(mut bytes: &[u8]) -> Result<CapnpEnvelope, CapnpDecodeError> {
-    let reader = serialize::read_message_from_flat_slice(
-        &mut bytes,
+pub fn decode_envelope(bytes: &[u8]) -> Result<CapnpEnvelope, CapnpDecodeError> {
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(bytes),
         message::ReaderOptions {
             traversal_limit_in_words: Some(8 * 1024 * 1024),
             nesting_limit: 64,
@@ -523,6 +536,48 @@ pub fn negotiate_capnp_transport(
             transport_version: peer_transport_version,
             min_supported_transport_version: peer_min_supported_transport_version,
         }),
+    }
+}
+
+pub fn negotiate_capnp_capabilities(
+    mode: CapnpTransportMode,
+    peer_min_supported_transport_version: u16,
+    peer_transport_version: u16,
+    local_supported_features: u64,
+    peer_required_features: u64,
+) -> Result<CapnpCapabilityNegotiation, CapnpDecodeError> {
+    let frame_format = negotiate_capnp_transport(
+        mode,
+        peer_min_supported_transport_version,
+        peer_transport_version,
+    )?;
+    if frame_format == WireFrameFormat::Legacy {
+        return Ok(CapnpCapabilityNegotiation {
+            frame_format,
+            enabled_features: 0,
+        });
+    }
+
+    let missing_features = peer_required_features & !local_supported_features;
+    if missing_features != 0 {
+        return Err(CapnpDecodeError::UnsupportedFeature { missing_features });
+    }
+
+    Ok(CapnpCapabilityNegotiation {
+        frame_format,
+        enabled_features: peer_required_features & local_supported_features,
+    })
+}
+
+pub fn validate_capnp_capabilities(
+    envelope: &CapnpEnvelope,
+    local_supported_features: u64,
+) -> Result<(), CapnpDecodeError> {
+    let missing_features = envelope.required_features & !local_supported_features;
+    if missing_features == 0 {
+        Ok(())
+    } else {
+        Err(CapnpDecodeError::UnsupportedFeature { missing_features })
     }
 }
 
