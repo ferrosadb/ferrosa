@@ -441,6 +441,11 @@ impl ModeController {
             .into_iter()
             .map(|(peer_uuid, addr)| (peer_uuid, self.normalize_cluster_peer_addr(addr)))
             .collect();
+        let phase_runner = super::bootstrap::runner::BootstrapPhaseRunner::canonical();
+        tracing::debug!(
+            phase_count = phase_runner.phase_order().len(),
+            "transition_to_cluster: bootstrap phase runner selected"
+        );
 
         // W6.3 (ADR-015): partition the peer set by DC. Only same-DC
         // peers participate in this node's Raft group; cross-DC peers

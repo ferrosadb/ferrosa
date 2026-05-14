@@ -46,7 +46,22 @@ pub mod phase;
 pub mod promote;
 pub mod replay_schema;
 pub mod retirement_gate;
+pub mod runner;
 pub mod util;
 pub mod wait_leader;
 
 pub use phase::{BootstrapError, BootstrapPhase};
+
+#[cfg(test)]
+mod tests {
+    use super::{runner::BootstrapPhaseRunner, BootstrapPhase};
+
+    #[test]
+    fn phase_runner_exposes_canonical_transition_order() {
+        assert_eq!(
+            BootstrapPhaseRunner::canonical().phase_order(),
+            BootstrapPhase::all(),
+            "transition_to_cluster should consume a named phase-runner seam rather than relying on prose-only ordering"
+        );
+    }
+}
