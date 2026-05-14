@@ -10,7 +10,7 @@
 
 **Scratch saved:** `specs/in-process/scratch-peer-recovery-invite-reservation.patch` contains the aborted invite-reservation attempt. It is not applied to source.
 
-**Current status:** Cards 1–6 are implemented and committed. Cards 5–6 established the named bootstrap phase seam (`deliver_invites`, `establish_pools`, `create_raft`, `wait_leader`, `replay_schema`, `bootstrap_stream`, `promote`, `drain_queue`) and bounded `bootstrap_stream` row materialization. Cards 7–9 now continue from that seam into storage startup replay, compaction finalization, and a non-destructive fmem smoke.
+**Current status:** Slices 1–6 are implemented and committed. The bootstrap work established the named phase seam (`DeliverInvites`, `EstablishPools`, `CreateRaft`, `WaitLeader`, `ReplaySchema`, `BootstrapStream`, `Promote`, `DrainQueue`) and bounded `BootstrapStream` row materialization. Slices 7–9 now continue from that seam into storage startup replay, compaction finalization, and a non-destructive fmem smoke.
 
 ---
 
@@ -28,7 +28,7 @@
   - `replay_pending_uploads`: 90 lines, deep nesting.
   - `poll_compactions`: 322 lines, CC=34.
   - `sync_sstables_to_s3`: 125 lines, deep nesting.
-- `specs/dsm-cluster-formation.md` is stale: it describes `controller/cluster` as ~880 lines after decomposition, but the module has accreted back to a god-module.
+- `specs/dsm-cluster-formation.md` now records the current `controller/cluster` line count and the named bootstrap phase modules; use it to track the remaining high-LOC orchestration shell.
 
 ## Acceptance Criteria
 
@@ -185,7 +185,7 @@ git commit -m "refactor: extract cluster invite planning"
 
 ---
 
-## Card 5: Split `transition_to_cluster` into phase runner skeleton
+## Slice 5: Split `transition_to_cluster` into phase runner skeleton
 
 **Status:** Implemented and committed. The bootstrap phase runner exposes the canonical phase order and phase-name errors, giving the storage follow-through an explicit boundary after `bootstrap_stream`.
 
@@ -219,7 +219,7 @@ git commit -m "refactor: add cluster bootstrap phase runner"
 
 ---
 
-## Card 6: Extract bounded bootstrap streaming planner
+## Slice 6: Extract bounded bootstrap streaming planner
 
 **Status:** Implemented and committed. Bootstrap streaming now prefers SSTable-backed streaming, rejects unbounded row fallback after SSTable-stream failure, and bounds small-table row fallback.
 

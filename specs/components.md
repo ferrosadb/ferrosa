@@ -297,9 +297,10 @@ graph BT
 - **Purpose**: Distributed coordination — Raft consensus, token ring, tunable CL, progressive join, DDL replication, failover
 - **Location**: `ferrosa-cluster/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`, `ferrosa-schema`, `openraft`, `sled`, `arc-swap`, `async-trait`, `bytes`, `serde`, `serde_json`, `tokio`, `uuid`
-- **Status**: Phase 3 complete + Accord transactions (Sprints A1-A7) + progressive join (Standalone→Pair→Forming→Cluster) — Raft consensus, token ring, coordinator, hinted handoff, node lifecycle, ClusterInvite protocol, LazyRaft handler registration, bootstrap streaming (all nodes participate), CQL broadcast propagation via PeerManager
+- **Status**: Phase 3 complete + Accord transactions (Sprints A1-A7) + progressive join (Standalone→Pair→Forming→Cluster) — Raft consensus, token ring, coordinator, hinted handoff, node lifecycle, ClusterInvite protocol, LazyRaft handler registration, named bootstrap phase runner, bounded bootstrap streaming (all nodes participate), CQL broadcast propagation via PeerManager
 - **Modules**:
-  - `controller/cluster.rs` — `transition_to_forming()`, `transition_to_cluster()` with 3-phase bootstrap (A: schema convergence, B: all-node streaming, C: promote Joining→Normal), `ClusterInviteHandler` (RPC handler for peer discovery + re-broadcast), reverse connection pool setup, `LazyRaft` channel for pre-init handler registration
+  - `controller/cluster.rs` — `transition_to_forming()`, `transition_to_cluster()` orchestration, `ClusterInviteHandler` (RPC handler for peer discovery + re-broadcast), reverse connection pool setup, `LazyRaft` channel for pre-init handler registration
+  - `controller/bootstrap/` — `BootstrapPhaseRunner` and canonical phases: `DeliverInvites`, `EstablishPools`, `CreateRaft`, `WaitLeader`, `ReplaySchema`, `BootstrapStream`, `Promote`, `DrainQueue`
   - `controller/mod.rs` — `ModeController` (Standalone→Pair→Forming→Cluster→DegradedPair→DegradedCluster), `formation_epoch` + `seen_invite_initiators` for idempotent invite dedup, tracked `JoinSet` for background tasks
   - `controller/peer_events.rs` — `on_inbound_peer()` with CQL broadcast extraction from handshake, progressive join transitions
   - `write_path.rs` — `WritePath` enum (Direct/Pair/Cluster/Unavailable) for atomic write routing, `WritePath::pk_read()` for PK reads routed through cluster coordinator with NTS support
