@@ -62,13 +62,9 @@ impl ModeController {
                         join_enqueued_invite = Some(host_id);
                     }
                 }
-                PeerEventAction::SendClusterInvite { host_id, force } => {
+                PeerEventAction::SendClusterInvite { host_id, force: _ } => {
                     invite_sent = true;
-                    if force {
-                        self.send_cluster_invite_to(host_id);
-                    } else {
-                        self.send_cluster_invite_to(host_id);
-                    }
+                    self.send_cluster_invite_to(host_id);
                 }
                 PeerEventAction::RestoreClusterMode => {
                     tracing::info!("quorum restored — transitioning back to Cluster");
