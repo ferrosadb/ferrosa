@@ -876,64 +876,41 @@ impl StorageEngine {
             "replaying pending S3 uploads from crash recovery"
         );
 
-        for (table_id_str, sstable_id) in &entries {
-            // Find the SSTable files on disk
-            let table_dir = self.config.data_dir.join("sstables").join(table_id_str);
-            let files = Self::collect_sstable_files(&table_dir, sstable_id.parse().unwrap_or(0));
-            if files.is_empty() {
-                // Also check compaction output directory
-                let compaction_dir = self.config.compaction.output_dir.join(table_id_str);
-                let files2 =
-                    Self::collect_sstable_files(&compaction_dir, sstable_id.parse().unwrap_or(0));
-                if files2.is_empty() {
-                    tracing::warn!(
-                        table = table_id_str,
-                        sstable = sstable_id,
-                        "pending upload: SSTable files not found on disk — cannot replay"
-                    );
-                    continue;
+        let report = crate::upload::replay::replay_pending_upload_entries(
+            &entries,
+            &self.config.data_dir,
+            &self.config.compaction.output_dir,
+            |task| match upload_mgr.try_submit(task) {
+                Ok(()) => crate::upload::replay::PendingUploadReplaySubmit::Submitted,
+                Err(e) if e.to_string().contains("upload queue full") => {
+                    crate::upload::replay::PendingUploadReplaySubmit::QueueFull
                 }
-                let task = crate::upload::UploadTask::SSTable {
-                    table_id: table_id_str.clone(),
-                    sstable_id: sstable_id.clone(),
-                    files: files2,
-                    on_complete: None,
-                };
-                if let Err(e) = upload_mgr.try_submit(task) {
-                    tracing::warn!(
-                        table = table_id_str,
-                        sstable = sstable_id,
-                        "pending upload replay could not enqueue without blocking; leaving entry for later retry: {e}"
-                    );
-                    if e.to_string().contains("upload queue full") {
-                        tracing::warn!(
-                            "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
-                        );
-                        break;
-                    }
-                }
-                continue;
-            }
+                Err(e) => crate::upload::replay::PendingUploadReplaySubmit::Failed(e.to_string()),
+            },
+        );
 
-            let task = crate::upload::UploadTask::SSTable {
-                table_id: table_id_str.clone(),
-                sstable_id: sstable_id.clone(),
-                files,
-                on_complete: None,
-            };
-            if let Err(e) = upload_mgr.try_submit(task) {
-                tracing::warn!(
-                    table = table_id_str,
-                    sstable = sstable_id,
-                    "pending upload replay could not enqueue without blocking; leaving entry for later retry: {e}"
-                );
-                if e.to_string().contains("upload queue full") {
-                    tracing::warn!(
-                        "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
-                    );
-                    break;
-                }
-            }
+        for (table_id_str, sstable_id) in &report.missing_files {
+            tracing::warn!(
+                table = table_id_str,
+                sstable = sstable_id,
+                "pending upload: SSTable files not found on disk — cannot replay"
+            );
+        }
+
+        for (table_id_str, sstable_id, error) in &report.submit_failures {
+            tracing::warn!(
+                table = table_id_str,
+                sstable = sstable_id,
+                "pending upload replay could not enqueue without blocking; leaving entry for later retry: {error}"
+            );
+        }
+
+        if let Some(sstable_id) = &report.queue_full_at {
+            tracing::warn!(
+                sstable = sstable_id,
+                remaining_entries = report.remaining_entries,
+                "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
+            );
         }
     }
 
