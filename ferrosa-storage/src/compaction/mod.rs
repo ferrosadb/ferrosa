@@ -6,6 +6,7 @@
 //!   Subsumes STCS (W=large), LCS (W=2), and TWCS behavior.
 
 pub mod executor;
+pub mod finalize;
 pub mod metadata;
 pub mod strategy;
 pub mod strategy_ucs;

@@ -2952,38 +2952,44 @@ impl StorageEngine {
             }
 
             // Step 3: await S3 confirmation.
-            match rx.await {
-                Ok(Ok(())) => {
-                    // Upload confirmed — increment the S3 upload counter.
+            let confirmation =
+                crate::compaction::finalize::upload_confirmation_from_result(rx.await);
+            match &confirmation {
+                crate::compaction::finalize::UploadConfirmation::Confirmed => {
                     self.compaction_metrics.inc_s3_uploads();
                 }
-                Ok(Err(msg)) => {
-                    tracing::error!(%sstable_id, %msg, "compaction: upload failed");
-                    if let Ok(ref pending_log) = pending_log_result {
-                        let _ = pending_log.remove_entry(&sstable_id);
-                    }
-                    continue;
+                crate::compaction::finalize::UploadConfirmation::Failed { message } => {
+                    tracing::error!(%sstable_id, %message, "compaction: upload failed");
                 }
-                Err(_) => {
+                crate::compaction::finalize::UploadConfirmation::WorkerDropped => {
                     tracing::error!(%sstable_id, "compaction: upload worker dropped channel");
-                    if let Ok(ref pending_log) = pending_log_result {
-                        let _ = pending_log.remove_entry(&sstable_id);
-                    }
-                    continue;
                 }
             }
 
-            // Step 4: remove the pending-log entry now that S3 confirmed.
-            if let Ok(ref pending_log) = pending_log_result {
-                if let Err(e) = pending_log.remove_entry(&sstable_id) {
-                    tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
-                    // Non-fatal: replay will re-upload (idempotent).
+            // Step 4: remove the pending-log entry only after S3 confirmation.
+            match crate::compaction::finalize::pending_log_decision_after_upload(confirmation) {
+                crate::compaction::finalize::PendingLogDecision::RemoveConfirmed => {
+                    if let Ok(ref pending_log) = pending_log_result {
+                        if let Err(e) = pending_log.remove_entry(&sstable_id) {
+                            tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
+                            // Non-fatal: replay will re-upload (idempotent).
+                        }
+                    }
+                }
+                crate::compaction::finalize::PendingLogDecision::KeepForReplay => {
+                    continue;
                 }
             }
 
             // Step 5: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
-            let input_ids: Vec<String> = result.task.inputs.iter().map(|i| i.id.clone()).collect();
+            let manifest_plan = crate::compaction::finalize::plan_manifest_update(
+                &table_id_str,
+                &result.task.inputs,
+                &result.output,
+                total_size,
+            );
+            let input_ids = manifest_plan.remove_input_ids.clone();
 
             // Compute total input bytes for metrics (used after manifest update).
             // If the metadata carries a non-zero size we use it directly;
@@ -3022,29 +3028,27 @@ impl StorageEngine {
 
             match crate::manifest::Manifest::load(store.as_ref(), &prefix).await {
                 Ok((mut manifest, _version)) => {
-                    manifest.remove_sstables(&table_id_str, &input_ids);
-                    manifest.add_sstable(
-                        &table_id_str,
-                        crate::manifest::ManifestEntry {
-                            id: sstable_id.clone(),
-                            size: total_size,
-                            min_token: result.output.min_token,
-                            max_token: result.output.max_token,
-                            min_timestamp: result.output.min_timestamp,
-                            max_timestamp: result.output.max_timestamp,
-                        },
-                    );
+                    manifest
+                        .remove_sstables(&manifest_plan.table_id, &manifest_plan.remove_input_ids);
+                    manifest.add_sstable(&manifest_plan.table_id, manifest_plan.add_output.clone());
                     // Pass removals explicitly so CAS retry re-applies them
                     // after merging with the latest manifest. Without this,
                     // merge_into re-introduces the entries we removed.
-                    let removals = vec![(table_id_str.clone(), input_ids.clone())];
                     let save_result = if self.cas_supported() {
                         manifest
-                            .save_with_retry_and_removals(store.as_ref(), &prefix, &removals)
+                            .save_with_retry_and_removals(
+                                store.as_ref(),
+                                &prefix,
+                                &manifest_plan.removals_for_cas_retry,
+                            )
                             .await
                     } else {
                         manifest
-                            .save_without_cas_and_removals(store.as_ref(), &prefix, &removals)
+                            .save_without_cas_and_removals(
+                                store.as_ref(),
+                                &prefix,
+                                &manifest_plan.removals_for_cas_retry,
+                            )
                             .await
                     };
                     if let Err(e) = save_result {
@@ -3062,20 +3066,27 @@ impl StorageEngine {
             }
 
             // Enqueue S3 deletion for each input SSTable (1-hour grace period).
-            for input_id in &input_ids {
+            let deletion_plan = crate::compaction::finalize::plan_input_deletions(
+                &table_id_str,
+                &result.task.inputs,
+                std::time::Duration::from_secs(3600),
+            );
+            for task_plan in deletion_plan.tasks {
                 let (del_tx, del_rx) = tokio::sync::oneshot::channel();
                 let _ = upload_mgr
                     .submit(crate::upload::UploadTask::DeleteSSTable {
-                        table_id: table_id_str.clone(),
-                        sstable_id: input_id.to_string(),
-                        grace_period: std::time::Duration::from_secs(3600),
+                        table_id: task_plan.table_id,
+                        sstable_id: task_plan.sstable_id,
+                        grace_period: task_plan.grace_period,
                         on_complete: Some(del_tx),
                     })
                     .await;
                 // Increment the S3 delete counter for each enqueued deletion.
                 self.compaction_metrics.inc_s3_deletes();
-                // Fire-and-forget: S3 deletions are best-effort.
-                drop(del_rx);
+                if deletion_plan.fire_and_forget {
+                    // Fire-and-forget: S3 deletions are best-effort.
+                    drop(del_rx);
+                }
             }
 
             // Evict local input SSTable component files (best-effort).
