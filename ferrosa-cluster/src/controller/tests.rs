@@ -572,6 +572,151 @@ fn cluster_reconnect_invite_is_rate_limited_when_join_is_deduped() {
 }
 
 #[test]
+fn peer_event_plan_cluster_connect_existing_member_triggers_join_and_invite() {
+    let peer = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let addr = "10.89.5.18:7000".parse().unwrap();
+    let now = std::time::Instant::now();
+
+    let plan = super::peer_plan::plan_connected_peer(super::peer_plan::ConnectedPeerInput {
+        host_id: peer,
+        addr,
+        mode: DeploymentMode::Cluster,
+        known_peer_count_after_tracking: 3,
+        committed_cluster_size: 3,
+        join_enqueued: false,
+        last_reconnect_invite_sent: None,
+        cql_broadcast: Some("127.0.0.1:38043".to_string()),
+        now,
+    });
+
+    assert_eq!(
+        plan.actions,
+        vec![
+            super::peer_plan::PeerEventAction::TriggerClusterJoin {
+                host_id: peer,
+                addr,
+                cql_broadcast: Some("127.0.0.1:38043".to_string()),
+            },
+            super::peer_plan::PeerEventAction::SendClusterInvite {
+                host_id: peer,
+                force: false,
+            },
+        ],
+        "a recreated existing cluster member can have current ring metadata so JoinNode is deduped, \
+         but it still needs a ClusterInvite to leave pair mode and register Raft handlers"
+    );
+}
+
+#[test]
+fn peer_event_plan_cluster_connect_suppresses_duplicate_invite_with_recent_reservation() {
+    let peer = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let addr = "10.89.5.18:7000".parse().unwrap();
+    let now = std::time::Instant::now();
+
+    let plan = super::peer_plan::plan_connected_peer(super::peer_plan::ConnectedPeerInput {
+        host_id: peer,
+        addr,
+        mode: DeploymentMode::Cluster,
+        known_peer_count_after_tracking: 3,
+        committed_cluster_size: 3,
+        join_enqueued: false,
+        last_reconnect_invite_sent: Some(now),
+        cql_broadcast: None,
+        now,
+    });
+
+    assert!(plan
+        .actions
+        .contains(&super::peer_plan::PeerEventAction::TriggerClusterJoin {
+            host_id: peer,
+            addr,
+            cql_broadcast: None,
+        }));
+    assert!(
+        !plan.actions.iter().any(|action| matches!(
+            action,
+            super::peer_plan::PeerEventAction::SendClusterInvite { host_id, .. } if *host_id == peer
+        )),
+        "a recent invite reservation suppresses only duplicate ClusterInvite delivery"
+    );
+}
+
+#[test]
+fn peer_event_plan_degraded_cluster_restores_only_after_committed_quorum() {
+    let peer = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let addr = "10.89.5.19:7000".parse().unwrap();
+    let now = std::time::Instant::now();
+
+    let below_quorum = super::peer_plan::ConnectedPeerInput {
+        host_id: peer,
+        addr,
+        mode: DeploymentMode::DegradedCluster,
+        known_peer_count_after_tracking: 1,
+        committed_cluster_size: 5,
+        join_enqueued: false,
+        last_reconnect_invite_sent: None,
+        cql_broadcast: None,
+        now,
+    };
+    let still_degraded = super::peer_plan::plan_connected_peer(below_quorum.clone());
+    assert!(
+        !still_degraded
+            .actions
+            .contains(&super::peer_plan::PeerEventAction::RestoreClusterMode),
+        "dynamic peer count must not claim quorum for a 5-node committed cluster with only 2 live members"
+    );
+
+    let restored = super::peer_plan::plan_connected_peer(super::peer_plan::ConnectedPeerInput {
+        known_peer_count_after_tracking: 2,
+        ..below_quorum
+    });
+    assert!(
+        restored
+            .actions
+            .contains(&super::peer_plan::PeerEventAction::RestoreClusterMode),
+        "3 live members restores quorum for a committed 5-node cluster"
+    );
+}
+
+#[test]
+fn peer_event_plan_recovered_cluster_peer_invites_and_delivers_hints_independently() {
+    let peer = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+
+    let invite_only = super::peer_plan::plan_recovered_peer(super::peer_plan::RecoveredPeerInput {
+        host_id: peer,
+        mode: DeploymentMode::Cluster,
+        pending_hint_count: 0,
+        peer_manager_available: false,
+    });
+    assert_eq!(
+        invite_only.actions,
+        vec![super::peer_plan::PeerEventAction::SendClusterInvite {
+            host_id: peer,
+            force: false,
+        }],
+        "recovery invite delivery must not depend on pending hints or PeerManager availability"
+    );
+
+    let invite_and_hints =
+        super::peer_plan::plan_recovered_peer(super::peer_plan::RecoveredPeerInput {
+            host_id: peer,
+            mode: DeploymentMode::Cluster,
+            pending_hint_count: 7,
+            peer_manager_available: true,
+        });
+    assert_eq!(
+        invite_and_hints.actions,
+        vec![
+            super::peer_plan::PeerEventAction::SendClusterInvite {
+                host_id: peer,
+                force: false,
+            },
+            super::peer_plan::PeerEventAction::DeliverHints { host_id: peer },
+        ]
+    );
+}
+
+#[test]
 fn initial_raft_membership_uses_local_broadcast_address_for_seed() {
     let local_host_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
     let peer1_host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
