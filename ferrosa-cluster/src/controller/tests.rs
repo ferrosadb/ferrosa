@@ -572,6 +572,107 @@ fn cluster_reconnect_invite_is_rate_limited_when_join_is_deduped() {
 }
 
 #[test]
+fn reconnect_invite_plan_includes_self_and_excludes_recipient() {
+    let local = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let recipient = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+    let other = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+    let local_addr = "10.0.0.1:7000".parse().unwrap();
+    let recipient_addr = "10.0.0.2:7000".parse().unwrap();
+    let other_addr = "10.0.0.3:7000".parse().unwrap();
+
+    let plan = super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
+        local_host_id: local,
+        local_addr: Some(local_addr),
+        recipient,
+        connected_peers: &[(recipient, recipient_addr), (other, other_addr)],
+    })
+    .expect("other peers plus self should produce an invite payload");
+
+    assert_eq!(plan.recipient, recipient);
+    assert_eq!(plan.peers, vec![(other, other_addr), (local, local_addr)]);
+}
+
+#[test]
+fn reconnect_invite_plan_returns_none_when_no_peer_addresses_available() {
+    let local = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let recipient = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+    let recipient_addr = "10.0.0.2:7000".parse().unwrap();
+
+    let plan = super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
+        local_host_id: local,
+        local_addr: None,
+        recipient,
+        connected_peers: &[(recipient, recipient_addr)],
+    });
+
+    assert!(
+        plan.is_none(),
+        "an invite with no reachable peers would only echo the recipient"
+    );
+}
+
+#[test]
+fn reconnect_invite_reservation_is_atomic_under_burst_callbacks() {
+    let peer = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let now = std::time::Instant::now();
+    let mut recent = std::collections::BTreeMap::new();
+
+    assert!(super::invite::reserve_reconnect_invite(
+        &mut recent,
+        peer,
+        now,
+        super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+        super::MAX_CONNECTED_PEERS,
+    ));
+    assert_eq!(recent.get(&peer).copied(), Some(now));
+
+    let duplicate = now + std::time::Duration::from_millis(5);
+    assert!(
+        !super::invite::reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            duplicate,
+            super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+            super::MAX_CONNECTED_PEERS,
+        ),
+        "the second callback in a reconnect burst must observe the reservation and skip delivery"
+    );
+    assert_eq!(
+        recent.get(&peer).copied(),
+        Some(now),
+        "suppressed duplicates must not extend the cooldown window"
+    );
+}
+
+#[test]
+fn invite_cooldown_allows_retry_after_interval() {
+    let peer = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let now = std::time::Instant::now();
+    let mut recent = std::collections::BTreeMap::new();
+
+    assert!(super::invite::reserve_reconnect_invite(
+        &mut recent,
+        peer,
+        now,
+        super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+        super::MAX_CONNECTED_PEERS,
+    ));
+
+    let after_cooldown = now + super::CLUSTER_RECONNECT_INVITE_COOLDOWN;
+    assert!(
+        super::invite::reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            after_cooldown,
+            super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+            super::MAX_CONNECTED_PEERS,
+        ),
+        "reconnect invites must be retried once the cooldown interval has elapsed"
+    );
+    assert_eq!(recent.get(&peer).copied(), Some(after_cooldown));
+}
+
+#[test]
 fn peer_event_plan_cluster_connect_existing_member_triggers_join_and_invite() {
     let peer = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
     let addr = "10.89.5.18:7000".parse().unwrap();

@@ -328,35 +328,34 @@ impl ModeController {
         let Some(pm) = pm_guard.as_ref().as_ref().cloned() else {
             return;
         };
+        let local_host_id = self.local_host_id;
+        let connected_peers = self.connected_peers.lock().clone();
+        let Some(plan) =
+            super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
+                local_host_id,
+                local_addr: Some(self.net_config.broadcast_addr),
+                recipient,
+                connected_peers: &connected_peers,
+            })
+        else {
+            return;
+        };
         {
             let mut recent = self.recent_reconnect_invites.lock();
-            if recent.len() >= super::MAX_CONNECTED_PEERS {
-                recent.clear();
+            if !super::invite::reserve_reconnect_invite(
+                &mut recent,
+                recipient,
+                std::time::Instant::now(),
+                super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+                super::MAX_CONNECTED_PEERS,
+            ) {
+                tracing::debug!(peer = %recipient, "ClusterInvite delivery suppressed by reconnect cooldown");
+                return;
             }
-            recent.insert(recipient, std::time::Instant::now());
-        }
-        let local_host_id = self.local_host_id;
-        // Build the peer list from our `connected_peers` plus self. The
-        // recipient is excluded — the receiver doesn't need its own
-        // address back, only those of the other cluster members.
-        let mut peers: Vec<(Uuid, SocketAddr)> = self
-            .connected_peers
-            .lock()
-            .iter()
-            .filter(|(id, _)| *id != recipient && *id != local_host_id)
-            .copied()
-            .collect();
-        // Include self so the recipient can establish a reverse connection.
-        let local_addr = self.net_config.broadcast_addr;
-        if !peers.iter().any(|(id, _)| *id == local_host_id) {
-            peers.push((local_host_id, local_addr));
-        }
-        if peers.is_empty() {
-            return;
         }
         let invite = Message::ClusterInvite {
-            initiator: local_host_id,
-            peers,
+            initiator: plan.initiator,
+            peers: plan.peers,
         };
         let pm_clone = pm.clone();
         self.spawn_tracked(async move {

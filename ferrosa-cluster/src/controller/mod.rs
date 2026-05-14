@@ -14,6 +14,7 @@
 pub mod bootstrap;
 pub mod cluster;
 pub mod cluster_rejoin;
+mod invite;
 mod membership;
 mod operator;
 mod pair;
