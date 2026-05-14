@@ -1773,7 +1773,13 @@ impl ModeController {
                                     }
                                 };
 
-                                if !sstable_dirs.is_empty() {
+                                let stream_plan = super::bootstrap::bootstrap_stream::plan_table_stream(
+                                    super::bootstrap::bootstrap_stream::TableStreamPlanInput {
+                                        sstable_dir_count: sstable_dirs.len(),
+                                        row_fallback_limit: super::bootstrap::bootstrap_stream::BOUNDED_ROW_FALLBACK_LIMIT,
+                                    },
+                                );
+                                if let super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } = stream_plan {
                                     tracing::info!(
                                         ks,
                                         tbl,
@@ -1841,12 +1847,25 @@ impl ModeController {
                                     continue;
                                 }
 
-                                const BOOTSTRAP_READ_LIMIT: usize = 1_000;
+                                let row_fallback_limit = match stream_plan {
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::BoundedRows { limit } => limit,
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::RetryRequired => {
+                                        tracing::warn!(
+                                            ks,
+                                            tbl,
+                                            "bootstrap: table stream requires retry/repair; skipping row materialization"
+                                        );
+                                        continue;
+                                    }
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } => unreachable!(
+                                        "SSTable-backed bootstrap tables return above and never row-materialize"
+                                    ),
+                                };
                                 let partitions = match storage_for_bootstrap.read_range(
                                     &table_id,
                                     None,
                                     None,
-                                    BOOTSTRAP_READ_LIMIT,
+                                    row_fallback_limit,
                                 ) {
                                     Ok(p) => p,
                                     Err(e) => {
