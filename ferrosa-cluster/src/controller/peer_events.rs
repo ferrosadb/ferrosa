@@ -9,8 +9,10 @@ use ferrosa_net::rpc::InboundPeerCallback;
 use crate::hints::delivery::HintDeliveryTask;
 use crate::mode::DeploymentMode;
 
+use super::peer_plan::{self, PeerConnectPlanInput, PeerEventAction, PeerRecoveredPlanInput};
 use super::ModeController;
 
+#[cfg(test)]
 pub(super) fn should_send_cluster_invite_after_join_trigger(
     join_enqueued: bool,
     last_sent: Option<std::time::Instant>,
@@ -22,10 +24,82 @@ pub(super) fn should_send_cluster_invite_after_join_trigger(
     // JoinNode/UpdateNodeInfo proposal. That peer can still be in pair mode,
     // though, and needs a fresh ClusterInvite to transition into cluster mode
     // and register Raft/Bulk/Data handlers.
-    join_enqueued
-        || last_sent
-            .map(|sent| now.duration_since(sent) >= super::CLUSTER_RECONNECT_INVITE_COOLDOWN)
-            .unwrap_or(true)
+    peer_plan::should_send_cluster_invite(join_enqueued, last_sent, now)
+}
+
+impl ModeController {
+    fn execute_peer_event_plan(
+        &self,
+        actions: Vec<PeerEventAction>,
+        all_peers_after_track: &[(uuid::Uuid, std::net::SocketAddr)],
+        pair_transition_enters_cluster: bool,
+    ) {
+        let mut join_enqueued_invite = None;
+        let mut invite_sent = false;
+
+        for action in actions {
+            match action {
+                PeerEventAction::TrackPeer { .. } => {}
+                PeerEventAction::TransitionToPair {
+                    host_id,
+                    addr,
+                    inbound,
+                } => self.transition_to_pair(host_id, addr, inbound),
+                PeerEventAction::TransitionToForming => {
+                    if pair_transition_enters_cluster {
+                        self.transition_to_cluster(all_peers_after_track.to_vec());
+                    } else {
+                        self.transition_to_forming(all_peers_after_track.to_vec());
+                    }
+                }
+                PeerEventAction::TriggerClusterJoin {
+                    host_id,
+                    addr,
+                    cql_broadcast,
+                } => {
+                    tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
+                    if self.trigger_cluster_join(host_id, addr, cql_broadcast) {
+                        join_enqueued_invite = Some(host_id);
+                    }
+                }
+                PeerEventAction::SendClusterInvite { host_id, force: _ } => {
+                    invite_sent = true;
+                    self.send_cluster_invite_to(host_id);
+                }
+                PeerEventAction::RestoreClusterMode => {
+                    tracing::info!("quorum restored — transitioning back to Cluster");
+                    self.mode.store(Arc::new(DeploymentMode::Cluster));
+                    // Raft will resume accepting writes once leader is re-elected.
+                    // Write path and DDL path are restored by the Raft leader
+                    // election callback (already in transition_to_cluster's async task).
+                }
+                PeerEventAction::DeliverHints { host_id } => self.spawn_hint_delivery(host_id),
+            }
+        }
+
+        if let Some(host_id) = join_enqueued_invite {
+            if !invite_sent {
+                self.send_cluster_invite_to(host_id);
+            }
+        }
+    }
+
+    fn spawn_hint_delivery(&self, peer_id: uuid::Uuid) {
+        let peer_manager = match &**self.peer_manager.load() {
+            Some(pm) => pm.clone(),
+            None => {
+                tracing::warn!(%peer_id, "hint delivery skipped: peer_manager not set");
+                return;
+            }
+        };
+
+        let hint_store = self.hint_store.clone();
+        let hint_config = self.hint_config.clone();
+
+        self.spawn_tracked(async move {
+            HintDeliveryTask::run(peer_id, hint_store, peer_manager, &hint_config).await;
+        });
+    }
 }
 
 impl PeerEventListener for ModeController {
@@ -53,75 +127,31 @@ impl PeerEventListener for ModeController {
         let guard_start = std::time::Instant::now();
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        match current_mode {
-            DeploymentMode::Standalone => {
-                self.transition_to_pair(host_id, addr, false);
-            }
-            DeploymentMode::Pair => {
-                // 2nd peer connecting while in pair mode → enter forming state
-                let all_peers = self.connected_peers.lock().clone();
-                if all_peers.len() >= 2 {
-                    self.transition_to_forming(all_peers);
-                }
-            }
-            DeploymentMode::Cluster => {
-                tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
-                let cql_broadcast = self
-                    .peer_manager
-                    .load()
-                    .as_ref()
-                    .as_ref()
-                    .and_then(|pm| pm.get_peer_cql_broadcast_sync(host_id));
-                let enqueued = self.trigger_cluster_join(host_id, addr, cql_broadcast);
-                // Re-broadcast ClusterInvite to the new peer. The pair →
-                // forming → cluster transition delivered an invite once,
-                // but a peer that crashed or was recreated *after* that
-                // transition would never receive it — leaving it stuck
-                // in pair mode with no Raft handler registered. Without
-                // this, recreating any single node breaks Raft quorum
-                // forever. Match the connect path used by `transition_to_*`.
-                if should_send_cluster_invite_after_join_trigger(
-                    enqueued,
-                    self.recent_reconnect_invites.lock().get(&host_id).copied(),
-                    std::time::Instant::now(),
-                ) {
-                    self.send_cluster_invite_to(host_id);
-                }
-            }
-            DeploymentMode::Forming => {
-                tracing::info!(peer = %host_id, "peer connected during formation");
-            }
-            DeploymentMode::DegradedPair => {
-                tracing::info!(peer = %host_id, "peer reconnected in degraded pair mode");
-            }
-            DeploymentMode::DegradedCluster => {
-                // Check if quorum is restored using committed cluster size
-                // (not the dynamic connected count) to prevent false quorum
-                // restoration after network partitions.
-                let connected = self.connected_peers.lock().len();
-                let committed = self
-                    .committed_cluster_size
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let total = if committed > 0 {
-                    committed
-                } else {
-                    connected + 1
-                };
-                let quorum = (total / 2) + 1;
-                if connected + 1 >= quorum {
-                    tracing::info!(
-                        connected,
-                        committed_size = total,
-                        quorum,
-                        "quorum restored — transitioning back to Cluster"
-                    );
-                    self.mode.store(Arc::new(DeploymentMode::Cluster));
-                    // Raft will resume accepting writes once leader is re-elected.
-                    // Write path and DDL path are restored by the Raft leader
-                    // election callback (already in transition_to_cluster's async task).
-                }
-            }
-        }
+        let all_peers = self.connected_peers.lock().clone();
+        let cql_broadcast = if matches!(current_mode, DeploymentMode::Cluster) {
+            self.peer_manager
+                .load()
+                .as_ref()
+                .as_ref()
+                .and_then(|pm| pm.get_peer_cql_broadcast_sync(host_id))
+        } else {
+            None
+        };
+        let plan = peer_plan::plan_peer_connected(PeerConnectPlanInput {
+            mode: current_mode,
+            host_id,
+            addr,
+            inbound: false,
+            connected_peers_after_track: all_peers.clone(),
+            committed_cluster_size: self
+                .committed_cluster_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            join_enqueued: false,
+            last_invite_sent: self.recent_reconnect_invites.lock().get(&host_id).copied(),
+            now: std::time::Instant::now(),
+            cql_broadcast,
+        });
+        self.execute_peer_event_plan(plan, &all_peers, false);
 
         // Record how long the transition guard was held.
         drop(_guard);
@@ -187,27 +217,17 @@ impl PeerEventListener for ModeController {
     }
 
     fn on_peer_recovered(&self, peer_id: uuid::Uuid) {
-        tracing::info!(%peer_id, "peer recovered — scheduling hint delivery");
+        tracing::info!(%peer_id, "peer recovered — planning invite and hint delivery");
 
-        // Only replay hints if there are any pending for this peer.
-        if self.hint_store.pending_count(peer_id) == 0 {
-            return;
-        }
-
-        let peer_manager = match &**self.peer_manager.load() {
-            Some(pm) => pm.clone(),
-            None => {
-                tracing::warn!(%peer_id, "hint delivery skipped: peer_manager not set");
-                return;
-            }
-        };
-
-        let hint_store = self.hint_store.clone();
-        let hint_config = self.hint_config.clone();
-
-        self.spawn_tracked(async move {
-            HintDeliveryTask::run(peer_id, hint_store, peer_manager, &hint_config).await;
+        let pending_hint_count = self.hint_store.pending_count(peer_id);
+        let peer_manager_available = self.peer_manager.load().is_some();
+        let plan = peer_plan::plan_peer_recovered(PeerRecoveredPlanInput {
+            mode: **self.mode.load(),
+            host_id: peer_id,
+            pending_hint_count,
+            peer_manager_available,
         });
+        self.execute_peer_event_plan(plan, &[], false);
     }
 
     fn on_peer_failed(&self, peer_id: uuid::Uuid) {
@@ -251,38 +271,25 @@ impl InboundPeerCallback for ModeController {
 
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        match current_mode {
-            DeploymentMode::Standalone => {
-                // Inbound connection — we need a reverse outbound pool for sends.
-                self.transition_to_pair(host_id, addr, true);
-            }
-            DeploymentMode::Pair => {
-                let all_peers = self.connected_peers.lock().clone();
-                if all_peers.len() >= 2 {
-                    self.transition_to_cluster(all_peers);
-                }
-            }
-            DeploymentMode::Cluster => {
-                tracing::info!(peer = %host_id, "new inbound peer in cluster mode, triggering join");
-                let enqueued = self.trigger_cluster_join(host_id, reverse_addr, cql_broadcast);
-                // See on_peer_connected for the full rationale: a recreated
-                // peer would otherwise miss the one-shot ClusterInvite from
-                // the original pair → forming → cluster transition and
-                // stay stuck in pair mode (no Raft handler → no quorum).
-                if should_send_cluster_invite_after_join_trigger(
-                    enqueued,
-                    self.recent_reconnect_invites.lock().get(&host_id).copied(),
-                    std::time::Instant::now(),
-                ) {
-                    self.send_cluster_invite_to(host_id);
-                }
-            }
-            DeploymentMode::Forming => {
-                tracing::info!(peer = %host_id, "inbound peer during formation");
-            }
-            DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => {
-                tracing::info!(peer = %host_id, "inbound peer in degraded mode");
-            }
-        }
+        let all_peers = self.connected_peers.lock().clone();
+        let plan = peer_plan::plan_peer_connected(PeerConnectPlanInput {
+            mode: current_mode,
+            host_id,
+            addr: if matches!(current_mode, DeploymentMode::Cluster) {
+                reverse_addr
+            } else {
+                addr
+            },
+            inbound: true,
+            connected_peers_after_track: all_peers.clone(),
+            committed_cluster_size: self
+                .committed_cluster_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            join_enqueued: false,
+            last_invite_sent: self.recent_reconnect_invites.lock().get(&host_id).copied(),
+            now: std::time::Instant::now(),
+            cql_broadcast,
+        });
+        self.execute_peer_event_plan(plan, &all_peers, true);
     }
 }

@@ -1,4 +1,4 @@
-//! Phase 7 — Promote (W4.8).
+//! Phase 7 — Promote.
 //!
 //! Pre-condition: BootstrapStream completed.
 //! Post-condition: every peer in the Raft state-machine member map

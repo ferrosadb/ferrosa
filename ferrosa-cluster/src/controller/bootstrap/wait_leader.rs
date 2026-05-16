@@ -1,9 +1,9 @@
-//! Phase 4 — WaitLeader (W4.5).
+//! Phase 4 — WaitLeader.
 //!
 //! Pre-condition: the local Raft instance is published.
 //! Post-condition: `current_leader().await.is_some()` within the
 //! formation deadline (default 30 s, overridable via
-//! `formation_timeout_secs` per W1.17).
+//! `formation_timeout_secs`).
 //!
 //! Failure to satisfy the post-condition surfaces as
 //! `BootstrapError::Phase { name: WaitLeader, .. }` — the caller

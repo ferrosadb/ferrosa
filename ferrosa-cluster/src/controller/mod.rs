@@ -14,10 +14,12 @@
 pub mod bootstrap;
 pub mod cluster;
 pub mod cluster_rejoin;
+mod invite;
 mod membership;
 mod operator;
 mod pair;
 mod peer_events;
+mod peer_plan;
 mod token;
 
 pub use cluster::bootstrap_silent_failure_counts;

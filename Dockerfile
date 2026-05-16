@@ -1,6 +1,10 @@
 FROM rust:1.94 AS builder
 WORKDIR /build
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends capnproto \
+    && rm -rf /var/lib/apt/lists/*
+
 # Layer 1: cache dependencies (only re-runs when Cargo.toml/lock change)
 COPY Cargo.toml Cargo.lock ./
 COPY ferrosa/Cargo.toml ferrosa/Cargo.toml

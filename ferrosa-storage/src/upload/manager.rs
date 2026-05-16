@@ -8,7 +8,10 @@ use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parking_lot::Mutex;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+
+const S3_UPLOAD_PART_BYTES: usize = 8 * 1024 * 1024;
 
 /// Local SSTable component file scheduled for upload.
 #[derive(Debug, Clone)]
@@ -146,9 +149,9 @@ impl UploadManager {
                                 &sstable_id,
                                 component,
                             );
-                            let data = match std::fs::read(&file.path) {
-                                Ok(data) => Bytes::from(data),
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            match Self::put_file_with_retry(&store, &path, &file.path, 5).await {
+                                Ok(()) => {}
+                                Err(UploadFileError::Missing) => {
                                     // The SSTable was compacted away (or
                                     // explicitly deleted) between the scan that
                                     // produced `files` and this read. Not a real
@@ -170,9 +173,8 @@ impl UploadManager {
                                     if upload_err.is_none() {
                                         upload_err = Some(msg);
                                     }
-                                    continue;
                                 }
-                                Err(e) => {
+                                Err(UploadFileError::Read(e)) => {
                                     let msg = format!(
                                         "upload failed for {path}: failed to read {}: {e}",
                                         file.path.display()
@@ -181,15 +183,14 @@ impl UploadManager {
                                     if upload_err.is_none() {
                                         upload_err = Some(msg);
                                     }
-                                    continue;
                                 }
-                            };
-                            if let Err(e) = Self::put_with_retry(&store, &path, data, 5).await {
-                                let msg = format!("upload failed for {path}: {e}");
-                                tracing_or_eprintln(msg.clone());
-                                // Record first error; continue so all files are attempted.
-                                if upload_err.is_none() {
-                                    upload_err = Some(msg);
+                                Err(UploadFileError::Store(e)) => {
+                                    let msg = format!("upload failed for {path}: {e}");
+                                    tracing_or_eprintln(msg.clone());
+                                    // Record first error; continue so all files are attempted.
+                                    if upload_err.is_none() {
+                                        upload_err = Some(msg);
+                                    }
                                 }
                             }
                         }
@@ -352,6 +353,135 @@ impl UploadManager {
 
         unreachable!()
     }
+
+    /// Streams a local file into object storage without eagerly materializing
+    /// large SSTable components.
+    ///
+    /// Large components use multipart upload. Small components intentionally use
+    /// a normal PUT because S3 rejects multipart uploads whose only part is
+    /// smaller than the 5 MiB minimum (`EntityTooSmall`).
+    async fn put_file_with_retry(
+        store: &dyn ObjectStore,
+        path: &ObjectPath,
+        file_path: &std::path::Path,
+        max_retries: u32,
+    ) -> Result<(), UploadFileError> {
+        let mut delay = Duration::from_millis(100);
+
+        for attempt in 0..=max_retries {
+            match Self::put_file_once(store, path, file_path).await {
+                Ok(()) => return Ok(()),
+                Err(UploadFileError::Store(e)) if attempt < max_retries && is_transient(&e) => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        unreachable!()
+    }
+
+    async fn put_file_once(
+        store: &dyn ObjectStore,
+        path: &ObjectPath,
+        file_path: &std::path::Path,
+    ) -> Result<(), UploadFileError> {
+        let metadata = tokio::fs::metadata(file_path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => UploadFileError::Missing,
+                _ => UploadFileError::Read(e),
+            })?;
+        let mut file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => UploadFileError::Missing,
+                _ => UploadFileError::Read(e),
+            })?;
+
+        if metadata.len() < S3_UPLOAD_PART_BYTES as u64 {
+            let mut data = Vec::with_capacity(metadata.len() as usize);
+            file.read_to_end(&mut data)
+                .await
+                .map_err(UploadFileError::Read)?;
+            return store
+                .put(path, Bytes::from(data).into())
+                .await
+                .map(|_| ())
+                .map_err(UploadFileError::Store);
+        }
+
+        Self::put_reader_multipart_once(store, path, &mut file).await
+    }
+
+    async fn put_reader_multipart_once<R>(
+        store: &dyn ObjectStore,
+        path: &ObjectPath,
+        reader: &mut R,
+    ) -> Result<(), UploadFileError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut upload = store
+            .put_multipart(path)
+            .await
+            .map_err(UploadFileError::Store)?;
+        let mut buf = vec![0u8; S3_UPLOAD_PART_BYTES];
+
+        loop {
+            let mut filled = 0;
+            while filled < buf.len() {
+                let bytes_read = reader
+                    .read(&mut buf[filled..])
+                    .await
+                    .map_err(UploadFileError::Read)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                filled += bytes_read;
+            }
+
+            if filled == 0 {
+                break;
+            }
+
+            if let Err(e) = upload
+                .put_part(Bytes::copy_from_slice(&buf[..filled]).into())
+                .await
+            {
+                let _ = upload.abort().await;
+                return Err(UploadFileError::Store(e));
+            }
+
+            if filled < buf.len() {
+                break;
+            }
+        }
+
+        upload
+            .complete()
+            .await
+            .map(|_| ())
+            .map_err(UploadFileError::Store)
+    }
+}
+
+#[derive(Debug)]
+enum UploadFileError {
+    Missing,
+    Read(std::io::Error),
+    Store(object_store::Error),
+}
+
+impl std::fmt::Display for UploadFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "source file disappeared before upload"),
+            Self::Read(e) => write!(f, "{e}"),
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// Compute a 2-character hex prefix from an SSTable ID for S3 key distribution.
@@ -408,7 +538,10 @@ fn tracing_or_eprintln(msg: String) {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
     use tokio::sync::Notify;
 
     fn make_runtime() -> tokio::runtime::Runtime {
@@ -531,6 +664,179 @@ mod tests {
                 let result = store.get(&path).await.unwrap();
                 assert!(!result.bytes().await.unwrap().is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn sstable_upload_streams_file_through_multipart_not_single_memory_payload() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let component_path = dir.path().join("stream-Data.db");
+            let data = vec![0x5a; 9 * 1024 * 1024 + 17];
+            std::fs::write(&component_path, &data).unwrap();
+
+            let inner = Arc::new(InMemory::new());
+            let store = Arc::new(RejectSinglePutStore::new(
+                Arc::clone(&inner) as Arc<dyn ObjectStore>
+            ));
+            let multipart_started = Arc::clone(&store.multipart_started);
+            let manager = UploadManager::new(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "pfx".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.t".into(),
+                    sstable_id: "stream".into(),
+                    files: vec![SstableComponentFile::new("stream-Data.db", &component_path)],
+                    on_complete: Some(tx),
+                })
+                .await
+                .unwrap();
+
+            rx.await.unwrap().unwrap();
+            manager.shutdown().await;
+
+            assert_eq!(
+                multipart_started.load(Ordering::SeqCst),
+                1,
+                "SSTable uploads must use multipart streaming from the local component file, not ObjectStore::put with one full-file Bytes payload"
+            );
+            let hex = hex_prefix_for("stream");
+            let path = sstable_object_key("pfx", &hex, "ks.t", "stream", "Data.db");
+            let result = inner.get(&path).await.unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(bytes.len(), data.len());
+            assert_eq!(&bytes[..32], &data[..32]);
+        });
+    }
+
+    #[test]
+    fn small_sstable_upload_uses_single_put_to_avoid_s3_entity_too_small() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let component_path = dir.path().join("small-Data.db");
+            let data = b"tiny sstable component";
+            std::fs::write(&component_path, data).unwrap();
+
+            let inner = Arc::new(InMemory::new());
+            let store = Arc::new(RejectSinglePutStore::allow_single_put(
+                Arc::clone(&inner) as Arc<dyn ObjectStore>
+            ));
+            let multipart_started = Arc::clone(&store.multipart_started);
+            let single_put_started = Arc::clone(&store.single_put_started);
+            let manager = UploadManager::new(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "pfx".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.t".into(),
+                    sstable_id: "small".into(),
+                    files: vec![SstableComponentFile::new("small-Data.db", &component_path)],
+                    on_complete: Some(tx),
+                })
+                .await
+                .unwrap();
+
+            rx.await.unwrap().unwrap();
+            manager.shutdown().await;
+
+            assert_eq!(
+                multipart_started.load(Ordering::SeqCst),
+                0,
+                "S3 rejects multipart uploads for objects below its minimum part size"
+            );
+            assert_eq!(single_put_started.load(Ordering::SeqCst), 1);
+            let hex = hex_prefix_for("small");
+            let path = sstable_object_key("pfx", &hex, "ks.t", "small", "Data.db");
+            let result = inner.get(&path).await.unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(bytes.as_ref(), data);
+        });
+    }
+
+    #[test]
+    fn medium_sstable_upload_uses_single_put_to_avoid_one_part_multipart_entity_too_small() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let component_path = dir.path().join("medium-Data.db");
+            let data = vec![0x6d; 6 * 1024 * 1024 + 17];
+            std::fs::write(&component_path, &data).unwrap();
+
+            let inner = Arc::new(InMemory::new());
+            let store = Arc::new(RejectSinglePutStore::allow_single_put(
+                Arc::clone(&inner) as Arc<dyn ObjectStore>
+            ));
+            let multipart_started = Arc::clone(&store.multipart_started);
+            let single_put_started = Arc::clone(&store.single_put_started);
+            let manager = UploadManager::new(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "pfx".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.t".into(),
+                    sstable_id: "medium".into(),
+                    files: vec![SstableComponentFile::new("medium-Data.db", &component_path)],
+                    on_complete: Some(tx),
+                })
+                .await
+                .unwrap();
+
+            rx.await.unwrap().unwrap();
+            manager.shutdown().await;
+
+            assert_eq!(
+                multipart_started.load(Ordering::SeqCst),
+                0,
+                "files smaller than the upload chunk size must not use one-part multipart upload"
+            );
+            assert_eq!(single_put_started.load(Ordering::SeqCst), 1);
+            let hex = hex_prefix_for("medium");
+            let path = sstable_object_key("pfx", &hex, "ks.t", "medium", "Data.db");
+            let result = inner.get(&path).await.unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(bytes.len(), data.len());
+            assert_eq!(&bytes[..32], &data[..32]);
+        });
+    }
+
+    #[test]
+    fn multipart_upload_coalesces_short_file_reads_into_full_sized_non_final_parts() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let part_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let store = PartSizeRecordingStore::new(Arc::clone(&part_sizes));
+            let path = ObjectPath::from("pfx/large-Data.db");
+            let total_len = S3_UPLOAD_PART_BYTES + 21_527;
+            let mut reader = ShortRead::new(total_len, 128 * 1024);
+
+            UploadManager::put_reader_multipart_once(&store, &path, &mut reader)
+                .await
+                .unwrap();
+
+            let sizes = part_sizes.lock().unwrap().clone();
+            assert_eq!(
+                sizes,
+                vec![S3_UPLOAD_PART_BYTES, 21_527],
+                "short file reads must be coalesced so only the final multipart part is below the chunk size"
+            );
         });
     }
 
@@ -679,6 +985,266 @@ mod tests {
             let bytes = result.bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), b"commit-log-segment-bytes");
         });
+    }
+
+    struct ShortRead {
+        remaining: usize,
+        chunk: usize,
+    }
+
+    impl ShortRead {
+        fn new(total: usize, chunk: usize) -> Self {
+            Self {
+                remaining: total,
+                chunk,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ShortRead {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let n = self.remaining.min(self.chunk).min(buf.remaining());
+            if n > 0 {
+                buf.put_slice(&vec![0x42; n]);
+                self.remaining -= n;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PartSizeRecordingStore {
+        inner: Arc<dyn ObjectStore>,
+        part_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl PartSizeRecordingStore {
+        fn new(part_sizes: Arc<std::sync::Mutex<Vec<usize>>>) -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                part_sizes,
+            }
+        }
+    }
+
+    impl std::fmt::Display for PartSizeRecordingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PartSizeRecordingStore")
+        }
+    }
+
+    impl std::fmt::Debug for PartSizeRecordingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PartSizeRecordingStore")
+        }
+    }
+
+    struct PartSizeRecordingUpload {
+        part_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl std::fmt::Debug for PartSizeRecordingUpload {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PartSizeRecordingUpload")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for PartSizeRecordingUpload {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            let part_sizes = Arc::clone(&self.part_sizes);
+            Box::pin(async move {
+                part_sizes.lock().unwrap().push(data.content_length());
+                Ok(())
+            })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            Ok(object_store::PutResult {
+                e_tag: None,
+                version: None,
+            })
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PartSizeRecordingStore {
+        async fn put_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Ok(Box::new(PartSizeRecordingUpload {
+                part_sizes: Arc::clone(&self.part_sizes),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    struct RejectSinglePutStore {
+        inner: Arc<dyn ObjectStore>,
+        multipart_started: Arc<AtomicUsize>,
+        single_put_started: Arc<AtomicUsize>,
+        reject_single_put: bool,
+    }
+
+    impl RejectSinglePutStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                multipart_started: Arc::new(AtomicUsize::new(0)),
+                single_put_started: Arc::new(AtomicUsize::new(0)),
+                reject_single_put: true,
+            }
+        }
+
+        fn allow_single_put(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                multipart_started: Arc::new(AtomicUsize::new(0)),
+                single_put_started: Arc::new(AtomicUsize::new(0)),
+                reject_single_put: false,
+            }
+        }
+    }
+
+    impl std::fmt::Display for RejectSinglePutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RejectSinglePutStore")
+        }
+    }
+
+    impl std::fmt::Debug for RejectSinglePutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RejectSinglePutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RejectSinglePutStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.single_put_started.fetch_add(1, Ordering::SeqCst);
+            if self.reject_single_put {
+                Err(object_store::Error::NotImplemented)
+            } else {
+                self.inner.put_opts(location, payload, opts).await
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.multipart_started.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
     }
 
     struct BlockingFirstPutStore {

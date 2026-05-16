@@ -876,64 +876,41 @@ impl StorageEngine {
             "replaying pending S3 uploads from crash recovery"
         );
 
-        for (table_id_str, sstable_id) in &entries {
-            // Find the SSTable files on disk
-            let table_dir = self.config.data_dir.join("sstables").join(table_id_str);
-            let files = Self::collect_sstable_files(&table_dir, sstable_id.parse().unwrap_or(0));
-            if files.is_empty() {
-                // Also check compaction output directory
-                let compaction_dir = self.config.compaction.output_dir.join(table_id_str);
-                let files2 =
-                    Self::collect_sstable_files(&compaction_dir, sstable_id.parse().unwrap_or(0));
-                if files2.is_empty() {
-                    tracing::warn!(
-                        table = table_id_str,
-                        sstable = sstable_id,
-                        "pending upload: SSTable files not found on disk — cannot replay"
-                    );
-                    continue;
+        let report = crate::upload::replay::replay_pending_upload_entries(
+            &entries,
+            &self.config.data_dir,
+            &self.config.compaction.output_dir,
+            |task| match upload_mgr.try_submit(task) {
+                Ok(()) => crate::upload::replay::PendingUploadReplaySubmit::Submitted,
+                Err(e) if e.to_string().contains("upload queue full") => {
+                    crate::upload::replay::PendingUploadReplaySubmit::QueueFull
                 }
-                let task = crate::upload::UploadTask::SSTable {
-                    table_id: table_id_str.clone(),
-                    sstable_id: sstable_id.clone(),
-                    files: files2,
-                    on_complete: None,
-                };
-                if let Err(e) = upload_mgr.try_submit(task) {
-                    tracing::warn!(
-                        table = table_id_str,
-                        sstable = sstable_id,
-                        "pending upload replay could not enqueue without blocking; leaving entry for later retry: {e}"
-                    );
-                    if e.to_string().contains("upload queue full") {
-                        tracing::warn!(
-                            "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
-                        );
-                        break;
-                    }
-                }
-                continue;
-            }
+                Err(e) => crate::upload::replay::PendingUploadReplaySubmit::Failed(e.to_string()),
+            },
+        );
 
-            let task = crate::upload::UploadTask::SSTable {
-                table_id: table_id_str.clone(),
-                sstable_id: sstable_id.clone(),
-                files,
-                on_complete: None,
-            };
-            if let Err(e) = upload_mgr.try_submit(task) {
-                tracing::warn!(
-                    table = table_id_str,
-                    sstable = sstable_id,
-                    "pending upload replay could not enqueue without blocking; leaving entry for later retry: {e}"
-                );
-                if e.to_string().contains("upload queue full") {
-                    tracing::warn!(
-                        "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
-                    );
-                    break;
-                }
-            }
+        for (table_id_str, sstable_id) in &report.missing_files {
+            tracing::warn!(
+                table = table_id_str,
+                sstable = sstable_id,
+                "pending upload: SSTable files not found on disk — cannot replay"
+            );
+        }
+
+        for (table_id_str, sstable_id, error) in &report.submit_failures {
+            tracing::warn!(
+                table = table_id_str,
+                sstable = sstable_id,
+                "pending upload replay could not enqueue without blocking; leaving entry for later retry: {error}"
+            );
+        }
+
+        if let Some(sstable_id) = &report.queue_full_at {
+            tracing::warn!(
+                sstable = sstable_id,
+                remaining_entries = report.remaining_entries,
+                "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
+            );
         }
     }
 
@@ -2975,38 +2952,44 @@ impl StorageEngine {
             }
 
             // Step 3: await S3 confirmation.
-            match rx.await {
-                Ok(Ok(())) => {
-                    // Upload confirmed — increment the S3 upload counter.
+            let confirmation =
+                crate::compaction::finalize::upload_confirmation_from_result(rx.await);
+            match &confirmation {
+                crate::compaction::finalize::UploadConfirmation::Confirmed => {
                     self.compaction_metrics.inc_s3_uploads();
                 }
-                Ok(Err(msg)) => {
-                    tracing::error!(%sstable_id, %msg, "compaction: upload failed");
-                    if let Ok(ref pending_log) = pending_log_result {
-                        let _ = pending_log.remove_entry(&sstable_id);
-                    }
-                    continue;
+                crate::compaction::finalize::UploadConfirmation::Failed { message } => {
+                    tracing::error!(%sstable_id, %message, "compaction: upload failed");
                 }
-                Err(_) => {
+                crate::compaction::finalize::UploadConfirmation::WorkerDropped => {
                     tracing::error!(%sstable_id, "compaction: upload worker dropped channel");
-                    if let Ok(ref pending_log) = pending_log_result {
-                        let _ = pending_log.remove_entry(&sstable_id);
-                    }
-                    continue;
                 }
             }
 
-            // Step 4: remove the pending-log entry now that S3 confirmed.
-            if let Ok(ref pending_log) = pending_log_result {
-                if let Err(e) = pending_log.remove_entry(&sstable_id) {
-                    tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
-                    // Non-fatal: replay will re-upload (idempotent).
+            // Step 4: remove the pending-log entry only after S3 confirmation.
+            match crate::compaction::finalize::pending_log_decision_after_upload(confirmation) {
+                crate::compaction::finalize::PendingLogDecision::RemoveConfirmed => {
+                    if let Ok(ref pending_log) = pending_log_result {
+                        if let Err(e) = pending_log.remove_entry(&sstable_id) {
+                            tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
+                            // Non-fatal: replay will re-upload (idempotent).
+                        }
+                    }
+                }
+                crate::compaction::finalize::PendingLogDecision::KeepForReplay => {
+                    continue;
                 }
             }
 
             // Step 5: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
-            let input_ids: Vec<String> = result.task.inputs.iter().map(|i| i.id.clone()).collect();
+            let manifest_plan = crate::compaction::finalize::plan_manifest_update(
+                &table_id_str,
+                &result.task.inputs,
+                &result.output,
+                total_size,
+            );
+            let input_ids = manifest_plan.remove_input_ids.clone();
 
             // Compute total input bytes for metrics (used after manifest update).
             // If the metadata carries a non-zero size we use it directly;
@@ -3045,29 +3028,27 @@ impl StorageEngine {
 
             match crate::manifest::Manifest::load(store.as_ref(), &prefix).await {
                 Ok((mut manifest, _version)) => {
-                    manifest.remove_sstables(&table_id_str, &input_ids);
-                    manifest.add_sstable(
-                        &table_id_str,
-                        crate::manifest::ManifestEntry {
-                            id: sstable_id.clone(),
-                            size: total_size,
-                            min_token: result.output.min_token,
-                            max_token: result.output.max_token,
-                            min_timestamp: result.output.min_timestamp,
-                            max_timestamp: result.output.max_timestamp,
-                        },
-                    );
+                    manifest
+                        .remove_sstables(&manifest_plan.table_id, &manifest_plan.remove_input_ids);
+                    manifest.add_sstable(&manifest_plan.table_id, manifest_plan.add_output.clone());
                     // Pass removals explicitly so CAS retry re-applies them
                     // after merging with the latest manifest. Without this,
                     // merge_into re-introduces the entries we removed.
-                    let removals = vec![(table_id_str.clone(), input_ids.clone())];
                     let save_result = if self.cas_supported() {
                         manifest
-                            .save_with_retry_and_removals(store.as_ref(), &prefix, &removals)
+                            .save_with_retry_and_removals(
+                                store.as_ref(),
+                                &prefix,
+                                &manifest_plan.removals_for_cas_retry,
+                            )
                             .await
                     } else {
                         manifest
-                            .save_without_cas_and_removals(store.as_ref(), &prefix, &removals)
+                            .save_without_cas_and_removals(
+                                store.as_ref(),
+                                &prefix,
+                                &manifest_plan.removals_for_cas_retry,
+                            )
                             .await
                     };
                     if let Err(e) = save_result {
@@ -3085,20 +3066,27 @@ impl StorageEngine {
             }
 
             // Enqueue S3 deletion for each input SSTable (1-hour grace period).
-            for input_id in &input_ids {
+            let deletion_plan = crate::compaction::finalize::plan_input_deletions(
+                &table_id_str,
+                &result.task.inputs,
+                std::time::Duration::from_secs(3600),
+            );
+            for task_plan in deletion_plan.tasks {
                 let (del_tx, del_rx) = tokio::sync::oneshot::channel();
                 let _ = upload_mgr
                     .submit(crate::upload::UploadTask::DeleteSSTable {
-                        table_id: table_id_str.clone(),
-                        sstable_id: input_id.to_string(),
-                        grace_period: std::time::Duration::from_secs(3600),
+                        table_id: task_plan.table_id,
+                        sstable_id: task_plan.sstable_id,
+                        grace_period: task_plan.grace_period,
                         on_complete: Some(del_tx),
                     })
                     .await;
                 // Increment the S3 delete counter for each enqueued deletion.
                 self.compaction_metrics.inc_s3_deletes();
-                // Fire-and-forget: S3 deletions are best-effort.
-                drop(del_rx);
+                if deletion_plan.fire_and_forget {
+                    // Fire-and-forget: S3 deletions are best-effort.
+                    drop(del_rx);
+                }
             }
 
             // Evict local input SSTable component files (best-effort).
@@ -3674,11 +3662,13 @@ impl StorageEngine {
             "TOC.txt",
         ];
 
-        for entry in entries {
+        'entry_loop: for entry in entries {
             let hex = crate::upload::manager::hex_prefix_for(&entry.id);
             let mut wrote_any = false;
 
-            // Required components: return an error on NotFound.
+            // Required components: skip stale manifest entries whose required
+            // data is neither local nor in object storage, but keep restoring
+            // other entries. If none are restorable, fail closed below.
             for component in &required_components {
                 let s3_path = crate::upload::manager::sstable_object_key(
                     &prefix,
@@ -3710,9 +3700,13 @@ impl StorageEngine {
                         wrote_any = true;
                     }
                     Err(object_store::Error::NotFound { .. }) => {
-                        return Err(ferrosa_common::Error::InvalidFormat(format!(
-                            "required SSTable component not found in S3: {s3_path}"
-                        )));
+                        tracing::warn!(
+                            sstable = entry.id,
+                            component,
+                            path = %s3_path,
+                            "required SSTable component absent in S3 and local disk — skipping stale manifest entry"
+                        );
+                        continue 'entry_loop;
                     }
                     Err(e) => {
                         return Err(ferrosa_common::Error::InvalidFormat(format!(
@@ -3772,6 +3766,12 @@ impl StorageEngine {
             if wrote_any {
                 downloaded += 1;
             }
+        }
+
+        if downloaded == 0 && !entries.is_empty() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "no SSTables for table {table_id} could be restored from local disk or S3"
+            )));
         }
 
         Ok(downloaded)
@@ -11007,6 +11007,85 @@ mod tests {
     // =========================================================================
     // P0-13: SSTable upload→S3→download round-trip
     // =========================================================================
+
+    #[test]
+    fn download_sstables_from_s3_skips_stale_manifest_entries_when_other_sstables_restore() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-stale-manifest-entry".to_string();
+            let tid = table_id();
+            let table_id_str = tid.to_string();
+
+            let engine = StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir.path()),
+                Arc::clone(&store),
+                prefix.clone(),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+
+            let mut manifest = crate::manifest::Manifest::new();
+            for id in ["1", "2"] {
+                manifest.add_sstable(
+                    &table_id_str,
+                    crate::manifest::ManifestEntry {
+                        id: id.to_string(),
+                        size: 4,
+                        min_token: 0,
+                        max_token: 0,
+                        min_timestamp: 0,
+                        max_timestamp: 0,
+                    },
+                );
+            }
+
+            // Only generation 1 is actually present in object storage. Generation
+            // 2 models a stale manifest entry left behind by interrupted
+            // compaction/upload cleanup. Bootstrap should restore the usable
+            // SSTable instead of failing the whole table on the stale entry.
+            let hex = crate::upload::manager::hex_prefix_for("1");
+            let path = crate::upload::manager::sstable_object_key(
+                &prefix,
+                &hex,
+                &table_id_str,
+                "1",
+                "Data.db",
+            );
+            store
+                .put(
+                    &path,
+                    object_store::PutPayload::from(bytes::Bytes::from_static(b"data")),
+                )
+                .await
+                .unwrap();
+
+            let downloaded = engine
+                .download_sstables_from_s3(&tid, &manifest)
+                .await
+                .expect("stale missing SSTable entries must not fail partial restore");
+
+            assert_eq!(downloaded, 1);
+            assert!(dir
+                .path()
+                .join("sstables")
+                .join(&table_id_str)
+                .join("1-Data.db")
+                .exists());
+            assert!(!dir
+                .path()
+                .join("sstables")
+                .join(&table_id_str)
+                .join("2-Data.db")
+                .exists());
+        });
+    }
 
     /// Round-trip test: write rows → flush SSTables → upload to mock S3 →
     /// delete local SSTable files → call download_sstables_from_s3 →

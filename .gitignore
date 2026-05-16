@@ -17,3 +17,9 @@ quarantine/
 .DS_Store
 /ferrosa-jepsen/rootfs/test_key
 /ferrosa-jepsen/rootfs/test_key.pub
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

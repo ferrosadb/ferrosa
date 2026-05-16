@@ -1,6 +1,7 @@
 use super::cluster::{
-    build_recovered_topology_refresh_plan, drain_ddl_queue, keyspace_needs_cluster_replay,
-    should_initialize_seed_membership, should_run_bootstrap_streaming,
+    build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
+    drain_ddl_queue, keyspace_needs_cluster_replay, should_initialize_seed_membership,
+    should_run_bootstrap_streaming,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -571,6 +572,252 @@ fn cluster_reconnect_invite_is_rate_limited_when_join_is_deduped() {
 }
 
 #[test]
+fn reconnect_invite_plan_includes_self_and_excludes_recipient() {
+    let local = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let recipient = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+    let other = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+    let local_addr = "10.0.0.1:7000".parse().unwrap();
+    let recipient_addr = "10.0.0.2:7000".parse().unwrap();
+    let other_addr = "10.0.0.3:7000".parse().unwrap();
+
+    let plan = super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
+        local_host_id: local,
+        local_addr: Some(local_addr),
+        recipient,
+        connected_peers: &[(recipient, recipient_addr), (other, other_addr)],
+    })
+    .expect("other peers plus self should produce an invite payload");
+
+    assert_eq!(plan.recipient, recipient);
+    assert_eq!(plan.peers, vec![(other, other_addr), (local, local_addr)]);
+}
+
+#[test]
+fn reconnect_invite_plan_returns_none_when_no_peer_addresses_available() {
+    let local = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let recipient = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+    let recipient_addr = "10.0.0.2:7000".parse().unwrap();
+
+    let plan = super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
+        local_host_id: local,
+        local_addr: None,
+        recipient,
+        connected_peers: &[(recipient, recipient_addr)],
+    });
+
+    assert!(
+        plan.is_none(),
+        "an invite with no reachable peers would only echo the recipient"
+    );
+}
+
+#[test]
+fn reconnect_invite_reservation_is_atomic_under_burst_callbacks() {
+    let peer = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let now = std::time::Instant::now();
+    let mut recent = std::collections::BTreeMap::new();
+
+    assert!(super::invite::reserve_reconnect_invite(
+        &mut recent,
+        peer,
+        now,
+        super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+        super::MAX_CONNECTED_PEERS,
+    ));
+    assert_eq!(recent.get(&peer).copied(), Some(now));
+
+    let duplicate = now + std::time::Duration::from_millis(5);
+    assert!(
+        !super::invite::reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            duplicate,
+            super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+            super::MAX_CONNECTED_PEERS,
+        ),
+        "the second callback in a reconnect burst must observe the reservation and skip delivery"
+    );
+    assert_eq!(
+        recent.get(&peer).copied(),
+        Some(now),
+        "suppressed duplicates must not extend the cooldown window"
+    );
+}
+
+#[test]
+fn invite_cooldown_allows_retry_after_interval() {
+    let peer = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let now = std::time::Instant::now();
+    let mut recent = std::collections::BTreeMap::new();
+
+    assert!(super::invite::reserve_reconnect_invite(
+        &mut recent,
+        peer,
+        now,
+        super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+        super::MAX_CONNECTED_PEERS,
+    ));
+
+    let after_cooldown = now + super::CLUSTER_RECONNECT_INVITE_COOLDOWN;
+    assert!(
+        super::invite::reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            after_cooldown,
+            super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+            super::MAX_CONNECTED_PEERS,
+        ),
+        "reconnect invites must be retried once the cooldown interval has elapsed"
+    );
+    assert_eq!(recent.get(&peer).copied(), Some(after_cooldown));
+}
+
+#[test]
+fn peer_event_plan_cluster_connect_existing_member_triggers_join_and_invite() {
+    let peer = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let addr = "10.89.5.18:7000".parse().unwrap();
+    let now = std::time::Instant::now();
+
+    let plan = super::peer_plan::plan_connected_peer(super::peer_plan::ConnectedPeerInput {
+        host_id: peer,
+        addr,
+        mode: DeploymentMode::Cluster,
+        known_peer_count_after_tracking: 3,
+        committed_cluster_size: 3,
+        join_enqueued: false,
+        last_reconnect_invite_sent: None,
+        cql_broadcast: Some("127.0.0.1:38043".to_string()),
+        now,
+    });
+
+    assert_eq!(
+        plan.actions,
+        vec![
+            super::peer_plan::PeerEventAction::TriggerClusterJoin {
+                host_id: peer,
+                addr,
+                cql_broadcast: Some("127.0.0.1:38043".to_string()),
+            },
+            super::peer_plan::PeerEventAction::SendClusterInvite {
+                host_id: peer,
+                force: false,
+            },
+        ],
+        "a recreated existing cluster member can have current ring metadata so JoinNode is deduped, \
+         but it still needs a ClusterInvite to leave pair mode and register Raft handlers"
+    );
+}
+
+#[test]
+fn peer_event_plan_cluster_connect_suppresses_duplicate_invite_with_recent_reservation() {
+    let peer = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let addr = "10.89.5.18:7000".parse().unwrap();
+    let now = std::time::Instant::now();
+
+    let plan = super::peer_plan::plan_connected_peer(super::peer_plan::ConnectedPeerInput {
+        host_id: peer,
+        addr,
+        mode: DeploymentMode::Cluster,
+        known_peer_count_after_tracking: 3,
+        committed_cluster_size: 3,
+        join_enqueued: false,
+        last_reconnect_invite_sent: Some(now),
+        cql_broadcast: None,
+        now,
+    });
+
+    assert!(plan
+        .actions
+        .contains(&super::peer_plan::PeerEventAction::TriggerClusterJoin {
+            host_id: peer,
+            addr,
+            cql_broadcast: None,
+        }));
+    assert!(
+        !plan.actions.iter().any(|action| matches!(
+            action,
+            super::peer_plan::PeerEventAction::SendClusterInvite { host_id, .. } if *host_id == peer
+        )),
+        "a recent invite reservation suppresses only duplicate ClusterInvite delivery"
+    );
+}
+
+#[test]
+fn peer_event_plan_degraded_cluster_restores_only_after_committed_quorum() {
+    let peer = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let addr = "10.89.5.19:7000".parse().unwrap();
+    let now = std::time::Instant::now();
+
+    let below_quorum = super::peer_plan::ConnectedPeerInput {
+        host_id: peer,
+        addr,
+        mode: DeploymentMode::DegradedCluster,
+        known_peer_count_after_tracking: 1,
+        committed_cluster_size: 5,
+        join_enqueued: false,
+        last_reconnect_invite_sent: None,
+        cql_broadcast: None,
+        now,
+    };
+    let still_degraded = super::peer_plan::plan_connected_peer(below_quorum.clone());
+    assert!(
+        !still_degraded
+            .actions
+            .contains(&super::peer_plan::PeerEventAction::RestoreClusterMode),
+        "dynamic peer count must not claim quorum for a 5-node committed cluster with only 2 live members"
+    );
+
+    let restored = super::peer_plan::plan_connected_peer(super::peer_plan::ConnectedPeerInput {
+        known_peer_count_after_tracking: 2,
+        ..below_quorum
+    });
+    assert!(
+        restored
+            .actions
+            .contains(&super::peer_plan::PeerEventAction::RestoreClusterMode),
+        "3 live members restores quorum for a committed 5-node cluster"
+    );
+}
+
+#[test]
+fn peer_event_plan_recovered_cluster_peer_invites_and_delivers_hints_independently() {
+    let peer = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+
+    let invite_only = super::peer_plan::plan_recovered_peer(super::peer_plan::RecoveredPeerInput {
+        host_id: peer,
+        mode: DeploymentMode::Cluster,
+        pending_hint_count: 0,
+        peer_manager_available: false,
+    });
+    assert_eq!(
+        invite_only.actions,
+        vec![super::peer_plan::PeerEventAction::SendClusterInvite {
+            host_id: peer,
+            force: false,
+        }],
+        "recovery invite delivery must not depend on pending hints or PeerManager availability"
+    );
+
+    let invite_and_hints =
+        super::peer_plan::plan_recovered_peer(super::peer_plan::RecoveredPeerInput {
+            host_id: peer,
+            mode: DeploymentMode::Cluster,
+            pending_hint_count: 7,
+            peer_manager_available: true,
+        });
+    assert_eq!(
+        invite_and_hints.actions,
+        vec![
+            super::peer_plan::PeerEventAction::SendClusterInvite {
+                host_id: peer,
+                force: false,
+            },
+            super::peer_plan::PeerEventAction::DeliverHints { host_id: peer },
+        ]
+    );
+}
+
+#[test]
 fn initial_raft_membership_uses_local_broadcast_address_for_seed() {
     let local_host_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
     let peer1_host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
@@ -658,6 +905,39 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
     assert_eq!(plan[1].host_id, peer_host_id);
     assert_eq!(plan[1].addr, "10.89.5.18:7000");
     assert_eq!(plan[1].cql_broadcast.as_deref(), Some("127.0.0.1:38043"));
+}
+
+#[test]
+fn recovered_topology_refresh_plan_repairs_tokens_for_every_voter() {
+    let local_host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let peer_host_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let peers = vec![(peer_host_id, "10.89.5.18:7000".parse().unwrap())];
+    let peer_cql_broadcasts = std::collections::HashMap::new();
+    let num_tokens = 4;
+
+    let refresh_plan = build_recovered_topology_refresh_plan(
+        local_host_id,
+        "10.89.5.17:7000".to_string(),
+        Some("127.0.0.1:38042".to_string()),
+        "dc1",
+        "rack1",
+        &peers,
+        &peer_cql_broadcasts,
+    );
+    let token_plan = build_recovered_topology_token_repair_plan(&refresh_plan, num_tokens);
+
+    assert_eq!(
+        token_plan.len(),
+        refresh_plan.len(),
+        "recovered topology must re-author token assignments for every recovered voter"
+    );
+    for (node_id, tokens) in token_plan {
+        assert_eq!(
+            tokens.len(),
+            num_tokens,
+            "node {node_id} should receive deterministic token ownership on recovered topology refresh"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1842,7 +2122,7 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
         ring.assign_tokens(nid, &tokens);
     }
 
-    // --- This is the bootstrap streaming logic (Phase B from the fix) ---
+    // --- This is the bootstrap streaming logic. ---
     // Iterate schema tables, read from storage, group by target node.
     let schema_snap = schema.snapshot();
     let mut total_remote_mutations = 0usize;
@@ -2304,7 +2584,7 @@ fn keyspace_needs_cluster_replay_includes_system_graph_keyspaces() {
     // The graph engine builds `system_graph_<user_ks>` keyspaces lazily on
     // the first graph query. If that first query happens before the local
     // node has transitioned to Cluster mode, the keyspace + adjacency table
-    // get registered locally only. Phase A of transition_to_cluster must
+    // get registered locally only. ReplaySchema in transition_to_cluster must
     // re-fire those DDLs through Raft so every replica's state machine
     // registers them too — otherwise followers reject every adjacency
     // MutationForward with "table not registered". Regression guard for

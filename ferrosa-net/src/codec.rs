@@ -13,6 +13,8 @@ use crate::error::{NetError, Result};
 ///
 /// All-zero means no active trace.
 pub const HEADER_SIZE: usize = 44;
+pub const LEGACY_FRAME_VERSION: u8 = 1;
+pub const CAPNP_FRAME_VERSION: u8 = 2;
 
 /// Size of the trace context field in the frame header.
 pub const TRACE_CONTEXT_SIZE: usize = 32;
@@ -286,11 +288,36 @@ pub struct FrameHeader {
     pub trace_context: TraceContext,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireFrameFormat {
+    Legacy,
+    CapnpEnvelope,
+}
+
+impl WireFrameFormat {
+    pub fn version(self) -> u8 {
+        match self {
+            Self::Legacy => LEGACY_FRAME_VERSION,
+            Self::CapnpEnvelope => CAPNP_FRAME_VERSION,
+        }
+    }
+}
+
 impl FrameHeader {
-    /// Create a new frame header with version=1, flags=0, and empty trace context.
+    /// Create a new legacy frame header with flags=0 and empty trace context.
     pub fn new(msg_type: MsgType, lane: Lane, stream_id: u32, length: u32) -> Self {
+        Self::new_with_format(WireFrameFormat::Legacy, msg_type, lane, stream_id, length)
+    }
+
+    pub fn new_with_format(
+        format: WireFrameFormat,
+        msg_type: MsgType,
+        lane: Lane,
+        stream_id: u32,
+        length: u32,
+    ) -> Self {
         Self {
-            version: 1,
+            version: format.version(),
             flags: 0,
             lane,
             msg_type,
@@ -334,7 +361,7 @@ impl FrameHeader {
             return Err(NetError::Protocol("header too short".into()));
         }
         let version = buf[0];
-        if version != 1 {
+        if version != LEGACY_FRAME_VERSION && version != CAPNP_FRAME_VERSION {
             return Err(NetError::Protocol(format!(
                 "unsupported internode protocol version: {version}"
             )));
@@ -362,12 +389,18 @@ pub struct Frame {
 /// Codec for encoding/decoding internode frames on a TCP stream.
 pub struct InternodeCodec {
     max_frame_body_size: u32,
+    frame_format: WireFrameFormat,
 }
 
 impl InternodeCodec {
     pub fn new(max_frame_body_size: u32) -> Self {
+        Self::with_format(max_frame_body_size, WireFrameFormat::Legacy)
+    }
+
+    pub fn with_format(max_frame_body_size: u32, frame_format: WireFrameFormat) -> Self {
         Self {
             max_frame_body_size,
+            frame_format,
         }
     }
 }
@@ -381,6 +414,20 @@ impl Decoder for InternodeCodec {
             return Ok(None);
         }
         let header = FrameHeader::decode(&src[..HEADER_SIZE])?;
+        if header.version != self.frame_format.version() {
+            let reason = match (self.frame_format, header.version) {
+                (WireFrameFormat::CapnpEnvelope, LEGACY_FRAME_VERSION) => {
+                    "legacy frame received on CapnProto envelope connection".to_string()
+                }
+                (WireFrameFormat::Legacy, CAPNP_FRAME_VERSION) => {
+                    "CapnProto envelope frame received on legacy connection".to_string()
+                }
+                (expected, actual) => format!(
+                    "internode frame version {actual} does not match negotiated format {expected:?}"
+                ),
+            };
+            return Err(NetError::Protocol(reason));
+        }
         if header.length > self.max_frame_body_size {
             return Err(NetError::FrameTooLarge {
                 size: header.length,
@@ -403,6 +450,7 @@ impl Encoder<Frame> for InternodeCodec {
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<()> {
         let mut header = item.header;
+        header.version = self.frame_format.version();
         let body_len = u32::try_from(item.body.len())
             .map_err(|_| NetError::Protocol("frame body exceeds u32::MAX".into()))?;
         header.length = body_len;

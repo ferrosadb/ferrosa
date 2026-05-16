@@ -84,7 +84,7 @@ pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool)
 
 /// Keyspaces that should be re-proposed through Raft during the
 /// post-Raft-init schema-convergence pass (`transition_to_cluster`
-/// Phase A).
+/// `ReplaySchema` phase).
 ///
 /// The built-in Cassandra system keyspaces (`system`, `system_schema`,
 /// `system_auth`, etc.) are hardcoded on every node and never need
@@ -237,6 +237,22 @@ pub(super) fn build_recovered_topology_refresh_plan(
     plan
 }
 
+pub(super) fn build_recovered_topology_token_repair_plan(
+    refresh_plan: &[crate::raft::NodeInfo],
+    num_tokens: usize,
+) -> Vec<(u64, Vec<crate::raft::Token>)> {
+    refresh_plan
+        .iter()
+        .map(|node_info| {
+            let node_id = uuid_to_node_id(node_info.host_id);
+            (
+                node_id,
+                crate::controller::token::deterministic_tokens_for_node(node_id, num_tokens),
+            )
+        })
+        .collect()
+}
+
 pub(super) fn build_initial_raft_members(
     local_host_id: uuid::Uuid,
     local_addr: SocketAddr,
@@ -312,35 +328,34 @@ impl ModeController {
         let Some(pm) = pm_guard.as_ref().as_ref().cloned() else {
             return;
         };
+        let local_host_id = self.local_host_id;
+        let connected_peers = self.connected_peers.lock().clone();
+        let Some(plan) =
+            super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
+                local_host_id,
+                local_addr: Some(self.net_config.broadcast_addr),
+                recipient,
+                connected_peers: &connected_peers,
+            })
+        else {
+            return;
+        };
         {
             let mut recent = self.recent_reconnect_invites.lock();
-            if recent.len() >= super::MAX_CONNECTED_PEERS {
-                recent.clear();
+            if !super::invite::reserve_reconnect_invite(
+                &mut recent,
+                recipient,
+                std::time::Instant::now(),
+                super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+                super::MAX_CONNECTED_PEERS,
+            ) {
+                tracing::debug!(peer = %recipient, "ClusterInvite delivery suppressed by reconnect cooldown");
+                return;
             }
-            recent.insert(recipient, std::time::Instant::now());
-        }
-        let local_host_id = self.local_host_id;
-        // Build the peer list from our `connected_peers` plus self. The
-        // recipient is excluded — the receiver doesn't need its own
-        // address back, only those of the other cluster members.
-        let mut peers: Vec<(Uuid, SocketAddr)> = self
-            .connected_peers
-            .lock()
-            .iter()
-            .filter(|(id, _)| *id != recipient && *id != local_host_id)
-            .copied()
-            .collect();
-        // Include self so the recipient can establish a reverse connection.
-        let local_addr = self.net_config.broadcast_addr;
-        if !peers.iter().any(|(id, _)| *id == local_host_id) {
-            peers.push((local_host_id, local_addr));
-        }
-        if peers.is_empty() {
-            return;
         }
         let invite = Message::ClusterInvite {
-            initiator: local_host_id,
-            peers,
+            initiator: plan.initiator,
+            peers: plan.peers,
         };
         let pm_clone = pm.clone();
         self.spawn_tracked(async move {
@@ -426,11 +441,16 @@ impl ModeController {
             .into_iter()
             .map(|(peer_uuid, addr)| (peer_uuid, self.normalize_cluster_peer_addr(addr)))
             .collect();
+        let phase_runner = super::bootstrap::runner::BootstrapPhaseRunner::canonical();
+        tracing::debug!(
+            phase_count = phase_runner.phase_order().len(),
+            "transition_to_cluster: bootstrap phase runner selected"
+        );
 
-        // W6.3 (ADR-015): partition the peer set by DC. Only same-DC
+        // ADR-015: partition the peer set by DC. Only same-DC
         // peers participate in this node's Raft group; cross-DC peers
         // are tracked in the controller's connected_peers map for
-        // future Accord routing (Sprint 7) but are not voters here.
+        // future Accord routing but are not voters here.
         //
         // Backward-compat: peers with no recorded DC default to the
         // local DC, so existing single-DC clusters keep their full
@@ -443,7 +463,7 @@ impl ModeController {
                 local_dc = %local_dc,
                 local_voters = peers.len(),
                 cross_dc_count = cross_dc_peers.values().map(|v| v.len()).sum::<usize>(),
-                "transition_to_cluster: cross-DC peers excluded from local Raft group (Sprint 6 scaffolding; Accord cross-DC arrives in Sprint 7)"
+                "transition_to_cluster: cross-DC peers excluded from local Raft group; Accord cross-DC routing is deferred"
             );
         }
         let peer_manager = match &**self.peer_manager.load() {
@@ -1421,6 +1441,10 @@ impl ModeController {
                             &peers,
                             &peer_cql_broadcasts,
                         );
+                        let token_repair_plan = build_recovered_topology_token_repair_plan(
+                            &refresh_plan,
+                            config_for_promotion.num_tokens as usize,
+                        );
                         for node_info in refresh_plan {
                             if let Err(e) = raft_arc
                                 .client_write(crate::raft::RaftCommand {
@@ -1434,6 +1458,22 @@ impl ModeController {
                                     leader = lid,
                                     %e,
                                     "leader failed to refresh recovered topology metadata"
+                                );
+                            }
+                        }
+                        for (node_id, tokens) in token_repair_plan {
+                            if let Err(e) = raft_arc
+                                .client_write(crate::raft::RaftCommand {
+                                    op: crate::raft::RaftOp::AssignTokens { node_id, tokens },
+                                    schema_version: Uuid::new_v4(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    node_id,
+                                    leader = lid,
+                                    %e,
+                                    "leader failed to refresh recovered topology token assignment"
                                 );
                             }
                         }
@@ -1597,7 +1637,7 @@ impl ModeController {
                         }
                     }
 
-                    // --- Phase A: Schema convergence (all nodes) ---
+                    // --- ReplaySchema phase: schema convergence (all nodes) ---
                     //
                     // Every node replays its local schema so that all peers
                     // learn about user-created keyspaces/tables. The leader
@@ -1684,7 +1724,7 @@ impl ModeController {
                     }
 
                     if should_run_bootstrap_streaming(has_recovered_topology_state) {
-                        // --- Phase B: Bootstrap streaming (all nodes) ---
+                        // --- BootstrapStream phase: data streaming (all nodes) ---
                         //
                         // Every node reads from its local storage and streams
                         // partitions that belong to other nodes per the new ring.
@@ -1733,7 +1773,13 @@ impl ModeController {
                                     }
                                 };
 
-                                if !sstable_dirs.is_empty() {
+                                let stream_plan = super::bootstrap::bootstrap_stream::plan_table_stream(
+                                    super::bootstrap::bootstrap_stream::TableStreamPlanInput {
+                                        sstable_dir_count: sstable_dirs.len(),
+                                        row_fallback_limit: super::bootstrap::bootstrap_stream::BOUNDED_ROW_FALLBACK_LIMIT,
+                                    },
+                                );
+                                if let super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } = stream_plan {
                                     tracing::info!(
                                         ks,
                                         tbl,
@@ -1801,12 +1847,25 @@ impl ModeController {
                                     continue;
                                 }
 
-                                const BOOTSTRAP_READ_LIMIT: usize = 1_000;
+                                let row_fallback_limit = match stream_plan {
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::BoundedRows { limit } => limit,
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::RetryRequired => {
+                                        tracing::warn!(
+                                            ks,
+                                            tbl,
+                                            "bootstrap: table stream requires retry/repair; skipping row materialization"
+                                        );
+                                        continue;
+                                    }
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } => unreachable!(
+                                        "SSTable-backed bootstrap tables return above and never row-materialize"
+                                    ),
+                                };
                                 let partitions = match storage_for_bootstrap.read_range(
                                     &table_id,
                                     None,
                                     None,
-                                    BOOTSTRAP_READ_LIMIT,
+                                    row_fallback_limit,
                                 ) {
                                     Ok(p) => p,
                                     Err(e) => {

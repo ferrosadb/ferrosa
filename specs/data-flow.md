@@ -865,14 +865,14 @@ sequenceDiagram
     N1-->>N3: AppendEntries (N3 joins via Raft, not initialize)
 
     rect rgb(230,245,255)
-        Note over N1,N3: Phase A — Schema convergence
+        Note over N1,N3: ReplaySchema — schema convergence
         N1->>N1: Replay user keyspaces/tables through Raft
         N1-->>N2: Raft commit schema
         N1-->>N3: Raft commit schema
     end
 
     rect rgb(230,255,230)
-        Note over N1,N3: Phase B — Bootstrap streaming
+        Note over N1,N3: BootstrapStream — bounded all-node streaming
         N1->>N2: Stream mutations for N2's token ranges
         N1->>N3: Stream mutations for N3's token ranges
         N2->>N1: Stream mutations for N1's token ranges
@@ -882,9 +882,11 @@ sequenceDiagram
     end
 
     rect rgb(255,245,230)
-        Note over N1,N3: Phase C — Promotion (5s delay, TODO: RPC barrier)
+        Note over N1,N3: Promote — Joining to Normal after stream completion
         N1->>N1: Raft command: promote Joining → Normal
     end
+
+    N1->>N1: DrainQueue — replay queued DDL through cluster path
 
     Note over N1,N3: Cluster mode — Raft consensus, tunable CL, Accord
 ```

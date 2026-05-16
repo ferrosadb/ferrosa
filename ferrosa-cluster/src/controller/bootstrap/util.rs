@@ -1,4 +1,4 @@
-//! Shared helpers for bootstrap phases (Sprint 4 W4.2–W4.9 REFACTOR).
+//! Shared helpers for bootstrap phases.
 //!
 //! The DeliverInvites, EstablishPools, BootstrapStream, and Promote
 //! phases all share a "missing-set" pattern: compute
