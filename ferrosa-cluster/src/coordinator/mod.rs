@@ -6,7 +6,9 @@ pub mod cl_routing;
 pub mod metrics;
 pub mod read;
 pub mod stream_consumer;
+pub mod stream_frame_router;
 pub mod stream_producer;
+pub mod stream_request_handler;
 pub mod truncate;
 pub mod write;
 
