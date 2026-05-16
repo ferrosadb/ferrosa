@@ -372,6 +372,14 @@ impl SledLogStore {
         meta.flush()?;
         db.flush()?;
 
+        // Release sled's exclusive directory lock before reporting reset
+        // success. CI immediately reopens the same log-store path to prove
+        // the reset result, and returning while tree/db handles are still
+        // alive can race with sled's lock release on slower runners.
+        drop(log);
+        drop(meta);
+        drop(db);
+
         Ok(ResetCounts {
             log_entries,
             meta_keys,

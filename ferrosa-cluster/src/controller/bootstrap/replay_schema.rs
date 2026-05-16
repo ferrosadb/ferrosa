@@ -1,4 +1,4 @@
-//! Phase 5 — ReplaySchema (W4.6).
+//! Phase 5 — ReplaySchema.
 //!
 //! Pre-condition: leader elected (WaitLeader post-condition holds).
 //! Post-condition: every node in the cluster reports the same

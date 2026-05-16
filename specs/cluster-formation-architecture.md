@@ -187,11 +187,11 @@ sequenceDiagram
     N1-->>N3: RaftVote
     N1->>N1: Forming → Cluster (leader)
 
-    Note over N1,N3: Phase 6: Bootstrap (A/B/C)
-    N1->>N2: Phase A: schema replay via Raft
-    N1->>N3: Phase A: schema replay via Raft
-    Note over N1,N3: Phase B: all nodes stream local data to new token owners
-    N1->>N1: Phase C: propose Joining → Normal for all nodes
+    Note over N1,N3: Phase 6: named bootstrap runner
+    N1->>N2: ReplaySchema: schema replay via Raft
+    N1->>N3: ReplaySchema: schema replay via Raft
+    Note over N1,N3: BootstrapStream: all nodes stream local data to new token owners
+    N1->>N1: Promote: propose Joining → Normal for all nodes
     N2->>N2: Forming → Cluster (follower)
     N3->>N3: Forming → Cluster (follower)
 ```
@@ -270,17 +270,26 @@ are not yet registered on the receiving node.
 3. If connected_peers >= 2: transition to Forming
 4. Re-broadcast ClusterInvite to newly connected peers (propagation guarantee)
 
-### Bootstrap Phases (all nodes)
+### Bootstrap phase runner (all nodes)
 
-After Raft leader election, bootstrap streaming runs on ALL nodes in 3 phases:
+After Raft leader election, bootstrap runs on ALL nodes through the canonical
+`BootstrapPhaseRunner` order:
 
-- **Phase A — Schema convergence:** Leader replays local schema state through Raft.
+- **DeliverInvites:** Multicast `ClusterInvite` to every peer before Raft-only
+  coordination is required.
+- **EstablishPools:** Ensure outbound pools are live on both `Lane::Raft` and
+  `Lane::Data`.
+- **CreateRaft:** Construct `FerrosRaft` and publish it to the controller sinks.
+- **WaitLeader:** Block until the cluster observes a Raft `current_leader`.
+- **ReplaySchema:** Leader replays local schema state through Raft.
   Non-leaders replay schema via `PairDdlForward` to ensure DDL applied during
   the Pair/Direct window is captured on all nodes.
-- **Phase B — Data streaming:** ALL nodes stream their local data to the new
+- **BootstrapStream:** ALL nodes stream their local data to the new
   token owners based on the initial token ring assignment.
-- **Phase C — Leader promotes:** Leader proposes state changes from `Joining`
+- **Promote:** Leader proposes state changes from `Joining`
   to `Normal` for all nodes via Raft.
+- **DrainQueue:** Replay queued DDL operations through the cluster path once
+  promotion has made the cluster path authoritative.
 
 ### Role Assignment
 

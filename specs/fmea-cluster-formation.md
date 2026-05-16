@@ -24,7 +24,7 @@
 | F8 | T3 Forming→Cluster | Raft leader election timeout (30s) — DDL on Direct | 30s of unreplicated DDL. If leader never elected, Direct path persists. | 8 | 3 | 5 | **120** |
 | F1 | T2 Pair→Forming | ClusterInvite not received — non-seed nodes fail to discover each other | Nodes stuck in Pair. Raft can't form quorum. Cluster is non-functional. **Partially mitigated:** ClusterInvite now sent on Data lane with 10-attempt retry (808b72b), and ClusterInvite handler triggers cluster transition on receiving nodes (ba7599a). Remaining risk: all 10 retries fail under sustained network partition. | 9 | 4 | 3 | **108** |
 | F2 | T2 Pair→Forming | No Forming state — jumps Pair→Cluster. If pool not ready, Raft fails. | Raft init hangs. DDL on Direct forever. Cluster appears formed but inoperable. **Substantially mitigated:** Forming state added (0bf686d) with progressive join path Standalone→Pair→Forming→Cluster. Forming→Pair fallback transition defined. Remaining risk: fallback timeout path untested (see F26). | 8 | 3 | 4 | **96** |
-| F27 | T3 Forming→Cluster | Bootstrap Phase C delay now configurable (10s, derived from formation_timeout_secs) | Delay increased from 5s to 10s and made configurable. Full RPC barrier remains future work. Reduced occurrence — 10s covers most bootstrap scenarios. | 8 | 2 | 3 | **48** |
+| F27 | T3 Forming→Cluster | `Promote` delay now configurable (10s, derived from formation_timeout_secs) | Delay increased from 5s to 10s and made configurable. Full RPC barrier remains future work. Reduced occurrence — 10s covers most bootstrap scenarios. | 8 | 2 | 3 | **48** |
 | F18 | T5b Decommission Leader | transfer_leader not implemented — leader removes itself from Raft | Remaining nodes lose coordinator. Possible membership corruption. | 9 | 2 | 5 | **90** |
 | F28 | T4/T6a/T6b | PeerManager broadcast map cleaned on disconnect via remove_peer() | **Fixed:** `remove_peer()` now cleans broadcast map entries on disconnect. Stale entry accumulation eliminated. Remaining risk: race between disconnect and map read. | 3 | 2 | 3 | **18** |
 | F29 | T3 Forming→Cluster | LazyRaft now retries 3x with 5s intervals instead of single 10s timeout | **Fixed:** LazyRaft retries 3 times with 5s intervals (total 15s window). Messages queued during init, not dropped. Remaining risk: init exceeding 15s total. | 6 | 2 | 3 | **36** |
@@ -100,7 +100,7 @@ Old primary returns with unreplicated writes after partition. Writes silently di
 2. **Fire-and-forget spawns** — 7 critical `tokio::spawn` calls with no JoinHandle tracking.
 3. **Single-attempt operations** — reverse pools, schema sync, Raft proposals attempted once. Transient failures → permanent inconsistency.
 4. **Mode transition not atomic with side effects** — mode stored as Cluster before Raft init completes (L933 vs L950).
-5. **Hardcoded timing** — 500ms, 2s, 4s magic numbers remain. Phase C bootstrap delay now configurable (F27). LazyRaft timeout replaced with 3x retry (F29). Raft heartbeat/election tunable via env vars (P2-7).
+5. **Hardcoded timing** — 500ms, 2s, 4s magic numbers remain. `Promote` bootstrap delay now configurable (F27). LazyRaft timeout replaced with 3x retry (F29). Raft heartbeat/election tunable via env vars (P2-7).
 6. ~~**No cleanup on disconnect**~~ — **Fixed:** PeerManager `remove_peer()` now cleans broadcast map on disconnect (F28).
 
 ## Recommended Test Cases
@@ -123,6 +123,6 @@ Old primary returns with unreplicated writes after partition. Writes silently di
 | 14 | Hub-and-spoke ClusterInvite propagation | F1 | 108 | Firecracker |
 | 15 | Forming state gates Raft initialization | F2 | 96 | Firecracker |
 | 16 | Formation timeout restores DDL path to Direct | F26 | 60 | Unit |
-| 17 | Bootstrap Phase C configurable delay covers streaming | F27 | 48 | Firecracker |
+| 17 | `Promote` configurable delay covers streaming | F27 | 48 | Firecracker |
 | 18 | LazyRaft retries handle slow init without dropping messages | F29 | 36 | Unit (mock) |
 | 19 | Reverse pool retries on failure | F9 | 84 | Unit (mock) |

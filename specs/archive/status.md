@@ -457,7 +457,7 @@ jepsen         ██████   █████░  ████░░   █
   - [x] SUBSCRIBE dual timestamps for Accord ordering
 - **Recent fixes (2026-04-02, cluster formation hardening):**
   - [x] system.peers tokens column fix
-  - [x] Bootstrap streaming all-nodes fix (Phase A: schema convergence, Phase B: streaming, Phase C: leader promotes)
+  - [x] Bootstrap streaming all-nodes fix (`ReplaySchema`: schema convergence, `BootstrapStream`: streaming, `Promote`: leader promotes)
   - [x] LazyRaft handler registration — Raft handlers registered before async init (7b057b0)
   - [x] ClusterInvite sent on Data lane with 10-attempt retry (808b72b)
   - [x] ClusterInvite delivered synchronously before Raft init (30768c0)

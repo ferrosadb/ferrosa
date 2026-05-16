@@ -30,6 +30,11 @@ pub struct CompactionConfig {
     pub min_threshold: usize,
     /// Maximum SSTables per compaction task.
     pub max_threshold: usize,
+    /// Maximum bytes of SSTable input selected for one compaction task.
+    ///
+    /// This caps memory pressure for large fan-in compactions independently of
+    /// the input-file count cap.
+    pub max_compaction_bytes: u64,
     /// Lower bound of the size ratio for bucket membership.
     pub bucket_low: f64,
     /// Upper bound of the size ratio for bucket membership.
@@ -49,6 +54,10 @@ impl CompactionConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(32);
+        let max_compaction_bytes = std::env::var("FERROSA_COMPACTION_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512 * 1024 * 1024);
         let bucket_low = std::env::var("FERROSA_COMPACTION_BUCKET_LOW")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -61,6 +70,7 @@ impl CompactionConfig {
         Self {
             min_threshold,
             max_threshold,
+            max_compaction_bytes,
             bucket_low,
             bucket_high,
             output_dir,
@@ -143,9 +153,21 @@ impl CompactionStrategy for SizeTieredStrategy {
 
         for bucket in buckets {
             if bucket.len() >= self.config.min_threshold {
-                let count = bucket.len().min(self.config.max_threshold);
-                let inputs: Vec<SSTableMetadata> =
-                    bucket.into_iter().take(count).cloned().collect();
+                let mut input_bytes = 0_u64;
+                let mut inputs = Vec::new();
+                for sstable in bucket.into_iter().take(self.config.max_threshold) {
+                    let next_bytes = input_bytes.saturating_add(sstable.size_bytes);
+                    if !inputs.is_empty() && next_bytes > self.config.max_compaction_bytes {
+                        break;
+                    }
+                    input_bytes = next_bytes;
+                    inputs.push(sstable.clone());
+                }
+
+                if inputs.len() < self.config.min_threshold {
+                    continue;
+                }
+
                 // Use per-table subdirectory to prevent generation collisions
                 // between concurrent compactions of different tables. Without
                 // this, two tasks scanning the same shared directory both get
@@ -201,6 +223,7 @@ mod tests {
         CompactionConfig {
             min_threshold: 4,
             max_threshold: 32,
+            max_compaction_bytes: 512 * 1024 * 1024,
             bucket_low: 0.5,
             bucket_high: 1.5,
             output_dir: PathBuf::from("/tmp/compaction"),
@@ -290,6 +313,26 @@ mod tests {
         let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].inputs.len(), 3); // capped at max_threshold
+    }
+
+    #[test]
+    fn large_bucket_is_capped_by_default_compaction_bytes() {
+        let strategy = SizeTieredStrategy::new(test_config());
+        let sstable_size = 64 * 1024 * 1024;
+        let sstables: Vec<_> = (0..20)
+            .map(|idx| make_metadata(&format!("sst-{idx}"), sstable_size))
+            .collect();
+
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+
+        assert_eq!(tasks.len(), 1);
+        let input_bytes: u64 = tasks[0].inputs.iter().map(|input| input.size_bytes).sum();
+        assert!(
+            input_bytes <= 512 * 1024 * 1024,
+            "selected {} bytes across {} inputs; compaction must stay below the per-task byte cap to avoid container OOM",
+            input_bytes,
+            tasks[0].inputs.len()
+        );
     }
 
     #[test]

@@ -1,19 +1,32 @@
 # DSM Analysis: Cluster Formation Subsystem
 
-> Last updated: 2026-04-02
-> Scope: 38 modules across ferrosa-cluster, ferrosa-net, and ferrosa-cql, focused on cluster formation lifecycle
+> Last updated: 2026-05-14
+> Scope: 51 modules across ferrosa-cluster, ferrosa-net, and ferrosa-cql, focused on cluster formation lifecycle. Line counts are `wc -l` snapshots after the bootstrap phase-runner decomposition.
 
 ## Module Inventory
 
 | ID | Module | Lines | Role |
 |----|--------|------:|------|
-| A0 | `controller/mod` | 471 | ModeController struct, public API, shared state (decomposed from controller.rs) |
-| A1 | `controller/cluster` | 880 | Raft init, bootstrap streaming (all-node), schema replay |
-| A2 | `controller/pair` | 249 | Pair formation, switchover, promotion |
-| A3 | `controller/membership` | 322 | Membership changes, node join/leave |
+| A0 | `controller/mod` | 688 | ModeController struct, public API, shared state, tracked tasks |
+| A1 | `controller/cluster` | 2315 | Transition orchestration, ClusterInvite handler, legacy executor wiring that delegates to bootstrap phase modules |
+| A1a | `controller/bootstrap/mod` | 68 | Bootstrap module boundary and canonical phase table |
+| A1b | `controller/bootstrap/phase` | 182 | `BootstrapPhase` enum, phase-scoped errors, canonical order |
+| A1c | `controller/bootstrap/runner` | 21 | `BootstrapPhaseRunner::canonical()` seam |
+| A1d | `controller/bootstrap/deliver_invites` | 120 | `DeliverInvites` pre/post-condition helpers |
+| A1e | `controller/bootstrap/establish_pools` | 150 | `EstablishPools` connection-pool pre/post-condition helpers |
+| A1f | `controller/bootstrap/create_raft` | 102 | `CreateRaft` publication pre/post-condition helpers |
+| A1g | `controller/bootstrap/wait_leader` | 78 | `WaitLeader` election-observation helpers |
+| A1h | `controller/bootstrap/replay_schema` | 116 | `ReplaySchema` schema convergence helpers |
+| A1i | `controller/bootstrap/bootstrap_stream` | 197 | `BootstrapStream` bounded all-node streaming planner helpers |
+| A1j | `controller/bootstrap/promote` | 88 | `Promote` Joining→Normal helpers |
+| A1k | `controller/bootstrap/drain_queue` | 97 | `DrainQueue` queued-DDL drain helpers |
+| A1l | `controller/bootstrap/retirement_gate` | 252 | Bootstrap retirement manifest gate |
+| A1m | `controller/bootstrap/util` | 67 | Shared bootstrap helper functions |
+| A2 | `controller/pair` | 266 | Pair formation, switchover, promotion |
+| A3 | `controller/membership` | 570 | Membership changes, node join/leave |
 | A4 | `controller/operator` | 94 | Operator-facing API (status, drain) |
-| A5 | `controller/peer_events` | 200 | PeerEventListener implementation |
-| A6 | `controller/token` | 52 | Token generation utilities |
+| A5 | `controller/peer_events` | 295 | PeerEventListener implementation |
+| A6 | `controller/token` | 202 | Token generation utilities |
 | B | `mode` | 210 | DeploymentMode enum (Standalone/Pair/Cluster) |
 | C | `state` | 425 | PairClusterState, RaftClusterState (+PeerManager CQL broadcast lookup) |
 | D | `config` | 171 | ClusterConfig (seeds, data_dir, mode hint) |
@@ -50,8 +63,9 @@
 
 | Module | Fan-Out | Fan-In | Coupling (FI×FO) | Lines | Instability | Delta |
 |--------|--------:|-------:|------------------:|------:|------------:|-------|
-| **controller/cluster** | 18 | 1 | **18** | 880 | 0.95 | +134 LOC, +all-node streaming |
-| **controller/mod** | 12 | 0 | 0 | 471 | 1.00 | |
+| **controller/cluster** | 18 | 1 | **18** | 2315 | 0.95 | delegates named bootstrap phases but still carries legacy orchestration glue |
+| **controller/bootstrap/** | 3 | 1 | **3** | 1540 | 0.75 | new low-fan-out phase modules (`DeliverInvites` → `DrainQueue`) |
+| **controller/mod** | 12 | 0 | 0 | 688 | 1.00 | |
 | **net/peer** | 5 | 13 | **65** | 492 | 0.28 | +1 FI (state.rs), +32 LOC |
 | **state** | 6 | 8 | **48** | 425 | 0.43 | +1 FO (PeerManager), +258 LOC |
 | **pair/coordinator** | 4 | 8 | **32** | 544 | 0.33 | |
@@ -66,11 +80,13 @@
 | **consistency** | 0 | 6 | 0 | 243 | 0.00 | |
 | **pair/mod** | 0 | 8 | 0 | 139 | 0.00 | |
 
-## Former God Module: controller.rs (Decomposed)
+## Controller Decomposition Status
 
-The original 1977-line `controller.rs` has been decomposed into 7 sub-modules (A0–A6, totaling 2268 lines). The largest piece, `controller/cluster` (880 lines, fan-out 18), carries most of the original complexity: Raft init, all-node bootstrap streaming, schema replay. It remains the highest fan-out module but is now scoped to cluster formation only.
+The original monolithic `controller.rs` has been decomposed into controller sub-modules plus a dedicated `controller/bootstrap/` namespace. The bootstrap namespace defines the canonical runner order: `DeliverInvites` → `EstablishPools` → `CreateRaft` → `WaitLeader` → `ReplaySchema` → `BootstrapStream` → `Promote` → `DrainQueue`.
 
-`controller/mod` (471 lines, fan-out 12) is the public API surface and shared state holder. Combined fan-out across the two largest controller modules is 30 (vs. 22 for the monolith), reflecting the new all-node streaming and CQL broadcast wiring. However, individual modules are more focused and testable.
+`controller/cluster.rs` is still large at 2315 lines because it remains the transition orchestration shell and retains legacy executor wiring around the newly extracted bootstrap phase helpers. Current line-count evidence shows the next architecture target is to migrate more of the executor body into the named phase modules without reintroducing cross-phase coupling.
+
+`controller/mod` (688 lines, fan-out 12) is the public API surface and shared state holder. `controller/bootstrap/` (1540 lines across 13 files) gives the bootstrap path named seams and localized pre/post-condition tests even while the top-level orchestrator remains high fan-out.
 
 ## Dependency Cycles
 
@@ -137,9 +153,11 @@ Move from `pair/coordinator.rs` to `ferrosa-cluster/src/wire.rs`. Breaks cross-m
 
 **Risk:** Low — function relocation.
 
-### 3. Split controller.rs into phase modules — DONE
+### 3. Split bootstrap runner into named phase modules — PARTIAL
 
-Completed. Controller decomposed into 7 modules (A0–A6): mod, cluster, pair, membership, operator, peer_events, token. The largest piece (`controller/cluster`, 880 lines) remains above the 60-line function guideline internally but is now focused on cluster formation only.
+The bootstrap path now has canonical named phases (`DeliverInvites`, `EstablishPools`, `CreateRaft`, `WaitLeader`, `ReplaySchema`, `BootstrapStream`, `Promote`, `DrainQueue`) under `controller/bootstrap/`, with a `BootstrapPhaseRunner` seam and per-phase pre/post-condition helpers. This improves traceability and test locality, but `controller/cluster.rs` still owns too much executor glue at 2315 lines.
+
+**Next step:** continue moving phase-specific execution out of `controller/cluster.rs` into the existing named modules until `cluster.rs` is primarily orchestration and error routing.
 
 ### 4. Split raft/state_machine.rs (MEDIUM)
 
@@ -160,12 +178,12 @@ Move from coordinator/read to ring/replica_selection.rs to break L2→L3 violati
 
 | Metric | Value | Target | Status | Delta |
 |--------|-------|--------|--------|-------|
-| Modules analyzed | 38 | — | — | +6 (controller decomposed) |
-| Total lines | 20,952 | — | — | +2,559 |
+| Modules analyzed | 51 | — | — | +13 bootstrap phase modules |
+| Total lines | 23,927 | — | — | +bootstrap phase modules + current controller line snapshot |
 | Avg propagation cost | ~33% | <20% | **High** | -1pp (denominator growth) |
 | Layering violations | 4 | 0 | **Fix** | unchanged |
 | Direct cycles | 1 | 0 | **Fix** | unchanged |
-| God modules | 0 | 0 | **Done** | controller decomposed |
-| Files >1000 lines | 5 | 0 | **Reduce** | unchanged (coordinator/read, pair/ddl, raft/handlers, raft/state_machine, net/rpc) |
+| God modules | 1 | 0 | **Reduce** | `controller/cluster.rs` remains a high-LOC orchestration shell |
+| Files >1000 lines | 6 | 0 | **Reduce** | controller/cluster plus coordinator/read, pair/ddl, raft/handlers, raft/state_machine, net/rpc |
 | Highest coupling score | 65 (net/peer) | <30 | **Too high** | was 60 |
 | Highest fan-out | 18 (controller/cluster) | <10 | **Too high** | was 22 (monolith) |

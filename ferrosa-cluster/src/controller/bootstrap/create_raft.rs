@@ -1,4 +1,4 @@
-//! Phase 3 — CreateRaft (W4.4).
+//! Phase 3 — CreateRaft.
 //!
 //! Constructs the `FerrosRaft` instance and publishes the resulting
 //! `Arc<FerrosRaft>` to the three watch / swap sinks the rest of the

@@ -14,6 +14,7 @@ pub mod lane_actor;
 pub mod message;
 pub mod peer;
 pub mod pool;
+pub mod protocol;
 pub mod reconnect;
 pub mod rpc;
 pub mod skew;

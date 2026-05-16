@@ -1,4 +1,4 @@
-//! Phase 6 — BootstrapStream (W4.7).
+//! Phase 6 — BootstrapStream.
 //!
 //! Pre-condition: schema replay complete on every node.
 //! Post-condition: every owning replica has streamed its share of the
@@ -10,6 +10,60 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::phase::{BootstrapError, BootstrapPhase};
+
+/// Small-table row fallback cap. Row fallback is only selected when no SSTable
+/// directories exist for the table; SSTable-backed tables must use bulk streaming
+/// or be left for retry/repair.
+pub const BOUNDED_ROW_FALLBACK_LIMIT: usize = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableStreamPlanInput {
+    pub sstable_dir_count: usize,
+    pub row_fallback_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableStreamPlan {
+    SstableBulk { sstable_dir_count: usize },
+    BoundedRows { limit: usize },
+    RetryRequired,
+}
+
+impl TableStreamPlan {
+    pub fn allows_row_materialization(self) -> bool {
+        matches!(self, Self::BoundedRows { .. })
+    }
+
+    pub fn row_materialization_limit(self) -> Option<usize> {
+        match self {
+            Self::BoundedRows { limit } => Some(limit),
+            Self::SstableBulk { .. } | Self::RetryRequired => None,
+        }
+    }
+
+    pub fn requires_retry(self) -> bool {
+        matches!(self, Self::RetryRequired)
+    }
+
+    pub fn after_sstable_stream_failure(self, _reason: impl AsRef<str>) -> Self {
+        match self {
+            Self::SstableBulk { .. } => Self::RetryRequired,
+            other => other,
+        }
+    }
+}
+
+pub fn plan_table_stream(input: TableStreamPlanInput) -> TableStreamPlan {
+    if input.sstable_dir_count > 0 {
+        TableStreamPlan::SstableBulk {
+            sstable_dir_count: input.sstable_dir_count,
+        }
+    } else {
+        TableStreamPlan::BoundedRows {
+            limit: input.row_fallback_limit,
+        }
+    }
+}
 
 /// Per-replica streaming progress.  `expected_owners` is every
 /// replica that owes data to the joining set; `completed_owners` is
@@ -82,5 +136,62 @@ mod tests {
     #[test]
     fn bootstrap_stream_precondition_requires_replay() {
         assert!(precondition(false).is_err());
+    }
+
+    #[test]
+    fn sstable_backed_table_uses_sstable_stream_before_row_materialization() {
+        let plan = plan_table_stream(TableStreamPlanInput {
+            sstable_dir_count: 3,
+            row_fallback_limit: BOUNDED_ROW_FALLBACK_LIMIT,
+        });
+
+        assert_eq!(
+            plan,
+            TableStreamPlan::SstableBulk {
+                sstable_dir_count: 3,
+            }
+        );
+        assert!(
+            !plan.allows_row_materialization(),
+            "SSTable-backed bootstrap must attempt bulk SSTable transfer before row materialization"
+        );
+    }
+
+    #[test]
+    fn failed_sstable_stream_does_not_fall_back_to_unbounded_rows() {
+        let plan = TableStreamPlan::SstableBulk {
+            sstable_dir_count: 2,
+        };
+
+        let retry = plan.after_sstable_stream_failure("network partition");
+
+        assert!(retry.requires_retry());
+        assert!(
+            !retry.allows_row_materialization(),
+            "SSTable stream failure must not switch to row materialization, bounded or unbounded"
+        );
+    }
+
+    #[test]
+    fn small_table_row_fallback_is_partition_bounded() {
+        let plan = plan_table_stream(TableStreamPlanInput {
+            sstable_dir_count: 0,
+            row_fallback_limit: 64,
+        });
+
+        assert_eq!(plan, TableStreamPlan::BoundedRows { limit: 64 });
+        assert!(plan.allows_row_materialization());
+        assert_eq!(plan.row_materialization_limit(), Some(64));
+    }
+
+    #[test]
+    fn stream_failure_reports_retry_required() {
+        let retry = TableStreamPlan::SstableBulk {
+            sstable_dir_count: 1,
+        }
+        .after_sstable_stream_failure("send_sstable_files failed");
+
+        assert_eq!(retry, TableStreamPlan::RetryRequired);
+        assert!(retry.requires_retry());
     }
 }

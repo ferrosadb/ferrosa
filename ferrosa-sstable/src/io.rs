@@ -76,36 +76,43 @@ pub trait WriteAt {
 
 /// File-system implementation of [`ReadAt`] using `pread` on Unix.
 pub struct FileReadAt {
-    file: std::fs::File,
+    path: std::path::PathBuf,
 }
 
 impl FileReadAt {
     /// Open a file for positional reading.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let file = std::fs::File::open(path)?;
-        Ok(Self { file })
+        let path = path.as_ref().to_path_buf();
+        // Validate that the file exists and is readable, but don't retain the
+        // descriptor. SSTable readers live for as long as an SSTable is present
+        // in a table store; pinning Data.db/Partitions.db/Rows.db handles for
+        // every idle SSTable exhausts RLIMIT_NOFILE during startup/compaction
+        // backlogs and in parallel engine tests. Reads reopen briefly per call.
+        std::fs::File::open(&path)?;
+        Ok(Self { path })
     }
 }
 
 impl ReadAt for FileReadAt {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let file = std::fs::File::open(&self.path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            Ok(self.file.read_at(buf, offset)?)
+            Ok(file.read_at(buf, offset)?)
         }
         #[cfg(not(unix))]
         {
             // Fallback: seek + read (not thread-safe, but functional)
             use std::io::{Read, Seek, SeekFrom};
-            let mut file = &self.file;
+            let mut file = file;
             file.seek(SeekFrom::Start(offset))?;
             Ok(file.read(buf)?)
         }
     }
 
     fn len(&self) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(std::fs::metadata(&self.path)?.len())
     }
 }
 
@@ -288,5 +295,38 @@ mod tests {
 
         reader.read_exact_at(&mut buf, 10).unwrap();
         assert_eq!(&buf, b"world");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn many_file_readers_do_not_pin_idle_file_descriptors() {
+        fn open_fd_count() -> usize {
+            std::fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sstable-component.db");
+        std::fs::write(&path, b"ferrosa component bytes").unwrap();
+
+        let baseline = open_fd_count();
+        let readers: Vec<_> = (0..256).map(|_| FileReadAt::open(&path).unwrap()).collect();
+        let after_open = open_fd_count();
+
+        assert!(
+            after_open <= baseline + 8,
+            "idle FileReadAt instances must not pin one fd each: baseline={baseline}, after_open={after_open}"
+        );
+
+        for reader in &readers {
+            let mut buf = [0u8; 7];
+            reader.read_exact_at(&mut buf, 0).unwrap();
+            assert_eq!(&buf, b"ferrosa");
+        }
+
+        let after_reads = open_fd_count();
+        assert!(
+            after_reads <= baseline + 8,
+            "read_at must close transient descriptors promptly: baseline={baseline}, after_reads={after_reads}"
+        );
     }
 }

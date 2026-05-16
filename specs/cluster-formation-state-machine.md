@@ -141,14 +141,19 @@ surprise.
 6. Initialize Raft membership with all nodes
 7. Wait for leader election (30s timeout with backoff)
 8. Swap DDL path to `DdlPath::Cluster`
-9. **Bootstrap streaming on ALL nodes** (3 phases):
-   - **Phase A — Schema convergence:** Leader replays local schema state through
-     Raft so all followers converge. Non-leaders replay schema via
-     `PairDdlForward` to ensure DDL applied during Pair/Direct windows is captured.
-   - **Phase B — Data streaming:** ALL nodes stream their local data to the new
-     token owners based on the initial token ring assignment.
-   - **Phase C — Leader promotes:** Leader proposes state changes from `Joining`
-     to `Normal` for all nodes via Raft.
+9. **Canonical bootstrap runner on ALL nodes**:
+   - **DeliverInvites:** multicast `ClusterInvite` to every peer.
+   - **EstablishPools:** ensure outbound `Lane::Raft` and `Lane::Data` pools.
+   - **CreateRaft:** construct and publish `FerrosRaft`.
+   - **WaitLeader:** wait until a Raft `current_leader` is observed.
+   - **ReplaySchema:** Leader replays local schema state through Raft so all
+     followers converge. Non-leaders replay schema via `PairDdlForward` to
+     ensure DDL applied during Pair/Direct windows is captured.
+   - **BootstrapStream:** ALL nodes stream their local data to the new token
+     owners based on the initial token ring assignment.
+   - **Promote:** Leader proposes state changes from `Joining` to `Normal` for
+     all nodes via Raft.
+   - **DrainQueue:** queued DDL drains through the cluster path.
 10. Swap write path to `WritePath::Cluster`
 11. Set state to `Cluster`
 

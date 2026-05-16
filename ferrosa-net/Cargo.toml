@@ -10,6 +10,7 @@ repository.workspace = true
 arc-swap = "1.7"
 async-trait = "0.1"
 bytes = "1"
+capnp = "0.25"
 dashmap = "6"
 futures = "0.3"
 hmac = "0.12"
@@ -25,6 +26,9 @@ rustls-pemfile = "2"
 tokio-rustls = "0.26"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+capnpc = "0.25"
 
 [dev-dependencies]
 proptest = "1"

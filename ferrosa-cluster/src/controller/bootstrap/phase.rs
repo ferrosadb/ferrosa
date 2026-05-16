@@ -1,4 +1,4 @@
-//! Phase enum + structured error for the bootstrap pipeline (W4.1).
+//! Phase enum + structured error for the bootstrap pipeline.
 //!
 //! Each step in `transition_to_cluster` is one [`BootstrapPhase`].  A
 //! failure inside a phase is reported as [`BootstrapError::Phase`] with
@@ -7,7 +7,7 @@
 //!
 //! Phases are pure value types — they carry no behaviour beyond
 //! identification.  Pre/post-condition functions live alongside the
-//! phase implementations in their own modules (W4.2 and onward).
+//! phase implementations in their own modules.
 //!
 //! Both types implement `Eq` so unit tests can match the precise phase
 //! that produced an error, and `Display` for human-readable logs.
@@ -138,7 +138,7 @@ impl std::error::Error for BootstrapError {
 mod tests {
     use super::*;
 
-    /// W4.1 RED → GREEN: each phase carries pre/post conditions through
+    /// Each phase carries pre/post conditions through
     /// the `Result<(), BootstrapError>` type and `BootstrapError`
     /// distinguishes phases by name.
     #[test]

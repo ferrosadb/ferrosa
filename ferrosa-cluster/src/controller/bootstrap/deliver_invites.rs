@@ -1,4 +1,4 @@
-//! Phase 1 — DeliverInvites (W4.2).
+//! Phase 1 — DeliverInvites.
 //!
 //! On entry we are in [`crate::mode::DeploymentMode::Forming`] with a
 //! committed peer list.  The phase multicasts a `ClusterInvite` to
@@ -9,7 +9,7 @@
 //! This module exposes the *pure* pre/post-condition logic so it can be
 //! unit-tested in isolation. The networking side-effect lives in the
 //! existing imperative bootstrap task in `controller/cluster.rs`; the
-//! follow-on rewire (after Sprint 6's multi-Raft scaffolding) will
+//! follow-on rewire (after multi-Raft scaffolding) will
 //! replace that imperative section with a call into this module.
 
 use std::collections::BTreeSet;
@@ -75,7 +75,7 @@ mod tests {
         Uuid::from_bytes([byte; 16])
     }
 
-    /// W4.2 RED → GREEN: 3-node setup, every peer acks → post-condition
+    /// Three-node setup, every peer acks → post-condition
     /// is satisfied; the phase reports `Ok(())`.
     #[test]
     fn deliver_invites_succeeds_to_all_peers() {

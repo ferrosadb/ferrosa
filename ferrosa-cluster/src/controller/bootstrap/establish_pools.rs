@@ -1,4 +1,4 @@
-//! Phase 2 — EstablishPools (W4.3).
+//! Phase 2 — EstablishPools.
 //!
 //! Pre-condition: every expected peer has a registered identity (UUID
 //! known to the network factory).

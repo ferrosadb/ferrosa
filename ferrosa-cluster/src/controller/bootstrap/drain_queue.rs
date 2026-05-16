@@ -1,4 +1,4 @@
-//! Phase 8 — DrainQueue (W4.9).
+//! Phase 8 — DrainQueue.
 //!
 //! Pre-condition: Promote completed.
 //! Post-condition: the DDL queue receiver is empty AND every queued DDL
