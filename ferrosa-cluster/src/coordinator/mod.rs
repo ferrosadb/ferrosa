@@ -9,6 +9,8 @@ pub mod stream_consumer;
 pub mod stream_frame_router;
 pub mod stream_producer;
 pub mod stream_request_handler;
+#[cfg(test)]
+pub mod streaming_e2e_tests;
 pub mod truncate;
 pub mod write;
 
