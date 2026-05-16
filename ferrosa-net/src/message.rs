@@ -117,6 +117,28 @@ pub enum Message {
     RepairWrite(Bytes),
     RangeReadRequest(Bytes),
     RangeReadResponse(Bytes),
+    /// ADR-020: client side of the streaming range-read RPC. Payload
+    /// is a bincoded `RangeReadStreamRequestPayload` (defined in
+    /// ferrosa-cluster) carrying `request_id`, keyspace/table, and
+    /// optional start/end key bounds.
+    RangeReadStreamRequest(Bytes),
+    /// ADR-020: one batch of partitions belonging to a streaming
+    /// range-read response, keyed by `request_id`. Payload is a
+    /// bincoded `RangeReadStreamChunkPayload`.
+    RangeReadStreamChunk(Bytes),
+    /// ADR-020: keep-alive emitted by the handler when the next chunk
+    /// is slow to produce (e.g., S3 fetch, compaction back-pressure).
+    /// The coordinator's idle watchdog treats heartbeats as activity.
+    RangeReadStreamHeartbeat(Bytes),
+    /// ADR-020: terminator for a streaming range-read response.
+    /// Payload carries final stream metadata (total_chunks, truncated
+    /// flag).
+    RangeReadStreamDone(Bytes),
+    /// ADR-020: coordinator → handler signal to abort a stream
+    /// in-flight (CQL client disconnected, read-quorum already
+    /// satisfied, KILL issued). Handler stops iterating between
+    /// batches.
+    RangeReadStreamCancel(Bytes),
     TruncateForward(Bytes),
     TruncateAck(Bytes),
 
@@ -240,6 +262,11 @@ impl Message {
             Self::RepairWrite(_) => MsgType::RepairWrite,
             Self::RangeReadRequest(_) => MsgType::RangeReadRequest,
             Self::RangeReadResponse(_) => MsgType::RangeReadResponse,
+            Self::RangeReadStreamRequest(_) => MsgType::RangeReadStreamRequest,
+            Self::RangeReadStreamChunk(_) => MsgType::RangeReadStreamChunk,
+            Self::RangeReadStreamHeartbeat(_) => MsgType::RangeReadStreamHeartbeat,
+            Self::RangeReadStreamDone(_) => MsgType::RangeReadStreamDone,
+            Self::RangeReadStreamCancel(_) => MsgType::RangeReadStreamCancel,
             Self::TruncateForward(_) => MsgType::TruncateForward,
             Self::TruncateAck(_) => MsgType::TruncateAck,
             Self::StreamStart(_) => MsgType::StreamStart,
@@ -391,6 +418,11 @@ impl Message {
             | Self::RepairWrite(b)
             | Self::RangeReadRequest(b)
             | Self::RangeReadResponse(b)
+            | Self::RangeReadStreamRequest(b)
+            | Self::RangeReadStreamChunk(b)
+            | Self::RangeReadStreamHeartbeat(b)
+            | Self::RangeReadStreamDone(b)
+            | Self::RangeReadStreamCancel(b)
             | Self::TruncateForward(b)
             | Self::TruncateAck(b)
             | Self::StreamStart(b)
@@ -582,6 +614,21 @@ impl Message {
             MsgType::RepairWrite => Self::RepairWrite(body.split_to(body.remaining())),
             MsgType::RangeReadRequest => Self::RangeReadRequest(body.split_to(body.remaining())),
             MsgType::RangeReadResponse => Self::RangeReadResponse(body.split_to(body.remaining())),
+            MsgType::RangeReadStreamRequest => {
+                Self::RangeReadStreamRequest(body.split_to(body.remaining()))
+            }
+            MsgType::RangeReadStreamChunk => {
+                Self::RangeReadStreamChunk(body.split_to(body.remaining()))
+            }
+            MsgType::RangeReadStreamHeartbeat => {
+                Self::RangeReadStreamHeartbeat(body.split_to(body.remaining()))
+            }
+            MsgType::RangeReadStreamDone => {
+                Self::RangeReadStreamDone(body.split_to(body.remaining()))
+            }
+            MsgType::RangeReadStreamCancel => {
+                Self::RangeReadStreamCancel(body.split_to(body.remaining()))
+            }
             MsgType::TruncateForward => Self::TruncateForward(body.split_to(body.remaining())),
             MsgType::TruncateAck => Self::TruncateAck(body.split_to(body.remaining())),
             MsgType::StreamStart => Self::StreamStart(body.split_to(body.remaining())),
@@ -1048,6 +1095,49 @@ mod tests {
                     let _ = Message::decode(msg_type, &mut bytes.clone());
                 }
             }
+        }
+    }
+
+    /// ADR-020 streaming range-read message variants must encode and
+    /// decode losslessly. They are opaque `Bytes` payloads; the
+    /// structured shapes (request_id, seq, partitions, …) are bincoded
+    /// by ferrosa-cluster, identical to the existing
+    /// RangeReadRequest/RangeReadResponse pattern.
+    #[test]
+    fn streaming_range_read_variants_round_trip_through_encode_decode() {
+        let cases: &[(MsgType, Message)] = &[
+            (
+                MsgType::RangeReadStreamRequest,
+                Message::RangeReadStreamRequest(Bytes::from_static(b"req-payload")),
+            ),
+            (
+                MsgType::RangeReadStreamChunk,
+                Message::RangeReadStreamChunk(Bytes::from_static(b"chunk-bytes")),
+            ),
+            (
+                MsgType::RangeReadStreamHeartbeat,
+                Message::RangeReadStreamHeartbeat(Bytes::from_static(b"hb")),
+            ),
+            (
+                MsgType::RangeReadStreamDone,
+                Message::RangeReadStreamDone(Bytes::from_static(b"done")),
+            ),
+            (
+                MsgType::RangeReadStreamCancel,
+                Message::RangeReadStreamCancel(Bytes::from_static(b"cancel")),
+            ),
+        ];
+
+        for (expected_type, msg) in cases {
+            assert_eq!(
+                msg.msg_type(),
+                *expected_type,
+                "msg_type() mapping wrong for {msg:?}"
+            );
+            let mut buf = BytesMut::new();
+            msg.encode(&mut buf).expect("encode");
+            let decoded = Message::decode(*expected_type, &mut buf.freeze()).expect("decode");
+            assert_eq!(decoded, *msg, "round-trip lost data for {msg:?}");
         }
     }
 }
