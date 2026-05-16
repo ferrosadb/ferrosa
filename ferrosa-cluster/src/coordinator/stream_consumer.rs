@@ -75,15 +75,6 @@ pub enum StreamConsumeError {
         delivered_done: usize,
         expected_done: usize,
     },
-    /// A `Done` payload reported a `total_chunks` count that doesn't
-    /// match the number of chunks the consumer actually observed for
-    /// that request_id. Strict invariant — surfaces in tests; in
-    /// production the consumer accepts and logs.
-    DoneChunkCountMismatch {
-        request_id: u32,
-        reported: u32,
-        observed: u32,
-    },
 }
 
 /// Consume a streaming range-read response.
@@ -107,6 +98,13 @@ pub async fn consume_range_stream(
 
     loop {
         if delivered_done >= expected_done {
+            // All Dones received. The server spawns a task per
+            // inbound frame so Chunk handlers can race the Done
+            // handler — drain any straggler chunks that arrived
+            // after the Done was routed but before this loop saw
+            // them. Bounded by a short grace period; long-tail
+            // chunks beyond the window are lost (logged at debug).
+            drain_stragglers(&mut watchdog, &mut outcome, request_id).await;
             return Ok(outcome);
         }
 
@@ -146,12 +144,24 @@ pub async fn consume_range_stream(
             }
             Message::RangeReadStreamDone(bytes) => {
                 let done = decode_done(request_id, bytes)?;
+                // Chunk counts disagreeing with Done is observable but
+                // expected under the current server: ferrosa-net's
+                // rpc::server::run_connection spawns a tokio task per
+                // inbound frame so handlers for Chunk vs Done race —
+                // Done can be routed onto the per-request mpsc before
+                // a preceding Chunk's handler runs. We do not treat
+                // this as an error; total_chunks is telemetry. After
+                // the Done count is satisfied below we drain remaining
+                // chunks with a short grace period so stragglers land
+                // in the result instead of being lost to the unregister
+                // call.
                 if done.total_chunks != observed_chunks_per_replica {
-                    return Err(StreamConsumeError::DoneChunkCountMismatch {
+                    tracing::debug!(
                         request_id,
-                        reported: done.total_chunks,
-                        observed: observed_chunks_per_replica,
-                    });
+                        reported = done.total_chunks,
+                        observed = observed_chunks_per_replica,
+                        "stream Done arrived before all preceding chunks were routed; will drain stragglers"
+                    );
                 }
                 if done.truncated {
                     outcome.any_truncated = true;
@@ -164,6 +174,45 @@ pub async fn consume_range_stream(
                     msg_type: other.msg_type(),
                 });
             }
+        }
+    }
+}
+
+/// Grace period for draining stragglers after the last Done.
+/// Sized to absorb tokio-task scheduling jitter between Chunk and
+/// Done dispatches on the server side (typically sub-millisecond).
+const STRAGGLER_DRAIN: Duration = Duration::from_millis(200);
+
+async fn drain_stragglers(
+    watchdog: &mut IdleTimeoutWatchdog<Message>,
+    outcome: &mut StreamConsumeOutcome,
+    request_id: u32,
+) {
+    let deadline = tokio::time::Instant::now() + STRAGGLER_DRAIN;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let next = match tokio::time::timeout(remaining, watchdog.next()).await {
+            Ok(Ok(Some(msg))) => msg,
+            // Stream closed cleanly, watchdog tripped, or grace
+            // window elapsed — all terminate the drain.
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+        };
+        match next {
+            Message::RangeReadStreamChunk(bytes) => match decode_chunk(request_id, bytes) {
+                Ok(chunk) => {
+                    outcome.total_chunks = outcome.total_chunks.saturating_add(1);
+                    outcome
+                        .partitions
+                        .extend(chunk.partitions.into_iter().map(partition_from_wire));
+                }
+                Err(e) => tracing::debug!(?e, "straggler chunk decode failed"),
+            },
+            // Stragglers we don't care about.
+            Message::RangeReadStreamHeartbeat(_) | Message::RangeReadStreamDone(_) => {}
+            other => tracing::debug!(?other, "straggler frame of unexpected type; dropped"),
         }
     }
 }
@@ -365,25 +414,27 @@ mod tests {
         );
     }
 
-    /// Done carrying a chunk count that disagrees with what we
-    /// observed is a wire-corruption / serialization bug — surfaces
-    /// as `DoneChunkCountMismatch`.
+    /// Done arriving with a `total_chunks` count that disagrees
+    /// with what the consumer observed is tolerated — the server
+    /// spawns a task per inbound frame, so Done can be routed
+    /// onto the per-request mpsc before a preceding Chunk's
+    /// handler runs. The consumer drains stragglers within a short
+    /// grace window so the missing chunk lands in the result, and
+    /// the mismatch is logged at debug rather than surfacing as an
+    /// error.
     #[tokio::test]
-    async fn done_with_wrong_chunk_count_fails_loud() {
+    async fn done_with_higher_chunk_count_drains_straggler() {
         let (tx, rx) = mpsc::channel(8);
+        // Done first (race winner), Chunk after — simulates the
+        // server-side Chunk-vs-Done dispatch race.
+        tx.send(done_msg(1, false)).await.unwrap();
         tx.send(chunk_msg(0, vec![make_partition(1)])).await.unwrap();
-        // Reported 5 but we observed 1.
-        tx.send(done_msg(5, false)).await.unwrap();
+        drop(tx);
 
-        let err = consume_range_stream(rx, IDLE, 1, REQ_ID).await.unwrap_err();
-        assert_eq!(
-            err,
-            StreamConsumeError::DoneChunkCountMismatch {
-                request_id: REQ_ID,
-                reported: 5,
-                observed: 1,
-            }
-        );
+        let outcome = consume_range_stream(rx, IDLE, 1, REQ_ID).await.unwrap();
+        // Straggler-drain picked up the chunk that arrived after Done.
+        assert_eq!(outcome.partitions.len(), 1);
+        assert_eq!(outcome.total_chunks, 1);
     }
 
     /// `any_truncated` is true if any replica's Done sets the flag.
