@@ -23,7 +23,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
+use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
@@ -130,6 +132,61 @@ where
 pub trait SinkFactory: Send + Sync {
     type Sink: ChunkSink + 'static;
     fn for_peer(&self, from: PeerId, request_id: u32) -> Self::Sink;
+}
+
+/// Production sink: fires every chunk back to the originating peer
+/// via `PeerManager::fire` on `Lane::Bulk`. Wire-side errors are
+/// logged and dropped — the coordinator's `IdleTimeoutWatchdog`
+/// surfaces stalled streams independently.
+pub struct PeerFireSink {
+    peers: Arc<PeerManager>,
+    target: uuid::Uuid,
+    request_id: u32,
+}
+
+impl PeerFireSink {
+    pub fn new(peers: Arc<PeerManager>, target: uuid::Uuid, request_id: u32) -> Self {
+        Self {
+            peers,
+            target,
+            request_id,
+        }
+    }
+}
+
+#[async_trait]
+impl ChunkSink for PeerFireSink {
+    async fn send(&self, msg: Message) {
+        if let Err(e) = self.peers.fire(self.target, msg, Lane::Bulk).await {
+            tracing::warn!(
+                request_id = self.request_id,
+                target = %self.target,
+                "stream chunk fire failed: {e}"
+            );
+        }
+    }
+}
+
+/// Production `SinkFactory` that builds a `PeerFireSink` per
+/// (peer, request_id). Registered on every node so the request
+/// handler can ship chunks back to the originating coordinator.
+pub struct PeerManagerSinkFactory {
+    peers: Arc<PeerManager>,
+}
+
+impl PeerManagerSinkFactory {
+    pub fn new(peers: Arc<PeerManager>) -> Self {
+        Self { peers }
+    }
+}
+
+impl SinkFactory for PeerManagerSinkFactory {
+    type Sink = PeerFireSink;
+
+    fn for_peer(&self, from: PeerId, request_id: u32) -> PeerFireSink {
+        let (host_id, _addr) = from;
+        PeerFireSink::new(self.peers.clone(), host_id, request_id)
+    }
 }
 
 impl<R, F> RangeReadStreamRequestHandler<R, F>
