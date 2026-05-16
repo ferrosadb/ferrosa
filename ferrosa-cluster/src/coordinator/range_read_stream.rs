@@ -14,6 +14,7 @@
 //! partition with no further chunks or heartbeats) abort the
 //! consume.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,7 +32,13 @@ use crate::raft::handlers::RangeReadStreamRequestPayload;
 /// Idle deadline on the streaming receiver. Reset on every chunk OR
 /// heartbeat. A producer that stops sending entirely for longer
 /// than this aborts the consume. Tunable later via NetConfig.
-const STREAMING_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// The Phase 1 handler emits a heartbeat every 3 s while a slow
+/// storage read blocks (see stream_request_handler::HEARTBEAT_INTERVAL).
+/// 30 s leaves room for runtime starvation under heavy concurrent
+/// compaction load — if the handler can't even get scheduled for
+/// 30 s the peer is genuinely stuck and aborting is correct.
+const STREAMING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-request buffer for the StreamRouter receiver. Bounded so a
 /// slow consumer back-pressures the inbound dispatch (chunks queue
@@ -44,6 +51,29 @@ const STREAM_RECEIVER_BUFFER: usize = 32;
 /// still amortizing the per-message frame overhead. Tunable later
 /// via NetConfig.
 pub const STREAMING_CHUNK_PARTITIONS: usize = 64;
+
+/// Deduplicate partitions by token — multiple replicas (RF=N) each
+/// return a copy of every partition they own; without this, COUNT(*)
+/// and full-table scans return N× the real partition count. Mirrors
+/// the dedup loop at the end of `coordinate_range_read_limited_rows`
+/// in `read.rs` so the streaming and legacy paths return the same
+/// shape to the CQL layer.
+fn dedup_by_token(partitions: Vec<Partition>) -> Vec<Partition> {
+    let mut by_token: BTreeMap<i64, Vec<Partition>> = BTreeMap::new();
+    for p in partitions {
+        by_token.entry(p.key.token.0).or_default().push(p);
+    }
+    by_token
+        .into_values()
+        .map(|group| {
+            if group.len() == 1 {
+                group.into_iter().next().unwrap()
+            } else {
+                ferrosa_storage::merge::merge_partitions(group)
+            }
+        })
+        .collect()
+}
 
 impl ClusterCoordinator {
     /// ADR-020 streaming range-read entry point.
@@ -172,7 +202,7 @@ impl ClusterCoordinator {
                         "streaming range read: partial — some replicas could not be reached"
                     );
                 }
-                Ok(all_partitions)
+                Ok(dedup_by_token(all_partitions))
             }
             Err(StreamConsumeError::IdleTimeout { idle_timeout, .. }) => {
                 Err(ClusterError::Internal(format!(
