@@ -124,7 +124,7 @@ async fn end_to_end_single_replica_streams_all_partitions() {
     // coordinator; here both are tasks on the same runtime sharing
     // the in-memory router.
     let producer = tokio::spawn(async move {
-        handle_stream_request(req, &reader, &sink, 3).await;
+        handle_stream_request(req, Arc::new(reader), &sink, 3).await;
     });
 
     let outcome = consume_range_stream(rx, IDLE, 1, REQ_ID).await.unwrap();
@@ -178,10 +178,10 @@ async fn end_to_end_two_replicas_aggregates_both_streams() {
     let req_a = req.clone();
     let req_b = req.clone();
     let p_a = tokio::spawn(async move {
-        handle_stream_request(req_a, &reader_a, &sink_a, 2).await;
+        handle_stream_request(req_a, Arc::new(reader_a), &sink_a, 2).await;
     });
     let p_b = tokio::spawn(async move {
-        handle_stream_request(req_b, &reader_b, &sink_b, 2).await;
+        handle_stream_request(req_b, Arc::new(reader_b), &sink_b, 2).await;
     });
 
     let outcome = consume_range_stream(rx, IDLE, 2, REQ_ID).await.unwrap();

@@ -19,6 +19,7 @@
 //! [`HandlerRegistry`]: ferrosa_net::rpc::handler::HandlerRegistry
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,7 +32,16 @@ use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
 
 use super::stream_producer::{stream_range_response, ChunkSink};
-use crate::raft::handlers::{RangeReadStreamDonePayload, RangeReadStreamRequestPayload};
+use crate::raft::handlers::{
+    RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
+};
+
+/// How often to emit a `RangeReadStreamHeartbeat` while a slow
+/// storage read blocks. Picked smaller than the coordinator's idle
+/// timeout (10s) with margin for tokio scheduling jitter and wire
+/// transit; a producer that misses three intervals indicates a real
+/// stall.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Storage surface the request handler needs. Mirrors
 /// `RangeReadStorage` in `coordinator::read` but is its own trait so
@@ -73,15 +83,62 @@ impl StreamRangeReader for ferrosa_storage::StorageEngine {
 /// partial.
 pub async fn handle_stream_request<R, S>(
     req: RangeReadStreamRequestPayload,
-    reader: &R,
+    reader: Arc<R>,
     sink: &S,
     chunk_size: usize,
 ) where
-    R: StreamRangeReader,
+    R: StreamRangeReader + 'static,
     S: ChunkSink,
 {
     let table_id = TableId::new(&req.keyspace, &req.table);
-    let partitions = match reader.read_range(&table_id) {
+
+    // The current `StreamRangeReader::read_range` is a synchronous
+    // blocking call (Phase 1 reads from the materializing storage
+    // path which can stall for tens of seconds on a 10K-partition
+    // table backed by S3). Park it on the blocking pool so the
+    // tokio runtime can drive the heartbeat ticker concurrently,
+    // and the coordinator's `IdleTimeoutWatchdog` sees activity
+    // every HEARTBEAT_INTERVAL even while no chunks are in flight.
+    //
+    // Phase 2's lazy storage iterator removes the long quiet
+    // window — chunks land as partitions decode — and the
+    // heartbeat ticker becomes pure insurance against a stuck
+    // batch.
+    let table_id_for_read = table_id.clone();
+    let mut read_task = tokio::task::spawn_blocking(move || reader.read_range(&table_id_for_read));
+
+    let mut heartbeat_seq: u32 = 0;
+    let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Discard the immediate first tick — we don't want to send a
+    // heartbeat before we've even started waiting.
+    ticker.tick().await;
+
+    let read_result = loop {
+        tokio::select! {
+            biased;
+            res = &mut read_task => {
+                break match res {
+                    Ok(inner) => inner,
+                    Err(join_err) => Err(ferrosa_common::Error::InvalidData(format!(
+                        "stream request: storage read task panicked: {join_err}"
+                    ))),
+                };
+            }
+            _ = ticker.tick() => {
+                let hb = RangeReadStreamHeartbeatPayload {
+                    request_id: req.request_id,
+                    seq: heartbeat_seq,
+                };
+                heartbeat_seq = heartbeat_seq.saturating_add(1);
+                let bytes = bincode::serialize(&hb)
+                    .expect("RangeReadStreamHeartbeatPayload serialization is infallible");
+                sink.send(Message::RangeReadStreamHeartbeat(Bytes::from(bytes))).await;
+            }
+        }
+    };
+
+    let partitions = match read_result {
         Ok(ps) => ps,
         Err(e) => {
             tracing::warn!(
@@ -228,7 +285,7 @@ where
         let chunk_size = self.chunk_size;
 
         tokio::spawn(async move {
-            handle_stream_request(req, reader.as_ref(), &sink, chunk_size).await;
+            handle_stream_request(req, reader, &sink, chunk_size).await;
         });
 
         // Streaming responses ride on fire-and-forget chunks; no
@@ -317,7 +374,7 @@ mod tests {
         };
         let sink = VecSink::new();
 
-        handle_stream_request(req(11), &reader, &sink, 2).await;
+        handle_stream_request(req(11), Arc::new(reader), &sink, 2).await;
 
         let frames = sink.take();
         assert_eq!(frames.len(), 4);
@@ -339,7 +396,7 @@ mod tests {
         let reader = StaticReader { partitions: vec![] };
         let sink = VecSink::new();
 
-        handle_stream_request(req(12), &reader, &sink, 4).await;
+        handle_stream_request(req(12), Arc::new(reader), &sink, 4).await;
 
         let frames = sink.take();
         assert_eq!(frames.len(), 1);
@@ -359,7 +416,7 @@ mod tests {
         let reader = FailingReader;
         let sink = VecSink::new();
 
-        handle_stream_request(req(13), &reader, &sink, 4).await;
+        handle_stream_request(req(13), Arc::new(reader), &sink, 4).await;
 
         let frames = sink.take();
         assert_eq!(frames.len(), 1);
@@ -379,7 +436,7 @@ mod tests {
         };
         let sink = VecSink::new();
 
-        handle_stream_request(req(0xDEAD_BEEF), &reader, &sink, 1).await;
+        handle_stream_request(req(0xDEAD_BEEF), Arc::new(reader), &sink, 1).await;
 
         let frames = sink.take();
         for frame in &frames {
