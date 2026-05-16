@@ -826,6 +826,93 @@ impl RpcHandler for RangeReadHandler {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-020 streaming range-read payloads
+// ---------------------------------------------------------------------------
+//
+// Each of the five new `Message::RangeReadStream*` variants in
+// ferrosa-net carries an opaque `Bytes` body. These structs are the
+// bincoded shapes that the handler emits and the coordinator decodes.
+// The `request_id` field is the first u32 in every payload — the
+// dispatch leaf (`ferrosa_net::stream_router::StreamRouter`) uses it
+// to route each inbound frame to the right per-request consumer.
+
+/// Coordinator → handler: open a streaming range read on a table.
+///
+/// Unlike the legacy [`RangeReadRequestPayload`], there is no
+/// `limit` field — the consumer controls how many partitions it
+/// wants via back-pressure (the bounded mpsc backing the
+/// coordinator's receiver) and via an explicit
+/// [`RangeReadStreamCancelPayload`] when it has enough.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeReadStreamRequestPayload {
+    /// Per-coordinator-call correlation id. Returned in every chunk,
+    /// heartbeat, done, and cancel frame for this stream so the
+    /// StreamRouter can dispatch frames to the right consumer.
+    pub request_id: u32,
+    pub keyspace: String,
+    pub table: String,
+}
+
+/// Handler → coordinator: one batch of partitions belonging to a
+/// streaming range read.
+///
+/// The chunk size is bounded at the handler by a runtime-configurable
+/// target (NetConfig.bulk_stream_chunk_partitions, future work), not
+/// by a hardcoded constant — so PB-scale tables stream naturally at
+/// O(chunk_size) memory regardless of total table size.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RangeReadStreamChunkPayload {
+    pub request_id: u32,
+    /// Monotonic 0-based chunk sequence within this stream. Lets the
+    /// coordinator detect dropped or reordered frames (TCP excludes
+    /// reorders today, but seq is cheap insurance against future
+    /// lane changes).
+    pub seq: u32,
+    pub partitions: Vec<PartitionWire>,
+}
+
+/// Handler → coordinator: keep-alive emitted when the next chunk is
+/// slow to produce (e.g. S3 fetch, compaction back-pressure).
+///
+/// The coordinator's `IdleTimeoutWatchdog` treats heartbeats as
+/// activity and resets its per-message deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeReadStreamHeartbeatPayload {
+    pub request_id: u32,
+    /// Sequence number of the next chunk the handler is working on
+    /// (i.e. one past the seq of the last delivered chunk). Useful
+    /// for debugging stuck streams.
+    pub seq: u32,
+}
+
+/// Handler → coordinator: terminator for a streaming range read.
+///
+/// After receiving Done, the coordinator unregisters from the
+/// StreamRouter and resolves the user query. `total_chunks` is the
+/// count of `RangeReadStreamChunkPayload` messages emitted (for
+/// validation); `truncated` is reserved for future use when the
+/// handler bounds its iteration externally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeReadStreamDonePayload {
+    pub request_id: u32,
+    pub total_chunks: u32,
+    pub truncated: bool,
+}
+
+/// Coordinator → handler: abort a stream in-flight.
+///
+/// Used when the CQL client disconnects, when read-quorum is already
+/// satisfied by other replicas, or when the user issues `KILL`. The
+/// handler observes the cancel between batches and stops iterating;
+/// any partial chunks already in flight on the wire are discarded by
+/// the coordinator (the route has been unregistered before sending
+/// the cancel).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeReadStreamCancelPayload {
+    pub request_id: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Index read handler
 // ---------------------------------------------------------------------------
 
@@ -1351,5 +1438,86 @@ mod tests {
             rows: vec![],
         };
         assert_eq!(newest_timestamp(&partition), i64::MIN);
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-020 streaming range-read payloads
+    // -----------------------------------------------------------------------
+
+    /// All five streaming-RPC payload types must round-trip through
+    /// bincode unchanged. These are the structured shapes carried in
+    /// the opaque `Bytes` of the matching `Message::RangeReadStream*`
+    /// variants from ferrosa-net.
+    #[test]
+    fn streaming_range_read_payloads_round_trip_through_bincode() {
+        let req = RangeReadStreamRequestPayload {
+            request_id: 7,
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+        };
+        let encoded = bincode::serialize(&req).expect("encode request");
+        let decoded: RangeReadStreamRequestPayload =
+            bincode::deserialize(&encoded).expect("decode request");
+        assert_eq!(decoded, req);
+
+        let key = DecoratedKey::new(PartitionKey::new(b"pk".to_vec()));
+        let part = Partition {
+            key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![],
+        };
+        let chunk = RangeReadStreamChunkPayload {
+            request_id: 7,
+            seq: 3,
+            partitions: vec![partition_to_wire(part)],
+        };
+        let encoded = bincode::serialize(&chunk).expect("encode chunk");
+        let decoded: RangeReadStreamChunkPayload =
+            bincode::deserialize(&encoded).expect("decode chunk");
+        assert_eq!(decoded.request_id, chunk.request_id);
+        assert_eq!(decoded.seq, chunk.seq);
+        assert_eq!(decoded.partitions.len(), 1);
+
+        let hb = RangeReadStreamHeartbeatPayload {
+            request_id: 7,
+            seq: 4,
+        };
+        let encoded = bincode::serialize(&hb).expect("encode heartbeat");
+        let decoded: RangeReadStreamHeartbeatPayload =
+            bincode::deserialize(&encoded).expect("decode heartbeat");
+        assert_eq!(decoded, hb);
+
+        let done = RangeReadStreamDonePayload {
+            request_id: 7,
+            total_chunks: 12,
+            truncated: false,
+        };
+        let encoded = bincode::serialize(&done).expect("encode done");
+        let decoded: RangeReadStreamDonePayload =
+            bincode::deserialize(&encoded).expect("decode done");
+        assert_eq!(decoded, done);
+
+        let cancel = RangeReadStreamCancelPayload { request_id: 7 };
+        let encoded = bincode::serialize(&cancel).expect("encode cancel");
+        let decoded: RangeReadStreamCancelPayload =
+            bincode::deserialize(&encoded).expect("decode cancel");
+        assert_eq!(decoded, cancel);
+    }
+
+    /// Every payload shape carries the `request_id` so the coordinator's
+    /// StreamRouter can dispatch the chunk back to the right per-request
+    /// receiver. The router decodes the first 4 bytes as a `u32` and
+    /// looks up the registration — this test pins the bincode prefix.
+    #[test]
+    fn streaming_chunk_payload_starts_with_request_id_for_router_dispatch() {
+        let chunk = RangeReadStreamChunkPayload {
+            request_id: 0xDEAD_BEEF,
+            seq: 0,
+            partitions: vec![],
+        };
+        let encoded = bincode::serialize(&chunk).expect("encode");
+        // bincode default little-endian fixint: u32 occupies bytes 0..4.
+        assert_eq!(&encoded[..4], &0xDEAD_BEEFu32.to_le_bytes());
     }
 }
