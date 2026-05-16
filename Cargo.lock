@@ -1698,7 +1698,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferrosa"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -1737,7 +1737,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-cluster"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-common"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "num-bigint",
  "proptest",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-cql"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-ctl"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-graph"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-index"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "crc32fast",
  "ferrosa-common",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-index-builder"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-jepsen"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-loadgen"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-net"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-schema"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "argon2 0.6.0-rc.8",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sim"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "proptest",
  "serde",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sparql"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sstable"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "crc32fast",
  "ferrosa-common",
@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-storage"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-udf"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bumpalo",
  "ferrosa-common",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-worker"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ferrosa-common",
  "ferrosa-index",
