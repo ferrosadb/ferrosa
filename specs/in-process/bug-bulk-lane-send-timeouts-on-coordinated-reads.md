@@ -101,6 +101,48 @@ $ cqlsh 127.0.0.1 19042 -u ferrosa_admin -p ferrosa_admin
 Same query against node2 (19043) returns 9774; node3 (19044) returns
 10800 (replica skew, likely separate).
 
+## Performance baseline (2026-05-16)
+
+Three back-to-back `SELECT COUNT(*) FROM agent_memory.entity_store` runs
+on the live cluster (9 774 partitions, RF=3, 3 nodes, no concurrent
+load) under the v0.10.0 image:
+
+| Run | Wall-clock | Notes                                          |
+|-----|-----------|------------------------------------------------|
+| 1   | 7.28 s    | survives because cqlsh `--request-timeout=60`  |
+| 2   | 37.15 s   | same query — variance is intrinsic, not noise  |
+| 3   | 7.32 s    | reproducible                                   |
+
+A bounded `SELECT … LIMIT 5` against the same table returns in 0.65 s
+because the coordinator does not need to fan out a full range scan.
+
+On-disk size: `~/data/ferrosa-memory/minio/` is 3.6 GB; node1's
+`/var/lib/ferrosa` working set is 6.1 GB.
+
+## Why tweaking the timeout is the wrong axis
+
+- The current `BULK_READ_TIMEOUT = 3 s` already fires; the proposed bump
+  to 8 s (PR #41) still loses Run 2 (37 s). No fixed wall-clock value is
+  correct for both the steady-state (~7 s) and the outlier (~37 s)
+  observed *today* at 9 K partitions, let alone for production-scale
+  tables with millions or billions of partitions.
+- Magic-number caps are antipatterns. The existing
+  `RANGE_READ_MATERIALIZATION_CAP = 10_000` in `ferrosa-storage` is a
+  declared antipattern — its own error message says
+  `"use a paged/streaming read path"`. Adding a hardcoded 8 s timeout
+  alongside it compounds the problem.
+- The Bulk lane already has a 60 s envelope timeout
+  (`Lane::Bulk.timeout()` in `ferrosa-net/src/codec.rs`); the
+  coordinator's 3 s/8 s wall-clock cap on top of that is the
+  contradiction — Bulk lane is sized for high-throughput
+  latency-tolerant transfers, but the coordinator denies it the time
+  to actually transfer.
+
+The correct architecture replaces the single-shot RPC with a streaming
+response gated by an **idle-timeout watchdog** that resets every time a
+chunk or heartbeat arrives. See
+[[020-streaming-internode-range-read]] for the design.
+
 ## Suspected scope
 
 - `ferrosa_cluster::coordinator::read::coordinate_range_read` and
