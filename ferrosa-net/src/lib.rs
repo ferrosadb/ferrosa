@@ -10,6 +10,7 @@ pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod handshake;
+pub mod idle_timeout;
 pub mod lane_actor;
 pub mod message;
 pub mod peer;
