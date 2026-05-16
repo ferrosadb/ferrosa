@@ -870,8 +870,19 @@ impl ClusterCoordinator {
     /// Must be shorter than the CQL client timeout (typically 10s) so the
     /// coordinator returns a result (even partial/error) before the client
     /// gives up. A long timeout caused SELECT to hang on startup when
-    /// remote nodes hadn't established connections yet.
-    const BULK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    /// remote nodes hadn't established connections yet — that hang is now
+    /// prevented at the lane layer (`dispatch_send` returns immediately
+    /// with `NetError::Reconnecting` when the lane isn't `Connected`), so
+    /// this timeout only fires for in-flight RPCs that are genuinely slow.
+    ///
+    /// 3s was too aggressive: cross-node range/index scans against
+    /// agent_memory tables (~10K to ~26K rows) routinely run past 3s on
+    /// the local 3-node ferrosa-memory cluster, surfacing as
+    /// `net: timeout: Bulk lane send timeout` on every coordinated read
+    /// (see specs/in-process/bug-bulk-lane-send-timeouts-on-coordinated-reads.md).
+    /// 8s keeps the coordinator inside the 10s CQL client default while
+    /// tolerating realistic scan latency.
+    const BULK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
     pub async fn coordinate_range_read(
         &self,
@@ -3052,6 +3063,39 @@ mod tests {
             result.is_ok(),
             "CL=ONE with NTS should succeed: {:?}",
             result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // select_index_ready_replicas: all-ready
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // BULK_READ_TIMEOUT bounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bulk_read_timeout_accommodates_realistic_remote_range_scans() {
+        // Bug: specs/in-process/bug-bulk-lane-send-timeouts-on-coordinated-reads.md
+        // 2026-05-16, ferrosa-memory 3-node cluster, v0.10.0 and earlier:
+        // every cross-node range/index read against `agent_memory` tables
+        // (~10K to ~26K rows) failed with `net: timeout: Bulk lane send
+        // timeout` because the per-RPC deadline was only 3s. Cluster
+        // hardware and table sizes routinely push a Bulk-lane range scan
+        // past 3s. Lower bound must allow realistic scans to complete.
+        assert!(
+            ClusterCoordinator::BULK_READ_TIMEOUT >= std::time::Duration::from_secs(8),
+            "BULK_READ_TIMEOUT must be >= 8s to accommodate realistic remote range/index scans; was {:?}",
+            ClusterCoordinator::BULK_READ_TIMEOUT
+        );
+        // Upper bound: the comment on BULK_READ_TIMEOUT requires it to
+        // stay shorter than the typical 10s CQL client timeout so the
+        // coordinator can surface a partial-result / error before the
+        // client gives up.
+        assert!(
+            ClusterCoordinator::BULK_READ_TIMEOUT < std::time::Duration::from_secs(10),
+            "BULK_READ_TIMEOUT must remain shorter than the 10s CQL client default; was {:?}",
+            ClusterCoordinator::BULK_READ_TIMEOUT
         );
     }
 
