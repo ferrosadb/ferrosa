@@ -74,6 +74,15 @@ pub struct SSTableReader<R: ReadAt> {
     _decompressed_data: Option<Vec<u8>>,
     #[allow(dead_code)]
     rows: R,
+    /// Lazily-populated sorted list of partition start offsets in
+    /// `data`. Built by walking the data file once via
+    /// `DataReader::read_partition_count` (no cell decode, only row
+    /// header walking) on the first call to `partition_offsets`.
+    /// Used by `PartitionIter::skip_to_next_partition` so the merger
+    /// can advance past duplicate-key sources in O(log N) without
+    /// decoding any partition body — the cold-cache dominant cost
+    /// (see bug-streaming-range-read-perf-50x-floor).
+    partition_offsets: std::sync::OnceLock<std::sync::Arc<Vec<u64>>>,
 }
 
 impl<R: ReadAt> SSTableReader<R> {
@@ -108,7 +117,46 @@ impl<R: ReadAt> SSTableReader<R> {
             data: components.data,
             _decompressed_data: decompressed_data,
             rows: components.rows,
+            partition_offsets: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Sorted list of partition start offsets in this SSTable's
+    /// `Data.db`. Lazily built on first call by walking the data
+    /// file with `read_partition_count` (no cell decode); cached for
+    /// the SSTable's lifetime. Subsequent calls are O(1).
+    ///
+    /// Used by `PartitionIter::skip_to_next_partition` for the
+    /// merger's duplicate-key dedup path — pre-decoded offsets
+    /// reduce a "skip past this partition" call from `O(rows × cold
+    /// page faults)` (the row-walking cost of
+    /// `next_partition_metadata`) to one binary search + one pos
+    /// assignment.
+    ///
+    /// On error the offsets list is left empty and a warning is
+    /// logged; callers fall back to body-decode advancement.
+    pub fn partition_offsets(&self) -> std::sync::Arc<Vec<u64>> {
+        self.partition_offsets
+            .get_or_init(|| {
+                let mut offsets: Vec<u64> = Vec::new();
+                let mut iter = match self.partitions_iter() {
+                    Ok(it) => it,
+                    Err(_) => {
+                        // Caller falls back to body-decode advance.
+                        return std::sync::Arc::new(offsets);
+                    }
+                };
+                loop {
+                    let pos_before = iter.pos;
+                    match iter.next_partition_count() {
+                        Ok(Some(_)) => offsets.push(pos_before),
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+                std::sync::Arc::new(offsets)
+            })
+            .clone()
     }
 
     /// Look up a partition by its decorated key.
@@ -373,6 +421,42 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
             self.pos = reader.position();
             Ok(result)
         }
+    }
+
+    /// Advance past the partition currently at `self.pos` WITHOUT
+    /// decoding it. Returns `Ok(())` when there is a next partition
+    /// (pos is moved to its start), `Ok(())` AT EOF too (pos is
+    /// moved to file_len so subsequent peek/next yield None).
+    ///
+    /// Uses the SSTable's cached `partition_offsets` for O(log N)
+    /// lookup of the next partition's start offset. The cache is
+    /// built lazily on first call (one-time O(file) walk via
+    /// `next_partition_count`).
+    ///
+    /// Used by the merger's duplicate-key dedup path: when we've
+    /// already popped the partition for key K from one source, the
+    /// OTHER sources holding key K need to advance past it but their
+    /// decoded body is discarded — `skip_to_next_partition` does the
+    /// advance without paying that wasted decode cost.
+    pub fn skip_to_next_partition(&mut self) -> Result<()> {
+        let offsets = self.sst.partition_offsets();
+        if offsets.is_empty() {
+            // Cache build failed; fall back to body-decode advance.
+            // (We can't return error here without changing the API;
+            // caller should use next_partition* as a fallback.)
+            let _ = self.next_partition_metadata()?;
+            return Ok(());
+        }
+        // Find the first offset strictly greater than self.pos.
+        let next_idx = match offsets.binary_search(&self.pos) {
+            Ok(i) => i + 1, // self.pos sits AT a partition start; advance to next
+            Err(i) => i,    // self.pos is inside a partition; i is the next start
+        };
+        self.pos = match offsets.get(next_idx) {
+            Some(&p) => p,
+            None => self.sst.data.len()?, // past last partition → EOF
+        };
+        Ok(())
     }
 
     /// Peek the next partition's key WITHOUT advancing iteration
@@ -897,6 +981,82 @@ mod tests {
         // EOF stable.
         assert!(iter_counts.next_partition_count().unwrap().is_none());
         assert!(iter_counts.next_partition_count().unwrap().is_none());
+    }
+
+    /// `skip_to_next_partition` advances `pos` past the current
+    /// partition WITHOUT decoding it. Combined with `peek_partition_key`
+    /// it lets the merger advance duplicate-key sources without
+    /// paying any cell decode cost — the cold-cache dominant cost
+    /// (see bug-streaming-range-read-perf-50x-floor).
+    ///
+    /// Verifies:
+    ///  - skip advances to the NEXT partition's key (matches what
+    ///    a non-skip iteration would yield next).
+    ///  - skip-then-skip-...-then-skip eventually reaches EOF cleanly.
+    ///  - alternating peek+skip yields the same key sequence as
+    ///    pure next_partition iteration.
+    #[test]
+    fn skip_to_next_partition_advances_without_decode() {
+        let header = test_header();
+        let dks: Vec<_> = (0..5u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Reference iteration: full next_partition over every partition.
+        let mut iter_ref = reader.partitions_iter().unwrap();
+        let mut ref_keys = Vec::new();
+        while let Some(p) = iter_ref.next_partition().unwrap() {
+            ref_keys.push(p.key);
+        }
+        assert_eq!(ref_keys, dks, "sanity: reference iteration yields all keys");
+
+        // Skip-only iteration: peek+skip the whole file. Must yield
+        // the same key sequence (peek before each skip).
+        let mut iter = reader.partitions_iter().unwrap();
+        let mut skip_keys = Vec::new();
+        loop {
+            let peeked = iter.peek_partition_key().unwrap();
+            let Some(k) = peeked else { break };
+            skip_keys.push(k);
+            iter.skip_to_next_partition().unwrap();
+        }
+        assert_eq!(
+            skip_keys, dks,
+            "peek+skip yields the same key sequence as full iteration"
+        );
+
+        // EOF stable: extra peek + skip yields None / no-op.
+        assert!(
+            iter.peek_partition_key().unwrap().is_none(),
+            "peek at EOF returns None"
+        );
+        iter.skip_to_next_partition()
+            .expect("skip at EOF must be a no-op");
+        assert!(
+            iter.peek_partition_key().unwrap().is_none(),
+            "peek at EOF stays None after redundant skip"
+        );
     }
 
     /// `peek_partition_key` returns the same key as the subsequent

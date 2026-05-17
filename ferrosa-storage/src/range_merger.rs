@@ -131,6 +131,32 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
             }
         }
     }
+
+    /// Advance past the currently-peeked partition WITHOUT decoding
+    /// its body — used by the merger's duplicate-key dedup loop.
+    /// For SSTable sources, this uses the lazy partition-offset
+    /// cache so the cost is a single binary search + pos
+    /// assignment. For memtable sources, we just discard the cached
+    /// peek (the memtable iterator already yielded the partition
+    /// during peek, so advancing is "drop the cached peek").
+    fn skip_peeked_partition(&mut self) -> Result<()> {
+        match self {
+            Self::Memtable { peeked, .. } => {
+                peeked.take();
+                Ok(())
+            }
+            Self::SsTable {
+                iter, peeked_key, ..
+            } => {
+                peeked_key.take();
+                iter.skip_to_next_partition()
+            }
+            Self::SsTableRun { run, peeked_key } => {
+                peeked_key.take();
+                run.skip_to_next_partition()
+            }
+        }
+    }
 }
 
 /// Iterator over a sequence of token-disjoint SSTables — emits
@@ -164,6 +190,44 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
             mode,
             cursor: 0,
             current: None,
+        }
+    }
+
+    /// Skip past the partition currently at the front of this run
+    /// WITHOUT decoding it. If the current SSTable is exhausted,
+    /// advance to the next SSTable in the run. Used by the merger's
+    /// duplicate-key dedup loop via
+    /// `MergeSource::skip_peeked_partition`.
+    fn skip_to_next_partition(&mut self) -> Result<()> {
+        loop {
+            if self.current.is_none() {
+                if self.cursor >= self.sstables.len() {
+                    return Ok(());
+                }
+                match self.sstables[self.cursor].partitions_iter() {
+                    Ok(it) => self.current = Some(it),
+                    Err(e) => {
+                        tracing::warn!(
+                            cursor = self.cursor,
+                            "SsTableRunIter: skip open failed, skipping table: {e}"
+                        );
+                        self.cursor += 1;
+                        continue;
+                    }
+                }
+            }
+            let it = self.current.as_mut().expect("just initialised");
+            it.skip_to_next_partition()?;
+            // If the iterator is now at EOF, advance to the next
+            // SSTable so the next peek_key sees the run's next
+            // partition.
+            match it.peek_partition_key()? {
+                Some(_) => return Ok(()),
+                None => {
+                    self.current = None;
+                    self.cursor += 1;
+                }
+            }
         }
     }
 
@@ -624,9 +688,6 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         let first_partition = match self.sources[first_src].pop_partition() {
             Ok(Some(p)) => p,
             Ok(None) => {
-                // Source exhausted between peek and pop — should not
-                // happen for our single-threaded sources. Skip and
-                // continue: refill and try again.
                 self.refill_source(first_src);
                 return self.next_merged_partition();
             }
@@ -635,7 +696,6 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         let mut group: Vec<Partition> = vec![first_partition];
         let mut popped_srcs: Vec<usize> = vec![first_src];
 
-        // Drain any other heap entries with the SAME key.
         while let Some(top) = self.heap.peek() {
             if top.key != key {
                 break;
@@ -647,14 +707,11 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                     group.push(p);
                 }
                 None => {
-                    // Defensive: peek said Some, pop said None. Skip.
                     popped_srcs.push(entry.src);
                 }
             }
         }
 
-        // Refill every source we drained from so the next call sees
-        // a fresh peek.
         for src in popped_srcs {
             self.refill_source(src);
         }
