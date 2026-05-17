@@ -220,6 +220,7 @@ impl WritePath {
         &self,
         table_id: &TableId,
         wanted: Vec<u16>,
+        partition_limit: Option<usize>,
     ) -> crate::error::Result<Vec<Partition>> {
         use futures::stream::StreamExt;
         let engine = match self {
@@ -233,9 +234,16 @@ impl WritePath {
             }
         };
         let mut stream = engine.range_iter_projected(table_id, wanted, None, None);
+        let cap = partition_limit.unwrap_or(usize::MAX);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             out.push(item.map_err(crate::error::ClusterError::Storage)?);
+            if out.len() >= cap {
+                // Drop the stream so the producer task sees the
+                // channel close and bails out of the merger early.
+                drop(stream);
+                break;
+            }
         }
         Ok(out)
     }

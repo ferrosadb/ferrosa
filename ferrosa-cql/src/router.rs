@@ -182,6 +182,104 @@ fn prepare_order_by_execution(
     }
 }
 
+/// ADR-020 projection fast path eligibility + ordinal computation.
+///
+/// Returns `Some(wanted)` if the SELECT statement is safe to route
+/// through `WritePath::range_read_projected`, where `wanted` is the
+/// storage-ordinal Vec of regular columns the projection asks for.
+/// Returns `None` otherwise — the caller falls back to the legacy
+/// `range_read` path.
+///
+/// Eligibility:
+/// - All SELECT items are `SelectColumn::Column(_)` (no `*`, no
+///   function calls — those need every cell).
+/// - Static columns are not projected. The storage projection
+///   target is `regular_columns` ordinal space; a SELECT that names
+///   a static column needs a different path (static rows live in
+///   `Partition::static_row`, separate from `Partition::rows[*].cells`).
+///   We fall back to the legacy path in that case rather than silently
+///   dropping static values.
+///
+/// An empty `wanted` Vec (e.g. `SELECT pk, ck FROM t` — projects
+/// only PK/CK, no regular columns) is the BEST case: the SSTable
+/// layer byte-skips every cell. PK comes from the partition key
+/// bytes, CK from `Row.clustering` — both are already present in
+/// every row regardless of cell projection.
+///
+/// Ordinal mapping mirrors `ferrosa_schema::convert` (Vec of regular
+/// columns sorted by `ColumnMetadata.position`) so the indexes match
+/// `SerializationHeader::regular_columns` on disk.
+///
+/// The caller must additionally confirm WHERE is empty — a predicate
+/// on a non-projected regular column would silently evaluate against
+/// the stripped (NULL) cell and produce wrong results.
+fn projection_storage_ordinals(
+    select_columns: &[SelectColumn],
+    table_meta: &TableMetadata,
+) -> Option<Vec<u16>> {
+    // All projected items must be simple column names.
+    let names: Vec<&str> = select_columns
+        .iter()
+        .map(|c| match c {
+            SelectColumn::Column(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // Build the regular column list in `position` order — exactly
+    // what `ferrosa_schema::convert` emits into the SSTable's
+    // SerializationHeader.regular_columns.
+    let mut regulars: Vec<&ColumnMetadata> = table_meta
+        .columns
+        .values()
+        .filter(|c| c.kind == ColumnKind::Regular)
+        .collect();
+    regulars.sort_by_key(|c| c.position);
+
+    let mut wanted: Vec<u16> = Vec::new();
+    for name in &names {
+        if let Some(col) = table_meta
+            .columns
+            .iter()
+            .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
+            .map(|(_, c)| c)
+        {
+            match col.kind {
+                ColumnKind::Regular => {
+                    if let Some(idx) = regulars
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                    {
+                        wanted.push(idx as u16);
+                    }
+                }
+                ColumnKind::PartitionKey | ColumnKind::Clustering => {
+                    // Live in the partition-key bytes / clustering
+                    // bytes, not cells. No-op for `wanted`; the row
+                    // carries them regardless of cell projection.
+                }
+                ColumnKind::Static => {
+                    // Static columns live in Partition::static_row,
+                    // not in Partition::rows[*].cells. The current
+                    // projected path doesn't yet handle static
+                    // columns separately — bail out so the legacy
+                    // path returns the full static row correctly.
+                    return None;
+                }
+            }
+        } else {
+            // Unknown column name — bail out so the legacy path
+            // returns the right error.
+            return None;
+        }
+    }
+    // An empty `wanted` is intentional and valid: SELECT pk, ck
+    // (no regular columns) means "skip every cell". The SSTable
+    // layer's `read_partition_projected` accepts `&[]` and returns
+    // rows whose `cells` is empty — exactly what we want.
+    Some(wanted)
+}
+
 fn is_count_only_select(columns: &[SelectColumn]) -> bool {
     !columns.is_empty()
         && columns.iter().all(|c| {
@@ -2441,7 +2539,35 @@ async fn route_select_user_table(
                 let row_limit =
                     safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
                         .unwrap_or(0);
-                let partitions = if let Some(bound) = scan_bound {
+                // ADR-020 projection fast path. If the SELECT names
+                // a subset of regular columns and has no WHERE, route
+                // through range_read_projected so the SSTable layer
+                // byte-skips cell payloads for unprojected columns.
+                // Big win on wide tables with bulky cells (e.g.
+                // entity_store's entity_embedding column).
+                //
+                // Requires no WHERE (a predicate on an unprojected
+                // regular column would see NULL after the cell strip
+                // and evaluate incorrectly). LIMIT and ORDER BY are
+                // applied downstream against the projected rows
+                // unchanged — both work on whatever cells are present.
+                let projection_wanted = if !count_only_select
+                    && s.where_clauses.is_empty()
+                {
+                    projection_storage_ordinals(&s.columns, table_meta)
+                } else {
+                    None
+                };
+                let partitions = if let Some(wanted) = projection_wanted {
+                    // Push partition-count cap down to the merger so
+                    // `LIMIT N` stops the scan after N partitions
+                    // rather than walking every SSTable.
+                    state
+                        .write_path
+                        .load()
+                        .range_read_projected(&table_id, wanted, scan_bound)
+                        .await?
+                } else if let Some(bound) = scan_bound {
                     state
                         .write_path
                         .load()
