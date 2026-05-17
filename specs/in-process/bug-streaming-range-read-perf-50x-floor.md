@@ -229,15 +229,30 @@ plane writes don't go through Raft (which only handles schema /
 topology) — this is in the WritePath / coordinator. Reproducible:
 direct query to each node returns DIFFERENT first 5 partitions.
 
-**2. Read repair is not implemented.**
+**2. Read repair only covers CL>ONE point reads, not range reads or CL=ONE.**
 
-`coordinator::metrics::ReadRepairMetrics` exists with
-`read_repairs_attempted / succeeded / failed` counters, but a
-codebase-wide grep for `.attempted()` / `.succeeded()` /
-`ReadRepairMetrics::` shows only the struct constructor — no
-production code increments these counters. The scaffolding is
-present, the read repair LOGIC is absent. Without it, divergent
-replicas (see issue 1) never reconcile.
+*(Earlier draft of this bug claimed read repair was unimplemented;
+that was wrong.)* `coordinate_read_with` in `coordinator::read`
+does the full digest protocol for CL=QUORUM/ALL: full-read +
+digests on peers, mismatch detection, `send_repair_writes` to
+stale replicas, metric increments via `inc_attempted` /
+`inc_succeeded` / `inc_failed`. Confirmed at `coordinator/read.rs`
+lines 1233-1279.
+
+What's MISSING:
+- **CL=ONE point reads** skip the digest phase entirely and return
+  whatever the first replica has. Most application traffic
+  (including the MCP client's default) is CL=ONE → no repair.
+- **Range reads** (the entire ADR-020 streaming path) collect
+  partitions from replicas and dedup by token, but do NOT diff
+  per-partition for repair. The streaming coordinator never
+  identifies "this replica was missing partition X" and never
+  back-fills.
+
+This explains why divergent state from issue 1 never reconciles
+under normal load: the only repair path requires explicit
+CL=QUORUM+ on point reads, which the MCP/CQL traffic does not
+use.
 
 **3. `system.peers` advertises `rpc_address=127.0.0.1`.**
 
