@@ -148,8 +148,7 @@ impl Memtable for SkipListMemtable {
                 .iter()
                 .filter(move |entry| {
                     let key = entry.key();
-                    start.as_ref().is_none_or(|s| key >= s)
-                        && end.as_ref().is_none_or(|e| key <= e)
+                    start.as_ref().is_none_or(|s| key >= s) && end.as_ref().is_none_or(|e| key <= e)
                 })
                 .map(|entry| {
                     let guard = entry.value().load();

@@ -473,9 +473,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// `O(num_sources × header_read) + O(N × body_decode)`.
     ///
     /// Returns `Ok(None)` at EOF.
-    pub fn peek_partition_key(
-        &mut self,
-    ) -> Result<Option<ferrosa_common::key::DecoratedKey>> {
+    pub fn peek_partition_key(&mut self) -> Result<Option<ferrosa_common::key::DecoratedKey>> {
         let header = &self.sst.header;
         if let Some(ref buf) = self.decompressed {
             let slice: &[u8] = buf.as_slice();
@@ -498,9 +496,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// COUNT(*) fast path where the storage layer needs row-level
     /// dedup via `merge::merge_partitions` but doesn't need cell
     /// data. Returns `Ok(None)` at EOF.
-    pub fn next_partition_metadata(
-        &mut self,
-    ) -> Result<Option<crate::types::Partition>> {
+    pub fn next_partition_metadata(&mut self) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
         if let Some(ref buf) = self.decompressed {
             let slice: &[u8] = buf.as_slice();
@@ -1119,7 +1115,10 @@ mod tests {
         }
         // EOF: peek and next both yield None, repeatedly.
         assert!(iter.peek_partition_key().unwrap().is_none(), "peek at EOF");
-        assert!(iter.peek_partition_key().unwrap().is_none(), "peek EOF stable");
+        assert!(
+            iter.peek_partition_key().unwrap().is_none(),
+            "peek EOF stable"
+        );
         assert!(iter.next_partition().unwrap().is_none(), "next at EOF");
     }
 
@@ -1251,10 +1250,7 @@ mod tests {
                 // Full had column 0; ensure projection didn't drop it.
                 let full_has_col0 = fr.cells.iter().any(|(c, _)| *c == 0);
                 let proj_has_col0 = pr.cells.iter().any(|(c, _)| *c == 0);
-                assert_eq!(
-                    proj_has_col0, full_has_col0,
-                    "column 0 presence preserved"
-                );
+                assert_eq!(proj_has_col0, full_has_col0, "column 0 presence preserved");
             }
         }
 

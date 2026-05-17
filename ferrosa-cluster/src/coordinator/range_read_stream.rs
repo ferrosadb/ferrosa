@@ -65,10 +65,7 @@ impl ClusterCoordinator {
     /// keys across replicas would defeat the optimization — that
     /// is a separate design (and matches Cassandra's "COUNT is
     /// eventually consistent by default" semantics).
-    pub fn coordinate_range_count(
-        &self,
-        table_id: &TableId,
-    ) -> crate::error::Result<u64> {
+    pub fn coordinate_range_count(&self, table_id: &TableId) -> crate::error::Result<u64> {
         self.storage
             .count_range(table_id, None, None)
             .map_err(ClusterError::Storage)
@@ -231,11 +228,9 @@ impl ClusterCoordinator {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
         };
-        let req_body = Bytes::from(
-            bincode::serialize(&req_payload).map_err(|e| {
-                ClusterError::Internal(format!("streaming range read: encode request: {e}"))
-            })?,
-        );
+        let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
+            ClusterError::Internal(format!("streaming range read: encode request: {e}"))
+        })?);
 
         let mut fire_failures: Vec<(uuid::Uuid, String)> = Vec::new();
         for (host_id, _addr) in &remotes {

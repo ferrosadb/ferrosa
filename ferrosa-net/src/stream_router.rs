@@ -211,7 +211,10 @@ mod tests {
         assert_eq!(rx.recv().await, None, "unregister closes the channel");
         // And subsequent routes return NoRoute, not ChannelClosed —
         // the entry is gone.
-        assert_eq!(router.route(5, chunk(0)).unwrap_err(), RouteError::NoRoute(5));
+        assert_eq!(
+            router.route(5, chunk(0)).unwrap_err(),
+            RouteError::NoRoute(5)
+        );
     }
 
     #[tokio::test]

@@ -991,13 +991,7 @@ impl<F: FlushTarget> TableStore<F> {
         partition_limit: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn futures::stream::Stream<
-                    Item = Result<Partition>,
-                > + Send,
-        >,
-    > {
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
         // Buffer is intentionally small. The producer runs on a
         // spawn_blocking thread and per-partition body decode on cold
         // cache is the dominant cost (wide rows + embedding cells +
@@ -1082,13 +1076,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn futures::stream::Stream<
-                    Item = Result<Partition>,
-                > + Send,
-        >,
-    > {
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
         /// Per-stream channel buffer. Kept small because per-partition
         /// decode on cold cache is expensive (wide rows + cell decode)
         /// and a `LIMIT N` consumer should pay for ~N body decodes,

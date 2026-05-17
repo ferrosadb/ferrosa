@@ -2551,9 +2551,7 @@ async fn route_select_user_table(
                 // and evaluate incorrectly). LIMIT and ORDER BY are
                 // applied downstream against the projected rows
                 // unchanged — both work on whatever cells are present.
-                let projection_wanted = if !count_only_select
-                    && s.where_clauses.is_empty()
-                {
+                let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
                     projection_storage_ordinals(&s.columns, table_meta)
                 } else {
                     None

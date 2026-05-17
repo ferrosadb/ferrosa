@@ -68,7 +68,8 @@ pub async fn stream_range_response<S: ChunkSink>(
         };
         let bytes = bincode::serialize(&payload)
             .expect("RangeReadStreamChunkPayload serialization is infallible");
-        sink.send(Message::RangeReadStreamChunk(Bytes::from(bytes))).await;
+        sink.send(Message::RangeReadStreamChunk(Bytes::from(bytes)))
+            .await;
         seq = seq.saturating_add(1);
     }
 
@@ -77,9 +78,10 @@ pub async fn stream_range_response<S: ChunkSink>(
         total_chunks: seq,
         truncated,
     };
-    let bytes = bincode::serialize(&done)
-        .expect("RangeReadStreamDonePayload serialization is infallible");
-    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes))).await;
+    let bytes =
+        bincode::serialize(&done).expect("RangeReadStreamDonePayload serialization is infallible");
+    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes)))
+        .await;
 }
 
 #[cfg(test)]

@@ -239,8 +239,7 @@ impl WritePath {
         // `STREAM_BUFFER` body decodes after the consumer has
         // already read enough, and on cold cache each of those
         // wasted body decodes is ~hundreds of ms.
-        let mut stream =
-            engine.range_iter_projected(table_id, wanted, partition_limit, None, None);
+        let mut stream = engine.range_iter_projected(table_id, wanted, partition_limit, None, None);
         let cap = partition_limit.unwrap_or(usize::MAX);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {

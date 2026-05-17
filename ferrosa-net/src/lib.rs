@@ -18,6 +18,6 @@ pub mod pool;
 pub mod protocol;
 pub mod reconnect;
 pub mod rpc;
-pub mod stream_router;
 pub mod skew;
+pub mod stream_router;
 pub mod tls;

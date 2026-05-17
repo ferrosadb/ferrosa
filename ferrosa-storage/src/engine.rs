@@ -2150,15 +2150,13 @@ impl StorageEngine {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
-        Box<
-            dyn futures::stream::Stream<
-                    Item = ferrosa_common::Result<Partition>,
-                > + Send,
-        >,
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.range_iter_projected(wanted, partition_limit, start, end),
+            Some(state) => state
+                .store
+                .range_iter_projected(wanted, partition_limit, start, end),
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -2178,11 +2176,7 @@ impl StorageEngine {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
-        Box<
-            dyn futures::stream::Stream<
-                    Item = ferrosa_common::Result<Partition>,
-                > + Send,
-        >,
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
@@ -3039,8 +3033,7 @@ impl StorageEngine {
             // a single slow upload can't starve the poll loop. The
             // pending-log entry from Step 1 means we lose no durability
             // by giving up here — sync_sstables_to_s3 will pick it up.
-            const UPLOAD_AWAIT_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(15);
+            const UPLOAD_AWAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
             let rx_result = match tokio::time::timeout(UPLOAD_AWAIT_TIMEOUT, rx).await {
                 Ok(r) => r,
                 Err(_) => {

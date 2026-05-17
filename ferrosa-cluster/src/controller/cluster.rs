@@ -892,10 +892,8 @@ impl ModeController {
             sink_factory,
             STREAMING_CHUNK_PARTITIONS,
         ));
-        self.registry.register(
-            MsgType::RangeReadStreamRequest,
-            stream_request_handler,
-        );
+        self.registry
+            .register(MsgType::RangeReadStreamRequest, stream_request_handler);
 
         // Coordinator side: routes inbound chunk/heartbeat/done
         // frames through the coordinator's shared StreamRouter so
@@ -904,18 +902,12 @@ impl ModeController {
         // streaming response MsgTypes.
         use crate::coordinator::stream_frame_router::StreamFrameRouter;
         let frame_router = Arc::new(StreamFrameRouter::new(stream_router_for_handler));
-        self.registry.register(
-            MsgType::RangeReadStreamChunk,
-            frame_router.clone(),
-        );
-        self.registry.register(
-            MsgType::RangeReadStreamHeartbeat,
-            frame_router.clone(),
-        );
-        self.registry.register(
-            MsgType::RangeReadStreamDone,
-            frame_router,
-        );
+        self.registry
+            .register(MsgType::RangeReadStreamChunk, frame_router.clone());
+        self.registry
+            .register(MsgType::RangeReadStreamHeartbeat, frame_router.clone());
+        self.registry
+            .register(MsgType::RangeReadStreamDone, frame_router);
 
         let index_read_handler = Arc::new(IndexReadHandler::new(self.storage.clone()));
         self.registry

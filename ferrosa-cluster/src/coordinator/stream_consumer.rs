@@ -130,8 +130,7 @@ pub async fn consume_range_stream(
             Message::RangeReadStreamChunk(bytes) => {
                 let chunk = decode_chunk(request_id, bytes)?;
                 outcome.total_chunks = outcome.total_chunks.saturating_add(1);
-                observed_chunks_per_replica =
-                    observed_chunks_per_replica.saturating_add(1);
+                observed_chunks_per_replica = observed_chunks_per_replica.saturating_add(1);
                 outcome
                     .partitions
                     .extend(chunk.partitions.into_iter().map(partition_from_wire));
@@ -313,7 +312,9 @@ mod tests {
         tx.send(chunk_msg(0, vec![make_partition(1), make_partition(2)]))
             .await
             .unwrap();
-        tx.send(chunk_msg(1, vec![make_partition(3)])).await.unwrap();
+        tx.send(chunk_msg(1, vec![make_partition(3)]))
+            .await
+            .unwrap();
         tx.send(done_msg(2, false)).await.unwrap();
 
         let outcome = consume_range_stream(rx, IDLE, 1, REQ_ID).await.unwrap();
@@ -331,7 +332,9 @@ mod tests {
     async fn heartbeats_keep_stream_alive_and_are_not_counted_as_chunks() {
         let (tx, rx) = mpsc::channel(8);
         tx.send(heartbeat_msg(0)).await.unwrap();
-        tx.send(chunk_msg(0, vec![make_partition(1)])).await.unwrap();
+        tx.send(chunk_msg(0, vec![make_partition(1)]))
+            .await
+            .unwrap();
         tx.send(heartbeat_msg(1)).await.unwrap();
         tx.send(done_msg(1, false)).await.unwrap();
 
@@ -347,8 +350,12 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         // Replica A: 1 chunk + done. Replica B: 1 chunk + done.
         // Interleaved on the same routed channel.
-        tx.send(chunk_msg(0, vec![make_partition(0xA)])).await.unwrap();
-        tx.send(chunk_msg(0, vec![make_partition(0xB)])).await.unwrap();
+        tx.send(chunk_msg(0, vec![make_partition(0xA)]))
+            .await
+            .unwrap();
+        tx.send(chunk_msg(0, vec![make_partition(0xB)]))
+            .await
+            .unwrap();
         tx.send(done_msg(2, false)).await.unwrap();
         // First Done consumed → still waiting for the second.
         tx.send(done_msg(0, false)).await.unwrap();
@@ -379,7 +386,9 @@ mod tests {
     #[tokio::test]
     async fn channel_close_before_done_surfaces_partial() {
         let (tx, rx) = mpsc::channel(8);
-        tx.send(chunk_msg(0, vec![make_partition(1)])).await.unwrap();
+        tx.send(chunk_msg(0, vec![make_partition(1)]))
+            .await
+            .unwrap();
         drop(tx); // no Done
 
         let err = consume_range_stream(rx, IDLE, 1, REQ_ID).await.unwrap_err();
@@ -428,7 +437,9 @@ mod tests {
         // Done first (race winner), Chunk after — simulates the
         // server-side Chunk-vs-Done dispatch race.
         tx.send(done_msg(1, false)).await.unwrap();
-        tx.send(chunk_msg(0, vec![make_partition(1)])).await.unwrap();
+        tx.send(chunk_msg(0, vec![make_partition(1)]))
+            .await
+            .unwrap();
         drop(tx);
 
         let outcome = consume_range_stream(rx, IDLE, 1, REQ_ID).await.unwrap();

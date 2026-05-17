@@ -675,12 +675,10 @@ mod tests {
             let mutation = crate::pair::coordinator::decode_mutation(&body).ok()?;
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
             for row in &mutation.rows {
-                if let Err(e) = self.storage.write(
-                    &table_id,
-                    &mutation.key,
-                    row.clone(),
-                    mutation.timestamp,
-                ) {
+                if let Err(e) =
+                    self.storage
+                        .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
+                {
                     tracing::warn!(%e, "test handler: write failed — withholding ACK");
                     return None;
                 }
@@ -1007,8 +1005,12 @@ mod tests {
             "remote B row count diverged from local"
         );
 
-        server_a.shutdown(std::time::Duration::from_millis(50)).await;
-        server_b.shutdown(std::time::Duration::from_millis(50)).await;
+        server_a
+            .shutdown(std::time::Duration::from_millis(50))
+            .await;
+        server_b
+            .shutdown(std::time::Duration::from_millis(50))
+            .await;
     }
 
     // ---------------------------------------------------------------------------

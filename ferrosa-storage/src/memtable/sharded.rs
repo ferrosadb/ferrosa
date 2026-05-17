@@ -269,8 +269,7 @@ impl Memtable for ShardedBTreeMemtable {
             let guard = shard.read();
             let mut v = Vec::new();
             for (key, arc) in guard.iter() {
-                if start.as_ref().is_none_or(|s| key >= s)
-                    && end.as_ref().is_none_or(|e| key <= e)
+                if start.as_ref().is_none_or(|s| key >= s) && end.as_ref().is_none_or(|e| key <= e)
                 {
                     v.push(Arc::clone(arc));
                 }

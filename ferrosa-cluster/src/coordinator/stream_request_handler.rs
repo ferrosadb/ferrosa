@@ -66,17 +66,11 @@ pub trait StreamRangeReader: Send + Sync {
     /// failures (table not found, etc.); per-partition decode
     /// failures surface inside the stream so a corrupt SSTable
     /// page can be skipped without aborting the whole scan.
-    fn range_iter<'a>(
-        &'a self,
-        table_id: &TableId,
-    ) -> ferrosa_common::Result<PartitionStream<'a>>;
+    fn range_iter<'a>(&'a self, table_id: &TableId) -> ferrosa_common::Result<PartitionStream<'a>>;
 }
 
 impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
-    fn range_iter<'a>(
-        &'a self,
-        table_id: &TableId,
-    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+    fn range_iter<'a>(&'a self, table_id: &TableId) -> ferrosa_common::Result<PartitionStream<'a>> {
         // ADR-020 Phase 2 backing: StorageEngine::range_iter returns
         // a Stream backed by crate::range_merger::RangeMerger — a
         // k-way merge across memtable + flushing memtable + per-SSTable
@@ -193,9 +187,10 @@ pub async fn handle_stream_request<R, S>(
         total_chunks: total_chunks_emitted,
         truncated: any_decode_error,
     };
-    let bytes = bincode::serialize(&done)
-        .expect("RangeReadStreamDonePayload serialization is infallible");
-    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes))).await;
+    let bytes =
+        bincode::serialize(&done).expect("RangeReadStreamDonePayload serialization is infallible");
+    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes)))
+        .await;
 }
 
 /// Build a `RangeReadStreamChunk` from `batch`, send it via `sink`,
@@ -221,21 +216,20 @@ async fn emit_chunk<S: ChunkSink>(
     };
     let bytes = bincode::serialize(&payload)
         .expect("RangeReadStreamChunkPayload serialization is infallible");
-    sink.send(Message::RangeReadStreamChunk(Bytes::from(bytes))).await;
+    sink.send(Message::RangeReadStreamChunk(Bytes::from(bytes)))
+        .await;
 }
 
-async fn send_truncated_done<S: ChunkSink>(
-    req: &RangeReadStreamRequestPayload,
-    sink: &S,
-) {
+async fn send_truncated_done<S: ChunkSink>(req: &RangeReadStreamRequestPayload, sink: &S) {
     let done = RangeReadStreamDonePayload {
         request_id: req.request_id,
         total_chunks: 0,
         truncated: true,
     };
-    let bytes = bincode::serialize(&done)
-        .expect("RangeReadStreamDonePayload serialization is infallible");
-    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes))).await;
+    let bytes =
+        bincode::serialize(&done).expect("RangeReadStreamDonePayload serialization is infallible");
+    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes)))
+        .await;
 }
 
 /// `RpcHandler` shell. Decodes the request, spawns the streaming
@@ -599,12 +593,7 @@ mod tests {
             &'a self,
             _table_id: &TableId,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
-            let ps = self
-                .partitions
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_default();
+            let ps = self.partitions.lock().unwrap().take().unwrap_or_default();
             let counter = self.partitions_yielded.clone();
             // Yield Ok(partition) one at a time, bumping the
             // counter on each successful pull. The handler's

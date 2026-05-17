@@ -697,10 +697,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// arithmetic isn't trusted.
     ///
     /// Returns `Ok(None)` at EOF.
-    pub fn read_partition_projected(
-        &mut self,
-        wanted: &[u16],
-    ) -> Result<Option<Partition>> {
+    pub fn read_partition_projected(&mut self, wanted: &[u16]) -> Result<Option<Partition>> {
         let file_len = self.reader.len()?;
         if self.pos >= file_len {
             return Ok(None);
@@ -756,12 +753,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// `wanted`, otherwise skip it via `read_cell_skip`. The
     /// returned `Row.cells` contains only the cells the caller asked
     /// for.
-    fn read_row_projected(
-        &mut self,
-        flags: u8,
-        is_static: bool,
-        wanted: &[u16],
-    ) -> Result<Row> {
+    fn read_row_projected(&mut self, flags: u8, is_static: bool, wanted: &[u16]) -> Result<Row> {
         // Clustering (same as read_row).
         let clustering = if is_static {
             Vec::new()

@@ -139,6 +139,11 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
     /// assignment. For memtable sources, we just discard the cached
     /// peek (the memtable iterator already yielded the partition
     /// during peek, so advancing is "drop the cached peek").
+    ///
+    /// `allow(dead_code)`: wired but not yet applied in the dedup
+    /// loop — see the matching note on
+    /// `SsTableRunIter::skip_to_next_partition`.
+    #[allow(dead_code)]
     fn skip_peeked_partition(&mut self) -> Result<()> {
         match self {
             Self::Memtable { peeked, .. } => {
@@ -198,6 +203,14 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
     /// advance to the next SSTable in the run. Used by the merger's
     /// duplicate-key dedup loop via
     /// `MergeSource::skip_peeked_partition`.
+    ///
+    /// `allow(dead_code)`: the primitive is wired but the dedup
+    /// loop in `next_merged_partition` does not yet apply it
+    /// conditionally — that requires surfacing the table's
+    /// clustering shape so we only skip when the body decode is
+    /// safe to drop (single-row partitions). See
+    /// `bug-streaming-range-read-perf-50x-floor.md`.
+    #[allow(dead_code)]
     fn skip_to_next_partition(&mut self) -> Result<()> {
         loop {
             if self.current.is_none() {
@@ -398,136 +411,153 @@ pub fn group_disjoint_runs(bounds: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<usize>> {
     runs
 }
 
-#[cfg(test)]
-mod tests {
-    use super::group_disjoint_runs;
+/// Convenience constructor: build a merger from explicit source
+/// inputs. `active_iter` and `flushing_iter` are memtable iterators;
+/// `sstables` are the per-SSTable Arcs whose `partitions_iter()`
+/// will be consumed.
+pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    Ok(build_merger_with_runs(
+        active_iter,
+        flushing_iter,
+        sstables,
+        RunMode::Full,
+        start,
+        end,
+    ))
+}
 
-    fn b(s: &[u8]) -> Vec<u8> {
-        s.to_vec()
-    }
+/// Projection variant: SSTables decode only the cells whose
+/// ordinals are in `wanted`; memtable contributions retain their
+/// full cells (already in memory; stripping costs more than it
+/// saves). `merge::merge_partitions` correctly merges across the
+/// mixed-projection rows because dedup is keyed on the clustering
+/// key, not on the cell payload. Used by the CQL projection fast
+/// path.
+pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    wanted: &'a [u16],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    Ok(build_merger_with_runs(
+        active_iter,
+        flushing_iter,
+        sstables,
+        RunMode::Projected(wanted),
+        start,
+        end,
+    ))
+}
 
-    /// Token-disjoint SSTables in input order collapse into a
-    /// single run — the dream LSM-leveled state.
-    #[test]
-    fn disjoint_in_order_yields_one_run() {
-        let bounds = vec![
-            (b(b"a"), b(b"c")),
-            (b(b"d"), b(b"f")),
-            (b(b"g"), b(b"i")),
-        ];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs.len(), 1, "all disjoint → exactly one run");
-        assert_eq!(runs[0], vec![0, 1, 2]);
-    }
+/// Metadata-only variant: SSTables use `next_partition_metadata`
+/// so cell payloads are byte-skipped. Memtables still contribute
+/// full partitions (they're already in memory; stripping cells
+/// would cost a clone with no IO savings — `merge::merge_partitions`
+/// produces the correct merged shape anyway, and the caller is
+/// expected to read only `rows.len()` / `clustering` from the
+/// output). Used by the COUNT(*) fast path.
+pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    Ok(build_merger_with_runs(
+        active_iter,
+        flushing_iter,
+        sstables,
+        RunMode::Metadata,
+        start,
+        end,
+    ))
+}
 
-    /// Disjoint SSTables given OUT OF ORDER still collapse into one
-    /// run, with the run sorted by smallest key. Proves the sort
-    /// step works.
-    #[test]
-    fn disjoint_out_of_order_sorts_into_one_run() {
-        let bounds = vec![
-            (b(b"g"), b(b"i")),
-            (b(b"a"), b(b"c")),
-            (b(b"d"), b(b"f")),
-        ];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs.len(), 1);
-        // Run holds indices sorted by smallest_key: 1 (a-c), 2
-        // (d-f), 0 (g-i).
-        assert_eq!(runs[0], vec![1, 2, 0]);
+/// Shared back-end for the three `merger_for_*_sources` constructors:
+/// group SSTables into token-disjoint runs (interval coloring), then
+/// build one `MergeSource::SsTableRun` per run rather than one
+/// `MergeSource::SsTable*` per SSTable. Cuts the merger heap's
+/// initial peek count from `O(num_sstables)` to `O(num_runs)` —
+/// dramatic for fragmented LSM states where the leader has 100+
+/// SSTables on a single table.
+fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    mode: RunMode<'a>,
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> RangeMerger<'a, R> {
+    // We can't actually keep the runs as `Vec<Vec<Arc<...>>>` because
+    // SsTableRunIter borrows from a slice (`&'a [Arc<...>]`), and a
+    // freshly allocated Vec<Arc<...>> wouldn't have the same lifetime
+    // as the input slice. Instead, we compute the run *indices* via
+    // `partition_into_disjoint_runs`, then turn those into
+    // `&'a [Arc<...>]` sub-slices into the original `sstables` slice
+    // by detecting contiguous-after-sort groupings.
+    //
+    // The greedy interval-coloring algorithm produces runs that are
+    // not necessarily *contiguous* in the input order — so we need
+    // to either:
+    //   (a) keep the per-run Vec owned by the merger, or
+    //   (b) accept that some runs will produce non-sorted output if
+    //       not stable-sorted.
+    //
+    // Option (a) is straightforward: own the per-run Vec, pass a
+    // borrow into the SsTableRunIter. We do that here.
+    let runs = partition_into_disjoint_runs(sstables);
+    // Move the Vec<Vec<Arc>> into a boxed slab the merger owns;
+    // SsTableRunIter holds `&'a [Arc<...>]` which we satisfy by
+    // leaking the slab to the merger's lifetime. We allocate it
+    // into a `Box<[Vec<Arc<...>>]>` and stash on the merger so it
+    // lives as long as the iterators borrowing from it.
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + runs.len());
+    sources.push(MergeSource::Memtable {
+        iter: active_iter,
+        peeked: None,
+    });
+    if let Some(it) = flushing_iter {
+        sources.push(MergeSource::Memtable {
+            iter: it,
+            peeked: None,
+        });
     }
-
-    /// Two SSTables with identical ranges cannot share a run — they
-    /// overlap. Output is two runs with one table each.
-    #[test]
-    fn fully_overlapping_split_across_runs() {
-        let bounds = vec![(b(b"a"), b(b"z")), (b(b"a"), b(b"z"))];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0], vec![0]);
-        assert_eq!(runs[1], vec![1]);
+    let mut owned_runs: Vec<Vec<Arc<SSTableReader<R>>>> = runs;
+    // We need a stable slice address per run. `Box<[Vec<...>]>` gives
+    // that — but borrowing from inside via `&self.runs[i]` requires
+    // the merger to own it. Stash into RangeMerger's `owned_runs`
+    // field (added below) and create SsTableRunIter borrowing from
+    // those entries.
+    //
+    // Lifetime trick: we extend the per-run slices to `'a` via the
+    // standard "self-ref with stable allocation" pattern — `Box<[T]>`
+    // owned by RangeMerger, slices into it that outlive the iters.
+    // This is sound because Vec<Arc<T>> never moves once boxed.
+    let runs_arena: Box<[Vec<Arc<SSTableReader<R>>>]> =
+        std::mem::take(&mut owned_runs).into_boxed_slice();
+    let runs_ptr: *const [Vec<Arc<SSTableReader<R>>>] = Box::leak(runs_arena);
+    // SAFETY: we own this allocation for the merger's lifetime and
+    // never move/free it until the merger is dropped (handled in
+    // RangeMerger::drop). The slices we hand to SsTableRunIter are
+    // therefore valid for `'a`.
+    let runs_ref: &'a [Vec<Arc<SSTableReader<R>>>] = unsafe { &*runs_ptr };
+    for run in runs_ref.iter() {
+        sources.push(MergeSource::SsTableRun {
+            run: SsTableRunIter::new(run.as_slice(), mode),
+            peeked_key: None,
+        });
     }
-
-    /// Partial overlap: [a,m] and [k,z] share keys k..m. Two runs.
-    #[test]
-    fn partial_overlap_two_runs() {
-        let bounds = vec![(b(b"a"), b(b"m")), (b(b"k"), b(b"z"))];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs.len(), 2);
-    }
-
-    /// Three tables where 0 and 1 overlap, but 2 is disjoint from
-    /// both. Greedy places 2 into run-0 (after 0) or run-1 (after
-    /// 1), whichever scanner reaches first — but the result must be
-    /// at most 2 runs (the count of pairwise overlaps at any
-    /// point).
-    #[test]
-    fn one_overlap_extra_disjoint_fits_into_existing_run() {
-        let bounds = vec![
-            (b(b"a"), b(b"m")), // run-0
-            (b(b"k"), b(b"q")), // overlaps with #0 → run-1
-            (b(b"r"), b(b"z")), // disjoint from both → fits into either
-        ];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs.len(), 2, "max overlap is 2 → 2 runs suffice");
-        let total_placed: usize = runs.iter().map(|r| r.len()).sum();
-        assert_eq!(total_placed, 3, "every input placed exactly once");
-    }
-
-    /// Three tables all overlapping at one token point → 3 runs.
-    /// Demonstrates worst-case fragmentation = number of intervals
-    /// covering the densest point.
-    #[test]
-    fn fully_overlapping_three_yields_three_runs() {
-        let bounds = vec![
-            (b(b"a"), b(b"z")),
-            (b(b"b"), b(b"y")),
-            (b(b"c"), b(b"x")),
-        ];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs.len(), 3);
-    }
-
-    /// Edge: empty input → empty output, no panic.
-    #[test]
-    fn empty_input_no_runs() {
-        let runs = group_disjoint_runs(&[]);
-        assert!(runs.is_empty());
-    }
-
-    /// Edge: single SSTable always yields exactly one run with one
-    /// member.
-    #[test]
-    fn single_table_one_run() {
-        let bounds = vec![(b(b"a"), b(b"z"))];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs, vec![vec![0]]);
-    }
-
-    /// Within each run, entries must be sorted by smallest key so
-    /// concatenation produces sorted output. This invariant is
-    /// load-bearing for the merger (SsTableRunIter walks the run
-    /// in order and assumes the result is globally token-sorted).
-    #[test]
-    fn runs_are_sorted_by_smallest_key_internally() {
-        let bounds = vec![
-            (b(b"d"), b(b"f")),
-            (b(b"a"), b(b"c")),
-            (b(b"g"), b(b"i")),
-            (b(b"j"), b(b"l")),
-        ];
-        let runs = group_disjoint_runs(&bounds);
-        assert_eq!(runs.len(), 1);
-        let run = &runs[0];
-        for w in run.windows(2) {
-            let prev_smallest = &bounds[w[0]].0;
-            let next_smallest = &bounds[w[1]].0;
-            assert!(
-                prev_smallest <= next_smallest,
-                "run not sorted: {prev_smallest:?} > {next_smallest:?}",
-            );
-        }
-    }
+    let mut merger = RangeMerger::new(sources, start, end);
+    merger.runs_arena = Some(runs_ptr);
+    merger
 }
 
 /// Heap entry: one peeked KEY per still-active source. The heap is
@@ -725,152 +755,122 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         Ok(Some(merged))
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::group_disjoint_runs;
 
-/// Convenience constructor: build a merger from explicit source
-/// inputs. `active_iter` and `flushing_iter` are memtable iterators;
-/// `sstables` are the per-SSTable Arcs whose `partitions_iter()`
-/// will be consumed.
-pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    start: Option<DecoratedKey>,
-    end: Option<DecoratedKey>,
-) -> Result<RangeMerger<'a, R>> {
-    Ok(build_merger_with_runs(
-        active_iter,
-        flushing_iter,
-        sstables,
-        RunMode::Full,
-        start,
-        end,
-    ))
-}
-
-/// Projection variant: SSTables decode only the cells whose
-/// ordinals are in `wanted`; memtable contributions retain their
-/// full cells (already in memory; stripping costs more than it
-/// saves). `merge::merge_partitions` correctly merges across the
-/// mixed-projection rows because dedup is keyed on the clustering
-/// key, not on the cell payload. Used by the CQL projection fast
-/// path.
-pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    wanted: &'a [u16],
-    start: Option<DecoratedKey>,
-    end: Option<DecoratedKey>,
-) -> Result<RangeMerger<'a, R>> {
-    Ok(build_merger_with_runs(
-        active_iter,
-        flushing_iter,
-        sstables,
-        RunMode::Projected(wanted),
-        start,
-        end,
-    ))
-}
-
-/// Metadata-only variant: SSTables use `next_partition_metadata`
-/// so cell payloads are byte-skipped. Memtables still contribute
-/// full partitions (they're already in memory; stripping cells
-/// would cost a clone with no IO savings — `merge::merge_partitions`
-/// produces the correct merged shape anyway, and the caller is
-/// expected to read only `rows.len()` / `clustering` from the
-/// output). Used by the COUNT(*) fast path.
-pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    start: Option<DecoratedKey>,
-    end: Option<DecoratedKey>,
-) -> Result<RangeMerger<'a, R>> {
-    Ok(build_merger_with_runs(
-        active_iter,
-        flushing_iter,
-        sstables,
-        RunMode::Metadata,
-        start,
-        end,
-    ))
-}
-
-/// Shared back-end for the three `merger_for_*_sources` constructors:
-/// group SSTables into token-disjoint runs (interval coloring), then
-/// build one `MergeSource::SsTableRun` per run rather than one
-/// `MergeSource::SsTable*` per SSTable. Cuts the merger heap's
-/// initial peek count from `O(num_sstables)` to `O(num_runs)` —
-/// dramatic for fragmented LSM states where the leader has 100+
-/// SSTables on a single table.
-fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    mode: RunMode<'a>,
-    start: Option<DecoratedKey>,
-    end: Option<DecoratedKey>,
-) -> RangeMerger<'a, R> {
-    // We can't actually keep the runs as `Vec<Vec<Arc<...>>>` because
-    // SsTableRunIter borrows from a slice (`&'a [Arc<...>]`), and a
-    // freshly allocated Vec<Arc<...>> wouldn't have the same lifetime
-    // as the input slice. Instead, we compute the run *indices* via
-    // `partition_into_disjoint_runs`, then turn those into
-    // `&'a [Arc<...>]` sub-slices into the original `sstables` slice
-    // by detecting contiguous-after-sort groupings.
-    //
-    // The greedy interval-coloring algorithm produces runs that are
-    // not necessarily *contiguous* in the input order — so we need
-    // to either:
-    //   (a) keep the per-run Vec owned by the merger, or
-    //   (b) accept that some runs will produce non-sorted output if
-    //       not stable-sorted.
-    //
-    // Option (a) is straightforward: own the per-run Vec, pass a
-    // borrow into the SsTableRunIter. We do that here.
-    let runs = partition_into_disjoint_runs(sstables);
-    // Move the Vec<Vec<Arc>> into a boxed slab the merger owns;
-    // SsTableRunIter holds `&'a [Arc<...>]` which we satisfy by
-    // leaking the slab to the merger's lifetime. We allocate it
-    // into a `Box<[Vec<Arc<...>>]>` and stash on the merger so it
-    // lives as long as the iterators borrowing from it.
-    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + runs.len());
-    sources.push(MergeSource::Memtable {
-        iter: active_iter,
-        peeked: None,
-    });
-    if let Some(it) = flushing_iter {
-        sources.push(MergeSource::Memtable {
-            iter: it,
-            peeked: None,
-        });
+    fn b(s: &[u8]) -> Vec<u8> {
+        s.to_vec()
     }
-    let mut owned_runs: Vec<Vec<Arc<SSTableReader<R>>>> = runs;
-    // We need a stable slice address per run. `Box<[Vec<...>]>` gives
-    // that — but borrowing from inside via `&self.runs[i]` requires
-    // the merger to own it. Stash into RangeMerger's `owned_runs`
-    // field (added below) and create SsTableRunIter borrowing from
-    // those entries.
-    //
-    // Lifetime trick: we extend the per-run slices to `'a` via the
-    // standard "self-ref with stable allocation" pattern — `Box<[T]>`
-    // owned by RangeMerger, slices into it that outlive the iters.
-    // This is sound because Vec<Arc<T>> never moves once boxed.
-    let runs_arena: Box<[Vec<Arc<SSTableReader<R>>>]> =
-        std::mem::take(&mut owned_runs).into_boxed_slice();
-    let runs_ptr: *const [Vec<Arc<SSTableReader<R>>>] = Box::leak(runs_arena);
-    // SAFETY: we own this allocation for the merger's lifetime and
-    // never move/free it until the merger is dropped (handled in
-    // RangeMerger::drop). The slices we hand to SsTableRunIter are
-    // therefore valid for `'a`.
-    let runs_ref: &'a [Vec<Arc<SSTableReader<R>>>] = unsafe { &*runs_ptr };
-    for run in runs_ref.iter() {
-        sources.push(MergeSource::SsTableRun {
-            run: SsTableRunIter::new(run.as_slice(), mode),
-            peeked_key: None,
-        });
+
+    /// Token-disjoint SSTables in input order collapse into a
+    /// single run — the dream LSM-leveled state.
+    #[test]
+    fn disjoint_in_order_yields_one_run() {
+        let bounds = vec![(b(b"a"), b(b"c")), (b(b"d"), b(b"f")), (b(b"g"), b(b"i"))];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs.len(), 1, "all disjoint → exactly one run");
+        assert_eq!(runs[0], vec![0, 1, 2]);
     }
-    let mut merger = RangeMerger::new(sources, start, end);
-    merger.runs_arena = Some(runs_ptr);
-    merger
+
+    /// Disjoint SSTables given OUT OF ORDER still collapse into one
+    /// run, with the run sorted by smallest key. Proves the sort
+    /// step works.
+    #[test]
+    fn disjoint_out_of_order_sorts_into_one_run() {
+        let bounds = vec![(b(b"g"), b(b"i")), (b(b"a"), b(b"c")), (b(b"d"), b(b"f"))];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs.len(), 1);
+        // Run holds indices sorted by smallest_key: 1 (a-c), 2
+        // (d-f), 0 (g-i).
+        assert_eq!(runs[0], vec![1, 2, 0]);
+    }
+
+    /// Two SSTables with identical ranges cannot share a run — they
+    /// overlap. Output is two runs with one table each.
+    #[test]
+    fn fully_overlapping_split_across_runs() {
+        let bounds = vec![(b(b"a"), b(b"z")), (b(b"a"), b(b"z"))];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], vec![0]);
+        assert_eq!(runs[1], vec![1]);
+    }
+
+    /// Partial overlap: [a,m] and [k,z] share keys k..m. Two runs.
+    #[test]
+    fn partial_overlap_two_runs() {
+        let bounds = vec![(b(b"a"), b(b"m")), (b(b"k"), b(b"z"))];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs.len(), 2);
+    }
+
+    /// Three tables where 0 and 1 overlap, but 2 is disjoint from
+    /// both. Greedy places 2 into run-0 (after 0) or run-1 (after
+    /// 1), whichever scanner reaches first — but the result must be
+    /// at most 2 runs (the count of pairwise overlaps at any
+    /// point).
+    #[test]
+    fn one_overlap_extra_disjoint_fits_into_existing_run() {
+        let bounds = vec![
+            (b(b"a"), b(b"m")), // run-0
+            (b(b"k"), b(b"q")), // overlaps with #0 → run-1
+            (b(b"r"), b(b"z")), // disjoint from both → fits into either
+        ];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs.len(), 2, "max overlap is 2 → 2 runs suffice");
+        let total_placed: usize = runs.iter().map(|r| r.len()).sum();
+        assert_eq!(total_placed, 3, "every input placed exactly once");
+    }
+
+    /// Three tables all overlapping at one token point → 3 runs.
+    /// Demonstrates worst-case fragmentation = number of intervals
+    /// covering the densest point.
+    #[test]
+    fn fully_overlapping_three_yields_three_runs() {
+        let bounds = vec![(b(b"a"), b(b"z")), (b(b"b"), b(b"y")), (b(b"c"), b(b"x"))];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs.len(), 3);
+    }
+
+    /// Edge: empty input → empty output, no panic.
+    #[test]
+    fn empty_input_no_runs() {
+        let runs = group_disjoint_runs(&[]);
+        assert!(runs.is_empty());
+    }
+
+    /// Edge: single SSTable always yields exactly one run with one
+    /// member.
+    #[test]
+    fn single_table_one_run() {
+        let bounds = vec![(b(b"a"), b(b"z"))];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs, vec![vec![0]]);
+    }
+
+    /// Within each run, entries must be sorted by smallest key so
+    /// concatenation produces sorted output. This invariant is
+    /// load-bearing for the merger (SsTableRunIter walks the run
+    /// in order and assumes the result is globally token-sorted).
+    #[test]
+    fn runs_are_sorted_by_smallest_key_internally() {
+        let bounds = vec![
+            (b(b"d"), b(b"f")),
+            (b(b"a"), b(b"c")),
+            (b(b"g"), b(b"i")),
+            (b(b"j"), b(b"l")),
+        ];
+        let runs = group_disjoint_runs(&bounds);
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        for w in run.windows(2) {
+            let prev_smallest = &bounds[w[0]].0;
+            let next_smallest = &bounds[w[1]].0;
+            assert!(
+                prev_smallest <= next_smallest,
+                "run not sorted: {prev_smallest:?} > {next_smallest:?}",
+            );
+        }
+    }
 }

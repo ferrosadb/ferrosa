@@ -58,15 +58,11 @@ fn peek_request_id(bytes: &[u8]) -> Option<u32> {
 impl RpcHandler for StreamFrameRouter {
     async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
         let (request_id, msg_type) = match &msg {
-            Message::RangeReadStreamChunk(b) => {
-                (peek_request_id(b), MsgType::RangeReadStreamChunk)
-            }
+            Message::RangeReadStreamChunk(b) => (peek_request_id(b), MsgType::RangeReadStreamChunk),
             Message::RangeReadStreamHeartbeat(b) => {
                 (peek_request_id(b), MsgType::RangeReadStreamHeartbeat)
             }
-            Message::RangeReadStreamDone(b) => {
-                (peek_request_id(b), MsgType::RangeReadStreamDone)
-            }
+            Message::RangeReadStreamDone(b) => (peek_request_id(b), MsgType::RangeReadStreamDone),
             // Not ours — return None so the handler dispatch chain
             // can give a different handler a chance. (HandlerRegistry
             // currently dispatches by MsgType, so this is defensive.)
@@ -124,8 +120,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::raft::handlers::{
-        RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
-        RangeReadStreamHeartbeatPayload,
+        RangeReadStreamChunkPayload, RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload,
     };
     use ferrosa_net::rpc::handler::PeerId;
 
@@ -264,7 +259,10 @@ mod tests {
     /// bytes — pins the on-wire contract.
     #[test]
     fn peek_request_id_returns_le_u32() {
-        assert_eq!(peek_request_id(&[0x78, 0x56, 0x34, 0x12]), Some(0x1234_5678));
+        assert_eq!(
+            peek_request_id(&[0x78, 0x56, 0x34, 0x12]),
+            Some(0x1234_5678)
+        );
         assert_eq!(peek_request_id(&[1, 2, 3]), None, "too short → None");
         assert_eq!(peek_request_id(&[0, 0, 0, 0, 99]), Some(0));
     }
