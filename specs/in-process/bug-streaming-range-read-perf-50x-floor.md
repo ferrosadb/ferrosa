@@ -130,6 +130,72 @@ files for this table).
    agent_memory.entity_store;"` — observe 50–110 s wall on a
    table that local-only should finish in <1 s.
 
+## 2026-05-17 fourth update: ROOT CAUSE FOUND — poll_compactions starvation
+
+Direct in-cluster inspection showed 127 compaction OUTPUTS sitting
+in `/var/lib/ferrosa/compaction/entity_store/` that had been
+produced over the cluster's lifetime but **never swapped into the
+in-memory view**. Reads kept hitting all 43 original SSTables.
+
+Cause: `poll_compactions` processes results SERIALLY and each
+result blocks on `upload_mgr.submit(task).await` + `rx.await`
+for S3 confirmation. After the cluster restarted with 177
+pending crash-recovery uploads ("upload queue is full,
+remaining_entries=160"), every queued compaction result's S3
+upload hung waiting for queue space — starving every subsequent
+result's swap step. We saw this empirically: entity_warmth
+compactions kept rerunning the same input set every ~10s
+forever, never reaching "swap complete".
+
+Fix landed in `fa45c7d`:
+
+  * `upload_mgr.submit(task).await` → `upload_mgr.try_submit(task)`.
+    On queue-full, log + skip the rest of this result's S3 dance.
+    Pending-uploads.log Step 1 persists; sync_sstables_to_s3
+    handles retry.
+  * `rx.await` (S3 confirmation) → `tokio::time::timeout(15s, rx).await`.
+    Bounds the worst-case per-result wait so one slow upload
+    can't starve subsequent results.
+
+Crucially the swap (read-correctness path) at `engine.rs:2884`
+runs BEFORE any S3 work, so deferring S3 doesn't affect what
+reads see. Durability is preserved by the pending-log + the
+periodic sync_sstables_to_s3 retry path.
+
+**Measured live cluster impact** (`SELECT pk,ck LIMIT 5`):
+
+| | Before fix | After fix |
+|---|---|---|
+| node1 (entity_store) | 22-32s | **1.91s** |
+| node2 | 22s | **1.94s** |
+| node3 | 3.3s | **1.91s** |
+
+`force-compact` POST then a 90s wait produced **53 swap events**
+across the cluster (vs zero before the fix). For entity_store:
+
+  * node1: pre_swap_count=43 → post_swap_count=1 (one swap collapsed all 43)
+  * node3: pre_swap_count=20 → post_swap_count=1
+
+That's the merger dedup-pop bottleneck removed at the source:
+when the in-memory view has 1 SSTable per token range,
+duplicate-key dedup pops trivially collapse.
+
+LIMIT 100 measured at 2.15s, LIMIT 1000 at 2.14s — meaning
+per-row marginal cost is negligible; we're at the merger
+floor.
+
+Regression tests (TDD, both passing):
+
+  * `poll_compactions_swap_happens_without_upload_manager`:
+    asserts swap merges 2 inputs → 1 output even with no S3
+    configured.
+  * `poll_compactions_does_not_re_process_already_swapped_result`:
+    asserts re-polling without new tasks is a complete no-op
+    (no infinite loop, no new compaction outputs).
+
+This was the dominant bug behind the entire 50× streaming
+range-read floor we'd been chasing.
+
 ## 2026-05-17 third update: spread-the-data experiment confirms data layout is the bottleneck
 
 To test the hypothesis that the cold-cache 32 s wall is caused by
