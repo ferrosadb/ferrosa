@@ -30,8 +30,13 @@ use crate::merge;
 pub enum MergeSource<'a, R: ReadAt> {
     /// Memtable / flushing memtable: infallible per-partition yield.
     Memtable(Box<dyn Iterator<Item = Partition> + Send + 'a>),
-    /// SSTable streaming reader.
+    /// SSTable streaming reader. Yields full partitions including
+    /// decoded cells.
     SsTable(PartitionIter<'a, R>),
+    /// SSTable streaming reader in METADATA-ONLY mode (clustering +
+    /// liveness + row-deletion decoded, cells byte-skipped). Used by
+    /// the COUNT(*) fast path.
+    SsTableMetadata(PartitionIter<'a, R>),
 }
 
 impl<'a, R: ReadAt> MergeSource<'a, R> {
@@ -39,6 +44,7 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
         match self {
             Self::Memtable(it) => Ok(it.next()),
             Self::SsTable(it) => it.next_partition(),
+            Self::SsTableMetadata(it) => it.next_partition_metadata(),
         }
     }
 }
@@ -216,6 +222,36 @@ pub fn merger_for_sources<'a, R: ReadAt>(
             Ok(it) => sources.push(MergeSource::SsTable(it)),
             Err(e) => {
                 tracing::warn!("range_merger: SSTable open failed, skipping: {e}");
+            }
+        }
+    }
+    Ok(RangeMerger::new(sources, start, end))
+}
+
+/// Metadata-only variant: SSTables use `next_partition_metadata`
+/// so cell payloads are byte-skipped. Memtables still contribute
+/// full partitions (they're already in memory; stripping cells
+/// would cost a clone with no IO savings — `merge::merge_partitions`
+/// produces the correct merged shape anyway, and the caller is
+/// expected to read only `rows.len()` / `clustering` from the
+/// output). Used by the COUNT(*) fast path.
+pub fn merger_for_metadata_sources<'a, R: ReadAt>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + sstables.len());
+    sources.push(MergeSource::Memtable(active_iter));
+    if let Some(it) = flushing_iter {
+        sources.push(MergeSource::Memtable(it));
+    }
+    for sst in sstables {
+        match sst.partitions_iter() {
+            Ok(it) => sources.push(MergeSource::SsTableMetadata(it)),
+            Err(e) => {
+                tracing::warn!("range_merger: SSTable open (metadata) failed, skipping: {e}");
             }
         }
     }

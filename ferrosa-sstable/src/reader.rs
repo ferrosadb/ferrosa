@@ -342,6 +342,30 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
             Ok(result)
         }
     }
+
+    /// Yield the next partition with full row metadata (clustering
+    /// keys, row-level deletion, liveness) but **no cell payloads**
+    /// — `Partition.rows[*].cells` is always empty. Used by the
+    /// COUNT(*) fast path where the storage layer needs row-level
+    /// dedup via `merge::merge_partitions` but doesn't need cell
+    /// data. Returns `Ok(None)` at EOF.
+    pub fn next_partition_metadata(
+        &mut self,
+    ) -> Result<Option<crate::types::Partition>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_metadata()?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_metadata()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -808,5 +832,67 @@ mod tests {
         // EOF stable.
         assert!(iter_counts.next_partition_count().unwrap().is_none());
         assert!(iter_counts.next_partition_count().unwrap().is_none());
+    }
+
+    /// ADR-020 fast COUNT(*) metadata path: next_partition_metadata
+    /// yields partitions with the same key + same row count + same
+    /// per-row clustering keys as the full path, but with empty
+    /// `cells`. Verifies the body-end skip arithmetic stays aligned
+    /// across rows.
+    #[test]
+    fn next_partition_metadata_matches_keys_drops_cells() {
+        let header = test_header();
+        let dks: Vec<_> = (0..5u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        let mut iter_full = reader.partitions_iter().expect("partitions_iter (full)");
+        let mut full = Vec::new();
+        while let Some(p) = iter_full.next_partition().expect("next full") {
+            full.push(p);
+        }
+
+        let mut iter_meta = reader.partitions_iter().expect("partitions_iter (meta)");
+        let mut meta = Vec::new();
+        while let Some(p) = iter_meta.next_partition_metadata().expect("next meta") {
+            meta.push(p);
+        }
+
+        assert_eq!(meta.len(), full.len(), "same partition count");
+        for (f, m) in full.iter().zip(meta.iter()) {
+            assert_eq!(m.key, f.key, "partition key matches");
+            assert_eq!(m.rows.len(), f.rows.len(), "row count matches");
+            for (fr, mr) in f.rows.iter().zip(m.rows.iter()) {
+                assert_eq!(mr.clustering, fr.clustering, "clustering matches");
+                assert!(
+                    mr.cells.is_empty(),
+                    "metadata path must NOT decode cells (got {} cells)",
+                    mr.cells.len()
+                );
+            }
+        }
+        // EOF stable.
+        assert!(iter_meta.next_partition_metadata().unwrap().is_none());
     }
 }

@@ -924,6 +924,59 @@ impl<F: FlushTarget> TableStore<F> {
         self.read_range_limited_rows(start, end, limit, 0)
     }
 
+    /// COUNT(*) fast path. Returns the total row count for
+    /// `[start, end]` without ever decoding cell payloads:
+    /// SSTables go through `next_partition_metadata`, memtables
+    /// contribute their already-in-memory partitions, and
+    /// `merge::merge_partitions` does row-level dedup via clustering
+    /// keys for correctness across sources and replicas. Memory
+    /// peak: one merged Partition's metadata at a time.
+    ///
+    /// Runs on the blocking pool because the merger drives sync
+    /// SSTable reads. Returns the count rather than a stream so
+    /// the caller doesn't even allocate per-partition.
+    pub fn count_range(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> Result<u64> {
+        let view = self.view.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let active_iter = view
+            .active
+            .range_iter(start_owned.as_ref(), end_owned.as_ref());
+        let flushing_iter = view
+            .flushing
+            .as_ref()
+            .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+        let sstables_slice = &view.sstables[..];
+
+        let mut merger = crate::range_merger::merger_for_metadata_sources(
+            active_iter,
+            flushing_iter,
+            sstables_slice,
+            start_owned,
+            end_owned,
+        )?;
+
+        let mut total: u64 = 0;
+        // Each row in the merged partition contributes 1 to the
+        // count unless its tombstone marker covers it.
+        // `merge::apply_deletions` (called inside the merger) has
+        // already dropped fully-shadowed rows, so rows.len() is the
+        // live count. Static rows count as one row (Cassandra
+        // semantics for COUNT(*) include the static row when
+        // present).
+        while let Some(p) = merger.next_merged_partition()? {
+            total = total.saturating_add(p.rows.len() as u64);
+            if p.static_row.is_some() {
+                total = total.saturating_add(1);
+            }
+        }
+        Ok(total)
+    }
+
     /// ADR-020 lazy range iterator. Returns an async `Stream` that
     /// yields every partition in `[start, end]` one at a time —
     /// memtable + flushing memtable + SSTables k-way merged, with

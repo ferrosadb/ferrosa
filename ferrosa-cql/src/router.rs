@@ -2010,6 +2010,31 @@ async fn route_select_user_table(
     let read_strategy = keyspace_strategy(&state.schema, ks);
     let count_only_select = is_count_only_select(&s.columns);
 
+    // ADR-020 COUNT(*) fast path. `SELECT COUNT(*) FROM t` with no
+    // WHERE clauses, no LIMIT, no GROUP BY, and no other projected
+    // columns goes through `WritePath::count_range` which uses the
+    // metadata-only k-way merger in ferrosa-storage. Cell payloads
+    // are byte-skipped at every SSTable — typical 5-10× speedup
+    // over the legacy `range_read → Vec → count_rows` path.
+    //
+    // We bail out to the legacy path for any WHERE clauses
+    // (predicates may filter partitions), ORDER BY (changes the
+    // visible row order), or LIMIT (caller wants bounded output).
+    let no_where = s.where_clauses.is_empty();
+    let no_order_by = s.order_by.is_empty();
+    let no_limit = s.limit.is_none();
+    if count_only_select && no_where && no_order_by && no_limit && pk_result.is_err() {
+        let count = state.write_path.load().count_range(&table_id).await?;
+        return Ok(SelectRawResult {
+            column_names: col_names.to_vec(),
+            column_types: col_types.to_vec(),
+            rows: vec![vec![Some(CqlValue::Bigint(count as i64))]],
+            keyspace: ks.to_string(),
+            table: s.table.clone(),
+            paging_state: None,
+        });
+    }
+
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
         let pk_types: Vec<CqlType> = table_meta

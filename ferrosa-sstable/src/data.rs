@@ -202,6 +202,164 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         Ok(Some((key, row_count)))
     }
 
+    /// Read the next partition with full row metadata (clustering
+    /// keys, row-level deletion, liveness) but **no cell payloads**.
+    ///
+    /// Cells are byte-skipped via `body_end = body_start + row_size`,
+    /// so cross-source dedup (memtable + flushing + N SSTables, plus
+    /// replica overlap) can still happen via the existing
+    /// `merge::merge_partitions` — which only needs partition key +
+    /// clustering key + deletion timestamps to be correct. The
+    /// returned `Partition`'s `rows[*].cells` is always empty.
+    /// Returns `Ok(None)` at EOF.
+    pub fn read_partition_metadata(&mut self) -> Result<Option<Partition>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+
+        let (key_bytes, deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        let mut static_row = None;
+        let mut rows = Vec::new();
+
+        loop {
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                break;
+            }
+
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row = self.read_row_metadata(flags, is_static)?;
+            if is_static {
+                static_row = Some(row);
+            } else {
+                rows.push(row);
+            }
+        }
+
+        Ok(Some(Partition {
+            key,
+            deletion,
+            static_row,
+            rows,
+        }))
+    }
+
+    /// Decode a row's clustering key + liveness + row deletion,
+    /// then byte-skip past the cells. The returned `Row` has
+    /// `cells: Vec::new()`. Used by `read_partition_metadata`.
+    fn read_row_metadata(&mut self, flags: u8, is_static: bool) -> Result<Row> {
+        // Clustering (same shape as read_row).
+        let clustering = if is_static {
+            Vec::new()
+        } else {
+            let num_clustering = self.header.clustering_types.len();
+            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+
+            let mut ck_bytes = Vec::new();
+            for i in 0..num_clustering {
+                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+                if is_null || is_empty {
+                    continue;
+                }
+                let type_name = &self.header.clustering_types[i];
+                let vlen = match marshal::value_length_if_fixed(type_name) {
+                    Some(fixed_len) => fixed_len,
+                    None => {
+                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                        self.pos += n as u64;
+                        len as usize
+                    }
+                };
+                let mut vbuf = vec![0u8; vlen];
+                self.reader.read_exact_at(&mut vbuf, self.pos)?;
+                self.pos += vlen as u64;
+
+                if num_clustering > 1 {
+                    ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                }
+                ck_bytes.extend_from_slice(&vbuf);
+            }
+            ck_bytes
+        };
+
+        // Row body size — pins where the body ends so we can skip
+        // cells regardless of liveness/deletion encoding length.
+        let (row_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        let (_prev_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        let body_start = self.pos;
+        let body_end = body_start + row_size;
+
+        // Liveness.
+        let mut liveness = LivenessInfo::NONE;
+        if flags & HAS_TIMESTAMP != 0 {
+            let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            liveness.timestamp = self.header.min_timestamp.wrapping_add(delta as i64);
+
+            if flags & HAS_TTL != 0 {
+                let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                liveness.ttl = self.header.min_ttl.wrapping_add(ttl_delta as i32);
+
+                let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                liveness.local_deletion_time = self
+                    .header
+                    .min_local_deletion_time
+                    .wrapping_add(ldt_delta as i32);
+            }
+        }
+
+        // Row-level deletion.
+        let deletion = if flags & HAS_DELETION != 0 {
+            let (ts_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
+            let local_deletion_time =
+                (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
+            DeletionTime::new(marked_for_delete_at, local_deletion_time)
+        } else {
+            DeletionTime::LIVE
+        };
+
+        // Skip the rest of the row body (columns bitmap + all cells).
+        if body_end > self.pos {
+            self.pos = body_end;
+        }
+
+        Ok(Row {
+            clustering,
+            cells: Vec::new(),
+            deletion,
+            primary_key_liveness: liveness,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Internal: partition header
     // -----------------------------------------------------------------------

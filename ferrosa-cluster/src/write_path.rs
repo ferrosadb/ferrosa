@@ -182,6 +182,28 @@ impl WritePath {
             .await
     }
 
+    /// COUNT(*) fast path. Returns the total row count for
+    /// `table_id` without materializing any partition into a Vec
+    /// and without decoding any cell payloads. Uses
+    /// `StorageEngine::count_range` which drives the metadata-only
+    /// k-way merger across memtable + flushing memtable + per-SSTable
+    /// streaming readers. Per-replica view (LOCAL consistency).
+    pub async fn count_range(&self, table_id: &TableId) -> crate::error::Result<u64> {
+        match self {
+            Self::Direct(engine) => engine
+                .count_range(table_id, None, None)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .count_range(table_id, None, None)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Cluster(coordinator) => coordinator.coordinate_range_count(table_id),
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "count_range unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
     /// Read up to `limit` partitions for unordered full-scan consumers.
     ///
     /// This lets CQL `LIMIT` and protocol page-size produce the first page

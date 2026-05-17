@@ -2121,6 +2121,22 @@ impl StorageEngine {
         }
     }
 
+    /// COUNT(*) fast path. Returns the total row count for
+    /// `[start, end]` on `table_id` without ever decoding cell
+    /// payloads. Returns `Ok(0)` when the table is not registered.
+    pub fn count_range(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> ferrosa_common::Result<u64> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.count_range(start, end),
+            None => Ok(0),
+        }
+    }
+
     /// ADR-020 lazy range iterator. Returns an async `Stream` that
     /// yields every partition in `[start, end]` for `table_id`, one
     /// at a time, without materializing the full result. Backed by

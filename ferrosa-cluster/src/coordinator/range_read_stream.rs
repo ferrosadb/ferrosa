@@ -52,6 +52,29 @@ const STREAM_RECEIVER_BUFFER: usize = 32;
 /// via NetConfig.
 pub const STREAMING_CHUNK_PARTITIONS: usize = 64;
 
+impl ClusterCoordinator {
+    /// COUNT(*) fast path. Returns the local replica's row count
+    /// for `[start, end]` on `table_id`. Bypasses the streaming
+    /// range-read RPC entirely — calls `StorageEngine::count_range`
+    /// which uses the metadata-only merger
+    /// (`range_merger::merger_for_metadata_sources`) so cell
+    /// payloads are byte-skipped at every SSTable.
+    ///
+    /// Consistency: returns the LOCAL replica's view. For
+    /// quorum / all consistency on COUNT(*), shipping partition
+    /// keys across replicas would defeat the optimization — that
+    /// is a separate design (and matches Cassandra's "COUNT is
+    /// eventually consistent by default" semantics).
+    pub fn coordinate_range_count(
+        &self,
+        table_id: &TableId,
+    ) -> crate::error::Result<u64> {
+        self.storage
+            .count_range(table_id, None, None)
+            .map_err(ClusterError::Storage)
+    }
+}
+
 /// Deduplicate partitions by token — multiple replicas (RF=N) each
 /// return a copy of every partition they own; without this, COUNT(*)
 /// and full-table scans return N× the real partition count. Mirrors
