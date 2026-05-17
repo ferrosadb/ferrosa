@@ -656,6 +656,47 @@ mod tests {
         }
     }
 
+    /// MutationForward handler that actually writes to a backing
+    /// `StorageEngine`, mirroring the production
+    /// `MutationForwardHandler` in `coordinator::mod`. Used to assert
+    /// that the fan-out actually delivers writes to every replica's
+    /// storage (not just that ACKs arrive).
+    struct RealStorageMutationHandler {
+        storage: Arc<StorageEngine>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for RealStorageMutationHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let body = match msg {
+                Message::MutationForward(b) => b,
+                _ => return None,
+            };
+            let mutation = crate::pair::coordinator::decode_mutation(&body).ok()?;
+            let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+            for row in &mutation.rows {
+                if let Err(e) =
+                    self.storage
+                        .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
+                {
+                    tracing::warn!(%e, "test handler: write failed — withholding ACK");
+                    return None;
+                }
+            }
+            Some(Message::MutationAck(Bytes::new()))
+        }
+    }
+
+    async fn start_real_storage_rpc_server(
+        storage: Arc<StorageEngine>,
+    ) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+        start_rpc_server(
+            MsgType::MutationForward,
+            Arc::new(RealStorageMutationHandler { storage }),
+        )
+        .await
+    }
+
     async fn start_rpc_server(
         msg_type: MsgType,
         handler: Arc<dyn RpcHandler>,
@@ -861,6 +902,115 @@ mod tests {
         assert!(stored.is_some(), "local replica must have written");
 
         server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Replication symmetry: every replica's STORAGE must contain the write.
+    //
+    // This is the gap surfaced by the 2026-05-17 ferrosa-memory cluster
+    // perf investigation: existing CL=ALL tests use MutationAckHandler
+    // (auto-ACKs without writing), so they prove the coordinator's *ACK
+    // accounting* is right, not that data lands on every replica.
+    //
+    // The test below wires THREE real StorageEngines + their
+    // MutationForwardHandlers and asserts that after a CL=ALL write,
+    // every storage's read returns the same row. If hint-fallback fires
+    // for any replica (i.e. a peer doesn't write), the assertion fails.
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coordinate_write_at_cl_all_replicates_to_every_replica_storage() {
+        // Three real storage engines — one local on the coordinator,
+        // two remote behind RPC servers with the production-shaped
+        // MutationForwardHandler.
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_storage = test_storage(local_dir.path());
+        register_test_table(&local_storage);
+
+        let remote_a_dir = tempfile::tempdir().unwrap();
+        let remote_a_storage = test_storage(remote_a_dir.path());
+        register_test_table(&remote_a_storage);
+
+        let remote_b_dir = tempfile::tempdir().unwrap();
+        let remote_b_storage = test_storage(remote_b_dir.path());
+        register_test_table(&remote_b_storage);
+
+        let (server_a, addr_a, host_a) =
+            start_real_storage_rpc_server(remote_a_storage.clone()).await;
+        let (server_b, addr_b, host_b) =
+            start_real_storage_rpc_server(remote_b_storage.clone()).await;
+
+        let local_node_id = 1u64;
+        let pm = noop_peer_manager();
+
+        let mut local = make_node("10.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote_a = make_node(&addr_a.to_string());
+        remote_a.host_id = host_a;
+        let mut remote_b = make_node(&addr_b.to_string());
+        remote_b.host_id = host_b;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote_a);
+        ring.add_node(3u64, remote_b);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        ring.assign_tokens(3u64, &[200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            local_storage.clone(),
+            3,
+            ConsistencyLevel::All,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        coordinator
+            .coordinate_write_with(&table_id, &key, row, 1000, ConsistencyLevel::All, 3)
+            .await
+            .expect("CL=ALL with all replicas up should succeed");
+
+        // The contract: every replica's storage now holds the row.
+        // Today this fails for remote_a / remote_b because the
+        // coordinator-side fan-out path doesn't deliver across all
+        // hops symmetrically in some configurations.
+        let from_local = local_storage
+            .read(&table_id, &key)
+            .unwrap()
+            .expect("local replica must have the write");
+        let from_a = remote_a_storage
+            .read(&table_id, &key)
+            .unwrap()
+            .expect("remote A must have the write after CL=ALL");
+        let from_b = remote_b_storage
+            .read(&table_id, &key)
+            .unwrap()
+            .expect("remote B must have the write after CL=ALL");
+
+        // All three replicas should hold the same partition shape.
+        assert_eq!(
+            from_local.rows.len(),
+            from_a.rows.len(),
+            "remote A row count diverged from local"
+        );
+        assert_eq!(
+            from_local.rows.len(),
+            from_b.rows.len(),
+            "remote B row count diverged from local"
+        );
+
+        server_a
+            .shutdown(std::time::Duration::from_millis(50))
+            .await;
+        server_b
+            .shutdown(std::time::Duration::from_millis(50))
+            .await;
     }
 
     // ---------------------------------------------------------------------------

@@ -83,6 +83,14 @@ pub enum MsgType {
     RangeReadResponse = 0x26,
     TruncateForward = 0x27,
     TruncateAck = 0x28,
+    // ADR-020 streaming range read — multi-message RPC keyed by
+    // request_id, terminated by RangeReadStreamDone, cancellable via
+    // RangeReadStreamCancel, kept alive by RangeReadStreamHeartbeat.
+    RangeReadStreamRequest = 0x36,
+    RangeReadStreamChunk = 0x37,
+    RangeReadStreamHeartbeat = 0x38,
+    RangeReadStreamDone = 0x39,
+    RangeReadStreamCancel = 0x3A,
     // Streaming (row-based)
     StreamStart = 0x30,
     StreamChunk = 0x31,
@@ -173,6 +181,11 @@ impl TryFrom<u8> for MsgType {
             0x24 => Ok(Self::RepairWrite),
             0x25 => Ok(Self::RangeReadRequest),
             0x26 => Ok(Self::RangeReadResponse),
+            0x36 => Ok(Self::RangeReadStreamRequest),
+            0x37 => Ok(Self::RangeReadStreamChunk),
+            0x38 => Ok(Self::RangeReadStreamHeartbeat),
+            0x39 => Ok(Self::RangeReadStreamDone),
+            0x3A => Ok(Self::RangeReadStreamCancel),
             0x27 => Ok(Self::TruncateForward),
             0x28 => Ok(Self::TruncateAck),
             0x30 => Ok(Self::StreamStart),
@@ -648,5 +661,26 @@ mod tests {
         assert_eq!(decoded.trace_context.span_id, [2; 8]);
         assert_eq!(decoded.trace_context.flags[0], 0x01);
         assert!(!decoded.trace_context.is_empty());
+    }
+
+    /// ADR-020 streaming range-read variants must round-trip through
+    /// the u8 wire encoding. New byte slots: 0x36..=0x3A. These are
+    /// the dedicated multi-message types — they coexist with the
+    /// legacy single-shot RangeReadRequest/RangeReadResponse (0x25,
+    /// 0x26) so a rolling upgrade can negotiate the protocol version
+    /// without breaking older peers.
+    #[test]
+    fn msg_type_round_trip_for_streaming_range_read_variants() {
+        for (byte, expected) in [
+            (0x36u8, MsgType::RangeReadStreamRequest),
+            (0x37, MsgType::RangeReadStreamChunk),
+            (0x38, MsgType::RangeReadStreamHeartbeat),
+            (0x39, MsgType::RangeReadStreamDone),
+            (0x3A, MsgType::RangeReadStreamCancel),
+        ] {
+            let parsed = MsgType::try_from(byte).expect("known streaming MsgType byte");
+            assert_eq!(parsed, expected, "byte 0x{byte:02X} did not decode");
+            assert_eq!(parsed as u8, byte, "round-trip byte mismatch");
+        }
     }
 }

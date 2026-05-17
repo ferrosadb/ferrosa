@@ -924,6 +924,221 @@ impl<F: FlushTarget> TableStore<F> {
         self.read_range_limited_rows(start, end, limit, 0)
     }
 
+    /// COUNT(*) fast path. Returns the total row count for
+    /// `[start, end]` without ever decoding cell payloads:
+    /// SSTables go through `next_partition_metadata`, memtables
+    /// contribute their already-in-memory partitions, and
+    /// `merge::merge_partitions` does row-level dedup via clustering
+    /// keys for correctness across sources and replicas. Memory
+    /// peak: one merged Partition's metadata at a time.
+    ///
+    /// Runs on the blocking pool because the merger drives sync
+    /// SSTable reads. Returns the count rather than a stream so
+    /// the caller doesn't even allocate per-partition.
+    pub fn count_range(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> Result<u64> {
+        let view = self.view.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let active_iter = view
+            .active
+            .range_iter(start_owned.as_ref(), end_owned.as_ref());
+        let flushing_iter = view
+            .flushing
+            .as_ref()
+            .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+        let sstables_slice = &view.sstables[..];
+
+        let mut merger = crate::range_merger::merger_for_metadata_sources(
+            active_iter,
+            flushing_iter,
+            sstables_slice,
+            start_owned,
+            end_owned,
+        )?;
+
+        let mut total: u64 = 0;
+        // Each row in the merged partition contributes 1 to the
+        // count unless its tombstone marker covers it.
+        // `merge::apply_deletions` (called inside the merger) has
+        // already dropped fully-shadowed rows, so rows.len() is the
+        // live count. Static rows count as one row (Cassandra
+        // semantics for COUNT(*) include the static row when
+        // present).
+        while let Some(p) = merger.next_merged_partition()? {
+            total = total.saturating_add(p.rows.len() as u64);
+            if p.static_row.is_some() {
+                total = total.saturating_add(1);
+            }
+        }
+        Ok(total)
+    }
+
+    /// Projection-aware variant of `range_iter`. SSTable cells
+    /// whose ordinals are NOT in `wanted` are byte-skipped via
+    /// `DataReader::read_cell_skip` — saves one syscall + one heap
+    /// alloc + the value-byte memcpy per skipped cell. Memtable
+    /// partitions retain their full cells (already in memory).
+    ///
+    /// Takes `wanted` by value so the spawned blocking task can
+    /// move it in; the returned stream has no borrow.
+    pub fn range_iter_projected(
+        &self,
+        wanted: Vec<u16>,
+        partition_limit: Option<usize>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+        // Buffer is intentionally small. The producer runs on a
+        // spawn_blocking thread and per-partition body decode on cold
+        // cache is the dominant cost (wide rows + embedding cells +
+        // dedup across multiple SSTable runs sharing a key). A larger
+        // buffer turns a `LIMIT N` scan into a `LIMIT N + buffer`
+        // scan because the producer races ahead before the consumer
+        // can drop the stream; we measured ~32 s cold-cache walls on
+        // a 1.7 GB table for `LIMIT 5` with buffer=64. With buffer=4
+        // *and* `partition_limit` pushed into the producer loop, the
+        // producer stops cleanly after N emissions.
+        const STREAM_BUFFER: usize = 4;
+
+        let view = self.view.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let wanted_owned = wanted;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+
+        tokio::task::spawn_blocking(move || {
+            let active_iter = view
+                .active
+                .range_iter(start_owned.as_ref(), end_owned.as_ref());
+            let flushing_iter = view
+                .flushing
+                .as_ref()
+                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            let sstables_slice = &view.sstables[..];
+
+            let mut merger = match crate::range_merger::merger_for_projected_sources(
+                active_iter,
+                flushing_iter,
+                sstables_slice,
+                &wanted_owned,
+                start_owned,
+                end_owned,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+
+            let cap = partition_limit.unwrap_or(usize::MAX);
+            let mut emitted: usize = 0;
+            loop {
+                if emitted >= cap {
+                    return;
+                }
+                match merger.next_merged_partition() {
+                    Ok(Some(partition)) => {
+                        if tx.blocking_send(Ok(partition)).is_err() {
+                            return;
+                        }
+                        emitted += 1;
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+
+    /// ADR-020 lazy range iterator. Returns an async `Stream` that
+    /// yields every partition in `[start, end]` one at a time —
+    /// memtable + flushing memtable + SSTables k-way merged, with
+    /// same-key partitions merged and deletions suppressed inline.
+    ///
+    /// Memory profile: peak is O(num_sources) partitions held by
+    /// the merger, regardless of total table size. Unlike
+    /// `read_range_limited_rows` there is no
+    /// `RANGE_READ_MATERIALIZATION_CAP`; the caller drives the rate
+    /// of consumption via mpsc back-pressure (`STREAM_BUFFER` items).
+    pub fn range_iter(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+        /// Per-stream channel buffer. Kept small because per-partition
+        /// decode on cold cache is expensive (wide rows + cell decode)
+        /// and a `LIMIT N` consumer should pay for ~N body decodes,
+        /// not N + buffer_capacity. See the matching constant in
+        /// `range_iter_projected` for the LIMIT-pushdown rationale.
+        const STREAM_BUFFER: usize = 4;
+
+        let view = self.view.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+
+        tokio::task::spawn_blocking(move || {
+            // Build source iterators — these borrow from `view`
+            // (memtable Arcs and per-SSTable Arcs) which the closure
+            // owns for the task's full lifetime, so there is no
+            // self-referential lifetime problem.
+            let active_iter = view
+                .active
+                .range_iter(start_owned.as_ref(), end_owned.as_ref());
+            let flushing_iter = view
+                .flushing
+                .as_ref()
+                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            let sstables_slice = &view.sstables[..];
+
+            let mut merger = match crate::range_merger::merger_for_sources(
+                active_iter,
+                flushing_iter,
+                sstables_slice,
+                start_owned,
+                end_owned,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+
+            loop {
+                match merger.next_merged_partition() {
+                    Ok(Some(partition)) => {
+                        if tx.blocking_send(Ok(partition)).is_err() {
+                            // Consumer dropped (cancelled stream).
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,

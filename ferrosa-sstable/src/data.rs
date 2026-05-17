@@ -143,6 +143,252 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         self.pos
     }
 
+    /// Read the next partition's KEY + ROW COUNT only.
+    ///
+    /// Walks the partition body using `read_partition_header` then
+    /// `skip_row_body` for each clustered row — no cell payloads
+    /// are decoded. Used by the COUNT(*) fast path in
+    /// `ferrosa-cluster::coordinator::range_count` (ADR-020) where
+    /// the caller needs row counts per partition but not the row
+    /// data. Memory: `O(1)` per call; CPU: roughly proportional
+    /// to row count but ~10-100× cheaper than `read_partition`
+    /// because cell payloads are byte-skipped, not parsed.
+    ///
+    /// Returns `Ok(None)` at EOF. Static rows count as part of the
+    /// row count returned (mirrors `read_rows_limited` which puts
+    /// the static row in `static_row` rather than `rows`); callers
+    /// who need to distinguish static from clustered can use the
+    /// full `read_partition_limited_rows` path.
+    pub fn read_partition_count(&mut self) -> Result<Option<(DecoratedKey, u64)>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+
+        let (key_bytes, _deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        let mut row_count: u64 = 0;
+        loop {
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                // Range tombstones aren't rows — mirror
+                // read_rows_limited's "stop at marker" behavior.
+                break;
+            }
+
+            // Extended flags byte (only present if EXTENSION_FLAG set).
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            self.skip_row_body(flags, is_static)?;
+            row_count += 1;
+        }
+
+        Ok(Some((key, row_count)))
+    }
+
+    /// Peek the next partition's key **without** decoding the body.
+    ///
+    /// Reads only the partition header (key bytes + DeletionTime) and
+    /// **does not advance** `self.pos` — the next `read_partition*`
+    /// call will re-read from the same offset and produce the full
+    /// partition (or, on EOF, `Ok(None)`).
+    ///
+    /// Used by the range merger to populate its priming heap with
+    /// keys without paying the full partition decode cost up front.
+    /// On cold cache the per-source partition-body decode dominates
+    /// scan latency; deferring it until a source is popped (after
+    /// the heap proves it's the min) collapses
+    /// `O(num_sources × cold_body_decode)` into
+    /// `O(num_sources × cold_header_read) + O(emitted × cold_body_decode)`.
+    ///
+    /// Memory: `O(key_len)` per call. CPU: 2-3 small `pread`s of
+    /// well under 100 bytes total.
+    /// Returns `Ok(None)` at EOF.
+    pub fn peek_partition_key(&mut self) -> Result<Option<DecoratedKey>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+        let saved_pos = self.pos;
+        let (key_bytes, _deletion) = self.read_partition_header()?;
+        self.pos = saved_pos;
+        Ok(Some(DecoratedKey::new(PartitionKey::new(key_bytes))))
+    }
+
+    /// Read the next partition with full row metadata (clustering
+    /// keys, row-level deletion, liveness) but **no cell payloads**.
+    ///
+    /// Cells are byte-skipped via `body_end = body_start + row_size`,
+    /// so cross-source dedup (memtable + flushing + N SSTables, plus
+    /// replica overlap) can still happen via the existing
+    /// `merge::merge_partitions` — which only needs partition key +
+    /// clustering key + deletion timestamps to be correct. The
+    /// returned `Partition`'s `rows[*].cells` is always empty.
+    /// Returns `Ok(None)` at EOF.
+    pub fn read_partition_metadata(&mut self) -> Result<Option<Partition>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+
+        let (key_bytes, deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        let mut static_row = None;
+        let mut rows = Vec::new();
+
+        loop {
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                break;
+            }
+
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row = self.read_row_metadata(flags, is_static)?;
+            if is_static {
+                static_row = Some(row);
+            } else {
+                rows.push(row);
+            }
+        }
+
+        Ok(Some(Partition {
+            key,
+            deletion,
+            static_row,
+            rows,
+        }))
+    }
+
+    /// Decode a row's clustering key + liveness + row deletion,
+    /// then byte-skip past the cells. The returned `Row` has
+    /// `cells: Vec::new()`. Used by `read_partition_metadata`.
+    fn read_row_metadata(&mut self, flags: u8, is_static: bool) -> Result<Row> {
+        // Clustering (same shape as read_row).
+        let clustering = if is_static {
+            Vec::new()
+        } else {
+            let num_clustering = self.header.clustering_types.len();
+            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+
+            let mut ck_bytes = Vec::new();
+            for i in 0..num_clustering {
+                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+                if is_null || is_empty {
+                    continue;
+                }
+                let type_name = &self.header.clustering_types[i];
+                let vlen = match marshal::value_length_if_fixed(type_name) {
+                    Some(fixed_len) => fixed_len,
+                    None => {
+                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                        self.pos += n as u64;
+                        len as usize
+                    }
+                };
+                let mut vbuf = vec![0u8; vlen];
+                self.reader.read_exact_at(&mut vbuf, self.pos)?;
+                self.pos += vlen as u64;
+
+                if num_clustering > 1 {
+                    ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                }
+                ck_bytes.extend_from_slice(&vbuf);
+            }
+            ck_bytes
+        };
+
+        // Row body size — pins where the body ends so we can skip
+        // cells regardless of liveness/deletion encoding length.
+        let (row_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        let (_prev_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        let body_start = self.pos;
+        let body_end = body_start + row_size;
+
+        // Liveness.
+        let mut liveness = LivenessInfo::NONE;
+        if flags & HAS_TIMESTAMP != 0 {
+            let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            liveness.timestamp = self.header.min_timestamp.wrapping_add(delta as i64);
+
+            if flags & HAS_TTL != 0 {
+                let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                liveness.ttl = self.header.min_ttl.wrapping_add(ttl_delta as i32);
+
+                let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                liveness.local_deletion_time = self
+                    .header
+                    .min_local_deletion_time
+                    .wrapping_add(ldt_delta as i32);
+            }
+        }
+
+        // Row-level deletion.
+        let deletion = if flags & HAS_DELETION != 0 {
+            let (ts_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
+            let local_deletion_time =
+                (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
+            DeletionTime::new(marked_for_delete_at, local_deletion_time)
+        } else {
+            DeletionTime::LIVE
+        };
+
+        // Skip the rest of the row body (columns bitmap + all cells).
+        if body_end > self.pos {
+            self.pos = body_end;
+        }
+
+        Ok(Row {
+            clustering,
+            cells: Vec::new(),
+            deletion,
+            primary_key_liveness: liveness,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Internal: partition header
     // -----------------------------------------------------------------------
@@ -435,10 +681,263 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         })
     }
 
+    /// Read the next partition with a column projection — only the
+    /// cells whose ordinals are in `wanted` are decoded; all others
+    /// are byte-skipped via `read_cell_skip`. Used by the CQL fast
+    /// path for `SELECT col1, col2, ... FROM t` where many columns
+    /// (especially wide embedding vectors) live in the table but
+    /// only a few are projected.
+    ///
+    /// `wanted` is interpreted against the SerializationHeader's
+    /// `regular_columns` ordinal space (and `static_columns` for
+    /// static rows). An empty `wanted` slice means "no cells at all"
+    /// — the row is returned with clustering + metadata only, same
+    /// shape as `read_partition_metadata` but going through the
+    /// per-cell skip path so it works even when the body-end
+    /// arithmetic isn't trusted.
+    ///
+    /// Returns `Ok(None)` at EOF.
+    pub fn read_partition_projected(&mut self, wanted: &[u16]) -> Result<Option<Partition>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+
+        let (key_bytes, deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        let mut static_row = None;
+        let mut rows = Vec::new();
+
+        loop {
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                break;
+            }
+
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row = self.read_row_projected(flags, is_static, wanted)?;
+            if is_static {
+                static_row = Some(row);
+            } else {
+                rows.push(row);
+            }
+        }
+
+        Ok(Some(Partition {
+            key,
+            deletion,
+            static_row,
+            rows,
+        }))
+    }
+
+    /// Decode a row's clustering key + liveness + row deletion, then
+    /// for each present column decode the cell if its ordinal is in
+    /// `wanted`, otherwise skip it via `read_cell_skip`. The
+    /// returned `Row.cells` contains only the cells the caller asked
+    /// for.
+    fn read_row_projected(&mut self, flags: u8, is_static: bool, wanted: &[u16]) -> Result<Row> {
+        // Clustering (same as read_row).
+        let clustering = if is_static {
+            Vec::new()
+        } else {
+            let num_clustering = self.header.clustering_types.len();
+            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+
+            let mut ck_bytes = Vec::new();
+            for i in 0..num_clustering {
+                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+                if is_null || is_empty {
+                    continue;
+                }
+                let type_name = &self.header.clustering_types[i];
+                let vlen = match marshal::value_length_if_fixed(type_name) {
+                    Some(fixed_len) => fixed_len,
+                    None => {
+                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                        self.pos += n as u64;
+                        len as usize
+                    }
+                };
+                let mut vbuf = vec![0u8; vlen];
+                self.reader.read_exact_at(&mut vbuf, self.pos)?;
+                self.pos += vlen as u64;
+
+                if num_clustering > 1 {
+                    ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                }
+                ck_bytes.extend_from_slice(&vbuf);
+            }
+            ck_bytes
+        };
+
+        // Row body size + prev size (same as read_row).
+        let (_row_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        let (_prev_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+
+        // Liveness.
+        let mut liveness = LivenessInfo::NONE;
+        if flags & HAS_TIMESTAMP != 0 {
+            let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            liveness.timestamp = self.header.min_timestamp.wrapping_add(delta as i64);
+
+            if flags & HAS_TTL != 0 {
+                let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                liveness.ttl = self.header.min_ttl.wrapping_add(ttl_delta as i32);
+
+                let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                liveness.local_deletion_time = self
+                    .header
+                    .min_local_deletion_time
+                    .wrapping_add(ldt_delta as i32);
+            }
+        }
+
+        // Row-level deletion.
+        let deletion = if flags & HAS_DELETION != 0 {
+            let (ts_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
+            let local_deletion_time =
+                (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
+            DeletionTime::new(marked_for_delete_at, local_deletion_time)
+        } else {
+            DeletionTime::LIVE
+        };
+
+        // Columns present (same as read_row).
+        let columns = if is_static {
+            &self.header.static_columns
+        } else {
+            &self.header.regular_columns
+        };
+        let num_columns = columns.len();
+
+        let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
+            (0..num_columns).collect()
+        } else {
+            let bitmap_bytes = num_columns.div_ceil(8);
+            let mut bitmap = vec![0u8; bitmap_bytes];
+            self.reader.read_exact_at(&mut bitmap, self.pos)?;
+            self.pos += bitmap_bytes as u64;
+
+            let mut present = Vec::new();
+            for i in 0..num_columns {
+                let byte_idx = i / 8;
+                let bit_idx = 7 - (i % 8);
+                if bitmap[byte_idx] & (1 << bit_idx) != 0 {
+                    present.push(i);
+                }
+            }
+            present
+        };
+
+        // For each present column: decode if wanted, skip otherwise.
+        // `wanted` is small (typical SELECT projects a few cols), so
+        // linear contains() is faster than a HashSet for the common
+        // case.
+        let mut cells = Vec::with_capacity(wanted.len().min(present_columns.len()));
+        for &col_idx in &present_columns {
+            let col_u16 = col_idx as u16;
+            if wanted.contains(&col_u16) {
+                let cell = self.read_cell(&liveness)?;
+                cells.push((col_u16, cell));
+            } else {
+                self.read_cell_skip(&liveness)?;
+            }
+        }
+
+        Ok(Row {
+            clustering,
+            cells,
+            deletion,
+            primary_key_liveness: liveness,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Internal: cell reading
     // Reference: Cell.Serializer in Cell.java lines 377-419
     // -----------------------------------------------------------------------
+
+    /// Advance the read position past a single cell without
+    /// materializing its value. Reads the same flag + varint sequence
+    /// as `read_cell` but discards the parsed timestamps and skips
+    /// the value bytes via a position bump rather than allocating
+    /// a buffer + read_exact_at — saves one syscall, one heap alloc,
+    /// and the value-byte memcpy per skipped cell. Used by the
+    /// projection-aware decode path so cells outside the SELECT list
+    /// never pay the read+decode cost (especially big values like
+    /// vector embeddings).
+    fn read_cell_skip(&mut self, row_liveness: &LivenessInfo) -> Result<()> {
+        let mut cell_flags_buf = [0u8; 1];
+        self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
+        self.pos += 1;
+        let cell_flags = cell_flags_buf[0];
+
+        let is_deleted = cell_flags & CELL_IS_DELETED != 0;
+        let is_expiring = cell_flags & CELL_IS_EXPIRING != 0;
+        let has_empty_value = cell_flags & CELL_HAS_EMPTY_VALUE != 0;
+        let use_row_timestamp = cell_flags & CELL_USE_ROW_TIMESTAMP != 0;
+        let use_row_ttl = cell_flags & CELL_USE_ROW_TTL != 0;
+        let _ = row_liveness; // borrow only to mirror read_cell signature.
+
+        if !use_row_timestamp {
+            let (_, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+        }
+        if !use_row_ttl && (is_deleted || is_expiring) {
+            let (_, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+        }
+        if !use_row_ttl && is_expiring {
+            let (_, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+        }
+        if !has_empty_value {
+            let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            // Same corruption guard as read_cell so a bogus vlen
+            // doesn't carry us past EOF silently.
+            const MAX_CELL_VALUE_LEN: u64 = 256 * 1024 * 1024;
+            if vlen > MAX_CELL_VALUE_LEN {
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cell value length {vlen} exceeds maximum ({MAX_CELL_VALUE_LEN}), likely corrupt SSTable"
+                    ),
+                )));
+            }
+            self.pos += vlen;
+        }
+        Ok(())
+    }
 
     /// Read a single cell value.
     fn read_cell(&mut self, row_liveness: &LivenessInfo) -> Result<CellValue> {

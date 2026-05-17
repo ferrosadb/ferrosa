@@ -32,6 +32,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
 # Replaces glibc malloc to avoid thread-arena retention (27× 64MB arenas ≈ 1.7GB RSS on 3-node cluster).
