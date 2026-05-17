@@ -300,9 +300,26 @@ async fn persist_schema_to_s3(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize tracing
+    // 1. Initialize tracing.
+    //
+    // Non-blocking writer: every `tracing::info!` etc. goes through
+    // an in-process channel to a dedicated logging thread that does
+    // the synchronous write to stdout. Without this, a slow stdout
+    // consumer (e.g. docker's json-file driver under host disk
+    // pressure) back-pressures every emitter — and since background
+    // tasks (compaction, schema sync, raft heartbeats) emit
+    // hundreds of info!() lines per minute, foreground hot paths
+    // like the range merger end up blocking on log writes. We
+    // measured cold-cache `SELECT … LIMIT 5` stalls of 30 s+ that
+    // disappear with non-blocking logging.
+    //
+    // The `_log_guard` MUST stay alive for the program lifetime —
+    // dropping it shuts the worker thread down, which would flush
+    // and then drop any pending events. We bind it in `main` so it
+    // lives until the process exits.
     let env_filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let (non_blocking_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
 
     if std::env::var("FERROSA_TELEMETRY_ENABLED").as_deref() == Ok("true") {
         use tracing_subscriber::layer::SubscriberExt;
@@ -328,11 +345,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_writer))
             .with(telemetry_layer)
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(non_blocking_writer)
+            .init();
     }
 
     tracing::info!("ferrosa starting");

@@ -988,6 +988,7 @@ impl<F: FlushTarget> TableStore<F> {
     pub fn range_iter_projected(
         &self,
         wanted: Vec<u16>,
+        partition_limit: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
@@ -997,7 +998,17 @@ impl<F: FlushTarget> TableStore<F> {
                 > + Send,
         >,
     > {
-        const STREAM_BUFFER: usize = 64;
+        // Buffer is intentionally small. The producer runs on a
+        // spawn_blocking thread and per-partition body decode on cold
+        // cache is the dominant cost (wide rows + embedding cells +
+        // dedup across multiple SSTable runs sharing a key). A larger
+        // buffer turns a `LIMIT N` scan into a `LIMIT N + buffer`
+        // scan because the producer races ahead before the consumer
+        // can drop the stream; we measured ~32 s cold-cache walls on
+        // a 1.7 GB table for `LIMIT 5` with buffer=64. With buffer=4
+        // *and* `partition_limit` pushed into the producer loop, the
+        // producer stops cleanly after N emissions.
+        const STREAM_BUFFER: usize = 4;
 
         let view = self.view.load_full();
         let start_owned = start.cloned();
@@ -1030,12 +1041,18 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             };
 
+            let cap = partition_limit.unwrap_or(usize::MAX);
+            let mut emitted: usize = 0;
             loop {
+                if emitted >= cap {
+                    return;
+                }
                 match merger.next_merged_partition() {
                     Ok(Some(partition)) => {
                         if tx.blocking_send(Ok(partition)).is_err() {
                             return;
                         }
+                        emitted += 1;
                     }
                     Ok(None) => return,
                     Err(e) => {
@@ -1072,10 +1089,12 @@ impl<F: FlushTarget> TableStore<F> {
                 > + Send,
         >,
     > {
-        /// Per-stream channel buffer. Bounded so a slow consumer
-        /// (e.g. CQL coordinator under load) back-pressures the
-        /// blocking merger task instead of letting it run away.
-        const STREAM_BUFFER: usize = 64;
+        /// Per-stream channel buffer. Kept small because per-partition
+        /// decode on cold cache is expensive (wide rows + cell decode)
+        /// and a `LIMIT N` consumer should pay for ~N body decodes,
+        /// not N + buffer_capacity. See the matching constant in
+        /// `range_iter_projected` for the LIMIT-pushdown rationale.
+        const STREAM_BUFFER: usize = 4;
 
         let view = self.view.load_full();
         let start_owned = start.cloned();

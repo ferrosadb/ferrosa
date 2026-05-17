@@ -24,46 +24,111 @@ use ferrosa_sstable::ReadAt;
 
 use crate::merge;
 
-/// One source contributing partitions to the merge. Wraps either a
-/// memtable iterator (infallible) or an SSTable streaming iterator
-/// (fallible per-partition).
+/// One source contributing partitions to the merge.
+///
+/// Each variant supports a **peek/pop split**: `peek_key()` returns
+/// the next partition's key without decoding the body (cheap — for
+/// SSTables it reads a ~10-byte header), and `pop_partition()`
+/// decodes and consumes the full partition. This is the cold-cache
+/// fast-path: the merger primes its heap with `(key, source_id)`
+/// pairs via `peek_key`, then decodes the body only when the source
+/// is popped — turning `O(num_sources × cold_body_decode)` into
+/// `O(num_sources × cold_header_read) + O(emitted × cold_body_decode)`.
+///
+/// For memtable sources the iterator yields owned `Partition`s and
+/// there is no cheap "peek key" primitive — so peek reads + caches
+/// the whole partition. That's still free in practice (memtables are
+/// in-memory) and pop takes the cached partition.
 pub enum MergeSource<'a, R: ReadAt> {
     /// Memtable / flushing memtable: infallible per-partition yield.
-    Memtable(Box<dyn Iterator<Item = Partition> + Send + 'a>),
-    /// SSTable streaming reader. Yields full partitions including
-    /// decoded cells.
-    SsTable(PartitionIter<'a, R>),
-    /// SSTable streaming reader in METADATA-ONLY mode (clustering +
-    /// liveness + row-deletion decoded, cells byte-skipped). Used by
-    /// the COUNT(*) fast path.
-    SsTableMetadata(PartitionIter<'a, R>),
-    /// SSTable streaming reader with COLUMN PROJECTION — decodes
-    /// only the cells whose ordinals are in `wanted`; the rest are
-    /// byte-skipped via `read_cell_skip`. Used by the CQL projection
-    /// fast path so `SELECT a, b FROM t` on a wide table doesn't pay
-    /// the cell read+decode cost for columns the caller doesn't want.
-    SsTableProjected {
+    /// `peeked` caches the result of the most recent `peek_key()`
+    /// (the full partition, since memtables yield owned partitions);
+    /// `pop_partition` takes it.
+    Memtable {
+        iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+        peeked: Option<Partition>,
+    },
+    /// Single SSTable streaming reader. `mode` controls per-cell
+    /// decoding on `pop_partition`. `peek_key` reads only the
+    /// partition header (~10 bytes) via `PartitionIter::peek_partition_key`
+    /// and caches the key in `peeked_key`; `pop_partition` decodes
+    /// the body from the same offset and clears the cache.
+    SsTable {
         iter: PartitionIter<'a, R>,
-        /// Column ordinals to retain. Order matches
-        /// `SerializationHeader::regular_columns` (and
-        /// `static_columns` for static rows). Empty = no cells.
-        wanted: &'a [u16],
+        mode: RunMode<'a>,
+        peeked_key: Option<DecoratedKey>,
     },
     /// LSM-level-style run of token-disjoint SSTables. The run is
     /// read **sequentially** (concatenated) instead of contributing
     /// `len()` separate slots to the k-way merge heap — collapses
-    /// O(num_sstables) initial peeks into O(num_runs).
-    SsTableRun(SsTableRunIter<'a, R>),
+    /// O(num_sstables) initial peeks into O(num_runs). `peek_key`
+    /// reads the current SSTable's header; `pop_partition` decodes
+    /// the body.
+    SsTableRun {
+        run: SsTableRunIter<'a, R>,
+        peeked_key: Option<DecoratedKey>,
+    },
 }
 
 impl<'a, R: ReadAt> MergeSource<'a, R> {
-    fn next_partition(&mut self) -> Result<Option<Partition>> {
+    /// Look at the next partition's key WITHOUT decoding the body.
+    /// Repeated calls are idempotent; the cached peek is consumed by
+    /// the next `pop_partition()`. Returns `Ok(None)` at EOS.
+    fn peek_key(&mut self) -> Result<Option<DecoratedKey>> {
         match self {
-            Self::Memtable(it) => Ok(it.next()),
-            Self::SsTable(it) => it.next_partition(),
-            Self::SsTableMetadata(it) => it.next_partition_metadata(),
-            Self::SsTableProjected { iter, wanted } => iter.next_partition_projected(wanted),
-            Self::SsTableRun(run) => run.next_partition(),
+            Self::Memtable { iter, peeked } => {
+                if peeked.is_none() {
+                    *peeked = iter.next();
+                }
+                Ok(peeked.as_ref().map(|p| p.key.clone()))
+            }
+            Self::SsTable {
+                iter, peeked_key, ..
+            } => {
+                if peeked_key.is_none() {
+                    *peeked_key = iter.peek_partition_key()?;
+                }
+                Ok(peeked_key.clone())
+            }
+            Self::SsTableRun { run, peeked_key } => {
+                if peeked_key.is_none() {
+                    *peeked_key = run.peek_key()?;
+                }
+                Ok(peeked_key.clone())
+            }
+        }
+    }
+
+    /// Decode and consume the next partition (the one most recently
+    /// returned by `peek_key()` — must follow a peek that returned
+    /// `Ok(Some(_))`). Clears the peek cache. Returns `Ok(None)` at
+    /// EOS only if the source was exhausted between peek and pop
+    /// (race-free here — we don't share sources across threads).
+    fn pop_partition(&mut self) -> Result<Option<Partition>> {
+        match self {
+            Self::Memtable { iter, peeked } => {
+                if let Some(p) = peeked.take() {
+                    Ok(Some(p))
+                } else {
+                    Ok(iter.next())
+                }
+            }
+            Self::SsTable {
+                iter,
+                mode,
+                peeked_key,
+            } => {
+                peeked_key.take();
+                match mode {
+                    RunMode::Full => iter.next_partition(),
+                    RunMode::Metadata => iter.next_partition_metadata(),
+                    RunMode::Projected(wanted) => iter.next_partition_projected(wanted),
+                }
+            }
+            Self::SsTableRun { run, peeked_key } => {
+                peeked_key.take();
+                run.next_partition()
+            }
         }
     }
 }
@@ -99,6 +164,47 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
             mode,
             cursor: 0,
             current: None,
+        }
+    }
+
+    /// Peek the next partition's key, advancing through exhausted
+    /// SSTables in the run if necessary. Does NOT decode any
+    /// partition body. Used by `MergeSource::peek_key` for cheap
+    /// heap priming.
+    fn peek_key(&mut self) -> Result<Option<DecoratedKey>> {
+        loop {
+            if self.current.is_none() {
+                if self.cursor >= self.sstables.len() {
+                    return Ok(None);
+                }
+                match self.sstables[self.cursor].partitions_iter() {
+                    Ok(it) => self.current = Some(it),
+                    Err(e) => {
+                        tracing::warn!(
+                            cursor = self.cursor,
+                            "SsTableRunIter: open failed, skipping table: {e}"
+                        );
+                        self.cursor += 1;
+                        continue;
+                    }
+                }
+            }
+            let it = self.current.as_mut().expect("just initialised");
+            match it.peek_partition_key() {
+                Ok(Some(k)) => return Ok(Some(k)),
+                Ok(None) => {
+                    self.current = None;
+                    self.cursor += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cursor = self.cursor,
+                        "SsTableRunIter: peek failed, dropping rest of table: {e}"
+                    );
+                    self.current = None;
+                    self.cursor += 1;
+                }
+            }
         }
     }
 
@@ -360,14 +466,19 @@ mod tests {
     }
 }
 
-/// Heap entry: one peeked partition per still-active source. The
-/// heap is min-keyed; ties (same DecoratedKey across sources) are
-/// broken by source index for total ordering — the merger groups
-/// all same-key partitions into a single merge call.
+/// Heap entry: one peeked KEY per still-active source. The heap is
+/// min-keyed; ties (same DecoratedKey across sources) are broken by
+/// source index for total ordering — the merger groups all same-key
+/// partitions into a single merge call.
+///
+/// Importantly the entry does NOT hold the partition body. The body
+/// is decoded lazily when the entry's source is popped, via
+/// `MergeSource::pop_partition`. On cold cache this defers the
+/// dominant cost (per-partition body decode) from `O(num_sources)`
+/// at construction time to `O(emitted)` over the scan lifetime.
 struct HeapEntry {
     key: DecoratedKey,
     src: usize,
-    partition: Partition,
 }
 
 impl PartialEq for HeapEntry {
@@ -459,50 +570,49 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         merger
     }
 
-    /// Pull the next available partition from `src` (skipping over
-    /// entries below `start`) and push it onto the heap.
+    /// Peek the next key from `src`, skipping entries below `start`,
+    /// and push it onto the heap. The partition BODY is not decoded
+    /// here — only the cheap header read is performed. If `peek_key`
+    /// returns a key below `start`, we pop it (consuming the body to
+    /// advance the source) and try again.
     fn refill_source(&mut self, src: usize) {
         loop {
-            match self.sources[src].next_partition() {
-                Ok(Some(partition)) => {
-                    if let Some(ref s) = self.start {
-                        if partition.key < *s {
-                            continue;
-                        }
-                    }
-                    self.heap.push(HeapEntry {
-                        key: partition.key.clone(),
-                        src,
-                        partition,
-                    });
+            let peeked = match self.sources[src].peek_key() {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(src, "range_merger: source peek error, dropping source: {e}");
                     return;
                 }
-                Ok(None) => return,
-                Err(e) => {
-                    tracing::warn!(src, "range_merger: source error, dropping source: {e}");
-                    return;
+            };
+            let key = match peeked {
+                Some(k) => k,
+                None => return,
+            };
+            if let Some(ref s) = self.start {
+                if key < *s {
+                    let _ = self.sources[src].pop_partition();
+                    continue;
                 }
             }
+            self.heap.push(HeapEntry { key, src });
+            return;
         }
     }
 
     /// Pull one merged partition. Returns `Ok(None)` when every
     /// source is exhausted (or the upper bound was crossed). Pops
-    /// the smallest-key entry; if more entries share that key,
-    /// drains them too and merges via `merge::merge_partitions`;
-    /// applies deletion suppression before yielding.
+    /// the smallest-key heap entry, asks that source for the full
+    /// partition (now warm — header was just paged in by peek), and
+    /// repeats for every other source whose head matches the same
+    /// key. Merges + applies deletion suppression before yielding.
     pub fn next_merged_partition(&mut self) -> Result<Option<Partition>> {
         if self.exhausted {
             return Ok(None);
         }
-        // Pop the smallest-key entry.
         let first = match self.heap.pop() {
             Some(e) => e,
             None => return Ok(None),
         };
-        // Upper-bound check — once the smallest key in the heap is
-        // past `end`, all remaining entries are too (the heap is
-        // min-key ordered).
         if let Some(ref e) = self.end {
             if first.key > *e {
                 self.exhausted = true;
@@ -511,27 +621,44 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         }
         let key = first.key.clone();
         let first_src = first.src;
-        let mut group: Vec<Partition> = vec![first.partition];
+        let first_partition = match self.sources[first_src].pop_partition() {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                // Source exhausted between peek and pop — should not
+                // happen for our single-threaded sources. Skip and
+                // continue: refill and try again.
+                self.refill_source(first_src);
+                return self.next_merged_partition();
+            }
+            Err(e) => return Err(e),
+        };
+        let mut group: Vec<Partition> = vec![first_partition];
+        let mut popped_srcs: Vec<usize> = vec![first_src];
 
         // Drain any other heap entries with the SAME key.
-        let mut refill_srcs: Vec<usize> = vec![first_src];
         while let Some(top) = self.heap.peek() {
             if top.key != key {
                 break;
             }
             let entry = self.heap.pop().expect("peek succeeded");
-            refill_srcs.push(entry.src);
-            group.push(entry.partition);
+            match self.sources[entry.src].pop_partition()? {
+                Some(p) => {
+                    popped_srcs.push(entry.src);
+                    group.push(p);
+                }
+                None => {
+                    // Defensive: peek said Some, pop said None. Skip.
+                    popped_srcs.push(entry.src);
+                }
+            }
         }
 
         // Refill every source we drained from so the next call sees
         // a fresh peek.
-        for src in refill_srcs {
+        for src in popped_srcs {
             self.refill_source(src);
         }
 
-        // Merge same-key group (no-op for group of 1, but still
-        // useful to apply deletion suppression uniformly).
         let mut merged = if group.len() == 1 {
             group.into_iter().next().unwrap()
         } else {
@@ -651,9 +778,15 @@ fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     // into a `Box<[Vec<Arc<...>>]>` and stash on the merger so it
     // lives as long as the iterators borrowing from it.
     let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + runs.len());
-    sources.push(MergeSource::Memtable(active_iter));
+    sources.push(MergeSource::Memtable {
+        iter: active_iter,
+        peeked: None,
+    });
     if let Some(it) = flushing_iter {
-        sources.push(MergeSource::Memtable(it));
+        sources.push(MergeSource::Memtable {
+            iter: it,
+            peeked: None,
+        });
     }
     let mut owned_runs: Vec<Vec<Arc<SSTableReader<R>>>> = runs;
     // We need a stable slice address per run. `Box<[Vec<...>]>` gives
@@ -675,10 +808,10 @@ fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     // therefore valid for `'a`.
     let runs_ref: &'a [Vec<Arc<SSTableReader<R>>>] = unsafe { &*runs_ptr };
     for run in runs_ref.iter() {
-        sources.push(MergeSource::SsTableRun(SsTableRunIter::new(
-            run.as_slice(),
-            mode,
-        )));
+        sources.push(MergeSource::SsTableRun {
+            run: SsTableRunIter::new(run.as_slice(), mode),
+            peeked_key: None,
+        });
     }
     let mut merger = RangeMerger::new(sources, start, end);
     merger.runs_arena = Some(runs_ptr);

@@ -2146,6 +2146,7 @@ impl StorageEngine {
         &self,
         table_id: &TableId,
         wanted: Vec<u16>,
+        partition_limit: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
@@ -2157,7 +2158,7 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.range_iter_projected(wanted, start, end),
+            Some(state) => state.store.range_iter_projected(wanted, partition_limit, start, end),
             None => Box::pin(futures::stream::empty()),
         }
     }

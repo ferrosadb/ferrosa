@@ -202,6 +202,35 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         Ok(Some((key, row_count)))
     }
 
+    /// Peek the next partition's key **without** decoding the body.
+    ///
+    /// Reads only the partition header (key bytes + DeletionTime) and
+    /// **does not advance** `self.pos` — the next `read_partition*`
+    /// call will re-read from the same offset and produce the full
+    /// partition (or, on EOF, `Ok(None)`).
+    ///
+    /// Used by the range merger to populate its priming heap with
+    /// keys without paying the full partition decode cost up front.
+    /// On cold cache the per-source partition-body decode dominates
+    /// scan latency; deferring it until a source is popped (after
+    /// the heap proves it's the min) collapses
+    /// `O(num_sources × cold_body_decode)` into
+    /// `O(num_sources × cold_header_read) + O(emitted × cold_body_decode)`.
+    ///
+    /// Memory: `O(key_len)` per call. CPU: 2-3 small `pread`s of
+    /// well under 100 bytes total.
+    /// Returns `Ok(None)` at EOF.
+    pub fn peek_partition_key(&mut self) -> Result<Option<DecoratedKey>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+        let saved_pos = self.pos;
+        let (key_bytes, _deletion) = self.read_partition_header()?;
+        self.pos = saved_pos;
+        Ok(Some(DecoratedKey::new(PartitionKey::new(key_bytes))))
+    }
+
     /// Read the next partition with full row metadata (clustering
     /// keys, row-level deletion, liveness) but **no cell payloads**.
     ///

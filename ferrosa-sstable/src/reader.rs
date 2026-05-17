@@ -375,6 +375,39 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         }
     }
 
+    /// Peek the next partition's key WITHOUT advancing iteration
+    /// state. The following `next_partition*` call yields the same
+    /// partition (decoded), at the same `self.pos`.
+    ///
+    /// Used by the range merger to populate its priming heap with
+    /// `(key, source_id)` pairs cheaply: on cold cache the full
+    /// per-source partition-body decode is the dominant cost of
+    /// any range scan with `LIMIT N` (especially small N), so
+    /// deferring body decode until the merger actually pops that
+    /// source collapses the cold-cache wall from
+    /// `O(num_sources × body_decode)` to
+    /// `O(num_sources × header_read) + O(N × body_decode)`.
+    ///
+    /// Returns `Ok(None)` at EOF.
+    pub fn peek_partition_key(
+        &mut self,
+    ) -> Result<Option<ferrosa_common::key::DecoratedKey>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.peek_partition_key()?;
+            // peek does not advance pos
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.peek_partition_key()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
     /// Yield the next partition with full row metadata (clustering
     /// keys, row-level deletion, liveness) but **no cell payloads**
     /// — `Partition.rows[*].cells` is always empty. Used by the
@@ -864,6 +897,70 @@ mod tests {
         // EOF stable.
         assert!(iter_counts.next_partition_count().unwrap().is_none());
         assert!(iter_counts.next_partition_count().unwrap().is_none());
+    }
+
+    /// `peek_partition_key` returns the same key as the subsequent
+    /// `next_partition*` call WITHOUT advancing iterator state.
+    /// Critical for the range-merger cold-cache fast-path: priming
+    /// the heap with peeked keys is `O(num_sources × header_read)`,
+    /// then bodies are decoded only on pop (`O(emitted)`).
+    /// Verifies: peek does not advance, repeated peek is idempotent,
+    /// peek-then-next yields the same key, and EOF is stable.
+    #[test]
+    fn peek_partition_key_does_not_advance_iterator() {
+        let header = test_header();
+        let dks: Vec<_> = (0..4u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        let mut iter = reader.partitions_iter().expect("partitions_iter");
+        for expected in &dks {
+            let pos_before = iter.pos;
+            let peeked1 = iter
+                .peek_partition_key()
+                .expect("peek1")
+                .expect("peek1 some");
+            assert_eq!(&peeked1, expected, "peek yields next key");
+            assert_eq!(iter.pos, pos_before, "peek must not advance pos");
+
+            // Idempotent: a second peek returns the same key without advancing.
+            let peeked2 = iter
+                .peek_partition_key()
+                .expect("peek2")
+                .expect("peek2 some");
+            assert_eq!(peeked2, peeked1, "repeated peek is stable");
+            assert_eq!(iter.pos, pos_before, "repeated peek must not advance");
+
+            // The full decode now consumes this partition and advances.
+            let partition = iter.next_partition().expect("next").expect("partition");
+            assert_eq!(&partition.key, expected, "next_partition yields peeked key");
+            assert!(iter.pos > pos_before, "next_partition must advance pos");
+        }
+        // EOF: peek and next both yield None, repeatedly.
+        assert!(iter.peek_partition_key().unwrap().is_none(), "peek at EOF");
+        assert!(iter.peek_partition_key().unwrap().is_none(), "peek EOF stable");
+        assert!(iter.next_partition().unwrap().is_none(), "next at EOF");
     }
 
     /// ADR-020 fast COUNT(*) metadata path: next_partition_metadata

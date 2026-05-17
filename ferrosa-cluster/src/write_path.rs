@@ -233,14 +233,19 @@ impl WritePath {
                 ));
             }
         };
-        let mut stream = engine.range_iter_projected(table_id, wanted, None, None);
+        // Push `partition_limit` into the producer so the merger
+        // stops emitting after N partitions — without this, the
+        // bounded mpsc buffer means the producer races ahead by
+        // `STREAM_BUFFER` body decodes after the consumer has
+        // already read enough, and on cold cache each of those
+        // wasted body decodes is ~hundreds of ms.
+        let mut stream =
+            engine.range_iter_projected(table_id, wanted, partition_limit, None, None);
         let cap = partition_limit.unwrap_or(usize::MAX);
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             out.push(item.map_err(crate::error::ClusterError::Storage)?);
             if out.len() >= cap {
-                // Drop the stream so the producer task sees the
-                // channel close and bails out of the merger early.
                 drop(stream);
                 break;
             }
