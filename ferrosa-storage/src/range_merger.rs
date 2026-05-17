@@ -37,6 +37,18 @@ pub enum MergeSource<'a, R: ReadAt> {
     /// liveness + row-deletion decoded, cells byte-skipped). Used by
     /// the COUNT(*) fast path.
     SsTableMetadata(PartitionIter<'a, R>),
+    /// SSTable streaming reader with COLUMN PROJECTION — decodes
+    /// only the cells whose ordinals are in `wanted`; the rest are
+    /// byte-skipped via `read_cell_skip`. Used by the CQL projection
+    /// fast path so `SELECT a, b FROM t` on a wide table doesn't pay
+    /// the cell read+decode cost for columns the caller doesn't want.
+    SsTableProjected {
+        iter: PartitionIter<'a, R>,
+        /// Column ordinals to retain. Order matches
+        /// `SerializationHeader::regular_columns` (and
+        /// `static_columns` for static rows). Empty = no cells.
+        wanted: &'a [u16],
+    },
 }
 
 impl<'a, R: ReadAt> MergeSource<'a, R> {
@@ -45,6 +57,7 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
             Self::Memtable(it) => Ok(it.next()),
             Self::SsTable(it) => it.next_partition(),
             Self::SsTableMetadata(it) => it.next_partition_metadata(),
+            Self::SsTableProjected { iter, wanted } => iter.next_partition_projected(wanted),
         }
     }
 }
@@ -222,6 +235,37 @@ pub fn merger_for_sources<'a, R: ReadAt>(
             Ok(it) => sources.push(MergeSource::SsTable(it)),
             Err(e) => {
                 tracing::warn!("range_merger: SSTable open failed, skipping: {e}");
+            }
+        }
+    }
+    Ok(RangeMerger::new(sources, start, end))
+}
+
+/// Projection variant: SSTables decode only the cells whose
+/// ordinals are in `wanted`; memtable contributions retain their
+/// full cells (already in memory; stripping costs more than it
+/// saves). `merge::merge_partitions` correctly merges across the
+/// mixed-projection rows because dedup is keyed on the clustering
+/// key, not on the cell payload. Used by the CQL projection fast
+/// path.
+pub fn merger_for_projected_sources<'a, R: ReadAt>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    wanted: &'a [u16],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + sstables.len());
+    sources.push(MergeSource::Memtable(active_iter));
+    if let Some(it) = flushing_iter {
+        sources.push(MergeSource::Memtable(it));
+    }
+    for sst in sstables {
+        match sst.partitions_iter() {
+            Ok(iter) => sources.push(MergeSource::SsTableProjected { iter, wanted }),
+            Err(e) => {
+                tracing::warn!("range_merger: SSTable open (projected) failed, skipping: {e}");
             }
         }
     }

@@ -977,6 +977,80 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(total)
     }
 
+    /// Projection-aware variant of `range_iter`. SSTable cells
+    /// whose ordinals are NOT in `wanted` are byte-skipped via
+    /// `DataReader::read_cell_skip` — saves one syscall + one heap
+    /// alloc + the value-byte memcpy per skipped cell. Memtable
+    /// partitions retain their full cells (already in memory).
+    ///
+    /// Takes `wanted` by value so the spawned blocking task can
+    /// move it in; the returned stream has no borrow.
+    pub fn range_iter_projected(
+        &self,
+        wanted: Vec<u16>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::stream::Stream<
+                    Item = Result<Partition>,
+                > + Send,
+        >,
+    > {
+        const STREAM_BUFFER: usize = 64;
+
+        let view = self.view.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let wanted_owned = wanted;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+
+        tokio::task::spawn_blocking(move || {
+            let active_iter = view
+                .active
+                .range_iter(start_owned.as_ref(), end_owned.as_ref());
+            let flushing_iter = view
+                .flushing
+                .as_ref()
+                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            let sstables_slice = &view.sstables[..];
+
+            let mut merger = match crate::range_merger::merger_for_projected_sources(
+                active_iter,
+                flushing_iter,
+                sstables_slice,
+                &wanted_owned,
+                start_owned,
+                end_owned,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+
+            loop {
+                match merger.next_merged_partition() {
+                    Ok(Some(partition)) => {
+                        if tx.blocking_send(Ok(partition)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+
     /// ADR-020 lazy range iterator. Returns an async `Stream` that
     /// yields every partition in `[start, end]` one at a time —
     /// memtable + flushing memtable + SSTables k-way merged, with

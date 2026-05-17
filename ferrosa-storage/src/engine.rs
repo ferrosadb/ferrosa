@@ -2137,6 +2137,31 @@ impl StorageEngine {
         }
     }
 
+    /// Projection-aware variant of `range_iter`. Only the cells whose
+    /// ordinals are in `wanted` are decoded; SSTable cells outside
+    /// the projection are byte-skipped via
+    /// `range_merger::merger_for_projected_sources`. Returns an
+    /// empty stream when the table is not registered.
+    pub fn range_iter_projected(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::stream::Stream<
+                    Item = ferrosa_common::Result<Partition>,
+                > + Send,
+        >,
+    > {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.range_iter_projected(wanted, start, end),
+            None => Box::pin(futures::stream::empty()),
+        }
+    }
+
     /// ADR-020 lazy range iterator. Returns an async `Stream` that
     /// yields every partition in `[start, end]` for `table_id`, one
     /// at a time, without materializing the full result. Backed by

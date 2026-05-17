@@ -204,6 +204,42 @@ impl WritePath {
         }
     }
 
+    /// Projection-aware range read. Returns partitions whose
+    /// `rows[*].cells` contains only cells whose ordinals are in
+    /// `wanted` — SSTable cells outside the projection are
+    /// byte-skipped via `read_cell_skip`. Used by the CQL fast
+    /// path for `SELECT col1, col2 FROM t` on wide tables (esp.
+    /// embedding vectors).
+    ///
+    /// The caller is expected to have already verified that the
+    /// projection is safe — i.e., no WHERE clause references
+    /// cells outside `wanted` — otherwise predicates would fail
+    /// to evaluate against the trimmed rows. CQL router enforces
+    /// this; raw callers should too.
+    pub async fn range_read_projected(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+    ) -> crate::error::Result<Vec<Partition>> {
+        use futures::stream::StreamExt;
+        let engine = match self {
+            Self::Direct(engine) => engine.clone(),
+            Self::Pair(coordinator) => coordinator.local_storage().clone(),
+            Self::Cluster(coordinator) => coordinator.storage.clone(),
+            Self::Unavailable => {
+                return Err(crate::error::ClusterError::Internal(
+                    "range_read_projected unavailable: write path is in degraded mode".into(),
+                ));
+            }
+        };
+        let mut stream = engine.range_iter_projected(table_id, wanted, None, None);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item.map_err(crate::error::ClusterError::Storage)?);
+        }
+        Ok(out)
+    }
+
     /// Read up to `limit` partitions for unordered full-scan consumers.
     ///
     /// This lets CQL `LIMIT` and protocol page-size produce the first page

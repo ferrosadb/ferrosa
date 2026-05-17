@@ -343,6 +343,38 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         }
     }
 
+    /// Yield the next partition decoding only the cells whose
+    /// ordinals are in `wanted`. Cells outside the projection are
+    /// byte-skipped via `DataReader::read_cell_skip` — saves one
+    /// syscall, one heap alloc, and the value-byte memcpy per
+    /// skipped cell. Used by the CQL projection fast path so a
+    /// `SELECT a, b FROM t` on a wide table (especially with
+    /// embedding columns) doesn't pay the read+decode cost for
+    /// columns the caller doesn't want.
+    ///
+    /// An empty `wanted` slice yields rows with empty `cells` —
+    /// useful when only clustering keys / metadata are needed
+    /// (similar to `next_partition_metadata` but going through
+    /// the per-cell skip path).
+    pub fn next_partition_projected(
+        &mut self,
+        wanted: &[u16],
+    ) -> Result<Option<crate::types::Partition>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_projected(wanted)?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_projected(wanted)?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
     /// Yield the next partition with full row metadata (clustering
     /// keys, row-level deletion, liveness) but **no cell payloads**
     /// — `Partition.rows[*].cells` is always empty. Used by the
@@ -894,5 +926,90 @@ mod tests {
         }
         // EOF stable.
         assert!(iter_meta.next_partition_metadata().unwrap().is_none());
+    }
+
+    /// ADR-020 projection-aware decode: `next_partition_projected`
+    /// returns the same partition keys + same row count + same
+    /// clustering keys as the full path, but `cells` contains only
+    /// the cells the caller named in `wanted`. Cells outside the
+    /// projection are byte-skipped via `read_cell_skip`.
+    #[test]
+    fn next_partition_projected_filters_cells_to_wanted_set() {
+        let header = test_header();
+        let dks: Vec<_> = (0..3u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Reference: full partition iteration.
+        let mut iter_full = reader.partitions_iter().expect("partitions_iter (full)");
+        let mut full = Vec::new();
+        while let Some(p) = iter_full.next_partition().expect("next full") {
+            full.push(p);
+        }
+
+        // Projection: wanted = {0} → only column 0's cell per row.
+        let wanted: Vec<u16> = vec![0];
+        let mut iter_proj = reader.partitions_iter().expect("partitions_iter (proj)");
+        let mut proj = Vec::new();
+        while let Some(p) = iter_proj
+            .next_partition_projected(&wanted)
+            .expect("next projected")
+        {
+            proj.push(p);
+        }
+
+        assert_eq!(proj.len(), full.len(), "same partition count");
+        for (f, p) in full.iter().zip(proj.iter()) {
+            assert_eq!(p.key, f.key, "key matches");
+            assert_eq!(p.rows.len(), f.rows.len(), "row count matches");
+            for (fr, pr) in f.rows.iter().zip(p.rows.iter()) {
+                assert_eq!(pr.clustering, fr.clustering, "clustering matches");
+                // Projected: only column 0 cells should remain.
+                let proj_col_ids: Vec<u16> = pr.cells.iter().map(|(c, _)| *c).collect();
+                assert!(
+                    proj_col_ids.iter().all(|c| wanted.contains(c)),
+                    "projected row only has wanted cells: {proj_col_ids:?}"
+                );
+                // Full had column 0; ensure projection didn't drop it.
+                let full_has_col0 = fr.cells.iter().any(|(c, _)| *c == 0);
+                let proj_has_col0 = pr.cells.iter().any(|(c, _)| *c == 0);
+                assert_eq!(
+                    proj_has_col0, full_has_col0,
+                    "column 0 presence preserved"
+                );
+            }
+        }
+
+        // Empty projection = no cells.
+        let mut iter_empty = reader.partitions_iter().expect("partitions_iter (empty)");
+        if let Some(p) = iter_empty
+            .next_partition_projected(&[])
+            .expect("next empty projection")
+        {
+            for r in &p.rows {
+                assert!(r.cells.is_empty(), "empty projection leaves cells empty");
+            }
+        }
     }
 }
