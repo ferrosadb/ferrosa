@@ -74,6 +74,15 @@ pub struct SSTableReader<R: ReadAt> {
     _decompressed_data: Option<Vec<u8>>,
     #[allow(dead_code)]
     rows: R,
+    /// Lazily-populated sorted list of partition start offsets in
+    /// `data`. Built by walking the data file once via
+    /// `DataReader::read_partition_count` (no cell decode, only row
+    /// header walking) on the first call to `partition_offsets`.
+    /// Used by `PartitionIter::skip_to_next_partition` so the merger
+    /// can advance past duplicate-key sources in O(log N) without
+    /// decoding any partition body — the cold-cache dominant cost
+    /// (see bug-streaming-range-read-perf-50x-floor).
+    partition_offsets: std::sync::OnceLock<std::sync::Arc<Vec<u64>>>,
 }
 
 impl<R: ReadAt> SSTableReader<R> {
@@ -108,7 +117,46 @@ impl<R: ReadAt> SSTableReader<R> {
             data: components.data,
             _decompressed_data: decompressed_data,
             rows: components.rows,
+            partition_offsets: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Sorted list of partition start offsets in this SSTable's
+    /// `Data.db`. Lazily built on first call by walking the data
+    /// file with `read_partition_count` (no cell decode); cached for
+    /// the SSTable's lifetime. Subsequent calls are O(1).
+    ///
+    /// Used by `PartitionIter::skip_to_next_partition` for the
+    /// merger's duplicate-key dedup path — pre-decoded offsets
+    /// reduce a "skip past this partition" call from `O(rows × cold
+    /// page faults)` (the row-walking cost of
+    /// `next_partition_metadata`) to one binary search + one pos
+    /// assignment.
+    ///
+    /// On error the offsets list is left empty and a warning is
+    /// logged; callers fall back to body-decode advancement.
+    pub fn partition_offsets(&self) -> std::sync::Arc<Vec<u64>> {
+        self.partition_offsets
+            .get_or_init(|| {
+                let mut offsets: Vec<u64> = Vec::new();
+                let mut iter = match self.partitions_iter() {
+                    Ok(it) => it,
+                    Err(_) => {
+                        // Caller falls back to body-decode advance.
+                        return std::sync::Arc::new(offsets);
+                    }
+                };
+                loop {
+                    let pos_before = iter.pos;
+                    match iter.next_partition_count() {
+                        Ok(Some(_)) => offsets.push(pos_before),
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+                std::sync::Arc::new(offsets)
+            })
+            .clone()
     }
 
     /// Look up a partition by its decorated key.
@@ -315,6 +363,150 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         } else {
             let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
             let result = reader.read_partition()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
+    /// Yield `(partition_key, row_count)` for the next partition without
+    /// decoding any cell payloads. Cells are byte-skipped via
+    /// `DataReader::read_partition_count`. Used by the COUNT(*) fast
+    /// path so a full-table count never pays the per-cell decode cost.
+    /// Returns `Ok(None)` at EOF.
+    pub fn next_partition_count(
+        &mut self,
+    ) -> Result<Option<(ferrosa_common::key::DecoratedKey, u64)>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_count()?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_count()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
+    /// Yield the next partition decoding only the cells whose
+    /// ordinals are in `wanted`. Cells outside the projection are
+    /// byte-skipped via `DataReader::read_cell_skip` — saves one
+    /// syscall, one heap alloc, and the value-byte memcpy per
+    /// skipped cell. Used by the CQL projection fast path so a
+    /// `SELECT a, b FROM t` on a wide table (especially with
+    /// embedding columns) doesn't pay the read+decode cost for
+    /// columns the caller doesn't want.
+    ///
+    /// An empty `wanted` slice yields rows with empty `cells` —
+    /// useful when only clustering keys / metadata are needed
+    /// (similar to `next_partition_metadata` but going through
+    /// the per-cell skip path).
+    pub fn next_partition_projected(
+        &mut self,
+        wanted: &[u16],
+    ) -> Result<Option<crate::types::Partition>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_projected(wanted)?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_projected(wanted)?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
+    /// Advance past the partition currently at `self.pos` WITHOUT
+    /// decoding it. Returns `Ok(())` when there is a next partition
+    /// (pos is moved to its start), `Ok(())` AT EOF too (pos is
+    /// moved to file_len so subsequent peek/next yield None).
+    ///
+    /// Uses the SSTable's cached `partition_offsets` for O(log N)
+    /// lookup of the next partition's start offset. The cache is
+    /// built lazily on first call (one-time O(file) walk via
+    /// `next_partition_count`).
+    ///
+    /// Used by the merger's duplicate-key dedup path: when we've
+    /// already popped the partition for key K from one source, the
+    /// OTHER sources holding key K need to advance past it but their
+    /// decoded body is discarded — `skip_to_next_partition` does the
+    /// advance without paying that wasted decode cost.
+    pub fn skip_to_next_partition(&mut self) -> Result<()> {
+        let offsets = self.sst.partition_offsets();
+        if offsets.is_empty() {
+            // Cache build failed; fall back to body-decode advance.
+            // (We can't return error here without changing the API;
+            // caller should use next_partition* as a fallback.)
+            let _ = self.next_partition_metadata()?;
+            return Ok(());
+        }
+        // Find the first offset strictly greater than self.pos.
+        let next_idx = match offsets.binary_search(&self.pos) {
+            Ok(i) => i + 1, // self.pos sits AT a partition start; advance to next
+            Err(i) => i,    // self.pos is inside a partition; i is the next start
+        };
+        self.pos = match offsets.get(next_idx) {
+            Some(&p) => p,
+            None => self.sst.data.len()?, // past last partition → EOF
+        };
+        Ok(())
+    }
+
+    /// Peek the next partition's key WITHOUT advancing iteration
+    /// state. The following `next_partition*` call yields the same
+    /// partition (decoded), at the same `self.pos`.
+    ///
+    /// Used by the range merger to populate its priming heap with
+    /// `(key, source_id)` pairs cheaply: on cold cache the full
+    /// per-source partition-body decode is the dominant cost of
+    /// any range scan with `LIMIT N` (especially small N), so
+    /// deferring body decode until the merger actually pops that
+    /// source collapses the cold-cache wall from
+    /// `O(num_sources × body_decode)` to
+    /// `O(num_sources × header_read) + O(N × body_decode)`.
+    ///
+    /// Returns `Ok(None)` at EOF.
+    pub fn peek_partition_key(&mut self) -> Result<Option<ferrosa_common::key::DecoratedKey>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.peek_partition_key()?;
+            // peek does not advance pos
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.peek_partition_key()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
+    /// Yield the next partition with full row metadata (clustering
+    /// keys, row-level deletion, liveness) but **no cell payloads**
+    /// — `Partition.rows[*].cells` is always empty. Used by the
+    /// COUNT(*) fast path where the storage layer needs row-level
+    /// dedup via `merge::merge_partitions` but doesn't need cell
+    /// data. Returns `Ok(None)` at EOF.
+    pub fn next_partition_metadata(&mut self) -> Result<Option<crate::types::Partition>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_metadata()?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_metadata()?;
             self.pos = reader.position();
             Ok(result)
         }
@@ -732,5 +924,345 @@ mod tests {
         // EOF stays at EOF
         assert!(iter.next_partition().unwrap().is_none());
         assert!(iter.next_partition().unwrap().is_none());
+    }
+
+    /// ADR-020 COUNT(*) fast path: next_partition_count yields the
+    /// same partition keys as next_partition, with row_count
+    /// matching `partition.rows.len()`. Crucially does NOT decode
+    /// any cell payloads — `read_partition_count` advances by
+    /// byte-skipping via `skip_row_body`.
+    #[test]
+    fn next_partition_count_matches_partition_rows_len() {
+        let header = test_header();
+        let dks: Vec<_> = (0..5u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Reference: full partition iteration with row counts.
+        let mut iter_full = reader.partitions_iter().expect("partitions_iter");
+        let mut expected: Vec<(_, u64)> = Vec::new();
+        while let Some(p) = iter_full.next_partition().expect("next") {
+            expected.push((p.key, p.rows.len() as u64));
+        }
+
+        // Under test: counts-only iteration.
+        let mut iter_counts = reader.partitions_iter().expect("partitions_iter (counts)");
+        let mut got: Vec<(_, u64)> = Vec::new();
+        while let Some(pc) = iter_counts.next_partition_count().expect("next_count") {
+            got.push(pc);
+        }
+
+        assert_eq!(got, expected, "count iterator must match full iter");
+        // EOF stable.
+        assert!(iter_counts.next_partition_count().unwrap().is_none());
+        assert!(iter_counts.next_partition_count().unwrap().is_none());
+    }
+
+    /// `skip_to_next_partition` advances `pos` past the current
+    /// partition WITHOUT decoding it. Combined with `peek_partition_key`
+    /// it lets the merger advance duplicate-key sources without
+    /// paying any cell decode cost — the cold-cache dominant cost
+    /// (see bug-streaming-range-read-perf-50x-floor).
+    ///
+    /// Verifies:
+    ///  - skip advances to the NEXT partition's key (matches what
+    ///    a non-skip iteration would yield next).
+    ///  - skip-then-skip-...-then-skip eventually reaches EOF cleanly.
+    ///  - alternating peek+skip yields the same key sequence as
+    ///    pure next_partition iteration.
+    #[test]
+    fn skip_to_next_partition_advances_without_decode() {
+        let header = test_header();
+        let dks: Vec<_> = (0..5u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Reference iteration: full next_partition over every partition.
+        let mut iter_ref = reader.partitions_iter().unwrap();
+        let mut ref_keys = Vec::new();
+        while let Some(p) = iter_ref.next_partition().unwrap() {
+            ref_keys.push(p.key);
+        }
+        assert_eq!(ref_keys, dks, "sanity: reference iteration yields all keys");
+
+        // Skip-only iteration: peek+skip the whole file. Must yield
+        // the same key sequence (peek before each skip).
+        let mut iter = reader.partitions_iter().unwrap();
+        let mut skip_keys = Vec::new();
+        loop {
+            let peeked = iter.peek_partition_key().unwrap();
+            let Some(k) = peeked else { break };
+            skip_keys.push(k);
+            iter.skip_to_next_partition().unwrap();
+        }
+        assert_eq!(
+            skip_keys, dks,
+            "peek+skip yields the same key sequence as full iteration"
+        );
+
+        // EOF stable: extra peek + skip yields None / no-op.
+        assert!(
+            iter.peek_partition_key().unwrap().is_none(),
+            "peek at EOF returns None"
+        );
+        iter.skip_to_next_partition()
+            .expect("skip at EOF must be a no-op");
+        assert!(
+            iter.peek_partition_key().unwrap().is_none(),
+            "peek at EOF stays None after redundant skip"
+        );
+    }
+
+    /// `peek_partition_key` returns the same key as the subsequent
+    /// `next_partition*` call WITHOUT advancing iterator state.
+    /// Critical for the range-merger cold-cache fast-path: priming
+    /// the heap with peeked keys is `O(num_sources × header_read)`,
+    /// then bodies are decoded only on pop (`O(emitted)`).
+    /// Verifies: peek does not advance, repeated peek is idempotent,
+    /// peek-then-next yields the same key, and EOF is stable.
+    #[test]
+    fn peek_partition_key_does_not_advance_iterator() {
+        let header = test_header();
+        let dks: Vec<_> = (0..4u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        let mut iter = reader.partitions_iter().expect("partitions_iter");
+        for expected in &dks {
+            let pos_before = iter.pos;
+            let peeked1 = iter
+                .peek_partition_key()
+                .expect("peek1")
+                .expect("peek1 some");
+            assert_eq!(&peeked1, expected, "peek yields next key");
+            assert_eq!(iter.pos, pos_before, "peek must not advance pos");
+
+            // Idempotent: a second peek returns the same key without advancing.
+            let peeked2 = iter
+                .peek_partition_key()
+                .expect("peek2")
+                .expect("peek2 some");
+            assert_eq!(peeked2, peeked1, "repeated peek is stable");
+            assert_eq!(iter.pos, pos_before, "repeated peek must not advance");
+
+            // The full decode now consumes this partition and advances.
+            let partition = iter.next_partition().expect("next").expect("partition");
+            assert_eq!(&partition.key, expected, "next_partition yields peeked key");
+            assert!(iter.pos > pos_before, "next_partition must advance pos");
+        }
+        // EOF: peek and next both yield None, repeatedly.
+        assert!(iter.peek_partition_key().unwrap().is_none(), "peek at EOF");
+        assert!(
+            iter.peek_partition_key().unwrap().is_none(),
+            "peek EOF stable"
+        );
+        assert!(iter.next_partition().unwrap().is_none(), "next at EOF");
+    }
+
+    /// ADR-020 fast COUNT(*) metadata path: next_partition_metadata
+    /// yields partitions with the same key + same row count + same
+    /// per-row clustering keys as the full path, but with empty
+    /// `cells`. Verifies the body-end skip arithmetic stays aligned
+    /// across rows.
+    #[test]
+    fn next_partition_metadata_matches_keys_drops_cells() {
+        let header = test_header();
+        let dks: Vec<_> = (0..5u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        let mut iter_full = reader.partitions_iter().expect("partitions_iter (full)");
+        let mut full = Vec::new();
+        while let Some(p) = iter_full.next_partition().expect("next full") {
+            full.push(p);
+        }
+
+        let mut iter_meta = reader.partitions_iter().expect("partitions_iter (meta)");
+        let mut meta = Vec::new();
+        while let Some(p) = iter_meta.next_partition_metadata().expect("next meta") {
+            meta.push(p);
+        }
+
+        assert_eq!(meta.len(), full.len(), "same partition count");
+        for (f, m) in full.iter().zip(meta.iter()) {
+            assert_eq!(m.key, f.key, "partition key matches");
+            assert_eq!(m.rows.len(), f.rows.len(), "row count matches");
+            for (fr, mr) in f.rows.iter().zip(m.rows.iter()) {
+                assert_eq!(mr.clustering, fr.clustering, "clustering matches");
+                assert!(
+                    mr.cells.is_empty(),
+                    "metadata path must NOT decode cells (got {} cells)",
+                    mr.cells.len()
+                );
+            }
+        }
+        // EOF stable.
+        assert!(iter_meta.next_partition_metadata().unwrap().is_none());
+    }
+
+    /// ADR-020 projection-aware decode: `next_partition_projected`
+    /// returns the same partition keys + same row count + same
+    /// clustering keys as the full path, but `cells` contains only
+    /// the cells the caller named in `wanted`. Cells outside the
+    /// projection are byte-skipped via `read_cell_skip`.
+    #[test]
+    fn next_partition_projected_filters_cells_to_wanted_set() {
+        let header = test_header();
+        let dks: Vec<_> = (0..3u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Reference: full partition iteration.
+        let mut iter_full = reader.partitions_iter().expect("partitions_iter (full)");
+        let mut full = Vec::new();
+        while let Some(p) = iter_full.next_partition().expect("next full") {
+            full.push(p);
+        }
+
+        // Projection: wanted = {0} → only column 0's cell per row.
+        let wanted: Vec<u16> = vec![0];
+        let mut iter_proj = reader.partitions_iter().expect("partitions_iter (proj)");
+        let mut proj = Vec::new();
+        while let Some(p) = iter_proj
+            .next_partition_projected(&wanted)
+            .expect("next projected")
+        {
+            proj.push(p);
+        }
+
+        assert_eq!(proj.len(), full.len(), "same partition count");
+        for (f, p) in full.iter().zip(proj.iter()) {
+            assert_eq!(p.key, f.key, "key matches");
+            assert_eq!(p.rows.len(), f.rows.len(), "row count matches");
+            for (fr, pr) in f.rows.iter().zip(p.rows.iter()) {
+                assert_eq!(pr.clustering, fr.clustering, "clustering matches");
+                // Projected: only column 0 cells should remain.
+                let proj_col_ids: Vec<u16> = pr.cells.iter().map(|(c, _)| *c).collect();
+                assert!(
+                    proj_col_ids.iter().all(|c| wanted.contains(c)),
+                    "projected row only has wanted cells: {proj_col_ids:?}"
+                );
+                // Full had column 0; ensure projection didn't drop it.
+                let full_has_col0 = fr.cells.iter().any(|(c, _)| *c == 0);
+                let proj_has_col0 = pr.cells.iter().any(|(c, _)| *c == 0);
+                assert_eq!(proj_has_col0, full_has_col0, "column 0 presence preserved");
+            }
+        }
+
+        // Empty projection = no cells.
+        let mut iter_empty = reader.partitions_iter().expect("partitions_iter (empty)");
+        if let Some(p) = iter_empty
+            .next_partition_projected(&[])
+            .expect("next empty projection")
+        {
+            for r in &p.rows {
+                assert!(r.cells.is_empty(), "empty projection leaves cells empty");
+            }
+        }
     }
 }

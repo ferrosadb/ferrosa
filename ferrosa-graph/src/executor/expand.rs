@@ -2525,6 +2525,17 @@ async fn execute_merge(
         // and no regular cells to preserve from an existing row, so it can bind
         // from the deterministic key shape and write an idempotent liveness row
         // without a partition read.
+        //
+        // Treat `skip_partition_read` as "no read, but still WRITE the liveness
+        // row idempotently". The previous code set `row_exists = true` here,
+        // which skipped the create arm entirely — leaving the entity_store
+        // partition with no row at all and breaking every subsequent
+        // `MATCH (a:Entity {entity_id})` (smoke "graph readback: KNOWN ISSUE
+        // rows=[]"). Idempotent LWW means re-writing the same key with the same
+        // empty-cells liveness row at a fresh timestamp is safe — it's
+        // exactly the same shape we'd write on the first MERGE — and the read
+        // path then finds the row via the normal anchor scan + clustering
+        // match.
         let existing = if skip_partition_read {
             None
         } else {
@@ -2540,7 +2551,7 @@ async fn execute_merge(
             })?
         };
         let row_exists = if skip_partition_read {
-            true
+            false
         } else {
             existing.as_ref().is_some_and(|partition| {
                 partition
@@ -5231,6 +5242,171 @@ mod tests {
                 .iter()
                 .any(|row| row.clustering == expected_in.rows[0].clustering),
             "target adjacency should contain IN entry for merged edge"
+        );
+    }
+
+    /// TDD regression for the 2026-05-17 smoke "graph readback: KNOWN
+    /// ISSUE rows=[]" failure mode.
+    ///
+    /// `MERGE (a:Entity {tenant_id, session_id, entity_id})` on a
+    /// scoped vertex table (PK = (tenant_id, session_id), CK =
+    /// entity_id, no regular cells in the MERGE) was a NO-OP because
+    /// `merge_can_bind_schema_key_only_vertex_without_read` returned
+    /// true → `skip_partition_read = true` → `row_exists` was hard-
+    /// coded to true → the create arm never ran → the entity row was
+    /// never persisted to entity_store. The MERGE reported "merged 1
+    /// vertices" but `vertices_written=0` and CQL readback returned
+    /// nothing.
+    ///
+    /// Subsequent `MATCH (a:Entity {entity_id: ...})` then failed
+    /// because the anchor scan over entity_store had no row to bind
+    /// to — even though the typed_edges row + adjacency entries had
+    /// been written successfully.
+    ///
+    /// This test asserts that a key-only vertex MERGE persists the
+    /// liveness row to the scoped vertex table.
+    #[tokio::test]
+    async fn execute_merge_key_only_scoped_vertex_persists_liveness_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let auth = ferrosa_schema::auth::role::AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        let user_ks = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: "agent_memory".to_string(),
+            durable_writes: true,
+            replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+        schema.create_keyspace(user_ks.clone(), &auth).unwrap();
+        schema
+            .create_keyspace(
+                ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                    name: adjacency_keyspace_name("agent_memory"),
+                    ..user_ks
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let mut entity_meta = scoped_entity_meta();
+        entity_meta
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        entity_meta
+            .extensions
+            .insert("graph.label".to_string(), "Entity".to_string());
+        let adjacency_meta = adjacency_table_metadata("agent_memory");
+        schema.create_table(entity_meta.clone(), &auth).unwrap();
+        schema.create_table(adjacency_meta.clone(), &auth).unwrap();
+        storage
+            .register_table(entity_meta.to_storage_schema())
+            .unwrap();
+        storage
+            .register_table(adjacency_meta.to_storage_schema())
+            .unwrap();
+
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let entity_id = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        // Crucially: do NOT pre-write the entity row. The MERGE
+        // should create it.
+        let merges = vec![MergeOp {
+            var: Some("a".to_string()),
+            table: crate::planner::ResolvedTable {
+                keyspace: "agent_memory".to_string(),
+                table: "entity_store".to_string(),
+                label: "Entity".to_string(),
+                graph_type: "vertex".to_string(),
+            },
+            match_props: vec![
+                (
+                    "tenant_id".to_string(),
+                    Expr::Literal(Literal::String(tenant_id.to_string())),
+                ),
+                (
+                    "session_id".to_string(),
+                    Expr::Literal(Literal::String(session_id.to_string())),
+                ),
+                (
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(entity_id.to_string())),
+                ),
+            ],
+            create_props: vec![],
+            src_match_props: None,
+            src_var: None,
+            dst_match_props: None,
+            dst_var: None,
+        }];
+
+        let write_path = ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage));
+        execute_merge(
+            &write_path,
+            &merges,
+            &[],
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            Some(&schema),
+        )
+        .await
+        .unwrap();
+
+        // The MERGE must persist a row in entity_store: PK =
+        // (tenant_id, session_id), CK = entity_id. A subsequent
+        // MATCH over entity_store needs to find this row by
+        // scanning the partition and matching the clustering key.
+        let entity_tid = TableId::new("agent_memory", "entity_store");
+        let partition_key = encode_partition_components(&[
+            tenant_id.as_bytes().to_vec(),
+            session_id.as_bytes().to_vec(),
+        ]);
+        let expected_clustering = encode_clustering_components(&[entity_id.as_bytes().to_vec()]);
+
+        let partition = write_path
+            .read(
+                &entity_tid,
+                &DecoratedKey::new(PartitionKey::new(partition_key)),
+            )
+            .await
+            .unwrap()
+            .expect(
+                "MERGE on key-only scoped vertex must persist the liveness row \
+                 — without this, MATCH on a freshly-merged entity_id finds nothing",
+            );
+
+        let row = partition
+            .rows
+            .iter()
+            .find(|row| row.clustering == expected_clustering)
+            .expect(
+                "merged row must exist with the requested clustering key \
+                 (entity_id) — the create arm did not run",
+            );
+
+        // Liveness row: no cell payloads required, just the
+        // primary_key_liveness marker.
+        assert!(
+            row.primary_key_liveness.timestamp > 0,
+            "merged liveness row must have a non-zero timestamp"
         );
     }
 

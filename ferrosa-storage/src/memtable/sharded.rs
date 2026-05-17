@@ -7,7 +7,8 @@
 //! enables swapping to a lock-free structure (crossbeam-skiplist, Okasaki-style
 //! persistent structures) without changing consumer code.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -246,6 +247,41 @@ impl Memtable for ShardedBTreeMemtable {
         k_way_merge(shard_data).into_iter().take(limit).collect()
     }
 
+    fn range_iter<'a>(
+        &'a self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> Box<dyn Iterator<Item = Partition> + Send + 'a> {
+        // Per-shard: collect the Arc<Partition> values within the
+        // range bound. The clones are cheap (one Arc bump per entry,
+        // ~8 bytes), not Partition deep-clones. The per-shard guard
+        // is dropped immediately after each shard's range is
+        // snapshotted as Arcs so we don't hold locks for the
+        // iterator lifetime.
+        //
+        // K-way merge across the Vec<Arc<Partition>> yields one
+        // Arc at a time in global token order; the Partition deep
+        // clone happens only when the consumer pulls.
+        let start = start.cloned();
+        let end = end.cloned();
+        let mut per_shard: Vec<Vec<Arc<Partition>>> = Vec::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            let guard = shard.read();
+            let mut v = Vec::new();
+            for (key, arc) in guard.iter() {
+                if start.as_ref().is_none_or(|s| key >= s) && end.as_ref().is_none_or(|e| key <= e)
+                {
+                    v.push(Arc::clone(arc));
+                }
+            }
+            per_shard.push(v);
+        }
+        // Each shard's Vec is already sorted by DecoratedKey
+        // (BTreeMap iteration order). The merger pops the
+        // current-smallest across shards.
+        Box::new(ShardedRangeIter::new(per_shard))
+    }
+
     fn size_bytes(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
@@ -357,6 +393,98 @@ fn k_way_merge(mut sources: Vec<Vec<Partition>>) -> Vec<Partition> {
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// ShardedRangeIter: lazy k-way merge across pre-snapshotted shards
+// ---------------------------------------------------------------------------
+//
+// Each shard contributes a `Vec<Arc<Partition>>` already sorted by
+// DecoratedKey (BTreeMap iteration order). The iterator yields one
+// Partition at a time in global token order without ever materializing
+// the merged Vec — memory peaks at `num_shards * sizeof(Arc) + 1
+// Partition deep clone in flight`. Used by `ShardedBTreeMemtable::range_iter`
+// for ADR-020 streaming range reads.
+
+/// Heap entry: (key, source_idx) where the heap is min-keyed.
+/// Wraps the comparison so `BinaryHeap` (which is a max-heap) becomes
+/// a min-heap.
+struct ShardHeapEntry {
+    key: DecoratedKey,
+    src: usize,
+}
+impl PartialEq for ShardHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.src == other.src
+    }
+}
+impl Eq for ShardHeapEntry {}
+impl PartialOrd for ShardHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ShardHeapEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reverse the key comparison so the BinaryHeap (max-heap)
+        // pops the smallest key first. Tie-break on src so the heap
+        // is total-ordered.
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| other.src.cmp(&self.src))
+    }
+}
+
+pub(crate) struct ShardedRangeIter {
+    /// One pre-sorted Vec<Arc<Partition>> per shard.
+    shards: Vec<Vec<Arc<Partition>>>,
+    /// Next-unread cursor per shard.
+    cursors: Vec<usize>,
+    /// Min-heap of (current_key, src_idx) across shards that still
+    /// have unread entries.
+    heap: BinaryHeap<ShardHeapEntry>,
+}
+
+impl ShardedRangeIter {
+    pub(crate) fn new(shards: Vec<Vec<Arc<Partition>>>) -> Self {
+        let cursors = vec![0; shards.len()];
+        let mut heap = BinaryHeap::with_capacity(shards.len());
+        for (src, v) in shards.iter().enumerate() {
+            if let Some(first) = v.first() {
+                heap.push(ShardHeapEntry {
+                    key: first.key.clone(),
+                    src,
+                });
+            }
+        }
+        Self {
+            shards,
+            cursors,
+            heap,
+        }
+    }
+}
+
+impl Iterator for ShardedRangeIter {
+    type Item = Partition;
+
+    fn next(&mut self) -> Option<Partition> {
+        let entry = self.heap.pop()?;
+        let src = entry.src;
+        let cursor = self.cursors[src];
+        let arc = Arc::clone(&self.shards[src][cursor]);
+        self.cursors[src] += 1;
+        // Push the shard's next key onto the heap (if any) so this
+        // source can be chosen again on the next call.
+        if let Some(next_arc) = self.shards[src].get(self.cursors[src]) {
+            self.heap.push(ShardHeapEntry {
+                key: next_arc.key.clone(),
+                src,
+            });
+        }
+        Some(Partition::clone(&arc))
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +789,39 @@ mod tests {
                 window[1].key.token
             );
         }
+    }
+
+    /// ADR-020 lazy range_iter contract for the Sharded memtable.
+    /// The k-way merge across shards must produce partitions in
+    /// global token order, independent of which shard each partition
+    /// landed in (shard selection is by `token % num_shards`, so
+    /// adjacent tokens scatter across shards).
+    #[test]
+    fn range_iter_merges_shards_into_global_token_order() {
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = test_schema();
+        for i in 0..100 {
+            let key = make_key(&format!("k_{i:03}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+        let collected: Vec<_> = mem.range_iter(None, None).collect();
+        assert_eq!(collected.len(), 100);
+        for window in collected.windows(2) {
+            assert!(
+                window[0].key <= window[1].key,
+                "range_iter not in token order across shards: {:?} > {:?}",
+                window[0].key.token,
+                window[1].key.token,
+            );
+        }
+        // Same output as the eager snapshot path, verifying merge
+        // correctness against the existing implementation.
+        let snapshot = mem.snapshot();
+        assert_eq!(
+            collected.iter().map(|p| p.key.clone()).collect::<Vec<_>>(),
+            snapshot.iter().map(|p| p.key.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

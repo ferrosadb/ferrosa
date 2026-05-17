@@ -78,7 +78,7 @@ pub fn select_index_ready_replicas(
     ready
 }
 
-trait RangeReadStorage {
+pub(super) trait RangeReadStorage {
     fn read_range_unbounded(
         &self,
         table_id: &TableId,
@@ -112,7 +112,7 @@ impl RangeReadStorage for ferrosa_storage::StorageEngine {
     }
 }
 
-fn read_local_range_limited_rows(
+pub(super) fn read_local_range_limited_rows(
     storage: &impl RangeReadStorage,
     table_id: &TableId,
     limit: usize,
@@ -896,6 +896,19 @@ impl ClusterCoordinator {
         limit: usize,
         row_limit: usize,
     ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        // ADR-020: when streaming range reads are enabled at startup
+        // (FERROSA_BULK_STREAMING_RANGE_READ=1), delegate to the
+        // multi-message lane that does not depend on a wall-clock
+        // BULK_READ_TIMEOUT. The legacy materializing path below
+        // stays as the default during rolling upgrade so older peers
+        // (which lack the RangeReadStream* MsgType variants) keep
+        // working until every node is upgraded.
+        if self.streaming_range_reads {
+            return self
+                .coordinate_range_read_stream_limited_rows(table_id, limit, row_limit)
+                .await;
+        }
+
         let limit = limit.clamp(1, crate::write_path::DEFAULT_RANGE_READ_LIMIT);
         let ring = self.ring.load();
         let node_ids = ring.node_ids();

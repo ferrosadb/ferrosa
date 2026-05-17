@@ -4,10 +4,18 @@
 pub mod batch;
 pub mod cl_routing;
 pub mod metrics;
+pub mod range_read_stream;
 pub mod read;
+pub mod stream_consumer;
+pub mod stream_frame_router;
+pub mod stream_producer;
+pub mod stream_request_handler;
+#[cfg(test)]
+pub mod streaming_e2e_tests;
 pub mod truncate;
 pub mod write;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -16,6 +24,7 @@ use bytes::Bytes;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_net::stream_router::StreamRouter;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
@@ -49,6 +58,22 @@ pub struct ClusterCoordinator {
     /// Bounded semaphore limiting concurrent in-flight writes. Prevents bulk
     /// CQL inserts from saturating the tokio runtime and starving Raft.
     pub(crate) write_semaphore: Arc<tokio::sync::Semaphore>,
+    /// ADR-020 streaming range-read dispatch table. Shared with the
+    /// `StreamFrameRouter` registered in `HandlerRegistry` — the
+    /// router decodes the leading `request_id` of every inbound
+    /// `RangeReadStream*` frame and pushes it onto the receiver this
+    /// coordinator registered before sending the request.
+    pub(crate) stream_router: Arc<StreamRouter>,
+    /// Monotonic counter for generating per-call `request_id`s in
+    /// streaming range reads. Wraps around at u32::MAX (4 billion
+    /// in-flight calls is well past any realistic cluster).
+    pub(crate) next_request_id: Arc<AtomicU32>,
+    /// When `true`, `coordinate_range_read_limited_rows` delegates to
+    /// the ADR-020 streaming path instead of the legacy single-shot
+    /// `RangeReadRequest` RPC. Toggled by
+    /// `FERROSA_BULK_STREAMING_RANGE_READ=1` at process start; off
+    /// by default during rolling upgrade.
+    pub(crate) streaming_range_reads: bool,
 }
 
 impl ClusterCoordinator {
@@ -60,6 +85,17 @@ impl ClusterCoordinator {
         default_rf: usize,
         default_cl: ConsistencyLevel,
     ) -> Self {
+        let streaming_range_reads = matches!(
+            std::env::var("FERROSA_BULK_STREAMING_RANGE_READ")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        if streaming_range_reads {
+            tracing::info!(
+                "coordinator: ADR-020 streaming range reads ENABLED via FERROSA_BULK_STREAMING_RANGE_READ"
+            );
+        }
         Self {
             ring,
             peer_manager,
@@ -71,7 +107,21 @@ impl ClusterCoordinator {
             repair_metrics: Arc::new(ReadRepairMetrics::new()),
             raft_state: None,
             write_semaphore: Arc::new(tokio::sync::Semaphore::new(WRITE_CONCURRENCY_LIMIT)),
+            stream_router: Arc::new(StreamRouter::new()),
+            next_request_id: Arc::new(AtomicU32::new(1)),
+            streaming_range_reads,
         }
+    }
+
+    /// Borrow the shared `StreamRouter` so the cluster bootstrap can
+    /// build a `StreamFrameRouter` against the same routing table.
+    pub fn stream_router(&self) -> Arc<StreamRouter> {
+        self.stream_router.clone()
+    }
+
+    /// Pull a fresh `request_id` for a streaming range read.
+    pub(crate) fn next_stream_request_id(&self) -> u32 {
+        self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Attach a hint store to this coordinator.

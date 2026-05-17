@@ -761,6 +761,11 @@ impl ModeController {
         ));
 
         let repair_metrics_for_handler = coordinator.repair_metrics.clone();
+        // Capture handles for the ADR-020 streaming-handler registration
+        // below; the coordinator itself is moved into WritePath::cluster
+        // on the next line and is no longer directly accessible.
+        let stream_router_for_handler = coordinator.stream_router();
+        let peer_manager_for_handler = coordinator.peer_manager.clone();
 
         // 6. Swap write path — cluster coordinator handles replica routing.
         self.write_path
@@ -859,6 +864,50 @@ impl ModeController {
         let range_read_handler = Arc::new(RangeReadHandler::new(self.storage.clone()));
         self.registry
             .register(MsgType::RangeReadRequest, range_read_handler);
+
+        // ADR-020 streaming range-read handlers. These coexist with
+        // the legacy single-shot RangeReadRequest path above —
+        // the streaming path is selected by the coordinator only
+        // when FERROSA_BULK_STREAMING_RANGE_READ=1. Both endpoints
+        // are registered on every node so a mixed-mode cluster can
+        // serve either flow.
+        //
+        // Server side: handles inbound RangeReadStreamRequest by
+        // spawning a task that fires chunks back to the originator
+        // via PeerManager::fire on Lane::Bulk.
+        use crate::coordinator::range_read_stream::STREAMING_CHUNK_PARTITIONS;
+        use crate::coordinator::stream_request_handler::{
+            PeerManagerSinkFactory, RangeReadStreamRequestHandler,
+        };
+        let sink_factory = Arc::new(PeerManagerSinkFactory::new(peer_manager_for_handler));
+        // The new StreamRangeReader trait (ADR-020 Phase 2 work) is
+        // implemented on `Arc<StorageEngine>` because the impl needs
+        // to clone the engine handle for spawn_blocking. The factory
+        // wraps that in another Arc for shared ownership across
+        // concurrent RPC handlers — `Arc<Arc<StorageEngine>>` is
+        // cheap (two atomic pointer copies) and lets the trait stay
+        // generic over `R: StreamRangeReader + 'static`.
+        let stream_request_handler = Arc::new(RangeReadStreamRequestHandler::new(
+            Arc::new(self.storage.clone()),
+            sink_factory,
+            STREAMING_CHUNK_PARTITIONS,
+        ));
+        self.registry
+            .register(MsgType::RangeReadStreamRequest, stream_request_handler);
+
+        // Coordinator side: routes inbound chunk/heartbeat/done
+        // frames through the coordinator's shared StreamRouter so
+        // they reach the per-request consume_range_stream receiver.
+        // Single handler instance registered against all three
+        // streaming response MsgTypes.
+        use crate::coordinator::stream_frame_router::StreamFrameRouter;
+        let frame_router = Arc::new(StreamFrameRouter::new(stream_router_for_handler));
+        self.registry
+            .register(MsgType::RangeReadStreamChunk, frame_router.clone());
+        self.registry
+            .register(MsgType::RangeReadStreamHeartbeat, frame_router.clone());
+        self.registry
+            .register(MsgType::RangeReadStreamDone, frame_router);
 
         let index_read_handler = Arc::new(IndexReadHandler::new(self.storage.clone()));
         self.registry

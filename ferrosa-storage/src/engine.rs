@@ -2121,6 +2121,70 @@ impl StorageEngine {
         }
     }
 
+    /// COUNT(*) fast path. Returns the total row count for
+    /// `[start, end]` on `table_id` without ever decoding cell
+    /// payloads. Returns `Ok(0)` when the table is not registered.
+    pub fn count_range(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> ferrosa_common::Result<u64> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.count_range(start, end),
+            None => Ok(0),
+        }
+    }
+
+    /// Projection-aware variant of `range_iter`. Only the cells whose
+    /// ordinals are in `wanted` are decoded; SSTable cells outside
+    /// the projection are byte-skipped via
+    /// `range_merger::merger_for_projected_sources`. Returns an
+    /// empty stream when the table is not registered.
+    pub fn range_iter_projected(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        partition_limit: Option<usize>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state
+                .store
+                .range_iter_projected(wanted, partition_limit, start, end),
+            None => Box::pin(futures::stream::empty()),
+        }
+    }
+
+    /// ADR-020 lazy range iterator. Returns an async `Stream` that
+    /// yields every partition in `[start, end]` for `table_id`, one
+    /// at a time, without materializing the full result. Backed by
+    /// the per-source k-way merge in
+    /// `crate::range_merger::RangeMerger`.
+    ///
+    /// Returns `Ok` with an empty stream when the table is not
+    /// registered (matches the semantics of `read_range_limited_rows`,
+    /// which returns Ok(vec![])).
+    pub fn range_iter(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.range_iter(start, end),
+            None => Box::pin(futures::stream::empty()),
+        }
+    }
+
     /// Query by secondary index across memtable and SSTable sidecar indexes.
     ///
     /// Delegates to [`TableStore::read_by_index`] which merges results from
@@ -2939,6 +3003,15 @@ impl StorageEngine {
             }
 
             // Step 2: create completion channel and submit the upload.
+            //
+            // **Non-blocking submit** (try_submit, not submit().await): if
+            // the upload queue is full (e.g., heavy crash-recovery replay
+            // backlog) we MUST NOT block the poll loop. Every other
+            // queued compaction result is waiting behind us, and a stuck
+            // upload here starves all subsequent swaps from reaching the
+            // read path. The pending-log entry (Step 1) is durable — the
+            // periodic `sync_sstables_to_s3` will re-submit. On queue-full
+            // we skip the rest of the S3 dance and continue.
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
             let task = crate::upload::UploadTask::SSTable {
                 table_id: table_id_str.clone(),
@@ -2946,14 +3019,35 @@ impl StorageEngine {
                 files,
                 on_complete: Some(tx),
             };
-            if let Err(e) = upload_mgr.submit(task).await {
-                tracing::error!(%e, %sstable_id, "compaction: failed to submit upload task");
+            if let Err(e) = upload_mgr.try_submit(task) {
+                tracing::warn!(
+                    %e,
+                    %sstable_id,
+                    "compaction: upload queue full, deferring to sync_sstables_to_s3 — \
+                     swap already complete, no data loss (pending-log persists)"
+                );
                 continue;
             }
 
-            // Step 3: await S3 confirmation.
+            // Step 3: await S3 confirmation, with a **bounded** timeout so
+            // a single slow upload can't starve the poll loop. The
+            // pending-log entry from Step 1 means we lose no durability
+            // by giving up here — sync_sstables_to_s3 will pick it up.
+            const UPLOAD_AWAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+            let rx_result = match tokio::time::timeout(UPLOAD_AWAIT_TIMEOUT, rx).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(
+                        %sstable_id,
+                        timeout_secs = UPLOAD_AWAIT_TIMEOUT.as_secs(),
+                        "compaction: S3 confirmation timed out; deferring manifest \
+                         update to sync_sstables_to_s3 — swap already complete"
+                    );
+                    continue;
+                }
+            };
             let confirmation =
-                crate::compaction::finalize::upload_confirmation_from_result(rx.await);
+                crate::compaction::finalize::upload_confirmation_from_result(rx_result);
             match &confirmation {
                 crate::compaction::finalize::UploadConfirmation::Confirmed => {
                     self.compaction_metrics.inc_s3_uploads();
@@ -11267,5 +11361,187 @@ mod tests {
 
             restored.shutdown().unwrap();
         });
+    }
+
+    // ---------------------------------------------------------------------------
+    // poll_compactions regression tests (2026-05-17)
+    //
+    // Live cluster bug: the loop blocked on `submit().await` + `rx.await` for
+    // S3 confirmation, so one slow upload starved all queued compaction
+    // results' swap step. Symptom on ferrosa-memory: 127 compaction outputs
+    // sitting in /var/lib/ferrosa/compaction/entity_store/ that were
+    // produced but never swapped into the in-memory view — reads kept
+    // hitting all 43 original SSTables, LIMIT 5 took 22-32 s on cold cache.
+    //
+    // Fix (engine.rs poll_compactions): replace blocking submit+await with
+    // try_submit + bounded timeout on the confirmation, so the loop body
+    // for each result completes in bounded time. Durability is preserved
+    // by the pending-uploads.log (Step 1) and the periodic
+    // sync_sstables_to_s3 retry.
+    //
+    // The tests below pin the contract that the read-correctness path (swap
+    // into the in-memory view) MUST complete regardless of whether the
+    // S3-durability path succeeds, AND that a re-poll without new compaction
+    // input does NOT re-process the same result (no infinite loop).
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn poll_compactions_swap_happens_without_upload_manager() {
+        // No S3 / upload manager. The Some(upload_mgr) early-return at
+        // engine.rs ~2972 means we skip all S3 work — but the swap MUST
+        // still happen so reads see the compacted output.
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let pre_swap_count = engine.sstable_count(&tid);
+        assert_eq!(pre_swap_count, 2, "two flushes → two SSTables in view");
+
+        // Submit a compaction merging the two flush SSTables.
+        {
+            let compaction_output_dir = dir.path().join("compaction");
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            let task = crate::compaction::metadata::CompactionTask {
+                inputs: metadata,
+                output_dir: compaction_output_dir,
+                schema: test_schema(),
+                table_id: tid.clone(),
+            };
+            engine.compaction_executor.submit(task).unwrap();
+        }
+
+        // Wait for the compaction thread to produce the result, then poll.
+        let compaction_dir = dir.path().join("compaction").join(tid.to_string());
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if compaction_dir.exists() {
+                let has_output = std::fs::read_dir(&compaction_dir)
+                    .ok()
+                    .map(|mut rd| rd.any(|_| true))
+                    .unwrap_or(false);
+                if has_output {
+                    break;
+                }
+            }
+        }
+
+        engine.poll_compactions().await;
+
+        let post_swap_count = engine.sstable_count(&tid);
+        assert_eq!(
+            post_swap_count, 1,
+            "swap must merge 2 inputs into 1 output regardless of S3 availability \
+             (pre={pre_swap_count}, post={post_swap_count})"
+        );
+
+        // Reads must still return both rows after the swap.
+        let r1 = engine.read(&tid, &make_key("k1")).unwrap();
+        assert!(r1.is_some(), "k1 must be readable after swap");
+        let r2 = engine.read(&tid, &make_key("k2")).unwrap();
+        assert!(r2.is_some(), "k2 must be readable after swap");
+    }
+
+    #[tokio::test]
+    async fn poll_compactions_does_not_re_process_already_swapped_result() {
+        // After a successful swap, poll_compactions must NOT see the same
+        // result again — the executor's mpsc channel must be drained
+        // exactly once per result. Re-running poll_compactions when no
+        // new compaction has been submitted MUST be a no-op (no
+        // re-swap, no growth in SSTable count, no growth in compaction
+        // output dir).
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let compaction_output_dir = dir.path().join("compaction");
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            let task = crate::compaction::metadata::CompactionTask {
+                inputs: metadata,
+                output_dir: compaction_output_dir.clone(),
+                schema: test_schema(),
+                table_id: tid.clone(),
+            };
+            engine.compaction_executor.submit(task).unwrap();
+        }
+
+        let table_compaction_dir = compaction_output_dir.join(tid.to_string());
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if table_compaction_dir.exists()
+                && std::fs::read_dir(&table_compaction_dir)
+                    .ok()
+                    .map(|mut rd| rd.any(|_| true))
+                    .unwrap_or(false)
+            {
+                break;
+            }
+        }
+
+        // First poll: swap should occur.
+        engine.poll_compactions().await;
+        let count_after_first_poll = engine.sstable_count(&tid);
+        let dir_entries_after_first_poll = std::fs::read_dir(&table_compaction_dir)
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+
+        assert_eq!(
+            count_after_first_poll, 1,
+            "first poll: 2 inputs merged into 1 swap output"
+        );
+
+        // Second + third poll WITHOUT submitting any new task: must be
+        // a complete no-op. No new compaction task gets created here,
+        // and the queue is drained → result iterator is empty.
+        engine.poll_compactions().await;
+        engine.poll_compactions().await;
+
+        let count_after_repolls = engine.sstable_count(&tid);
+        assert_eq!(
+            count_after_repolls, count_after_first_poll,
+            "re-polling without new compaction must NOT change the in-memory \
+             view (no re-swap, no infinite loop)"
+        );
+
+        // Compaction output dir must not grow either (no new output files
+        // were emitted by re-polling).
+        let dir_entries_after_repolls = std::fs::read_dir(&table_compaction_dir)
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        assert_eq!(
+            dir_entries_after_repolls, dir_entries_after_first_poll,
+            "re-polling must NOT produce new output files (live cluster bug: \
+             127 compaction outputs accumulated because results were stuck \
+             behind blocked uploads and the strategy kept queuing the same \
+             inputs)"
+        );
     }
 }

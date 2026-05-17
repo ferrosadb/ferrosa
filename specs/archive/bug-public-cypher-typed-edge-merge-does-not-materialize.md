@@ -268,8 +268,56 @@ would violate the public-boundary design.
 
 ## Acceptance criteria
 
-- [ ] The canonical `MERGE (a)-[r:TYPED_EDGE {edge_type: ...}]->(b)` shape
+- [x] The canonical `MERGE (a)-[r:TYPED_EDGE {edge_type: ...}]->(b)` shape
       materializes a row in `agent_memory.typed_edges`.
-- [ ] A follow-up Cypher `MATCH` sees the relationship immediately.
-- [ ] `ferrosa-memory` `create_edge` succeeds and the edge is visible through
+- [x] A follow-up Cypher `MATCH` sees the relationship immediately.
+- [x] `ferrosa-memory` `create_edge` succeeds and the edge is visible through
       both CQL readback and graph readback.
+
+## Resolution (2026-05-17, commit b25f659)
+
+Root cause: `execute_merge` in `ferrosa-graph/src/executor/expand.rs`
+treated `skip_partition_read = true` (the OOM-avoidance path for
+scoped vertex tables with large partitions) as "the row already
+exists, don't write" by hard-coding `row_exists = true`. The comment
+above the branch said it should "write an idempotent liveness row
+without a partition read" but the code skipped the write entirely.
+
+For `MERGE (a:Entity {tenant_id, session_id, entity_id})` on
+`agent_memory.entity_store` (PK = `(tenant_id, session_id)`,
+CK = `entity_id`), all storage key bytes are deterministic from
+the props and there are no regular cells to preserve, so
+`merge_can_bind_schema_key_only_vertex_without_read` returned
+true and the create arm was bypassed. The MERGE reported
+"merged N vertices, M properties updated" but
+`vertices_written = 0` and entity_store never received the row.
+
+Subsequent `MATCH (a:Entity {entity_id: ...})` anchored on
+entity_store found no row to bind to, so the traversal had no
+source vertex — even though the typed_edges row and adjacency
+entries had been written successfully.
+
+Fix: when `skip_partition_read = true`, set `row_exists = false`
+so the create arm runs. The write is idempotent (same
+deterministic key, same empty-cells liveness row, LWW timestamp)
+so re-running the MERGE on an existing entity is safe.
+
+TDD regression test:
+`execute_merge_key_only_scoped_vertex_persists_liveness_row` in
+`ferrosa-graph/src/executor/expand.rs`. RED before fix, GREEN
+after. All 300 ferrosa-graph lib tests pass.
+
+End-to-end verification on the live ferrosa-memory cluster:
+
+```
+MERGE (a:Entity {tenant_id, session_id, entity_id})
+MERGE (b:Entity {tenant_id, session_id, entity_id})
+MERGE (a)-[r:TYPED_EDGE {edge_type: 'references'}]->(b)
+SET r.weight = 0.5 RETURN r
+  → { "rows": [["merged 3 vertices, 3 properties updated"]],
+      stats: { vertices_written: 4 } }                       ← was 0 before
+SELECT FROM agent_memory.entity_store WHERE tenant_id = ... AND session_id = ...
+  → 2 rows                                                   ← was 0 before
+MATCH (a:Entity {tenant, session, entity_id})-[r:TYPED_EDGE]->(b)
+  → [["references", 0.5]]                                    ← was [] before
+```

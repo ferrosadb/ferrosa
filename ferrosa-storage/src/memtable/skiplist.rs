@@ -133,6 +133,30 @@ impl Memtable for SkipListMemtable {
             .collect()
     }
 
+    fn range_iter<'a>(
+        &'a self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> Box<dyn Iterator<Item = Partition> + Send + 'a> {
+        // Clone the bounds so the returned iterator owns its filter
+        // predicate state — `&DecoratedKey` doesn't live long enough
+        // for the iterator's lifetime.
+        let start = start.cloned();
+        let end = end.cloned();
+        Box::new(
+            self.map
+                .iter()
+                .filter(move |entry| {
+                    let key = entry.key();
+                    start.as_ref().is_none_or(|s| key >= s) && end.as_ref().is_none_or(|e| key <= e)
+                })
+                .map(|entry| {
+                    let guard = entry.value().load();
+                    (**guard).clone()
+                }),
+        )
+    }
+
     fn size_bytes(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
@@ -278,6 +302,30 @@ mod tests {
         for window in snapshot.windows(2) {
             assert!(window[0].key <= window[1].key);
         }
+    }
+
+    /// ADR-020 lazy range_iter contract for the Skiplist memtable.
+    /// Iterates without materializing the full Vec; partitions come
+    /// out in token order; honors start/end bounds.
+    #[test]
+    fn range_iter_yields_sorted_and_honors_bounds() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        for i in 0..20 {
+            let key = make_key(&format!("key_{i:02}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+        // Unbounded → all 20.
+        let all: Vec<_> = mem.range_iter(None, None).collect();
+        assert_eq!(all.len(), 20);
+        for w in all.windows(2) {
+            assert!(w[0].key <= w[1].key);
+        }
+        // Bounded — call .take(5) to prove the iterator stops pulling
+        // after the consumer is done (laziness in action).
+        let first_5: Vec<_> = mem.range_iter(None, None).take(5).collect();
+        assert_eq!(first_5.len(), 5);
     }
 
     #[test]
