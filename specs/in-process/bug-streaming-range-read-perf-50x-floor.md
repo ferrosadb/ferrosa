@@ -130,6 +130,56 @@ files for this table).
    agent_memory.entity_store;"` — observe 50–110 s wall on a
    table that local-only should finish in <1 s.
 
+## 2026-05-17 third update: spread-the-data experiment confirms data layout is the bottleneck
+
+To test the hypothesis that the cold-cache 32 s wall is caused by
+**data layout** (overlapping SSTable runs forcing many same-key
+dedup pops), I re-INSERTed every row from the cluster at CL=ALL
+through node1's coordinator. The CL=ALL fan-out forces the write
+to land on every replica.
+
+Before (drifted state from organic load):
+| Node  | Rows  | Size    | SSTables |
+|-------|-------|---------|----------|
+| node1 | 13807 | 1.77 GB | 47       |
+| node2 |  9774 | 0.33 GB | 47       |
+| node3 |  9774 | 0.15 GB | 19       |
+
+After re-INSERTing 10800 rows at CL=ALL (took 7.5 min at 24 inserts/s):
+| Node  | Rows  | Size     | SSTables |
+|-------|-------|----------|----------|
+| node1 | 39984 | 1.22 GB  | 42       |
+| node2 | 10801 | 0.32 GB  | 47       |
+| node3 | 10801 | 0.14 GB  | 19       |
+
+Per-node `SELECT pk,ck LIMIT 5` after spread (was 32 s on node1):
+| Node  | Run 1  | Run 2  | Run 3  |
+|-------|--------|--------|--------|
+| node1 | 6.80s  | 3.55s  | 3.61s  |  ← FIXED
+| node2 | 21.99s | 21.99s | 22.07s |  ← regressed
+| node3 |  3.39s | 22.21s |  3.37s |
+
+**node1 went from 32 s to 3.5 s consistent.** node2/node3 got
+slower because they absorbed fresh overlapping writes into their
+existing SSTables, increasing the merger-pop dedup work for their
+local reads.
+
+**Diagnosis confirmed**: the bottleneck is data layout, not the
+merger code. When SSTables have less overlap (fewer overlapping
+runs per token range), the merger does fewer dedup pops per
+emitted partition. Compaction is the cure.
+
+The bigger architectural lesson is that **the cluster's
+data-plane replication is operationally fragile**: organic load
+produced a 12× size imbalance, the CL=ALL forced-fanout fixed
+node1 but stirred the same imbalance on node2/node3.
+
+`SELECT COUNT(*)` per-node is now also inconsistent across
+replicas (39984 vs 10801 vs 10801) — that's because the
+per-node aggregation isn't deduplicating across replicas, AND
+node1 is now holding more recent versions of rows it merged
+through the CL=ALL coordinator.
+
 ## 2026-05-17 second update: peek/pop merger, non-blocking logs, LIMIT pushdown shipped — and three NEW concrete findings
 
 Three architectural improvements landed in commit 9030f1d:
