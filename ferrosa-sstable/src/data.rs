@@ -143,6 +143,65 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         self.pos
     }
 
+    /// Read the next partition's KEY + ROW COUNT only.
+    ///
+    /// Walks the partition body using `read_partition_header` then
+    /// `skip_row_body` for each clustered row — no cell payloads
+    /// are decoded. Used by the COUNT(*) fast path in
+    /// `ferrosa-cluster::coordinator::range_count` (ADR-020) where
+    /// the caller needs row counts per partition but not the row
+    /// data. Memory: `O(1)` per call; CPU: roughly proportional
+    /// to row count but ~10-100× cheaper than `read_partition`
+    /// because cell payloads are byte-skipped, not parsed.
+    ///
+    /// Returns `Ok(None)` at EOF. Static rows count as part of the
+    /// row count returned (mirrors `read_rows_limited` which puts
+    /// the static row in `static_row` rather than `rows`); callers
+    /// who need to distinguish static from clustered can use the
+    /// full `read_partition_limited_rows` path.
+    pub fn read_partition_count(&mut self) -> Result<Option<(DecoratedKey, u64)>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+
+        let (key_bytes, _deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        let mut row_count: u64 = 0;
+        loop {
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                // Range tombstones aren't rows — mirror
+                // read_rows_limited's "stop at marker" behavior.
+                break;
+            }
+
+            // Extended flags byte (only present if EXTENSION_FLAG set).
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            self.skip_row_body(flags, is_static)?;
+            row_count += 1;
+        }
+
+        Ok(Some((key, row_count)))
+    }
+
     // -----------------------------------------------------------------------
     // Internal: partition header
     // -----------------------------------------------------------------------

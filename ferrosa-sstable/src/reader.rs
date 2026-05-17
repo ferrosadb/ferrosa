@@ -319,6 +319,29 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
             Ok(result)
         }
     }
+
+    /// Yield `(partition_key, row_count)` for the next partition without
+    /// decoding any cell payloads. Cells are byte-skipped via
+    /// `DataReader::read_partition_count`. Used by the COUNT(*) fast
+    /// path so a full-table count never pays the per-cell decode cost.
+    /// Returns `Ok(None)` at EOF.
+    pub fn next_partition_count(
+        &mut self,
+    ) -> Result<Option<(ferrosa_common::key::DecoratedKey, u64)>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_count()?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_count()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -732,5 +755,58 @@ mod tests {
         // EOF stays at EOF
         assert!(iter.next_partition().unwrap().is_none());
         assert!(iter.next_partition().unwrap().is_none());
+    }
+
+    /// ADR-020 COUNT(*) fast path: next_partition_count yields the
+    /// same partition keys as next_partition, with row_count
+    /// matching `partition.rows.len()`. Crucially does NOT decode
+    /// any cell payloads — `read_partition_count` advances by
+    /// byte-skipping via `skip_row_body`.
+    #[test]
+    fn next_partition_count_matches_partition_rows_len() {
+        let header = test_header();
+        let dks: Vec<_> = (0..5u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Reference: full partition iteration with row counts.
+        let mut iter_full = reader.partitions_iter().expect("partitions_iter");
+        let mut expected: Vec<(_, u64)> = Vec::new();
+        while let Some(p) = iter_full.next_partition().expect("next") {
+            expected.push((p.key, p.rows.len() as u64));
+        }
+
+        // Under test: counts-only iteration.
+        let mut iter_counts = reader.partitions_iter().expect("partitions_iter (counts)");
+        let mut got: Vec<(_, u64)> = Vec::new();
+        while let Some(pc) = iter_counts.next_partition_count().expect("next_count") {
+            got.push(pc);
+        }
+
+        assert_eq!(got, expected, "count iterator must match full iter");
+        // EOF stable.
+        assert!(iter_counts.next_partition_count().unwrap().is_none());
+        assert!(iter_counts.next_partition_count().unwrap().is_none());
     }
 }
