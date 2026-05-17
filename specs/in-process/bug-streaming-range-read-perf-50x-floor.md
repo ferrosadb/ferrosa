@@ -130,6 +130,88 @@ files for this table).
    agent_memory.entity_store;"` — observe 50–110 s wall on a
    table that local-only should finish in <1 s.
 
+## 2026-05-17 second update: peek/pop merger, non-blocking logs, LIMIT pushdown shipped — and three NEW concrete findings
+
+Three architectural improvements landed in commit 9030f1d:
+
+1. **Peek/pop merger split.** `MergeSource::peek_key()` returns the
+   next key WITHOUT decoding the partition body (new
+   `DataReader::peek_partition_key` reads only the partition header).
+   Heap is primed via peeks; pop_partition decodes the body only
+   when popped. This eliminates the eager 38-source body decode at
+   merger construction time.
+
+2. **Non-blocking logging.** `tracing_subscriber::fmt()` was
+   writing to stdout SYNCHRONOUSLY. With the cluster emitting
+   hundreds of `info!()` lines per minute (compaction +
+   schema-sync + raft heartbeats), a slow stdout consumer
+   (docker json-file driver under host disk pressure)
+   back-pressured every emitter — including the storage hot
+   path. Switched to `tracing_appender::non_blocking`.
+
+3. **LIMIT pushdown.** `range_iter_projected` now takes
+   `partition_limit: Option<usize>` and the producer breaks the
+   loop after N emissions. Without this, the bounded mpsc
+   buffer (was 64, now 4) caused the producer to race ahead by
+   ~buffer body decodes after the consumer had already read
+   enough, turning a 5-decode scan into a 69-decode scan.
+
+**The 32 s cold-cache wall persists on node1 even after all three
+fixes.** The remaining bottleneck is per-emit cost: for the
+smallest-token dedup group, the merger pops every overlapping
+source (~30 of node1's 47 SSTables on entity_store) and each pop
+is a full wide-partition body decode on cold cache.
+
+### Three NEW concrete bugs identified during this investigation
+
+**1. Write-path replication is broken / unbalanced.**
+
+| Node  | entity_store size | SSTable count |
+|-------|------------------|---------------|
+| node1 | 1.77 GB          | 47            |
+| node2 | 0.33 GB          | 47            |
+| node3 | 0.15 GB          | 19            |
+
+RF=3 but writes are not landing on peers symmetrically. Writes
+either land only on one replica or hinted handoff isn't
+delivering. node3 has 1/12 of node1's data. Cassandra-style data
+plane writes don't go through Raft (which only handles schema /
+topology) — this is in the WritePath / coordinator. Reproducible:
+direct query to each node returns DIFFERENT first 5 partitions.
+
+**2. Read repair is not implemented.**
+
+`coordinator::metrics::ReadRepairMetrics` exists with
+`read_repairs_attempted / succeeded / failed` counters, but a
+codebase-wide grep for `.attempted()` / `.succeeded()` /
+`ReadRepairMetrics::` shows only the struct constructor — no
+production code increments these counters. The scaffolding is
+present, the read repair LOGIC is absent. Without it, divergent
+replicas (see issue 1) never reconcile.
+
+**3. `system.peers` advertises `rpc_address=127.0.0.1`.**
+
+```
+peer       | rpc_address | native_address
+172.20.0.4 |   127.0.0.1 |      127.0.0.1
+172.20.0.5 |   127.0.0.1 |      127.0.0.1
+```
+
+All three replicas advertise themselves on the same loopback
+address. The cqlsh driver discovers three hosts and round-robins
+between them at 127.0.0.1:9042 — which maps only to node1
+externally. Inside docker the published ports are
+19042/19043/19044 mapped to nodes 1/2/3 respectively. This caused
+an early misdiagnosis where every 3rd query (round-robin
+host-3) appeared slow; in reality all three "hosts" resolve to
+the same coordinator, but data asymmetry across nodes (issue 1)
+made node1's coordinator-side reads pathological.
+
+These three issues are independent of the cold-cache scan
+bottleneck but were ALL surfaced by the perf investigation.
+
+---
+
 ## 2026-05-17 update: cold-cache root cause identified
 
 The **cold-cache 32 s wall** for `SELECT pk, ck FROM
