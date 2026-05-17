@@ -52,7 +52,7 @@ use crate::raft::handlers::RangeReadStreamRequestPayload;
 use super::stream_consumer::{consume_range_stream, StreamConsumeError};
 use super::stream_frame_router::StreamFrameRouter;
 use super::stream_producer::ChunkSink;
-use super::stream_request_handler::{handle_stream_request, StreamRangeReader};
+use super::stream_request_handler::{handle_stream_request, PartitionStream, StreamRangeReader};
 
 const IDLE: Duration = Duration::from_secs(2);
 
@@ -92,8 +92,13 @@ struct StaticReader {
     partitions: Vec<Partition>,
 }
 impl StreamRangeReader for StaticReader {
-    fn read_range(&self, _table_id: &TableId) -> ferrosa_common::Result<Vec<Partition>> {
-        Ok(self.partitions.clone())
+    fn range_iter<'a>(
+        &'a self,
+        _table_id: &TableId,
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+        let items: Vec<ferrosa_common::Result<Partition>> =
+            self.partitions.iter().cloned().map(Ok).collect();
+        Ok(Box::pin(futures::stream::iter(items)))
     }
 }
 

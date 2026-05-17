@@ -880,8 +880,15 @@ impl ModeController {
             PeerManagerSinkFactory, RangeReadStreamRequestHandler,
         };
         let sink_factory = Arc::new(PeerManagerSinkFactory::new(peer_manager_for_handler));
+        // The new StreamRangeReader trait (ADR-020 Phase 2 work) is
+        // implemented on `Arc<StorageEngine>` because the impl needs
+        // to clone the engine handle for spawn_blocking. The factory
+        // wraps that in another Arc for shared ownership across
+        // concurrent RPC handlers — `Arc<Arc<StorageEngine>>` is
+        // cheap (two atomic pointer copies) and lets the trait stay
+        // generic over `R: StreamRangeReader + 'static`.
         let stream_request_handler = Arc::new(RangeReadStreamRequestHandler::new(
-            self.storage.clone(),
+            Arc::new(self.storage.clone()),
             sink_factory,
             STREAMING_CHUNK_PARTITIONS,
         ));

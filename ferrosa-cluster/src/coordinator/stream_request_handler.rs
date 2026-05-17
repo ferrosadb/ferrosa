@@ -18,11 +18,13 @@
 //!
 //! [`HandlerRegistry`]: ferrosa_net::rpc::handler::HandlerRegistry
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::{Stream, StreamExt};
 
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
@@ -31,7 +33,7 @@ use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
 
-use super::stream_producer::{stream_range_response, ChunkSink};
+use super::stream_producer::ChunkSink;
 use crate::raft::handlers::{
     RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
 };
@@ -43,34 +45,73 @@ use crate::raft::handlers::{
 /// stall.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Storage surface the request handler needs. Mirrors
-/// `RangeReadStorage` in `coordinator::read` but is its own trait so
-/// tests can swap in an in-memory backing without dragging the full
-/// `StorageEngine`.
+/// Type alias for the per-partition async stream returned by
+/// [`StreamRangeReader::range_iter`]. Each item is either a
+/// successfully-decoded partition or a (recoverable) per-partition
+/// error; producer-fatal errors come back as `Err` from the
+/// `range_iter` call itself.
+pub type PartitionStream<'a> =
+    Pin<Box<dyn Stream<Item = ferrosa_common::Result<Partition>> + Send + 'a>>;
+
+/// Storage surface the request handler pulls from. ADR-020 contract:
+/// the reader yields partitions one at a time through an async
+/// `Stream`, so the handler's resident memory is bounded by
+/// `chunk_size` regardless of total table size. There is no
+/// Vec-returning method; materializing the whole partition list at
+/// any layer above the per-source iterator is the very antipattern
+/// this trait exists to prevent.
 pub trait StreamRangeReader: Send + Sync {
-    /// Read partitions for `table_id`. The Phase 1 implementation
-    /// returns a materialized Vec; Phase 2 will return a lazy
-    /// iterator (see ADR-020) and the handler will chunk it without
-    /// materializing.
-    ///
-    /// Returns `Err` for table-not-found / IO / decode failures — the
-    /// handler turns these into a truncated Done so the coordinator
-    /// resolves quickly.
-    fn read_range(&self, table_id: &TableId) -> ferrosa_common::Result<Vec<Partition>>;
+    /// Open a lazy stream of every partition in `table_id`,
+    /// in token order. Returns `Err` for synchronous open-time
+    /// failures (table not found, etc.); per-partition decode
+    /// failures surface inside the stream so a corrupt SSTable
+    /// page can be skipped without aborting the whole scan.
+    fn range_iter<'a>(
+        &'a self,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<PartitionStream<'a>>;
 }
 
-impl StreamRangeReader for ferrosa_storage::StorageEngine {
-    fn read_range(&self, table_id: &TableId) -> ferrosa_common::Result<Vec<Partition>> {
-        // Phase 1: existing materializing read path, capped at the
-        // 10K RANGE_READ_MATERIALIZATION_CAP inside ferrosa-storage.
-        // ADR-020 Phase 2 replaces this with a streaming iterator.
-        ferrosa_storage::engine::StorageEngine::read_range(
-            self,
-            table_id,
-            None,
-            None,
-            crate::write_path::DEFAULT_RANGE_READ_LIMIT,
-        )
+impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
+    fn range_iter<'a>(
+        &'a self,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+        // INTERIM Phase 1 backing: spawn_blocking the existing
+        // materializing read, then yield partitions one at a time
+        // through an mpsc-backed Stream. The HANDLER is now bounded
+        // — it never holds more than chunk_size partitions at once.
+        // The internal Vec in the spawned task is still materialized;
+        // ADR-020 Phase 2 work (memtable/SSTable streaming + k-way
+        // merge) replaces this stub with a true per-partition
+        // pipeline that bounds memory at every layer.
+        let engine = Arc::clone(self);
+        let table_id = table_id.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<ferrosa_common::Result<Partition>>(64);
+        tokio::task::spawn_blocking(move || {
+            let partitions = engine.read_range(
+                &table_id,
+                None,
+                None,
+                crate::write_path::DEFAULT_RANGE_READ_LIMIT,
+            );
+            match partitions {
+                Ok(ps) => {
+                    for p in ps {
+                        if tx.blocking_send(Ok(p)).is_err() {
+                            // Consumer cancelled.
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                }
+            }
+        });
+        Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })))
     }
 }
 
@@ -90,41 +131,65 @@ pub async fn handle_stream_request<R, S>(
     R: StreamRangeReader + 'static,
     S: ChunkSink,
 {
+    assert!(chunk_size >= 1, "chunk_size must be >= 1");
+
     let table_id = TableId::new(&req.keyspace, &req.table);
 
-    // The current `StreamRangeReader::read_range` is a synchronous
-    // blocking call (Phase 1 reads from the materializing storage
-    // path which can stall for tens of seconds on a 10K-partition
-    // table backed by S3). Park it on the blocking pool so the
-    // tokio runtime can drive the heartbeat ticker concurrently,
-    // and the coordinator's `IdleTimeoutWatchdog` sees activity
-    // every HEARTBEAT_INTERVAL even while no chunks are in flight.
-    //
-    // Phase 2's lazy storage iterator removes the long quiet
-    // window — chunks land as partitions decode — and the
-    // heartbeat ticker becomes pure insurance against a stuck
-    // batch.
-    let table_id_for_read = table_id.clone();
-    let mut read_task = tokio::task::spawn_blocking(move || reader.read_range(&table_id_for_read));
+    // Open the lazy partition stream. Errors here are open-time
+    // (table not found, etc.) — emit a truncated Done and bail.
+    let mut stream = match reader.range_iter(&table_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                request_id = req.request_id,
+                keyspace = req.keyspace,
+                table = req.table,
+                "stream request: open failed: {e}"
+            );
+            send_truncated_done(&req, sink).await;
+            return;
+        }
+    };
 
-    let mut heartbeat_seq: u32 = 0;
+    // Heartbeat ticker. Each tick that fires when the partition
+    // stream is slow to yield emits a RangeReadStreamHeartbeat so
+    // the coordinator's IdleTimeoutWatchdog sees activity. The
+    // first tick is discarded — no point heartbeating before we've
+    // even started waiting.
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Discard the immediate first tick — we don't want to send a
-    // heartbeat before we've even started waiting.
     ticker.tick().await;
 
-    let read_result = loop {
+    let mut heartbeat_seq: u32 = 0;
+    let mut chunk_seq: u32 = 0;
+    let mut batch: Vec<Partition> = Vec::with_capacity(chunk_size);
+    let mut total_chunks_emitted: u32 = 0;
+    let mut any_decode_error = false;
+
+    'pull: loop {
         tokio::select! {
             biased;
-            res = &mut read_task => {
-                break match res {
-                    Ok(inner) => inner,
-                    Err(join_err) => Err(ferrosa_common::Error::InvalidData(format!(
-                        "stream request: storage read task panicked: {join_err}"
-                    ))),
-                };
-            }
+            next = stream.next() => match next {
+                Some(Ok(partition)) => {
+                    batch.push(partition);
+                    if batch.len() >= chunk_size {
+                        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+                        chunk_seq = chunk_seq.saturating_add(1);
+                        total_chunks_emitted = total_chunks_emitted.saturating_add(1);
+                    }
+                }
+                Some(Err(e)) => {
+                    // Per-partition decode failure (e.g. corrupt
+                    // SSTable page). Log and continue — losing one
+                    // partition beats failing the whole scan.
+                    tracing::warn!(
+                        request_id = req.request_id,
+                        "stream request: per-partition decode error: {e}"
+                    );
+                    any_decode_error = true;
+                }
+                None => break 'pull, // stream exhausted
+            },
             _ = ticker.tick() => {
                 let hb = RangeReadStreamHeartbeatPayload {
                     request_id: req.request_id,
@@ -136,34 +201,63 @@ pub async fn handle_stream_request<R, S>(
                 sink.send(Message::RangeReadStreamHeartbeat(Bytes::from(bytes))).await;
             }
         }
-    };
+    }
 
-    let partitions = match read_result {
-        Ok(ps) => ps,
-        Err(e) => {
-            tracing::warn!(
-                request_id = req.request_id,
-                keyspace = req.keyspace,
-                table = req.table,
-                "stream request: storage read failed: {e}"
-            );
-            // Emit truncated Done so the coordinator finishes
-            // instead of waiting for the idle-timeout watchdog.
-            let done = RangeReadStreamDonePayload {
-                request_id: req.request_id,
-                total_chunks: 0,
-                truncated: true,
-            };
-            let bytes = bincode::serialize(&done)
-                .expect("RangeReadStreamDonePayload serialization is infallible");
-            sink.send(Message::RangeReadStreamDone(Bytes::from(bytes))).await;
-            return;
-        }
-    };
+    // Flush any final partial batch.
+    if !batch.is_empty() {
+        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+        total_chunks_emitted = total_chunks_emitted.saturating_add(1);
+    }
 
-    // Phase 1 does not currently exceed any further bound beyond the
-    // storage cap; truncated stays false at the handler level.
-    stream_range_response(&req, &partitions, chunk_size, false, sink).await;
+    // Terminator.
+    let done = RangeReadStreamDonePayload {
+        request_id: req.request_id,
+        total_chunks: total_chunks_emitted,
+        truncated: any_decode_error,
+    };
+    let bytes = bincode::serialize(&done)
+        .expect("RangeReadStreamDonePayload serialization is infallible");
+    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes))).await;
+}
+
+/// Build a `RangeReadStreamChunk` from `batch`, send it via `sink`,
+/// and clear `batch` so its backing allocation is reused for the
+/// next chunk. The partitions are moved out of the batch — no
+/// clone — so memory peaks at `chunk_size` partitions held by the
+/// builder, not 2×.
+async fn emit_chunk<S: ChunkSink>(
+    req: &RangeReadStreamRequestPayload,
+    batch: &mut Vec<Partition>,
+    seq: u32,
+    sink: &S,
+) {
+    // Drain into a wire-shaped Vec without cloning. After this
+    // function returns, both the original Partition Vec and the
+    // wire Vec are dropped.
+    use crate::raft::handlers::partition_to_wire;
+    let wire: Vec<_> = batch.drain(..).map(partition_to_wire).collect();
+    let payload = crate::raft::handlers::RangeReadStreamChunkPayload {
+        request_id: req.request_id,
+        seq,
+        partitions: wire,
+    };
+    let bytes = bincode::serialize(&payload)
+        .expect("RangeReadStreamChunkPayload serialization is infallible");
+    sink.send(Message::RangeReadStreamChunk(Bytes::from(bytes))).await;
+}
+
+async fn send_truncated_done<S: ChunkSink>(
+    req: &RangeReadStreamRequestPayload,
+    sink: &S,
+) {
+    let done = RangeReadStreamDonePayload {
+        request_id: req.request_id,
+        total_chunks: 0,
+        truncated: true,
+    };
+    let bytes = bincode::serialize(&done)
+        .expect("RangeReadStreamDonePayload serialization is infallible");
+    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes))).await;
 }
 
 /// `RpcHandler` shell. Decodes the request, spawns the streaming
@@ -325,21 +419,30 @@ mod tests {
         }
     }
 
-    /// Test reader returning a fixed Vec<Partition>.
+    /// Test reader that yields a fixed list of partitions lazily,
+    /// one at a time through the new `range_iter` async stream.
     struct StaticReader {
         partitions: Vec<Partition>,
     }
     impl StreamRangeReader for StaticReader {
-        fn read_range(&self, _table_id: &TableId) -> ferrosa_common::Result<Vec<Partition>> {
-            Ok(self.partitions.clone())
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            let items: Vec<ferrosa_common::Result<Partition>> =
+                self.partitions.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(futures::stream::iter(items)))
         }
     }
 
-    /// Test reader that always fails — exercises the
-    /// storage-error → truncated-Done path.
+    /// Test reader that always fails at open time — exercises the
+    /// open-error → truncated-Done path.
     struct FailingReader;
     impl StreamRangeReader for FailingReader {
-        fn read_range(&self, _table_id: &TableId) -> ferrosa_common::Result<Vec<Partition>> {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
             Err(ferrosa_common::Error::InvalidData("simulated".into()))
         }
     }
@@ -485,6 +588,123 @@ mod tests {
             )
             .await;
         assert!(reply.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-020 lazy-iterator contract (memory boundedness)
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Reader that increments `partitions_yielded` every time
+    /// `next()` on its stream produces a partition. A correctly
+    /// lazy handler pulls chunk_size partitions, emits a chunk,
+    /// drops it, and only THEN pulls the next chunk_size — so the
+    /// counter at the moment the first chunk frame lands at the
+    /// sink is ≤ chunk_size. A handler that materializes the whole
+    /// list before emitting would have already pulled EVERY
+    /// partition past the counter before the first emit.
+    struct LazyContractReader {
+        partitions: Mutex<Option<Vec<Partition>>>,
+        partitions_yielded: Arc<AtomicUsize>,
+    }
+    impl LazyContractReader {
+        fn new(partitions: Vec<Partition>, counter: Arc<AtomicUsize>) -> Self {
+            Self {
+                partitions: Mutex::new(Some(partitions)),
+                partitions_yielded: counter,
+            }
+        }
+    }
+    impl StreamRangeReader for LazyContractReader {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            let ps = self
+                .partitions
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_default();
+            let counter = self.partitions_yielded.clone();
+            // Yield Ok(partition) one at a time, bumping the
+            // counter on each successful pull. The handler's
+            // emission rate vs the counter rate is what proves
+            // bounded memory.
+            let stream = futures::stream::iter(ps).map(move |p| {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok::<_, ferrosa_common::Error>(p)
+            });
+            Ok(Box::pin(stream))
+        }
+    }
+
+    /// Sink that snapshots the yield counter the FIRST time a
+    /// Chunk frame is emitted. Lazy handler: counter == chunk_size.
+    /// Materializing handler: counter == total partition count.
+    struct YieldWatermarkSink {
+        watermark_at_first_chunk: Mutex<Option<usize>>,
+        yield_counter: Arc<AtomicUsize>,
+        frames: Mutex<Vec<Message>>,
+    }
+    impl YieldWatermarkSink {
+        fn new(counter: Arc<AtomicUsize>) -> Self {
+            Self {
+                watermark_at_first_chunk: Mutex::new(None),
+                yield_counter: counter,
+                frames: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl ChunkSink for YieldWatermarkSink {
+        async fn send(&self, msg: Message) {
+            if matches!(msg, Message::RangeReadStreamChunk(_)) {
+                let mut wm = self.watermark_at_first_chunk.lock().unwrap();
+                if wm.is_none() {
+                    *wm = Some(self.yield_counter.load(AtomicOrdering::Relaxed));
+                }
+            }
+            self.frames.lock().unwrap().push(msg);
+        }
+    }
+
+    /// ADR-020 memory boundedness — the handler MUST pull from a
+    /// lazy iterator, never materialize the whole partition list
+    /// before emitting. With chunk_size = 16 and 1000 partitions,
+    /// the yield-counter at the moment the first chunk is emitted
+    /// must be ≤ chunk_size (plus iterator-internal slack). The
+    /// current trait's Vec-returning shape makes this impossible —
+    /// this test will RED until `read_range` is replaced with a
+    /// per-partition lazy iterator and the handler is rewired to
+    /// pull from it.
+    #[tokio::test]
+    async fn handler_holds_at_most_chunk_size_partitions_before_first_emit() {
+        const TOTAL: usize = 1000;
+        const CHUNK: usize = 16;
+
+        let partitions: Vec<Partition> = (0u8..=255)
+            .cycle()
+            .take(TOTAL)
+            .map(make_partition)
+            .collect();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(LazyContractReader::new(partitions, counter.clone()));
+        let sink = YieldWatermarkSink::new(counter.clone());
+
+        handle_stream_request(req(1), reader, &sink, CHUNK).await;
+
+        let watermark = sink
+            .watermark_at_first_chunk
+            .lock()
+            .unwrap()
+            .expect("at least one chunk frame must have been emitted");
+        assert!(
+            watermark <= CHUNK,
+            "handler materialized {watermark} partitions before emitting the first chunk; \
+             ADR-020 requires lazy iteration (chunk_size={CHUNK})"
+        );
     }
 
     /// RpcHandler shell: malformed RangeReadStreamRequest payload
