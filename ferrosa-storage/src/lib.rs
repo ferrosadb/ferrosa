@@ -26,6 +26,7 @@ pub mod index;
 pub mod manifest;
 pub mod memtable;
 pub mod merge;
+pub mod range_merger;
 pub mod metrics;
 pub mod observer;
 pub mod pin_config;

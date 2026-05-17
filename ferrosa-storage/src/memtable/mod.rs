@@ -115,6 +115,27 @@ pub trait Memtable: Send + Sync {
             .collect()
     }
 
+    /// Lazy iterator yielding every partition in token order within
+    /// the optional `[start, end]` bounds. The iterator must NOT
+    /// pre-materialize partitions — `next()` should produce exactly
+    /// one clone at a time so memtable scans contribute O(1) memory
+    /// to upstream consumers like the streaming range-read handler
+    /// (ADR-020).
+    ///
+    /// The default impl falls back to `snapshot_range_limited` for
+    /// backings that haven't been upgraded yet; production backings
+    /// (Skiplist, Sharded) override with a truly lazy implementation.
+    fn range_iter<'a>(
+        &'a self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> Box<dyn Iterator<Item = Partition> + Send + 'a> {
+        Box::new(
+            self.snapshot_range_limited(start, end, usize::MAX)
+                .into_iter(),
+        )
+    }
+
     /// Approximate memory usage in bytes. Wait-free (`AtomicUsize`).
     fn size_bytes(&self) -> usize;
 

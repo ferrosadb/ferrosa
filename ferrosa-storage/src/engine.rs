@@ -2121,6 +2121,34 @@ impl StorageEngine {
         }
     }
 
+    /// ADR-020 lazy range iterator. Returns an async `Stream` that
+    /// yields every partition in `[start, end]` for `table_id`, one
+    /// at a time, without materializing the full result. Backed by
+    /// the per-source k-way merge in
+    /// `crate::range_merger::RangeMerger`.
+    ///
+    /// Returns `Ok` with an empty stream when the table is not
+    /// registered (matches the semantics of `read_range_limited_rows`,
+    /// which returns Ok(vec![])).
+    pub fn range_iter(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::stream::Stream<
+                    Item = ferrosa_common::Result<Partition>,
+                > + Send,
+        >,
+    > {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.range_iter(start, end),
+            None => Box::pin(futures::stream::empty()),
+        }
+    }
+
     /// Query by secondary index across memtable and SSTable sidecar indexes.
     ///
     /// Delegates to [`TableStore::read_by_index`] which merges results from

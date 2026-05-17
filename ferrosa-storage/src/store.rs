@@ -924,6 +924,87 @@ impl<F: FlushTarget> TableStore<F> {
         self.read_range_limited_rows(start, end, limit, 0)
     }
 
+    /// ADR-020 lazy range iterator. Returns an async `Stream` that
+    /// yields every partition in `[start, end]` one at a time —
+    /// memtable + flushing memtable + SSTables k-way merged, with
+    /// same-key partitions merged and deletions suppressed inline.
+    ///
+    /// Memory profile: peak is O(num_sources) partitions held by
+    /// the merger, regardless of total table size. Unlike
+    /// `read_range_limited_rows` there is no
+    /// `RANGE_READ_MATERIALIZATION_CAP`; the caller drives the rate
+    /// of consumption via mpsc back-pressure (`STREAM_BUFFER` items).
+    pub fn range_iter(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::stream::Stream<
+                    Item = Result<Partition>,
+                > + Send,
+        >,
+    > {
+        /// Per-stream channel buffer. Bounded so a slow consumer
+        /// (e.g. CQL coordinator under load) back-pressures the
+        /// blocking merger task instead of letting it run away.
+        const STREAM_BUFFER: usize = 64;
+
+        let view = self.view.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+
+        tokio::task::spawn_blocking(move || {
+            // Build source iterators — these borrow from `view`
+            // (memtable Arcs and per-SSTable Arcs) which the closure
+            // owns for the task's full lifetime, so there is no
+            // self-referential lifetime problem.
+            let active_iter = view
+                .active
+                .range_iter(start_owned.as_ref(), end_owned.as_ref());
+            let flushing_iter = view
+                .flushing
+                .as_ref()
+                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            let sstables_slice = &view.sstables[..];
+
+            let mut merger = match crate::range_merger::merger_for_sources(
+                active_iter,
+                flushing_iter,
+                sstables_slice,
+                start_owned,
+                end_owned,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+
+            loop {
+                match merger.next_merged_partition() {
+                    Ok(Some(partition)) => {
+                        if tx.blocking_send(Ok(partition)).is_err() {
+                            // Consumer dropped (cancelled stream).
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,

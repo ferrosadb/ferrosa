@@ -77,41 +77,19 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
         &'a self,
         table_id: &TableId,
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
-        // INTERIM Phase 1 backing: spawn_blocking the existing
-        // materializing read, then yield partitions one at a time
-        // through an mpsc-backed Stream. The HANDLER is now bounded
-        // — it never holds more than chunk_size partitions at once.
-        // The internal Vec in the spawned task is still materialized;
-        // ADR-020 Phase 2 work (memtable/SSTable streaming + k-way
-        // merge) replaces this stub with a true per-partition
-        // pipeline that bounds memory at every layer.
-        let engine = Arc::clone(self);
-        let table_id = table_id.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<ferrosa_common::Result<Partition>>(64);
-        tokio::task::spawn_blocking(move || {
-            let partitions = engine.read_range(
-                &table_id,
-                None,
-                None,
-                crate::write_path::DEFAULT_RANGE_READ_LIMIT,
-            );
-            match partitions {
-                Ok(ps) => {
-                    for p in ps {
-                        if tx.blocking_send(Ok(p)).is_err() {
-                            // Consumer cancelled.
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
-                }
-            }
-        });
-        Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        })))
+        // ADR-020 Phase 2 backing: StorageEngine::range_iter returns
+        // a Stream backed by crate::range_merger::RangeMerger — a
+        // k-way merge across memtable + flushing memtable + per-SSTable
+        // iterators, yielding one merged-and-deletion-suppressed
+        // partition at a time. Memory at every layer is bounded by
+        // num_sources, not table size; no Vec<Partition> exists for
+        // the whole table at any point in the pipeline.
+        Ok(ferrosa_storage::StorageEngine::range_iter(
+            self.as_ref(),
+            table_id,
+            None,
+            None,
+        ))
     }
 }
 
