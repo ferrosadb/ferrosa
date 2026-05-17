@@ -130,6 +130,86 @@ files for this table).
    agent_memory.entity_store;"` — observe 50–110 s wall on a
    table that local-only should finish in <1 s.
 
+## 2026-05-17 update: cold-cache root cause identified
+
+The **cold-cache 32 s wall** for `SELECT pk, ck FROM
+agent_memory.entity_store LIMIT 5` (separate symptom from the
+50× streaming gap above, but in the same code path) has a
+single mechanical cause: the k-way merger's heap-priming loop
+in `RangeMerger::new` calls `refill_source(src)` for every
+source up-front, and each `refill_source` for an SSTable source
+**reads and decodes the full first partition body** just to
+extract its key for the heap entry.
+
+For `entity_store` (47 SSTables, disjoint-runs grouping
+collapses to 38 runs because token ranges are heavily
+overlapping), 38 cold-cache full-partition decodes ≈ 38 × ~800
+ms = ~30 s wall before the merger emits a single partition.
+Per-source timing (instrumented via `PERF slow refill_source`
+trace on a host-page-cache-evicted run):
+
+```
+src=5  iters=1 ms=1257
+src=6  iters=1 ms=1251
+src=7  iters=1 ms=1254
+src=8  iters=1 ms=1252
+src=9  iters=1 ms=713
+src=10 iters=1 ms=688
+src=11 iters=1 ms=2635
+src=12 iters=1 ms=1313
+...
+```
+
+`iters=1` confirms each source pays for exactly one partition
+decode and the cost is per-decode, not per-iteration. The wide
+entity rows (768-dim float32 embedding cell + clustering)
+amplify per-partition I/O even with projected/byte-skip mode
+(`next_partition_projected(&[])`) because cells must still be
+*read* to be skipped.
+
+### Why disjoint-runs barely helps for this table
+
+`PERF disjoint runs computed sstable_count=47 run_count=38
+run_sizes=[4,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1]`
+
+Most runs are size 1 — the SSTables overlap pairwise in token
+space, so concatenation reduces only 47 → 38, not 47 → ~log N.
+A properly-compacted LSM would have far fewer runs; this
+cluster's UCS state is highly fragmented.
+
+### Proposed fix: key-cursor over partition_index
+
+The merger reads partition bodies to learn keys. The
+`PartitionIndex` already has every key cached
+(`smallest_key`/`largest_key` and walkable trie). The fix is to
+add a `PartitionKeyCursor` abstraction that walks the trie
+producing `DecoratedKey` only, and to make the merger heap key
+the `(next_key, source_id)` pair — decoding the partition body
+only when the source is popped.
+
+Then for `LIMIT 5` on cold cache:
+- Init: 38 sources × *trie-walk-only* key lookup ≈ 38 × few ms = <200 ms
+- Per emit: pop min, decode that one partition body
+- Total cold: 5 partition decodes + ~38 trie walks ≈ <2 s
+
+Trade-off: requires extending `SSTableReader` /
+`PartitionIndex` with a key-iteration API (`iter_keys() -> impl
+Iterator<Item = DecoratedKey>`). The trie supports it but the
+current code only exposes lookup by key, not in-order walk.
+
+### Why this is independent of the disjoint-runs work
+
+The disjoint-runs collapse is correct and helpful when the LSM
+is compacted (the typical case). For the cold-cache pathology
+on fragmented LSMs, the *runs themselves* still each pay the
+priming cost. Both optimizations stack — compacted LSM →
+fewer runs → fewer priming reads → fast even cold.
+
+Short-term mitigation while the key-cursor change lands: drive
+UCS to actually compact `entity_store` down to <10 SSTables.
+That alone reduces 30 s init → ~6 s on cold cache without any
+code change.
+
 ## Investigation next steps
 
 - **Profile inside the container.** `perf record -p <ferrosa-pid>
