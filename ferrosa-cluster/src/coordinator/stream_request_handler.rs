@@ -10,7 +10,7 @@
 //!
 //! Decode failures and storage errors do not synthesize an error
 //! reply frame today: the coordinator times out via its
-//! [`super::stream_consumer::IdleTimeoutWatchdog`] and surfaces the
+//! [`ferrosa_net::idle_timeout::IdleTimeoutWatchdog`] and surfaces the
 //! partial result. Storage errors emit a `RangeReadStreamDone` with
 //! `truncated = true` so the coordinator sees a clean terminator
 //! and can mark the replica as partial without waiting for the

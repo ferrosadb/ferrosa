@@ -1,6 +1,6 @@
 //! Lazy k-way merge across memtable + flushing memtable + SSTable
 //! iterators (ADR-020). Yields one merged-and-deletion-suppressed
-//! partition at a time in token order — no Vec<Partition> ever held
+//! partition at a time in token order — no `Vec<Partition>` ever held
 //! for the whole table.
 //!
 //! Memory profile: peak is one Partition (the currently-emitting
@@ -8,7 +8,7 @@
 //! peek. With ~3 sources (memtable + flushing + a few SSTables) the
 //! resident set is O(num_sources) partitions, not O(table_size).
 //!
-//! Used by [`TableStore::range_iter`] to back the
+//! Used by `TableStore::range_iter` to back the
 //! `ferrosa_cluster::coordinator::stream_request_handler::StreamRangeReader`
 //! Phase 2 path.
 
