@@ -75,6 +75,48 @@ impl ClusterCoordinator {
     }
 }
 
+/// Number of REMOTE replicas to query for a range read at the given
+/// consistency level. Local replica always reads directly (counts as
+/// one satisfied response), so this returns the *additional* remote
+/// count needed.
+///
+/// For RF == node_count (every node owns every token range, typical
+/// in the dev/test cluster), CL=ONE / LOCAL_ONE is satisfied by the
+/// local read alone and we return 0 — full fan-out is wasted work
+/// since dedup would just collapse identical replica copies anyway.
+///
+/// For RF < node_count we cannot prove the local node owns every
+/// partition without a token-range-aware query plan; conservatively
+/// fall back to the existing all-remotes fan-out until that proper
+/// path lands. (Filed as next-step in
+/// bug-streaming-range-read-perf-50x-floor.md.)
+fn remote_count_for_cl(
+    cl: crate::consistency::ConsistencyLevel,
+    rf: usize,
+    node_count: usize,
+    remote_count: usize,
+) -> usize {
+    use crate::consistency::ConsistencyLevel as CL;
+    // RF<cluster — fall back to full fan-out for correctness.
+    if rf < node_count {
+        return remote_count;
+    }
+    // RF==cluster — local has every partition. Apply CL.
+    match cl {
+        CL::One | CL::LocalOne => 0,
+        // QUORUM/ALL: contact enough remotes to satisfy CL beyond
+        // the local response. For RF=N, QUORUM = floor(N/2)+1.
+        CL::Quorum | CL::LocalQuorum | CL::EachQuorum => {
+            let needed = rf / 2 + 1; // QUORUM count including local
+            needed.saturating_sub(1).min(remote_count)
+        }
+        CL::All => remote_count,
+        // Any/Two/Three are unusual or write-only — keep
+        // conservative full fan-out so we never under-read.
+        _ => remote_count,
+    }
+}
+
 /// Deduplicate partitions by token — multiple replicas (RF=N) each
 /// return a copy of every partition they own; without this, COUNT(*)
 /// and full-table scans return N× the real partition count. Mirrors
@@ -132,11 +174,34 @@ impl ClusterCoordinator {
         drop(ring);
 
         let local_id = self.local_node_id;
-        let remotes: Vec<(uuid::Uuid, String)> = nodes
+        let node_count = nodes.len();
+        let all_remotes: Vec<(uuid::Uuid, String)> = nodes
             .iter()
             .filter(|(id, _)| *id != local_id)
             .filter_map(|(_, host)| host.clone())
             .collect();
+
+        // CL-aware fan-out. The local replica counts as one
+        // satisfied response, so we only need to contact
+        // additional remotes when the configured consistency
+        // demands more than one response AND the local node
+        // doesn't already own every token range.
+        //
+        // RF=cluster_size case (every node owns every partition,
+        // typical for the test cluster): CL=ONE / LOCAL_ONE is
+        // satisfied entirely by the local read.
+        // RF<cluster_size case: token-ownership-aware fan-out is
+        // required for correctness — we conservatively fall back
+        // to the full fan-out for those tables until the proper
+        // per-token-range query path lands.
+        let cl_remote_count = remote_count_for_cl(
+            self.default_cl,
+            self.default_rf,
+            node_count,
+            all_remotes.len(),
+        );
+        let remotes: Vec<(uuid::Uuid, String)> =
+            all_remotes.into_iter().take(cl_remote_count).collect();
         let expected_done = remotes.len();
 
         // Local read goes direct — no internode hop.
@@ -152,7 +217,7 @@ impl ClusterCoordinator {
 
         // No remote replicas → done after the local read.
         if expected_done == 0 {
-            return Ok(all_partitions);
+            return Ok(dedup_by_token(all_partitions));
         }
 
         let request_id = self.next_stream_request_id();
@@ -242,5 +307,42 @@ impl ClusterCoordinator {
                 "streaming range read: {e:?}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consistency::ConsistencyLevel as CL;
+
+    /// RF=cluster_size: local replica owns every partition, so
+    /// CL=ONE / LOCAL_ONE needs zero remote replicas. QUORUM needs
+    /// floor(RF/2)+1 total responses → that count minus 1 (local)
+    /// is the remote count. ALL needs every remote.
+    #[test]
+    fn cl_remote_count_rf_equals_cluster() {
+        // 3 nodes, RF=3, 2 remotes.
+        assert_eq!(remote_count_for_cl(CL::One, 3, 3, 2), 0);
+        assert_eq!(remote_count_for_cl(CL::LocalOne, 3, 3, 2), 0);
+        assert_eq!(remote_count_for_cl(CL::Quorum, 3, 3, 2), 1);
+        assert_eq!(remote_count_for_cl(CL::LocalQuorum, 3, 3, 2), 1);
+        assert_eq!(remote_count_for_cl(CL::All, 3, 3, 2), 2);
+        // 5 nodes, RF=5, 4 remotes.
+        assert_eq!(remote_count_for_cl(CL::One, 5, 5, 4), 0);
+        assert_eq!(remote_count_for_cl(CL::Quorum, 5, 5, 4), 2);
+        assert_eq!(remote_count_for_cl(CL::All, 5, 5, 4), 4);
+    }
+
+    /// RF<cluster_size: we cannot prove the local node owns every
+    /// token range, so we fall back to the full fan-out for
+    /// correctness — under-reading would surface as missing
+    /// partitions for whichever ranges the local node doesn't own.
+    /// Replace with a token-aware query plan in a follow-up.
+    #[test]
+    fn cl_remote_count_rf_less_than_cluster_falls_back_to_full_fanout() {
+        // 5 nodes, RF=3 — local may not own every range.
+        assert_eq!(remote_count_for_cl(CL::One, 3, 5, 4), 4);
+        assert_eq!(remote_count_for_cl(CL::Quorum, 3, 5, 4), 4);
+        assert_eq!(remote_count_for_cl(CL::All, 3, 5, 4), 4);
     }
 }
