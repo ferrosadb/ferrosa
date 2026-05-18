@@ -79,10 +79,19 @@ pub struct RepairCoordinator {
 /// many equal-token chunks before scheduling. Bounds per-session
 /// memory to roughly `table_size / K * 2` (local + remote) so a
 /// session never tries to materialise a multi-GB replica in one
-/// shot. 32 keeps the wire-call count modest (RF=3/3-node: 1 group
-/// × 32 chunks × 2 peers = 64 sessions per node vs. 1 536 without
-/// the merge) while bounding peak memory at ~table_size/32.
-pub const REPAIR_CHUNKS_PER_MERGED_RANGE: usize = 32;
+/// shot.
+///
+/// 256 is sized for fat-partition tables where average-case
+/// partition size hides outliers: on the fmem entity_store with
+/// ~10 k partitions and a 1.3 GB local replica, K=32 still let a
+/// skewed chunk push peak memory to ~1.9 GiB (well-distributed
+/// average × 4 concurrent + skew + apply accumulation) and OOM
+/// the 2 GiB container. At K=256 each chunk holds roughly 40
+/// partitions on average and worst-case skew stays under a few MB
+/// per chunk. Wire-call count is still bounded — RF=3/3-node:
+/// 1 group × 256 chunks × 2 peers = 512 sessions per node, vs.
+/// 1 536 without the merge.
+pub const REPAIR_CHUNKS_PER_MERGED_RANGE: usize = 256;
 
 impl Default for RepairCoordinator {
     fn default() -> Self {
