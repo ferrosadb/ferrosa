@@ -78,8 +78,14 @@ pub struct RepairCoordinator {
 impl Default for RepairCoordinator {
     fn default() -> Self {
         Self {
-            // Matches Cassandra's default per-node repair concurrency.
-            max_concurrent_sessions: 4,
+            // Conservative default: 1 session at a time. Each session
+            // currently does a per-call full-table prefix scan (until a
+            // token-bounded scan API lands on StorageEngine), so running
+            // many in parallel multiplies the working-set memory by the
+            // concurrency factor. On a 2 GB container this OOMs almost
+            // immediately. Raise this once the read path is bounded by
+            // token range, not by an in-memory limit-then-filter.
+            max_concurrent_sessions: 1,
         }
     }
 }

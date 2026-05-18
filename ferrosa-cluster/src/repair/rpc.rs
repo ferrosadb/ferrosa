@@ -158,8 +158,18 @@ impl RpcHandler for RepairFetchHandler {
             }
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
-        let partitions =
-            match StorageEngine::read_range(&self.storage, &table_id, None, None, usize::MAX) {
+        // See `StorageEngineRepairStore::read_range`: small per-session
+        // budget keeps the container under its memory limit while still
+        // covering realistic-table leaves. A token-bounded scan API on
+        // StorageEngine is the proper fix; this is the interim.
+        const REPAIR_LEAF_READ_LIMIT: usize = 200;
+        let partitions = match StorageEngine::read_range(
+            &self.storage,
+            &table_id,
+            None,
+            None,
+            REPAIR_LEAF_READ_LIMIT,
+        ) {
                 Ok(ps) => ps,
                 Err(e) => {
                     tracing::warn!(%e, ?table_id, "RepairFetchHandler: read_range failed");
