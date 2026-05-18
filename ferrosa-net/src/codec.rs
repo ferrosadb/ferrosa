@@ -83,6 +83,16 @@ pub enum MsgType {
     RangeReadResponse = 0x26,
     TruncateForward = 0x27,
     TruncateAck = 0x28,
+    // Anti-entropy repair (cluster/repair) — three request/response pairs.
+    // Initiator → peer: build Merkle for table range. Peer → initiator: tree.
+    RepairMerkleRequest = 0x29,
+    RepairMerkleResponse = 0x2A,
+    // Initiator → peer: send partitions in a token sub-range.
+    RepairFetchRequest = 0x2B,
+    RepairFetchResponse = 0x2C,
+    // Initiator → peer: apply these partitions (LWW). Peer → initiator: ack.
+    RepairApplyRequest = 0x2D,
+    RepairApplyResponse = 0x2E,
     // ADR-020 streaming range read — multi-message RPC keyed by
     // request_id, terminated by RangeReadStreamDone, cancellable via
     // RangeReadStreamCancel, kept alive by RangeReadStreamHeartbeat.

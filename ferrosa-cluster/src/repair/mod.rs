@@ -19,10 +19,12 @@
 pub mod coordinator;
 pub mod executor;
 pub mod merkle;
+pub mod rpc;
 
 pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
 pub use executor::{InMemoryRepairStore, LocalRepairExecutor, RepairStore};
 pub use merkle::MerkleTree;
+pub use rpc::{RemoteRepairStore, RepairApplyHandler, RepairFetchHandler, RepairMerkleHandler};
 
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
