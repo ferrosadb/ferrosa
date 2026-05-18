@@ -16,8 +16,10 @@
 //! - **RepairScheduler**: Background task that periodically triggers repair
 //!   sessions for all locally-owned token ranges.
 
+pub mod coordinator;
 pub mod merkle;
 
+pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
 pub use merkle::MerkleTree;
 
 use ferrosa_sstable::types::Partition;
