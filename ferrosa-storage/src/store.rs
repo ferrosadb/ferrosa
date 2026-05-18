@@ -1139,6 +1139,45 @@ impl<F: FlushTarget> TableStore<F> {
         }))
     }
 
+    /// Read all partitions whose tokens fall in `[start_token, end_token)`,
+    /// up to `limit` matching partitions.
+    ///
+    /// Anti-entropy repair needs "every partition in this Merkle leaf's
+    /// token sub-range." The existing key-bounded read API can't answer
+    /// that because partition keys hash to tokens; a contiguous token
+    /// range is a discontiguous key range. This method materialises the
+    /// merged stream (capped at [`RANGE_READ_MATERIALIZATION_CAP`]) once
+    /// and filters by token.
+    ///
+    /// Returns an empty vector when the range is empty (`start >= end`)
+    /// or `limit == 0`. When the table holds more than the materialisation
+    /// cap, the result is best-effort: only partitions falling in the
+    /// cap-sized prefix-by-key are inspected. A token-streaming primitive
+    /// is the long-term fix; this is the unblock for repair-on-fmem-scale
+    /// tables (9 774 partitions, well under the cap).
+    pub fn read_token_range(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        limit: usize,
+    ) -> Result<Vec<Partition>> {
+        if start_token >= end_token || limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Pull the full materialisation up to the cap, then filter by
+        // token. We can request the cap directly because the underlying
+        // call rejects anything larger.
+        let all = self.read_range_limited_rows(None, None, RANGE_READ_MATERIALIZATION_CAP, 0)?;
+        Ok(all
+            .into_iter()
+            .filter(|p| {
+                let t = p.key.token.0;
+                t >= start_token && t < end_token
+            })
+            .take(limit)
+            .collect())
+    }
+
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,
