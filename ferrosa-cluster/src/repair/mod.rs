@@ -20,6 +20,7 @@ pub mod merkle;
 
 pub use merkle::MerkleTree;
 
+use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
@@ -82,20 +83,48 @@ pub fn build_tree_for_range(
         if token < range_start || token >= range_end {
             continue;
         }
-        let hash = partition_hash(partition.key.key.as_bytes());
-        tree.insert(token, hash);
+        tree.insert(token, partition_merkle_hash(partition));
     }
 
     tree.compute_root();
     Ok(tree)
 }
 
-/// Compute a hash for a partition key's bytes.
-fn partition_hash(key_bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key_bytes.hash(&mut hasher);
-    hasher.finish()
+/// Hash of a partition's full content (key + deletion + static row + clustered
+/// rows + every cell with timestamps), suitable for Merkle-tree leaf XOR
+/// accumulation in anti-entropy repair.
+///
+/// **Why partition content, not just the key.** An earlier draft of this code
+/// hashed only `partition.key.key.as_bytes()`. That made Merkle comparison
+/// blind to content divergence: two replicas with the same set of keys but
+/// different cells, timestamps, or deletions produced identical Merkle roots,
+/// so the repair scheduler would conclude "nothing to do" and never reconcile
+/// them. Repair MUST detect content divergence, so the hash MUST include
+/// content.
+///
+/// Delegates to [`crate::raft::handlers::compute_partition_digest`], which is
+/// the same CRC32 over a bincode-serialized `PartitionWire` that the digest
+/// phase of `coordinate_read_with` uses, so Merkle agreement and digest-phase
+/// agreement are guaranteed consistent. The CRC32 is widened to 64 bits to
+/// match the Merkle leaf hash width — XOR collisions are theoretically
+/// possible but cap at ~2^-32 per leaf for diverging content (Cassandra's
+/// classic merkle accepts the same trade-off).
+pub fn partition_merkle_hash(partition: &Partition) -> u64 {
+    match crate::raft::handlers::compute_partition_digest(partition) {
+        Ok(crc) => {
+            // Two-step widen: high half = CRC, low half = CRC rotated.
+            // Better than zero-padding because zero-pad leaves the upper
+            // 32 bits constant, which throws away half the tree's XOR
+            // distinguishing power.
+            let lo = crc as u64;
+            let hi = (crc.rotate_left(16)) as u64;
+            (hi << 32) | lo
+        }
+        // Serialisation should not fail for any partition the storage engine
+        // returned — fall back to 0 (silently identical) rather than panic.
+        // Tracked as a metric in the repair coordinator (TODO).
+        Err(_) => 0,
+    }
 }
 
 /// Diff two Merkle trees and return the sub-ranges that differ.
@@ -167,13 +196,39 @@ fn diff_subtree(
 mod tests {
     use super::*;
 
+    /// Build a minimal Partition for tests with a given partition-key bytes
+    /// and a single cell whose value is `value` and whose timestamp is `ts`.
+    /// The partition's token is computed from the key via Murmur3 so the
+    /// token-to-leaf mapping in Merkle inserts is realistic.
+    fn test_partition(key_bytes: &[u8], value: &[u8], ts: i64) -> Partition {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let key = PartitionKey::new(key_bytes.to_vec());
+        let dk = DecoratedKey::new(key);
+        let cell = CellValue::live(value.to_vec(), ts);
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, cell)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        }
+    }
+
     #[test]
     fn identical_trees_produce_no_diffs() {
         let mut t1 = MerkleTree::new(4, i64::MIN, i64::MAX);
         let mut t2 = MerkleTree::new(4, i64::MIN, i64::MAX);
 
-        for token in [100i64, 200, 300, 400] {
-            let hash = partition_hash(&token.to_be_bytes());
+        for i in 0..4u8 {
+            let p = test_partition(&[b'k', i], b"value", 1000);
+            let token = p.key.token.0;
+            let hash = partition_merkle_hash(&p);
             t1.insert(token, hash);
             t2.insert(token, hash);
         }
@@ -183,6 +238,59 @@ mod tests {
 
         let diffs = diff_trees(&t1, &t2);
         assert!(diffs.is_empty(), "identical trees should have no diffs");
+    }
+
+    /// REGRESSION: prior to this fix, `partition_hash` hashed only the
+    /// partition key bytes, so two replicas holding the same key with
+    /// different cells produced identical Merkle hashes — repair was
+    /// blind to content divergence (the exact failure mode anti-entropy
+    /// is supposed to fix).
+    #[test]
+    fn partition_merkle_hash_detects_content_divergence() {
+        let same_key = b"shared-pkey";
+        let local = test_partition(same_key, b"value-a", 1_000);
+        let remote = test_partition(same_key, b"value-b", 1_000);
+        assert_ne!(
+            partition_merkle_hash(&local),
+            partition_merkle_hash(&remote),
+            "two partitions with the same key but different cell values MUST hash differently"
+        );
+
+        // And the same hash for identical content (sanity check).
+        let dup = test_partition(same_key, b"value-a", 1_000);
+        assert_eq!(
+            partition_merkle_hash(&local),
+            partition_merkle_hash(&dup),
+            "identical content must hash identically (deterministic across nodes)"
+        );
+    }
+
+    /// REGRESSION: the same content divergence must propagate up the
+    /// Merkle tree so `diff_trees` reports the leaf containing the
+    /// diverging partition.
+    #[test]
+    fn diff_trees_detects_content_divergence_at_same_key() {
+        let same_key = b"shared-pkey";
+        let local = test_partition(same_key, b"value-a", 1_000);
+        let remote = test_partition(same_key, b"value-b", 1_000);
+        let token = local.key.token.0;
+
+        let mut t1 = MerkleTree::new(8, i64::MIN, i64::MAX);
+        let mut t2 = MerkleTree::new(8, i64::MIN, i64::MAX);
+        t1.insert(token, partition_merkle_hash(&local));
+        t2.insert(token, partition_merkle_hash(&remote));
+        t1.compute_root();
+        t2.compute_root();
+
+        let diffs = diff_trees(&t1, &t2);
+        assert!(
+            !diffs.is_empty(),
+            "diff_trees must detect partition-content divergence"
+        );
+        assert!(
+            diffs.iter().any(|&(s, e)| s <= token && token < e),
+            "diff range must contain the divergent token; got {diffs:?} token={token}"
+        );
     }
 
     #[test]
