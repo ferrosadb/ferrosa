@@ -198,6 +198,12 @@ impl TryFrom<u8> for MsgType {
             0x3A => Ok(Self::RangeReadStreamCancel),
             0x27 => Ok(Self::TruncateForward),
             0x28 => Ok(Self::TruncateAck),
+            0x29 => Ok(Self::RepairMerkleRequest),
+            0x2A => Ok(Self::RepairMerkleResponse),
+            0x2B => Ok(Self::RepairFetchRequest),
+            0x2C => Ok(Self::RepairFetchResponse),
+            0x2D => Ok(Self::RepairApplyRequest),
+            0x2E => Ok(Self::RepairApplyResponse),
             0x30 => Ok(Self::StreamStart),
             0x31 => Ok(Self::StreamChunk),
             0x32 => Ok(Self::StreamEnd),
@@ -594,6 +600,30 @@ mod tests {
         let mt = MsgType::try_from(0x24u8).unwrap();
         assert_eq!(mt, MsgType::RepairWrite);
         assert_eq!(mt as u8, 0x24);
+    }
+
+    /// Every anti-entropy repair RPC byte-tag must round-trip through
+    /// `TryFrom<u8>`. The enum has variants 0x29..=0x2E (declared at the
+    /// top of this module) but those cases were not added to the decoder's
+    /// match arm — so peers serialise repair frames fine but reject them
+    /// on receipt with `UnknownMessageType`, repair sessions silently
+    /// fail and zero partitions converge. This test pins each byte.
+    #[test]
+    fn msg_type_repair_rpc_tags_round_trip() {
+        for (byte, expected) in [
+            (0x29u8, MsgType::RepairMerkleRequest),
+            (0x2A, MsgType::RepairMerkleResponse),
+            (0x2B, MsgType::RepairFetchRequest),
+            (0x2C, MsgType::RepairFetchResponse),
+            (0x2D, MsgType::RepairApplyRequest),
+            (0x2E, MsgType::RepairApplyResponse),
+        ] {
+            let parsed = MsgType::try_from(byte).unwrap_or_else(|_| {
+                panic!("MsgType::try_from(0x{byte:02X}) must succeed — repair will silently drop frames otherwise")
+            });
+            assert_eq!(parsed, expected, "byte 0x{byte:02X} round-trip");
+            assert_eq!(parsed as u8, byte, "byte 0x{byte:02X} discriminant");
+        }
     }
 
     #[test]
