@@ -75,6 +75,15 @@ pub struct RepairCoordinator {
     pub max_concurrent_sessions: usize,
 }
 
+/// Each merged (replica-set, owned-range) group is split into this
+/// many equal-token chunks before scheduling. Bounds per-session
+/// memory to roughly `table_size / K * 2` (local + remote) so a
+/// session never tries to materialise a multi-GB replica in one
+/// shot. 32 keeps the wire-call count modest (RF=3/3-node: 1 group
+/// × 32 chunks × 2 peers = 64 sessions per node vs. 1 536 without
+/// the merge) while bounding peak memory at ~table_size/32.
+pub const REPAIR_CHUNKS_PER_MERGED_RANGE: usize = 32;
+
 impl Default for RepairCoordinator {
     fn default() -> Self {
         Self {
@@ -137,10 +146,31 @@ impl RepairCoordinator {
             }
             merged.push((range_start, range_end, peers));
         }
+        // Each merged range is then split into K equal-token chunks
+        // so each session's working set scales with chunk size, not
+        // table size. Without this, a 3-node RF=3 cluster collapses
+        // ALL owned ranges into one full-ring session per peer, which
+        // tries to materialise the entire local replica before
+        // diffing — observed to OOM the 2 GiB fmem container at
+        // ~1.4 GiB on a 1.3 GB table.
         let mut tasks: Vec<(i64, i64, u64)> = Vec::new();
         for (range_start, range_end, peers) in merged {
-            for peer in peers {
-                tasks.push((range_start, range_end, peer));
+            let span = (range_end as i128) - (range_start as i128);
+            let k = REPAIR_CHUNKS_PER_MERGED_RANGE as i128;
+            for i in 0..REPAIR_CHUNKS_PER_MERGED_RANGE {
+                let chunk_start = (range_start as i128 + (span * i as i128) / k) as i64;
+                let chunk_end = if i + 1 == REPAIR_CHUNKS_PER_MERGED_RANGE {
+                    range_end
+                } else {
+                    (range_start as i128 + (span * (i as i128 + 1)) / k) as i64
+                };
+                if chunk_start == chunk_end {
+                    // Token-space too narrow to split further at this k.
+                    continue;
+                }
+                for &peer in &peers {
+                    tasks.push((chunk_start, chunk_end, peer));
+                }
             }
         }
 
@@ -292,35 +322,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_table_merges_ranges_sharing_the_same_replica_set() {
+    async fn repair_table_merges_and_chunks_each_replica_set_range() {
         let ring = three_node_ring();
         let table = TableId::new("ks", "tbl");
         let exec = Arc::new(MockExecutor::new());
         let coord = RepairCoordinator {
             max_concurrent_sessions: 4,
         };
-        // RF=3 on a 3-node ring: every range is replicated by ALL three
-        // nodes, so every (range, peer) pair is doing identical work as
-        // every other. The coordinator must collapse them: schedule
-        // exactly ONE session per non-self peer (covering the union of
-        // all owned ranges), not one per vnode × per peer. This is what
-        // turns repair on a 256-vnode default cluster from 1 536 wire
-        // calls per node into 2.
+        // RF=3/3-node: every owned range has the same replica set, so
+        // the coordinator merges them into one super-range per
+        // replica-set group. To keep per-session memory bounded
+        // independent of table size, that super-range is then split
+        // into `REPAIR_CHUNKS_PER_MERGED_RANGE` equal-token chunks
+        // — each chunk yields one session per non-self peer. This is
+        // the structural fix for the memory blow-up where a single
+        // full-table session held ~1.4 GiB on the fmem cluster and
+        // tipped the container OOM limit.
         let results = coord.repair_table(exec.clone(), &ring, 1, 3, &table).await;
         let calls = exec.calls.lock().unwrap();
+        let expected = super::REPAIR_CHUNKS_PER_MERGED_RANGE * 2;
         assert_eq!(
             calls.len(),
-            2,
-            "RF=3/3-node merges all owned ranges into one session per non-self peer"
+            expected,
+            "RF=3/3-node: 1 merged range × {} chunks × 2 peers = {expected} sessions",
+            super::REPAIR_CHUNKS_PER_MERGED_RANGE
         );
-        assert_eq!(
-            results.len(),
-            calls.len(),
-            "every session must record exactly one mock call"
-        );
+        assert_eq!(results.len(), calls.len());
         assert!(results.iter().all(|r| r.result.is_ok()));
         let peers: std::collections::BTreeSet<u64> = calls.iter().map(|(_, _, _, p)| *p).collect();
         assert_eq!(peers, [2u64, 3].iter().copied().collect());
+
+        // Every chunk has the same peer counts and the chunks for a
+        // single peer cover [i64::MIN, i64::MAX) end-to-end with no
+        // gap and no overlap.
+        let mut chunks_for_peer_2: Vec<(i64, i64)> = calls
+            .iter()
+            .filter_map(|(_, s, e, p)| if *p == 2 { Some((*s, *e)) } else { None })
+            .collect();
+        chunks_for_peer_2.sort();
+        assert_eq!(chunks_for_peer_2.len(), super::REPAIR_CHUNKS_PER_MERGED_RANGE);
+        assert_eq!(chunks_for_peer_2.first().unwrap().0, i64::MIN);
+        assert_eq!(chunks_for_peer_2.last().unwrap().1, i64::MAX);
+        for win in chunks_for_peer_2.windows(2) {
+            assert_eq!(win[0].1, win[1].0, "chunks must be contiguous, no gap");
+        }
     }
 
     #[tokio::test]
