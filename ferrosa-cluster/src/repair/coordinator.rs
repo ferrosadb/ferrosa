@@ -78,14 +78,14 @@ pub struct RepairCoordinator {
 impl Default for RepairCoordinator {
     fn default() -> Self {
         Self {
-            // Conservative default: 1 session at a time. Each session
-            // currently does a per-call full-table prefix scan (until a
-            // token-bounded scan API lands on StorageEngine), so running
-            // many in parallel multiplies the working-set memory by the
-            // concurrency factor. On a 2 GB container this OOMs almost
-            // immediately. Raise this once the read path is bounded by
-            // token range, not by an in-memory limit-then-filter.
-            max_concurrent_sessions: 1,
+            // 4 matches Cassandra's per-node default. With the
+            // `read_token_range` primitive wiring (only materialises
+            // partitions in the requested token sub-range, not a full
+            // key-ordered prefix), the per-session working set is bounded
+            // by leaf cardinality — typically << 1 partition per leaf at
+            // TREE_DEPTH=15 — so 4 concurrent sessions fit comfortably in
+            // the 2 GB fmem container.
+            max_concurrent_sessions: 4,
         }
     }
 }

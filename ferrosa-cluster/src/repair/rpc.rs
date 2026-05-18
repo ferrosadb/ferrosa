@@ -158,27 +158,25 @@ impl RpcHandler for RepairFetchHandler {
             }
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
-        // See `StorageEngineRepairStore::read_range`: small per-session
-        // budget keeps the container under its memory limit while still
-        // covering realistic-table leaves. A token-bounded scan API on
-        // StorageEngine is the proper fix; this is the interim.
-        const REPAIR_LEAF_READ_LIMIT: usize = 200;
-        let partitions = match StorageEngine::read_range(
+        // Token-bounded read: repair asks "everything in this token
+        // sub-range," which the new `read_token_range` primitive answers
+        // directly. Limit matches the storage materialisation cap.
+        const REPAIR_LEAF_READ_LIMIT: usize = 10_000;
+        let in_range_partitions = match StorageEngine::read_token_range(
             &self.storage,
             &table_id,
-            None,
-            None,
+            req.range_start,
+            req.range_end,
             REPAIR_LEAF_READ_LIMIT,
         ) {
-                Ok(ps) => ps,
-                Err(e) => {
-                    tracing::warn!(%e, ?table_id, "RepairFetchHandler: read_range failed");
-                    return None;
-                }
-            };
-        let in_range: Vec<PartitionWire> = partitions
+            Ok(ps) => ps,
+            Err(e) => {
+                tracing::warn!(%e, ?table_id, "RepairFetchHandler: read_token_range failed");
+                return None;
+            }
+        };
+        let in_range: Vec<PartitionWire> = in_range_partitions
             .into_iter()
-            .filter(|p| p.key.token.0 >= req.range_start && p.key.token.0 < req.range_end)
             .map(partition_to_wire)
             .collect();
         let resp = RepairFetchResponsePayload {

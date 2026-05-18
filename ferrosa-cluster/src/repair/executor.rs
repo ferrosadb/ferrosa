@@ -73,25 +73,20 @@ impl RepairStore for StorageEngineRepairStore {
         let engine = self.engine.clone();
         let table = table.clone();
         let result: Result<Vec<Partition>, String> = tokio::task::spawn_blocking(move || {
-            // StorageEngine::read_range bounds by KEY (not token), so even
-            // a tight token sub-range filters from a full table-prefix scan.
-            // We then filter to the leaf token range in-memory. A small
-            // limit keeps the per-session working set tiny — most leaves
-            // are sparse (avg << 1 partition per leaf at TREE_DEPTH=15 for
-            // realistic tables) so we rarely read what we'd need anyway.
-            // The right fix is a token-bounded scan API on StorageEngine;
-            // this is the workaround until that lands.
-            //
-            // 200 keeps per-session memory at ~30 MB on a ~150 KB partition
-            // and won't OOM a 2 GB container even with 4 concurrent sessions.
-            const REPAIR_LEAF_READ_LIMIT: usize = 200;
-            let all =
-                StorageEngine::read_range(&engine, &table, None, None, REPAIR_LEAF_READ_LIMIT)
-                    .map_err(|e| format!("read_range: {e}"))?;
-            Ok(all
-                .into_iter()
-                .filter(|p| p.key.token.0 >= range_start && p.key.token.0 < range_end)
-                .collect())
+            // Use the token-bounded primitive so we don't read a key-
+            // ordered prefix of the whole table per session. Limit
+            // matches the storage materialisation cap; the typical
+            // Merkle leaf on a ~10 k-partition table is sparse so this
+            // budget is comfortably above what any single leaf needs.
+            const REPAIR_LEAF_READ_LIMIT: usize = 10_000;
+            StorageEngine::read_token_range(
+                &engine,
+                &table,
+                range_start,
+                range_end,
+                REPAIR_LEAF_READ_LIMIT,
+            )
+            .map_err(|e| format!("read_token_range: {e}"))
         })
         .await
         .map_err(|e| format!("read_range join: {e}"))?;
