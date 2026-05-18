@@ -96,13 +96,14 @@ impl Drop for ConnectionGuard {
 /// In-flight request limiting: a semaphore bounds the number of concurrent
 /// requests being processed. When the limit is reached, new requests receive
 /// ERROR(Overloaded) without consuming a permit.
-pub async fn handle_connection<S>(
+pub(crate) async fn handle_connection<S>(
     stream: S,
     peer: SocketAddr,
     max_frame_size: u32,
     max_in_flight: usize,
     auth_disabled: bool,
     state: Arc<SharedState>,
+    mut ip_slot: Option<crate::server::IpSlotGuard>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -435,6 +436,15 @@ pub async fn handle_connection<S>(
                             if let Some(ctx) = auth_context.as_ref() {
                                 state.connection_tracker.update_username(&peer, &ctx.role);
                             }
+                            // F3: drop the per-IP rate-limit slot the instant
+                            // the connection reaches Ready. The per-IP cap is a
+                            // defence against unauthenticated connection storms;
+                            // once a client has completed the handshake (and auth,
+                            // if enabled), it should not be counted toward that
+                            // cap — otherwise a burst from one IP holds slots
+                            // for the full IDLE_TIMEOUT even after all clients
+                            // succeed, rejecting legitimate follow-up traffic.
+                            ip_slot.take();
                         }
                         if was_ready {
                             state.connection_tracker.increment_requests(&peer);

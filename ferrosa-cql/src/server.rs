@@ -145,7 +145,16 @@ impl IpConnectionTracker {
 ///
 /// This ensures the slot is freed even if the handler task panics
 /// or is cancelled, preventing permanent connection slot leaks.
-struct IpSlotGuard {
+///
+/// The guard is handed off to `handle_connection`, which drops it
+/// as soon as the connection reaches the `Ready` phase — the per-IP
+/// limit only needs to defend against unauthenticated connection
+/// storms; once a client has completed the protocol handshake (and
+/// auth, if enabled), it is no longer counted toward the per-IP cap.
+/// If the handler never reaches `Ready` (e.g. the client disconnects
+/// before STARTUP, or fails MAX_AUTH_ATTEMPTS), the guard drops with
+/// the handler task and the slot is released anyway.
+pub(crate) struct IpSlotGuard {
     tracker: Arc<IpConnectionTracker>,
     ip: IpAddr,
 }
@@ -329,7 +338,9 @@ impl CqlServer {
 
                         // RAII guard: releases the IP slot on drop (including panics
                         // and task cancellation), preventing permanent slot leaks.
-                        let _ip_guard = IpSlotGuard {
+                        // Handed to the connection handler, which drops it the moment
+                        // the connection reaches Ready phase — see IpSlotGuard docs.
+                        let ip_guard = IpSlotGuard {
                             tracker: ip_tracker.clone(),
                             ip: peer_ip,
                         };
@@ -338,10 +349,6 @@ impl CqlServer {
                         let state = state.clone();
                         let tls_acceptor = tls_acceptor.clone();
                         tokio::spawn(async move {
-                            // Move the guard into the spawned task so its lifetime
-                            // is tied to the connection handler, not the accept loop.
-                            let _ip_guard = _ip_guard;
-
                             if let Some(acceptor) = tls_acceptor {
                                 // TLS handshake with 10s timeout
                                 match tokio::time::timeout(
@@ -358,10 +365,12 @@ impl CqlServer {
                                             max_in_flight,
                                             auth_disabled,
                                             state,
+                                            Some(ip_guard),
                                         )
                                         .await;
                                     }
                                     Ok(Err(e)) => {
+                                        // ip_guard drops here, releasing the slot.
                                         warn!("TLS handshake failed from {peer}: {e}");
                                     }
                                     Err(_) => {
@@ -376,10 +385,10 @@ impl CqlServer {
                                     max_in_flight,
                                     auth_disabled,
                                     state,
+                                    Some(ip_guard),
                                 )
                                 .await;
                             }
-                            // _ip_guard drops here, releasing the IP slot.
                             // active connection count is decremented explicitly.
                             active.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -542,6 +551,83 @@ mod tests {
         assert_eq!(header.opcode, Opcode::Error);
         let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
         assert_eq!(error_code, 0x1100);
+    }
+
+    /// Send a v4 STARTUP frame and read one response frame.
+    async fn startup_and_read_one_frame(stream: &mut TcpStream) -> FrameHeader {
+        use bytes::BufMut;
+        use tokio::io::AsyncWriteExt;
+        let mut body = bytes::BytesMut::new();
+        body.put_u16(1); // 1 entry in the string map
+        let key = b"CQL_VERSION";
+        body.put_u16(key.len() as u16);
+        body.put_slice(key);
+        let val = b"3.0.0";
+        body.put_u16(val.len() as u16);
+        body.put_slice(val);
+        let body_len = body.len() as u32;
+
+        let mut header = bytes::BytesMut::new();
+        header.put_u8(0x04); // version (request)
+        header.put_u8(0x00); // flags
+        header.put_i16(0); // stream id
+        header.put_u8(0x01); // STARTUP opcode
+        header.put_u32(body_len);
+        stream.write_all(&header).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+
+        let mut buf = vec![0u8; HEADER_SIZE];
+        let mut read_total = 0;
+        while read_total < HEADER_SIZE {
+            let n = stream.read(&mut buf[read_total..]).await.unwrap();
+            if n == 0 {
+                panic!("EOF before response header");
+            }
+            read_total += n;
+        }
+        let h = FrameHeader::decode(&buf).unwrap();
+        // drain body so caller can reuse stream cleanly
+        if h.length > 0 {
+            let mut body = vec![0u8; h.length as usize];
+            let _ = stream.read_exact(&mut body).await;
+        }
+        h
+    }
+
+    /// F3 regression test: per-IP rate-limit slot must be released the moment
+    /// the connection reaches Ready phase. Otherwise a burst from one IP
+    /// holds every slot for the full IDLE_TIMEOUT after the clients finish,
+    /// rejecting legitimate follow-up traffic for minutes.
+    #[tokio::test]
+    async fn per_ip_slot_released_on_ready_transition() {
+        let (state, _dir) = setup_state();
+        let mut config = test_config(10, 1); // per-IP cap = 1
+        config.auth_disabled = true; // STARTUP transitions directly to Ready
+        let server = CqlServer::new(config, state);
+        let addr = server.start_background().await.unwrap();
+
+        // Connection 1 — complete handshake, reach Ready.
+        let mut c1 = TcpStream::connect(addr).await.unwrap();
+        let h1 = startup_and_read_one_frame(&mut c1).await;
+        assert_eq!(h1.opcode, Opcode::Ready);
+
+        // Give the server a brief window to drop the slot guard.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Connection 2 from SAME IP — pre-F3, c1 still holds the per-IP slot
+        // and this would be rejected with Overloaded. Post-F3, c1's slot was
+        // released when it reached Ready, so c2 acquires it and succeeds.
+        let mut c2 = TcpStream::connect(addr).await.unwrap();
+        let h2 = startup_and_read_one_frame(&mut c2).await;
+        assert_eq!(
+            h2.opcode,
+            Opcode::Ready,
+            "second connection from same IP should be accepted: c1 must release its per-IP slot on Ready transition"
+        );
+
+        // Keep c1 alive so we know its IDLE_TIMEOUT didn't release the slot.
+        drop(c1);
+        drop(c2);
     }
 
     /// Regression test for the CQL connect-stall: if rejection writes happen
