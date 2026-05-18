@@ -6190,6 +6190,47 @@ mod tests {
         assert_eq!(results.len(), 7);
     }
 
+    /// Streaming contract: even with thousands of partitions in the table,
+    /// asking for a small token sub-range must return ONLY the in-range
+    /// matches. This is what makes anti-entropy repair viable on a multi-GB
+    /// table in a constrained container: working set scales with matches,
+    /// not table size.
+    #[test]
+    fn read_token_range_streaming_returns_only_in_range_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        let n_total: usize = 1_000;
+        let mut tokens: Vec<i64> = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            let k = format!("k{i:06}");
+            let dk = make_key(&k);
+            tokens.push(dk.token.0);
+            engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+        }
+        tokens.sort_unstable();
+
+        // 1 % slice of the token space.
+        let lo = tokens[(n_total * 49) / 100];
+        let hi = tokens[(n_total * 50) / 100];
+        let expected = tokens.iter().filter(|&&t| t >= lo && t < hi).count();
+        assert!(expected > 0);
+
+        let results = engine.read_token_range(&tid, lo, hi, 10_000).unwrap();
+        assert_eq!(
+            results.len(),
+            expected,
+            "streaming must return exactly the matches, not a prefix of the table"
+        );
+        for p in &results {
+            let t = p.key.token.0;
+            assert!(t >= lo && t < hi);
+        }
+    }
+
     #[test]
     fn read_token_range_honors_limit() {
         let dir = tempfile::tempdir().unwrap();
