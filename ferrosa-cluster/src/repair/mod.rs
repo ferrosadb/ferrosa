@@ -17,9 +17,11 @@
 //!   sessions for all locally-owned token ranges.
 
 pub mod coordinator;
+pub mod executor;
 pub mod merkle;
 
 pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
+pub use executor::{InMemoryRepairStore, LocalRepairExecutor, RepairStore};
 pub use merkle::MerkleTree;
 
 use ferrosa_sstable::types::Partition;
