@@ -74,28 +74,156 @@ pub trait WriteAt {
     }
 }
 
+/// Bounded LRU cache of open file descriptors shared by all `FileReadAt`
+/// instances that route through it. Same path => one cached `Arc<File>`,
+/// reused by every read until the entry is evicted by capacity pressure
+/// or by `FileReadAt::drop` (which removes its own path on the way out so
+/// a compacted SSTable's inode is not kept alive by a stale fd).
+///
+/// `pread` is offsetful (no shared seek state), so sharing one `File` via
+/// `Arc` across threads is safe — see `std::os::unix::fs::FileExt::read_at`.
+///
+/// Capacity is a tunable (`FERROSA_FD_CACHE_SIZE`, default 1024) chosen so a
+/// node with hundreds of active SSTables fits comfortably under typical
+/// `RLIMIT_NOFILE` values while still amortising opens across queries.
+pub struct FdCache {
+    inner: std::sync::Mutex<lru::LruCache<std::path::PathBuf, std::sync::Arc<std::fs::File>>>,
+    opens: std::sync::atomic::AtomicU64,
+}
+
+impl FdCache {
+    /// Build a cache with the given capacity. Pre-allocates the LRU index.
+    pub fn with_capacity(capacity: std::num::NonZeroUsize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(capacity)),
+            opens: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Number of entries currently held.
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("fd cache poisoned").len()
+    }
+
+    /// True when no entries are cached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether `path` is currently cached.
+    pub fn contains(&self, path: &std::path::Path) -> bool {
+        // `peek` does not promote the entry — important if a caller is just
+        // sampling the cache (tests, metrics) and doesn't want to perturb
+        // LRU order.
+        self.inner
+            .lock()
+            .expect("fd cache poisoned")
+            .peek(path)
+            .is_some()
+    }
+
+    /// Cumulative count of `File::open` calls made by this cache. A cheap
+    /// proxy for cache-miss rate: misses go up by one per open, hits do
+    /// not advance it.
+    pub fn opens_observed(&self) -> u64 {
+        self.opens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drop `path`'s cached fd, if any. Idempotent.
+    fn invalidate(&self, path: &std::path::Path) {
+        let _ = self.inner.lock().expect("fd cache poisoned").pop(path);
+    }
+
+    #[doc(hidden)]
+    pub fn invalidate_for_test(&self, path: &std::path::Path) {
+        self.invalidate(path);
+    }
+
+    /// Obtain a shared handle to `path`, opening + inserting on miss.
+    ///
+    /// On a hit the entry is promoted to most-recently-used. On a miss the
+    /// lock is dropped around the `open()` syscall so concurrent misses
+    /// do not serialise on the cache mutex; a re-check on reinsert keeps
+    /// the cache single-valued per path (a racing thread's `Arc<File>` is
+    /// dropped if it lost the race, closing its fd).
+    fn get_or_open(&self, path: &std::path::Path) -> Result<std::sync::Arc<std::fs::File>> {
+        {
+            let mut guard = self.inner.lock().expect("fd cache poisoned");
+            if let Some(f) = guard.get(path) {
+                return Ok(std::sync::Arc::clone(f));
+            }
+        }
+        let file = std::sync::Arc::new(std::fs::File::open(path)?);
+        self.opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut guard = self.inner.lock().expect("fd cache poisoned");
+        if let Some(f) = guard.get(path) {
+            return Ok(std::sync::Arc::clone(f));
+        }
+        guard.put(path.to_path_buf(), std::sync::Arc::clone(&file));
+        Ok(file)
+    }
+}
+
+const DEFAULT_FD_CACHE_CAPACITY: usize = 1024;
+
+fn global_fd_cache() -> &'static std::sync::Arc<FdCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let cap = std::env::var("FERROSA_FD_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(std::num::NonZeroUsize::new)
+            .unwrap_or_else(|| {
+                std::num::NonZeroUsize::new(DEFAULT_FD_CACHE_CAPACITY)
+                    .expect("DEFAULT_FD_CACHE_CAPACITY is non-zero")
+            });
+        std::sync::Arc::new(FdCache::with_capacity(cap))
+    })
+}
+
 /// File-system implementation of [`ReadAt`] using `pread` on Unix.
+///
+/// Backed by a per-process LRU [`FdCache`]: idle readers hold no fd, the
+/// first read opens + caches the descriptor, subsequent reads to the same
+/// path reuse the cached handle. Replaces the previous reopen-per-pread
+/// pattern (see `bug-streaming-range-read-perf-50x-floor.md`).
 pub struct FileReadAt {
     path: std::path::PathBuf,
+    cache: std::sync::Arc<FdCache>,
 }
 
 impl FileReadAt {
-    /// Open a file for positional reading.
+    /// Open a file for positional reading via the process-wide LRU fd cache.
+    /// Validates the path is readable; does not retain a descriptor.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_with_cache(path, std::sync::Arc::clone(global_fd_cache()))
+    }
+
+    /// Open against an explicit cache — used by tests so capacity and
+    /// eviction can be observed in isolation from the global cache.
+    pub fn open_with_cache(
+        path: impl AsRef<std::path::Path>,
+        cache: std::sync::Arc<FdCache>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        // Validate that the file exists and is readable, but don't retain the
-        // descriptor. SSTable readers live for as long as an SSTable is present
-        // in a table store; pinning Data.db/Partitions.db/Rows.db handles for
-        // every idle SSTable exhausts RLIMIT_NOFILE during startup/compaction
-        // backlogs and in parallel engine tests. Reads reopen briefly per call.
         std::fs::File::open(&path)?;
-        Ok(Self { path })
+        Ok(Self { path, cache })
+    }
+}
+
+impl Drop for FileReadAt {
+    fn drop(&mut self) {
+        // Evict on drop so a compacted/deleted SSTable's inode is released
+        // promptly. FileReadAt is single-owner (never cloned), so the path
+        // is unique to this reader at drop time.
+        self.cache.invalidate(&self.path);
     }
 }
 
 impl ReadAt for FileReadAt {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let file = std::fs::File::open(&self.path)?;
+        let file = self.cache.get_or_open(&self.path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -103,9 +231,10 @@ impl ReadAt for FileReadAt {
         }
         #[cfg(not(unix))]
         {
-            // Fallback: seek + read (not thread-safe, but functional)
+            // pread is unix-only; on non-unix fall back to a per-call clone
+            // + seek so concurrent reads do not corrupt a shared offset.
             use std::io::{Read, Seek, SeekFrom};
-            let mut file = file;
+            let mut file = file.try_clone()?;
             file.seek(SeekFrom::Start(offset))?;
             Ok(file.read(buf)?)
         }
@@ -297,36 +426,213 @@ mod tests {
         assert_eq!(&buf, b"world");
     }
 
+    // ---- LRU fd-cache contracts ----
+    //
+    // The previous contract ("idle FileReadAt holds no fd AND each read closes
+    // its transient descriptor immediately") was reopen-per-pread. Profiling
+    // (`specs/in-process/bug-streaming-range-read-perf-50x-floor.md`) showed
+    // this dominated streaming range-read cost — ~10 reopen syscalls per
+    // partition body decode. The new contract:
+    //
+    //   1. Constructing a `FileReadAt` does not open an fd (idle = no fd).
+    //   2. First `read_at` opens the fd and inserts it into a tunable LRU
+    //      cache keyed by path. Subsequent reads to the same path reuse it.
+    //   3. When capacity is exceeded the LRU entry is evicted; its fd closes
+    //      when the last `Arc<File>` drops.
+    //   4. Dropping a `FileReadAt` evicts its entry — so when compaction
+    //      removes an SSTable on disk, the cache does not pin its inode.
+
+    use super::{FdCache, FileReadAt, ReadAt, WriteAt};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    #[test]
+    fn open_does_not_populate_cache() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(8).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idle.db");
+        std::fs::write(&path, b"abcd").unwrap();
+
+        let _reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+
+        assert_eq!(
+            cache.len(),
+            0,
+            "constructing FileReadAt must not insert into the fd cache"
+        );
+    }
+
+    #[test]
+    fn first_read_populates_cache_and_subsequent_reads_reuse_it() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(8).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reuse.db");
+        std::fs::write(&path, b"abcdefghij").unwrap();
+
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        let opens_before = cache.opens_observed();
+
+        for offset in 0..8 {
+            let mut buf = [0u8; 2];
+            reader.read_exact_at(&mut buf, offset).unwrap();
+        }
+
+        let opens_after = cache.opens_observed();
+        assert_eq!(cache.len(), 1, "single path => single cache entry");
+        assert!(cache.contains(&path));
+        assert_eq!(
+            opens_after - opens_before,
+            1,
+            "the underlying file must be opened exactly once across N reads"
+        );
+    }
+
+    #[test]
+    fn many_readers_same_path_share_one_fd() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(8).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        std::fs::write(&path, b"ferrosa shared component").unwrap();
+        let readers: Vec<_> = (0..32)
+            .map(|_| FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap())
+            .collect();
+        let opens_before = cache.opens_observed();
+
+        for r in &readers {
+            let mut buf = [0u8; 7];
+            r.read_exact_at(&mut buf, 0).unwrap();
+            assert_eq!(&buf, b"ferrosa");
+        }
+
+        assert_eq!(cache.len(), 1, "all 32 readers must collapse to one entry");
+        assert_eq!(
+            cache.opens_observed() - opens_before,
+            1,
+            "underlying open() must be called exactly once across all readers"
+        );
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used_when_capacity_exceeded() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(3).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut entries = Vec::new();
+        for i in 0..4 {
+            let p = dir.path().join(format!("file-{i}.db"));
+            std::fs::write(&p, b"data").unwrap();
+            let r = FileReadAt::open_with_cache(&p, Arc::clone(&cache)).unwrap();
+            let mut buf = [0u8; 2];
+            r.read_exact_at(&mut buf, 0).unwrap();
+            entries.push((p, r));
+        }
+
+        assert_eq!(cache.len(), 3, "cache must not exceed capacity");
+        assert!(
+            !cache.contains(&entries[0].0),
+            "oldest entry must be evicted: {:?}",
+            entries[0].0
+        );
+        for (p, _) in &entries[1..] {
+            assert!(cache.contains(p), "recent entry missing: {p:?}");
+        }
+    }
+
+    #[test]
+    fn dropping_filereadat_evicts_cache_entry() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(8).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drop.db");
+        std::fs::write(&path, b"xyz").unwrap();
+
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        let mut buf = [0u8; 2];
+        reader.read_exact_at(&mut buf, 0).unwrap();
+        assert!(cache.contains(&path));
+
+        drop(reader);
+
+        assert!(
+            !cache.contains(&path),
+            "Drop must evict the entry so a deleted SSTable's inode does not stay pinned"
+        );
+    }
+
+    #[test]
+    fn read_returns_error_when_underlying_file_is_unreadable() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(4).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.db");
+        // Validation at open time still requires the file to exist; first read
+        // populates the cache from the same path.
+        std::fs::write(&path, b"present").unwrap();
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+
+        // Remove the file *and* drop the FileReadAt's cache entry, so the next
+        // read has to reopen. The reopen must fail loudly.
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate_for_test(&path);
+
+        let mut buf = [0u8; 4];
+        let err = reader.read_exact_at(&mut buf, 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("No such file") || msg.contains("missing.db") || msg.contains("ENOENT"),
+            "expected open-error surfaced from read_at, got: {msg}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn many_file_readers_do_not_pin_idle_file_descriptors() {
+    fn idle_filereadat_holds_no_process_fd() {
         fn open_fd_count() -> usize {
             std::fs::read_dir("/proc/self/fd").unwrap().count()
         }
 
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(64).unwrap()));
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sstable-component.db");
-        std::fs::write(&path, b"ferrosa component bytes").unwrap();
+        let path = dir.path().join("idle-proc-fd.db");
+        std::fs::write(&path, b"ferrosa idle bytes").unwrap();
 
         let baseline = open_fd_count();
-        let readers: Vec<_> = (0..256).map(|_| FileReadAt::open(&path).unwrap()).collect();
+        let readers: Vec<_> = (0..256)
+            .map(|_| FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap())
+            .collect();
         let after_open = open_fd_count();
 
         assert!(
             after_open <= baseline + 8,
-            "idle FileReadAt instances must not pin one fd each: baseline={baseline}, after_open={after_open}"
+            "constructing FileReadAt must not pin fds: baseline={baseline}, after_open={after_open}"
         );
+        drop(readers);
+    }
 
-        for reader in &readers {
-            let mut buf = [0u8; 7];
-            reader.read_exact_at(&mut buf, 0).unwrap();
-            assert_eq!(&buf, b"ferrosa");
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_same_path_readers_pin_at_most_one_fd() {
+        fn open_fd_count() -> usize {
+            std::fs::read_dir("/proc/self/fd").unwrap().count()
         }
 
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(64).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active-proc-fd.db");
+        std::fs::write(&path, b"ferrosa active bytes").unwrap();
+
+        let baseline = open_fd_count();
+        let readers: Vec<_> = (0..256)
+            .map(|_| FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap())
+            .collect();
+        for r in &readers {
+            let mut buf = [0u8; 7];
+            r.read_exact_at(&mut buf, 0).unwrap();
+            assert_eq!(&buf, b"ferrosa");
+        }
         let after_reads = open_fd_count();
+
         assert!(
             after_reads <= baseline + 8,
-            "read_at must close transient descriptors promptly: baseline={baseline}, after_reads={after_reads}"
+            "same-path readers must share one cache entry, not 256 fds: baseline={baseline}, after_reads={after_reads}"
         );
     }
 }

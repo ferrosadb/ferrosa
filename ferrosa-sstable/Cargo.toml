@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 crc32fast = "1"
 ferrosa-common = { path = "../ferrosa-common" }
+lru = "0.12"
 lz4_flex = "0.11"
 zstd = "0.13"
 
