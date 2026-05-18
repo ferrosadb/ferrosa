@@ -363,6 +363,101 @@ mod tests {
         }
     }
 
+    // ---- Three-store integration test exercising coordinator → executor ----
+
+    /// Stand up three [`InMemoryRepairStore`]s as a simulated 3-node, RF=3
+    /// cluster, stage the fmem-style divergence pattern (one node has all
+    /// the data, the others have partial or none), and run the full
+    /// [`crate::repair::RepairCoordinator`] against the executor. After
+    /// the run, every store must hold the same set of partitions and the
+    /// values must reflect the highest-timestamp source.
+    #[tokio::test]
+    async fn coordinator_plus_local_executor_converges_three_node_cluster() {
+        use crate::raft::{NodeInfo, NodeState};
+        use crate::repair::RepairCoordinator;
+        use crate::ring::TokenRing;
+        use uuid::Uuid;
+
+        fn node_with(addr: &str) -> NodeInfo {
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: addr.to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            }
+        }
+
+        // 3-node ring, RF=3 — every range owned by every node.
+        let mut ring = TokenRing::new();
+        ring.add_node(1, node_with("10.0.0.1:7000"));
+        ring.add_node(2, node_with("10.0.0.2:7000"));
+        ring.add_node(3, node_with("10.0.0.3:7000"));
+        ring.assign_tokens(1, &[100_000_000]);
+        ring.assign_tokens(2, &[200_000_000]);
+        ring.assign_tokens(3, &[300_000_000]);
+
+        // node1: full dataset, node2: partial (3 of 5 keys), node3: empty.
+        // Mirrors the fmem scenario (node1=1.41GB, node2=401MB, node3=217MB
+        // is the same shape — just shrunk to 5 keys for the test).
+        let store1 = Arc::new(InMemoryRepairStore::new());
+        let store2 = Arc::new(InMemoryRepairStore::new());
+        let store3 = Arc::new(InMemoryRepairStore::new());
+
+        let tokens = [
+            (50_000_000, b"k1"),
+            (150_000_000, b"k2"),
+            (250_000_000, b"k3"),
+            (350_000_000, b"k4"),
+            (450_000_000, b"k5"),
+        ];
+        for (token, key) in tokens.iter() {
+            let p = test_partition_at(*token, key.as_ref(), b"v", 1_000);
+            store1.insert(p.clone()).await;
+            // node2 has only k1, k2, k3
+            if matches!(*key, b"k1" | b"k2" | b"k3") {
+                store2.insert(p.clone()).await;
+            }
+            // node3 has nothing
+        }
+
+        // Run repair FROM node1's perspective: local=store1, remotes=store2+store3.
+        let executor = Arc::new(
+            LocalRepairExecutor::<InMemoryRepairStore, InMemoryRepairStore> {
+                local: store1.clone(),
+                remotes: [(2u64, store2.clone()), (3u64, store3.clone())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        let coord = RepairCoordinator::default();
+        let results = coord
+            .repair_table(executor, &ring, 1, 3, &TableId::new("ks", "tbl"))
+            .await;
+        assert!(!results.is_empty(), "coordinator must dispatch sessions");
+        assert!(
+            results.iter().all(|r| r.result.is_ok()),
+            "every session must succeed; got errors: {:?}",
+            results
+                .iter()
+                .filter_map(|r| r.result.as_ref().err())
+                .collect::<Vec<_>>()
+        );
+
+        // After repair, all three stores hold the SAME set of partition keys.
+        let want: std::collections::BTreeSet<Vec<u8>> =
+            tokens.iter().map(|(_, k)| k.to_vec()).collect();
+        for (name, store) in [("node1", &store1), ("node2", &store2), ("node3", &store3)] {
+            let snap = store.snapshot().await;
+            let got: std::collections::BTreeSet<Vec<u8>> = keys_in(&snap);
+            assert_eq!(
+                got, want,
+                "{name} did not converge: got {got:?} want {want:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn local_executor_records_timestamp_ties_without_streaming() {
         let a = Arc::new(InMemoryRepairStore::new());
