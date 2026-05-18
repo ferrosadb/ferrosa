@@ -89,6 +89,7 @@ pub trait WriteAt {
 pub struct FdCache {
     inner: std::sync::Mutex<lru::LruCache<std::path::PathBuf, std::sync::Arc<std::fs::File>>>,
     opens: std::sync::atomic::AtomicU64,
+    gets: std::sync::atomic::AtomicU64,
 }
 
 impl FdCache {
@@ -97,6 +98,7 @@ impl FdCache {
         Self {
             inner: std::sync::Mutex::new(lru::LruCache::new(capacity)),
             opens: std::sync::atomic::AtomicU64::new(0),
+            gets: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -129,6 +131,14 @@ impl FdCache {
         self.opens.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Cumulative count of `get_or_open` calls — i.e. cache lookups that
+    /// took the global mutex. A `FileReadAt`'s per-reader fast path bypasses
+    /// the cache after its first successful read, so a healthy production
+    /// pattern is `gets_observed << pread count`.
+    pub fn gets_observed(&self) -> u64 {
+        self.gets.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Drop `path`'s cached fd, if any. Idempotent.
     fn invalidate(&self, path: &std::path::Path) {
         let _ = self.inner.lock().expect("fd cache poisoned").pop(path);
@@ -147,6 +157,7 @@ impl FdCache {
     /// the cache single-valued per path (a racing thread's `Arc<File>` is
     /// dropped if it lost the race, closing its fd).
     fn get_or_open(&self, path: &std::path::Path) -> Result<std::sync::Arc<std::fs::File>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut guard = self.inner.lock().expect("fd cache poisoned");
             if let Some(f) = guard.get(path) {
@@ -191,6 +202,12 @@ fn global_fd_cache() -> &'static std::sync::Arc<FdCache> {
 pub struct FileReadAt {
     path: std::path::PathBuf,
     cache: std::sync::Arc<FdCache>,
+    /// Per-reader cached handle. Populated on first successful `read_at`;
+    /// subsequent reads use it directly and skip the global cache (no mutex,
+    /// no `PathBuf` hash — both showed up as the dominant cost after the
+    /// LRU cache landed). Holds an `Arc<File>` so the handle outlives any
+    /// LRU eviction of the same path from the global cache.
+    handle: std::sync::OnceLock<std::sync::Arc<std::fs::File>>,
 }
 
 impl FileReadAt {
@@ -208,7 +225,17 @@ impl FileReadAt {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         std::fs::File::open(&path)?;
-        Ok(Self { path, cache })
+        Ok(Self {
+            path,
+            cache,
+            handle: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Whether this reader has already cached its file handle locally
+    /// (true after the first successful `read_at`).
+    pub fn is_handle_cached(&self) -> bool {
+        self.handle.get().is_some()
     }
 }
 
@@ -223,7 +250,20 @@ impl Drop for FileReadAt {
 
 impl ReadAt for FileReadAt {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let file = self.cache.get_or_open(&self.path)?;
+        // Fast path: local handle is set, skip the global cache entirely.
+        // Slow path (first read, or local handle missing): consult the
+        // global LRU; populate the local handle so subsequent reads stay fast.
+        let file: &std::fs::File = if let Some(f) = self.handle.get() {
+            f
+        } else {
+            let from_cache = self.cache.get_or_open(&self.path)?;
+            // `set` may race with another thread on the same FileReadAt
+            // (rare: FileReadAt is single-owner in practice). Either Arc
+            // points at a valid open file for the same path; the losing
+            // Arc drops, releasing its surplus reference.
+            let _ = self.handle.set(from_cache);
+            self.handle.get().expect("OnceLock just initialized")
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -536,6 +576,122 @@ mod tests {
         for (p, _) in &entries[1..] {
             assert!(cache.contains(p), "recent entry missing: {p:?}");
         }
+    }
+
+    // ---- Per-reader local handle fast-path contracts ----
+    //
+    // Profiling the LRU fd cache showed `Path::hash` at 5.59% CPU and
+    // `LruCache::get` at 0.59% per read — every read takes the cache
+    // mutex and hashes the full PathBuf. After the first read, a
+    // `FileReadAt` should fast-path subsequent reads through a local
+    // `Arc<File>` and skip the global cache entirely.
+
+    #[test]
+    fn second_read_does_not_touch_global_cache() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(8).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fast.db");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+
+        let mut buf = [0u8; 4];
+        reader.read_exact_at(&mut buf, 0).unwrap();
+        let gets_after_first = cache.gets_observed();
+        for offset in 0..4 {
+            reader.read_exact_at(&mut buf, offset).unwrap();
+        }
+        let gets_after_many = cache.gets_observed();
+
+        assert_eq!(
+            gets_after_many - gets_after_first,
+            0,
+            "subsequent reads must hit the per-reader local handle, never the global cache"
+        );
+    }
+
+    #[test]
+    fn handle_is_cached_locally_after_first_read() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(8).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.db");
+        std::fs::write(&path, b"abcd").unwrap();
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+
+        assert!(!reader.is_handle_cached(), "no local fd before first read");
+        let mut buf = [0u8; 2];
+        reader.read_exact_at(&mut buf, 0).unwrap();
+        assert!(
+            reader.is_handle_cached(),
+            "first read must populate the local handle"
+        );
+    }
+
+    #[test]
+    fn local_handle_survives_global_cache_eviction() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(2).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+
+        let pinned_path = dir.path().join("pinned.db");
+        std::fs::write(&pinned_path, b"persist").unwrap();
+        let pinned = FileReadAt::open_with_cache(&pinned_path, Arc::clone(&cache)).unwrap();
+        let mut buf = [0u8; 7];
+        pinned.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"persist");
+
+        // Push other paths through the cache until `pinned_path` is evicted.
+        // Hold the readers in a Vec so their Drop does not invalidate their
+        // own entries — we want capacity pressure to do the eviction work.
+        let mut victims = Vec::new();
+        for i in 0..5 {
+            let p = dir.path().join(format!("victim-{i}.db"));
+            std::fs::write(&p, b"victim!").unwrap();
+            let r = FileReadAt::open_with_cache(&p, Arc::clone(&cache)).unwrap();
+            let mut b = [0u8; 7];
+            r.read_exact_at(&mut b, 0).unwrap();
+            victims.push(r);
+        }
+        assert!(
+            !cache.contains(&pinned_path),
+            "pinned path should have been evicted by LRU pressure"
+        );
+
+        // The pinned reader must still read fine via its locally cached handle.
+        let gets_before = cache.gets_observed();
+        let opens_before = cache.opens_observed();
+        let mut buf = [0u8; 7];
+        pinned.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"persist");
+        assert_eq!(
+            cache.gets_observed() - gets_before,
+            0,
+            "fast-path read must not touch global cache after eviction"
+        );
+        assert_eq!(
+            cache.opens_observed() - opens_before,
+            0,
+            "fast-path read must not reopen the file"
+        );
+    }
+
+    #[test]
+    fn cross_reader_first_reads_still_share_via_global_cache() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(8).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared-cross.db");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let reader1 = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        let reader2 = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        let opens_before = cache.opens_observed();
+
+        let mut buf = [0u8; 3];
+        reader1.read_exact_at(&mut buf, 0).unwrap();
+        reader2.read_exact_at(&mut buf, 0).unwrap();
+
+        assert_eq!(
+            cache.opens_observed() - opens_before,
+            1,
+            "second reader's first read must hit the global cache and share the fd"
+        );
     }
 
     #[test]
