@@ -103,6 +103,21 @@ enum Commands {
     /// Rebalance token distribution across the cluster.
     Rebalance,
 
+    /// Run anti-entropy repair on a table — reconciles divergent replica
+    /// content by exchanging Merkle trees with each peer and streaming
+    /// the diverging partitions in the newer direction.
+    Repair {
+        /// Keyspace name (e.g. `agent_memory`).
+        #[arg(long)]
+        keyspace: String,
+        /// Table name (e.g. `entity_store`).
+        #[arg(long)]
+        table: String,
+        /// Replication factor. Defaults to 3.
+        #[arg(long, default_value = "3")]
+        rf: usize,
+    },
+
     /// Manage node snapshots (create, list, delete).
     Snapshot {
         #[command(subcommand)]
@@ -354,6 +369,11 @@ async fn main() {
         }
         Commands::Ring => commands::ring(&web_host, web_port).await,
         Commands::Rebalance => commands::rebalance(&web_host, web_port).await,
+        Commands::Repair {
+            keyspace,
+            table,
+            rf,
+        } => commands::repair(&web_host, web_port, &keyspace, &table, rf).await,
         Commands::Snapshot { action } => match action {
             SnapshotAction::Create { name, ttl_hours } => {
                 commands::snapshot_create(&web_host, web_port, &name, ttl_hours).await
@@ -629,6 +649,50 @@ mod tests {
     fn subcommand_rebalance_parses() {
         let cli = Cli::try_parse_from(["ferrosa-ctl", "rebalance"]).unwrap();
         assert!(matches!(cli.command, Commands::Rebalance));
+    }
+
+    #[test]
+    fn subcommand_repair_parses() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "repair",
+            "--keyspace",
+            "agent_memory",
+            "--table",
+            "entity_store",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Repair {
+                keyspace,
+                table,
+                rf,
+            } => {
+                assert_eq!(keyspace, "agent_memory");
+                assert_eq!(table, "entity_store");
+                assert_eq!(rf, 3, "rf must default to 3");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subcommand_repair_explicit_rf() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "repair",
+            "--keyspace",
+            "ks",
+            "--table",
+            "t",
+            "--rf",
+            "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Repair { rf, .. } => assert_eq!(rf, 5),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     // ── Snapshot / Restore argument-parsing tests ─────────────────────────────

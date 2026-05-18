@@ -82,6 +82,154 @@ pub fn cluster_routes() -> Router<WebAppState> {
         .route("/decommission", post(decommission_handler))
         .route("/ring", get(ring_handler))
         .route("/rebalance", post(rebalance_handler))
+        .route("/repair", post(repair_handler))
+}
+
+#[derive(serde::Deserialize)]
+struct RepairParams {
+    keyspace: Option<String>,
+    table: Option<String>,
+    /// Replication factor for the repair fan-out. Defaults to 3 (the
+    /// fmem-cluster RF and the most common Cassandra configuration).
+    rf: Option<usize>,
+}
+
+/// `POST /api/cluster/repair?keyspace=X&table=Y[&rf=N]` — run anti-entropy
+/// repair against every peer that replicates the given table. Requires the
+/// node to be in cluster mode with a token ring and a live `PeerManager`.
+///
+/// The handler builds a `LocalRepairExecutor` whose `local` side is the
+/// in-process [`StorageEngineRepairStore`] and whose `remotes` are
+/// per-peer `RemoteRepairStore`s, then runs [`RepairCoordinator::repair_table`].
+/// Returns a JSON summary: total sessions, successful, failed, total
+/// partitions streamed in/out, total timestamp ties.
+async fn repair_handler(
+    State(state): State<crate::web::WebAppState>,
+    axum::extract::Query(params): axum::extract::Query<RepairParams>,
+) -> (StatusCode, Json<Value>) {
+    use std::sync::Arc;
+
+    let keyspace = match params.keyspace {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "keyspace query parameter required" })),
+            );
+        }
+    };
+    let table = match params.table {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "table query parameter required" })),
+            );
+        }
+    };
+    let rf = params.rf.unwrap_or(3);
+
+    let mc = &state.mode_controller;
+    let ring = match mc.token_ring() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "not in cluster mode (no token ring)" })),
+            );
+        }
+    };
+    let peer_manager = match mc.peer_manager_arc() {
+        Some(pm) => pm,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "peer manager not initialised" })),
+            );
+        }
+    };
+
+    // Resolve our own node_id by looking up our host_id in the ring.
+    let host_id = mc.host_id();
+    let local_node_id = match ring.node_ids().iter().find_map(|&id| {
+        ring.get_node(id)
+            .filter(|info| info.host_id == host_id)
+            .map(|_| id)
+    }) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "local node not in the token ring yet" })),
+            );
+        }
+    };
+
+    // Build the executor: local = in-process storage, remotes = per-peer
+    // RemoteRepairStore (one entry per other node in the ring).
+    let local: Arc<dyn ferrosa_cluster::RepairStore> = Arc::new(
+        ferrosa_cluster::StorageEngineRepairStore::new(state.storage.clone()),
+    );
+    let mut remotes: std::collections::HashMap<u64, Arc<dyn ferrosa_cluster::RepairStore>> =
+        std::collections::HashMap::new();
+    for node_id in ring.node_ids() {
+        if node_id == local_node_id {
+            continue;
+        }
+        let Some(node_info) = ring.get_node(node_id) else {
+            continue;
+        };
+        let remote: Arc<dyn ferrosa_cluster::RepairStore> =
+            Arc::new(ferrosa_cluster::RemoteRepairStore {
+                host_id: node_info.host_id,
+                peer_manager: peer_manager.clone(),
+            });
+        remotes.insert(node_id, remote);
+    }
+
+    let executor: Arc<dyn ferrosa_cluster::SessionExecutor> =
+        Arc::new(ferrosa_cluster::LocalRepairExecutor { local, remotes });
+    let table_id = ferrosa_storage::TableId::new(&keyspace, &table);
+    let coord = ferrosa_cluster::RepairCoordinator::default();
+    let results = coord
+        .repair_table(executor, &ring, local_node_id, rf, &table_id)
+        .await;
+
+    let total = results.len();
+    let mut ok = 0usize;
+    let mut streamed_in = 0u64;
+    let mut streamed_out = 0u64;
+    let mut ties = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for r in &results {
+        match &r.result {
+            Ok(stats) => {
+                ok += 1;
+                streamed_in += stats.partitions_streamed_in;
+                streamed_out += stats.partitions_streamed_out;
+                ties += stats.timestamp_ties;
+            }
+            Err(e) => errors.push(format!(
+                "peer {} range [{}, {}): {}",
+                r.peer, r.range_start, r.range_end, e
+            )),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "keyspace": keyspace,
+            "table": table,
+            "rf": rf,
+            "sessions_total": total,
+            "sessions_ok": ok,
+            "sessions_failed": total - ok,
+            "partitions_streamed_in": streamed_in,
+            "partitions_streamed_out": streamed_out,
+            "timestamp_ties": ties,
+            "errors": errors,
+        })),
+    )
 }
 
 /// Sprint 2 W2.3: routes mounted at `/admin/*`. Currently exposes a single

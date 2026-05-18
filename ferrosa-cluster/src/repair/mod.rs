@@ -22,7 +22,9 @@ pub mod merkle;
 pub mod rpc;
 
 pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
-pub use executor::{InMemoryRepairStore, LocalRepairExecutor, RepairStore};
+pub use executor::{
+    InMemoryRepairStore, LocalRepairExecutor, RepairStore, StorageEngineRepairStore,
+};
 pub use merkle::MerkleTree;
 pub use rpc::{RemoteRepairStore, RepairApplyHandler, RepairFetchHandler, RepairMerkleHandler};
 

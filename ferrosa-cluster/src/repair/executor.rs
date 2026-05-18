@@ -44,8 +44,24 @@ pub trait RepairStore: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// `RepairStore` over a local [`StorageEngine`]. Used by the production
+/// `LocalRepairExecutor` as the `local` side and (theoretically) by
+/// a single-node repair simulation. Wraps the engine in a newtype so
+/// `Arc<StorageEngineRepairStore>` cleanly unsizes to `Arc<dyn RepairStore>`
+/// (the trait impl would otherwise need to be on `Arc<StorageEngine>`,
+/// which then can't be wrapped in another `Arc<dyn ...>`).
+pub struct StorageEngineRepairStore {
+    engine: Arc<StorageEngine>,
+}
+
+impl StorageEngineRepairStore {
+    pub fn new(engine: Arc<StorageEngine>) -> Self {
+        Self { engine }
+    }
+}
+
 #[async_trait]
-impl RepairStore for Arc<StorageEngine> {
+impl RepairStore for StorageEngineRepairStore {
     async fn read_range(
         &self,
         table: &TableId,
@@ -54,7 +70,7 @@ impl RepairStore for Arc<StorageEngine> {
     ) -> Result<Vec<Partition>, String> {
         // StorageEngine::read_range is sync + does file I/O; offload so we
         // don't block the async worker on a potentially-large scan.
-        let engine = self.clone();
+        let engine = self.engine.clone();
         let table = table.clone();
         let result: Result<Vec<Partition>, String> = tokio::task::spawn_blocking(move || {
             let all = StorageEngine::read_range(&engine, &table, None, None, usize::MAX)
@@ -74,7 +90,7 @@ impl RepairStore for Arc<StorageEngine> {
         table: &TableId,
         partitions: &[Partition],
     ) -> Result<(), String> {
-        let engine = self.clone();
+        let engine = self.engine.clone();
         let table = table.clone();
         let parts = partitions.to_vec();
         tokio::task::spawn_blocking(move || {
@@ -98,21 +114,24 @@ impl RepairStore for Arc<StorageEngine> {
     }
 }
 
-/// In-process executor: runs anti-entropy between two stores that both live
-/// locally. Used by tests + by single-node simulations. The production wire
-/// executor (RPC-backed) has the same shape but `remote` is reached via the
-/// internode protocol.
-pub struct LocalRepairExecutor<L: RepairStore + 'static, R: RepairStore + 'static> {
-    pub local: Arc<L>,
-    /// `peer_id -> remote store` map. The coordinator dispatches sessions
-    /// against `peer_id`; this map looks up the in-process store to use.
-    pub remotes: std::collections::HashMap<u64, Arc<R>>,
+/// Executor that drives anti-entropy between a local `RepairStore` and one
+/// or more remote `RepairStore`s. The "remote" side is type-erased via a
+/// trait object so production can plug in [`super::rpc::RemoteRepairStore`]
+/// (RPC) and tests can plug in [`InMemoryRepairStore`] without recompiling.
+///
+/// `local` and `remotes` use the same trait — the local side is just
+/// "remote 0". In practice the local store is an `Arc<StorageEngine>`
+/// (the same engine the coordinator runs on) and each remote is an
+/// `Arc<RemoteRepairStore>` pointed at one peer.
+pub struct LocalRepairExecutor {
+    pub local: Arc<dyn RepairStore>,
+    /// `peer_id -> remote store`. The coordinator dispatches sessions
+    /// against `peer_id`; this map looks up the store to use.
+    pub remotes: std::collections::HashMap<u64, Arc<dyn RepairStore>>,
 }
 
 #[async_trait]
-impl<L: RepairStore + 'static, R: RepairStore + 'static> SessionExecutor
-    for LocalRepairExecutor<L, R>
-{
+impl SessionExecutor for LocalRepairExecutor {
     async fn run_session(
         &self,
         table: &TableId,
@@ -296,9 +315,11 @@ mod tests {
         b.insert(test_partition_at(400_000_000, b"k4", b"b4", 100))
             .await;
 
-        let executor = LocalRepairExecutor::<InMemoryRepairStore, InMemoryRepairStore> {
-            local: a.clone(),
-            remotes: [(7u64, b.clone())].into_iter().collect(),
+        let executor = LocalRepairExecutor {
+            local: a.clone() as Arc<dyn RepairStore>,
+            remotes: [(7u64, b.clone() as Arc<dyn RepairStore>)]
+                .into_iter()
+                .collect(),
         };
 
         let table = TableId::new("ks", "tbl");
@@ -342,9 +363,11 @@ mod tests {
             b.insert(p).await;
         }
 
-        let executor = LocalRepairExecutor::<InMemoryRepairStore, InMemoryRepairStore> {
-            local: a.clone(),
-            remotes: [(7u64, b.clone())].into_iter().collect(),
+        let executor = LocalRepairExecutor {
+            local: a.clone() as Arc<dyn RepairStore>,
+            remotes: [(7u64, b.clone() as Arc<dyn RepairStore>)]
+                .into_iter()
+                .collect(),
         };
 
         let table = TableId::new("ks", "tbl");
@@ -423,14 +446,15 @@ mod tests {
         }
 
         // Run repair FROM node1's perspective: local=store1, remotes=store2+store3.
-        let executor = Arc::new(
-            LocalRepairExecutor::<InMemoryRepairStore, InMemoryRepairStore> {
-                local: store1.clone(),
-                remotes: [(2u64, store2.clone()), (3u64, store3.clone())]
-                    .into_iter()
-                    .collect(),
-            },
-        );
+        let executor = Arc::new(LocalRepairExecutor {
+            local: store1.clone() as Arc<dyn RepairStore>,
+            remotes: [
+                (2u64, store2.clone() as Arc<dyn RepairStore>),
+                (3u64, store3.clone() as Arc<dyn RepairStore>),
+            ]
+            .into_iter()
+            .collect(),
+        });
         let coord = RepairCoordinator::default();
         let results = coord
             .repair_table(executor, &ring, 1, 3, &TableId::new("ks", "tbl"))
@@ -467,9 +491,11 @@ mod tests {
         b.insert(test_partition_at(100_000_000, b"k", b"b-value", 500))
             .await;
 
-        let executor = LocalRepairExecutor::<InMemoryRepairStore, InMemoryRepairStore> {
-            local: a.clone(),
-            remotes: [(7u64, b.clone())].into_iter().collect(),
+        let executor = LocalRepairExecutor {
+            local: a.clone() as Arc<dyn RepairStore>,
+            remotes: [(7u64, b.clone() as Arc<dyn RepairStore>)]
+                .into_iter()
+                .collect(),
         };
 
         let stats = executor
