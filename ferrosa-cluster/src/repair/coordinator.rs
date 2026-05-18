@@ -102,20 +102,44 @@ impl RepairCoordinator {
         rf: usize,
         table: &TableId,
     ) -> Vec<SessionResult> {
-        // Build the work list synchronously. For each (range, peer) we
-        // need: range bounds, peer id. Skip ranges this node doesn't
-        // replicate, and skip self when looking up peers.
+        // Build the work list synchronously. We collapse adjacent
+        // owned vnode ranges that share the same replica set into a
+        // single session — every (range, peer) pair within such a
+        // group does identical work, so issuing N×peers wire calls
+        // when 1×peers would suffice is just amplifying load on the
+        // peer (and the local CQL listener, which has crashed in the
+        // past from a 1 536-session storm on RF=3 / 3-node).
         let owned_ranges = owned_token_ranges(ring, local_node_id, rf);
-        let mut tasks: Vec<(i64, i64, u64)> = Vec::new();
-        for (range_start, range_end) in owned_ranges {
-            // Pick a representative token in the range to ask the ring
-            // who replicates it. All tokens in a single vnode range
-            // share the same replica set by construction.
-            let peers = super::repair_participants(ring, range_start, rf);
-            for peer in peers {
-                if peer == local_node_id {
+        // (start, end, peers_excluding_self_sorted). Sort by start so
+        // the wrap segment `[i64::MIN, first_token)` — which
+        // `owned_token_ranges` emits last — sits before the body and
+        // can merge with it where the replica set agrees.
+        let mut owned_with_peers: Vec<(i64, i64, Vec<u64>)> = owned_ranges
+            .into_iter()
+            .map(|(s, e)| {
+                let mut peers: Vec<u64> = super::repair_participants(ring, s, rf)
+                    .into_iter()
+                    .filter(|p| *p != local_node_id)
+                    .collect();
+                peers.sort_unstable();
+                (s, e, peers)
+            })
+            .collect();
+        owned_with_peers.sort_by_key(|(s, _, _)| *s);
+        let mut merged: Vec<(i64, i64, Vec<u64>)> = Vec::new();
+        for (range_start, range_end, peers) in owned_with_peers {
+            if let Some(last) = merged.last_mut() {
+                if last.1 == range_start && last.2 == peers {
+                    // Same replica set AND contiguous in token order.
+                    last.1 = range_end;
                     continue;
                 }
+            }
+            merged.push((range_start, range_end, peers));
+        }
+        let mut tasks: Vec<(i64, i64, u64)> = Vec::new();
+        for (range_start, range_end, peers) in merged {
+            for peer in peers {
                 tasks.push((range_start, range_end, peer));
             }
         }
@@ -268,33 +292,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_table_schedules_one_session_per_peer_per_owned_range() {
+    async fn repair_table_merges_ranges_sharing_the_same_replica_set() {
         let ring = three_node_ring();
         let table = TableId::new("ks", "tbl");
         let exec = Arc::new(MockExecutor::new());
         let coord = RepairCoordinator {
             max_concurrent_sessions: 4,
         };
-        // RF=3 on a 3-node ring: every range is replicated by all 3 nodes.
+        // RF=3 on a 3-node ring: every range is replicated by ALL three
+        // nodes, so every (range, peer) pair is doing identical work as
+        // every other. The coordinator must collapse them: schedule
+        // exactly ONE session per non-self peer (covering the union of
+        // all owned ranges), not one per vnode × per peer. This is what
+        // turns repair on a 256-vnode default cluster from 1 536 wire
+        // calls per node into 2.
         let results = coord.repair_table(exec.clone(), &ring, 1, 3, &table).await;
-        // Expect: 9 vnode ranges × 2 peers = 18 sessions (plus the wrap
-        // segment if local owns it — which it does at RF=3).
         let calls = exec.calls.lock().unwrap();
         assert_eq!(
             calls.len(),
+            2,
+            "RF=3/3-node merges all owned ranges into one session per non-self peer"
+        );
+        assert_eq!(
             results.len(),
+            calls.len(),
             "every session must record exactly one mock call"
         );
-        assert!(
-            results.iter().all(|r| r.result.is_ok()),
-            "mock executor returns Ok for every call"
-        );
-        // Every peer recorded is in {2, 3} — never the local node.
+        assert!(results.iter().all(|r| r.result.is_ok()));
         let peers: std::collections::BTreeSet<u64> = calls.iter().map(|(_, _, _, p)| *p).collect();
         assert_eq!(peers, [2u64, 3].iter().copied().collect());
-        // At least one session per peer.
-        assert!(calls.iter().any(|(_, _, _, p)| *p == 2));
-        assert!(calls.iter().any(|(_, _, _, p)| *p == 3));
     }
 
     #[tokio::test]
