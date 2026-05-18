@@ -1202,7 +1202,11 @@ impl<F: FlushTarget> TableStore<F> {
         // SSTables: walk each via `partitions_iter()` (yields one
         // partition at a time). SSTable partitions are token-ordered,
         // so we bail out of this SSTable's iterator as soon as we see
-        // a token `>= end_token`.
+        // a token `>= end_token`. We also jump straight to the first
+        // partition with `token >= start_token` via `seek_to_token`
+        // (O(log N) via the SSTable's lazy `partition_token_offsets`
+        // cache) so each repair session pays O(matches), not
+        // O(table_size).
         for (i, sstable) in guard.sstables.iter().enumerate() {
             if matched.len() >= limit {
                 break;
@@ -1222,6 +1226,19 @@ impl<F: FlushTarget> TableStore<F> {
                     continue;
                 }
             };
+            if let Err(e) = iter.seek_to_token(start_token) {
+                let id = guard
+                    .sstable_ids
+                    .get(i)
+                    .map(|(gen, dir)| format!("{}/{gen}", dir.display()))
+                    .unwrap_or_else(|| format!("index={i}"));
+                tracing::warn!(
+                    sstable = %id,
+                    "read_token_range: seek_to_token failed, falling back to full scan: {e}"
+                );
+                // Iter is still at byte 0; the per-partition token
+                // filter below will handle correctness, just slower.
+            }
             while matched.len() < limit {
                 match iter.next_partition() {
                     Ok(Some(p)) => {
