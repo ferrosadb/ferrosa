@@ -287,12 +287,18 @@ impl RepairStore for RemoteRepairStore {
             range_end,
         };
         let body = bincode::serialize(&req).map_err(|e| format!("serialize: {e}"))?;
+        // Lane::Bulk: a Fetch response carries up to REPAIR_LEAF_READ_LIMIT
+        // (10 000) partitions — that's bulk transfer semantics, not a
+        // transactional read. Lane::Data's 10s timeout fires before a
+        // multi-GB-replica peer can finish its read_token_range scan,
+        // every session's caller drops, and repair never converges.
+        // Bulk gives 60s, which matches SSTable streaming's lane choice.
         let resp = self
             .peer_manager
             .send(
                 self.host_id,
                 Message::RepairFetchRequest(Bytes::from(body)),
-                Lane::Data,
+                Lane::Bulk,
             )
             .await
             .map_err(|e| format!("send: {e}"))?;
@@ -330,7 +336,7 @@ impl RepairStore for RemoteRepairStore {
             .send(
                 self.host_id,
                 Message::RepairApplyRequest(Bytes::from(body)),
-                Lane::Data,
+                Lane::Bulk,
             )
             .await
             .map_err(|e| format!("send: {e}"))?;
