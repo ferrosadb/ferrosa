@@ -142,6 +142,27 @@ pub enum Message {
     TruncateForward(Bytes),
     TruncateAck(Bytes),
 
+    /// Anti-entropy repair — initiator → peer: "build a Merkle tree for
+    /// keyspace.table over the given token range and send it back".
+    /// Payload is a bincoded `RepairMerkleRequestPayload`.
+    RepairMerkleRequest(Bytes),
+    /// Peer → initiator: serialized `MerkleTree`.
+    RepairMerkleResponse(Bytes),
+    /// Anti-entropy repair — initiator → peer: "send me the partitions
+    /// in this token sub-range". Payload is a bincoded
+    /// `RepairFetchRequestPayload`.
+    RepairFetchRequest(Bytes),
+    /// Peer → initiator: bincoded `RepairFetchResponsePayload` carrying
+    /// the matching partitions (as `PartitionWire` for serde).
+    RepairFetchResponse(Bytes),
+    /// Anti-entropy repair — initiator → peer: "apply these partitions
+    /// last-write-wins on a per-cell basis". Payload is a bincoded
+    /// `RepairApplyRequestPayload`.
+    RepairApplyRequest(Bytes),
+    /// Peer → initiator: bincoded `RepairApplyResponsePayload` carrying
+    /// the count of partitions applied and an optional error message.
+    RepairApplyResponse(Bytes),
+
     // Streaming (row-based) — opaque payloads
     StreamStart(Bytes),
     StreamChunk(Bytes),
@@ -269,6 +290,12 @@ impl Message {
             Self::RangeReadStreamCancel(_) => MsgType::RangeReadStreamCancel,
             Self::TruncateForward(_) => MsgType::TruncateForward,
             Self::TruncateAck(_) => MsgType::TruncateAck,
+            Self::RepairMerkleRequest(_) => MsgType::RepairMerkleRequest,
+            Self::RepairMerkleResponse(_) => MsgType::RepairMerkleResponse,
+            Self::RepairFetchRequest(_) => MsgType::RepairFetchRequest,
+            Self::RepairFetchResponse(_) => MsgType::RepairFetchResponse,
+            Self::RepairApplyRequest(_) => MsgType::RepairApplyRequest,
+            Self::RepairApplyResponse(_) => MsgType::RepairApplyResponse,
             Self::StreamStart(_) => MsgType::StreamStart,
             Self::StreamChunk(_) => MsgType::StreamChunk,
             Self::StreamEnd(_) => MsgType::StreamEnd,
@@ -425,6 +452,12 @@ impl Message {
             | Self::RangeReadStreamCancel(b)
             | Self::TruncateForward(b)
             | Self::TruncateAck(b)
+            | Self::RepairMerkleRequest(b)
+            | Self::RepairMerkleResponse(b)
+            | Self::RepairFetchRequest(b)
+            | Self::RepairFetchResponse(b)
+            | Self::RepairApplyRequest(b)
+            | Self::RepairApplyResponse(b)
             | Self::StreamStart(b)
             | Self::StreamChunk(b)
             | Self::StreamEnd(b)
@@ -631,6 +664,24 @@ impl Message {
             }
             MsgType::TruncateForward => Self::TruncateForward(body.split_to(body.remaining())),
             MsgType::TruncateAck => Self::TruncateAck(body.split_to(body.remaining())),
+            MsgType::RepairMerkleRequest => {
+                Self::RepairMerkleRequest(body.split_to(body.remaining()))
+            }
+            MsgType::RepairMerkleResponse => {
+                Self::RepairMerkleResponse(body.split_to(body.remaining()))
+            }
+            MsgType::RepairFetchRequest => {
+                Self::RepairFetchRequest(body.split_to(body.remaining()))
+            }
+            MsgType::RepairFetchResponse => {
+                Self::RepairFetchResponse(body.split_to(body.remaining()))
+            }
+            MsgType::RepairApplyRequest => {
+                Self::RepairApplyRequest(body.split_to(body.remaining()))
+            }
+            MsgType::RepairApplyResponse => {
+                Self::RepairApplyResponse(body.split_to(body.remaining()))
+            }
             MsgType::StreamStart => Self::StreamStart(body.split_to(body.remaining())),
             MsgType::StreamChunk => Self::StreamChunk(body.split_to(body.remaining())),
             MsgType::StreamEnd => Self::StreamEnd(body.split_to(body.remaining())),

@@ -2103,6 +2103,35 @@ impl StorageEngine {
         self.read_range_limited_rows(table_id, start, end, limit, 0)
     }
 
+    /// Read all partitions whose tokens fall in `[start_token, end_token)`,
+    /// up to `limit`.
+    ///
+    /// Anti-entropy repair's per-Merkle-leaf "give me everything in this
+    /// token sub-range" question can't be answered by the key-bounded
+    /// [`Self::read_range`] — partition keys hash to tokens via Murmur3, so a
+    /// contiguous token range is a discontiguous key range. This primitive
+    /// answers the token question directly by reading the merged stream
+    /// once and short-circuiting at `end_token`.
+    ///
+    /// Returns an empty vector when `start_token >= end_token` (empty
+    /// range) or the table doesn't exist.
+    pub fn read_token_range(
+        &self,
+        table_id: &TableId,
+        start_token: i64,
+        end_token: i64,
+        limit: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        if start_token >= end_token || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tables = self.tables.read();
+        let Some(state) = tables.get(table_id) else {
+            return Ok(Vec::new());
+        };
+        state.store.read_token_range(start_token, end_token, limit)
+    }
+
     /// Reads partitions from a table with an optional per-partition row cap.
     pub fn read_range_limited_rows(
         &self,
@@ -6066,6 +6095,163 @@ mod tests {
 
         let results = engine.read_range(&tid, None, None, 100).unwrap();
         assert_eq!(results.len(), 5);
+    }
+
+    /// `read_token_range` must return EXACTLY the partitions whose tokens
+    /// fall in `[start_token, end_token)`, regardless of where those
+    /// partitions sit in key order. This is the primitive anti-entropy
+    /// repair needs to ask "give me everything in this Merkle leaf's
+    /// token sub-range" — the existing key-bounded `read_range` cannot
+    /// answer that question.
+    #[test]
+    fn read_token_range_filters_by_token_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Write 20 partitions; Murmur3 scatters their tokens.
+        let mut keys_with_tokens: Vec<(String, i64)> = Vec::new();
+        for i in 0..20 {
+            let k = format!("k{i:03}");
+            let dk = make_key(&k);
+            let tok = dk.token.0;
+            engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+            keys_with_tokens.push((k, tok));
+        }
+
+        keys_with_tokens.sort_by_key(|(_, t)| *t);
+        let start = keys_with_tokens[5].1;
+        let end = keys_with_tokens[15].1; // exclusive
+        let expected_count = keys_with_tokens
+            .iter()
+            .filter(|(_, t)| *t >= start && *t < end)
+            .count();
+
+        let results = engine.read_token_range(&tid, start, end, 100).unwrap();
+        assert_eq!(
+            results.len(),
+            expected_count,
+            "expected exactly {expected_count} partitions in token range [{start}, {end})"
+        );
+        for p in &results {
+            let t = p.key.token.0;
+            assert!(
+                t >= start && t < end,
+                "partition token {t} outside requested range [{start}, {end})"
+            );
+        }
+    }
+
+    #[test]
+    fn read_token_range_empty_range_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..5 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        // start == end → empty range.
+        let results = engine.read_token_range(&tid, 0, 0, 100).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn read_token_range_full_range_returns_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..7 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+        let results = engine
+            .read_token_range(&tid, i64::MIN, i64::MAX, 100)
+            .unwrap();
+        assert_eq!(results.len(), 7);
+    }
+
+    /// Streaming contract: even with thousands of partitions in the table,
+    /// asking for a small token sub-range must return ONLY the in-range
+    /// matches. This is what makes anti-entropy repair viable on a multi-GB
+    /// table in a constrained container: working set scales with matches,
+    /// not table size.
+    #[test]
+    fn read_token_range_streaming_returns_only_in_range_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        let n_total: usize = 1_000;
+        let mut tokens: Vec<i64> = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            let k = format!("k{i:06}");
+            let dk = make_key(&k);
+            tokens.push(dk.token.0);
+            engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+        }
+        tokens.sort_unstable();
+
+        // 1 % slice of the token space.
+        let lo = tokens[(n_total * 49) / 100];
+        let hi = tokens[(n_total * 50) / 100];
+        let expected = tokens.iter().filter(|&&t| t >= lo && t < hi).count();
+        assert!(expected > 0);
+
+        let results = engine.read_token_range(&tid, lo, hi, 10_000).unwrap();
+        assert_eq!(
+            results.len(),
+            expected,
+            "streaming must return exactly the matches, not a prefix of the table"
+        );
+        for p in &results {
+            let t = p.key.token.0;
+            assert!(t >= lo && t < hi);
+        }
+    }
+
+    #[test]
+    fn read_token_range_honors_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..10 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+        let results = engine
+            .read_token_range(&tid, i64::MIN, i64::MAX, 3)
+            .unwrap();
+        assert_eq!(results.len(), 3, "limit must cap the result count");
     }
 
     #[test]

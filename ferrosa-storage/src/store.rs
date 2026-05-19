@@ -1139,6 +1139,146 @@ impl<F: FlushTarget> TableStore<F> {
         }))
     }
 
+    /// Read all partitions whose tokens fall in `[start_token, end_token)`,
+    /// up to `limit` matching partitions.
+    ///
+    /// Anti-entropy repair needs "every partition in this Merkle leaf's
+    /// token sub-range." The existing key-bounded read API can't answer
+    /// that because partition keys hash to tokens; a contiguous token
+    /// range is a discontiguous key range.
+    ///
+    /// Streaming implementation: each source (active memtable, flushing
+    /// memtable, every SSTable) is walked one partition at a time via its
+    /// lazy iterator. Partitions outside `[start_token, end_token)` are
+    /// dropped without ever entering the result `Vec`, and once a single
+    /// SSTable's iterator passes `end_token` we stop iterating it (SSTable
+    /// partitions are stored in token order). Peak working-set memory is
+    /// therefore `O(matches_in_range)` — one in-range partition copy per
+    /// hit, plus one in-flight clone per source — NOT `O(table_size)`.
+    /// This is what makes repair viable on a multi-GB table in a 2 GB
+    /// container: a typical Merkle leaf has < 10 partitions, so peak
+    /// is a few hundred KB per session.
+    ///
+    /// Returns an empty vector when the range is empty (`start >= end`)
+    /// or `limit == 0`.
+    pub fn read_token_range(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        limit: usize,
+    ) -> Result<Vec<Partition>> {
+        if start_token >= end_token || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let guard = self.view.load();
+        let in_range = |t: i64| t >= start_token && t < end_token;
+        let mut matched: Vec<Partition> = Vec::new();
+
+        // Active memtable: lazy iter. Per-partition deep clone happens
+        // only when we advance the iterator, and only matches survive.
+        for p in guard.active.range_iter(None, None) {
+            if matched.len() >= limit {
+                break;
+            }
+            if in_range(p.key.token.0) {
+                matched.push(p);
+            }
+        }
+
+        // Flushing memtable (if any).
+        if matched.len() < limit {
+            if let Some(ref flushing) = guard.flushing {
+                for p in flushing.range_iter(None, None) {
+                    if matched.len() >= limit {
+                        break;
+                    }
+                    if in_range(p.key.token.0) {
+                        matched.push(p);
+                    }
+                }
+            }
+        }
+
+        // SSTables: walk each via `partitions_iter()` (yields one
+        // partition at a time). SSTable partitions are token-ordered,
+        // so we bail out of this SSTable's iterator as soon as we see
+        // a token `>= end_token`. We also jump straight to the first
+        // partition with `token >= start_token` via `seek_to_token`
+        // (O(log N) via the SSTable's lazy `partition_token_offsets`
+        // cache) so each repair session pays O(matches), not
+        // O(table_size).
+        for (i, sstable) in guard.sstables.iter().enumerate() {
+            if matched.len() >= limit {
+                break;
+            }
+            let mut iter = match sstable.partitions_iter() {
+                Ok(it) => it,
+                Err(e) => {
+                    let id = guard
+                        .sstable_ids
+                        .get(i)
+                        .map(|(gen, dir)| format!("{}/{gen}", dir.display()))
+                        .unwrap_or_else(|| format!("index={i}"));
+                    tracing::warn!(
+                        sstable = %id,
+                        "read_token_range: skipping SSTable with broken iterator: {e}"
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = iter.seek_to_token(start_token) {
+                let id = guard
+                    .sstable_ids
+                    .get(i)
+                    .map(|(gen, dir)| format!("{}/{gen}", dir.display()))
+                    .unwrap_or_else(|| format!("index={i}"));
+                tracing::warn!(
+                    sstable = %id,
+                    "read_token_range: seek_to_token failed, falling back to full scan: {e}"
+                );
+                // Iter is still at byte 0; the per-partition token
+                // filter below will handle correctness, just slower.
+            }
+            while matched.len() < limit {
+                match iter.next_partition() {
+                    Ok(Some(p)) => {
+                        let t = p.key.token.0;
+                        if t >= end_token {
+                            break; // SSTable is token-sorted — done with this source.
+                        }
+                        if t >= start_token {
+                            matched.push(p);
+                        }
+                    }
+                    Ok(None) => break, // EOF.
+                    Err(e) => {
+                        tracing::warn!("read_token_range: SSTable partition decode error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Cross-source dedup + cell-level merge (same shape as
+        // `read_range_limited_rows` so range and token reads return
+        // semantically identical results for the same window).
+        matched.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut merged: Vec<Partition> = Vec::new();
+        for p in matched {
+            if let Some(last) = merged.last_mut() {
+                if last.key == p.key {
+                    *last = merge::merge_partitions(vec![last.clone(), p]);
+                    continue;
+                }
+            }
+            merged.push(p);
+        }
+        for p in &mut merged {
+            merge::apply_deletions(p);
+        }
+        Ok(merged.into_iter().take(limit).collect())
+    }
+
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,
