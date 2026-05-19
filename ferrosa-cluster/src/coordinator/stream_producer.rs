@@ -22,7 +22,7 @@ use bytes::Bytes;
 use ferrosa_sstable::types::Partition;
 
 use crate::raft::handlers::{
-    partition_to_wire, RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
+    serialize_partition_to_wire_borrowed, RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
     RangeReadStreamRequestPayload,
 };
 use ferrosa_net::message::Message;
@@ -61,14 +61,34 @@ pub async fn stream_range_response<S: ChunkSink>(
 
     let mut seq: u32 = 0;
     for chunk in partitions.chunks(chunk_size) {
-        let payload = RangeReadStreamChunkPayload {
-            request_id: req.request_id,
-            seq,
-            partitions: chunk.iter().cloned().map(partition_to_wire).collect(),
-        };
-        let bytes = bincode::serialize(&payload)
-            .expect("RangeReadStreamChunkPayload serialization is infallible");
-        sink.send(Message::RangeReadStreamChunk(Bytes::from(bytes)))
+        // Emit the chunk's bytes directly, without first
+        // materialising `Vec<PartitionWire>` (which would clone
+        // every cell value in the chunk).
+        //
+        // Wire format of `RangeReadStreamChunkPayload` is
+        // `request_id: u32 || seq: u32 || partitions: Vec<PartitionWire>`,
+        // and bincode encodes `Vec<T>` as `u64-LE length || items`.
+        // Emitting the three fields in declaration order, then
+        // each partition via `serialize_partition_to_wire_borrowed`,
+        // produces byte-identical output to
+        // `bincode::serialize(&RangeReadStreamChunkPayload{..})`.
+        // Equivalence is pinned at the helper-level by
+        // `serialize_partition_to_wire_borrowed_matches_legacy`
+        // and at this call site by
+        // `stream_range_response_borrowed_emit_matches_legacy_collect`.
+        let mut body: Vec<u8> = Vec::new();
+        bincode::serialize_into(&mut body, &req.request_id)
+            .expect("RangeReadStreamChunkPayload header serialization is infallible");
+        bincode::serialize_into(&mut body, &seq)
+            .expect("RangeReadStreamChunkPayload header serialization is infallible");
+        let chunk_partitions_len = chunk.len() as u64;
+        bincode::serialize_into(&mut body, &chunk_partitions_len)
+            .expect("RangeReadStreamChunkPayload header serialization is infallible");
+        for partition in chunk {
+            serialize_partition_to_wire_borrowed(&mut body, partition)
+                .expect("PartitionWire serialization is infallible");
+        }
+        sink.send(Message::RangeReadStreamChunk(Bytes::from(body)))
             .await;
         seq = seq.saturating_add(1);
     }
