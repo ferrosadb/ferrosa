@@ -1146,7 +1146,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// token sub-range." The existing key-bounded read API can't answer
     /// that because partition keys hash to tokens; a contiguous token
     /// range is a discontiguous key range. This method materialises the
-    /// merged stream (capped at [`RANGE_READ_MATERIALIZATION_CAP`]) once
+    /// merged stream (capped at `RANGE_READ_MATERIALIZATION_CAP`) once
     /// and filters by token.
     ///
     /// Returns an empty vector when the range is empty (`start >= end`)
