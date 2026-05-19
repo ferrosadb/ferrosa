@@ -2055,6 +2055,7 @@ version = "0.10.0"
 dependencies = [
  "crc32fast",
  "ferrosa-common",
+ "lru",
  "lz4_flex",
  "proptest",
  "tempfile",
