@@ -89,6 +89,18 @@ pub struct StorageEngineConfig {
     pub object_store: Option<ObjectStoreConfig>,
     pub local_cache_max_bytes: u64,
     pub flush_threshold_bytes: u64,
+    /// Active memtable size at which an in-line, synchronous flush
+    /// is triggered from inside `write()` — write-path
+    /// backpressure. Distinct from `flush_threshold_bytes`, which
+    /// is the soft "schedule an async flush" trigger consulted by
+    /// the maintenance loop. The backpressure trigger is much
+    /// higher so it only fires under sustained-write pressure
+    /// (anti-entropy repair's apply phase, bulk load, PITR
+    /// restore, raft state-machine catch-up) where writes
+    /// outpace the maintenance loop's drain rate and pile up
+    /// flushing memtables in RSS faster than S3 uploads complete.
+    /// Default: `max(flush_threshold_bytes * 4, 64 MB)`.
+    pub memtable_backpressure_bytes: u64,
     /// Maximum age (seconds) of unflushed memtable data before a time-based
     /// flush is triggered, regardless of size. Protects small/infrequent
     /// tables from data loss on restart. Default: 30 seconds.
@@ -173,10 +185,26 @@ impl StorageEngineConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10 * 1024 * 1024 * 1024); // 10 GB default
 
-        let flush_threshold_bytes = std::env::var("FERROSA_FLUSH_THRESHOLD_BYTES")
+        let flush_threshold_bytes: u64 = std::env::var("FERROSA_FLUSH_THRESHOLD_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64 * 1024 * 1024); // 64 MB default
+
+        let memtable_backpressure_bytes: u64 =
+            std::env::var("FERROSA_MEMTABLE_BACKPRESSURE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| {
+                    // Default: max(threshold × 4, 64 MB) so tests
+                    // with intentionally tiny thresholds (for testing
+                    // flush behaviour) don't trip the production
+                    // backpressure path. Production deployments with
+                    // the default 64 MB threshold land on 256 MB.
+                    std::cmp::max(
+                        flush_threshold_bytes.saturating_mul(4),
+                        64 * 1024 * 1024,
+                    )
+                });
 
         let flush_max_age_secs = std::env::var("FERROSA_FLUSH_MAX_AGE_SECS")
             .ok()
@@ -248,6 +276,7 @@ impl StorageEngineConfig {
             object_store,
             local_cache_max_bytes,
             flush_threshold_bytes,
+            memtable_backpressure_bytes,
             flush_max_age_secs,
             data_dir,
             index_backend: crate::index::IndexBackendConfig::from_env(),
@@ -272,6 +301,7 @@ impl StorageEngineConfig {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024, // 1 MB
             flush_threshold_bytes: 4096,        // 4 KB — triggers flush quickly in tests
+            memtable_backpressure_bytes: u64::MAX, // disabled by default in tests; opt-in per test
             flush_max_age_secs: 5,              // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
             index_backend: crate::index::IndexBackendConfig::Local,
@@ -1939,7 +1969,37 @@ impl StorageEngine {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        // Write-path backpressure. Routine threshold crossings
+        // (memtable size ≥ `flush_threshold_bytes`) are handled
+        // by the maintenance loop's periodic `flush_if_needed` —
+        // no per-write cost in the common case. But when writes
+        // arrive faster than the maintenance loop drains and the
+        // active memtable crosses `memtable_backpressure_bytes`,
+        // we block the writer by calling `self.flush(...)`
+        // synchronously here. The store's `flush_guard`
+        // serialises concurrent flushes, so a runaway writer
+        // waits for the in-progress flush instead of growing a
+        // second unbounded memtable in parallel.
+        //
+        // Without this, sustained writes (anti-entropy repair's
+        // apply phase, bulk load, PITR restore, raft state-
+        // machine catch-up) pile up flushing memtables in RSS
+        // faster than S3 uploads drain them and trip the per-
+        // node cgroup cap.
+        //
+        // Default in production is `max(flush_threshold × 4,
+        // 64 MB)`; default in `test_config` is `u64::MAX`
+        // (effectively disabled) so tests that intentionally
+        // pick tiny thresholds for flush-behaviour coverage
+        // don't deadlock against each other in unrelated test
+        // scenarios.
+        let mt_size = state.store.memtable_size() as u64;
+        let needs_flush = mt_size >= self.config.memtable_backpressure_bytes;
         drop(tables);
+
+        if needs_flush {
+            self.flush(table_id)?;
+        }
 
         // 3. Notify observers after successful commit log + memtable write.
         self.dispatch_sync_observers(table_id, &mutation);
@@ -6316,6 +6376,51 @@ mod tests {
             .read_token_range(&tid, i64::MIN, i64::MAX, 3)
             .unwrap();
         assert_eq!(results.len(), 3, "limit must cap the result count");
+    }
+
+    /// Memtable write-path backpressure. Without it, sustained
+    /// writes (e.g. anti-entropy repair's apply phase) can grow
+    /// the active memtable far past `flush_threshold_bytes`
+    /// between maintenance-loop ticks (default 30 s), pinning
+    /// hundreds of MB of partitions in RSS while a previous
+    /// flush is still draining S3.
+    ///
+    /// `write` itself must trigger a synchronous flush when the
+    /// active memtable crosses the threshold — concurrent writers
+    /// then serialise on the store's `flush_guard`, which is the
+    /// natural backpressure mechanism: a writer that overshoots
+    /// waits for the in-progress flush to complete before its own
+    /// flush call returns.
+    ///
+    /// This test pins the contract end-to-end: a single `write`
+    /// that pushes the memtable past `flush_threshold_bytes`
+    /// produces exactly one SSTable WITHOUT any explicit
+    /// `flush_if_needed` / `flush_all` call.
+    #[test]
+    fn write_triggers_inline_flush_when_backpressure_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        // Opt into backpressure with a tiny trigger so a single
+        // write trips it. Test confirms inline flush fires
+        // BEFORE any maintenance-loop tick or `flush_if_needed`
+        // call — the contract the production write path needs
+        // for sustained-write scenarios (anti-entropy repair
+        // apply, bulk load, restore).
+        config.memtable_backpressure_bytes = 1;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k"), make_row(b"data", 1000), 1000)
+            .unwrap();
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "write past memtable_backpressure_bytes must trigger an \
+             inline flush — otherwise sustained-write workloads (repair \
+             apply, bulk load, restore) accumulate memtable RSS \
+             unboundedly between maintenance ticks"
+        );
     }
 
     #[test]
