@@ -17,23 +17,79 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
 use super::coordinator::{SessionExecutor, SessionStats};
-use super::{compute_repair_plan, RepairPlan};
 
 /// Abstraction over a node's data store, scoped to the operations repair
 /// needs: read partitions in a token range, and apply partitions received
 /// from a peer. Implemented for `Arc<StorageEngine>` (production) and for
 /// `Arc<Mutex<Vec<Partition>>>` (tests).
+/// Maximum number of partitions a single Fetch RPC / single
+/// `read_range_chunked` call carries. Caps the per-chunk working
+/// set the executor holds in flight: at this limit the multi-
+/// chunk loop in `run_session` keeps memory bounded to
+/// `≈ 2 × REPAIR_FETCH_CHUNK_PARTITIONS × max_partition_size`
+/// regardless of how big the diff is.
+pub const REPAIR_FETCH_CHUNK_PARTITIONS: usize = 64;
+
+/// Maximum number of partitions sent in a single Apply RPC body.
+/// On the sender side the executor splits the diff into batches
+/// of this size before calling `apply_partitions`, so the wire
+/// payload + the peer's in-flight applied state are bounded.
+pub const REPAIR_APPLY_CHUNK_PARTITIONS: usize = 64;
+
 #[async_trait]
 pub trait RepairStore: Send + Sync {
     /// Return all partitions for `table` whose tokens fall in
     /// `[range_start, range_end)`. Order is unspecified; callers index by
     /// partition key.
+    ///
+    /// Production code should prefer [`Self::read_range_chunked`] in the
+    /// executor's hot path so each step's working set stays
+    /// bounded; this one-shot variant is retained for tests and
+    /// callers that genuinely want the entire range materialised.
     async fn read_range(
         &self,
         table: &TableId,
         range_start: i64,
         range_end: i64,
     ) -> Result<Vec<Partition>, String>;
+
+    /// Chunked fetch: return at most `limit` partitions starting
+    /// from `cursor.unwrap_or(range_start)`, in token order,
+    /// alongside the cursor the caller should pass on the next
+    /// call (or `None` when the range is exhausted).
+    ///
+    /// Default impl falls through to the one-shot `read_range` —
+    /// fine for in-memory test stores. Production impls
+    /// (`StorageEngineRepairStore`, `RemoteRepairStore`) override
+    /// with a cursor-aware path that honors `limit` on the
+    /// storage / wire side so peak in-flight is bounded.
+    async fn read_range_chunked(
+        &self,
+        table: &TableId,
+        range_start: i64,
+        range_end: i64,
+        cursor: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Partition>, Option<i64>), String> {
+        // Default: one-shot read, slice by cursor + limit.
+        let all = self.read_range(table, range_start, range_end).await?;
+        let mut filtered: Vec<Partition> = all
+            .into_iter()
+            .filter(|p| match cursor {
+                Some(c) => p.key.token.0 >= c,
+                None => true,
+            })
+            .collect();
+        filtered.sort_by_key(|p| p.key.token.0);
+        let next_cursor = if filtered.len() > limit {
+            let next = filtered[limit].key.token.0;
+            filtered.truncate(limit);
+            Some(next)
+        } else {
+            None
+        };
+        Ok((filtered, next_cursor))
+    }
 
     /// Apply the given partitions, last-write-wins on a per-cell basis.
     /// Used to land partitions streamed from a peer during repair.
@@ -42,6 +98,24 @@ pub trait RepairStore: Send + Sync {
         table: &TableId,
         partitions: &[Partition],
     ) -> Result<(), String>;
+
+    /// Build a Merkle tree summarising this store's content for the
+    /// token range `[range_start, range_end)`. The Merkle leaf
+    /// hashes are an order-independent XOR of per-partition
+    /// content hashes — see `repair::partition_merkle_hash`.
+    ///
+    /// The executor uses Merkle exchange to identify the divergent
+    /// leaf ranges between two replicas BEFORE fetching any
+    /// partitions, so the per-session working set scales with
+    /// *divergence size*, not table size — a fully-converged 1 GB
+    /// table costs only two tree builds (streaming, bounded
+    /// memory) plus one comparison, with zero partition transfers.
+    async fn build_merkle(
+        &self,
+        table: &TableId,
+        range_start: i64,
+        range_end: i64,
+    ) -> Result<super::merkle::MerkleTree, String>;
 }
 
 /// `RepairStore` over a local [`StorageEngine`]. Used by the production
@@ -93,6 +167,44 @@ impl RepairStore for StorageEngineRepairStore {
         result
     }
 
+    async fn read_range_chunked(
+        &self,
+        table: &TableId,
+        range_start: i64,
+        range_end: i64,
+        cursor: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Partition>, Option<i64>), String> {
+        // Chunked local read: only pull `limit` partitions per
+        // call, probe for one extra to detect "more remaining"
+        // without an extra round trip. This is the local-side
+        // analogue of RepairFetchHandler's chunking on the wire —
+        // matters when the executor walks a span on the *local*
+        // side: a wide span on a 1 GB replica can't fit through
+        // the 2 GiB cgroup if it materialises every partition in
+        // one shot, even if every partition is small.
+        let engine = self.engine.clone();
+        let table = table.clone();
+        let chunk_start = cursor.unwrap_or(range_start);
+        let probe = limit.saturating_add(1);
+        let result: Result<Vec<Partition>, String> = tokio::task::spawn_blocking(move || {
+            StorageEngine::read_token_range(&engine, &table, chunk_start, range_end, probe)
+                .map_err(|e| format!("read_token_range: {e}"))
+        })
+        .await
+        .map_err(|e| format!("read_range_chunked join: {e}"))?;
+        let mut got = result?;
+        got.sort_by_key(|p| p.key.token.0);
+        let next_cursor = if got.len() > limit {
+            let n = got[limit].key.token.0;
+            got.truncate(limit);
+            Some(n)
+        } else {
+            None
+        };
+        Ok((got, next_cursor))
+    }
+
     async fn apply_partitions(
         &self,
         table: &TableId,
@@ -120,6 +232,33 @@ impl RepairStore for StorageEngineRepairStore {
         .await
         .map_err(|e| format!("apply_partitions join: {e}"))?
     }
+
+    async fn build_merkle(
+        &self,
+        table: &TableId,
+        range_start: i64,
+        range_end: i64,
+    ) -> Result<super::merkle::MerkleTree, String> {
+        // build_tree_for_range is sync and walks the local SSTables
+        // page-by-page via read_token_range — offload so we don't
+        // block the async worker on a multi-GB scan. Acquire the
+        // process-wide REPAIR_BUILD_SEMAPHORE first so initiator
+        // and RPC-handler builds share one budget; without it,
+        // an N-node cluster runs ~N concurrent full-table walks
+        // per repair on the largest replica.
+        let _permit = super::REPAIR_BUILD_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|e| format!("build_merkle semaphore: {e}"))?;
+        let engine = self.engine.clone();
+        let table = table.clone();
+        tokio::task::spawn_blocking(move || {
+            super::build_tree_for_range(&engine, &table, range_start, range_end)
+                .map_err(|e| format!("build_tree_for_range: {e}"))
+        })
+        .await
+        .map_err(|e| format!("build_merkle join: {e}"))?
+    }
 }
 
 /// Executor that drives anti-entropy between a local `RepairStore` and one
@@ -140,6 +279,22 @@ pub struct LocalRepairExecutor {
 
 #[async_trait]
 impl SessionExecutor for LocalRepairExecutor {
+    /// Repair `[range_start, range_end)` between local and `peer` via
+    /// Merkle-then-stream:
+    ///
+    /// 1. Both sides build a Merkle tree by streaming their local
+    ///    replica through `build_merkle` (bounded memory, see
+    ///    `MERKLE_BUILD_BATCH`).
+    /// 2. Compare leaf hashes via `divergent_leaf_ranges`.
+    /// 3. For each maximal-contiguous run of divergent leaves, fetch
+    ///    only those partitions from both sides, diff, and apply
+    ///    in both directions.
+    ///
+    /// When the replicas already agree the Merkle exchange short-
+    /// circuits to "no divergent leaves" and zero partition data
+    /// crosses the wire — the structural difference from the prior
+    /// "fetch-all-and-diff" shape, which paid O(table_size) per
+    /// session regardless of divergence.
     async fn run_session(
         &self,
         table: &TableId,
@@ -152,23 +307,165 @@ impl SessionExecutor for LocalRepairExecutor {
             .get(&peer)
             .ok_or_else(|| format!("unknown peer {peer}"))?;
 
-        let local_parts = self.local.read_range(table, range_start, range_end).await?;
-        let remote_parts = remote.read_range(table, range_start, range_end).await?;
+        // Phase 1 — Merkle exchange.
+        let (local_tree, remote_tree) = tokio::try_join!(
+            self.local.build_merkle(table, range_start, range_end),
+            remote.build_merkle(table, range_start, range_end),
+        )?;
 
-        let plan: RepairPlan =
-            compute_repair_plan(&local_parts, &remote_parts, range_start, range_end);
-
-        let streamed_out = plan.a_to_b.len() as u64;
-        let streamed_in = plan.b_to_a.len() as u64;
-        let ties = plan.timestamp_ties.len() as u64;
-
-        // Push local-newer copies to the remote.
-        if !plan.a_to_b.is_empty() {
-            remote.apply_partitions(table, &plan.a_to_b).await?;
+        let divergent_leaves = local_tree.divergent_leaf_ranges(&remote_tree);
+        if divergent_leaves.is_empty() {
+            // Replicas already agree — no partition data crosses
+            // the wire.
+            return Ok(SessionStats::default());
         }
-        // Pull remote-newer copies into local.
-        if !plan.b_to_a.is_empty() {
-            self.local.apply_partitions(table, &plan.b_to_a).await?;
+
+        // Phase 2 — collapse adjacent divergent leaves into
+        // maximal contiguous spans so one fetch covers many leaves
+        // when the diff is dense. With TREE_DEPTH=15 each leaf
+        // covers a thin slice of the token space, but on a
+        // newly-rebuilt replica the diff is often a near-contiguous
+        // block. Merging here turns N tiny fetches into ~1 wider
+        // one without enlarging the working set beyond what the
+        // existing 10 000-partition read cap already bounds.
+        let merged_spans = merge_contiguous_token_ranges(&divergent_leaves);
+
+        // Phase 3 — per-span streaming fetch + diff + apply.
+        //
+        // Each span walks with parallel cursors on local and
+        // remote (chunked Fetch RPC). Within each chunk, the
+        // streaming diff `diff_partition_sets_streaming` consumes
+        // both `Vec<Partition>`s and emits one `RepairDecision`
+        // per partition — owned, not cloned. The executor pushes
+        // each decision into a small per-direction apply queue
+        // capped at `REPAIR_APPLY_CHUNK_PARTITIONS`, and flushes
+        // the queue via `apply_partitions` whenever it fills (or
+        // at span end).
+        //
+        // Peak in-flight memory per session is bounded by:
+        //
+        //   local_chunk (≤REPAIR_FETCH_CHUNK_PARTITIONS partitions)
+        // + remote_chunk (≤REPAIR_FETCH_CHUNK_PARTITIONS partitions)
+        // + a_to_b queue (≤REPAIR_APPLY_CHUNK_PARTITIONS partitions)
+        // + b_to_a queue (≤REPAIR_APPLY_CHUNK_PARTITIONS partitions)
+        //
+        // Critically, the diff itself never materialises a full
+        // `RepairPlan` — chosen partitions move directly from
+        // the input vecs into the apply queues without an
+        // intermediate Vec<Partition> clone (which the legacy
+        // `compute_repair_plan` did, costing ~chunk_size ×
+        // partition_size of extra allocation per chunk).
+        let mut streamed_in: u64 = 0;
+        let mut streamed_out: u64 = 0;
+        let mut ties: u64 = 0;
+        for (span_start, span_end) in merged_spans {
+            let mut local_cursor: Option<i64> = None;
+            let mut remote_cursor: Option<i64> = None;
+            // Per-span apply queues. Sized at
+            // `REPAIR_APPLY_CHUNK_PARTITIONS` so each flush
+            // sends one Apply RPC body of bounded size.
+            let mut a_to_b_queue: Vec<Partition> =
+                Vec::with_capacity(REPAIR_APPLY_CHUNK_PARTITIONS);
+            let mut b_to_a_queue: Vec<Partition> =
+                Vec::with_capacity(REPAIR_APPLY_CHUNK_PARTITIONS);
+
+            loop {
+                let (local_res, remote_res) = tokio::try_join!(
+                    self.local.read_range_chunked(
+                        table,
+                        span_start,
+                        span_end,
+                        local_cursor,
+                        REPAIR_FETCH_CHUNK_PARTITIONS,
+                    ),
+                    remote.read_range_chunked(
+                        table,
+                        span_start,
+                        span_end,
+                        remote_cursor,
+                        REPAIR_FETCH_CHUNK_PARTITIONS,
+                    ),
+                )?;
+                let (local_parts, local_next) = local_res;
+                let (remote_parts, remote_next) = remote_res;
+                if local_parts.is_empty() && remote_parts.is_empty() {
+                    break;
+                }
+                // Pick `sub_end` = smallest cursor frontier so the
+                // merge-join sees matching sets; anything beyond
+                // that on either side stays for the next iteration.
+                let local_high = local_next.unwrap_or(span_end);
+                let remote_high = remote_next.unwrap_or(span_end);
+                let sub_end = local_high.min(remote_high).min(span_end);
+                // Filter each side to partitions strictly before
+                // `sub_end` (the rest will be re-read on the next
+                // pass after the lagging side catches up).
+                let in_window = |p: &Partition| p.key.token.0 < sub_end;
+                let (mut local_in, local_keep): (Vec<Partition>, Vec<Partition>) =
+                    local_parts.into_iter().partition(in_window);
+                let (mut remote_in, remote_keep): (Vec<Partition>, Vec<Partition>) =
+                    remote_parts.into_iter().partition(in_window);
+                // Pre-sorted invariant from the chunked Fetch
+                // handler — but we partitioned the windowed half
+                // out, so re-establish the order.
+                local_in.sort_by_key(|p| (p.key.token.0, p.key.key.as_bytes().to_vec()));
+                remote_in.sort_by_key(|p| (p.key.token.0, p.key.key.as_bytes().to_vec()));
+
+                // Streaming diff — partitions move directly into
+                // the apply queues. When a queue fills, flush.
+                super::diff_partition_sets_streaming(local_in, remote_in, |decision| {
+                    match decision {
+                        super::RepairDecision::AToB(p) => {
+                            a_to_b_queue.push(p);
+                        }
+                        super::RepairDecision::BToA(p) => {
+                            b_to_a_queue.push(p);
+                        }
+                        super::RepairDecision::Tie(_) => {
+                            ties += 1;
+                        }
+                    }
+                    Ok(())
+                })?;
+                if a_to_b_queue.len() >= REPAIR_APPLY_CHUNK_PARTITIONS {
+                    streamed_out += a_to_b_queue.len() as u64;
+                    remote.apply_partitions(table, &a_to_b_queue).await?;
+                    a_to_b_queue.clear();
+                }
+                if b_to_a_queue.len() >= REPAIR_APPLY_CHUNK_PARTITIONS {
+                    streamed_in += b_to_a_queue.len() as u64;
+                    self.local.apply_partitions(table, &b_to_a_queue).await?;
+                    b_to_a_queue.clear();
+                }
+                // Carry the "future" half forward in the input
+                // vecs so we don't pay a re-read for it.
+                let _ = (local_keep, remote_keep);
+
+                // Advance whichever side hasn't already passed
+                // `sub_end`; the other side stays at its cursor.
+                local_cursor = match local_next {
+                    Some(c) if c <= sub_end => Some(c),
+                    _ => local_cursor,
+                };
+                remote_cursor = match remote_next {
+                    Some(c) if c <= sub_end => Some(c),
+                    _ => remote_cursor,
+                };
+                if local_next.is_none() && remote_next.is_none() {
+                    break;
+                }
+            }
+            // End-of-span flush.
+            if !a_to_b_queue.is_empty() {
+                streamed_out += a_to_b_queue.len() as u64;
+                remote.apply_partitions(table, &a_to_b_queue).await?;
+                a_to_b_queue.clear();
+            }
+            if !b_to_a_queue.is_empty() {
+                streamed_in += b_to_a_queue.len() as u64;
+                self.local.apply_partitions(table, &b_to_a_queue).await?;
+                b_to_a_queue.clear();
+            }
         }
 
         Ok(SessionStats {
@@ -178,6 +475,40 @@ impl SessionExecutor for LocalRepairExecutor {
         })
     }
 }
+
+/// Coalesce up to `MERGED_SPAN_MAX_LEAVES` adjacent
+/// divergent-leaf ranges into a single span. Bigger spans amortise
+/// the per-fetch RPC overhead when the diff is dense; the cap
+/// keeps per-span working-set memory bounded — at worst-case
+/// uniform partition density the largest span holds
+/// `MERGED_SPAN_MAX_LEAVES × partitions_per_leaf` partitions on
+/// each side. Without the cap, a fully-divergent table collapses
+/// to one giant span and the executor materialises the whole
+/// replica per session, defeating the point of Merkle exchange.
+fn merge_contiguous_token_ranges(ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+    let mut run_len: usize = 0;
+    for &(s, e) in ranges {
+        if let Some(last) = out.last_mut() {
+            if last.1 == s && run_len < MERGED_SPAN_MAX_LEAVES {
+                last.1 = e;
+                run_len += 1;
+                continue;
+            }
+        }
+        out.push((s, e));
+        run_len = 1;
+    }
+    out
+}
+
+/// Maximum number of adjacent Merkle leaves combined into a
+/// single read+apply span. Sized small enough that worst-case
+/// partition size (multi-MB embedding rows on the fmem
+/// entity_store) keeps a single span's working set well under
+/// the per-session memory budget, while still amortising RPC
+/// overhead across a useful number of leaves.
+pub const MERGED_SPAN_MAX_LEAVES: usize = 8;
 
 // ───────────── In-memory RepairStore for tests ─────────────
 
@@ -252,6 +583,25 @@ impl RepairStore for InMemoryRepairStore {
             self.apply_one(p.clone()).await;
         }
         Ok(())
+    }
+
+    async fn build_merkle(
+        &self,
+        _table: &TableId,
+        range_start: i64,
+        range_end: i64,
+    ) -> Result<super::merkle::MerkleTree, String> {
+        let store = self.inner.lock().await;
+        let mut tree = super::merkle::MerkleTree::new(super::TREE_DEPTH, range_start, range_end);
+        for (_, partition) in store.iter() {
+            let token = partition.key.token.0;
+            if token < range_start || token >= range_end {
+                continue;
+            }
+            tree.insert(token, super::partition_merkle_hash(partition));
+        }
+        tree.compute_root();
+        Ok(tree)
     }
 }
 

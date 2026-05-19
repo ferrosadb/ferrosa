@@ -70,10 +70,50 @@ pub fn repair_participants(ring: &TokenRing, token: i64, rf: usize) -> Vec<u64> 
 /// Depth 15 → 32768 leaves, giving fine-grained diffing.
 pub const TREE_DEPTH: u32 = 15;
 
-/// Build a Merkle tree for a table's data within a token range.
+/// How many partitions a single `read_token_range` page returns
+/// while streaming-building a Merkle tree. Bounds the peak working
+/// set per build to `MERKLE_BUILD_BATCH × max_partition_size`.
 ///
-/// Reads all partitions from local storage, filters to the given token range,
-/// computes a hash for each partition, and inserts them into the tree.
+/// Sized small (16) because partition size on production tables
+/// varies by orders of magnitude — the fmem entity_store carries
+/// a 768-dim embedding column plus arbitrary text and metadata,
+/// so individual partitions range from a few KB to several MB.
+/// At BATCH=200 the worst case crossed 1 GiB per build × multiple
+/// concurrent builds on the same node and tripped the 2 GiB cgroup
+/// limit (kernel oom-kill, docker reported `container oom` →
+/// exit 137).
+pub const MERKLE_BUILD_BATCH: usize = 16;
+
+/// Cap on simultaneous Merkle builds **per node**. A repair run
+/// triggers a build from every direction — the node's own
+/// (initiator) `build_merkle` and one per inbound
+/// `RepairMerkleRequest` from each peer trying to repair against
+/// this replica. Without throttling, a 3-node RF=3 cluster ends
+/// up with ~4 concurrent builds on the largest replica, each
+/// holding a `MERKLE_BUILD_BATCH` page of decoded partitions.
+/// Two at a time is enough to keep the work pipelined without
+/// stacking that many in-flight pages.
+pub const REPAIR_BUILD_CONCURRENCY: usize = 2;
+
+/// Process-wide semaphore that throttles concurrent
+/// `build_tree_for_range` calls. Used by both the local executor
+/// (initiator path) and `RepairMerkleHandler` (RPC responder path)
+/// so the same budget covers every direction.
+pub static REPAIR_BUILD_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(REPAIR_BUILD_CONCURRENCY));
+
+/// Build a Merkle tree for a table's data within a token range by
+/// **streaming** the local partitions in fixed-size pages.
+///
+/// The original implementation called `read_range(None, None,
+/// usize::MAX)`, which materialised the entire table into a `Vec`
+/// before filtering — observed to OOM the 2 GiB fmem container on
+/// a 1.3 GB local replica long before the tree was built. The
+/// streaming form walks the table with a token cursor and
+/// `read_token_range(cursor, range_end, MERKLE_BUILD_BATCH)`,
+/// hashing each batch into the tree and dropping it before the
+/// next page. Peak memory is bounded by the batch size regardless
+/// of table size.
 pub fn build_tree_for_range(
     storage: &StorageEngine,
     table_id: &TableId,
@@ -81,19 +121,47 @@ pub fn build_tree_for_range(
     range_end: i64,
 ) -> Result<MerkleTree> {
     let mut tree = MerkleTree::new(TREE_DEPTH, range_start, range_end);
-
-    let partitions = storage
-        .read_range(table_id, None, None, usize::MAX)
-        .map_err(crate::error::ClusterError::Storage)?;
-
-    for partition in &partitions {
-        let token = partition.key.token.0;
-        if token < range_start || token >= range_end {
-            continue;
-        }
-        tree.insert(token, partition_merkle_hash(partition));
+    if range_start >= range_end {
+        tree.compute_root();
+        return Ok(tree);
     }
-
+    storage
+        .walk_token_range_for_digest(
+            table_id,
+            range_start,
+            range_end,
+            |key, deletion, static_row, emit_rows| {
+                // Seed the digest stream with the partition header
+                // — token, key bytes, partition deletion, static
+                // row. Then fold each clustered row in via the
+                // emit_rows continuation. The SSTable reader never
+                // materialises a `Partition`; rows are decoded one
+                // at a time and dropped as we hash them.
+                let mut stream = crate::raft::handlers::PartitionDigestStream::new(
+                    key.token.0,
+                    key.key.as_bytes(),
+                    deletion,
+                    static_row,
+                )
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!("partition digest init: {e}"))
+                })?;
+                emit_rows(&mut |row| {
+                    stream.update_row(row).map_err(|e| {
+                        ferrosa_common::Error::InvalidData(format!("partition digest update: {e}"))
+                    })
+                })?;
+                let hash = stream.finalize().map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!("partition digest finalize: {e}"))
+                })? as u64;
+                // Widen to 64 bits matching `partition_merkle_hash`.
+                let hi = (hash as u32).rotate_left(16) as u64;
+                let lo = hash & 0xFFFF_FFFF;
+                tree.insert(key.token.0, (hi << 32) | lo);
+                Ok(())
+            },
+        )
+        .map_err(crate::error::ClusterError::Storage)?;
     tree.compute_root();
     Ok(tree)
 }
@@ -205,6 +273,105 @@ pub fn diff_partition_sets(a: &[Partition], b: &[Partition]) -> RepairPlan {
     plan
 }
 
+/// One emit event from the streaming diff. The executor pushes
+/// these into bounded apply queues so the full diff is never
+/// materialised in memory.
+pub enum RepairDecision {
+    /// Partition exists only in / is newer on side A — stream the
+    /// owned partition to side B.
+    AToB(Partition),
+    /// Partition exists only in / is newer on side B — stream the
+    /// owned partition to side A.
+    BToA(Partition),
+    /// Both sides have it with the same max timestamp but
+    /// different content. Operator must reconcile manually.
+    /// Caller may record the count for observability.
+    Tie(ferrosa_common::DecoratedKey),
+}
+
+/// Streaming counterpart of [`diff_partition_sets`]. Consumes both
+/// vectors in token order (the chunked Fetch path already returns
+/// them sorted) and invokes `emit` with a [`RepairDecision`] per
+/// partition. The decision is moved out of the input — neither
+/// side's `Vec<Partition>` retains it, so the caller can drop
+/// the input vecs as soon as this returns.
+///
+/// This is the apply-phase counterpart of the build-phase
+/// streaming work: `compute_repair_plan` materialises
+/// `plan.a_to_b: Vec<Partition>` and `plan.b_to_a:
+/// Vec<Partition>` by cloning every divergent partition out of
+/// the input; on a dense chunk those clones alone cost
+/// `~chunk_size × partition_size` of duplicate allocation,
+/// which compounds across the many chunks a session walks. The
+/// streaming form emits one decision per partition without
+/// cloning — the caller batches decisions into the existing
+/// `REPAIR_APPLY_CHUNK_PARTITIONS` queues and flushes via
+/// `apply_partitions` when each fills.
+///
+/// Both inputs MUST be sorted by `(token, key_bytes)` — the
+/// chunked Fetch handler sorts before responding so this is
+/// satisfied by construction.
+pub fn diff_partition_sets_streaming<F>(
+    mut a_sorted: Vec<Partition>,
+    mut b_sorted: Vec<Partition>,
+    mut emit: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut(RepairDecision) -> std::result::Result<(), String>,
+{
+    a_sorted.reverse(); // pop() takes from the tail — reverse so pop() yields in token order
+    b_sorted.reverse();
+    let mut a_head = a_sorted.pop();
+    let mut b_head = b_sorted.pop();
+    loop {
+        match (a_head.take(), b_head.take()) {
+            (None, None) => break,
+            (Some(a), None) => {
+                emit(RepairDecision::AToB(a))?;
+                a_head = a_sorted.pop();
+            }
+            (None, Some(b)) => {
+                emit(RepairDecision::BToA(b))?;
+                b_head = b_sorted.pop();
+            }
+            (Some(a), Some(b)) => {
+                // Order by (token, key_bytes). Murmur3 collisions on
+                // a real partitioner are vanishingly rare, but the
+                // tie-break keeps the merge-join correct in pathological
+                // inputs.
+                let a_cmp = (a.key.token.0, a.key.key.as_bytes());
+                let b_cmp = (b.key.token.0, b.key.key.as_bytes());
+                match a_cmp.cmp(&b_cmp) {
+                    std::cmp::Ordering::Less => {
+                        emit(RepairDecision::AToB(a))?;
+                        a_head = a_sorted.pop();
+                        b_head = Some(b);
+                    }
+                    std::cmp::Ordering::Greater => {
+                        emit(RepairDecision::BToA(b))?;
+                        b_head = b_sorted.pop();
+                        a_head = Some(a);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let ts_a = newest_partition_timestamp(&a);
+                        let ts_b = newest_partition_timestamp(&b);
+                        if ts_a > ts_b {
+                            emit(RepairDecision::AToB(a))?;
+                        } else if ts_b > ts_a {
+                            emit(RepairDecision::BToA(b))?;
+                        } else if partition_merkle_hash(&a) != partition_merkle_hash(&b) {
+                            emit(RepairDecision::Tie(a.key.clone()))?;
+                        }
+                        a_head = a_sorted.pop();
+                        b_head = b_sorted.pop();
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compute a [`RepairPlan`] between two partition sets covering the same
 /// `[range_start, range_end)` token range, using a Merkle tree to skip
 /// identical sub-ranges before partition-level comparison.
@@ -282,7 +449,11 @@ pub fn compute_repair_plan(
 /// possible but cap at ~2^-32 per leaf for diverging content (Cassandra's
 /// classic merkle accepts the same trade-off).
 pub fn partition_merkle_hash(partition: &Partition) -> u64 {
-    match crate::raft::handlers::compute_partition_digest(partition) {
+    // Use the streaming digest so the Merkle build doesn't allocate
+    // a Vec<u8> the size of each partition's serialised form on the
+    // way to a 4-byte CRC. Byte-identical output is pinned by
+    // `partition_digest_streaming_matches_legacy`.
+    match crate::raft::handlers::compute_partition_digest_streaming(partition) {
         Ok(crc) => {
             // Two-step widen: high half = CRC, low half = CRC rotated.
             // Better than zero-padding because zero-pad leaves the upper
@@ -571,6 +742,81 @@ mod tests {
         assert_eq!(keys_a_to_b, [&b"k1"[..], &b"k2"[..]].into_iter().collect());
         assert_eq!(keys_b_to_a, [&b"k3"[..], &b"k4"[..]].into_iter().collect());
         assert!(plan.timestamp_ties.is_empty());
+    }
+
+    /// `diff_partition_sets_streaming` emits the same decisions
+    /// as `diff_partition_sets` produces in its plan — same
+    /// keys in a_to_b / b_to_a, same ties — but consumes the
+    /// inputs by value instead of cloning each chosen partition
+    /// into a plan vector. The executor uses it to drive a
+    /// bounded apply queue without holding the full per-chunk
+    /// diff in memory.
+    #[test]
+    fn diff_partition_sets_streaming_matches_one_shot_diff() {
+        // Same mixed scenario as `diff_partition_sets_mixed_scenario`.
+        let a = vec![
+            test_partition(b"k1", b"a1", 100),
+            test_partition(b"k2", b"new", 500),
+            test_partition(b"k3", b"old", 100),
+            test_partition(b"k5", b"same", 999),
+        ];
+        let b = vec![
+            test_partition(b"k2", b"old", 100),
+            test_partition(b"k3", b"new", 500),
+            test_partition(b"k4", b"b4", 100),
+            test_partition(b"k5", b"same", 999),
+        ];
+
+        // Both sides must be sorted by `(token, key_bytes)` per
+        // the streaming-diff contract.
+        let mut a_sorted = a.clone();
+        a_sorted.sort_by(|p, q| {
+            (p.key.token.0, p.key.key.as_bytes()).cmp(&(q.key.token.0, q.key.key.as_bytes()))
+        });
+        let mut b_sorted = b.clone();
+        b_sorted.sort_by(|p, q| {
+            (p.key.token.0, p.key.key.as_bytes()).cmp(&(q.key.token.0, q.key.key.as_bytes()))
+        });
+
+        let plan_one_shot = diff_partition_sets(&a, &b);
+        let one_shot_a_to_b: std::collections::BTreeSet<Vec<u8>> = plan_one_shot
+            .a_to_b
+            .iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect();
+        let one_shot_b_to_a: std::collections::BTreeSet<Vec<u8>> = plan_one_shot
+            .b_to_a
+            .iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect();
+        let one_shot_ties: std::collections::BTreeSet<Vec<u8>> = plan_one_shot
+            .timestamp_ties
+            .iter()
+            .map(|k| k.key.as_bytes().to_vec())
+            .collect();
+
+        let mut stream_a_to_b: std::collections::BTreeSet<Vec<u8>> = Default::default();
+        let mut stream_b_to_a: std::collections::BTreeSet<Vec<u8>> = Default::default();
+        let mut stream_ties: std::collections::BTreeSet<Vec<u8>> = Default::default();
+        diff_partition_sets_streaming(a_sorted, b_sorted, |decision| {
+            match decision {
+                RepairDecision::AToB(p) => {
+                    stream_a_to_b.insert(p.key.key.as_bytes().to_vec());
+                }
+                RepairDecision::BToA(p) => {
+                    stream_b_to_a.insert(p.key.key.as_bytes().to_vec());
+                }
+                RepairDecision::Tie(k) => {
+                    stream_ties.insert(k.key.as_bytes().to_vec());
+                }
+            }
+            Ok(())
+        })
+        .expect("streaming diff must succeed on pre-sorted inputs");
+
+        assert_eq!(stream_a_to_b, one_shot_a_to_b, "A→B decisions match");
+        assert_eq!(stream_b_to_a, one_shot_b_to_a, "B→A decisions match");
+        assert_eq!(stream_ties, one_shot_ties, "tie decisions match");
     }
 
     // ---- compute_repair_plan: Merkle-narrowed end-to-end diff ----

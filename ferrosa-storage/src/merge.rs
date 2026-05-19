@@ -91,7 +91,13 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition {
 }
 
 /// Merge two rows with the same clustering key using cell-level LWW.
-fn merge_rows(a: Row, b: Row) -> Row {
+///
+/// Public so the cluster repair crate's cross-source streaming
+/// merge in `TableStore::walk_token_range_for_digest` can fold
+/// rows arriving one-at-a-time from N SSTable iterators into the
+/// merged row that gets hashed into a `PartitionDigestStream` —
+/// without ever materialising the full multi-source partition.
+pub fn merge_rows(a: Row, b: Row) -> Row {
     // Row-level deletion: newer wins
     let deletion = if b.deletion.marked_for_delete_at > a.deletion.marked_for_delete_at {
         b.deletion

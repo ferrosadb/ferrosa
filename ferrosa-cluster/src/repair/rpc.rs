@@ -59,11 +59,35 @@ pub struct RepairFetchRequestPayload {
     pub table: String,
     pub range_start: i64,
     pub range_end: i64,
+    /// Resume token for chunked fetch: the server reads partitions
+    /// whose tokens fall in `[cursor.unwrap_or(range_start), range_end)`.
+    /// `None` (first call) means start at `range_start`.
+    #[serde(default)]
+    pub cursor: Option<i64>,
+    /// Hard cap on partitions returned in this chunk. The client
+    /// loops fetching chunks until `next_cursor` is `None`. Sized
+    /// so the working set per chunk stays well under the per-node
+    /// memory cap regardless of partition size; the executor sets
+    /// this to `REPAIR_FETCH_CHUNK_PARTITIONS`.
+    #[serde(default = "default_fetch_limit")]
+    pub limit: u32,
+}
+
+/// Backwards-compatible default for the `limit` field on payloads
+/// deserialised from peers that don't yet send one. Matches
+/// `RepairStore::READ_RANGE_CHUNK_DEFAULT`.
+fn default_fetch_limit() -> u32 {
+    super::executor::REPAIR_FETCH_CHUNK_PARTITIONS as u32
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepairFetchResponsePayload {
     pub partitions: Vec<PartitionWire>,
+    /// Resume token for the next chunk. `None` indicates the
+    /// server returned every remaining partition in
+    /// `[cursor, range_end)` — caller should stop looping.
+    #[serde(default)]
+    pub next_cursor: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,6 +132,19 @@ impl RpcHandler for RepairMerkleHandler {
             }
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
+        // Share the same build budget as the initiator path —
+        // every repair touches the local table twice (once for
+        // this node's own session, once on behalf of each peer
+        // initiating against this node), so without one semaphore
+        // governing both, a cluster of N stacks N full-table
+        // walks here per repair run.
+        let _permit = match super::REPAIR_BUILD_SEMAPHORE.acquire().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%e, "RepairMerkleHandler: build semaphore closed");
+                return None;
+            }
+        };
         let tree = match super::build_tree_for_range(
             &self.storage,
             &table_id,
@@ -158,16 +195,25 @@ impl RpcHandler for RepairFetchHandler {
             }
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
-        // Token-bounded read: repair asks "everything in this token
-        // sub-range," which the new `read_token_range` primitive answers
-        // directly. Limit matches the storage materialisation cap.
-        const REPAIR_LEAF_READ_LIMIT: usize = 10_000;
-        let in_range_partitions = match StorageEngine::read_token_range(
+        // Token-bounded chunked read: the client loops calling
+        // Fetch with `cursor` carried forward from the prior
+        // response's `next_cursor` until we report `next_cursor:
+        // None`. Each chunk's `limit` caps the number of
+        // partitions in flight so per-RPC memory is bounded.
+        let chunk_start = req.cursor.unwrap_or(req.range_start);
+        let limit = req.limit.max(1) as usize;
+        // Ask for one more than `limit` so we can detect "more
+        // remaining" without an extra round-trip: if the storage
+        // engine returns `limit+1` matches, the (limit+1)th
+        // partition's token becomes the next cursor and is dropped
+        // from the response.
+        let probe = limit.saturating_add(1);
+        let mut in_range_partitions = match StorageEngine::read_token_range(
             &self.storage,
             &table_id,
-            req.range_start,
+            chunk_start,
             req.range_end,
-            REPAIR_LEAF_READ_LIMIT,
+            probe,
         ) {
             Ok(ps) => ps,
             Err(e) => {
@@ -175,12 +221,27 @@ impl RpcHandler for RepairFetchHandler {
                 return None;
             }
         };
+        // Sort by token so chunked iteration is well-defined even
+        // if the storage layer returns out-of-order on a multi-
+        // source merge path.
+        in_range_partitions.sort_by_key(|p| p.key.token.0);
+        let next_cursor: Option<i64> = if in_range_partitions.len() > limit {
+            // The (limit+1)th partition reveals where the next
+            // chunk should resume — keep the first `limit`,
+            // capture the cursor, drop the rest of the probe.
+            let next = in_range_partitions[limit].key.token.0;
+            in_range_partitions.truncate(limit);
+            Some(next)
+        } else {
+            None
+        };
         let in_range: Vec<PartitionWire> = in_range_partitions
             .into_iter()
             .map(partition_to_wire)
             .collect();
         let resp = RepairFetchResponsePayload {
             partitions: in_range,
+            next_cursor,
         };
         match bincode::serialize(&resp) {
             Ok(body) => Some(Message::RepairFetchResponse(Bytes::from(body))),
@@ -280,19 +341,54 @@ impl RepairStore for RemoteRepairStore {
         range_start: i64,
         range_end: i64,
     ) -> Result<Vec<Partition>, String> {
+        // Loop the chunked path until exhausted, accumulating the
+        // result. Callers that care about memory should use
+        // `read_range_chunked` directly. Kept for compatibility +
+        // tests that want the one-shot semantics.
+        let mut out: Vec<Partition> = Vec::new();
+        let mut cursor: Option<i64> = None;
+        loop {
+            let (chunk, next) = self
+                .read_range_chunked(
+                    table,
+                    range_start,
+                    range_end,
+                    cursor,
+                    super::executor::REPAIR_FETCH_CHUNK_PARTITIONS,
+                )
+                .await?;
+            out.extend(chunk);
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn read_range_chunked(
+        &self,
+        table: &TableId,
+        range_start: i64,
+        range_end: i64,
+        cursor: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Partition>, Option<i64>), String> {
         let req = RepairFetchRequestPayload {
             keyspace: table.keyspace.clone(),
             table: table.table.clone(),
             range_start,
             range_end,
+            cursor,
+            limit: limit.min(u32::MAX as usize) as u32,
         };
         let body = bincode::serialize(&req).map_err(|e| format!("serialize: {e}"))?;
-        // Lane::Bulk: a Fetch response carries up to REPAIR_LEAF_READ_LIMIT
-        // (10 000) partitions — that's bulk transfer semantics, not a
-        // transactional read. Lane::Data's 10s timeout fires before a
-        // multi-GB-replica peer can finish its read_token_range scan,
-        // every session's caller drops, and repair never converges.
-        // Bulk gives 60s, which matches SSTable streaming's lane choice.
+        // Lane::Bulk: chunked responses are still bulk (each
+        // chunk carries up to `limit` decoded partitions) but
+        // the per-chunk size is bounded by the executor's choice
+        // of `REPAIR_FETCH_CHUNK_PARTITIONS`. The 60 s timeout
+        // sits comfortably above the per-chunk encode + read
+        // latency even on a multi-GB replica.
         let resp = self
             .peer_manager
             .send(
@@ -313,11 +409,12 @@ impl RepairStore for RemoteRepairStore {
         };
         let resp: RepairFetchResponsePayload =
             bincode::deserialize(&body).map_err(|e| format!("deserialize: {e}"))?;
-        Ok(resp
+        let parts: Vec<Partition> = resp
             .partitions
             .into_iter()
             .map(partition_from_wire)
-            .collect())
+            .collect();
+        Ok((parts, resp.next_cursor))
     }
 
     async fn apply_partitions(
@@ -325,36 +422,87 @@ impl RepairStore for RemoteRepairStore {
         table: &TableId,
         partitions: &[Partition],
     ) -> Result<(), String> {
-        let req = RepairApplyRequestPayload {
+        // Chunk the apply payload so the wire body, the peer's
+        // bincode-deserialise buffer, and the peer's in-flight
+        // applied state all stay bounded. Without this the apply
+        // RPC carries the full diff for a span — fine when spans
+        // are small, but the moment a span happens to be dense
+        // the peer materialises that whole payload in memory
+        // (decoded `PartitionWire` → `Partition`) and the cgroup
+        // OOMs.
+        for chunk in partitions.chunks(super::executor::REPAIR_APPLY_CHUNK_PARTITIONS) {
+            let req = RepairApplyRequestPayload {
+                keyspace: table.keyspace.clone(),
+                table: table.table.clone(),
+                partitions: chunk.iter().cloned().map(partition_to_wire).collect(),
+            };
+            let body = bincode::serialize(&req).map_err(|e| format!("serialize: {e}"))?;
+            let resp = self
+                .peer_manager
+                .send(
+                    self.host_id,
+                    Message::RepairApplyRequest(Bytes::from(body)),
+                    Lane::Bulk,
+                )
+                .await
+                .map_err(|e| format!("send: {e}"))?;
+            let body = match resp {
+                Message::RepairApplyResponse(b) => b,
+                other => {
+                    return Err(format!(
+                        "expected RepairApplyResponse, got {:?}",
+                        std::mem::discriminant(&other)
+                    ))
+                }
+            };
+            let resp: RepairApplyResponsePayload =
+                bincode::deserialize(&body).map_err(|e| format!("deserialize: {e}"))?;
+            if let Some(e) = resp.error {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn build_merkle(
+        &self,
+        table: &TableId,
+        range_start: i64,
+        range_end: i64,
+    ) -> Result<super::merkle::MerkleTree, String> {
+        let req = RepairMerkleRequestPayload {
             keyspace: table.keyspace.clone(),
             table: table.table.clone(),
-            partitions: partitions.iter().cloned().map(partition_to_wire).collect(),
+            range_start,
+            range_end,
         };
         let body = bincode::serialize(&req).map_err(|e| format!("serialize: {e}"))?;
+        // Lane::Bulk: a Merkle build over a multi-GB replica can
+        // legitimately take seconds — same lane that Fetch/Apply
+        // already use so a single repair session shares one TCP
+        // pipe with its data exchange. Response payload is tiny
+        // (TREE_DEPTH=15 → ~256 KB of leaf hashes).
         let resp = self
             .peer_manager
             .send(
                 self.host_id,
-                Message::RepairApplyRequest(Bytes::from(body)),
+                Message::RepairMerkleRequest(Bytes::from(body)),
                 Lane::Bulk,
             )
             .await
             .map_err(|e| format!("send: {e}"))?;
         let body = match resp {
-            Message::RepairApplyResponse(b) => b,
+            Message::RepairMerkleResponse(b) => b,
             other => {
                 return Err(format!(
-                    "expected RepairApplyResponse, got {:?}",
+                    "expected RepairMerkleResponse, got {:?}",
                     std::mem::discriminant(&other)
                 ))
             }
         };
-        let resp: RepairApplyResponsePayload =
+        let resp: RepairMerkleResponsePayload =
             bincode::deserialize(&body).map_err(|e| format!("deserialize: {e}"))?;
-        match resp.error {
-            None => Ok(()),
-            Some(e) => Err(e),
-        }
+        Ok(resp.tree)
     }
 }
 
