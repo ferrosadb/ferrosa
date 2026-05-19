@@ -32,6 +32,7 @@ fn test_engine_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig 
         object_store: None,
         local_cache_max_bytes: profile.local_cache_max_bytes,
         flush_threshold_bytes: profile.flush_threshold_bytes,
+        memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 30,
         data_dir: dir.to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,

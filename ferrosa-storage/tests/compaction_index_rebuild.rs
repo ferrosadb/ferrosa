@@ -45,7 +45,8 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
         flush_threshold_bytes: 64 * 1024, // 64KB to avoid auto-flush
-        flush_max_age_secs: 300,          // 5min — don't trigger age-based flush in this test
+        memtable_backpressure_bytes: u64::MAX,
+        flush_max_age_secs: 300, // 5min — don't trigger age-based flush in this test
         data_dir: dir.to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
         auth_enabled: false,
