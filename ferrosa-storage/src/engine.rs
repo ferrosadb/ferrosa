@@ -2132,6 +2132,70 @@ impl StorageEngine {
         state.store.read_token_range(start_token, end_token, limit)
     }
 
+    /// Row-streaming walk over `[start_token, end_token)` for the
+    /// anti-entropy repair digest path. For each unique partition
+    /// the callback receives the header (key, deletion, optional
+    /// static row) plus an `emit_rows` continuation that walks
+    /// clustered rows one at a time. When a key is in exactly one
+    /// SSTable source the rows are streamed via the SSTable
+    /// reader's 2-phase API; no `Partition` is materialised. See
+    /// `TableStore::walk_token_range_for_digest` for the full
+    /// contract.
+    pub fn walk_token_range_for_digest<Cb>(
+        &self,
+        table_id: &TableId,
+        start_token: i64,
+        end_token: i64,
+        cb: Cb,
+    ) -> ferrosa_common::Result<()>
+    where
+        Cb: FnMut(
+            &ferrosa_common::DecoratedKey,
+            ferrosa_sstable::types::DeletionTime,
+            Option<&ferrosa_sstable::types::Row>,
+            &mut dyn FnMut(
+                &mut dyn FnMut(&ferrosa_sstable::types::Row) -> Result<(), ferrosa_common::Error>,
+            ) -> Result<(), ferrosa_common::Error>,
+        ) -> Result<(), ferrosa_common::Error>,
+    {
+        if start_token >= end_token {
+            return Ok(());
+        }
+        let tables = self.tables.read();
+        let Some(state) = tables.get(table_id) else {
+            return Ok(());
+        };
+        state
+            .store
+            .walk_token_range_for_digest(start_token, end_token, cb)
+    }
+
+    /// Streaming token-bounded walk that invokes `cb` once per
+    /// partition. Peak working set is **one** decoded partition per
+    /// SSTable source held by the in-flight merge head, so a
+    /// multi-GB table doesn't trip the per-container memory cap
+    /// even when partitions contain multi-MB rows. Used by
+    /// anti-entropy repair's Merkle-build path.
+    pub fn walk_token_range<F>(
+        &self,
+        table_id: &TableId,
+        start_token: i64,
+        end_token: i64,
+        cb: F,
+    ) -> ferrosa_common::Result<()>
+    where
+        F: FnMut(&Partition) -> ferrosa_common::Result<()>,
+    {
+        if start_token >= end_token {
+            return Ok(());
+        }
+        let tables = self.tables.read();
+        let Some(state) = tables.get(table_id) else {
+            return Ok(());
+        };
+        state.store.walk_token_range(start_token, end_token, cb)
+    }
+
     /// Reads partitions from a table with an optional per-partition row cap.
     pub fn read_range_limited_rows(
         &self,

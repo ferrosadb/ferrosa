@@ -1279,6 +1279,471 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(merged.into_iter().take(limit).collect())
     }
 
+    /// Streaming token-bounded walk: invoke `cb` for every partition
+    /// in `[start_token, end_token)`, one at a time, dropping each
+    /// before the next is decoded.
+    ///
+    /// The materialising `read_token_range` collects up to `limit`
+    /// partitions into a `Vec` before returning. Repair's Merkle
+    /// build only needs the hash of each partition — never the
+    /// collection — so a callback that consumes each partition by
+    /// reference lets the iterator's per-partition allocation be
+    /// freed on the next loop. Peak working-set is **one** decoded
+    /// partition per active walker, regardless of table size,
+    /// partition density, or per-partition row count.
+    ///
+    /// This is the only path that bounds memory for a Merkle build
+    /// on a table with multi-MB partitions inside the fmem 2 GiB
+    /// cgroup. The Vec-returning `read_token_range`, even with
+    /// `limit = 16`, still materialised dozens of MB of decoded
+    /// content per page; concurrent pages stacked past the cap.
+    ///
+    /// Dedup across (memtable + flushing-memtable + sstables) for
+    /// the same partition key is preserved: the callback receives
+    /// the *cell-merged* partition (cross-source dedup happens via
+    /// an O(1) "carry" — at most one held partition is kept in
+    /// flight, merged with later occurrences of the same key, then
+    /// emitted when a strictly-greater key arrives).
+    /// Walk partitions in `[start_token, end_token)` for the
+    /// anti-entropy repair digest path.
+    ///
+    /// For each unique partition key the callback is invoked with
+    /// the key, deletion, optional static row, and an `emit_rows`
+    /// continuation. The continuation accepts a `&mut dyn
+    /// FnMut(&Row) -> Result<()>` and walks the partition's
+    /// clustered rows, invoking it once per row.
+    ///
+    /// **Hot path** (key is in exactly one SSTable source, neither
+    /// memtable has it): rows are streamed via the SSTable
+    /// reader's 2-phase API — `next_partition_header_only` then
+    /// `stream_clustered_rows`. No `Partition` is materialised;
+    /// peak working set during the partition is one row.
+    ///
+    /// **Multi-source fallback** (memtable + SSTable, or
+    /// overlapping LSM levels): every contributing source's full
+    /// partition is decoded, `merge_partitions` + `apply_deletions`
+    /// produce the cell-merged content, and `emit_rows` iterates
+    /// the merged row vector. Same cost as the legacy materialised
+    /// path; only triggers for keys with cross-source content
+    /// (active writes / pre-compaction state) — settled replicas
+    /// stay on the hot path.
+    pub fn walk_token_range_for_digest<Cb>(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        mut cb: Cb,
+    ) -> Result<()>
+    where
+        Cb: FnMut(
+            &DecoratedKey,
+            ferrosa_sstable::types::DeletionTime,
+            Option<&ferrosa_sstable::types::Row>,
+            &mut dyn FnMut(&mut dyn FnMut(&ferrosa_sstable::types::Row) -> Result<()>) -> Result<()>,
+        ) -> Result<()>,
+    {
+        if start_token >= end_token {
+            return Ok(());
+        }
+        let guard = self.view.load();
+
+        // Memtable bootstrap (same shape as walk_token_range).
+        let mut mem_active: Vec<Partition> = guard
+            .active
+            .range_iter(None, None)
+            .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+            .collect();
+        mem_active.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut mem_active_iter = mem_active.into_iter().peekable();
+
+        let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
+            Some(ref f) => f
+                .range_iter(None, None)
+                .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+                .collect(),
+            None => Vec::new(),
+        };
+        mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut mem_flushing_iter = mem_flushing_vec.into_iter().peekable();
+
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
+            Vec::with_capacity(guard.sstables.len());
+        for sstable in guard.sstables.iter() {
+            let mut iter = match sstable.partitions_iter() {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+            let _ = iter.seek_to_token(start_token);
+            while let Ok(Some(k)) = iter.peek_partition_key() {
+                if k.token.0 < start_token {
+                    if iter.skip_to_next_partition().is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            sst_iters.push(iter);
+        }
+
+        loop {
+            // Pick the smallest key across all sources via peek.
+            let mut smallest_key: Option<DecoratedKey> = None;
+            let pick = |cur: &Option<DecoratedKey>, candidate: &DecoratedKey| -> bool {
+                cur.as_ref().map(|k| candidate < k).unwrap_or(true)
+            };
+            if let Some(p) = mem_active_iter.peek() {
+                if pick(&smallest_key, &p.key) {
+                    smallest_key = Some(p.key.clone());
+                }
+            }
+            if let Some(p) = mem_flushing_iter.peek() {
+                if pick(&smallest_key, &p.key) {
+                    smallest_key = Some(p.key.clone());
+                }
+            }
+            for iter in sst_iters.iter_mut() {
+                if let Ok(Some(k)) = iter.peek_partition_key() {
+                    if k.token.0 >= end_token {
+                        continue;
+                    }
+                    if pick(&smallest_key, &k) {
+                        smallest_key = Some(k);
+                    }
+                }
+            }
+            let Some(key) = smallest_key else {
+                break;
+            };
+
+            // Count how many sources hold `key`.
+            let mem_active_has = mem_active_iter.peek().map(|p| p.key == key) == Some(true);
+            let mem_flushing_has = mem_flushing_iter.peek().map(|p| p.key == key) == Some(true);
+            let sst_match_indices: Vec<usize> = sst_iters
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, iter)| match iter.peek_partition_key() {
+                    Ok(Some(k)) if k == key => Some(i),
+                    _ => None,
+                })
+                .collect();
+            let total_sources =
+                (mem_active_has as usize) + (mem_flushing_has as usize) + sst_match_indices.len();
+
+            if total_sources == 1 && sst_match_indices.len() == 1 {
+                // Hot path: single SSTable source. Use the 2-phase
+                // SSTable API so no `Partition` ever materialises.
+                let sst_idx = sst_match_indices[0];
+                let header = sst_iters[sst_idx]
+                    .next_partition_header_only()?
+                    .expect("source had key; header must yield");
+                let (decoded_key, deletion, static_row) = header;
+                debug_assert_eq!(decoded_key, key);
+                let iter_ref = &mut sst_iters[sst_idx];
+                let mut emit_rows = |on_row: &mut dyn FnMut(
+                    &ferrosa_sstable::types::Row,
+                ) -> Result<()>|
+                 -> Result<()> {
+                    iter_ref.stream_clustered_rows(|row| on_row(row))
+                };
+                cb(&decoded_key, deletion, static_row.as_ref(), &mut emit_rows)?;
+            } else {
+                // Multi-source streaming merge. The header (deletion,
+                // static row) is small (zero-or-one static row × N
+                // sources) so we merge it eagerly. The clustered
+                // rows are k-way-merged BY CLUSTERING KEY across all
+                // sources, one row at a time — we never hold the
+                // full multi-source partition in memory at any point.
+                //
+                // Memtable sources contribute a pre-sorted `Vec<Row>`
+                // iterator (the active memtable's rows are pulled
+                // into a Vec just for this partition, then iterated).
+                // SSTable sources contribute their `PartitionIter`,
+                // walked via `next_clustered_row` so each source's
+                // in-flight footprint is exactly one decoded row.
+
+                // Per-source memtable rows (sorted by clustering)
+                // and per-source SSTable iter indices.
+                let mut mem_row_iters: Vec<std::vec::IntoIter<ferrosa_sstable::types::Row>> =
+                    Vec::new();
+                let mut headers: Vec<(
+                    DecoratedKey,
+                    ferrosa_sstable::types::DeletionTime,
+                    Option<ferrosa_sstable::types::Row>,
+                )> = Vec::with_capacity(total_sources);
+
+                if mem_active_has {
+                    let p = mem_active_iter.next().expect("peeked");
+                    let key_p = p.key.clone();
+                    let deletion = p.deletion;
+                    let static_row = p.static_row;
+                    let mut rows = p.rows;
+                    rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
+                    headers.push((key_p, deletion, static_row));
+                    mem_row_iters.push(rows.into_iter());
+                }
+                if mem_flushing_has {
+                    let p = mem_flushing_iter.next().expect("peeked");
+                    let key_p = p.key.clone();
+                    let deletion = p.deletion;
+                    let static_row = p.static_row;
+                    let mut rows = p.rows;
+                    rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
+                    headers.push((key_p, deletion, static_row));
+                    mem_row_iters.push(rows.into_iter());
+                }
+                for i in &sst_match_indices {
+                    if let Some((k, d, sr)) = sst_iters[*i].next_partition_header_only()? {
+                        headers.push((k, d, sr));
+                    }
+                }
+
+                // Merge header: max-timestamp deletion, cell-merged
+                // static row.
+                let mut merged_deletion = ferrosa_sstable::types::DeletionTime::LIVE;
+                let mut merged_static: Option<ferrosa_sstable::types::Row> = None;
+                for (_, d, sr) in &headers {
+                    if d.marked_for_delete_at > merged_deletion.marked_for_delete_at {
+                        merged_deletion = *d;
+                    }
+                    if let Some(s) = sr {
+                        merged_static = match merged_static.take() {
+                            Some(prev) => Some(crate::merge::merge_rows(prev, s.clone())),
+                            None => Some(s.clone()),
+                        };
+                    }
+                }
+                let merged_key = headers[0].0.clone();
+
+                // Streaming row merge. Heads from each source —
+                // memtable rows arrive from `mem_row_iters`,
+                // SSTable rows from `sst_iters[idx].next_clustered_row()`.
+                let mem_indices: Vec<usize> = (0..mem_row_iters.len()).collect();
+                let sst_local_indices = sst_match_indices.clone();
+                let mut emit_rows = |on_row: &mut dyn FnMut(
+                    &ferrosa_sstable::types::Row,
+                ) -> Result<()>|
+                 -> Result<()> {
+                    let mut mem_heads: Vec<Option<ferrosa_sstable::types::Row>> =
+                        mem_row_iters.iter_mut().map(|it| it.next()).collect();
+                    let mut sst_heads: Vec<Option<ferrosa_sstable::types::Row>> =
+                        Vec::with_capacity(sst_local_indices.len());
+                    for &si in &sst_local_indices {
+                        sst_heads.push(sst_iters[si].next_clustered_row().map_err(|e| {
+                            ferrosa_common::Error::InvalidData(format!(
+                                "sst.next_clustered_row: {e}"
+                            ))
+                        })?);
+                    }
+                    loop {
+                        // Pick the smallest clustering key
+                        // across all live heads.
+                        let mut smallest: Option<Vec<u8>> = None;
+                        for r in mem_heads.iter().flatten() {
+                            if smallest.as_ref().map(|c| r.clustering < *c).unwrap_or(true) {
+                                smallest = Some(r.clustering.clone());
+                            }
+                        }
+                        for r in sst_heads.iter().flatten() {
+                            if smallest.as_ref().map(|c| r.clustering < *c).unwrap_or(true) {
+                                smallest = Some(r.clustering.clone());
+                            }
+                        }
+                        let Some(ck) = smallest else { break };
+
+                        // Collect every source's row at that
+                        // clustering, merging cells one pair at
+                        // a time. Peak in-flight: two rows.
+                        let mut merged_row: Option<ferrosa_sstable::types::Row> = None;
+                        for (i_local, _i_global) in mem_indices.iter().enumerate() {
+                            if mem_heads[i_local]
+                                .as_ref()
+                                .map(|r| r.clustering == ck)
+                                .unwrap_or(false)
+                            {
+                                let row = mem_heads[i_local].take().unwrap();
+                                merged_row = match merged_row.take() {
+                                    Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                                    None => Some(row),
+                                };
+                                mem_heads[i_local] = mem_row_iters[i_local].next();
+                            }
+                        }
+                        for (h_idx, &si) in sst_local_indices.iter().enumerate() {
+                            if sst_heads[h_idx]
+                                .as_ref()
+                                .map(|r| r.clustering == ck)
+                                .unwrap_or(false)
+                            {
+                                let row = sst_heads[h_idx].take().unwrap();
+                                merged_row = match merged_row.take() {
+                                    Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                                    None => Some(row),
+                                };
+                                sst_heads[h_idx] =
+                                    sst_iters[si].next_clustered_row().map_err(|e| {
+                                        ferrosa_common::Error::InvalidData(format!(
+                                            "sst.next_clustered_row: {e}"
+                                        ))
+                                    })?;
+                            }
+                        }
+                        let row = merged_row.expect("at least one source matched");
+                        on_row(&row)?;
+                        drop(row);
+                    }
+                    Ok(())
+                };
+                cb(
+                    &merged_key,
+                    merged_deletion,
+                    merged_static.as_ref(),
+                    &mut emit_rows,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn walk_token_range<Cb>(&self, start_token: i64, end_token: i64, mut cb: Cb) -> Result<()>
+    where
+        Cb: FnMut(&Partition) -> Result<()>,
+    {
+        if start_token >= end_token {
+            return Ok(());
+        }
+        let guard = self.view.load();
+
+        // K-way merge across sources (memtables + every SSTable)
+        // by key. Each source advertises its current key via a
+        // cheap **peek** (DecoratedKey only — no row bodies); the
+        // partition body is decoded ONLY for the source(s) whose
+        // peek matches the smallest key in the current cycle.
+        // That keeps peak in-flight memory at `O(#decoded_in_cycle)`
+        // — typically 1-3 partitions — regardless of how many
+        // SSTables exist or how big each partition is. The earlier
+        // version held `#sources × decoded_partition` simultaneously
+        // and OOM'd the 2 GiB cgroup at ~1.8 GiB on a 235-SSTable
+        // replica with fat partitions.
+
+        // Memtable matches are cheap to collect (memtables are
+        // already in memory by design) and small. Sort by key so
+        // the merge can rely on per-source order.
+        let mut mem_active: Vec<Partition> = guard
+            .active
+            .range_iter(None, None)
+            .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+            .collect();
+        mem_active.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut mem_active_iter = mem_active.into_iter().peekable();
+
+        let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
+            Some(ref f) => f
+                .range_iter(None, None)
+                .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+                .collect(),
+            None => Vec::new(),
+        };
+        mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut mem_flushing_iter = mem_flushing_vec.into_iter().peekable();
+
+        // For each SSTable: an iter parked at the first in-range
+        // partition. We do NOT decode the body — we keep only the
+        // peeked DecoratedKey (small).
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
+            Vec::with_capacity(guard.sstables.len());
+        for sstable in guard.sstables.iter() {
+            let mut iter = match sstable.partitions_iter() {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+            // seek_to_token can leave us BEFORE start_token (cache
+            // build failed → no-op) — the per-cycle key compare
+            // handles that, but skip any partition with token <
+            // start_token here to keep the peek-key honest.
+            let _ = iter.seek_to_token(start_token);
+            // Advance past any pre-range partitions left over from
+            // a cache-build-failure fallback.
+            while let Ok(Some(k)) = iter.peek_partition_key() {
+                if k.token.0 < start_token {
+                    // skip past this partition
+                    if iter.skip_to_next_partition().is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            sst_iters.push(iter);
+        }
+
+        loop {
+            // Pick the smallest key across all sources, using
+            // peek for SSTables (no body decode).
+            let mut smallest_key: Option<DecoratedKey> = None;
+            let pick = |cur: &Option<DecoratedKey>, candidate: &DecoratedKey| -> bool {
+                cur.as_ref().map(|k| candidate < k).unwrap_or(true)
+            };
+            if let Some(p) = mem_active_iter.peek() {
+                if pick(&smallest_key, &p.key) {
+                    smallest_key = Some(p.key.clone());
+                }
+            }
+            if let Some(p) = mem_flushing_iter.peek() {
+                if pick(&smallest_key, &p.key) {
+                    smallest_key = Some(p.key.clone());
+                }
+            }
+            for iter in sst_iters.iter_mut() {
+                if let Ok(Some(k)) = iter.peek_partition_key() {
+                    if k.token.0 >= end_token {
+                        // sstable is past the range; treat as exhausted
+                        continue;
+                    }
+                    if pick(&smallest_key, &k) {
+                        smallest_key = Some(k);
+                    }
+                }
+            }
+            let Some(key) = smallest_key else {
+                break; // every source exhausted
+            };
+
+            // Decode the body ONLY from sources whose peek matches
+            // the smallest key — typically 1 source, occasionally
+            // a handful when the same key landed in both memtable
+            // and an SSTable (or got split across compactions).
+            let mut group: Vec<Partition> = Vec::new();
+            if mem_active_iter.peek().map(|p| p.key == key) == Some(true) {
+                group.push(mem_active_iter.next().expect("peeked"));
+            }
+            if mem_flushing_iter.peek().map(|p| p.key == key) == Some(true) {
+                group.push(mem_flushing_iter.next().expect("peeked"));
+            }
+            for iter in sst_iters.iter_mut() {
+                let matches = matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key);
+                if !matches {
+                    continue;
+                }
+                match iter.next_partition() {
+                    Ok(Some(p)) => group.push(p),
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+
+            let merged = if group.len() == 1 {
+                group.into_iter().next().expect("len 1")
+            } else {
+                let mut m = crate::merge::merge_partitions(group);
+                crate::merge::apply_deletions(&mut m);
+                m
+            };
+            cb(&merged)?;
+            drop(merged);
+        }
+        Ok(())
+    }
+
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,
