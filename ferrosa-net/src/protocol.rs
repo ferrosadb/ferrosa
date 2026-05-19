@@ -1537,7 +1537,13 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::RangeReadRequest
             | MsgType::RangeReadResponse
             | MsgType::TruncateForward
-            | MsgType::TruncateAck,
+            | MsgType::TruncateAck
+            | MsgType::RepairMerkleRequest
+            | MsgType::RepairMerkleResponse
+            | MsgType::RepairFetchRequest
+            | MsgType::RepairFetchResponse
+            | MsgType::RepairApplyRequest
+            | MsgType::RepairApplyResponse,
         ) => MessageFamily::Data,
         Ok(
             MsgType::StreamStart

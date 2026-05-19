@@ -603,6 +603,42 @@ pub async fn ring(host: &str, web_port: u16) -> Result<(), WebError> {
     Ok(())
 }
 
+/// Run anti-entropy repair against every peer that replicates `keyspace.table`.
+///
+/// Issues `POST /api/cluster/repair?keyspace=&table=&rf=` and prints the
+/// per-table session summary the server returns: total/ok/failed session
+/// counts, partitions streamed in/out, timestamp ties, and any error
+/// strings from individual sessions.
+pub async fn repair(
+    host: &str,
+    web_port: u16,
+    keyspace: &str,
+    table: &str,
+    rf: usize,
+) -> Result<(), WebError> {
+    let url = format!(
+        "http://{host}:{web_port}/api/cluster/repair?keyspace={keyspace}&table={table}&rf={rf}"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        // Pretty-print the JSON summary if we can parse it; otherwise dump raw.
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or(body)),
+            Err(_) => println!("{body}"),
+        }
+        Ok(())
+    } else {
+        Err(format!("repair failed (HTTP {status}): {body}").into())
+    }
+}
+
 /// Rebalance token distribution across the cluster.
 ///
 /// Issues `POST /api/cluster/rebalance` with an empty body.
@@ -1003,6 +1039,31 @@ mod tests {
     /// Helper: build the URL for rebalance.
     fn rebalance_url(host: &str, web_port: u16) -> String {
         format!("http://{}:{}/api/cluster/rebalance", host, web_port)
+    }
+
+    /// Helper: build the URL for repair.
+    fn repair_url(host: &str, web_port: u16, keyspace: &str, table: &str, rf: usize) -> String {
+        format!(
+            "http://{host}:{web_port}/api/cluster/repair?keyspace={keyspace}&table={table}&rf={rf}"
+        )
+    }
+
+    #[test]
+    fn repair_formats_correct_url() {
+        let url = repair_url("127.0.0.1", 9090, "agent_memory", "entity_store", 3);
+        assert_eq!(
+            url,
+            "http://127.0.0.1:9090/api/cluster/repair?keyspace=agent_memory&table=entity_store&rf=3"
+        );
+    }
+
+    #[test]
+    fn repair_url_custom_rf() {
+        let url = repair_url("10.0.0.5", 8080, "ks", "t", 5);
+        assert_eq!(
+            url,
+            "http://10.0.0.5:8080/api/cluster/repair?keyspace=ks&table=t&rf=5"
+        );
     }
 
     // ── W8.5 — learner lifecycle CLI commands ────────────────────────

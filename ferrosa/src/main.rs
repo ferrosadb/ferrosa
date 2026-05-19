@@ -609,6 +609,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         truncate_fwd_handler,
     );
 
+    // Register the three anti-entropy repair handlers. The companion
+    // RemoteRepairStore on initiating nodes will issue Fetch/Apply RPCs
+    // against these handlers during a repair session; the Merkle handler
+    // builds and returns a tree for the requested table+range.
+    registry.register(
+        ferrosa_net::codec::MsgType::RepairMerkleRequest,
+        Arc::new(ferrosa_cluster::RepairMerkleHandler::new(storage.clone())),
+    );
+    registry.register(
+        ferrosa_net::codec::MsgType::RepairFetchRequest,
+        Arc::new(ferrosa_cluster::RepairFetchHandler::new(storage.clone())),
+    );
+    registry.register(
+        ferrosa_net::codec::MsgType::RepairApplyRequest,
+        Arc::new(ferrosa_cluster::RepairApplyHandler::new(storage.clone())),
+    );
+
     // 5b. Create subsystem runtimes (Raft gets its own so heartbeats
     // 5b. Dedicated Raft runtime — heartbeats can't be starved by CQL/S3 work.
     let runtimes = runtime::RuntimeManager::new();

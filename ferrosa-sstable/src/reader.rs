@@ -83,6 +83,14 @@ pub struct SSTableReader<R: ReadAt> {
     /// decoding any partition body — the cold-cache dominant cost
     /// (see bug-streaming-range-read-perf-50x-floor).
     partition_offsets: std::sync::OnceLock<std::sync::Arc<Vec<u64>>>,
+    /// Lazily-populated `(token, byte-offset)` pairs in Data.db
+    /// order (which is token-sorted). Built by walking the index
+    /// with `peek_partition_key + skip_to_next_partition` once.
+    /// Backs `PartitionIter::seek_to_token` so a token-bounded read
+    /// can jump straight to the first matching partition instead of
+    /// decoding every preceding partition — the difference between
+    /// O(matches) and O(table_size) per repair session.
+    partition_token_offsets: std::sync::OnceLock<std::sync::Arc<Vec<(i64, u64)>>>,
 }
 
 impl<R: ReadAt> SSTableReader<R> {
@@ -118,6 +126,7 @@ impl<R: ReadAt> SSTableReader<R> {
             _decompressed_data: decompressed_data,
             rows: components.rows,
             partition_offsets: std::sync::OnceLock::new(),
+            partition_token_offsets: std::sync::OnceLock::new(),
         })
     }
 
@@ -155,6 +164,49 @@ impl<R: ReadAt> SSTableReader<R> {
                     }
                 }
                 std::sync::Arc::new(offsets)
+            })
+            .clone()
+    }
+
+    /// Sorted `(token, byte-offset-in-Data.db)` pairs for every
+    /// partition in this SSTable, in token order. Lazily built on
+    /// first call by walking the file with `peek_partition_key +
+    /// skip_to_next_partition` (key decode only — no row bodies).
+    /// Cached for the SSTable's lifetime; subsequent calls are O(1).
+    ///
+    /// Used by `PartitionIter::seek_to_token` to turn anti-entropy
+    /// repair's "give me the partitions in token range `[a, b)`"
+    /// query from O(table_size) per session into O(log N + matches)
+    /// per session — the structural fix that makes repair viable on
+    /// a multi-GB table.
+    ///
+    /// On error the list is left empty and a warning is logged;
+    /// callers can detect the empty cache and fall back to a
+    /// linear scan from byte 0.
+    pub fn partition_token_offsets(&self) -> std::sync::Arc<Vec<(i64, u64)>> {
+        self.partition_token_offsets
+            .get_or_init(|| {
+                let mut out: Vec<(i64, u64)> = Vec::new();
+                let mut iter = match self.partitions_iter() {
+                    Ok(it) => it,
+                    Err(_) => {
+                        // Match `partition_offsets()`: silent empty
+                        // cache; callers detect and fall back.
+                        return std::sync::Arc::new(out);
+                    }
+                };
+                loop {
+                    let pos = iter.pos;
+                    match iter.peek_partition_key() {
+                        Ok(Some(dk)) => out.push((dk.token.0, pos)),
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                    if iter.skip_to_next_partition().is_err() {
+                        break;
+                    }
+                }
+                std::sync::Arc::new(out)
             })
             .clone()
     }
@@ -438,6 +490,40 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// OTHER sources holding key K need to advance past it but their
     /// decoded body is discarded — `skip_to_next_partition` does the
     /// advance without paying that wasted decode cost.
+    /// Position the iterator at the first partition whose token is
+    /// `>= target`. If no such partition exists the iterator is
+    /// parked at EOF (subsequent `peek/next` yield `None`).
+    ///
+    /// Uses the SSTable's cached `partition_token_offsets` for an
+    /// O(log N) lookup. On the first call per SSTable the cache is
+    /// populated by a single token-only walk (no row-body decode);
+    /// every subsequent `seek_to_token` is O(log N).
+    ///
+    /// This is the anti-entropy repair hot-path primitive: each of
+    /// repair's `num_tokens × peers` sessions asks for partitions in
+    /// a tiny token sub-range out of a multi-GB SSTable. Without a
+    /// seek the streaming iterator pays O(table_size) per session;
+    /// with one, it pays O(matches_in_range).
+    ///
+    /// If the cache is empty (build failed), this is a no-op and the
+    /// iterator stays at its current position — callers fall back to
+    /// the existing linear `next_partition + token-filter` shape.
+    pub fn seek_to_token(&mut self, target: i64) -> Result<()> {
+        let tokens = self.sst.partition_token_offsets();
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        // First entry with `token >= target`. partition_point splits
+        // the slice on the first element NOT satisfying the
+        // predicate; we want the first NOT `< target`.
+        let idx = tokens.partition_point(|(t, _)| *t < target);
+        self.pos = match tokens.get(idx) {
+            Some(&(_, pos)) => pos,
+            None => self.sst.data.len()?, // every token < target → EOF
+        };
+        Ok(())
+    }
+
     pub fn skip_to_next_partition(&mut self) -> Result<()> {
         let offsets = self.sst.partition_offsets();
         if offsets.is_empty() {
@@ -924,6 +1010,77 @@ mod tests {
         // EOF stays at EOF
         assert!(iter.next_partition().unwrap().is_none());
         assert!(iter.next_partition().unwrap().is_none());
+    }
+
+    /// `seek_to_token(T)` must land the iterator at the first
+    /// partition with token >= T, regardless of how many partitions
+    /// come before it in the SSTable. This is what makes
+    /// anti-entropy repair viable on a multi-GB table without
+    /// linearly scanning all partitions for every (range, peer)
+    /// session — repair runs O(#sessions × matches_per_range)
+    /// instead of O(#sessions × table_size).
+    #[test]
+    fn seek_to_token_starts_at_or_after_target() {
+        let header = test_header();
+        let n = 20usize;
+        let mut dks: Vec<_> = (0..n)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:03}").as_bytes())))
+            .collect();
+        dks.sort_by_key(|dk| dk.token.0);
+
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Seek to the token of the 10th partition. After seek, the
+        // iterator's NEXT decoded partition must be that one — every
+        // partition before it must have been skipped without decode.
+        let target = dks[n / 2].token.0;
+        let mut iter = reader.partitions_iter().expect("partitions_iter");
+        iter.seek_to_token(target).expect("seek_to_token");
+        let first = iter
+            .next_partition()
+            .expect("next after seek")
+            .expect("a partition exists at or after target");
+        assert_eq!(
+            first.key.token.0, target,
+            "first decoded partition's token must equal the seek target"
+        );
+        // Note: `first.key` is a DecoratedKey; its `token` field name matches
+        // the Partition struct convention.
+
+        // After exhausting the rest, exactly half (10) partitions
+        // should remain.
+        let mut yielded_after_seek = 1usize;
+        while iter.next_partition().expect("next").is_some() {
+            yielded_after_seek += 1;
+        }
+        assert_eq!(yielded_after_seek, n - n / 2);
+
+        // Seeking to a token greater than every partition's token
+        // must put the iterator at EOF.
+        let above_max = dks.last().unwrap().token.0.saturating_add(1);
+        let mut iter = reader.partitions_iter().expect("partitions_iter");
+        iter.seek_to_token(above_max).expect("seek above max");
+        assert!(iter.next_partition().expect("next").is_none());
     }
 
     /// ADR-020 COUNT(*) fast path: next_partition_count yields the

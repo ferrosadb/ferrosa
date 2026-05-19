@@ -39,5 +39,10 @@ pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};
 pub use mode::DeploymentMode;
 pub use pair::{PairCoordinator, PairNode, PairRole};
+pub use repair::{
+    InMemoryRepairStore, LocalRepairExecutor, RemoteRepairStore, RepairApplyHandler,
+    RepairCoordinator, RepairFetchHandler, RepairMerkleHandler, RepairStore, SessionExecutor,
+    SessionStats, StorageEngineRepairStore,
+};
 pub use state::{PairClusterState, RaftClusterState, SingleNodeClusterState};
 pub use write_path::WritePath;
