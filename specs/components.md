@@ -171,7 +171,8 @@ graph BT
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
   - *SSTable reads during compaction*: `Arc`-based refcounting. Compaction creates new SSTables and atomically swaps the active set via `arc-swap`. In-flight reads hold references to old SSTables, cleaned up when last reference drops.
   - *S3 upload concurrency*: Independent tokio task observes new SSTables via bounded `mpsc` channel (backpressure), uploads without holding storage engine locks. Local files retained until S3 upload confirms.
-- **Read path**: `read_range()` merges data from both memtable and flushed SSTables (previously memtable-only). Range queries now return the full merged view.
+- **Read path**: `read_range()` merges data from both memtable and flushed SSTables (previously memtable-only). Range queries now return the full merged view. `read_token_range(table_id, start_token, end_token, limit)` is the token-bounded primitive used by anti-entropy repair's per-Merkle-leaf fetch: returns partitions whose tokens fall in `[start_token, end_token)`, walking the merged stream once and short-circuiting at `end_token` so the working set scales with in-range matches, not table size. `walk_token_range_for_digest` exposes a row-streaming variant for Merkle builds (no `Partition` materialisation).
+- **Write-path backpressure**: `StorageEngineConfig::memtable_backpressure_bytes` (env `FERROSA_MEMTABLE_BACKPRESSURE_BYTES`, default `max(flush_threshold_bytes * 4, 64 MB)`) — when the active memtable crosses this size, `StorageEngine::write` triggers a synchronous in-line flush before returning. Disabled (`u64::MAX`) in `test_config`; one regression test opts in via `write_triggers_inline_flush_when_backpressure_exceeded`. Detailed design: [memtable-backpressure.md](memtable-backpressure.md).
 - **DELETE**: Row-level tombstone merge in memtable — DELETE operations merge tombstones at the row level, correctly suppressing older cells across multiple write sources.
 - **Commit log**: Oversized entries (exceeding segment capacity) are handled gracefully with a descriptive error instead of a panic or silent corruption.
 - **Serialization**: 0-clustering column serialization fix for tables with no clustering key.
@@ -285,7 +286,7 @@ graph BT
 - **Dependencies**: `ferrosa-cql`, `clap`, `ratatui`, `crossterm`, `tabled`, `tokio`
 - **Status**: Implemented — CLI subcommands for node inspection, live TUI dashboard with auto-refresh
 - **Modules**:
-  - `main.rs` — CLI entry point with `clap` derive, subcommands: `status`, `connections`, `queries`, `storage`, `topology`, `peers`, `monitor`, `snapshot` (create/list/delete), `restore`
+  - `main.rs` — CLI entry point with `clap` derive, subcommands: `status`, `connections`, `queries`, `storage`, `topology`, `peers`, `monitor`, `snapshot` (create/list/delete), `restore`, `repair` (`--keyspace`, `--table`, `--rf`; POSTs to `/api/cluster/repair` and prints the per-session summary)
   - `commands.rs` — Async subcommand implementations using `CqlClient` to query virtual tables
   - `tui.rs` — `ratatui` TUI with `Panel` enum (`Connections`/`Queries`/`Storage`), `AppState`, 2-second auto-refresh, keyboard navigation
 - **Key interfaces**: Connects to a Ferrosa node via CQL protocol using `ferrosa-cql::CqlClient`, queries `system_virtual.*` tables for live metrics
@@ -358,8 +359,13 @@ graph BT
   - `accord/electorate.rs` — Electorate reconfiguration: epoch propagation, JoinElectorate 4-gate, shrink/resize, epoch transition drain
   - `accord/metrics.rs` — 9 Accord-specific Prometheus metrics
   - `accord/jepsen/` — TestCluster, NemesisController, HistoryRecorder, LinearizabilityChecker
-- **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, `ModeController::transition_to_cluster()`, `ClusterCoordinator` (write/read fan-out), `TokenRing` (replica selection), `AccordCoordinator` (transaction coordination), `AccordStateMachine` (consensus state), REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`)
-- **Remaining**: NetworkTopologyStrategy (multi-DC), read repair (full inline), Quorum Lease / Mencius optimizations
+  - `repair/mod.rs` — `MerkleTree`, `partition_merkle_hash`, `compute_repair_plan`, `diff_partition_sets` + streaming counterpart, `build_tree_for_range` (Merkle build via `walk_token_range_for_digest`), `RepairDirection`, `RepairPlan`, `repair_participants` (W8.7: voters + `owns_tokens=true` learners), constants `TREE_DEPTH=15`, `MERKLE_BUILD_BATCH=16`, `REPAIR_BUILD_CONCURRENCY=2`, process-wide `REPAIR_BUILD_SEMAPHORE`
+  - `repair/coordinator.rs` — `RepairCoordinator` (per-table fan-out, default `max_concurrent_sessions=4`), `SessionExecutor` trait, `SessionStats`, `SessionResult`; merges adjacent owned token ranges that share the same replica set into super-ranges before dispatch
+  - `repair/executor.rs` — `RepairStore` trait, `LocalRepairExecutor` (production initiator), `StorageEngineRepairStore` (local side wrapping `Arc<StorageEngine>`), `InMemoryRepairStore` (test side); drives the Merkle-then-stream session with chunked Fetch/Apply (`REPAIR_FETCH_CHUNK_PARTITIONS=64`, `REPAIR_APPLY_CHUNK_PARTITIONS=64`, `MERGED_SPAN_MAX_LEAVES=8`)
+  - `repair/rpc.rs` — wire protocol: `RepairMerkleRequest/Response`, `RepairFetchRequest/Response` (with `cursor` + `limit` for chunked iteration), `RepairApplyRequest/Response`. Handlers: `RepairMerkleHandler`, `RepairFetchHandler`, `RepairApplyHandler`. Client: `RemoteRepairStore` (RPC over `PeerManager`, all three RPCs sent on `Lane::Bulk`).
+  - `raft/handlers.rs` — `PartitionDigestStream` (row-at-a-time CRC32 digest, lets the SSTable walker hash a multi-MB partition without materialising it), `compute_partition_digest_streaming`, `serialize_partition_to_wire_borrowed` (zero-copy serialisation for range-read stream chunks)
+- **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, `ModeController::transition_to_cluster()`, `ClusterCoordinator` (write/read fan-out), `TokenRing` (replica selection), `AccordCoordinator` (transaction coordination), `AccordStateMachine` (consensus state), `RepairCoordinator::repair_table(executor, ring, local_node_id, rf, table)` (anti-entropy repair, operator-triggered via HTTP/CLI), REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`, `/api/cluster/repair?keyspace=&table=&rf=`)
+- **Remaining**: NetworkTopologyStrategy (multi-DC), read repair (full inline), Quorum Lease / Mencius optimizations, repair scheduler / continuous-repair loop, per-keyspace repair policy, Jepsen-verified repair convergence
 
 ### ferrosa (binary)
 
@@ -369,7 +375,7 @@ graph BT
 - **Status**: Cluster-mode operation — CQL on 9042, graph HTTP on 7474, Bolt on 7687, web console + cluster API on 9090, Prometheus metrics, internode on 7000
 - **Modules**:
   - `web/mod.rs` — `WebConfig`, `start_web_server()` on port 9090 (configurable), Axum router composition
-  - `web/api.rs` — Axum JSON API routes: `/api/connections`, `/api/storage_stats`, `/api/active_queries`, `/api/tables`, `/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`, `GET/POST/DELETE /api/snapshots`, `GET /api/archive_status`, `POST /api/restore/preflight`, `POST /api/restore`
+  - `web/api.rs` — Axum JSON API routes: `/api/connections`, `/api/storage_stats`, `/api/active_queries`, `/api/tables`, `/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`, `/api/cluster/repair?keyspace=&table=&rf=` (operator-triggered anti-entropy repair — builds a `LocalRepairExecutor` from the in-process storage + per-peer `RemoteRepairStore`s and runs `RepairCoordinator::repair_table`, returning total/ok/failed session counts plus aggregate streamed-in/out + timestamp-ties), `GET/POST/DELETE /api/snapshots`, `GET /api/archive_status`, `POST /api/restore/preflight`, `POST /api/restore`
   - `web/static_files.rs` — `rust-embed` static file serving for the dashboard UI
   - `web/index.html` — Single-file HTML/CSS/JS dashboard with auto-refresh, connection/query/storage panels
 - **Startup sequence**: tracing init → host_id load/generate → `StorageEngine::new()` → `Schema::new()` → `ModeController::new()` → `PeerManager::new()` → RPC server on :7000 → `CqlServer::start_background()` → optional `GraphEngine` + HTTP → web admin + cluster API on :9090 → background seed connection → ctrl-c → graceful shutdown

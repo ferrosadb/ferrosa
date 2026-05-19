@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ferrosa Database — AI Native Database</title>
-  <meta name="description" content="Ferrosa Database is a Rust-native distributed database with CQL, graph, SPARQL, vector search, transactions, CDC, and S3-backed storage. Version 0.9.0 developer preview.">
+  <meta name="description" content="Ferrosa Database is a Rust-native distributed database with CQL, graph, SPARQL, vector search, transactions, CDC, and S3-backed storage. Version 0.11.0 developer preview.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <style>
     :root {
@@ -822,14 +822,14 @@
 </nav>
 
 <div class="beta-banner">
-  <span class="beta-tag">BETA</span> Ferrosa Database is version 0.9.0 and in active development.
+  <span class="beta-tag">BETA</span> Ferrosa Database is version 0.11.0 and in active development.
 </div>
 
 <!-- ═══════════════════ Hero ═══════════════════ -->
 <section class="hero">
   <div class="hero-badge">
     <span class="dot"></span>
-    v0.9.0 — active development
+    v0.11.0 — active development
   </div>
   <h1>
     One database. <span class="gradient">Many workloads.</span><br>
@@ -1295,10 +1295,39 @@
       <h3>Hinted Handoff</h3>
       <p>
         When a replica is temporarily unavailable, writes are stored as hints and replayed
-        automatically when the node recovers. Configurable hint window and TTL ensure data
-        consistency without manual repair for transient failures.
+        automatically when the node recovers. Configurable hint window and TTL cover the
+        transient-failure path; for divergence that outlives the hint window, operator-initiated
+        anti-entropy repair is the building block to reconcile replicas.
       </p>
       <span class="metric">auto hint storage · replay on recovery</span>
+    </div>
+
+    <!-- Anti-Entropy Repair -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(120, 180, 220, 0.12);">⚖</div>
+      <h3>Anti-Entropy Repair</h3>
+      <p>
+        Operator-initiated Merkle-tree-based repair via the HTTP <code>/repair</code> endpoint
+        and the <code>ferrosa-ctl repair</code> CLI reconciles replicas that have diverged
+        beyond the hinted-handoff window. A bounded-memory streaming digest builds the
+        Merkle comparison incrementally, so the repair path scales to tables larger than
+        a node's memory. Repair is manual today — there is no scheduler — and consistency
+        under repair has not yet been Jepsen-verified.
+      </p>
+      <span class="metric">manual /repair · ferrosa-ctl repair · streaming Merkle digest</span>
+    </div>
+
+    <!-- Write-Path Backpressure -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(200, 150, 220, 0.12);">⇄</div>
+      <h3>Write-Path Backpressure</h3>
+      <p>
+        Memtable backpressure, configurable via <code>FERROSA_MEMTABLE_BACKPRESSURE_BYTES</code>,
+        bounds in-memory write buffers under sustained write workloads. When the configured
+        threshold is reached, writers slow rather than letting memtables grow without limit,
+        keeping memory pressure predictable while flush and compaction drain the queue.
+      </p>
+      <span class="metric">configurable byte budget · bounded memtable growth</span>
     </div>
 
     <!-- Node Lifecycle -->

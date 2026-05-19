@@ -169,6 +169,90 @@ Low-bit tiers act like map tiles: they route to a smaller candidate set, then
 higher-bit tiers or exact `f32` pages refine survivors. A cache miss fetches a
 bounded byte range from S3; it must not trigger full artifact materialization.
 
+## Anti-Entropy Repair Flow
+
+Operator-triggered Merkle-tree comparison + bounded-memory streaming
+reconciliation between replica content. Full design in
+[anti-entropy-repair-architecture.md](anti-entropy-repair-architecture.md).
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant CLI as ferrosa-ctl repair
+    participant Web as Web API (:9090)
+    participant Coord as RepairCoordinator
+    participant Exec as LocalRepairExecutor
+    participant Local as Local StorageEngine
+    participant Peer as Peer RemoteRepairStore
+
+    Op->>CLI: ferrosa-ctl repair --keyspace ks --table t --rf 3
+    CLI->>Web: POST /api/cluster/repair?keyspace=ks&table=t&rf=3
+    Web->>Web: Build local StorageEngineRepairStore + per-peer RemoteRepairStores
+    Web->>Coord: repair_table(executor, ring, local_id, rf, table)
+
+    Coord->>Coord: Enumerate owned (range, peer) pairs; merge contiguous ranges sharing replica set
+    loop For each (merged_range, peer) — up to max_concurrent_sessions in flight
+        Coord->>Exec: run_session(table, range_start, range_end, peer)
+
+        rect rgb(230,245,255)
+            Note over Exec,Peer: Phase 1: Merkle build (parallel)
+            par Local build
+                Exec->>Local: build_merkle (REPAIR_BUILD_SEMAPHORE-throttled)
+                Local-->>Exec: MerkleTree (TREE_DEPTH=15, streaming via walk_token_range_for_digest)
+            and Remote build
+                Exec->>Peer: RepairMerkleRequest (Lane::Bulk)
+                Peer-->>Exec: RepairMerkleResponse { tree }
+            end
+        end
+
+        Exec->>Exec: divergent_leaf_ranges() + merge_contiguous_token_ranges (cap MERGED_SPAN_MAX_LEAVES=8)
+
+        rect rgb(230,255,230)
+            Note over Exec,Peer: Phase 2-3: Per-span chunked Fetch + streaming diff
+            loop For each merged span — until both cursors exhaust
+                par Fetch chunks
+                    Exec->>Local: read_range_chunked(span, cursor, REPAIR_FETCH_CHUNK_PARTITIONS=64)
+                    Exec->>Peer: RepairFetchRequest { cursor, limit: 64 } (Lane::Bulk)
+                    Peer-->>Exec: RepairFetchResponse { partitions, next_cursor }
+                end
+                Exec->>Exec: diff_partition_sets_streaming → push into per-direction apply queues
+                alt A→B queue reaches REPAIR_APPLY_CHUNK_PARTITIONS=64
+                    Exec->>Peer: RepairApplyRequest (Lane::Bulk)
+                    Peer->>Peer: StorageEngine.write (per row, LWW)
+                    Peer-->>Exec: RepairApplyResponse { applied }
+                end
+                alt B→A queue reaches REPAIR_APPLY_CHUNK_PARTITIONS=64
+                    Exec->>Local: apply_partitions → StorageEngine.write
+                    Note over Local: memtable_backpressure_bytes may trigger inline flush
+                end
+            end
+        end
+
+        Exec-->>Coord: SessionStats { in, out, timestamp_ties }
+    end
+
+    Coord-->>Web: Vec<SessionResult>
+    Web-->>CLI: JSON summary (total, ok, failed, streamed_in, streamed_out, timestamp_ties)
+    CLI-->>Op: Pretty-printed result
+```
+
+**Bounded memory invariants** (per session):
+
+- Local fetch chunk: ≤ `REPAIR_FETCH_CHUNK_PARTITIONS` partitions
+- Remote fetch chunk: ≤ `REPAIR_FETCH_CHUNK_PARTITIONS` partitions
+- A→B apply queue: ≤ `REPAIR_APPLY_CHUNK_PARTITIONS` partitions
+- B→A apply queue: ≤ `REPAIR_APPLY_CHUNK_PARTITIONS` partitions
+- Merkle build page: ≤ `MERKLE_BUILD_BATCH` partitions decoded at a time
+- Build concurrency per node: ≤ `REPAIR_BUILD_CONCURRENCY` (initiator + RPC handler share one semaphore)
+
+`Lane::Bulk` is used for all three RPCs because chunked Apply payloads
+carry 64 partitions × `max_partition_size`, far above the `Lane::Data`
+3-second wall-clock cap. The receiver's apply path lands writes through
+`StorageEngine::write`, which is now memtable-backpressure-aware — when a
+dense Apply chunk pushes the receiver's memtable past
+`memtable_backpressure_bytes`, the writer blocks on a synchronous flush
+before returning. See [memtable-backpressure.md](memtable-backpressure.md).
+
 ## Accord Transaction Flow
 
 Accord consensus provides serializable transactions without a dedicated coordinator. The protocol uses a multi-phase approach where the transaction coordinator can be any node.
@@ -916,4 +1000,6 @@ CQL connections use RAII `IpSlotGuard` — per-IP connection slots are released 
 - [Accord](archive/accord.md) — Accord consensus protocol specification
 - [Cluster Formation Architecture](cluster-formation-architecture.md) — detailed formation spec
 - [Cluster Formation State Machine](cluster-formation-state-machine.md) — state machine design
+- [Anti-Entropy Repair Architecture](anti-entropy-repair-architecture.md) — operator-triggered Merkle-then-stream repair
+- [Memtable Backpressure](memtable-backpressure.md) — receiver-side flow control protecting repair apply + sustained-write workloads
 - [Testing](testing.md) — data integrity and chaos tests

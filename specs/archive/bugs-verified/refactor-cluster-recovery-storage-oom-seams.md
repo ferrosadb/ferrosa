@@ -1,5 +1,22 @@
 # Cluster Recovery + Storage OOM Seam Refactor Plan
 
+> **RESOLVED 2026-05-19 — closing OOM seam delivered as write-path memtable backpressure (PR #50, v0.11.0).**
+>
+> The sustained-write OOM scenario this plan targeted — anti-entropy
+> repair's apply phase, bulk load, raft state-machine catch-up — is
+> now handled by the synchronous in-line flush trigger in
+> `StorageEngine::write` when `memtable_size() >=
+> memtable_backpressure_bytes`. Default is `max(flush_threshold_bytes
+> * 4, 64 MB)`. Disabled (`u64::MAX`) in `test_config`. Pinned by
+> `write_triggers_inline_flush_when_backpressure_exceeded` in
+> `ferrosa-storage/src/engine.rs`. Full design and limits:
+> [`specs/memtable-backpressure.md`](../../memtable-backpressure.md).
+>
+> The bootstrap + pending-upload-replay + compaction-finalize seam
+> refactor cards (5–8) in this plan are still latent work; this
+> archive header marks only the OOM symptom as fixed. Reopen with a
+> new spec if the seam refactor continues.
+
 > Use strict TDD. Work card-by-card, commit after each verified GREEN/refactor slice, and keep behavior changes behind focused regression tests.
 
 **Goal:** Make the fmem/Ferrosa LOCAL_QUORUM read-timeout/OOM recovery path debuggable and correct by extracting pure decision seams from cluster recovery, bootstrap, and storage replay/compaction hot paths.

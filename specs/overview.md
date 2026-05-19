@@ -121,6 +121,8 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 
 **Current progress**: Ferrosa is a developer-preview 18-crate workspace. Core storage/CQL, Raft metadata, graph/SPARQL experiments, index paths, PITR building blocks, and Accord transaction components exist in source and specs. Public production-readiness, Jepsen-verified behavior, complete observability backing, arbitrary `SUBSCRIBE` delivery, and full CQL/query conformance remain verification or open work. Current public docs should describe supported developer-preview paths and link unsupported topics to `todo/`, `proposed/`, or `verified-test-plan/` instead of presenting them as guarantees.
 
+**Anti-entropy repair** (operator-initiated) is available as of v0.11.0. The Merkle-then-stream design exchanges 32 768-leaf hashes between replicas, then fetches and applies only the divergent partitions in fixed-size chunks (64 partitions per RPC). Peak per-session memory is bounded by chunk size × max-partition-size rather than table size, so repair runs in the 2 GiB fmem cgroup against multi-GB replicas. The path is **operator-triggered** via `POST /api/cluster/repair?keyspace=&table=&rf=` or `ferrosa-ctl repair` — there is no scheduled / continuous-repair loop yet, no per-keyspace policy, and no Jepsen-verified convergence story. See [anti-entropy-repair-architecture.md](anti-entropy-repair-architecture.md). The companion write-path memtable backpressure that protects the receiver during the apply phase is documented in [memtable-backpressure.md](memtable-backpressure.md).
+
 ## Key Architectural Decisions
 
 | Decision | Choice | Rationale |

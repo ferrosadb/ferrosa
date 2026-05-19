@@ -496,6 +496,8 @@ impl StorageEngine {
     pub fn register_table(&self, schema: TableSchema) -> Result<()>;
     pub fn write(&self, table_id: &TableId, key: &DecoratedKey, row: Row, timestamp: i64) -> Result<()>;
     pub fn read(&self, table_id: &TableId, key: &DecoratedKey) -> Result<Option<Partition>>;
+    pub fn read_range(&self, table_id: &TableId, start: Option<&DecoratedKey>, end: Option<&DecoratedKey>, limit: usize) -> Result<Vec<Partition>>;
+    pub fn read_token_range(&self, table_id: &TableId, start_token: i64, end_token: i64, limit: usize) -> Result<Vec<Partition>>;
     pub fn flush(&self, table_id: &TableId) -> Result<()>;
     pub fn flush_if_needed(&self) -> Result<()>;  // threshold-based auto-flush
     pub fn poll_compactions(&self);
@@ -503,11 +505,43 @@ impl StorageEngine {
 }
 ```
 
-- `write()`: append to commit log, then write to table's memtable (both lock-free)
+- `write()`: append to commit log, then write to table's memtable (both lock-free). When `memtable_size() >= memtable_backpressure_bytes`, triggers a synchronous in-line flush before returning — see "Write-path backpressure".
 - `flush()`: flush memtable to SSTable, then check if STCS compaction is needed
 - `flush_if_needed()`: flush any table whose memtable exceeds `flush_threshold_bytes`
+- `read_range()`: key-bounded scan, used by ordinary SELECT range queries.
+- `read_token_range()`: token-bounded scan returning all partitions whose tokens fall in `[start_token, end_token)`, capped at `limit`. Because partition keys hash to tokens via Murmur3, a contiguous token range is a discontiguous key range — `read_range` cannot answer the "give me everything in this token sub-range" question used by anti-entropy repair's per-Merkle-leaf fetch. The implementation reads the merged stream (memtable + flushing memtable + SSTables) once and short-circuits at `end_token`, so the working set scales with matches-in-range, not table size. Pinned by `read_token_range_streaming_returns_only_in_range_matches`.
 - `shutdown()`: flush all tables, stop compaction executor, stop commit log
 - `upload_manager` is `Option` — tests run without S3
+
+#### StorageEngineConfig (selected fields)
+
+| Field | Env Var | Default | Purpose |
+|-------|---------|---------|---------|
+| `flush_threshold_bytes` | `FERROSA_FLUSH_THRESHOLD_BYTES` | 64 MB | Soft trigger for async flush via the maintenance loop |
+| `memtable_backpressure_bytes` | `FERROSA_MEMTABLE_BACKPRESSURE_BYTES` | `max(flush_threshold_bytes * 4, 64 MB)` | Hard trigger for synchronous in-line flush inside `write()` — see [Write-path backpressure](memtable-backpressure.md) |
+| `flush_max_age_secs` | `FERROSA_FLUSH_MAX_AGE_SECS` | 30 | Time-based flush for low-write tables |
+| `memtable_num_shards` | `FERROSA_MEMTABLE_NUM_SHARDS` | 64 | Per-table memtable shard count |
+| `write_verify` | `FERROSA_WRITE_VERIFY` | true | Defensive SSTable-writer self-readback after flush |
+
+`StorageEngineConfig::test_config` overrides `memtable_backpressure_bytes` to `u64::MAX`, effectively disabling backpressure in tests by default (tests that pick intentionally tiny `flush_threshold_bytes` would otherwise deadlock). One regression test opts in explicitly: `write_triggers_inline_flush_when_backpressure_exceeded`.
+
+#### Write-path backpressure
+
+When sustained writes (anti-entropy repair apply, bulk load, PITR restore,
+raft state-machine catch-up) arrive faster than the maintenance loop's
+periodic `flush_if_needed` can drain, the active memtable grows unboundedly
+between ticks and the flushing memtable + commit-log fan-out pin additional
+RSS. To bound this, `StorageEngine::write` checks `memtable_size() >=
+memtable_backpressure_bytes` after each insert and, on threshold cross,
+calls `self.flush(table_id)` synchronously before returning. The `flush_guard`
+mutex serialises concurrent flushes, so a runaway writer waits for the
+in-progress flush instead of growing a second unbounded memtable.
+
+The hard backpressure threshold is intentionally a multiple of the soft
+flush threshold (4×) so routine workloads never trip it — only sustained
+write streams where the maintenance loop has fallen behind hit the
+synchronous path. Full design and limits are in
+[memtable-backpressure.md](memtable-backpressure.md).
 
 ### Index Support
 
@@ -824,3 +858,5 @@ pub struct StorageStats {
 - [Components](components.md) — crate architecture, dependency graph
 - [Data Flow](data-flow.md) — write/read paths, S3 lifecycle
 - [Overview](overview.md) — system overview and design principles
+- [Memtable Backpressure](memtable-backpressure.md) — synchronous in-line flush trigger that protects sustained-write workloads
+- [Anti-Entropy Repair Architecture](anti-entropy-repair-architecture.md) — the apply-phase workload that motivated `read_token_range` + memtable backpressure
