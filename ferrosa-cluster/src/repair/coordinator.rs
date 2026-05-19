@@ -369,7 +369,10 @@ mod tests {
             .filter_map(|(_, s, e, p)| if *p == 2 { Some((*s, *e)) } else { None })
             .collect();
         chunks_for_peer_2.sort();
-        assert_eq!(chunks_for_peer_2.len(), super::REPAIR_CHUNKS_PER_MERGED_RANGE);
+        assert_eq!(
+            chunks_for_peer_2.len(),
+            super::REPAIR_CHUNKS_PER_MERGED_RANGE
+        );
         assert_eq!(chunks_for_peer_2.first().unwrap().0, i64::MIN);
         assert_eq!(chunks_for_peer_2.last().unwrap().1, i64::MAX);
         for win in chunks_for_peer_2.windows(2) {
