@@ -16,7 +16,7 @@
 //! Handlers live in this module and are registered into the cluster's
 //! [`HandlerRegistry`](ferrosa_net::rpc::handler::HandlerRegistry) during
 //! startup. [`RemoteRepairStore`] is the client side — a
-//! [`RepairStore`](super::RepairStore) implementation that talks to a peer
+//! [`RepairStore`] implementation that talks to a peer
 //! over the [`PeerManager`].
 
 use async_trait::async_trait;

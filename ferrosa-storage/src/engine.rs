@@ -2108,7 +2108,7 @@ impl StorageEngine {
     ///
     /// Anti-entropy repair's per-Merkle-leaf "give me everything in this
     /// token sub-range" question can't be answered by the key-bounded
-    /// [`read_range`] — partition keys hash to tokens via Murmur3, so a
+    /// [`Self::read_range`] — partition keys hash to tokens via Murmur3, so a
     /// contiguous token range is a discontiguous key range. This primitive
     /// answers the token question directly by reading the merged stream
     /// once and short-circuiting at `end_token`.

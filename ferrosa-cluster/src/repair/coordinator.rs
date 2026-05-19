@@ -1,4 +1,4 @@
-//! Anti-entropy repair scheduler — drives [`RepairSession`] runs across every
+//! Anti-entropy repair scheduler — drives `RepairSession` runs across every
 //! `(table, owned-range, peer)` triple and reports per-session results.
 //!
 //! ## Design
@@ -11,7 +11,7 @@
 //!
 //! 1. Enumerate every token range the local node is a replica of, using the
 //!    ring's vnode topology.
-//! 2. For each range, look up the peer replicas via [`repair_participants`].
+//! 2. For each range, look up the peer replicas via [`super::repair_participants`].
 //!    Skip self.
 //! 3. For each `(range, peer)` pair, invoke the executor. Cap concurrency
 //!    via a tokio semaphore.

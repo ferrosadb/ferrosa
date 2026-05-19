@@ -99,8 +99,8 @@ struct RepairParams {
 /// node to be in cluster mode with a token ring and a live `PeerManager`.
 ///
 /// The handler builds a `LocalRepairExecutor` whose `local` side is the
-/// in-process [`StorageEngineRepairStore`] and whose `remotes` are
-/// per-peer `RemoteRepairStore`s, then runs [`RepairCoordinator::repair_table`].
+/// in-process `StorageEngineRepairStore` and whose `remotes` are
+/// per-peer `RemoteRepairStore`s, then runs `RepairCoordinator::repair_table`.
 /// Returns a JSON summary: total sessions, successful, failed, total
 /// partitions streamed in/out, total timestamp ties.
 async fn repair_handler(

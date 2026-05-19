@@ -93,8 +93,8 @@ impl MerkleTree {
 
     /// Token sub-range owned by leaf `leaf_idx`, as `[start, end)`.
     ///
-    /// Inverse of [`token_to_leaf`]. Leaf 0 owns the lowest tokens; the last
-    /// leaf's `end` equals [`range_end`]. Equal-width leaves except for
+    /// Inverse of `token_to_leaf`. Leaf 0 owns the lowest tokens; the last
+    /// leaf's `end` equals `range_end`. Equal-width leaves except for
     /// rounding on the final leaf when the range width isn't divisible by
     /// `num_leaves`.
     pub fn leaf_range(&self, leaf_idx: usize) -> (i64, i64) {
