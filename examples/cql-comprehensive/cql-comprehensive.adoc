@@ -4,7 +4,7 @@
 :stylesheet: ../theme/ferrosa.css
 
 A systematic compatibility test for every CQL feature that Ferrosa supports.
-Run `schema.cql`, `data.cql`, and `queries.cql` in order against a Ferrosa cluster to verify full CQL coverage.
+Run `schema.cql`, `data.cql`, and `queries.cql` in order against a Ferrosa cluster to exercise this example coverage set.
 
 NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
 
@@ -19,7 +19,7 @@ The three CQL files are designed to run in order:
 . *data.cql* -- DML writes: inserts, updates, batches, counters, TTL, LWT
 . *queries.cql* -- DML reads: selects, aggregations, token scans, cleanup
 
-If all three files execute without error, the cluster under test supports the full CQL surface area covered here.
+If all three files execute without error, the cluster under test supports the CQL subset covered by these examples.
 
 == Data Types
 

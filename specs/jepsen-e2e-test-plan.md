@@ -358,8 +358,8 @@ ferrosa-jepsen/
 
 ## Related Specs
 
-- [Accord Consensus Protocol](accord.md)
-- [Accord Project Plan](accord-project-plan.md)
+- [Accord Consensus Protocol](archive/accord.md)
+- [Accord Project Plan](archive/project-plans/accord-project-plan.md)
 - [Testing Infrastructure](testing.md)
-- [Threat Model — Accord](threat-model-accord.md)
-- [FMEA — Accord](fmea-accord.md)
+- [Threat Model — Accord](archive/analysis/threat-model-accord.md)
+- [FMEA — Accord](archive/analysis/fmea-accord.md)

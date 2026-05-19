@@ -328,9 +328,9 @@ Full nemesis suite for fault injection:
 
 ## Related Specs
 
-- [Overview](overview.md) — system overview
-- [Components](components.md) — crate architecture (Accord modules listed under ferrosa-cluster)
-- [Data Flow](data-flow.md) — Accord transaction flow diagrams
-- [Accord Project Plan](accord-project-plan.md) — sprint completion details
-- [Testing](testing.md) — test infrastructure
-- [CQL](cql.md) — CQL protocol (LWT syntax, transaction syntax)
+- [Overview](../overview.md) — system overview
+- [Components](../components.md) — crate architecture (Accord modules listed under ferrosa-cluster)
+- [Data Flow](../data-flow.md) — Accord transaction flow diagrams
+- [Accord Project Plan](project-plans/accord-project-plan.md) — sprint completion details
+- [Testing](../testing.md) — test infrastructure
+- [CQL](../cql.md) — CQL protocol (LWT syntax, transaction syntax)

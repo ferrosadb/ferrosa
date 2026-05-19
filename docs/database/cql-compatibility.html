@@ -674,7 +674,7 @@
   </div>
 
   <h3>Lightweight transactions (LWT)</h3>
-  <p>Full Cassandra LWT compatibility for conditional mutations:</p>
+  <p>Supported conditional-mutation patterns for lightweight transactions:</p>
 
   <table>
     <thead><tr><th>Pattern</th><th>Status</th><th>Notes</th></tr></thead>
@@ -732,9 +732,8 @@
   <h2 id="subscribe">SUBSCRIBE Extension</h2>
 
   <div class="extension">
-    <strong>Ferrosa Extension:</strong> SUBSCRIBE is a Ferrosa-specific CQL extension for
-    real-time change streaming. It uses the native CQL v5 framing with a STREAMING response
-    flag (0x10) — existing drivers work unchanged, no client modifications required.
+    <strong>Developer-preview note:</strong> SUBSCRIBE is a Ferrosa-specific CQL extension under active verification.
+    Table-level polling/subscription examples are design targets; arbitrary SELECT streaming and driver behavior are not yet public compatibility guarantees.
   </div>
 
   <h3>Syntax</h3>
@@ -744,11 +743,7 @@
 <span class="cm">-- Subscribe with push-on-write (change data capture)</span>
 <span class="kw">SUBSCRIBE</span> keyspace.table <span class="kw">DELTA</span>;
 
-<span class="cm">-- Subscribe to a SELECT query</span>
-<span class="kw">SUBSCRIBE</span> <span class="kw">SELECT</span> name, email <span class="kw">FROM</span> social.users <span class="kw">WHERE</span> active = <span class="kw">true</span> <span class="kw">EVERY</span> <span class="var">10</span>s;
-
-<span class="cm">-- Subscribe to observability tables</span>
-<span class="kw">SUBSCRIBE</span> system_observability.connections <span class="kw">EVERY</span> <span class="var">5</span>s;
+<span class="cm">-- Arbitrary SELECT and observability subscriptions remain verification work</span>
 
 <span class="cm">-- Unsubscribe from a specific stream</span>
 <span class="kw">UNSUBSCRIBE</span> <span class="var">42</span>;
@@ -766,7 +761,7 @@
   </table>
 
   <h3>Backward compatibility</h3>
-  <p>SUBSCRIBE responses use the standard CQL RESULT opcode (0x08) with the STREAMING flag set in the frame header. Drivers that don't understand the flag will simply see it as a normal result set. The subscription lifecycle is managed server-side — clients don't need to implement any new protocol logic.</p>
+  <p>SUBSCRIBE response framing is still being verified against real drivers. Treat this extension as experimental until compatibility evidence is attached.</p>
 
   <!-- ── Graph ── -->
   <h2 id="graph">Graph (Cypher) Extension</h2>
@@ -798,12 +793,13 @@
       <tr><td>CREATE</td><td><span class="check">Parsed</span></td><td>Parsed; mutate via CQL INSERT (see <a href="cypher.html#create-set-delete">Cypher reference</a>)</td></tr>
       <tr><td>SET</td><td><span class="check">Parsed</span></td><td>Parsed; mutate via CQL UPDATE</td></tr>
       <tr><td>DELETE / DETACH DELETE</td><td><span class="check">Parsed</span></td><td>Parsed; mutate via CQL DELETE</td></tr>
-      <tr><td>SUBSCRIBE MATCH</td><td><span class="check">Supported</span></td><td>Real-time subscription to graph traversals with EVERY/DELTA</td></tr>
+      <tr><td>SUBSCRIBE MATCH</td><td><span class="warn">Experimental</span></td><td>Graph streaming syntax is documented as a developer-preview target pending verification</td></tr>
     </tbody>
   </table>
 
   <h3>Graph SUBSCRIBE</h3>
-  <pre><span class="cm">-- Subscribe to a graph traversal</span>
+  <p>Graph SUBSCRIBE examples are retained as experimental syntax, not a public production guarantee.</p>
+  <pre><span class="cm">-- Experimental graph traversal subscription</span>
 <span class="kw">SUBSCRIBE MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
 <span class="kw">RETURN</span> b.name, b.email
 <span class="kw">EVERY</span> <span class="var">10</span>s;
