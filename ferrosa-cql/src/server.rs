@@ -145,7 +145,16 @@ impl IpConnectionTracker {
 ///
 /// This ensures the slot is freed even if the handler task panics
 /// or is cancelled, preventing permanent connection slot leaks.
-struct IpSlotGuard {
+///
+/// The guard is handed off to `handle_connection`, which drops it
+/// as soon as the connection reaches the `Ready` phase — the per-IP
+/// limit only needs to defend against unauthenticated connection
+/// storms; once a client has completed the protocol handshake (and
+/// auth, if enabled), it is no longer counted toward the per-IP cap.
+/// If the handler never reaches `Ready` (e.g. the client disconnects
+/// before STARTUP, or fails MAX_AUTH_ATTEMPTS), the guard drops with
+/// the handler task and the slot is released anyway.
+pub(crate) struct IpSlotGuard {
     tracker: Arc<IpConnectionTracker>,
     ip: IpAddr,
 }
@@ -154,6 +163,38 @@ impl Drop for IpSlotGuard {
     fn drop(&mut self) {
         self.tracker.release(self.ip);
     }
+}
+
+/// Send a single rejection frame to a newly-accepted stream in a spawned task.
+///
+/// The accept loop must NEVER await on a write to a peer it has just rejected:
+/// if that one write blocks (slow peer, full kernel buffer, TCP retransmit
+/// timeout after the peer disappears), every subsequent `listener.accept()`
+/// is also blocked, and the entire CQL listener becomes unresponsive. This
+/// is exactly the failure mode triaged in the connect-stall investigation
+/// (commit message of this PR).
+///
+/// By spawning the send into its own task, slow rejection-writes are
+/// quarantined to their own task. The accept loop returns to
+/// `listener.accept()` on the very next instruction.
+fn spawn_reject(stream: tokio::net::TcpStream, max_frame_size: u32, err: CqlError) {
+    tokio::spawn(async move {
+        let codec = CqlCodec::new(max_frame_size);
+        let mut framed = Framed::new(stream, codec);
+        let body = err.encode_body().freeze();
+        let frame = CqlFrame {
+            header: FrameHeader {
+                version: VERSION_RESPONSE,
+                flags: 0,
+                stream_id: -1,
+                opcode: Opcode::Error,
+                length: 0,
+            },
+            body,
+        };
+        let _ = framed.send(frame).await;
+        // Framed (and the underlying TcpStream) drop here, closing the socket.
+    });
 }
 
 /// CQL protocol server.
@@ -249,21 +290,11 @@ impl CqlServer {
                         if current >= max_connections {
                             active.fetch_sub(1, Ordering::Relaxed);
                             warn!("connection limit reached, rejecting {peer}");
-                            let codec = CqlCodec::new(max_frame_size);
-                            let mut framed = Framed::new(stream, codec);
-                            let err = CqlError::Overloaded("connection limit reached".into());
-                            let body = err.encode_body().freeze();
-                            let frame = CqlFrame {
-                                header: FrameHeader {
-                                    version: VERSION_RESPONSE,
-                                    flags: 0,
-                                    stream_id: -1,
-                                    opcode: Opcode::Error,
-                                    length: 0,
-                                },
-                                body,
-                            };
-                            let _ = framed.send(frame).await;
+                            spawn_reject(
+                                stream,
+                                max_frame_size,
+                                CqlError::Overloaded("connection limit reached".into()),
+                            );
                             continue;
                         }
                         // In pair mode, only the primary accepts CQL connections.
@@ -273,24 +304,14 @@ impl CqlServer {
                             tracing::debug!(
                                 "rejecting CQL connection: node is pair-mode secondary"
                             );
-                            let codec = CqlCodec::new(max_frame_size);
-                            let mut framed = Framed::new(stream, codec);
-                            let err = CqlError::Overloaded(
-                                "writes disallowed on read replica; connect to the primary node"
-                                    .into(),
+                            spawn_reject(
+                                stream,
+                                max_frame_size,
+                                CqlError::Overloaded(
+                                    "writes disallowed on read replica; connect to the primary node"
+                                        .into(),
+                                ),
                             );
-                            let body = err.encode_body().freeze();
-                            let frame = CqlFrame {
-                                header: FrameHeader {
-                                    version: VERSION_RESPONSE,
-                                    flags: 0,
-                                    stream_id: -1,
-                                    opcode: Opcode::Error,
-                                    length: 0,
-                                },
-                                body,
-                            };
-                            let _ = framed.send(frame).await;
                             continue;
                         }
                         // Per-IP rate limiting
@@ -298,22 +319,11 @@ impl CqlServer {
                         if !ip_tracker.try_acquire(peer_ip, max_connections_per_ip) {
                             active.fetch_sub(1, Ordering::Relaxed);
                             warn!("per-IP limit reached for {peer_ip}, rejecting");
-                            let codec = CqlCodec::new(max_frame_size);
-                            let mut framed = Framed::new(stream, codec);
-                            let err =
-                                CqlError::Overloaded("per-IP connection limit reached".into());
-                            let body = err.encode_body().freeze();
-                            let frame = CqlFrame {
-                                header: FrameHeader {
-                                    version: VERSION_RESPONSE,
-                                    flags: 0,
-                                    stream_id: -1,
-                                    opcode: Opcode::Error,
-                                    length: 0,
-                                },
-                                body,
-                            };
-                            let _ = framed.send(frame).await;
+                            spawn_reject(
+                                stream,
+                                max_frame_size,
+                                CqlError::Overloaded("per-IP connection limit reached".into()),
+                            );
                             continue;
                         }
                         // Configure TCP keepalive to detect dead peers in ~60s
@@ -328,7 +338,9 @@ impl CqlServer {
 
                         // RAII guard: releases the IP slot on drop (including panics
                         // and task cancellation), preventing permanent slot leaks.
-                        let _ip_guard = IpSlotGuard {
+                        // Handed to the connection handler, which drops it the moment
+                        // the connection reaches Ready phase — see IpSlotGuard docs.
+                        let ip_guard = IpSlotGuard {
                             tracker: ip_tracker.clone(),
                             ip: peer_ip,
                         };
@@ -337,10 +349,6 @@ impl CqlServer {
                         let state = state.clone();
                         let tls_acceptor = tls_acceptor.clone();
                         tokio::spawn(async move {
-                            // Move the guard into the spawned task so its lifetime
-                            // is tied to the connection handler, not the accept loop.
-                            let _ip_guard = _ip_guard;
-
                             if let Some(acceptor) = tls_acceptor {
                                 // TLS handshake with 10s timeout
                                 match tokio::time::timeout(
@@ -357,10 +365,12 @@ impl CqlServer {
                                             max_in_flight,
                                             auth_disabled,
                                             state,
+                                            Some(ip_guard),
                                         )
                                         .await;
                                     }
                                     Ok(Err(e)) => {
+                                        // ip_guard drops here, releasing the slot.
                                         warn!("TLS handshake failed from {peer}: {e}");
                                     }
                                     Err(_) => {
@@ -375,10 +385,10 @@ impl CqlServer {
                                     max_in_flight,
                                     auth_disabled,
                                     state,
+                                    Some(ip_guard),
                                 )
                                 .await;
                             }
-                            // _ip_guard drops here, releasing the IP slot.
                             // active connection count is decremented explicitly.
                             active.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -541,6 +551,137 @@ mod tests {
         assert_eq!(header.opcode, Opcode::Error);
         let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
         assert_eq!(error_code, 0x1100);
+    }
+
+    /// Send a v4 STARTUP frame and read one response frame.
+    async fn startup_and_read_one_frame(stream: &mut TcpStream) -> FrameHeader {
+        use bytes::BufMut;
+        use tokio::io::AsyncWriteExt;
+        let mut body = bytes::BytesMut::new();
+        body.put_u16(1); // 1 entry in the string map
+        let key = b"CQL_VERSION";
+        body.put_u16(key.len() as u16);
+        body.put_slice(key);
+        let val = b"3.0.0";
+        body.put_u16(val.len() as u16);
+        body.put_slice(val);
+        let body_len = body.len() as u32;
+
+        let mut header = bytes::BytesMut::new();
+        header.put_u8(0x04); // version (request)
+        header.put_u8(0x00); // flags
+        header.put_i16(0); // stream id
+        header.put_u8(0x01); // STARTUP opcode
+        header.put_u32(body_len);
+        stream.write_all(&header).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+
+        let mut buf = vec![0u8; HEADER_SIZE];
+        let mut read_total = 0;
+        while read_total < HEADER_SIZE {
+            let n = stream.read(&mut buf[read_total..]).await.unwrap();
+            if n == 0 {
+                panic!("EOF before response header");
+            }
+            read_total += n;
+        }
+        let h = FrameHeader::decode(&buf).unwrap();
+        // drain body so caller can reuse stream cleanly
+        if h.length > 0 {
+            let mut body = vec![0u8; h.length as usize];
+            let _ = stream.read_exact(&mut body).await;
+        }
+        h
+    }
+
+    /// F3 regression test: per-IP rate-limit slot must be released the moment
+    /// the connection reaches Ready phase. Otherwise a burst from one IP
+    /// holds every slot for the full IDLE_TIMEOUT after the clients finish,
+    /// rejecting legitimate follow-up traffic for minutes.
+    #[tokio::test]
+    async fn per_ip_slot_released_on_ready_transition() {
+        let (state, _dir) = setup_state();
+        let mut config = test_config(10, 1); // per-IP cap = 1
+        config.auth_disabled = true; // STARTUP transitions directly to Ready
+        let server = CqlServer::new(config, state);
+        let addr = server.start_background().await.unwrap();
+
+        // Connection 1 — complete handshake, reach Ready.
+        let mut c1 = TcpStream::connect(addr).await.unwrap();
+        let h1 = startup_and_read_one_frame(&mut c1).await;
+        assert_eq!(h1.opcode, Opcode::Ready);
+
+        // Give the server a brief window to drop the slot guard.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Connection 2 from SAME IP — pre-F3, c1 still holds the per-IP slot
+        // and this would be rejected with Overloaded. Post-F3, c1's slot was
+        // released when it reached Ready, so c2 acquires it and succeeds.
+        let mut c2 = TcpStream::connect(addr).await.unwrap();
+        let h2 = startup_and_read_one_frame(&mut c2).await;
+        assert_eq!(
+            h2.opcode,
+            Opcode::Ready,
+            "second connection from same IP should be accepted: c1 must release its per-IP slot on Ready transition"
+        );
+
+        // Keep c1 alive so we know its IDLE_TIMEOUT didn't release the slot.
+        drop(c1);
+        drop(c2);
+    }
+
+    /// Regression test for the CQL connect-stall: if rejection writes happen
+    /// inline in the accept loop, ONE slow rejection-peer freezes every
+    /// subsequent accept on the listener. With the fix, rejection writes
+    /// are quarantined to spawned tasks; the accept loop keeps draining the
+    /// SYN queue regardless of how slow individual rejection-peers are.
+    #[tokio::test]
+    async fn rejection_does_not_block_subsequent_accepts() {
+        let (state, _dir) = setup_state();
+        // Global cap=1, per-IP cap large so we test only the global path.
+        let server = CqlServer::new(test_config(1, 64), state);
+        let addr = server.start_background().await.unwrap();
+
+        // Open and HOLD the one allowed slot; never read from it.
+        let _hog = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Open a rejected connection whose kernel recv buffer is set tiny
+        // and that NEVER reads. With the old inline-await design, the
+        // server's framed.send to this peer would saturate the kernel
+        // buffer and block the accept loop. (For a 50-byte Error frame
+        // this rarely happens in practice — but the structural fix is
+        // what protects us, not the kernel buffer luck.)
+        let slow_peer = TcpStream::connect(addr).await.unwrap();
+        {
+            let sref = socket2::SockRef::from(&slow_peer);
+            let _ = sref.set_recv_buffer_size(512);
+        }
+
+        // Now race a NEW client: in the buggy design the accept loop is
+        // wedged behind the slow_peer's rejection-send and this connect
+        // would have to wait. We assert it completes within a tight bound.
+        let race_start = std::time::Instant::now();
+        let mut race = TcpStream::connect(addr).await.unwrap();
+        let connect_elapsed = race_start.elapsed();
+
+        let mut buf = vec![0u8; 256];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), race.read(&mut buf))
+            .await
+            .expect("rejection frame read timed out")
+            .unwrap();
+        assert!(n >= HEADER_SIZE);
+        let header = FrameHeader::decode(&buf[..HEADER_SIZE]).unwrap();
+        assert_eq!(header.opcode, Opcode::Error);
+
+        assert!(
+            connect_elapsed < std::time::Duration::from_millis(500),
+            "race connect took {connect_elapsed:?} — accept loop appears blocked behind the slow rejection"
+        );
+
+        // Keep references alive so their sockets stay open during the test.
+        drop(_hog);
+        drop(slow_peer);
     }
 
     #[tokio::test]

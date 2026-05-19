@@ -42,6 +42,26 @@ use futures::SinkExt;
 /// Idle timeout: drop connection if no complete frame arrives within this duration (M11).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Authenticate on the blocking pool so bcrypt (`cost=12` ≈ 200 ms per call on
+/// commodity hardware) does not block the async worker that runs this
+/// connection's handler. Without offloading, a burst of concurrent auth
+/// attempts pins every async worker thread in CPU-bound `bcrypt::verify`
+/// for hundreds of milliseconds at a time, starving the accept loop and
+/// every other connection on the same runtime.
+///
+/// The `JoinError` path (task panicked) is mapped to `AuthenticationFailed`
+/// so panics in the auth path become auth failures rather than dropped
+/// futures.
+pub(crate) async fn authenticate_off_runtime(
+    schema: Arc<ferrosa_schema::Schema>,
+    username: String,
+    password: String,
+) -> ferrosa_schema::Result<ferrosa_schema::AuthContext> {
+    tokio::task::spawn_blocking(move || schema.authenticate(&username, &password))
+        .await
+        .unwrap_or(Err(ferrosa_schema::SchemaError::AuthenticationFailed))
+}
+
 /// Connection phase state machine (M7).
 #[derive(Debug)]
 enum ConnectionPhase {
@@ -76,13 +96,14 @@ impl Drop for ConnectionGuard {
 /// In-flight request limiting: a semaphore bounds the number of concurrent
 /// requests being processed. When the limit is reached, new requests receive
 /// ERROR(Overloaded) without consuming a permit.
-pub async fn handle_connection<S>(
+pub(crate) async fn handle_connection<S>(
     stream: S,
     peer: SocketAddr,
     max_frame_size: u32,
     max_in_flight: usize,
     auth_disabled: bool,
     state: Arc<SharedState>,
+    mut ip_slot: Option<crate::server::IpSlotGuard>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -415,6 +436,15 @@ pub async fn handle_connection<S>(
                             if let Some(ctx) = auth_context.as_ref() {
                                 state.connection_tracker.update_username(&peer, &ctx.role);
                             }
+                            // F3: drop the per-IP rate-limit slot the instant
+                            // the connection reaches Ready. The per-IP cap is a
+                            // defence against unauthenticated connection storms;
+                            // once a client has completed the handshake (and auth,
+                            // if enabled), it should not be counted toward that
+                            // cap — otherwise a burst from one IP holds slots
+                            // for the full IDLE_TIMEOUT even after all clients
+                            // succeed, rejecting legitimate follow-up traffic.
+                            ip_slot.take();
                         }
                         if was_ready {
                             state.connection_tracker.increment_requests(&peer);
@@ -834,7 +864,9 @@ async fn handle_frame(
             }
         },
         ConnectionPhase::Authenticating { .. } => match frame.header.opcode {
-            Opcode::AuthResponse => handle_auth_response(phase, auth_context, state, &frame.body),
+            Opcode::AuthResponse => {
+                handle_auth_response(phase, auth_context, state, &frame.body).await
+            }
             _ => {
                 // Any opcode other than AUTH_RESPONSE before authentication is
                 // complete is an unauthorized access attempt — return 0x2100, not
@@ -989,7 +1021,7 @@ fn handle_options() -> HandleResult {
 
 // ── AUTH_RESPONSE ─────────────────────────────────────────────────────────
 
-fn handle_auth_response(
+async fn handle_auth_response(
     phase: &mut ConnectionPhase,
     auth_context: &mut Option<AuthContext>,
     state: &SharedState,
@@ -1010,19 +1042,29 @@ fn handle_auth_response(
 
     let payload = &cursor[..payload_len as usize];
 
-    match parse_sasl_plain(payload) {
-        Ok((username, password)) => match state.schema.authenticate(username, password) {
-            Ok(ctx) => {
-                *auth_context = Some(ctx);
-                *phase = ConnectionPhase::Ready;
-                let body = BytesMut::from(&encode_auth_success()[..]);
-                HandleResult::Reply(Opcode::AuthSuccess, body)
-            }
-            Err(_) => {
-                let err = CqlError::BadCredentials;
-                increment_auth_attempts_and_reply(phase, err)
-            }
-        },
+    let (username, password) = match parse_sasl_plain(payload) {
+        Ok(creds) => creds,
+        Err(_) => {
+            let err = CqlError::BadCredentials;
+            return increment_auth_attempts_and_reply(phase, err);
+        }
+    };
+
+    // Offload bcrypt to the blocking pool — see `authenticate_off_runtime`.
+    let result = authenticate_off_runtime(
+        state.schema.clone(),
+        username.to_string(),
+        password.to_string(),
+    )
+    .await;
+
+    match result {
+        Ok(ctx) => {
+            *auth_context = Some(ctx);
+            *phase = ConnectionPhase::Ready;
+            let body = BytesMut::from(&encode_auth_success()[..]);
+            HandleResult::Reply(Opcode::AuthSuccess, body)
+        }
         Err(_) => {
             let err = CqlError::BadCredentials;
             increment_auth_attempts_and_reply(phase, err)
@@ -2083,6 +2125,66 @@ fn extract_keyspace_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_minimal_schema_for_test() -> Arc<ferrosa_schema::Schema> {
+        use ferrosa_schema::audit::TestAuditSink;
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+            RateLimitConfig, Schema, SchemaConfig,
+        };
+        let schema = Schema::new(SchemaConfig {
+            hasher: PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        })
+        .unwrap();
+        Arc::new(schema)
+    }
+
+    #[tokio::test]
+    async fn authenticate_off_runtime_does_not_serialize_on_async_thread() {
+        // Pre-fix: `authenticate` ran synchronously on the async worker. On a
+        // single-threaded runtime (which `#[tokio::test]` uses), 10 concurrent
+        // cost-4 bcrypts serialise through the one worker thread (~50-100 ms
+        // total). Post-fix: `spawn_blocking` offloads each to the blocking
+        // pool; the 10 run in parallel (~5-15 ms total).
+        let schema = build_minimal_schema_for_test();
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let s = schema.clone();
+            handles.push(tokio::spawn(async move {
+                authenticate_off_runtime(s, "cassandra".into(), "cassandra".into()).await
+            }));
+        }
+        for h in handles {
+            let res = h.await.unwrap();
+            assert!(
+                res.is_ok(),
+                "auth should succeed against the default cassandra user: {res:?}"
+            );
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(40),
+            "10 concurrent cost-4 auths took {elapsed:?} — auth is not offloaded to the blocking pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_off_runtime_returns_failure_for_bad_password() {
+        let schema = build_minimal_schema_for_test();
+        let result =
+            authenticate_off_runtime(schema, "cassandra".into(), "wrong-password".into()).await;
+        assert!(matches!(
+            result,
+            Err(ferrosa_schema::SchemaError::AuthenticationFailed)
+        ));
+    }
 
     #[test]
     fn connection_guard_deregisters_on_drop() {
