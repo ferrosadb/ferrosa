@@ -190,21 +190,17 @@ impl StorageEngineConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(64 * 1024 * 1024); // 64 MB default
 
-        let memtable_backpressure_bytes: u64 =
-            std::env::var("FERROSA_MEMTABLE_BACKPRESSURE_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| {
-                    // Default: max(threshold × 4, 64 MB) so tests
-                    // with intentionally tiny thresholds (for testing
-                    // flush behaviour) don't trip the production
-                    // backpressure path. Production deployments with
-                    // the default 64 MB threshold land on 256 MB.
-                    std::cmp::max(
-                        flush_threshold_bytes.saturating_mul(4),
-                        64 * 1024 * 1024,
-                    )
-                });
+        let memtable_backpressure_bytes: u64 = std::env::var("FERROSA_MEMTABLE_BACKPRESSURE_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                // Default: max(threshold × 4, 64 MB) so tests
+                // with intentionally tiny thresholds (for testing
+                // flush behaviour) don't trip the production
+                // backpressure path. Production deployments with
+                // the default 64 MB threshold land on 256 MB.
+                std::cmp::max(flush_threshold_bytes.saturating_mul(4), 64 * 1024 * 1024)
+            });
 
         let flush_max_age_secs = std::env::var("FERROSA_FLUSH_MAX_AGE_SECS")
             .ok()
@@ -299,10 +295,10 @@ impl StorageEngineConfig {
             commit_log: CommitLogConfig::test_config(dir),
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
-            local_cache_max_bytes: 1024 * 1024, // 1 MB
-            flush_threshold_bytes: 4096,        // 4 KB — triggers flush quickly in tests
+            local_cache_max_bytes: 1024 * 1024,    // 1 MB
+            flush_threshold_bytes: 4096,           // 4 KB — triggers flush quickly in tests
             memtable_backpressure_bytes: u64::MAX, // disabled by default in tests; opt-in per test
-            flush_max_age_secs: 5,              // 5s — fast age-based flush in tests
+            flush_max_age_secs: 5,                 // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
             index_backend: crate::index::IndexBackendConfig::Local,
             // Tests keep verification on — writer bugs surface
