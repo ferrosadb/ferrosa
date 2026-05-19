@@ -404,6 +404,133 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
 
     /// Yield the next partition in storage order. Returns `Ok(None)` when
     /// the iterator has reached EOF.
+    /// Phase 1 of the row-streamed partition read: decode header
+    /// (key + deletion + optional static row), park the iterator
+    /// at the first clustered row. The follow-up call is
+    /// [`Self::stream_clustered_rows`]. Together they let callers see
+    /// the header **before** providing a row consumer — which is
+    /// what the digest path needs (seed `PartitionDigestStream`
+    /// with the header, then fold rows in).
+    ///
+    /// Returns `Ok(None)` at EOF.
+    pub fn next_partition_header_only(
+        &mut self,
+    ) -> Result<
+        Option<(
+            ferrosa_common::DecoratedKey,
+            crate::types::DeletionTime,
+            Option<crate::types::Row>,
+        )>,
+    > {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_header_only()?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_header_only()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
+    /// One-row-at-a-time companion to [`Self::stream_clustered_rows`].
+    /// After [`Self::next_partition_header_only`] has parked the iter
+    /// at the first clustered row, repeatedly call this to pull
+    /// rows in storage order. Returns `Ok(None)` at
+    /// end-of-partition; the iterator is then ready for another
+    /// `next_partition_header_only`.
+    ///
+    /// Used by `TableStore::walk_token_range_for_digest`'s
+    /// multi-source path: each source's iter is advanced one
+    /// row at a time so the cross-source k-way merge by
+    /// clustering key controls the pull rate, holding at most
+    /// one row per source in flight at any moment.
+    pub fn next_clustered_row(&mut self) -> Result<Option<crate::types::Row>> {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_next_clustered_row()?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_next_clustered_row()?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
+    /// Phase 2 of the row-streamed partition read: walk clustered
+    /// rows until end-of-partition, invoking `on_row` once per row
+    /// in storage order. Each row is decoded into a fresh `Row`,
+    /// handed to the callback by reference, and dropped before
+    /// the next is read.
+    ///
+    /// Must be preceded by [`Self::next_partition_header_only`] — calling
+    /// it without phase 1 mis-aligns the data pointer.
+    pub fn stream_clustered_rows<F>(&mut self, on_row: F) -> Result<()>
+    where
+        F: FnMut(&crate::types::Row) -> Result<()>,
+    {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            reader.stream_clustered_rows(on_row)?;
+            self.pos = reader.position();
+            Ok(())
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            reader.stream_clustered_rows(on_row)?;
+            self.pos = reader.position();
+            Ok(())
+        }
+    }
+
+    /// Yield the next partition's header (key, deletion, static
+    /// row) and call `on_row` once per clustered row in storage
+    /// order. Each row is decoded into a freshly-allocated `Row`,
+    /// handed to the callback by reference, and dropped before the
+    /// next row is read.
+    ///
+    /// Peak working set during the call is **one row** — used by
+    /// anti-entropy repair to hash a multi-MB partition into a
+    /// `PartitionDigestStream` without ever materialising a full
+    /// `Partition` struct (which the bigger
+    /// `next_partition`/`read_partition` paths do).
+    pub fn next_partition_streaming<F>(
+        &mut self,
+        on_row: F,
+    ) -> Result<
+        Option<(
+            ferrosa_common::DecoratedKey,
+            crate::types::DeletionTime,
+            Option<crate::types::Row>,
+        )>,
+    >
+    where
+        F: FnMut(&crate::types::Row) -> Result<()>,
+    {
+        let header = &self.sst.header;
+        if let Some(ref buf) = self.decompressed {
+            let slice: &[u8] = buf.as_slice();
+            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+            let result = reader.read_partition_streaming(on_row)?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_partition_streaming(on_row)?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
     pub fn next_partition(&mut self) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
         if let Some(ref buf) = self.decompressed {
@@ -1081,6 +1208,208 @@ mod tests {
         let mut iter = reader.partitions_iter().expect("partitions_iter");
         iter.seek_to_token(above_max).expect("seek above max");
         assert!(iter.next_partition().expect("next").is_none());
+    }
+
+    /// After `next_partition_header_only` parks the iterator at
+    /// the first clustered row, `next_clustered_row` yields rows
+    /// one at a time, returning `Ok(None)` at end-of-partition.
+    /// Companion to `stream_clustered_rows` for callers that need
+    /// fine-grained control over advancement — specifically the
+    /// cross-source row merge in
+    /// `TableStore::walk_token_range_for_digest`'s multi-source
+    /// path, which pulls one row from each source's iterator and
+    /// k-way merges by clustering key.
+    ///
+    /// Calling this on a `PartitionIter` not parked inside a
+    /// partition's row section is undefined.
+    #[test]
+    fn next_clustered_row_yields_rows_one_at_a_time() {
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"ncr_key".as_slice()));
+        let data_bytes = build_data_blob_with_rows(dk.key.as_bytes(), 5);
+        let partitions_bytes = build_partition_index(&[(&dk, 0)]);
+        let filter_bytes = build_bloom_filter(&[&dk]);
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        let mut iter = reader.partitions_iter().unwrap();
+        let (key, _deletion, static_row) = iter.next_partition_header_only().unwrap().unwrap();
+        assert_eq!(key, dk);
+        assert!(static_row.is_none());
+
+        let mut got = Vec::new();
+        while let Some(row) = iter.next_clustered_row().unwrap() {
+            got.push(row);
+        }
+        assert_eq!(got.len(), 5, "should yield exactly the 5 clustered rows");
+        // After exhaust, repeated calls should keep returning None
+        // — and the iterator should be ready for the next
+        // partition (or EOF).
+        assert!(iter.next_clustered_row().unwrap().is_none());
+    }
+
+    /// `next_partition_header_only` reads the partition header
+    /// (key, deletion, static row) and leaves the iterator parked
+    /// at the first **clustered** row. `stream_clustered_rows` is
+    /// the continuation that walks those rows one at a time. The
+    /// two together let a caller process the header (e.g. seed a
+    /// `PartitionDigestStream`) BEFORE the rows arrive — which is
+    /// what `next_partition_streaming`'s one-shot
+    /// `(header, on_row)` API doesn't support since the header
+    /// can only be returned after the row callback has consumed
+    /// everything.
+    ///
+    /// Calling `stream_clustered_rows` on a fresh `PartitionIter`
+    /// (without a preceding `next_partition_header_only`) is
+    /// undefined; the iterator must be parked at the start of a
+    /// row sequence inside a partition.
+    #[test]
+    fn next_partition_header_only_then_stream_clustered_rows_matches_legacy() {
+        let header = test_header();
+        let dks: Vec<_> = (0..3u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("hsk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob_with_rows(dk.key.as_bytes(), 3));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Baseline via `next_partition`.
+        let mut baseline = Vec::new();
+        let mut iter = reader.partitions_iter().unwrap();
+        while let Some(p) = iter.next_partition().unwrap() {
+            baseline.push(p);
+        }
+
+        // 2-phase streaming.
+        let mut streamed = Vec::new();
+        let mut iter = reader.partitions_iter().unwrap();
+        while let Some((key, deletion, static_row)) = iter.next_partition_header_only().unwrap() {
+            let mut rows = Vec::new();
+            iter.stream_clustered_rows(|row| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+            streamed.push((key, deletion, static_row, rows));
+        }
+
+        assert_eq!(baseline.len(), streamed.len());
+        for (p, (key, deletion, static_row, rows)) in baseline.iter().zip(streamed.iter()) {
+            assert_eq!(p.key, *key);
+            assert_eq!(p.deletion, *deletion);
+            assert_eq!(p.static_row, *static_row);
+            assert_eq!(p.rows.len(), rows.len());
+            for (a, b) in p.rows.iter().zip(rows.iter()) {
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    /// `next_partition_streaming` yields the same partition
+    /// header and same sequence of clustered rows as
+    /// `next_partition`. This is the read-side primitive used by
+    /// anti-entropy repair to hash a multi-MB partition without
+    /// ever holding a full `Partition` in memory: peak working
+    /// set during the call is one row at a time.
+    #[test]
+    fn next_partition_streaming_matches_next_partition() {
+        let header = test_header();
+        let dks: Vec<_> = (0..3u32)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("psk{i:02}").as_bytes())))
+            .collect();
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            // build_data_blob_with_rows ensures multiple clustered
+            // rows so the streaming callback fires more than once.
+            data_bytes.extend_from_slice(&build_data_blob_with_rows(dk.key.as_bytes(), 4));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Baseline: collect via `next_partition`.
+        let mut materialised = Vec::new();
+        let mut iter = reader.partitions_iter().unwrap();
+        while let Some(p) = iter.next_partition().unwrap() {
+            materialised.push(p);
+        }
+
+        // Streaming: collect via `next_partition_streaming`.
+        let mut streamed_headers = Vec::new();
+        let mut streamed_rows: Vec<Vec<crate::types::Row>> = Vec::new();
+        let mut iter = reader.partitions_iter().unwrap();
+        loop {
+            let mut my_rows = Vec::new();
+            let result = iter
+                .next_partition_streaming(|row| {
+                    my_rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            match result {
+                Some((key, deletion, static_row)) => {
+                    streamed_headers.push((key, deletion, static_row));
+                    streamed_rows.push(my_rows);
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(materialised.len(), streamed_headers.len());
+        for ((p, (key, deletion, static_row)), rows) in materialised
+            .iter()
+            .zip(streamed_headers.iter())
+            .zip(streamed_rows.iter())
+        {
+            assert_eq!(p.key, *key);
+            assert_eq!(p.deletion, *deletion);
+            assert_eq!(p.static_row, *static_row);
+            assert_eq!(p.rows.len(), rows.len());
+            for (a, b) in p.rows.iter().zip(rows.iter()) {
+                assert_eq!(a, b);
+            }
+        }
     }
 
     /// ADR-020 COUNT(*) fast path: next_partition_count yields the

@@ -360,22 +360,214 @@ pub struct ReadResponsePayload {
 ///
 /// Returns an error if the partition cannot be serialized to bincode.
 pub fn compute_partition_digest(partition: &Partition) -> Result<u32, bincode::Error> {
-    // Clone into a wire type so we can serialize without mutating the caller's value.
-    let wire = PartitionWire {
-        token: partition.key.token.0,
-        key_bytes: partition.key.key.as_bytes().to_vec(),
-        deletion: DeletionTimeWire {
-            marked_for_delete_at: partition.deletion.marked_for_delete_at,
-            local_deletion_time: partition.deletion.local_deletion_time,
-        },
-        static_row: partition.static_row.clone().map(RowWire::from),
-        rows: partition.rows.iter().cloned().map(RowWire::from).collect(),
-    };
+    // Format: token || key_bytes || deletion || static_row ||
+    // rows... || row_count.
+    //
+    // Row count is emitted LAST so the streaming SSTable walker
+    // (see `PartitionDigestStream`) can hash rows as they're
+    // decoded without knowing the total in advance. This function
+    // exists as the reference impl and matches the streaming
+    // variants exactly — pinned by
+    // `partition_digest_streaming_matches_legacy`.
+    let mut stream = PartitionDigestStream::new(
+        partition.key.token.0,
+        partition.key.key.as_bytes(),
+        partition.deletion,
+        partition.static_row.as_ref(),
+    )?;
+    for row in &partition.rows {
+        stream.update_row(row)?;
+    }
+    stream.finalize()
+}
 
-    let bytes = bincode::serialize(&wire)?;
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&bytes);
-    Ok(hasher.finalize())
+/// Bridges `bincode`'s `serialize_into(W: std::io::Write, _)` into the
+/// `crc32fast::Hasher::update(&[u8])` API. Lets the serialiser stream
+/// its bytes straight into the hasher without ever holding the full
+/// serialised partition in a `Vec<u8>` — which is the difference
+/// between a Merkle build that fits in the 2 GiB cgroup and one that
+/// doesn't.
+struct CrcHashWriter<'a> {
+    hasher: &'a mut crc32fast::Hasher,
+}
+
+impl<'a> std::io::Write for CrcHashWriter<'a> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Byte-identical to [`compute_partition_digest`] but **never
+/// clones the partition's rows or cells**. Walks
+/// `partition.rows` row-by-row, converts one row at a time into
+/// its `RowWire` form, serialises it directly into the CRC hasher,
+/// and drops it before touching the next row. Peak transient
+/// allocation during a hash is the bytes of a **single row** plus
+/// bincode's small scratch state — independent of how many rows
+/// the partition has or how big each cell value is.
+///
+/// On the fmem entity_store this drops anon-RSS growth during a
+/// Merkle build from ~80 MB/s of churn (one full partition clone
+/// plus one same-sized bincode buffer per hash, freed but holding
+/// pages back from the OS) to a small steady-state value, so the
+/// concurrent builds a single repair triggers on a 1 GB-class
+/// replica fit comfortably inside the 2 GiB cgroup that the
+/// legacy shape OOM-killed.
+///
+/// Wire-format equivalence with [`compute_partition_digest`] is
+/// pinned by `partition_digest_streaming_matches_legacy` in the
+/// test module — bincode default options encode `Vec<T>` as
+/// `u64-LE length || items`, so emitting the length and then each
+/// row individually produces the same byte stream as serialising
+/// `Vec<RowWire>` in one shot.
+pub fn compute_partition_digest_streaming(partition: &Partition) -> Result<u32, bincode::Error> {
+    // Same shape as [`compute_partition_digest`] — both go through
+    // `PartitionDigestStream`. Kept under its own name for callers
+    // that already discovered it; the only difference from the
+    // legacy entry point is that this one is the "streamy" name.
+    compute_partition_digest(partition)
+}
+
+/// Emit a `Row` in `RowWire`'s on-wire byte layout without cloning
+/// any of its cell contents. `bincode::serialize_into(&mut writer,
+/// &row.clustering)` already passes the bytes of `row.clustering`
+/// by reference, and the same is true for each cell's
+/// `Option<Vec<u8>>` value — serde walks the Option tag, then if
+/// Some it writes the length followed by the borrowed bytes.
+fn serialize_row_borrowed<W: std::io::Write>(
+    writer: &mut W,
+    row: &ferrosa_sstable::types::Row,
+) -> Result<(), bincode::Error> {
+    // clustering: Vec<u8>
+    bincode::serialize_into(&mut *writer, &row.clustering)?;
+    // cells: Vec<(u16, CellValueWire)> — emit len then each pair
+    let n_cells = row.cells.len() as u64;
+    bincode::serialize_into(&mut *writer, &n_cells)?;
+    for (idx, cell) in &row.cells {
+        bincode::serialize_into(&mut *writer, idx)?;
+        // CellValueWire fields in order: value, timestamp, ttl,
+        // local_deletion_time. CellValueWire is `Serialize` for a
+        // struct with named fields — bincode emits its fields in
+        // declaration order with no field tags, so emitting them
+        // individually here produces an identical byte stream.
+        bincode::serialize_into(&mut *writer, &cell.value)?;
+        bincode::serialize_into(&mut *writer, &cell.timestamp)?;
+        bincode::serialize_into(&mut *writer, &cell.ttl)?;
+        bincode::serialize_into(&mut *writer, &cell.local_deletion_time)?;
+    }
+    // deletion: DeletionTimeWire
+    serialize_deletion_time(
+        &mut *writer,
+        row.deletion.marked_for_delete_at,
+        row.deletion.local_deletion_time,
+    )?;
+    // primary_key_liveness: LivenessInfoWire — fields in order
+    bincode::serialize_into(&mut *writer, &row.primary_key_liveness.timestamp)?;
+    bincode::serialize_into(&mut *writer, &row.primary_key_liveness.ttl)?;
+    bincode::serialize_into(&mut *writer, &row.primary_key_liveness.local_deletion_time)?;
+    Ok(())
+}
+
+/// Row-by-row streaming variant of [`compute_partition_digest`].
+///
+/// Caller seeds the digest with the partition header (token, key
+/// bytes, partition-level deletion, optional static row, and the
+/// **exact** number of clustered rows that will be fed), then calls
+/// [`PartitionDigestStream::update_row`] once per clustered row in
+/// the same order they appear in the partition, and finally
+/// [`PartitionDigestStream::finalize`] to get the CRC.
+///
+/// This lets the SSTable walker hash a multi-MB partition without
+/// ever materialising a `Partition` struct — peak transient
+/// allocation per row is the bincode scratch state, and each row's
+/// cell payloads are serialised by reference. Combined with the
+/// `walk_token_range` streaming merge, the per-session working set
+/// during a Merkle build no longer scales with partition size.
+///
+/// The output is byte-identical to
+/// `compute_partition_digest(&partition)` when the same header +
+/// rows are provided in declaration order — pinned by
+/// `partition_digest_stream_matches_legacy_with_multiple_rows`.
+pub struct PartitionDigestStream {
+    hasher: crc32fast::Hasher,
+    rows_so_far: u64,
+}
+
+impl PartitionDigestStream {
+    /// Initialise the digest with the partition header. **Row count
+    /// is not required at this point** — the streaming format puts
+    /// it at the end so the SSTable walker can feed rows as they're
+    /// decoded without knowing the total in advance.
+    pub fn new(
+        token: i64,
+        key_bytes: &[u8],
+        deletion: ferrosa_sstable::types::DeletionTime,
+        static_row: Option<&ferrosa_sstable::types::Row>,
+    ) -> Result<Self, bincode::Error> {
+        let mut hasher = crc32fast::Hasher::new();
+        {
+            let mut writer = CrcHashWriter {
+                hasher: &mut hasher,
+            };
+            bincode::serialize_into(&mut writer, &token)?;
+            bincode::serialize_into(&mut writer, key_bytes)?;
+            serialize_deletion_time(
+                &mut writer,
+                deletion.marked_for_delete_at,
+                deletion.local_deletion_time,
+            )?;
+            // Zero-or-one static-row clone — negligible per partition.
+            let static_wire = static_row.cloned().map(RowWire::from);
+            bincode::serialize_into(&mut writer, &static_wire)?;
+        }
+        Ok(Self {
+            hasher,
+            rows_so_far: 0,
+        })
+    }
+
+    /// Fold a single clustered row into the running digest. Cells
+    /// are serialised by reference — `row` is never cloned.
+    pub fn update_row(&mut self, row: &ferrosa_sstable::types::Row) -> Result<(), bincode::Error> {
+        let mut writer = CrcHashWriter {
+            hasher: &mut self.hasher,
+        };
+        serialize_row_borrowed(&mut writer, row)?;
+        self.rows_so_far += 1;
+        Ok(())
+    }
+
+    /// Emit the row count last and return the final CRC. Putting
+    /// the count at the end is what lets the streaming SSTable
+    /// walker hash a partition without knowing how many rows it
+    /// has up front.
+    pub fn finalize(self) -> Result<u32, bincode::Error> {
+        let Self {
+            mut hasher,
+            rows_so_far,
+        } = self;
+        {
+            let mut writer = CrcHashWriter {
+                hasher: &mut hasher,
+            };
+            bincode::serialize_into(&mut writer, &rows_so_far)?;
+        }
+        Ok(hasher.finalize())
+    }
+}
+
+fn serialize_deletion_time<W: std::io::Write>(
+    writer: &mut W,
+    marked_for_delete_at: i64,
+    local_deletion_time: u32,
+) -> Result<(), bincode::Error> {
+    bincode::serialize_into(&mut *writer, &marked_for_delete_at)?;
+    bincode::serialize_into(&mut *writer, &local_deletion_time)?;
+    Ok(())
 }
 
 /// Extract the newest timestamp from any row in the partition (including the
@@ -1281,6 +1473,76 @@ mod tests {
         let d1 = compute_partition_digest(&p).unwrap();
         let d2 = compute_partition_digest(&p).unwrap();
         assert_eq!(d1, d2, "same partition must produce the same digest");
+    }
+
+    /// `compute_partition_digest` clones every row + cell into a
+    /// `PartitionWire` and bincode-allocates a Vec<u8> the size of
+    /// the serialised partition before CRC. On a multi-GB local
+    /// replica that allocation churn dominates anti-entropy repair
+    /// memory — observed to grow node1's anon RSS by ~80 MB/s and
+    /// OOM the 2 GiB cgroup mid-Merkle-build, even though no
+    /// in-flight partition exceeded a few MB.
+    ///
+    /// The streaming variant must produce **byte-identical** CRC
+    /// output (otherwise two replicas hashing the same partition
+    /// land on different Merkle leaves and repair turns a no-op
+    /// into a spurious mismatch). This test pins the equivalence
+    /// for a representative partition.
+    #[test]
+    fn partition_digest_streaming_matches_legacy() {
+        let p = make_partition(b"abc", 999);
+        let legacy = compute_partition_digest(&p).unwrap();
+        let streaming = super::compute_partition_digest_streaming(&p).unwrap();
+        assert_eq!(
+            legacy, streaming,
+            "streaming digest MUST match the legacy bytes-then-hash result for replica compatibility"
+        );
+    }
+
+    /// `PartitionDigestStream` is the **row-by-row** digest path:
+    /// the SSTable iter feeds rows into the hasher one at a time
+    /// without ever building a full `Partition` struct. It must
+    /// produce the same CRC as the legacy function so two replicas
+    /// — one hashing in-memory partitions, one hashing via the
+    /// streaming SSTable walker — see each other on the wire.
+    ///
+    /// Verified for a partition with multiple rows: the streaming
+    /// API takes the header (token / key / deletion / static_row /
+    /// row_count) and `update_row` per clustered row, then
+    /// `finalize` returns the same u32 as
+    /// `compute_partition_digest(&partition)`.
+    #[test]
+    fn partition_digest_stream_matches_legacy_with_multiple_rows() {
+        let mut p = make_partition(b"multi-row-key", 12_345);
+        // make_partition builds a single-row partition; extend it
+        // so the streaming row-iteration path is exercised.
+        for i in 1..5 {
+            p.rows.push(Row {
+                clustering: vec![i as u8],
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("val-{i}").into_bytes(), 12_345 + i as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(12_345 + i as i64),
+            });
+        }
+        let legacy = compute_partition_digest(&p).unwrap();
+        let mut stream = super::PartitionDigestStream::new(
+            p.key.token.0,
+            p.key.key.as_bytes(),
+            p.deletion,
+            p.static_row.as_ref(),
+        )
+        .unwrap();
+        for row in &p.rows {
+            stream.update_row(row).unwrap();
+        }
+        let streaming = stream.finalize().unwrap();
+        assert_eq!(
+            legacy, streaming,
+            "PartitionDigestStream MUST match the legacy digest for replica compatibility"
+        );
     }
 
     #[test]

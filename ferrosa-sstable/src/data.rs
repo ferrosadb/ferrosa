@@ -119,6 +119,250 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// being fully decoded and materialized.  This keeps range scans with
     /// per-partition row caps bounded even when individual partitions contain
     /// many rows.
+    /// Read the next partition's header (key, partition-level
+    /// deletion, optional static row) and invoke `on_row` once per
+    /// clustered row in order. Each row is decoded into a
+    /// freshly-allocated `Row`, handed to the callback by reference,
+    /// and dropped before the next row's bytes are read from the
+    /// underlying reader. **Peak working set during the call is one
+    /// row** — independent of how many rows the partition has or
+    /// how big each cell value is.
+    ///
+    /// This is the read-side counterpart of
+    /// `ferrosa_cluster::raft::handlers::PartitionDigestStream`:
+    /// together they let anti-entropy repair hash a multi-MB
+    /// partition without ever materialising a `Partition` struct.
+    ///
+    /// Returns `Ok(None)` at EOF. On any decode error the call
+    /// stops at the failing row boundary and returns the error;
+    /// `self.pos` is left at a partition-boundary or end-of-stream
+    /// position depending on how far the walk got.
+    /// 2-phase streaming entry point. Reads the partition header
+    /// (key + deletion + optional static row) and **leaves
+    /// `self.pos` parked at the first clustered row** (or at the
+    /// `END_OF_PARTITION` marker if there are no clustered rows).
+    ///
+    /// The static row, if present, comes FIRST in the BTI row
+    /// section. This function peeks the first row's flags byte
+    /// and decodes only if `IS_STATIC`; otherwise it leaves the
+    /// byte un-consumed so the follow-up [`Self::stream_clustered_rows`]
+    /// call re-reads it.
+    ///
+    /// Returns `Ok(None)` at EOF.
+    pub fn read_partition_header_only(
+        &mut self,
+    ) -> Result<Option<(DecoratedKey, DeletionTime, Option<Row>)>> {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+        let (key_bytes, deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        // Static-row peek: read the first row's flags + (optional)
+        // extended flags WITHOUT moving the data pointer past them
+        // unless we end up decoding the static row body. If the
+        // first row is clustered, we rewind self.pos so
+        // `stream_clustered_rows` sees the same byte we just
+        // peeked at.
+        let saved_pos = self.pos;
+        let mut flags_buf = [0u8; 1];
+        self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+        let flags = flags_buf[0];
+
+        if flags & END_OF_PARTITION != 0 {
+            // No clustered rows at all — consume the marker and
+            // stream_clustered_rows will be a no-op.
+            self.pos += 1;
+            return Ok(Some((key, deletion, None)));
+        }
+        if flags & IS_MARKER != 0 {
+            // Range tombstone marker — same fallback as
+            // read_rows_limited; leave pos at the marker so the
+            // streaming continuation can treat it as an end
+            // condition.
+            return Ok(Some((key, deletion, None)));
+        }
+
+        // Peek the extended flags so we can detect IS_STATIC.
+        let ext_offset = saved_pos + 1;
+        let (extended_flags, ext_len) = if flags & EXTENSION_FLAG != 0 {
+            let mut ext_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut ext_buf, ext_offset)?;
+            (ext_buf[0], 1u64)
+        } else {
+            (0, 0u64)
+        };
+        let is_static = extended_flags & EXT_IS_STATIC != 0;
+        if is_static {
+            // Commit pos past the flags + extended_flags we just
+            // peeked, then decode the static row body.
+            self.pos = saved_pos + 1 + ext_len;
+            let row = self.read_row(flags, true)?;
+            Ok(Some((key, deletion, Some(row))))
+        } else {
+            // No static row. Leave pos at saved_pos so the
+            // continuation sees the same flags byte.
+            self.pos = saved_pos;
+            Ok(Some((key, deletion, None)))
+        }
+    }
+
+    /// One-row-at-a-time partner of [`Self::stream_clustered_rows`].
+    /// Reads the next clustered row at `self.pos`, returning
+    /// `Ok(None)` at end-of-partition (or a range-tombstone
+    /// marker — same fallback as the other streaming readers).
+    /// Used by the cross-source streaming merge in the
+    /// `walk_token_range_for_digest` multi-source path: each
+    /// source's iterator is advanced one row at a time so the
+    /// k-way merge by clustering key has full control over the
+    /// pull rate.
+    ///
+    /// Must be preceded by [`Self::read_partition_header_only`] (or
+    /// run inside a partition's row section after a prior
+    /// `next_clustered_row` returned `Some`).
+    pub fn read_next_clustered_row(&mut self) -> Result<Option<Row>> {
+        loop {
+            // EOF check first — a prior `END_OF_PARTITION` may
+            // have moved us to file_len, in which case any further
+            // call is just "nothing to do" rather than an I/O error.
+            let file_len = self.reader.len()?;
+            if self.pos >= file_len {
+                return Ok(None);
+            }
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+            if flags & END_OF_PARTITION != 0 {
+                return Ok(None);
+            }
+            if flags & IS_MARKER != 0 {
+                return Ok(None);
+            }
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            if is_static {
+                // Skip stray static rows defensively (Cassandra
+                // writes them first; `read_partition_header_only`
+                // already consumed any in this partition).
+                self.skip_row_body(flags, true)?;
+                continue;
+            }
+            let row = self.read_row(flags, false)?;
+            return Ok(Some(row));
+        }
+    }
+
+    /// 2-phase streaming continuation: read clustered rows until
+    /// `END_OF_PARTITION` (or a range-tombstone marker), invoking
+    /// `on_row` once per row. Each row is dropped before the
+    /// next is decoded.
+    ///
+    /// Must be preceded by [`Self::read_partition_header_only`]; calling
+    /// it on a fresh `DataReader` will mis-parse the data stream.
+    pub fn stream_clustered_rows<F>(&mut self, mut on_row: F) -> Result<()>
+    where
+        F: FnMut(&Row) -> Result<()>,
+    {
+        loop {
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                break;
+            }
+
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            if is_static {
+                // A static row inside the clustered section is
+                // not expected (Cassandra writes static first;
+                // `read_partition_header_only` consumed it). If
+                // we hit one anyway, skip its body — keeping the
+                // contract that this function yields only
+                // clustered rows.
+                self.skip_row_body(flags, true)?;
+                continue;
+            }
+            let row = self.read_row(flags, false)?;
+            on_row(&row)?;
+            drop(row);
+        }
+        Ok(())
+    }
+
+    pub fn read_partition_streaming<F>(
+        &mut self,
+        mut on_row: F,
+    ) -> Result<Option<(DecoratedKey, DeletionTime, Option<Row>)>>
+    where
+        F: FnMut(&Row) -> Result<()>,
+    {
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+        let (key_bytes, deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        let mut static_row: Option<Row> = None;
+        loop {
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                // See `read_rows_limited` for the rationale —
+                // range tombstones aren't written by Ferrosa and
+                // Cassandra-imported ones drop range-deleted data
+                // on this fast path.
+                break;
+            }
+
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row = self.read_row(flags, is_static)?;
+            if is_static {
+                static_row = Some(row);
+            } else {
+                on_row(&row)?;
+                drop(row);
+            }
+        }
+        Ok(Some((key, deletion, static_row)))
+    }
+
     pub fn read_partition_limited_rows(&mut self, row_limit: usize) -> Result<Option<Partition>> {
         let file_len = self.reader.len()?;
         if self.pos >= file_len {

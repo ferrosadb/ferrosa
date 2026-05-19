@@ -20,6 +20,34 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc tuning: release dirty + muzzy pages back to the OS
+/// immediately on free instead of caching them for ~10 s of reuse.
+///
+/// Default jemalloc trades RSS for throughput by holding freed
+/// pages in per-arena dirty queues (decay_ms=10000). For ferrosa
+/// nodes deployed inside a tight cgroup (e.g. the fmem cluster's
+/// 2 GiB cap), a write-heavy hot path or a Merkle build over a
+/// large replica can allocate-and-free GBs of partition data
+/// within the decay window — the kernel sees the RSS still
+/// growing toward the cap and OOM-kills before any reclamation
+/// happens.
+///
+/// `dirty_decay_ms:0,muzzy_decay_ms:0` is the documented
+/// memory-constrained tuning: every `free` immediately returns
+/// the page to the OS. Throughput trade-off is small for our
+/// allocation pattern (most freed pages are not reused
+/// in-arena anyway — repair scans walk forward through partitions,
+/// flushes hand SSTables off, etc).
+///
+/// The `unprefixed_malloc_on_supported_platforms` feature on
+/// `tikv-jemallocator` makes jemalloc read this symbol at process
+/// startup. Override per-deployment with the `MALLOC_CONF` env
+/// var (env wins over the link-time default).
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+
 mod cql_broadcast;
 mod runtime;
 mod web;
