@@ -1221,8 +1221,7 @@ mod tests {
         }
 
         let legacy_wire = partition_to_wire(original.clone());
-        let legacy_bytes =
-            bincode::serialize(&legacy_wire).expect("legacy serialize must succeed");
+        let legacy_bytes = bincode::serialize(&legacy_wire).expect("legacy serialize must succeed");
 
         let mut borrowed_bytes: Vec<u8> = Vec::new();
         super::serialize_partition_to_wire_borrowed(&mut borrowed_bytes, &original)

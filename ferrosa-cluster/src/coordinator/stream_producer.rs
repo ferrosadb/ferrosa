@@ -22,9 +22,15 @@ use bytes::Bytes;
 use ferrosa_sstable::types::Partition;
 
 use crate::raft::handlers::{
-    serialize_partition_to_wire_borrowed, RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
-    RangeReadStreamRequestPayload,
+    serialize_partition_to_wire_borrowed, RangeReadStreamDonePayload, RangeReadStreamRequestPayload,
 };
+// `RangeReadStreamChunkPayload` is referenced only from the
+// in-module tests (decode_chunk uses it as the deserialise
+// target) — re-import it under `cfg(test)` so non-test builds
+// don't see an unused-import warning under
+// `-D unused-imports`.
+#[cfg(test)]
+use crate::raft::handlers::RangeReadStreamChunkPayload;
 use ferrosa_net::message::Message;
 
 /// Where a stream producer pushes outbound frames. The production
