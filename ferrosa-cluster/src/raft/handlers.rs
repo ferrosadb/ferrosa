@@ -177,6 +177,101 @@ pub struct PartitionWire {
     pub rows: Vec<RowWire>,
 }
 
+/// Emit the bincode wire bytes for `p` (as if it had been
+/// converted with [`partition_to_wire`] then `bincode::serialize`d)
+/// **without cloning the partition or any of its rows or cells**.
+///
+/// Each `Option<Vec<u8>>` cell value is serialised by reference;
+/// the per-row conversion to `RowWire` is inlined into the writer
+/// rather than building a `Vec<RowWire>` intermediate. Per-call
+/// transient allocation is whatever bincode's small scratch state
+/// uses, independent of partition row count or cell-value size.
+///
+/// Used by the streaming range-read producer and the chunked
+/// repair Apply send path to avoid the
+/// `chunk.iter().cloned().map(partition_to_wire).collect::<Vec<_>>()`
+/// allocation that scales with chunk size × partition size.
+///
+/// Output is byte-identical to
+/// `bincode::serialize(&partition_to_wire(p.clone()))` — pinned
+/// by `serialize_partition_to_wire_borrowed_matches_legacy`.
+pub fn serialize_partition_to_wire_borrowed<W: std::io::Write>(
+    writer: &mut W,
+    p: &Partition,
+) -> Result<(), bincode::Error> {
+    // PartitionWire field order: token, key_bytes, deletion,
+    // static_row, rows.
+    bincode::serialize_into(&mut *writer, &p.key.token.0)?;
+    bincode::serialize_into(&mut *writer, p.key.key.as_bytes())?;
+    serialize_deletion_time_borrowed(
+        &mut *writer,
+        p.deletion.marked_for_delete_at,
+        p.deletion.local_deletion_time,
+    )?;
+    // Option<RowWire>: bincode tag (default u8) + inline payload.
+    // The zero-or-one static-row clone is a one-time cost per
+    // partition — negligible next to the row stream below.
+    let static_wire = p.static_row.clone().map(RowWire::from);
+    bincode::serialize_into(&mut *writer, &static_wire)?;
+    drop(static_wire);
+    // Vec<RowWire>: bincode emits length (u64) + items inline.
+    // Emit length then iterate, serialising each row from its
+    // owning slot — no intermediate Vec<RowWire>.
+    let n = p.rows.len() as u64;
+    bincode::serialize_into(&mut *writer, &n)?;
+    for row in &p.rows {
+        serialize_row_to_wire_borrowed(&mut *writer, row)?;
+    }
+    Ok(())
+}
+
+/// Inlined `RowWire` bincode emission from a borrowed `Row`. Each
+/// cell's `value: Option<Vec<u8>>` is serialised by reference —
+/// no clone. The cell tuple `(u16, CellValueWire)` is emitted
+/// field-by-field to match the wire layout exactly.
+fn serialize_row_to_wire_borrowed<W: std::io::Write>(
+    writer: &mut W,
+    row: &Row,
+) -> Result<(), bincode::Error> {
+    // RowWire: clustering, cells, deletion, primary_key_liveness.
+    bincode::serialize_into(&mut *writer, &row.clustering)?;
+    // Vec<(u16, CellValueWire)>: length + items.
+    let n_cells = row.cells.len() as u64;
+    bincode::serialize_into(&mut *writer, &n_cells)?;
+    for (idx, cell) in &row.cells {
+        bincode::serialize_into(&mut *writer, idx)?;
+        // CellValueWire field order: value, timestamp, ttl,
+        // local_deletion_time. Identical field layout to the
+        // in-memory `CellValue`, so emitting field-by-field
+        // matches the bincode struct serialisation.
+        bincode::serialize_into(&mut *writer, &cell.value)?;
+        bincode::serialize_into(&mut *writer, &cell.timestamp)?;
+        bincode::serialize_into(&mut *writer, &cell.ttl)?;
+        bincode::serialize_into(&mut *writer, &cell.local_deletion_time)?;
+    }
+    serialize_deletion_time_borrowed(
+        &mut *writer,
+        row.deletion.marked_for_delete_at,
+        row.deletion.local_deletion_time,
+    )?;
+    // LivenessInfoWire field order: timestamp, ttl,
+    // local_deletion_time.
+    bincode::serialize_into(&mut *writer, &row.primary_key_liveness.timestamp)?;
+    bincode::serialize_into(&mut *writer, &row.primary_key_liveness.ttl)?;
+    bincode::serialize_into(&mut *writer, &row.primary_key_liveness.local_deletion_time)?;
+    Ok(())
+}
+
+fn serialize_deletion_time_borrowed<W: std::io::Write>(
+    writer: &mut W,
+    marked_for_delete_at: i64,
+    local_deletion_time: u32,
+) -> Result<(), bincode::Error> {
+    bincode::serialize_into(&mut *writer, &marked_for_delete_at)?;
+    bincode::serialize_into(&mut *writer, &local_deletion_time)?;
+    Ok(())
+}
+
 /// Convert a [`Partition`] into its wire representation.
 pub fn partition_to_wire(p: Partition) -> PartitionWire {
     PartitionWire {
@@ -1089,6 +1184,53 @@ mod tests {
         assert_eq!(
             reconstructed.rows[0].cells[0].1.value,
             original.rows[0].cells[0].1.value
+        );
+    }
+
+    /// The borrow-based partition serializer must emit byte-for-byte
+    /// the same bincode output as
+    /// `bincode::serialize(&partition_to_wire(p.clone()))`.
+    ///
+    /// Without byte-equivalence, callers that decode on the wire
+    /// (RangeReadStreamChunk consumers, repair Apply receivers,
+    /// CL read responders) would see corrupted partitions —
+    /// the savings from skipping the clone aren't worth a
+    /// silent decoding bug.
+    ///
+    /// The streaming range-read producer
+    /// (`stream_range_response` in `coordinator::stream_producer`)
+    /// uses this helper to emit each chunk's partitions without
+    /// the per-partition `.clone()` + `Vec<PartitionWire>::collect()`
+    /// allocations that scale with chunk size.
+    #[test]
+    fn serialize_partition_to_wire_borrowed_matches_legacy() {
+        // Multi-row, multi-cell partition to exercise every layer
+        // of the wire encoding (DeletionTime, LivenessInfo,
+        // CellValue, Vec<(u16, _)>).
+        let mut original = make_partition(b"borrowed-eq", 12_345);
+        for i in 1..5 {
+            original.rows.push(Row {
+                clustering: vec![i as u8, 0, 0, 0],
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("v-{i}").into_bytes(), 12_345 + i as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(12_345 + i as i64),
+            });
+        }
+
+        let legacy_wire = partition_to_wire(original.clone());
+        let legacy_bytes = bincode::serialize(&legacy_wire).expect("legacy serialize must succeed");
+
+        let mut borrowed_bytes: Vec<u8> = Vec::new();
+        super::serialize_partition_to_wire_borrowed(&mut borrowed_bytes, &original)
+            .expect("borrowed serialize must succeed");
+
+        assert_eq!(
+            legacy_bytes, borrowed_bytes,
+            "borrowed partition serializer must emit byte-identical \
+             output to the clone-then-bincode path"
         );
     }
 
