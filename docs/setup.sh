@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ferrosa fast setup — installs prebuilt binaries via the LATEST file.
 #
-# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.10.0"),
+# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.11.0"),
 # downloads the matching release tarball from
 # https://github.com/ferrosadb/ferrosa/releases, verifies SHA256, installs to
 # ~/.ferrosa/, and optionally registers as a user service. No source clone,
@@ -9,7 +9,7 @@
 #
 # Usage:
 #   curl -fsSL https://ferrosadb.com/setup.sh | bash
-#   curl -fsSL https://ferrosadb.com/setup.sh | bash -s -- --version v0.10.0 --no-service
+#   curl -fsSL https://ferrosadb.com/setup.sh | bash -s -- --version v0.11.0 --no-service
 #
 # Env overrides (mostly for testing):
 #   FERROSA_LATEST_URL   — where to fetch the version pointer (default https://ferrosadb.com/LATEST)

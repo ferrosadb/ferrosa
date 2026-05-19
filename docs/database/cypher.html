@@ -517,21 +517,21 @@
   <h2 id="subscribe">SUBSCRIBE</h2>
 
   <div class="extension">
-    <strong>Ferrosa Extension:</strong> SUBSCRIBE extends Cypher with real-time streaming capabilities.
-    Subscribe to any MATCH pattern and receive updates as the graph changes.
+    <strong>Developer-preview note:</strong> SUBSCRIBE syntax for Cypher is experimental.
+    Arbitrary MATCH-pattern streaming remains verification work, not a production guarantee.
   </div>
 
-  <p>SUBSCRIBE supports two modes for real-time graph change streaming:</p>
+  <p>The proposed SUBSCRIBE syntax has two modes for graph change streaming:</p>
 
   <table>
     <thead><tr><th>Mode</th><th>Syntax</th><th>Behavior</th></tr></thead>
     <tbody>
       <tr><td>EVERY</td><td><code>EVERY 5s</code></td><td>Re-executes the graph query at the given interval and pushes results</td></tr>
-      <tr><td>DELTA</td><td><code>DELTA</code></td><td>Push-on-write — only sends changes as they occur via the commit log</td></tr>
+      <tr><td>DELTA</td><td><code>DELTA</code></td><td>Push-on-write design target pending verification</td></tr>
     </tbody>
   </table>
 
-  <h3>Examples</h3>
+  <h3>Experimental examples</h3>
   <pre><span class="cm">-- Poll for changes every 5 seconds</span>
 <span class="kw">SUBSCRIBE MATCH</span> (n:<span class="type">Person</span>) <span class="kw">RETURN</span> n <span class="kw">EVERY</span> <span class="var">5</span>s
 

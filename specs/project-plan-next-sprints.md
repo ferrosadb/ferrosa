@@ -1,9 +1,10 @@
 # Sprint Plan — Cluster Correctness & NTS Completion
 
 > Created: 2026-04-02
-> Status: S1-S3 Complete, S4 Active
+> Last updated: 2026-05-19 (mark repair + memtable backpressure delivered in v0.11.0)
+> Status: S1-S4 Complete; Repair shape + write-path backpressure delivered in v0.11.0
 > Focus: Fix all remaining hazards, complete NTS support, close correctness gaps
-> Predecessor: [project-plan-cluster-formation.md](project-plan-cluster-formation.md), [project-plan-correctness-sprints.md](project-plan-correctness-sprints.md)
+> Predecessor: [project-plan-cluster-formation.md](project-plan-cluster-formation.md), [project-plan-correctness-sprints.md](archive/project-plans/project-plan-correctness-sprints.md)
 
 ---
 
@@ -16,7 +17,37 @@
 | **S3** | Formation robustness + repair | 1 week | Forming timeout tested, promotion epoch, anti-entropy | **COMPLETE** |
 | **S4** | Close all hazards + SSTable streaming | 1 week | All hazards closed, SSTable streaming, BootstrapComplete RPC | **COMPLETE** |
 | **O1-O6** | Observability (self-hosted telemetry) | 1 week | 25+ spans, slow queries, fingerprints, billing, flame charts, OTLP flag | **COMPLETE** |
+| **R1** | Anti-entropy repair shape + memtable backpressure | 2 weeks | Repair runs on multi-GB replica in 2 GiB cgroup; chunked Fetch/Apply on Bulk lane; receiver memtable bounded | **DELIVERED v0.11.0** |
 | **S5** | Jepsen + drivers (needs infrastructure) | TBD | C4 Jepsen runs, C8 all-drivers compat | Deferred |
+
+---
+
+## R1: Anti-Entropy Repair Shape + Memtable Backpressure — DELIVERED v0.11.0
+
+The S3.3 "anti-entropy repair module" landed in earlier sprints as the
+algorithmic primitives (MerkleTree, diff_trees). R1 finished the
+production shape: chunked RPC wire protocol, Merkle-then-stream
+executor, operator interfaces, and the receiver-side memtable
+backpressure that protects the apply path from OOM.
+
+| # | Task | Source | Size | Status | Notes |
+|---|------|--------|------|--------|-------|
+| R1.1 | Merkle hashes partition **content**, not just key | PR #47 | M | **Done** | `partition_merkle_hash` delegates to `compute_partition_digest_streaming` (CRC32 over bincode `PartitionWire`); pinned by `partition_merkle_hash_detects_content_divergence` |
+| R1.2 | `compute_repair_plan` + `RepairCoordinator` + `RepairStore` trait | PR #47 | L | **Done** | Coordinator merges adjacent owned ranges sharing the same replica set; `LocalRepairExecutor` runs Merkle-then-stream |
+| R1.3 | Repair RPC wire protocol on `Lane::Bulk` | PR #47 | M | **Done** | `RepairMerkleRequest/Response`, `RepairFetchRequest/Response` (chunked), `RepairApplyRequest/Response` — resolves [bug-bulk-lane-send-timeouts-on-coordinated-reads](archive/bugs-verified/bug-bulk-lane-send-timeouts-on-coordinated-reads.md) |
+| R1.4 | HTTP `/repair` endpoint + `ferrosa-ctl repair` | PR #47 | S | **Done** | `POST /api/cluster/repair?keyspace=&table=&rf=`; CLI subcommand shells out to it |
+| R1.5 | `read_token_range` streaming-bounded primitive | PR #47 | M | **Done** | Token-bounded scan, peak working set scales with matches not table size; pinned by `read_token_range_streaming_returns_only_in_range_matches` |
+| R1.6 | Merkle-then-stream: `PartitionDigestStream`, two-phase SSTable streaming | PR #49 | L | **Done** | Row-at-a-time digest, `next_partition_header_only` + `stream_clustered_rows`, cross-source row-streaming merge in `walk_token_range_for_digest`; jemalloc `dirty_decay_ms:0` |
+| R1.7 | Chunked Fetch + Apply (64 partitions/RPC) | PR #49 | M | **Done** | `REPAIR_FETCH_CHUNK_PARTITIONS=64`, `REPAIR_APPLY_CHUNK_PARTITIONS=64`, `MERGED_SPAN_MAX_LEAVES=8` |
+| R1.8 | Write-path memtable backpressure | PR #50 | M | **Done** | `StorageEngineConfig::memtable_backpressure_bytes` field + `FERROSA_MEMTABLE_BACKPRESSURE_BYTES` env var; default `max(flush_threshold_bytes * 4, 64 MB)`; `u64::MAX` in `test_config`; pinned by `write_triggers_inline_flush_when_backpressure_exceeded` — resolves [refactor-cluster-recovery-storage-oom-seams](archive/bugs-verified/refactor-cluster-recovery-storage-oom-seams.md) |
+
+**Follow-ups still open (tracked in `specs/todo/`):**
+
+- [bug-streaming-range-read-perf-50x-floor](todo/bug-streaming-range-read-perf-50x-floor.md) — the streaming range-read path Fetch chunks walk through is ~50× slower than the arithmetic floor; bounding repair memory is correct but per-session wall time still needs work.
+- No repair scheduler yet (operator-initiated only)
+- No per-keyspace repair policy
+- No Jepsen-verified repair convergence (deferred to S5)
+- No persistent repair history / audit log
 
 ---
 

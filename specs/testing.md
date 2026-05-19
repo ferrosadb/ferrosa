@@ -399,5 +399,5 @@ Sprites' small memory footprint naturally triggers memory pressure issues that w
 
 - [Data Flow](data-flow.md) — write/read paths, Accord transaction flow, durability mitigations
 - [Components](components.md) — crate architecture
-- [Accord](accord.md) — Accord consensus protocol specification
-- [Accord Project Plan](accord-project-plan.md) — sprint completion details
+- [Accord](archive/accord.md) — Accord consensus protocol specification
+- [Accord Project Plan](archive/project-plans/accord-project-plan.md) — sprint completion details

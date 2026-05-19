@@ -1,4 +1,6 @@
 ---
+> Docs audit note: moved from `specs/in-process/` because the item needs a fresh live reproduction before it can be marked fixed.
+
 type: todo
 priority: P2
 status: draft

@@ -1,13 +1,30 @@
 ---
 type: todo
 priority: P1
-status: draft
+status: resolved
 created: 2026-05-16
-updated: 2026-05-16
+updated: 2026-05-19
+resolved-in: v0.11.0 (PR #47)
 affected-versions: ferrosa v0.10.0 and earlier (pre-existing; v0.10.0 timeouts are smaller/different but still present)
 ---
 
 # Bug: Cross-node coordinated reads time out on the Bulk lane
+
+> **RESOLVED 2026-05-19 — PR #47, v0.11.0.**
+>
+> Anti-entropy repair's Fetch + Apply RPCs now ride `Lane::Bulk` (60 s
+> envelope timeout, sized for high-throughput latency-tolerant
+> transfers) instead of `Lane::Data` (3 s coordinator timeout). The
+> chunked Fetch path also bounds per-RPC payload at
+> `REPAIR_FETCH_CHUNK_PARTITIONS = 64` partitions so a single RPC
+> never has to ship a multi-GB diff. See
+> [`specs/anti-entropy-repair-architecture.md`](../anti-entropy-repair-architecture.md) §
+> "RPC types" for the lane-choice rationale.
+>
+> Separately, the related streaming range-read perf gap (~50× floor)
+> is tracked in
+> [`specs/todo/bug-streaming-range-read-perf-50x-floor.md`](../../todo/bug-streaming-range-read-perf-50x-floor.md) —
+> that one is still open.
 
 ## Why this is a Ferrosa bug
 

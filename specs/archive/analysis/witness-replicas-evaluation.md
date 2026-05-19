@@ -18,6 +18,14 @@ authors: [agent-sprint-08]
 **Effort estimate: 2_400 LOC ± 600 LOC, 4–6 engineer-weeks of focused work
 on the openraft fork plus 2 weeks of integration on ferrosa-cluster.**
 
+## Archive Rationale and Evidence
+
+This document is archived as a completed design evaluation, not as implemented
+witness-replica functionality. The evidence is the explicit defer
+recommendation, the ADR cross-references below, and the concrete source-surface
+analysis in the engineering-effort section. Re-open as a proposed design before
+implementation work starts.
+
 The current path — 3 voters + 1 long-lived learner per DC (ADR-014, W8.2) —
 delivers most of the cost benefit witnesses promised at a fraction of the
 implementation risk. Witnesses become attractive only when (a) durable

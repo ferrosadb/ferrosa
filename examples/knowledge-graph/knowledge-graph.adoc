@@ -205,7 +205,7 @@ These queries are impossible to express in a single CQL statement:
 * *Path finding:* "What is the shortest collaboration chain from Alice to Jun?" is not expressible at all
 * *Mutual citations:* "Find papers that cite each other" requires a self-join on the cites table
 
-=== Full CQL query reference
+=== CQL query reference
 
 [source,sql]
 ----

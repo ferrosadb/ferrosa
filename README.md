@@ -5,8 +5,9 @@
 
 A Rust reimplementation of Apache Cassandra with S3-backed storage.
 
-Ferrosa is a distributed database that speaks the CQL protocol, enabling existing
-Cassandra applications to connect without modification. Under the hood, it replaces
+Ferrosa is a developer-preview distributed database that targets the Cassandra CQL
+client surface. The current implementation supports a useful subset of CQL and common
+driver workflows, but it is not yet a drop-in Cassandra replacement. Under the hood, it replaces
 Cassandra's local-disk storage model with a write-behind architecture where ephemeral
 local storage serves as a fast cache and S3-compatible object storage provides
 durability.
@@ -45,12 +46,13 @@ implementation that takes advantage of modern hardware and cloud infrastructure.
 
 - **S3 as the source of truth.** Nodes are ephemeral. SSTables live in object storage.
   A new node can serve reads within seconds by fetching from S3, not hours of streaming.
-- **CQL compatibility.** Existing applications, drivers, and tools work unchanged.
-  Ferrosa speaks CQL native protocol v5.
+- **CQL compatibility target.** Ferrosa speaks CQL native protocol v4/v5 and aims
+  for driver-compatible behavior, but compatibility is still being expanded and tested.
 - **Rust-native, not a transliteration.** Ferrosa is built as idiomatic Rust with clean
   ownership boundaries, not a line-by-line port of Java code.
-- **Cassandra's consistency model.** Tunable consistency levels (ONE, QUORUM, ALL) work
-  as expected. Replication factor and consistency level semantics are preserved.
+- **Cassandra-shaped consistency model.** Tunable consistency levels (ONE, QUORUM, ALL)
+  are implemented in the storage/cluster stack and still require broader live-cluster
+  verification before production claims.
 - **Independent crates.** Each subsystem is a standalone Rust crate with its own tests
   and documentation. `ferrosa-sstable` can read Cassandra SSTables and is useful on
   its own for migration tooling.
@@ -147,7 +149,7 @@ is planned behind a feature flag.
 - **Failure detection:** Heartbeat-based with configurable thresholds
 - **Internode protocol:** Custom binary protocol over TCP with TLS
 
-Distributed transactions (Accord-style) are a research item, not yet implemented.
+Distributed transactions (Accord-style) exist in the implementation and test specs, but public Jepsen-style verification is still a planned evidence item rather than a release guarantee.
 
 ## Crates
 
@@ -169,20 +171,21 @@ Distributed transactions (Accord-style) are a research item, not yet implemented
 ## Testing
 
 ```bash
-cargo test                        # All crates
+cargo test                        # Workspace tests
 cargo test -p ferrosa-storage     # Single crate
-cargo clippy --all-targets        # Lint
-cargo fmt --check                 # Format check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ## Project Status
 
-All 12 crates are implemented with ~115,000+ lines of Rust and ~1,650+ tests. The
-production cluster sprint is complete with Raft consensus, hinted handoff, node
-lifecycle management, and integration tests. Secondary indexes have a full query
-planner pipeline. Point-in-time recovery is implemented with commit log archiving,
-snapshot management, and timestamp-filtered restoration. See the
-[architecture specs](specs/README.md) for the full specification and status.
+Ferrosa is a developer-preview workspace with 18 Rust crates. Core single-node
+CQL/storage paths, graph/query experiments, secondary indexes, Raft-backed metadata
+coordination, and PITR building blocks are implemented, but the public release is not
+yet production-hardened. Cluster bootstrap/rebalance, end-to-end Jepsen verification,
+full CQL/query conformance, arbitrary query CDC, complete observability backing
+tables, and binary vector sidecars remain tracked as proposed/open or verification
+work in [the specs](specs/README.md).
 
 ## Contributing
 

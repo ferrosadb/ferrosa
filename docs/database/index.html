@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ferrosa Database — AI Native Database</title>
-  <meta name="description" content="Ferrosa Database is a Rust-native distributed database with CQL, graph, SPARQL, vector search, transactions, CDC, and S3-backed storage. Version 0.8.8.8 developer preview.">
+  <meta name="description" content="Ferrosa Database is a Rust-native distributed database with CQL, graph, SPARQL, vector search, transactions, CDC, and S3-backed storage. Version 0.11.0 developer preview.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <style>
     :root {
@@ -822,14 +822,14 @@
 </nav>
 
 <div class="beta-banner">
-  <span class="beta-tag">BETA</span> Ferrosa Database is version 0.8.8.8 and in active development.
+  <span class="beta-tag">BETA</span> Ferrosa Database is version 0.11.0 and in active development.
 </div>
 
 <!-- ═══════════════════ Hero ═══════════════════ -->
 <section class="hero">
   <div class="hero-badge">
     <span class="dot"></span>
-    v0.8.8.8 — active development
+    v0.11.0 — active development
   </div>
   <h1>
     One database. <span class="gradient">Many workloads.</span><br>
@@ -1071,7 +1071,7 @@
       <div class="feature-icon graph">◈</div>
       <h3>Graph Engine: Cypher + SPARQL</h3>
       <p>
-        Full Cypher and SPARQL 1.1 query engines on your CQL tables. No separate graph database.
+        Cypher and SPARQL endpoints run against CQL-backed graph/RDF tables in the developer preview.
         Vertices and edges are normal tables with schema extensions.
         Variable-length paths, aggregations, expression evaluation,
         and worst-case optimal joins via leapfrog triejoin for cyclic pattern matching.
@@ -1085,18 +1085,17 @@
     <div class="feature-card highlight">
       <div>
         <div class="feature-icon" style="background: rgba(240, 160, 100, 0.12);">⚡</div>
-        <h3>Built-In Pub/Sub &amp; CDC</h3>
+        <h3>Experimental Subscriptions</h3>
         <p>
-          SUBSCRIBE to any CQL or Cypher query for real-time change streaming.
-          Interval polling with EVERY, or push-on-write with DELTA mode.
-          No external Kafka, Debezium, or CDC connector pipeline needed —
-          change data capture is built into the storage engine.
+          Ferrosa includes parser and storage-observer work for table subscriptions.
+          Treat arbitrary-query CQL/Cypher streaming as proposed or partially covered until
+          the verification plans land.
         </p>
         <p style="margin-top: 0.75rem;">
-          Fully backward compatible with existing CQL drivers. Subscribe to
-          tables, graph traversals, or observability views with the same syntax.
+          The developer-preview docs keep these examples visible as design targets, not
+          production CDC guarantees.
         </p>
-        <span class="metric">SUBSCRIBE social.users EVERY 5s</span>
+        <span class="metric">SUBSCRIBE table-name EVERY 5s · experimental</span>
       </div>
       <div class="code-demo" style="margin: 0; border: none;">
         <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Poll for changes every 5 seconds</span>
@@ -1181,8 +1180,8 @@
           .accord sidecar files. Dynamic electorate reconfiguration with a 4-gate join
           protocol for safe membership changes.
         </p>
-        <span class="metric">Accord protocol · strict serializable · 1-RTT fast path · Jepsen-verified</span>
-        <p style="margin-top: 0.75rem; font-size: 0.875rem; color: var(--text-secondary);">Verified with Jepsen-style chaos testing across partition, kill, pause, and clock-skew fault injection.</p>
+        <span class="metric">Accord protocol · transaction components · Jepsen verification planned</span>
+        <p style="margin-top: 0.75rem; font-size: 0.875rem; color: var(--text-secondary);">Accord transaction components and Jepsen-style harness code exist, but public Jepsen evidence is still a tracked verification item.</p>
       </div>
       <div class="code-demo" style="margin: 0; border: none;">
         <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Lightweight transactions (Snapshot model-compatible)</span>
@@ -1296,10 +1295,39 @@
       <h3>Hinted Handoff</h3>
       <p>
         When a replica is temporarily unavailable, writes are stored as hints and replayed
-        automatically when the node recovers. Configurable hint window and TTL ensure data
-        consistency without manual repair for transient failures.
+        automatically when the node recovers. Configurable hint window and TTL cover the
+        transient-failure path; for divergence that outlives the hint window, operator-initiated
+        anti-entropy repair is the building block to reconcile replicas.
       </p>
       <span class="metric">auto hint storage · replay on recovery</span>
+    </div>
+
+    <!-- Anti-Entropy Repair -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(120, 180, 220, 0.12);">⚖</div>
+      <h3>Anti-Entropy Repair</h3>
+      <p>
+        Operator-initiated Merkle-tree-based repair via the HTTP <code>/repair</code> endpoint
+        and the <code>ferrosa-ctl repair</code> CLI reconciles replicas that have diverged
+        beyond the hinted-handoff window. A bounded-memory streaming digest builds the
+        Merkle comparison incrementally, so the repair path scales to tables larger than
+        a node's memory. Repair is manual today — there is no scheduler — and consistency
+        under repair has not yet been Jepsen-verified.
+      </p>
+      <span class="metric">manual /repair · ferrosa-ctl repair · streaming Merkle digest</span>
+    </div>
+
+    <!-- Write-Path Backpressure -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(200, 150, 220, 0.12);">⇄</div>
+      <h3>Write-Path Backpressure</h3>
+      <p>
+        Memtable backpressure, configurable via <code>FERROSA_MEMTABLE_BACKPRESSURE_BYTES</code>,
+        bounds in-memory write buffers under sustained write workloads. When the configured
+        threshold is reached, writers slow rather than letting memtables grow without limit,
+        keeping memory pressure predictable while flush and compaction drain the queue.
+      </p>
+      <span class="metric">configurable byte budget · bounded memtable growth</span>
     </div>
 
     <!-- Node Lifecycle -->
@@ -1834,8 +1862,8 @@ user = session.execute(stmt, [user_id])
     <p class="section-label centered">Grow With You</p>
     <h2 class="section-title centered">One binary. Every scale.</h2>
     <p class="section-subtitle centered">
-      Start on your laptop, ship to production. No re-architecture, no migration between tiers.
-      The same Ferrosa binary handles every stage of your growth.
+      Start on your laptop, then evaluate cluster features as they harden.
+      The same Ferrosa binary exposes single-node, pair-mode, and cluster-mode paths, but production hardening is still in progress.
     </p>
 
     <div class="use-cases" style="margin-top: 3rem;">
@@ -1843,9 +1871,9 @@ user = session.execute(stmt, [user_id])
         <p class="use-case-label migrate">1 Node</p>
         <h3>Development &amp; prototyping</h3>
         <p>
-          Run a single Ferrosa node locally. Full CQL compatibility, graph queries, and SUBSCRIBE
-          all work out of the box. No cluster setup, no coordination overhead.
-          Your application code stays exactly the same as you scale up.
+          Run a single Ferrosa node locally. Common CQL driver paths and graph endpoints are
+          available for developer-preview testing without cluster setup or coordination overhead.
+          Validate compatibility before moving an application between tiers.
         </p>
       </div>
       <div class="use-case">
@@ -1860,9 +1888,9 @@ user = session.execute(stmt, [user_id])
       </div>
       <div class="use-case">
         <p class="use-case-label graph-uc">3+ Nodes</p>
-        <h3>Full production cluster</h3>
+        <h3>Cluster-mode evaluation</h3>
         <p>
-          Add a third node and Ferrosa transitions to full cluster mode:
+          Add a third node to evaluate cluster mode:
           Raft consensus for metadata (openraft), Murmur3 token ring for data
           sharding, and a coordinator pattern with tunable consistency levels
           (ONE, QUORUM, ALL, LOCAL_QUORUM, EACH_QUORUM). Hinted handoff stores
@@ -1878,9 +1906,9 @@ user = session.execute(stmt, [user_id])
 <!-- ═══════════════════ Download ═══════════════════ -->
 <section id="download" style="padding-bottom: 2rem;">
   <p class="section-label centered">Download</p>
-  <h2 class="section-title centered">Coming Soon</h2>
+  <h2 class="section-title centered">Developer Preview</h2>
   <p class="section-subtitle centered" style="margin-bottom: 3rem;">
-    Ferrosa is under active development. Sign up below to be notified when the first release is available.
+    Ferrosa is under active development. Use the hosted setup script for the current developer-preview install path.
   </p>
 
   <div style="max-width: 700px; margin: 0 auto;">
@@ -1899,7 +1927,7 @@ user = session.execute(stmt, [user_id])
       </a>
       <a href="cql-compatibility.html" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; text-decoration: none; transition: border-color 0.2s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
         <h4 style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.5rem;">CQL Compatibility</h4>
-        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">Full CQL reference with supported statements, types, and functions.</p>
+        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">CQL compatibility notes with supported statements, types, and known gaps.</p>
       </a>
       <a href="migration.html" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; text-decoration: none; transition: border-color 0.2s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
         <h4 style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.5rem;">Migration Guide</h4>
@@ -1913,7 +1941,7 @@ user = session.execute(stmt, [user_id])
 <section class="cta-section" id="get-started">
   <h2>Ready to leave GC pauses behind?</h2>
   <p>
-    Ferrosa is in active development. Binary releases are coming soon.
+    Ferrosa is in active development. Developer-preview binary releases are available via the hosted setup script.
   </p>
   <div class="cta-actions">
     <a href="getting-started.html" class="btn-primary">Read the Docs</a>

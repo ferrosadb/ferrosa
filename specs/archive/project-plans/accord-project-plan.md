@@ -5,7 +5,7 @@
 
 ## Overview
 
-The Accord transaction implementation was delivered across 7 sprints (A1-A7), building from core types through full Jepsen-verified consensus with electorate reconfiguration. Total: 2,808 passing tests.
+The Accord transaction implementation was delivered across 7 sprints (A1-A7), building from core types through transaction and electorate-reconfiguration components plus Jepsen-style harness work. The historical sprint notes reported 2,808 passing tests; treat this archived count as implementation history, not current public Jepsen evidence.
 
 ## Sprint Summary
 
@@ -186,7 +186,7 @@ Combined with existing test suite (~2,300), total reaches ~2,808.
 
 ## Related Specs
 
-- [Accord Specification](accord.md) — protocol details and component descriptions
-- [Status](status.md) — overall project status
-- [Components](components.md) — crate architecture
-- [Testing](testing.md) — test infrastructure
+- [Accord Specification](../accord.md) — protocol details and component descriptions
+- [Status](../status.md) — overall project status
+- [Components](../../components.md) — crate architecture
+- [Testing](../../testing.md) — test infrastructure
