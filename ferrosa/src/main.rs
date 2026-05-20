@@ -53,7 +53,10 @@ mod runtime;
 mod web;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use uuid::Uuid;
 
@@ -72,6 +75,32 @@ fn config_val(
             .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
             .unwrap_or_else(|| default.to_string())
     })
+}
+
+#[derive(Clone, Default)]
+struct S3SyncSingleFlight {
+    running: Arc<AtomicBool>,
+}
+
+impl S3SyncSingleFlight {
+    fn try_start(&self) -> Option<S3SyncGuard> {
+        self.running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| S3SyncGuard {
+                running: Arc::clone(&self.running),
+            })
+    }
+}
+
+struct S3SyncGuard {
+    running: Arc<AtomicBool>,
+}
+
+impl Drop for S3SyncGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+    }
 }
 
 /// Like `config_val` but returns `None` when neither the env var nor the
@@ -1179,6 +1208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let maintenance_schema = schema.clone();
     let maintenance_data_dir = data_dir.clone();
     let has_s3 = maintenance_engine.has_s3();
+    let s3_sync_gate = S3SyncSingleFlight::default();
     tokio::spawn(async move {
         let mut flush_interval =
             tokio::time::interval(std::time::Duration::from_secs(flush_interval_secs));
@@ -1205,26 +1235,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Run on a dedicated thread so HTTP uploads don't starve
                     // the main tokio runtime (which handles Raft RPCs).
                     if has_s3 {
-                        let engine = maintenance_engine.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("s3-sync".into())
-                            .spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .expect("s3-sync runtime");
-                                rt.block_on(async {
-                                    match engine.sync_sstables_to_s3().await {
-                                        Ok(n) if n > 0 => {
-                                            tracing::info!(count = n, "synced SSTables to S3");
+                        if let Some(s3_sync_guard) = s3_sync_gate.try_start() {
+                            let engine = maintenance_engine.clone();
+                            match std::thread::Builder::new().name("s3-sync".into()).spawn(
+                                move || {
+                                    // Keep the single-flight slot held until this sync thread
+                                    // exits; dropping the guard releases the next flush tick.
+                                    let _s3_sync_guard = s3_sync_guard;
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .expect("s3-sync runtime");
+                                    rt.block_on(async {
+                                        match engine.sync_sstables_to_s3().await {
+                                            Ok(n) if n > 0 => {
+                                                tracing::info!(count = n, "synced SSTables to S3");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(%e, "S3 SSTable sync failed");
+                                            }
+                                            _ => {}
                                         }
-                                        Err(e) => {
-                                            tracing::warn!(%e, "S3 SSTable sync failed");
-                                        }
-                                        _ => {}
-                                    }
-                                });
-                            });
+                                    });
+                                },
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(%e, "failed to spawn S3 sync thread");
+                                }
+                            }
+                        } else {
+                            tracing::info!("skipping S3 SSTable sync: previous sync still running");
+                        }
                     }
 
                     // Commit log GC: discard segments with no remaining dirty tables.
@@ -1436,6 +1478,81 @@ mod tests {
             "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn s3_sync_single_flight_skips_overlapping_ticks() {
+        let gate = S3SyncSingleFlight::default();
+
+        let first = gate
+            .try_start()
+            .expect("first tick should be allowed to start S3 sync");
+        assert!(
+            gate.try_start().is_none(),
+            "second flush tick must not spawn another s3-sync while one is running"
+        );
+
+        drop(first);
+        assert!(
+            gate.try_start().is_some(),
+            "after the running sync completes, a later tick may start a new sync"
+        );
+    }
+
+    #[test]
+    fn s3_sync_single_flight_releases_slot_when_guard_drops() {
+        let gate = S3SyncSingleFlight::default();
+        let guard = gate
+            .try_start()
+            .expect("first tick should acquire the S3 sync slot");
+
+        drop(guard);
+
+        assert!(
+            gate.try_start().is_some(),
+            "dropping the guard before spawning a thread must release the slot"
+        );
+    }
+
+    #[test]
+    fn s3_sync_single_flight_allows_only_one_racing_thread() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Barrier,
+        };
+        use std::thread;
+
+        let gate = S3SyncSingleFlight::default();
+        let start = Arc::new(Barrier::new(8));
+        let release = Arc::new(Barrier::new(8));
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let gate = gate.clone();
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let winners = Arc::clone(&winners);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                let guard = gate.try_start();
+                if guard.is_some() {
+                    winners.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                release.wait();
+                drop(guard);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("contention worker should not panic");
+        }
+
+        assert_eq!(
+            winners.load(AtomicOrdering::Relaxed),
+            1,
+            "only one racing flush tick may acquire the S3 sync slot"
+        );
     }
 
     #[test]

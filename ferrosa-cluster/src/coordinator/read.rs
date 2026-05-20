@@ -1065,10 +1065,13 @@ impl ClusterCoordinator {
 
     /// Scatter-gather index read across all ring nodes.
     ///
-    /// Each node runs `StorageEngine::read_by_index()` locally and returns
-    /// matching partitions. The coordinator merges and deduplicates results
-    /// so that all rows matching the indexed value are returned regardless
-    /// of which node they reside on.
+    /// For CL > ONE/LOCAL_ONE, each node runs `StorageEngine::read_by_index()`
+    /// locally and the coordinator merges/deduplicates results so that all rows
+    /// matching the indexed value are returned regardless of which node they
+    /// reside on. For ONE/LOCAL_ONE, a nonempty local index result is allowed to
+    /// satisfy the read immediately; this preserves low-latency/availability
+    /// semantics and avoids waiting for slow remote index scans, but may return
+    /// a partial result set instead of the global union.
     pub async fn coordinate_index_read(
         &self,
         table_id: &TableId,
@@ -1083,6 +1086,26 @@ impl ClusterCoordinator {
             .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
             .collect();
         drop(ring);
+
+        if matches!(
+            self.default_cl,
+            ConsistencyLevel::One | ConsistencyLevel::LocalOne
+        ) && nodes
+            .iter()
+            .any(|(node_id, _)| *node_id == self.local_node_id)
+        {
+            let local = self
+                .storage
+                .read_by_index(table_id, index_name, index_key)
+                .map_err(ClusterError::Storage)?;
+            if !local.is_empty() {
+                tracing::warn!(
+                    partitions_received = local.len(),
+                    "coordinate_index_read: returning local nonempty result at CL=ONE/LOCAL_ONE without waiting for remote index scans"
+                );
+                return Ok(local);
+            }
+        }
 
         let req_payload = IndexReadRequestPayload {
             keyspace: table_id.keyspace.clone(),
@@ -2879,6 +2902,91 @@ mod tests {
         // Empty ring means no nodes to contact at all, should return Ok([])
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinate_index_read_returns_local_nonempty_without_waiting_for_slow_remote_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .add_index(&table_id, "val_idx", 0)
+            .expect("test table should accept a local secondary index");
+        let key = DecoratedKey::new(PartitionKey::new(vec![1, 2, 3]));
+        storage
+            .write(&table_id, &key, test_row(9876), 9876)
+            .expect("local indexed row write should succeed");
+        assert_eq!(
+            storage
+                .read_by_index(
+                    &table_id,
+                    "val_idx",
+                    &ferrosa_index::IndexKey(b"hello".to_vec())
+                )
+                .expect("local index read sanity check should succeed")
+                .len(),
+            1,
+            "test setup must have a nonempty local index result"
+        );
+
+        let remote_partition = Partition {
+            key: DecoratedKey {
+                token: Token(142),
+                key: PartitionKey::new(vec![9, 9, 9]),
+            },
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(9877)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::IndexReadRequest,
+            Arc::new(DelayedIndexReadHandler {
+                partition: remote_partition,
+                delay: std::time::Duration::from_secs(1),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(1u64, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(1u64, &[42]);
+        ring.assign_tokens(2u64, &[142]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            1u64,
+            storage,
+            2,
+            ConsistencyLevel::LocalOne,
+        );
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            coordinator.coordinate_index_read(
+                &table_id,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+            ),
+        )
+        .await
+        .expect("local nonempty index read must not wait for a slow remote full/index scan")
+        .expect("local nonempty index read should succeed");
+        assert_eq!(read.len(), 1, "expected the locally indexed partition");
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
