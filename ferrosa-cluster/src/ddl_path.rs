@@ -18,6 +18,7 @@ use ferrosa_storage::engine::StorageEngine;
 use crate::error::{ClusterError, Result};
 use crate::pair::ddl::{DdlCoordinator, DdlOperation};
 use crate::raft::{FerrosRaft, RaftCommand, RaftOp};
+use crate::system_table_writer::SystemTableWriter;
 
 /// The active DDL path. Swapped atomically via `ArcSwap` when
 /// the deployment mode changes (standalone → pair → cluster).
@@ -144,7 +145,7 @@ impl DdlPath {
 ///
 /// This mirrors [`DdlCoordinator::apply_ddl_locally`] exactly but does not
 /// require constructing a coordinator (which needs a peer ID and PeerManager).
-fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> Result<()> {
+fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>) -> Result<()> {
     match op {
         DdlOperation::CreateKeyspace(ks) => {
             schema
@@ -229,6 +230,13 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
             schema
                 .grant_internal(entry.clone())
                 .map_err(|e| ClusterError::Internal(format!("grant: {e}")))?;
+            SystemTableWriter::new(Arc::clone(engine))
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::GrantUpdated(
+                        entry.clone(),
+                    ),
+                )
+                .map_err(ClusterError::Storage)?;
         }
         DdlOperation::Revoke {
             role,
@@ -238,6 +246,15 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
             schema
                 .revoke_internal(role, resource, permission)
                 .map_err(|e| ClusterError::Internal(format!("revoke: {e}")))?;
+            SystemTableWriter::new(Arc::clone(engine))
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::PermissionRevoked {
+                        role: role.clone(),
+                        resource: resource.clone(),
+                        permission: *permission,
+                    },
+                )
+                .map_err(ClusterError::Storage)?;
         }
         DdlOperation::CreateIndex(idx) => {
             schema
