@@ -26,12 +26,15 @@ max_connections_per_ip = 64
 # ---------------------------------------------------------------------------
 # Internode RPC — used by multi-node clusters. A single-node install never
 # accepts inbound peers, but ferrosa-net still binds the listener at startup.
+# Port 17000 (not the historical Cassandra default 7000) avoids the
+# macOS ControlCenter clash that crashes ferrosa on fresh macOS installs
+# — see BUG-001.
 # ---------------------------------------------------------------------------
 [internode]
-bind          = "127.0.0.1:7000"
+bind          = "127.0.0.1:17000"
 cluster_name  = "ferrosa"
-# broadcast = "127.0.0.1:7000"   # advertised to peers; only matters in clusters
-# seed      = "10.0.0.2:7000"    # comma-separated list of seed peers
+# broadcast = "127.0.0.1:17000"  # advertised to peers; only matters in clusters
+# seed      = "10.0.0.2:17000"   # comma-separated list of seed peers
 # psk       = "shared-secret"    # pre-shared key for internode auth
 
 # ---------------------------------------------------------------------------
