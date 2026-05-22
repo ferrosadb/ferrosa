@@ -87,6 +87,8 @@ Current branch limitations:
 - Late materialization tasks outside `consolidation.late_window` are dropped in
   the engine drain path, increment observable stale/drop counters, and do not
   rewrite existing rollup rows.
+- Added CQL-router coverage proving normal CQL `CREATE TABLE` extensions and
+  `INSERT` statements enqueue materialization and produce queryable target rows.
 - Storage has an in-memory ring streaming path for current windows. Production
   late-window recomputation uses the keyed cursor API, but the current
   `TableStore` implementation still materializes one partition internally

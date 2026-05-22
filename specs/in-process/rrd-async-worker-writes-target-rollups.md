@@ -44,6 +44,8 @@ descriptor tasks and writes target table mutations through storage.
 - Stale late-data tasks outside `consolidation.late_window` are dropped before
   recomputation, increment `stale_drops_total`, and leave existing rollup rows
   unchanged.
+- Added CQL-router coverage for source/target DDL, source inserts, materializer
+  drain, and target rollup reads.
 
 ## Still Not Working
 
@@ -53,5 +55,5 @@ descriptor tasks and writes target table mutations through storage.
   true memtable/SSTable streaming cursor.
 - WASM aggregate functions are still rejected by the streaming materialization
   path until the streaming WASM aggregate ABI is implemented.
-- CQL-level eventual rollup tests are not complete yet; current coverage is at
-  the storage-engine layer.
+- End-to-end process supervision is still covered by the example script rather
+  than an in-process router test with the background worker running.

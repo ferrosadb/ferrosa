@@ -8259,6 +8259,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cql_inserts_materialize_rrd_rollup_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for cql in [
+            "CREATE KEYSPACE rrd WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE rrd.sensor_10s (sensor_id text, ts bigint, value_avg double, PRIMARY KEY (sensor_id, ts))",
+            "CREATE TABLE rrd.sensor (sensor_id text, ts bigint, value double, PRIMARY KEY (sensor_id, ts)) WITH extensions = {'consolidation.interval': '10s', 'consolidation.functions': 'avg', 'consolidation.target': 'sensor_10s', 'consolidation.columns': 'value', 'consolidation.ring_capacity': '4'}",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        for ts in 0..=10 {
+            let micros = ts * 1_000_000;
+            let cql = format!(
+                "INSERT INTO rrd.sensor (sensor_id, ts, value) VALUES ('s1', {micros}, {ts}.0)"
+            );
+            route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            state
+                .engine
+                .process_pending_time_series_materializations(8)
+                .unwrap(),
+            1
+        );
+
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT value_avg FROM rrd.sensor_10s WHERE sensor_id = 's1'")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let RouteResult::Result(body) = result else {
+            panic!("expected Rows result");
+        };
+        let value = extract_first_double_value(&body);
+        assert!(
+            (value - 4.5).abs() < f64::EPSILON,
+            "CQL DDL/DML should produce the same full-window rollup as storage-level materialization"
+        );
+    }
+
+    #[tokio::test]
     async fn feedback_outcomes_boolean_is_stored_as_single_byte_at_succeeded_column() {
         let (state, _dir) = setup();
         let auth = dev_auth();
@@ -9993,6 +10051,42 @@ mod tests {
         off += 4;
         assert_eq!(value_len, 8, "expected bigint value length");
         i64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
+    }
+
+    fn extract_first_double_value(buf: &[u8]) -> f64 {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        let row_count = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        assert_eq!(row_count, 1, "expected exactly one aggregate row");
+        off += 4;
+        let value_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        off += 4;
+        assert_eq!(value_len, 8, "expected double value length");
+        f64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
     }
 
     /// Extract column names from a Rows result buffer.
