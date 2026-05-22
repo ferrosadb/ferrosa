@@ -478,8 +478,8 @@ async fn transition_to_cluster_normalizes_ephemeral_peer_ports_before_seeding_ri
         .get_node(uuid_to_node_id(peer2_id))
         .expect("peer2 should be seeded into the initial ring");
 
-    assert_eq!(peer1.addr, "10.89.1.53:7000");
-    assert_eq!(peer2.addr, "10.89.1.54:7000");
+    assert_eq!(peer1.addr, "10.89.1.53:17000");
+    assert_eq!(peer2.addr, "10.89.1.54:17000");
 }
 
 #[test]

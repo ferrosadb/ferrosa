@@ -637,9 +637,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // BUG-006: `[cql].auth_enabled` in ferrosa.toml was silently ignored.
     // Apply it now if the env var did not already set it via from_env.
-    if let Some(toml_auth) =
-        resolve_auth_enabled_toml(&file_config, |k| std::env::var(k).ok())
-    {
+    if let Some(toml_auth) = resolve_auth_enabled_toml(&file_config, |k| std::env::var(k).ok()) {
         // Env wins inside the resolver, so if we got Some(_) it is the
         // operator's authoritative choice (env or TOML); set on config.
         storage_config.auth_enabled = toml_auth;
@@ -828,9 +826,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BUG-006: apply TOML overrides (env wins; TOML falls back). Previously
     // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml were
     // silently ignored.
-    apply_internode_toml_overrides(&mut net_config_mut, &file_config, |k| {
-        std::env::var(k).ok()
-    });
+    apply_internode_toml_overrides(&mut net_config_mut, &file_config, |k| std::env::var(k).ok());
     let net_config = Arc::new(net_config_mut);
 
     // Build handler registry — shared between RPC server and ModeController.
@@ -1745,10 +1741,7 @@ mod tests {
         let path = tmp.path().join("host_id");
         std::fs::write(&path, "").unwrap();
         match classify_host_id_state(&path, None) {
-            HostIdResolution::EmptyFileRegenerated {
-                path: p,
-                new_id: _,
-            } => {
+            HostIdResolution::EmptyFileRegenerated { path: p, new_id: _ } => {
                 assert_eq!(p, path);
             }
             other => panic!("expected EmptyFileRegenerated, got {other:?}"),
