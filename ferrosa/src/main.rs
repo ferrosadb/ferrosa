@@ -580,6 +580,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if storage_auth_enabled {
+        let loader =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));
+        match loader.replay_role_permissions_into_schema(&schema) {
+            Ok(count) if count > 0 => {
+                tracing::info!(
+                    count,
+                    "replayed persisted role permissions from system_auth"
+                )
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(%e, "failed to replay persisted role permissions"),
+        }
+    }
+
     // 4c. Replay pending commit log mutations now that tables are registered.
     if !pending_mutations.is_empty() {
         tracing::info!(
