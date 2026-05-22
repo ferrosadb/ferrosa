@@ -88,6 +88,95 @@ fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str)
         .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
 }
 
+/// Apply TOML `[internode]` overrides to a `NetConfig`.
+///
+/// The env-var-then-TOML precedence already exists for storage / cql /
+/// graph fields via [`config_val`]; this helper closes BUG-006 for the
+/// internode subsystem, which previously read *only* env vars. Env var
+/// wins if set (i.e. `FERROSA_INTERNODE_BIND`); otherwise the TOML
+/// value is applied. Parse failures are logged but never fatal.
+///
+/// Generic over the env lookup so tests can drive the path without
+/// touching process-global environment.
+fn apply_internode_toml_overrides<F>(
+    cfg: &mut ferrosa_net::config::NetConfig,
+    file_config: &toml::Value,
+    env: F,
+) where
+    F: Fn(&str) -> Option<String>,
+{
+    let internode = match file_config.get("internode") {
+        Some(t) => t,
+        None => return,
+    };
+
+    if env("FERROSA_INTERNODE_BIND").is_none() {
+        if let Some(v) = internode.get("bind").and_then(|v| v.as_str()) {
+            match v.parse() {
+                Ok(addr) => cfg.bind_addr = addr,
+                Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].bind"),
+            }
+        }
+    }
+    if env("FERROSA_INTERNODE_BROADCAST").is_none() {
+        if let Some(v) = internode.get("broadcast").and_then(|v| v.as_str()) {
+            match v.parse() {
+                Ok(addr) => cfg.broadcast_addr = addr,
+                Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].broadcast"),
+            }
+        }
+    }
+    if env("FERROSA_CLUSTER_NAME").is_none() {
+        if let Some(v) = internode.get("cluster_name").and_then(|v| v.as_str()) {
+            cfg.cluster_name = v.to_string();
+        }
+    }
+    if env("FERROSA_INTERNODE_PSK").is_none() {
+        if let Some(v) = internode.get("psk").and_then(|v| v.as_str()) {
+            cfg.psk = Some(v.to_string());
+        }
+    }
+}
+
+/// Resolve the graph-enabled flag honouring TOML when the env var is unset.
+///
+/// Previously the binary only read `FERROSA_GRAPH_ENABLED`, so a user
+/// who set `[graph] enabled = true` in TOML saw the graph engine stay
+/// silently off — BUG-006.
+fn resolve_graph_enabled<F>(file_config: &toml::Value, env: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(v) = env("FERROSA_GRAPH_ENABLED") {
+        return v == "true" || v == "1";
+    }
+    file_config
+        .get("graph")
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Resolve the auth-enabled flag honouring TOML when the env var is unset.
+///
+/// BUG-006: `[cql] auth_enabled = true` in TOML was silently ignored;
+/// only `FERROSA_AUTH_ENABLED=true` activated the authenticator. Returns
+/// `Some(true|false)` when the operator made an explicit choice in
+/// either place, `None` when they did not (so downstream resolution can
+/// fall back to the storage default).
+fn resolve_auth_enabled_toml<F>(file_config: &toml::Value, env: F) -> Option<bool>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(v) = env("FERROSA_AUTH_ENABLED") {
+        return Some(v == "true" || v == "1");
+    }
+    file_config
+        .get("cql")
+        .and_then(|s| s.get("auth_enabled"))
+        .and_then(|v| v.as_bool())
+}
+
 /// Load TOML configuration from disk. Returns an empty table if the file does not exist.
 fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     if std::path::Path::new(path).exists() {
@@ -424,6 +513,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             storage_config.memtable_num_shards = n;
         }
     }
+    // BUG-006: `[cql].auth_enabled` in ferrosa.toml was silently ignored.
+    // Apply it now if the env var did not already set it via from_env.
+    if let Some(toml_auth) =
+        resolve_auth_enabled_toml(&file_config, |k| std::env::var(k).ok())
+    {
+        // Env wins inside the resolver, so if we got Some(_) it is the
+        // operator's authoritative choice (env or TOML); set on config.
+        storage_config.auth_enabled = toml_auth;
+    }
     let storage_auth_warn = storage_config.auth_warn;
     // Capture auth enablement before the config is consumed by `new`/`open`.
     // Used below to gate the seed-role bootstrap and the 5-minute
@@ -604,7 +702,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Capture num_tokens locally before cluster_config is consumed by
     // ModeController — needed downstream when populating system.local.tokens.
     let num_tokens = cluster_config.num_tokens as usize;
-    let net_config = Arc::new(ferrosa_net::config::NetConfig::from_env());
+    let mut net_config_mut = ferrosa_net::config::NetConfig::from_env();
+    // BUG-006: apply TOML overrides (env wins; TOML falls back). Previously
+    // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml were
+    // silently ignored.
+    apply_internode_toml_overrides(&mut net_config_mut, &file_config, |k| {
+        std::env::var(k).ok()
+    });
+    let net_config = Arc::new(net_config_mut);
 
     // Build handler registry — shared between RPC server and ModeController.
     // Catch-up handler is always available; pair write/role-swap handlers are
@@ -972,10 +1077,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let web_addr = web::start_web_server(&web_config, web_state).await?;
     tracing::info!(%web_addr, "web console listening");
 
-    // 10. Graph engine (check FERROSA_GRAPH_ENABLED)
-    let graph_enabled = std::env::var("FERROSA_GRAPH_ENABLED")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    // 10. Graph engine — FERROSA_GRAPH_ENABLED env var, then [graph] enabled
+    // in ferrosa.toml. BUG-006: prior code only checked the env var.
+    let graph_enabled = resolve_graph_enabled(&file_config, |k| std::env::var(k).ok());
 
     // Create a shutdown watch channel for services that need graceful shutdown
     // notification (e.g. the Bolt server).
@@ -1484,6 +1588,115 @@ mod tests {
 
         let result = config_val(key, &config, "cql", "auth_disabled", "false");
         assert_eq!(result, "true");
+    }
+
+    // ---- BUG-006 -----------------------------------------------------
+
+    /// Internode bind from TOML is honored when the env var is unset.
+    #[test]
+    fn apply_internode_toml_overrides_sets_bind_when_env_unset() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value =
+            toml::from_str("[internode]\nbind = \"127.0.0.1:18001\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        assert_eq!(cfg.bind_addr, "127.0.0.1:18001".parse().unwrap());
+    }
+
+    /// Env var beats TOML — env wins precedence as advertised.
+    #[test]
+    fn apply_internode_toml_overrides_env_wins() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let default_bind = cfg.bind_addr;
+        let toml: toml::Value =
+            toml::from_str("[internode]\nbind = \"127.0.0.1:18002\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |k| {
+            if k == "FERROSA_INTERNODE_BIND" {
+                Some("ignored".into())
+            } else {
+                None
+            }
+        });
+        // Env-set means we do NOT apply TOML; bind_addr is whatever it was.
+        assert_eq!(cfg.bind_addr, default_bind);
+    }
+
+    /// Cluster name + broadcast + psk also flow from TOML.
+    #[test]
+    fn apply_internode_toml_overrides_sets_other_fields() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value = toml::from_str(
+            r#"
+            [internode]
+            bind         = "127.0.0.1:18003"
+            broadcast    = "10.0.0.1:18003"
+            cluster_name = "team-cluster"
+            psk          = "abc"
+            "#,
+        )
+        .unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        assert_eq!(cfg.bind_addr, "127.0.0.1:18003".parse().unwrap());
+        assert_eq!(cfg.broadcast_addr, "10.0.0.1:18003".parse().unwrap());
+        assert_eq!(cfg.cluster_name, "team-cluster");
+        assert_eq!(cfg.psk.as_deref(), Some("abc"));
+    }
+
+    /// Invalid bind format in TOML must NOT panic — log and move on.
+    #[test]
+    fn apply_internode_toml_overrides_invalid_bind_is_ignored() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let default_bind = cfg.bind_addr;
+        let toml: toml::Value = toml::from_str("[internode]\nbind = \"not-an-addr\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        assert_eq!(cfg.bind_addr, default_bind);
+    }
+
+    /// Graph enable via TOML when env unset.
+    #[test]
+    fn resolve_graph_enabled_reads_toml_when_env_unset() {
+        let toml: toml::Value = toml::from_str("[graph]\nenabled = true\n").unwrap();
+        assert!(resolve_graph_enabled(&toml, |_| None));
+        let toml: toml::Value = toml::from_str("[graph]\nenabled = false\n").unwrap();
+        assert!(!resolve_graph_enabled(&toml, |_| None));
+    }
+
+    #[test]
+    fn resolve_graph_enabled_env_wins_over_toml() {
+        let toml: toml::Value = toml::from_str("[graph]\nenabled = false\n").unwrap();
+        assert!(resolve_graph_enabled(&toml, |k| {
+            (k == "FERROSA_GRAPH_ENABLED").then(|| "true".into())
+        }));
+    }
+
+    #[test]
+    fn resolve_graph_enabled_defaults_false_when_unset_everywhere() {
+        let toml = empty_config();
+        assert!(!resolve_graph_enabled(&toml, |_| None));
+    }
+
+    /// Auth enabled via TOML.
+    #[test]
+    fn resolve_auth_enabled_toml_reads_file_when_env_unset() {
+        let toml: toml::Value = toml::from_str("[cql]\nauth_enabled = true\n").unwrap();
+        assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), Some(true));
+        let toml: toml::Value = toml::from_str("[cql]\nauth_enabled = false\n").unwrap();
+        assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), Some(false));
+    }
+
+    #[test]
+    fn resolve_auth_enabled_toml_env_wins() {
+        let toml: toml::Value = toml::from_str("[cql]\nauth_enabled = false\n").unwrap();
+        assert_eq!(
+            resolve_auth_enabled_toml(&toml, |k| (k == "FERROSA_AUTH_ENABLED")
+                .then(|| "true".into())),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn resolve_auth_enabled_toml_returns_none_when_unspecified() {
+        let toml = empty_config();
+        assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), None);
     }
 
     #[test]

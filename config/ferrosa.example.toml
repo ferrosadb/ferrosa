@@ -16,7 +16,8 @@
 # ---------------------------------------------------------------------------
 [cql]
 bind = "127.0.0.1:9042"
-auth_disabled = false           # CQL role auth: false = enforce passwords
+auth_enabled = true             # CQL role auth: true = enforce passwords (preferred)
+# auth_disabled = false         # DEPRECATED — use auth_enabled above. See BUG-006.
 max_connections = 1024
 max_connections_per_ip = 64
 # tls_cert = "~/.ferrosa/config/tls/server.crt"
@@ -63,8 +64,9 @@ commit_log_segment_size  = 33554432   # 32 MiB
 # allow_http = false
 
 # ---------------------------------------------------------------------------
-# Graph engine (Cypher / Bolt). Disabled by default; flip `enabled` and set
-# FERROSA_GRAPH_ENABLED=true in the service unit's Environment to start it.
+# Graph engine (Cypher / Bolt). Disabled by default; flip `enabled` here OR
+# set FERROSA_GRAPH_ENABLED=true (env var wins). BUG-006 fixed: this field
+# was previously silently ignored unless the env var was also set.
 # ---------------------------------------------------------------------------
 [graph]
 enabled   = false
