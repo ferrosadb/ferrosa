@@ -23,6 +23,9 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+      # Newer rustfs images reject default creds on non-loopback listeners;
+      # this sample is local-dev only (see FERROSA_AUTH_DISABLED above).
+      RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS: "true"
     volumes:
       - rustfs-data:/data
     healthcheck:
