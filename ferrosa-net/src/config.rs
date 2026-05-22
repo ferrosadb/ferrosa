@@ -43,8 +43,11 @@ pub struct NetConfig {
 impl Default for NetConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:7000".parse().unwrap(),
-            broadcast_addr: "127.0.0.1:7000".parse().unwrap(),
+            // Port 17000 instead of the historical Cassandra default 7000 —
+            // 7000 is reserved by macOS ControlCenter and produces an opaque
+            // EADDRINUSE crash on every fresh macOS install (BUG-001).
+            bind_addr: "0.0.0.0:17000".parse().unwrap(),
+            broadcast_addr: "127.0.0.1:17000".parse().unwrap(),
             seeds: Vec::new(),
             cluster_name: "ferrosa".to_string(),
             psk: None,
@@ -157,10 +160,25 @@ impl NetConfig {
 mod tests {
     use super::*;
 
+    /// BUG-001: the default internode port must NOT be 7000 on any platform
+    /// — that port is reserved by macOS ControlCenter and produces an
+    /// opaque EADDRINUSE crash loop on every fresh macOS install. 17000
+    /// is high enough to avoid OS-reserved port ranges and uncommon
+    /// enough to dodge most popular services.
+    #[test]
+    fn default_bind_port_is_not_7000() {
+        let cfg = NetConfig::default();
+        assert_ne!(
+            cfg.bind_addr.port(),
+            7000,
+            "port 7000 conflicts with macOS ControlCenter — see BUG-001"
+        );
+    }
+
     #[test]
     fn default_config_values() {
         let cfg = NetConfig::default();
-        assert_eq!(cfg.bind_addr, "0.0.0.0:7000".parse().unwrap());
+        assert_eq!(cfg.bind_addr, "0.0.0.0:17000".parse().unwrap());
         assert_eq!(cfg.cluster_name, "ferrosa");
         assert!(cfg.psk.is_none());
         assert_eq!(cfg.max_connections, 512);
