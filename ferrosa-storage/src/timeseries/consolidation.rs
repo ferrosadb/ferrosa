@@ -18,7 +18,8 @@ pub enum ConsolidationFn {
     /// Runs multiple functions in a single pass, produces multi-column output.
     /// Must not be nested. Must not contain Wasm.
     Composite(Vec<ConsolidationFn>),
-    /// Custom WASM UDF. Runs after the single-pass loop with the full batch.
+    /// Custom WASM UDF. Requires an explicit streaming ABI before it can run
+    /// in the materialization worker.
     Wasm {
         keyspace: String,
         function_name: String,
@@ -164,10 +165,24 @@ impl Accumulator {
 impl ConsolidationFn {
     /// Parse a function name string into a `ConsolidationFn`.
     ///
-    /// Supports: min, max, avg, mean, median, stddev, count, sum.
+    /// Supports: min, max, avg, mean, median, stddev, count, sum, and
+    /// wasm:keyspace.function_name for custom UDF rollups.
     /// Returns `None` for unrecognized names.
     pub fn parse(name: &str) -> Option<Self> {
-        match name.trim().to_lowercase().as_str() {
+        let trimmed = name.trim();
+        let lower = trimmed.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("wasm:") {
+            let (keyspace, function_name) = rest.split_once('.')?;
+            if keyspace.is_empty() || function_name.is_empty() || function_name.contains('.') {
+                return None;
+            }
+            return Some(ConsolidationFn::Wasm {
+                keyspace: keyspace.to_string(),
+                function_name: function_name.to_string(),
+            });
+        }
+
+        match lower.as_str() {
             "min" => Some(ConsolidationFn::Min),
             "max" => Some(ConsolidationFn::Max),
             "avg" | "mean" => Some(ConsolidationFn::Avg),
@@ -176,6 +191,32 @@ impl ConsolidationFn {
             "count" => Some(ConsolidationFn::Count),
             "sum" => Some(ConsolidationFn::Sum),
             _ => None,
+        }
+    }
+
+    /// Column suffix used for materialized output columns.
+    pub fn output_suffix(&self) -> Option<&str> {
+        match self {
+            ConsolidationFn::Min => Some("min"),
+            ConsolidationFn::Max => Some("max"),
+            ConsolidationFn::Avg => Some("avg"),
+            ConsolidationFn::Median => Some("median"),
+            ConsolidationFn::StdDev => Some("stddev"),
+            ConsolidationFn::Count => Some("count"),
+            ConsolidationFn::Sum => Some("sum"),
+            ConsolidationFn::Wasm { function_name, .. } => Some(function_name.as_str()),
+            ConsolidationFn::Composite(_) => None,
+        }
+    }
+
+    /// Extension value used when propagating rollup config across cascade tiers.
+    pub fn extension_name(&self) -> Option<String> {
+        match self {
+            ConsolidationFn::Wasm {
+                keyspace,
+                function_name,
+            } => Some(format!("wasm:{keyspace}.{function_name}")),
+            other => other.output_suffix().map(str::to_string),
         }
     }
 
@@ -218,6 +259,60 @@ pub fn consolidate_values(values: &[f64], functions: &[ConsolidationFn]) -> Vec<
     results
 }
 
+/// Error returned when a consolidation function has no streaming contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingConsolidationError {
+    RequiresMaterializedWindow(&'static str),
+}
+
+/// Emit consolidation results by folding a value stream once.
+///
+/// This path is intentionally limited to order-insensitive built-ins. It does
+/// not allocate a window buffer and it rejects functions that currently require
+/// materialized input, such as median and list-style WASM UDFs.
+pub fn emit_streaming_results<I, F>(
+    values: I,
+    functions: &[ConsolidationFn],
+    mut emit: F,
+) -> Result<(), StreamingConsolidationError>
+where
+    I: IntoIterator<Item = f64>,
+    F: FnMut(f64),
+{
+    ensure_streaming_supported(functions)?;
+
+    let mut acc = Accumulator::new(false);
+    for value in values {
+        acc.push(value);
+    }
+
+    if acc.count() == 0 {
+        return Ok(());
+    }
+
+    emit_streaming_function_results(&mut acc, functions, &mut emit)
+}
+
+/// Emit results from an accumulator that has already consumed a stream.
+///
+/// This is used by ring-backed workers that need to visit entries through a
+/// callback instead of first collecting source values into an iterator-owned
+/// buffer.
+pub fn emit_accumulated_streaming_results<F>(
+    acc: &mut Accumulator,
+    functions: &[ConsolidationFn],
+    mut emit: F,
+) -> Result<(), StreamingConsolidationError>
+where
+    F: FnMut(f64),
+{
+    ensure_streaming_supported(functions)?;
+    if acc.count() == 0 {
+        return Ok(());
+    }
+    emit_streaming_function_results(acc, functions, &mut emit)
+}
+
 /// Check if any function in the list (including nested Composite) needs median.
 fn functions_need_median(functions: &[ConsolidationFn]) -> bool {
     for f in functions {
@@ -248,6 +343,57 @@ fn collect_results(acc: &mut Accumulator, functions: &[ConsolidationFn], results
             }
         }
     }
+}
+
+fn ensure_streaming_supported(
+    functions: &[ConsolidationFn],
+) -> Result<(), StreamingConsolidationError> {
+    for function in functions {
+        match function {
+            ConsolidationFn::Median => {
+                return Err(StreamingConsolidationError::RequiresMaterializedWindow(
+                    "median",
+                ));
+            }
+            ConsolidationFn::Wasm { .. } => {
+                return Err(StreamingConsolidationError::RequiresMaterializedWindow(
+                    "wasm",
+                ));
+            }
+            ConsolidationFn::Composite(inner) => ensure_streaming_supported(inner)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn emit_streaming_function_results<F>(
+    acc: &mut Accumulator,
+    functions: &[ConsolidationFn],
+    emit: &mut F,
+) -> Result<(), StreamingConsolidationError>
+where
+    F: FnMut(f64),
+{
+    for function in functions {
+        match function {
+            ConsolidationFn::Composite(inner) => {
+                emit_streaming_function_results(acc, inner, emit)?;
+            }
+            ConsolidationFn::Median => {
+                return Err(StreamingConsolidationError::RequiresMaterializedWindow(
+                    "median",
+                ));
+            }
+            ConsolidationFn::Wasm { .. } => {
+                return Err(StreamingConsolidationError::RequiresMaterializedWindow(
+                    "wasm",
+                ));
+            }
+            other => emit(acc.result_for(other)),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -371,6 +517,44 @@ mod tests {
         assert!((results[2] - (8.0_f64).sqrt()).abs() < 1e-10);
     }
 
+    #[test]
+    fn streaming_consolidation_emits_builtins_without_materializing_window_values() {
+        let values = [2.0, 4.0, 4.0, 6.0];
+        let functions = [
+            ConsolidationFn::Min,
+            ConsolidationFn::Max,
+            ConsolidationFn::Avg,
+        ];
+        let mut emitted = [0.0; 3];
+        let mut emitted_len = 0;
+
+        emit_streaming_results(values, &functions, |value| {
+            emitted[emitted_len] = value;
+            emitted_len += 1;
+        })
+        .unwrap();
+
+        assert_eq!(emitted_len, 3);
+        assert_eq!(emitted, [2.0, 6.0, 4.0]);
+    }
+
+    #[test]
+    fn streaming_consolidation_rejects_non_streaming_functions() {
+        let mut emitted = [0.0; 1];
+        let mut emitted_len = 0;
+        let err = emit_streaming_results([1.0, 2.0], &[ConsolidationFn::Median], |value| {
+            emitted[emitted_len] = value;
+            emitted_len += 1;
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StreamingConsolidationError::RequiresMaterializedWindow("median")
+        ));
+        assert_eq!(emitted_len, 0);
+    }
+
     // -- Parse tests --
 
     #[test]
@@ -387,17 +571,38 @@ mod tests {
             ConsolidationFn::parse("STDDEV"),
             Some(ConsolidationFn::StdDev)
         );
+        assert_eq!(
+            ConsolidationFn::parse("wasm:plant.stddev"),
+            Some(ConsolidationFn::Wasm {
+                keyspace: "plant".to_string(),
+                function_name: "stddev".to_string(),
+            })
+        );
         assert_eq!(ConsolidationFn::parse("unknown"), None);
     }
 
     #[test]
     fn consolidation_fn_parse_list() {
-        let funcs = ConsolidationFn::parse_list("min,max, avg ,stddev").unwrap();
-        assert_eq!(funcs.len(), 4);
+        let funcs = ConsolidationFn::parse_list("min,max, avg ,stddev,wasm:plant.stddev").unwrap();
+        assert_eq!(funcs.len(), 5);
         assert_eq!(funcs[0], ConsolidationFn::Min);
         assert_eq!(funcs[1], ConsolidationFn::Max);
         assert_eq!(funcs[2], ConsolidationFn::Avg);
         assert_eq!(funcs[3], ConsolidationFn::StdDev);
+        assert_eq!(
+            funcs[4],
+            ConsolidationFn::Wasm {
+                keyspace: "plant".to_string(),
+                function_name: "stddev".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn consolidation_fn_rejects_malformed_wasm_names() {
+        assert_eq!(ConsolidationFn::parse("wasm:stddev"), None);
+        assert_eq!(ConsolidationFn::parse("wasm:plant."), None);
+        assert_eq!(ConsolidationFn::parse("wasm:.stddev"), None);
     }
 
     #[test]

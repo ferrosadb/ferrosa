@@ -4,9 +4,9 @@
 //! rather than SSTables. All observability data in Ferrosa is modeled as
 //! virtual tables: metrics, active queries, cluster topology, etc.
 //!
-//! Virtual tables are read-only and do not participate in replication or
-//! compaction. They are registered in the `VirtualTableRegistry` (Task 3)
-//! and served via the CQL native protocol as regular `SELECT` queries.
+//! Virtual tables do not participate in replication or compaction. Most are
+//! read-only, but selected admin control tables may accept bounded runtime
+//! updates through [`VirtualTable::apply_update`].
 
 use ferrosa_common::{CellValue, DataType};
 use std::time::Duration;
@@ -45,6 +45,18 @@ pub trait VirtualTable: Send + Sync {
     /// How the table should be kept fresh when watched by a subscriber.
     fn subscription_mode(&self) -> SubscriptionMode;
 
+    /// Apply a bounded runtime update to this virtual table.
+    ///
+    /// The default implementation keeps virtual tables read-only. Control-plane
+    /// tables override this for explicit, admin-only settings updates.
+    fn apply_update(&self, _update: &VirtualTableUpdate) -> Result<(), String> {
+        Err(format!(
+            "virtual table {}.{} is read-only",
+            self.keyspace(),
+            self.name()
+        ))
+    }
+
     /// Optional richer wire-type for the column at `col_idx`. Default
     /// returns `None` — the column's wire type derives from
     /// `columns()[col_idx].data_type`. Tables whose columns map to
@@ -71,6 +83,18 @@ pub struct VirtualColumnDef {
     pub name: String,
     /// Scalar CQL type of this column.
     pub data_type: DataType,
+}
+
+/// Runtime update applied to a virtual table row.
+pub struct VirtualTableUpdate {
+    pub assignments: Vec<VirtualColumnUpdate>,
+    pub predicate: RowPredicate,
+}
+
+/// A single virtual-table column assignment.
+pub struct VirtualColumnUpdate {
+    pub column: String,
+    pub value: CellValue,
 }
 
 /// Wire-type families needed for virtual columns whose protocol shape is

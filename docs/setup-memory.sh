@@ -3,13 +3,13 @@
 # downloads ONBOARDING.md, optionally clones source repos, optionally pulls
 # the Nomic embedding model, and hands off to a selected LLM harness.
 #
-# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.11.0")
+# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.12.0")
 # and uses it for both ferrosa and ferrosa-memory release artifacts (the two
 # projects ship synchronized tags). No source compile.
 #
 # Usage:
 #   curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
-#   curl -fsSL https://ferrosadb.com/setup-memory.sh | bash -s -- --version v0.11.0 --no-clone
+#   curl -fsSL https://ferrosadb.com/setup-memory.sh | bash -s -- --version v0.12.0 --no-clone
 #
 # Env overrides (mostly for testing):
 #   FERROSA_LATEST_URL    — version pointer (default https://ferrosadb.com/LATEST)

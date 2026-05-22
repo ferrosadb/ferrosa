@@ -10,7 +10,9 @@ pub mod billing;
 pub mod connections;
 pub mod consolidation_status;
 pub mod full_scan_reasons;
+pub mod materialization;
 pub mod query_fingerprints;
+pub mod rrd_runtime_settings;
 pub mod stubs;
 pub mod table_access;
 
@@ -20,6 +22,12 @@ pub use billing::{BillingMeter, BillingMetersTable};
 pub use connections::{ConnectionInfo, ConnectionTracker, ConnectionsTable};
 pub use consolidation_status::ConsolidationStatusTable;
 pub use full_scan_reasons::{FullScanReasonsTable, FullScanTracker};
+pub use materialization::{
+    InMemoryMaterializationProvider, MaterializationObservabilityProvider,
+    MaterializationQueueSnapshot, MaterializationQueuesTable, MaterializationStatusSnapshot,
+    MaterializationStatusTable, StorageMaterializationProvider,
+};
 pub use query_fingerprints::{QueryFingerprintTracker, QueryFingerprintsTable};
+pub use rrd_runtime_settings::RrdRuntimeSettingsTable;
 pub use stubs::register_all_stubs;
 pub use table_access::{TableAccessSummaryTable, TableAccessTracker};

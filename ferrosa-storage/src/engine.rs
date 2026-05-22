@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 
-use ferrosa_common::key::DecoratedKey;
+use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::TableSchema;
 use ferrosa_schema::SchemaSnapshot;
 use ferrosa_sstable::types::{Partition, Row};
@@ -34,7 +35,45 @@ use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::FileFlushTarget;
 use crate::store::TableStore;
+use crate::timeseries::aggregator::decode_typed_numeric;
+use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
+use crate::timeseries::consolidation::{emit_accumulated_streaming_results, Accumulator};
+use crate::timeseries::{
+    ConsolidationMetrics, ConsolidationTask, LateWindowClassification, MaterializationTarget,
+    MaterializedRollup, TimeSeriesAggregator, TimeSeriesRuntimeSettings,
+};
 use crate::upload::{ObjectStoreConfig, UploadManager};
+
+/// Bounded live queue snapshot for one time-series materialization target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeSeriesMaterializationQueueSnapshot {
+    pub source_table: TableId,
+    pub target_table: TableId,
+    pub window_start_ts: i64,
+    pub window_end_ts: i64,
+    pub task_type: String,
+    pub enqueued_at_ms: i64,
+    pub oldest_task_age_ms: i64,
+    pub queue_depth: i64,
+    pub retry_count: i64,
+    pub last_error: Option<String>,
+    pub max_delay_ms: i64,
+    pub alerting: bool,
+}
+
+/// Bounded live status snapshot for one time-series materialization target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeSeriesMaterializationStatusSnapshot {
+    pub source_table: TableId,
+    pub target_table: TableId,
+    pub status: String,
+    pub pending_tasks: i64,
+    pub completed_tasks: i64,
+    pub failed_tasks: i64,
+    pub stale_drops_total: i64,
+    pub last_materialized_window_end_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
 
 /// Configuration for NVMe pin mode on a table.
 ///
@@ -456,6 +495,8 @@ pub struct StorageEngine {
     local_cache: LocalCache,
     observers: RwLock<Vec<Arc<dyn crate::observer::WriteObserver>>>,
     async_observers: RwLock<Vec<AsyncObserverState>>,
+    time_series_consolidators: RwLock<HashMap<TableId, TimeSeriesConsolidatorHandle>>,
+    time_series_runtime_settings: Arc<TimeSeriesRuntimeSettings>,
     /// Default channel capacity for async observers.
     async_observer_capacity: usize,
     /// Index build scheduler — rebuilds secondary indexes after compaction.
@@ -528,12 +569,40 @@ type FileSSTableReader =
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
 type SSTableSidecarMap = Arc<HashMap<String, crate::index::sidecar::SidecarReader>>;
 
+const DEFAULT_TIME_SERIES_MATERIALIZATION_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+const DEFAULT_TIME_SERIES_MATERIALIZATION_BATCH_LIMIT: usize = 128;
+
 /// State for a single async observer: the observer, its sender half, and a
 /// drop counter for backpressure metrics.
 struct AsyncObserverState {
     observer: Arc<dyn crate::observer::WriteObserver>,
     sender: tokio::sync::mpsc::Sender<(TableId, Mutation)>,
     drop_count: Arc<AtomicU64>,
+}
+
+struct TimeSeriesConsolidatorHandle {
+    aggregator: Arc<TimeSeriesAggregator>,
+    observer: Arc<dyn crate::observer::WriteObserver>,
+    task_rx: parking_lot::Mutex<std::sync::mpsc::Receiver<ConsolidationTask>>,
+    target: MaterializationTarget,
+    late_window: std::time::Duration,
+    source_column_count: usize,
+    source_column_indices: Vec<u16>,
+    source_column_types: Vec<String>,
+}
+
+fn normalize_consolidation_type(type_name: &str) -> String {
+    match type_name {
+        "org.apache.cassandra.db.marshal.DoubleType" => "double",
+        "org.apache.cassandra.db.marshal.FloatType" => "float",
+        "org.apache.cassandra.db.marshal.Int32Type" => "int",
+        "org.apache.cassandra.db.marshal.LongType" => "bigint",
+        "org.apache.cassandra.db.marshal.CounterColumnType" => "counter",
+        "org.apache.cassandra.db.marshal.TimestampType" => "timestamp",
+        other => other,
+    }
+    .to_ascii_lowercase()
 }
 
 impl StorageEngine {
@@ -589,6 +658,10 @@ impl StorageEngine {
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
+            time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -729,6 +802,10 @@ impl StorageEngine {
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
+            time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -850,6 +927,10 @@ impl StorageEngine {
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
+            time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -1326,6 +1407,7 @@ impl StorageEngine {
                 return Ok(());
             }
         }
+        let time_series_handle = self.build_time_series_consolidator(&table_id, &schema)?;
         let state = Self::build_table_state(&self.config, schema, indexed_columns)?;
 
         // Register each declared index in the tracker.
@@ -1335,6 +1417,7 @@ impl StorageEngine {
         }
 
         self.tables.write().insert(table_id.clone(), state);
+        self.install_time_series_consolidator(table_id.clone(), time_series_handle);
 
         // Trigger compaction check for tables loaded with existing SSTables.
         // Without this, tables restored from S3 bootstrap can have thousands
@@ -1368,12 +1451,16 @@ impl StorageEngine {
         table_id: &TableId,
         new_schema: TableSchema,
     ) -> ferrosa_common::Result<()> {
+        let time_series_handle = self.build_time_series_consolidator(table_id, &new_schema)?;
         let mut tables = self.tables.write();
         let state = tables.get_mut(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
         state.schema = new_schema.clone();
         state.store.update_schema(new_schema);
+        drop(tables);
+        self.remove_time_series_consolidator(table_id);
+        self.install_time_series_consolidator(table_id.clone(), time_series_handle);
         Ok(())
     }
 
@@ -1390,6 +1477,7 @@ impl StorageEngine {
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         self.tables.write().remove(table_id);
+        self.remove_time_series_consolidator(table_id);
 
         // Delete local SSTable directory so DROP+CREATE starts empty.
         let table_dir = self
@@ -1726,6 +1814,457 @@ impl StorageEngine {
         };
         self.async_observers.write().push(state);
         rx
+    }
+
+    /// Returns the number of active DDL-registered time-series consolidators.
+    pub fn time_series_consolidator_count(&self) -> usize {
+        self.time_series_consolidators.read().len()
+    }
+
+    /// Returns the active ring count for a DDL-registered time-series table.
+    pub fn time_series_ring_count(&self, table_id: &TableId) -> Option<usize> {
+        self.time_series_consolidators
+            .read()
+            .get(table_id)
+            .map(|handle| handle.aggregator.ring_count())
+    }
+
+    /// Returns runtime-adjustable process-wide controls for RRD/time-series materialization.
+    pub fn time_series_runtime_settings(&self) -> Arc<TimeSeriesRuntimeSettings> {
+        Arc::clone(&self.time_series_runtime_settings)
+    }
+
+    /// Visits rows in one partition and time window for a registered table.
+    pub fn visit_time_series_window_rows<Cb>(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        window_start_ts: i64,
+        window_end_ts: i64,
+        cb: Cb,
+    ) -> ferrosa_common::Result<usize>
+    where
+        Cb: FnMut(&Row) -> ferrosa_common::Result<()>,
+    {
+        let tables = self.tables.read();
+        let Some(state) = tables.get(table_id) else {
+            return Ok(0);
+        };
+        state
+            .store
+            .visit_time_series_window_rows(key, window_start_ts, window_end_ts, cb)
+    }
+
+    /// Visits bounded live queue snapshots for time-series materialization observability.
+    pub fn visit_time_series_materialization_queues(
+        &self,
+        visit: &mut dyn FnMut(TimeSeriesMaterializationQueueSnapshot),
+    ) {
+        for handle in self.time_series_consolidators.read().values() {
+            let queue = handle.aggregator.queue_snapshot();
+            let max_delay_ms = handle.target.interval.as_millis().min(i64::MAX as u128) as i64;
+            visit(TimeSeriesMaterializationQueueSnapshot {
+                source_table: handle.target.source_table.clone(),
+                target_table: handle.target.target_table.clone(),
+                window_start_ts: queue.oldest_window_start_ts,
+                window_end_ts: queue.oldest_window_end_ts,
+                task_type: queue.oldest_task_type.to_string(),
+                enqueued_at_ms: queue.oldest_task_enqueued_at_ms,
+                oldest_task_age_ms: queue.oldest_task_age_ms,
+                queue_depth: queue.pending_tasks.min(i64::MAX as u64) as i64,
+                retry_count: 0,
+                last_error: None,
+                max_delay_ms,
+                alerting: queue.oldest_task_age_ms > max_delay_ms,
+            });
+        }
+    }
+
+    /// Visits bounded live status snapshots for time-series materialization observability.
+    pub fn visit_time_series_materialization_statuses(
+        &self,
+        visit: &mut dyn FnMut(TimeSeriesMaterializationStatusSnapshot),
+    ) {
+        for handle in self.time_series_consolidators.read().values() {
+            let queue = handle.aggregator.queue_snapshot();
+            let metrics = handle
+                .aggregator
+                .metrics()
+                .map(|metrics| metrics.snapshot());
+            let max_delay_ms = handle.target.interval.as_millis().min(i64::MAX as u128) as i64;
+            visit(TimeSeriesMaterializationStatusSnapshot {
+                source_table: handle.target.source_table.clone(),
+                target_table: handle.target.target_table.clone(),
+                status: if queue.pending_tasks == 0 {
+                    "idle".to_string()
+                } else if queue.oldest_task_age_ms > max_delay_ms {
+                    "degraded".to_string()
+                } else {
+                    "pending".to_string()
+                },
+                pending_tasks: queue.pending_tasks.min(i64::MAX as u64) as i64,
+                completed_tasks: metrics
+                    .as_ref()
+                    .map(|metrics| metrics.windows_consolidated.min(i64::MAX as u64) as i64)
+                    .unwrap_or(0),
+                failed_tasks: metrics
+                    .as_ref()
+                    .map(|metrics| metrics.decode_failures.min(i64::MAX as u64) as i64)
+                    .unwrap_or(0),
+                stale_drops_total: metrics
+                    .as_ref()
+                    .map(|metrics| metrics.consolidation_drops.min(i64::MAX as u64) as i64)
+                    .unwrap_or(0),
+                last_materialized_window_end_ms: if queue.oldest_window_end_ts == 0 {
+                    None
+                } else {
+                    Some(queue.oldest_window_end_ts)
+                },
+                last_error: None,
+            });
+        }
+    }
+
+    /// Drains and materializes one queued time-series descriptor for a source table.
+    pub fn process_one_time_series_materialization(
+        &self,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<bool> {
+        let mutation = {
+            let handles = self.time_series_consolidators.read();
+            let Some(handle) = handles.get(table_id) else {
+                return Ok(false);
+            };
+
+            let task = match handle.task_rx.lock().try_recv() {
+                Ok(task) => {
+                    handle.aggregator.note_materialization_task_drained();
+                    task
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "time-series materialization queue disconnected for {table_id}"
+                    )));
+                }
+            };
+
+            let (partition_key, window_start_ts, window_end_ts, write_timestamp) = match task {
+                ConsolidationTask::BoundaryCrossed {
+                    partition_key,
+                    window_start_ts,
+                    window_end_ts,
+                    ..
+                } => (partition_key, window_start_ts, window_end_ts, window_end_ts),
+                ConsolidationTask::LateData {
+                    partition_key,
+                    window_start_ts,
+                    late_timestamp,
+                    ..
+                } => {
+                    let interval_micros = handle.target.interval.as_micros() as i64;
+                    let window_end_ts = window_start_ts.saturating_add(interval_micros);
+                    if let Some(watermark_window_start_ts) =
+                        handle.aggregator.watermark_window_start(&partition_key)
+                    {
+                        if handle.target.classify_late_window(
+                            window_start_ts,
+                            watermark_window_start_ts,
+                            handle.late_window,
+                        ) == LateWindowClassification::Drop
+                        {
+                            if let Some(metrics) = handle.aggregator.metrics() {
+                                metrics.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::warn!(
+                                %table_id,
+                                target_table = %handle.target.target_table,
+                                window_start_ts,
+                                watermark_window_start_ts,
+                                late_window_ms = handle.late_window.as_millis(),
+                                "dropping stale time-series materialization outside late_window"
+                            );
+                            return Ok(true);
+                        }
+                    }
+                    let late_offset = late_timestamp.saturating_sub(window_start_ts).max(1);
+                    (
+                        partition_key,
+                        window_start_ts,
+                        window_end_ts,
+                        window_end_ts.saturating_add(late_offset),
+                    )
+                }
+            };
+
+            let source_key = DecoratedKey::new(PartitionKey::new(partition_key.clone()));
+            let mut results: SmallVec<[f64; 8]> = SmallVec::new();
+            for source_column_ordinal in 0..handle.source_column_count {
+                let column_index = handle.source_column_indices[source_column_ordinal];
+                let column_type = &handle.source_column_types[source_column_ordinal];
+                let mut acc = Accumulator::new(false);
+                self.visit_time_series_window_rows(
+                    table_id,
+                    &source_key,
+                    window_start_ts,
+                    window_end_ts,
+                    |row| {
+                        let Some((_, cell)) =
+                            row.cells.iter().find(|(idx, _)| *idx == column_index)
+                        else {
+                            return Ok(());
+                        };
+                        let Some(bytes) = cell.value.as_deref() else {
+                            return Ok(());
+                        };
+                        let Some(value) = decode_typed_numeric(bytes, column_type) else {
+                            if let Some(metrics) = handle.aggregator.metrics() {
+                                metrics.decode_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::warn!(
+                                %table_id,
+                                column_index,
+                                byte_len = bytes.len(),
+                                "failed to decode numeric bytes for time-series materialization"
+                            );
+                            return Ok(());
+                        };
+                        acc.push(value);
+                        Ok(())
+                    },
+                )?;
+                emit_accumulated_streaming_results(&mut acc, &handle.target.functions, |value| {
+                    results.push(value);
+                })
+                .map_err(|err| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "time-series materialization for {table_id} requires unsupported window materialization: {err:?}"
+                    ))
+                })?;
+            }
+
+            if results.is_empty() {
+                return Ok(true);
+            }
+
+            MaterializedRollup {
+                target: handle.target.clone(),
+                partition_key,
+                window_start_ts,
+            }
+            .encode_mutation_from_results_at(results, write_timestamp)
+        };
+
+        let target_table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        self.apply_derived_mutation(&mutation);
+        self.dispatch_sync_observers(&target_table_id, &mutation);
+        self.dispatch_async_observers(&target_table_id, &mutation);
+        Ok(true)
+    }
+
+    /// Drains queued time-series materialization descriptors across all active
+    /// consolidators, bounded by `max_tasks`.
+    pub fn process_pending_time_series_materializations(
+        &self,
+        max_tasks: usize,
+    ) -> ferrosa_common::Result<usize> {
+        let mut processed = 0;
+        while processed < max_tasks {
+            let table_ids: Vec<TableId> = self
+                .time_series_consolidators
+                .read()
+                .keys()
+                .cloned()
+                .collect();
+            if table_ids.is_empty() {
+                break;
+            }
+
+            let mut made_progress = false;
+            for table_id in table_ids {
+                if processed >= max_tasks {
+                    break;
+                }
+                if self.process_one_time_series_materialization(&table_id)? {
+                    processed += 1;
+                    made_progress = true;
+                }
+            }
+
+            if !made_progress {
+                break;
+            }
+        }
+
+        Ok(processed)
+    }
+
+    /// Starts the background worker that materializes queued RRD rollups.
+    pub fn spawn_time_series_materialization_worker(
+        engine: Arc<Self>,
+    ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_time_series_materialization_worker_with_config(
+            engine,
+            DEFAULT_TIME_SERIES_MATERIALIZATION_POLL_INTERVAL,
+            DEFAULT_TIME_SERIES_MATERIALIZATION_BATCH_LIMIT,
+        )
+    }
+
+    /// Starts the background worker that materializes queued RRD rollups using
+    /// caller-provided scheduling controls.
+    pub fn spawn_time_series_materialization_worker_with_config(
+        engine: Arc<Self>,
+        poll_interval: std::time::Duration,
+        batch_limit: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let poll_interval = poll_interval.max(std::time::Duration::from_millis(1));
+            let batch_limit = batch_limit.max(1);
+            let mut interval = tokio::time::interval(poll_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                interval.tick().await;
+                let worker_engine = engine.clone();
+                match tokio::task::spawn_blocking(move || {
+                    worker_engine.process_pending_time_series_materializations(batch_limit)
+                })
+                .await
+                {
+                    Ok(Ok(processed)) if processed > 0 => {
+                        tracing::debug!(
+                            processed,
+                            "time-series materialization worker drained queued rollups"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            %e,
+                            "time-series materialization worker failed; queued rollups may lag"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            %e,
+                            "time-series materialization worker task panicked"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        })
+    }
+
+    fn build_time_series_consolidator(
+        &self,
+        table_id: &TableId,
+        schema: &TableSchema,
+    ) -> ferrosa_common::Result<Option<TimeSeriesConsolidatorHandle>> {
+        let config = match ConsolidationConfig::from_extensions(&schema.extensions) {
+            Some(Ok(config)) => config,
+            Some(Err(reason)) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "invalid consolidation extensions for {table_id}: {reason}"
+                )));
+            }
+            None => return Ok(None),
+        };
+
+        let mut column_types_by_name = HashMap::new();
+        let mut column_indices_by_name = HashMap::new();
+        for (idx, column) in schema
+            .static_columns
+            .iter()
+            .chain(schema.regular_columns.iter())
+            .enumerate()
+        {
+            column_types_by_name.insert(
+                column.name.clone(),
+                normalize_consolidation_type(&column.type_name),
+            );
+            column_indices_by_name.insert(column.name.clone(), idx as u16);
+        }
+
+        validate_numeric_columns(&config.columns, &column_types_by_name).map_err(|reason| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "invalid consolidation extensions for {table_id}: {reason}"
+            ))
+        })?;
+
+        let mut value_column_indices = Vec::with_capacity(config.columns.len());
+        let mut column_types = Vec::with_capacity(config.columns.len());
+        for column_name in &config.columns {
+            let Some(&column_index) = column_indices_by_name.get(column_name) else {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "invalid consolidation extensions for {table_id}: column '{column_name}' not found"
+                )));
+            };
+            value_column_indices.push(column_index);
+            column_types.push(
+                column_types_by_name
+                    .get(column_name)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            );
+        }
+
+        let (task_tx, task_rx) = std::sync::mpsc::sync_channel(config.channel_capacity);
+        let target = MaterializationTarget {
+            source_table: table_id.clone(),
+            target_table: TableId::new(&schema.keyspace, &config.target_table),
+            interval: config.interval,
+            source_columns: config.columns.clone(),
+            functions: config.functions.clone(),
+        };
+        let source_column_count = value_column_indices.len();
+        let late_window = config.late_window;
+        let metrics = Arc::new(ConsolidationMetrics::new());
+        let aggregator = Arc::new(
+            TimeSeriesAggregator::with_column_types_runtime_settings_and_metrics(
+                config,
+                table_id.clone(),
+                value_column_indices.clone(),
+                column_types.clone(),
+                task_tx,
+                Arc::clone(&self.time_series_runtime_settings),
+                metrics,
+            ),
+        );
+        let observer: Arc<dyn crate::observer::WriteObserver> = aggregator.clone();
+
+        Ok(Some(TimeSeriesConsolidatorHandle {
+            aggregator,
+            observer,
+            task_rx: parking_lot::Mutex::new(task_rx),
+            target,
+            late_window,
+            source_column_count,
+            source_column_indices: value_column_indices,
+            source_column_types: column_types,
+        }))
+    }
+
+    fn install_time_series_consolidator(
+        &self,
+        table_id: TableId,
+        handle: Option<TimeSeriesConsolidatorHandle>,
+    ) {
+        let Some(handle) = handle else {
+            return;
+        };
+        self.register_observer(handle.observer.clone());
+        self.time_series_consolidators
+            .write()
+            .insert(table_id, handle);
+    }
+
+    fn remove_time_series_consolidator(&self, table_id: &TableId) {
+        let Some(handle) = self.time_series_consolidators.write().remove(table_id) else {
+            return;
+        };
+        self.observers
+            .write()
+            .retain(|observer| !Arc::ptr_eq(observer, &handle.observer));
     }
 
     /// Registers an async observer and spawns an in-process drain task that
@@ -4126,6 +4665,10 @@ impl StorageEngine {
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
+            time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,

@@ -37,9 +37,12 @@ pub struct FunctionKey(DefaultKey);
 // Using a fixed constant avoids a `num_cpus` dependency.
 const POOL_MAX_PER_FUNCTION: usize = 8;
 
+type FunctionCacheKey = (String, String, Vec<CqlType>);
+
 /// Compiled WASM component ready for instantiation.
 struct CompiledFunction {
     component: Component,
+    kind: FunctionKind,
 }
 
 /// Registry mapping (keyspace, name) -> compiled function via SlotMap.
@@ -48,7 +51,7 @@ struct CompiledFunction {
 /// The `index` HashMap maps the logical function name to its SlotMap key.
 struct FunctionRegistry {
     slots: SlotMap<DefaultKey, Arc<CompiledFunction>>,
-    index: HashMap<(String, String), FunctionKey>,
+    index: HashMap<FunctionCacheKey, FunctionKey>,
 }
 
 impl FunctionRegistry {
@@ -71,7 +74,7 @@ struct PooledInstance {
 /// Each function key maps to a `Mutex<Vec<PooledInstance>>`. Acquire pops
 /// from the vec; release pushes back (up to `max_per_function`).
 struct InstancePool {
-    pools: HashMap<(String, String), Mutex<Vec<PooledInstance>>>,
+    pools: HashMap<FunctionCacheKey, Mutex<Vec<PooledInstance>>>,
     max_per_function: usize,
 }
 
@@ -84,21 +87,21 @@ impl InstancePool {
     }
 
     /// Ensure a pool entry exists for `key`. No-op if already present.
-    fn ensure_pool(&mut self, key: (String, String)) {
+    fn ensure_pool(&mut self, key: FunctionCacheKey) {
         self.pools
             .entry(key)
             .or_insert_with(|| Mutex::new(Vec::new()));
     }
 
     /// Try to take a warm instance from the pool. Returns `None` on miss.
-    fn acquire(&self, key: &(String, String)) -> Option<PooledInstance> {
+    fn acquire(&self, key: &FunctionCacheKey) -> Option<PooledInstance> {
         let pool = self.pools.get(key)?;
         let mut guard = pool.lock().ok()?;
         guard.pop()
     }
 
     /// Return an instance to the pool. Drops the instance if the pool is full.
-    fn release(&self, key: &(String, String), instance: PooledInstance) {
+    fn release(&self, key: &FunctionCacheKey, instance: PooledInstance) {
         if let Some(pool) = self.pools.get(key) {
             if let Ok(mut guard) = pool.lock() {
                 if guard.len() < self.max_per_function {
@@ -109,7 +112,7 @@ impl InstancePool {
     }
 
     /// Remove and drop all pooled instances for `key` (called on invalidate).
-    fn drain(&self, key: &(String, String)) {
+    fn drain(&self, key: &FunctionCacheKey) {
         if let Some(pool) = self.pools.get(key) {
             if let Ok(mut guard) = pool.lock() {
                 guard.clear();
@@ -173,7 +176,13 @@ impl UdfExecutor {
     /// The compiled component is registered for later invocation and a pool
     /// slot is pre-allocated for the function key.
     /// If an entry already exists for (keyspace, name) it is replaced (CREATE OR REPLACE).
-    pub fn compile(&self, keyspace: &str, name: &str, wasm_bytes: &[u8]) -> Result<(), UdfError> {
+    pub fn compile(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+        wasm_bytes: &[u8],
+    ) -> Result<(), UdfError> {
         if wasm_bytes.len() > self.config.max_wasm_size {
             return Err(UdfError::BinaryTooLarge {
                 size: wasm_bytes.len(),
@@ -183,16 +192,61 @@ impl UdfExecutor {
 
         let component = Component::new(&self.engine, wasm_bytes)
             .map_err(|e| UdfError::CompilationFailed(format!("{e}")))?;
+        self.register_compiled_function(keyspace, name, arg_types, component, FunctionKind::Scalar)
+    }
 
-        tracing::info!(
+    /// Pre-compile a WASM streaming aggregate component for RRD rollups.
+    ///
+    /// Ferrosa's RRD materializer never calls list-style scalar WASM over a
+    /// materialized window. A custom rollup must be explicitly registered as a
+    /// streaming aggregate and carry the `ferrosa:streaming-aggregate:v1`
+    /// component custom-section marker. That marker is the compatibility gate
+    /// for the v1 aggregate contract: `init` creates bounded state, `update`
+    /// consumes one numeric value at a time, and `finalize` emits one bounded
+    /// numeric result.
+    pub fn compile_streaming_aggregate(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+        wasm_bytes: &[u8],
+    ) -> Result<(), UdfError> {
+        if wasm_bytes.len() > self.config.max_wasm_size {
+            return Err(UdfError::BinaryTooLarge {
+                size: wasm_bytes.len(),
+                max: self.config.max_wasm_size,
+            });
+        }
+
+        if !has_streaming_aggregate_abi_marker(wasm_bytes) {
+            return Err(UdfError::CompilationFailed(
+                "streaming aggregate WASM must declare ferrosa:streaming-aggregate:v1 ABI marker with init/update/finalize contract".into(),
+            ));
+        }
+
+        let component = Component::new(&self.engine, wasm_bytes)
+            .map_err(|e| UdfError::CompilationFailed(format!("{e}")))?;
+        self.register_compiled_function(
             keyspace,
             name,
-            size = wasm_bytes.len(),
-            "compiled WASM function"
-        );
+            arg_types,
+            component,
+            FunctionKind::Aggregate,
+        )
+    }
 
-        let key = (keyspace.to_string(), name.to_string());
-        let compiled = Arc::new(CompiledFunction { component });
+    fn register_compiled_function(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+        component: Component,
+        kind: FunctionKind,
+    ) -> Result<(), UdfError> {
+        tracing::info!(keyspace, name, ?kind, "compiled WASM function");
+
+        let key = (keyspace.to_string(), name.to_string(), arg_types.to_vec());
+        let compiled = Arc::new(CompiledFunction { component, kind });
 
         let mut reg = self.registry.write().expect("registry lock poisoned");
         // Remove old slot if replacing an existing entry.
@@ -215,8 +269,8 @@ impl UdfExecutor {
     ///
     /// Removes the compiled function from the registry and drains any pooled
     /// instances so stale code is not reused.
-    pub fn invalidate(&self, keyspace: &str, name: &str) {
-        let key = (keyspace.to_string(), name.to_string());
+    pub fn invalidate(&self, keyspace: &str, name: &str, arg_types: &[CqlType]) {
+        let key = (keyspace.to_string(), name.to_string(), arg_types.to_vec());
         let mut reg = self.registry.write().expect("registry lock poisoned");
         if let Some(fk) = reg.index.remove(&key) {
             reg.slots.remove(fk.0);
@@ -235,32 +289,38 @@ impl UdfExecutor {
         &self,
         keyspace: &str,
         name: &str,
+        arg_types: &[CqlType],
     ) -> Result<(FunctionKey, FunctionKind), UdfError> {
         let reg = self.registry.read().expect("registry lock poisoned");
         let fk = *reg
             .index
-            .get(&(keyspace.to_string(), name.to_string()))
+            .get(&(keyspace.to_string(), name.to_string(), arg_types.to_vec()))
             .ok_or_else(|| UdfError::NotFound {
                 keyspace: keyspace.to_string(),
                 name: name.to_string(),
             })?;
-        // All functions registered via compile() are scalar UDFs.
-        // UDA support will extend this when UDA metadata is tracked.
-        Ok((fk, FunctionKind::Scalar))
+        let kind = reg.slots.get(fk.0).expect("index/slots out of sync").kind;
+        Ok((fk, kind))
     }
 
     /// Look up the kind of a compiled function by name.
     ///
     /// Returns `NotFound` if the function has not been compiled.
-    pub fn get_kind(&self, keyspace: &str, name: &str) -> Result<FunctionKind, UdfError> {
+    pub fn get_kind(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+    ) -> Result<FunctionKind, UdfError> {
         let reg = self.registry.read().expect("registry lock poisoned");
-        reg.index
-            .get(&(keyspace.to_string(), name.to_string()))
-            .map(|_| FunctionKind::Scalar)
+        let fk = *reg
+            .index
+            .get(&(keyspace.to_string(), name.to_string(), arg_types.to_vec()))
             .ok_or_else(|| UdfError::NotFound {
                 keyspace: keyspace.to_string(),
                 name: name.to_string(),
-            })
+            })?;
+        Ok(reg.slots.get(fk.0).expect("index/slots out of sync").kind)
     }
 
     /// Invoke a UDF. Returns the function's result.
@@ -280,10 +340,14 @@ impl UdfExecutor {
         keyspace: &str,
         func_name: &str,
         args: Vec<CqlValue>,
-        _arg_types: &[CqlType],
+        arg_types: &[CqlType],
         return_type: &CqlType,
     ) -> Result<CqlValue, UdfError> {
-        let key = (keyspace.to_string(), func_name.to_string());
+        let key = (
+            keyspace.to_string(),
+            func_name.to_string(),
+            arg_types.to_vec(),
+        );
 
         let compiled = {
             let reg = self.registry.read().expect("registry lock poisoned");
@@ -476,12 +540,13 @@ impl UdfExecutor {
         &self,
         keyspace: &str,
         name: &str,
+        arg_types: &[CqlType],
     ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
         let compiled = {
             let reg = self.registry.read().expect("registry lock poisoned");
             let fk = reg
                 .index
-                .get(&(keyspace.to_string(), name.to_string()))
+                .get(&(keyspace.to_string(), name.to_string(), arg_types.to_vec()))
                 .ok_or_else(|| UdfError::NotFound {
                     keyspace: keyspace.to_string(),
                     name: name.to_string(),
@@ -504,6 +569,14 @@ impl UdfExecutor {
 
         Ok((store, instance))
     }
+}
+
+const STREAMING_AGGREGATE_ABI_MARKER: &[u8] = b"ferrosa:streaming-aggregate:v1";
+
+fn has_streaming_aggregate_abi_marker(wasm_bytes: &[u8]) -> bool {
+    wasm_bytes
+        .windows(STREAMING_AGGREGATE_ABI_MARKER.len())
+        .any(|window| window == STREAMING_AGGREGATE_ABI_MARKER)
 }
 
 /// The kind of a compiled function — scalar UDF or aggregate UDA.
@@ -1041,7 +1114,9 @@ mod tests {
             ..Default::default()
         };
         let executor = UdfExecutor::new(config).unwrap();
-        let err = executor.compile("ks", "func", &[0u8; 200]).unwrap_err();
+        let err = executor
+            .compile("ks", "func", &[CqlType::Int], &[0u8; 200])
+            .unwrap_err();
         assert!(matches!(err, UdfError::BinaryTooLarge { .. }));
     }
 
@@ -1049,7 +1124,7 @@ mod tests {
     fn compile_rejects_invalid_wasm() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
         let err = executor
-            .compile("ks", "bad", b"not valid wasm")
+            .compile("ks", "bad", &[CqlType::Int], b"not valid wasm")
             .unwrap_err();
         assert!(
             matches!(err, UdfError::CompilationFailed(..)),
@@ -1071,13 +1146,13 @@ mod tests {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
         // Insert via compile() so the registry is populated.
         executor
-            .compile("ks", "func", &minimal_component_bytes())
+            .compile("ks", "func", &[CqlType::Int], &minimal_component_bytes())
             .unwrap();
         // Confirm it is present.
-        assert!(executor.resolve("ks", "func").is_ok());
-        executor.invalidate("ks", "func");
+        assert!(executor.resolve("ks", "func", &[CqlType::Int]).is_ok());
+        executor.invalidate("ks", "func", &[CqlType::Int]);
         // Confirm it is gone.
-        assert!(executor.resolve("ks", "func").is_err());
+        assert!(executor.resolve("ks", "func", &[CqlType::Int]).is_err());
     }
 
     #[test]
@@ -1311,22 +1386,67 @@ mod tests {
     // ---- Cache lifecycle tests ----
 
     #[test]
+    fn compile_streaming_aggregate_rejects_scalar_component_without_abi_marker() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        let err = executor
+            .compile_streaming_aggregate(
+                "ks",
+                "stddev",
+                &[CqlType::Double],
+                &minimal_component_bytes(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UdfError::CompilationFailed(ref msg) if msg.contains("streaming aggregate")),
+            "expected ABI marker rejection, got: {err:?}"
+        );
+        assert!(executor
+            .resolve("ks", "stddev", &[CqlType::Double])
+            .is_err());
+    }
+
+    #[test]
+    fn compile_streaming_aggregate_marks_function_as_aggregate() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile_streaming_aggregate(
+                "ks",
+                "stddev",
+                &[CqlType::Double],
+                &minimal_streaming_aggregate_component_bytes(),
+            )
+            .unwrap();
+
+        let (_, kind) = executor
+            .resolve("ks", "stddev", &[CqlType::Double])
+            .unwrap();
+        assert_eq!(kind, FunctionKind::Aggregate);
+        assert_eq!(
+            executor
+                .get_kind("ks", "stddev", &[CqlType::Double])
+                .unwrap(),
+            FunctionKind::Aggregate
+        );
+    }
+
+    #[test]
     fn compile_valid_component_populates_cache() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
 
         // Before compile: resolve should fail with NotFound.
         assert!(
-            executor.resolve("ks", "func").is_err(),
+            executor.resolve("ks", "func", &[CqlType::Int]).is_err(),
             "resolve should fail before compile()"
         );
 
         executor
-            .compile("ks", "func", &minimal_component_bytes())
+            .compile("ks", "func", &[CqlType::Int], &minimal_component_bytes())
             .unwrap();
 
         // After compile: resolve should succeed.
         assert!(
-            executor.resolve("ks", "func").is_ok(),
+            executor.resolve("ks", "func", &[CqlType::Int]).is_ok(),
             "registry should contain compiled function after compile()"
         );
     }
@@ -1337,15 +1457,15 @@ mod tests {
 
         // Compile once and capture the FunctionKey.
         executor
-            .compile("ks", "func", &minimal_component_bytes())
+            .compile("ks", "func", &[CqlType::Int], &minimal_component_bytes())
             .unwrap();
-        let (first_key, _) = executor.resolve("ks", "func").unwrap();
+        let (first_key, _) = executor.resolve("ks", "func", &[CqlType::Int]).unwrap();
 
         // Compile same (keyspace, name) again — old slot is removed, new one inserted.
         executor
-            .compile("ks", "func", &minimal_component_bytes())
+            .compile("ks", "func", &[CqlType::Int], &minimal_component_bytes())
             .unwrap();
-        let (second_key, _) = executor.resolve("ks", "func").unwrap();
+        let (second_key, _) = executor.resolve("ks", "func", &[CqlType::Int]).unwrap();
 
         // The SlotMap keys should differ because the old slot was replaced.
         assert_ne!(
@@ -1358,31 +1478,55 @@ mod tests {
     fn compile_different_keyspaces_are_independent() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
         executor
-            .compile("ks1", "func", &minimal_component_bytes())
+            .compile("ks1", "func", &[CqlType::Int], &minimal_component_bytes())
             .unwrap();
         executor
-            .compile("ks2", "func", &minimal_component_bytes())
+            .compile("ks2", "func", &[CqlType::Int], &minimal_component_bytes())
             .unwrap();
 
         assert!(
-            executor.resolve("ks1", "func").is_ok(),
+            executor.resolve("ks1", "func", &[CqlType::Int]).is_ok(),
             "ks1/func should be registered"
         );
         assert!(
-            executor.resolve("ks2", "func").is_ok(),
+            executor.resolve("ks2", "func", &[CqlType::Int]).is_ok(),
             "ks2/func should be registered"
         );
 
         // Invalidating one keyspace should not affect the other.
-        executor.invalidate("ks1", "func");
+        executor.invalidate("ks1", "func", &[CqlType::Int]);
         assert!(
-            executor.resolve("ks1", "func").is_err(),
+            executor.resolve("ks1", "func", &[CqlType::Int]).is_err(),
             "ks1/func should be gone after invalidate"
         );
         assert!(
-            executor.resolve("ks2", "func").is_ok(),
+            executor.resolve("ks2", "func", &[CqlType::Int]).is_ok(),
             "ks2/func should still be registered"
         );
+    }
+
+    #[test]
+    fn compile_same_name_different_arg_types_are_independent() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile("ks", "func", &[CqlType::Int], &minimal_component_bytes())
+            .unwrap();
+        executor
+            .compile(
+                "ks",
+                "func",
+                &[CqlType::Varchar],
+                &minimal_component_bytes(),
+            )
+            .unwrap();
+
+        assert!(executor.resolve("ks", "func", &[CqlType::Int]).is_ok());
+        assert!(executor.resolve("ks", "func", &[CqlType::Varchar]).is_ok());
+
+        executor.invalidate("ks", "func", &[CqlType::Int]);
+
+        assert!(executor.resolve("ks", "func", &[CqlType::Int]).is_err());
+        assert!(executor.resolve("ks", "func", &[CqlType::Varchar]).is_ok());
     }
 
     #[test]
@@ -1391,7 +1535,7 @@ mod tests {
         // with an execution error (not NotFound).
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
         executor
-            .compile("ks", "noinvoke", &minimal_component_bytes())
+            .compile("ks", "noinvoke", &[], &minimal_component_bytes())
             .unwrap();
 
         let err = executor
@@ -1407,9 +1551,9 @@ mod tests {
     fn invalidate_then_call_returns_not_found() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
         executor
-            .compile("ks", "func", &minimal_component_bytes())
+            .compile("ks", "func", &[], &minimal_component_bytes())
             .unwrap();
-        executor.invalidate("ks", "func");
+        executor.invalidate("ks", "func", &[]);
 
         let err = executor
             .call("ks", "func", vec![], &[], &CqlType::Int)
@@ -1424,8 +1568,43 @@ mod tests {
     fn invalidate_nonexistent_is_noop() {
         // Invalidating a function that was never compiled should not panic.
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
-        executor.invalidate("ks", "never_compiled");
+        executor.invalidate("ks", "never_compiled", &[]);
         // No assertion needed — the test passes if it doesn't panic.
+    }
+
+    fn minimal_streaming_aggregate_component_bytes() -> Vec<u8> {
+        let mut bytes = minimal_component_bytes();
+        append_component_custom_section(
+            &mut bytes,
+            "ferrosa:streaming-aggregate:v1",
+            b"contract=init/update/finalize;value=f64;state=bounded",
+        );
+        bytes
+    }
+
+    fn append_component_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) {
+        let mut section = Vec::new();
+        push_uleb128(&mut section, name.len() as u32);
+        section.extend_from_slice(name.as_bytes());
+        section.extend_from_slice(payload);
+
+        bytes.push(0); // custom section id
+        push_uleb128(bytes, section.len() as u32);
+        bytes.extend_from_slice(&section);
+    }
+
+    fn push_uleb128(out: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
     }
 
     /// Generate a minimal valid WASM component binary.
