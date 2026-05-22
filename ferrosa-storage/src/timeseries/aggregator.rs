@@ -3,8 +3,11 @@
 //! The aggregator inserts into ring buffers inline on the write path and
 //! sends consolidation tasks to an async worker via a bounded channel.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use dashmap::DashMap;
 use smallvec::SmallVec;
@@ -13,7 +16,10 @@ use crate::commitlog::config::TableId;
 use crate::commitlog::mutation::Mutation;
 use crate::observer::{ObserverMode, WriteObserver};
 
-use super::config::ConsolidationConfig;
+use super::config::{ConsolidationConfig, TimeSeriesRuntimeSettings};
+use super::consolidation::{
+    emit_accumulated_streaming_results, Accumulator, ConsolidationFn, StreamingConsolidationError,
+};
 use super::ring::{BoundaryStatus, RingBuffer, RingEntry};
 
 /// A task sent from the inline write path to the async consolidation worker.
@@ -23,8 +29,8 @@ pub enum ConsolidationTask {
     BoundaryCrossed {
         table_id: TableId,
         partition_key: Vec<u8>,
-        window_entries: Vec<RingEntry>,
         window_start_ts: i64,
+        window_end_ts: i64,
     },
     /// Late data detected -- requires disk read to reconstruct window.
     LateData {
@@ -33,6 +39,61 @@ pub enum ConsolidationTask {
         window_start_ts: i64,
         late_timestamp: i64,
     },
+}
+
+/// Bounded queue metadata exposed to storage-backed observability tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeSeriesQueueSnapshot {
+    pub pending_tasks: u64,
+    pub oldest_task_enqueued_at_ms: i64,
+    pub oldest_task_age_ms: i64,
+    pub oldest_window_start_ts: i64,
+    pub oldest_window_end_ts: i64,
+    pub oldest_task_type: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct OldestQueuedTask {
+    enqueued_at_ms: i64,
+    window_start_ts: i64,
+    window_end_ts: i64,
+    task_type: &'static str,
+}
+
+impl ConsolidationTask {
+    fn task_type(&self) -> &'static str {
+        match self {
+            ConsolidationTask::BoundaryCrossed { .. } => "window_close",
+            ConsolidationTask::LateData { .. } => "late_data",
+        }
+    }
+
+    fn window_start_ts(&self) -> i64 {
+        match self {
+            ConsolidationTask::BoundaryCrossed {
+                window_start_ts, ..
+            }
+            | ConsolidationTask::LateData {
+                window_start_ts, ..
+            } => *window_start_ts,
+        }
+    }
+
+    fn window_end_ts(&self, interval_micros: i64) -> i64 {
+        match self {
+            ConsolidationTask::BoundaryCrossed { window_end_ts, .. } => *window_end_ts,
+            ConsolidationTask::LateData {
+                window_start_ts, ..
+            } => window_start_ts.saturating_add(interval_micros),
+        }
+    }
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 /// Time-series aggregator. Implements `WriteObserver` for inline ring buffer
@@ -52,10 +113,24 @@ pub struct TimeSeriesAggregator {
     task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
     /// Counter for dropped tasks (channel full).
     drop_count: AtomicU64,
+    /// Counter for ring allocation rejections caused by memory/count caps.
+    ring_budget_rejections: AtomicU64,
+    /// Counter for ring evictions caused by memory/count caps.
+    ring_evictions: AtomicU64,
+    /// Counter for ring-thrash warning threshold crossings.
+    ring_thrash_warnings: AtomicU64,
+    /// Runtime-adjustable memory and warning controls.
+    runtime_settings: Arc<TimeSeriesRuntimeSettings>,
     /// Maximum number of ring buffers.
     max_rings: usize,
     /// Optional shared metrics for observability.
     shared_metrics: Option<Arc<ConsolidationMetrics>>,
+    /// Number of successfully enqueued tasks not yet drained by the materializer.
+    pending_tasks: AtomicU64,
+    /// Wall-clock enqueue time for the oldest pending task; -1 means empty.
+    oldest_task_enqueued_at_ms: AtomicI64,
+    /// Metadata for the oldest pending task. Retains one bounded descriptor only.
+    oldest_task: Mutex<Option<OldestQueuedTask>>,
 }
 
 impl TimeSeriesAggregator {
@@ -71,6 +146,7 @@ impl TimeSeriesAggregator {
         task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
     ) -> Self {
         let max_rings = config.max_rings;
+        let runtime_settings = Arc::new(TimeSeriesRuntimeSettings::from_config(&config));
         Self {
             config,
             table_id,
@@ -79,8 +155,15 @@ impl TimeSeriesAggregator {
             rings: DashMap::new(),
             task_tx,
             drop_count: AtomicU64::new(0),
+            ring_budget_rejections: AtomicU64::new(0),
+            ring_evictions: AtomicU64::new(0),
+            ring_thrash_warnings: AtomicU64::new(0),
+            runtime_settings,
             max_rings,
             shared_metrics: None,
+            pending_tasks: AtomicU64::new(0),
+            oldest_task_enqueued_at_ms: AtomicI64::new(-1),
+            oldest_task: Mutex::new(None),
         }
     }
 
@@ -105,6 +188,54 @@ impl TimeSeriesAggregator {
         agg
     }
 
+    /// Create a new aggregator with CQL column type metadata and shared runtime settings.
+    pub fn with_column_types_and_runtime_settings(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        column_types: Vec<String>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+        runtime_settings: Arc<TimeSeriesRuntimeSettings>,
+    ) -> Self {
+        assert_eq!(
+            value_column_indices.len(),
+            column_types.len(),
+            "column_types must match value_column_indices length"
+        );
+        let mut agg = Self::with_runtime_settings(
+            config,
+            table_id,
+            value_column_indices,
+            task_tx,
+            runtime_settings,
+        );
+        agg.column_types = column_types;
+        agg
+    }
+
+    /// Create a new aggregator with CQL type metadata, shared runtime settings,
+    /// and externally managed metrics.
+    pub fn with_column_types_runtime_settings_and_metrics(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        column_types: Vec<String>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+        runtime_settings: Arc<TimeSeriesRuntimeSettings>,
+        metrics: Arc<ConsolidationMetrics>,
+    ) -> Self {
+        let mut agg = Self::with_column_types_and_runtime_settings(
+            config,
+            table_id,
+            value_column_indices,
+            column_types,
+            task_tx,
+            runtime_settings,
+        );
+        agg.shared_metrics = Some(metrics);
+        agg
+    }
+
     /// Create a new aggregator with externally managed shared metrics.
     pub fn with_metrics(
         config: ConsolidationConfig,
@@ -117,6 +248,19 @@ impl TimeSeriesAggregator {
         // its internal drop_count for the fast path.
         let mut agg = Self::new(config, table_id, value_column_indices, task_tx);
         agg.shared_metrics = Some(_metrics);
+        agg
+    }
+
+    /// Create a new aggregator using externally managed runtime settings.
+    pub fn with_runtime_settings(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+        runtime_settings: Arc<TimeSeriesRuntimeSettings>,
+    ) -> Self {
+        let mut agg = Self::new(config, table_id, value_column_indices, task_tx);
+        agg.runtime_settings = runtime_settings;
         agg
     }
 
@@ -135,16 +279,202 @@ impl TimeSeriesAggregator {
         self.shared_metrics.as_ref()
     }
 
+    /// Returns runtime-adjustable time-series controls.
+    pub fn runtime_settings(&self) -> Arc<TimeSeriesRuntimeSettings> {
+        Arc::clone(&self.runtime_settings)
+    }
+
+    /// Returns bounded queue metadata for observability without materializing queued tasks.
+    pub fn queue_snapshot(&self) -> TimeSeriesQueueSnapshot {
+        let pending_tasks = self.pending_tasks.load(Ordering::Relaxed);
+        let now_ms = now_millis();
+        let oldest_enqueued_at_ms = self.oldest_task_enqueued_at_ms.load(Ordering::Relaxed);
+        let oldest_task_age_ms = if pending_tasks > 0 && oldest_enqueued_at_ms >= 0 {
+            now_ms.saturating_sub(oldest_enqueued_at_ms)
+        } else {
+            0
+        };
+        let oldest = self.oldest_task.lock().clone();
+        TimeSeriesQueueSnapshot {
+            pending_tasks,
+            oldest_task_enqueued_at_ms: if pending_tasks > 0 {
+                oldest
+                    .as_ref()
+                    .map(|task| task.enqueued_at_ms)
+                    .unwrap_or(oldest_enqueued_at_ms)
+            } else {
+                0
+            },
+            oldest_task_age_ms,
+            oldest_window_start_ts: oldest.as_ref().map(|t| t.window_start_ts).unwrap_or(0),
+            oldest_window_end_ts: oldest.as_ref().map(|t| t.window_end_ts).unwrap_or(0),
+            oldest_task_type: oldest.as_ref().map(|t| t.task_type).unwrap_or("empty"),
+        }
+    }
+
+    /// Marks one queued materialization task as drained by the materializer.
+    pub fn note_materialization_task_drained(&self) {
+        let previous = self
+            .pending_tasks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if previous <= 1 {
+            self.oldest_task_enqueued_at_ms.store(-1, Ordering::Relaxed);
+            *self.oldest_task.lock() = None;
+        }
+    }
+
+    /// Stream one partition/window from the in-memory ring into consolidation results.
+    ///
+    /// Source values are never collected into a window buffer. The ring is
+    /// visited entry-by-entry and folded into a single accumulator for the
+    /// selected source column ordinal.
+    pub fn emit_ring_window_results<F>(
+        &self,
+        partition_key: &[u8],
+        window_start_ts: i64,
+        window_end_ts: i64,
+        source_column_ordinal: usize,
+        functions: &[ConsolidationFn],
+        emit: F,
+    ) -> Result<bool, StreamingConsolidationError>
+    where
+        F: FnMut(f64),
+    {
+        let Some(ring) = self.rings.get(partition_key) else {
+            return Ok(false);
+        };
+
+        let mut acc = Accumulator::new(false);
+        ring.visit_window(window_start_ts, window_end_ts, |entry| {
+            if let Some(value) = entry.values.get(source_column_ordinal) {
+                acc.push(*value);
+            }
+        });
+        let had_values = acc.count() > 0;
+        emit_accumulated_streaming_results(&mut acc, functions, emit)?;
+        Ok(had_values)
+    }
+
+    /// Returns the active ring cap after applying the optional memory budget.
+    pub fn effective_max_rings(&self) -> usize {
+        let Some(budget) = self.runtime_settings.ring_memory_budget_bytes() else {
+            return self.max_rings;
+        };
+
+        let per_ring = RingBuffer::estimated_heap_bytes(
+            self.config.ring_capacity,
+            self.value_column_indices.len(),
+        );
+        if per_ring == 0 {
+            return 0;
+        }
+
+        self.max_rings.min(budget / per_ring)
+    }
+
+    /// Returns the latest fully closed window start for a partition, when the
+    /// partition still has an in-memory ring.
+    pub fn watermark_window_start(&self, partition_key: &[u8]) -> Option<i64> {
+        self.rings.get(partition_key).map(|ring| {
+            ring.boundary_ts()
+                .saturating_sub(self.config.interval_micros())
+        })
+    }
+
+    fn ensure_capacity_for_new_ring(&self, partition_key: &[u8]) -> bool {
+        if self.rings.contains_key(partition_key) {
+            return true;
+        }
+
+        let effective_max = self.effective_max_rings();
+        if effective_max == 0 {
+            self.record_ring_budget_rejection(partition_key);
+            return false;
+        }
+
+        if self.rings.len() >= effective_max {
+            let evicted = self.evict_cold_rings_to_limit(effective_max.saturating_sub(1));
+            if evicted == 0 && self.rings.len() >= effective_max {
+                self.record_ring_budget_rejection(partition_key);
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn record_ring_budget_rejection(&self, partition_key: &[u8]) {
+        self.ring_budget_rejections.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref m) = self.shared_metrics {
+            m.ring_budget_rejections.fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::warn!(
+            table = %self.table_id.table,
+            partition_key_len = partition_key.len(),
+            ring_capacity = self.config.ring_capacity,
+            max_rings = self.max_rings,
+            ring_memory_budget_bytes = ?self.runtime_settings.ring_memory_budget_bytes(),
+            "skipping time-series ring allocation because ring memory budget is exhausted"
+        );
+    }
+
+    fn record_ring_evictions(&self, evicted: usize) {
+        if evicted == 0 {
+            return;
+        }
+
+        let total = self
+            .ring_evictions
+            .fetch_add(evicted as u64, Ordering::Relaxed)
+            + evicted as u64;
+        if let Some(ref m) = self.shared_metrics {
+            m.ring_evictions
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+        let threshold = self.runtime_settings.ring_thrash_warn_evictions();
+        if threshold != 0 && total / threshold > (total - evicted as u64) / threshold {
+            self.ring_thrash_warnings.fetch_add(1, Ordering::Relaxed);
+            if let Some(ref m) = self.shared_metrics {
+                m.ring_thrash_warnings.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(
+                table = %self.table_id.table,
+                ring_evictions_total = total,
+                ring_count = self.rings.len(),
+                effective_max_rings = self.effective_max_rings(),
+                "time-series ring buffer eviction thrashing detected"
+            );
+        }
+    }
+
     /// Extract f64 values from a mutation row for the configured columns.
     ///
     /// Uses type-aware decoding when `column_types` is available, falling back
     /// to length-based heuristic via `decode_numeric_bytes` otherwise.
+    fn note_materialization_task_enqueued(&self, task: &ConsolidationTask) {
+        let enqueued_at_ms = now_millis();
+        let previous = self.pending_tasks.fetch_add(1, Ordering::Relaxed);
+        if previous == 0 {
+            self.oldest_task_enqueued_at_ms
+                .store(enqueued_at_ms, Ordering::Relaxed);
+            *self.oldest_task.lock() = Some(OldestQueuedTask {
+                enqueued_at_ms,
+                window_start_ts: task.window_start_ts(),
+                window_end_ts: task.window_end_ts(self.config.interval_micros()),
+                task_type: task.task_type(),
+            });
+        }
+    }
+
     fn extract_values(
         &self,
         row: &ferrosa_sstable::types::Row,
     ) -> Option<(i64, SmallVec<[f64; 8]>)> {
         let mut values = SmallVec::new();
-        let timestamp = row.primary_key_liveness.timestamp;
+        let timestamp = row_timestamp_micros(row);
         let has_types = !self.column_types.is_empty();
 
         for (i, &col_idx) in self.value_column_indices.iter().enumerate() {
@@ -180,6 +510,16 @@ impl TimeSeriesAggregator {
         }
 
         Some((timestamp, values))
+    }
+}
+
+fn row_timestamp_micros(row: &ferrosa_sstable::types::Row) -> i64 {
+    if row.clustering.len() == std::mem::size_of::<i64>() {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&row.clustering);
+        i64::from_be_bytes(bytes)
+    } else {
+        row.primary_key_liveness.timestamp
     }
 }
 
@@ -252,6 +592,10 @@ impl WriteObserver for TimeSeriesAggregator {
                 continue;
             };
 
+            if !self.ensure_capacity_for_new_ring(&partition_key) {
+                continue;
+            }
+
             // Get or create ring buffer.
             let mut ring = self.rings.entry(partition_key.clone()).or_insert_with(|| {
                 RingBuffer::new(
@@ -266,23 +610,21 @@ impl WriteObserver for TimeSeriesAggregator {
 
             match status {
                 BoundaryStatus::BoundaryCrossed => {
-                    // Copy window entries for the completed window.
                     let window_start = boundary_before - self.config.interval_micros();
-                    let window_entries = ring.window_owned(window_start, boundary_before);
-
-                    if !window_entries.is_empty() {
-                        let task = ConsolidationTask::BoundaryCrossed {
-                            table_id: self.table_id.clone(),
-                            partition_key: partition_key.clone(),
-                            window_entries,
-                            window_start_ts: window_start,
-                        };
-                        if self.task_tx.try_send(task).is_err() {
-                            self.drop_count.fetch_add(1, Ordering::Relaxed);
-                            if let Some(ref m) = self.shared_metrics {
-                                m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
-                            }
-                        } else if let Some(ref m) = self.shared_metrics {
+                    let task = ConsolidationTask::BoundaryCrossed {
+                        table_id: self.table_id.clone(),
+                        partition_key: partition_key.clone(),
+                        window_start_ts: window_start,
+                        window_end_ts: boundary_before,
+                    };
+                    if self.task_tx.try_send(task.clone()).is_err() {
+                        self.drop_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref m) = self.shared_metrics {
+                            m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        self.note_materialization_task_enqueued(&task);
+                        if let Some(ref m) = self.shared_metrics {
                             m.windows_consolidated.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -296,13 +638,16 @@ impl WriteObserver for TimeSeriesAggregator {
                         window_start_ts: window_start,
                         late_timestamp: timestamp,
                     };
-                    if self.task_tx.try_send(task).is_err() {
+                    if self.task_tx.try_send(task.clone()).is_err() {
                         self.drop_count.fetch_add(1, Ordering::Relaxed);
                         if let Some(ref m) = self.shared_metrics {
                             m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
                         }
-                    } else if let Some(ref m) = self.shared_metrics {
-                        m.late_arrivals.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.note_materialization_task_enqueued(&task);
+                        if let Some(ref m) = self.shared_metrics {
+                            m.late_arrivals.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 BoundaryStatus::Normal => {}
@@ -327,6 +672,12 @@ pub struct ConsolidationMetrics {
     pub consolidation_drops: AtomicU64,
     /// Total number of failed numeric byte decodes during value extraction.
     pub decode_failures: AtomicU64,
+    /// Total number of ring buffers evicted to stay within memory/count caps.
+    pub ring_evictions: AtomicU64,
+    /// Total number of times eviction volume crossed the configured thrash threshold.
+    pub ring_thrash_warnings: AtomicU64,
+    /// Total writes skipped because no ring could be allocated within budget.
+    pub ring_budget_rejections: AtomicU64,
 }
 
 impl ConsolidationMetrics {
@@ -342,6 +693,9 @@ impl ConsolidationMetrics {
             late_arrivals: self.late_arrivals.load(Ordering::Relaxed),
             consolidation_drops: self.consolidation_drops.load(Ordering::Relaxed),
             decode_failures: self.decode_failures.load(Ordering::Relaxed),
+            ring_evictions: self.ring_evictions.load(Ordering::Relaxed),
+            ring_thrash_warnings: self.ring_thrash_warnings.load(Ordering::Relaxed),
+            ring_budget_rejections: self.ring_budget_rejections.load(Ordering::Relaxed),
         }
     }
 }
@@ -353,6 +707,9 @@ pub struct MetricsSnapshot {
     pub late_arrivals: u64,
     pub consolidation_drops: u64,
     pub decode_failures: u64,
+    pub ring_evictions: u64,
+    pub ring_thrash_warnings: u64,
+    pub ring_budget_rejections: u64,
 }
 
 /// Async worker that processes consolidation tasks.
@@ -406,12 +763,16 @@ impl TimeSeriesAggregator {
     /// Returns the number of evicted entries. This is called by a background
     /// sweep, not on the write path.
     pub fn evict_cold_rings(&self) -> usize {
+        self.evict_cold_rings_to_limit(self.effective_max_rings())
+    }
+
+    fn evict_cold_rings_to_limit(&self, max_rings: usize) -> usize {
         let current = self.rings.len();
-        if current <= self.max_rings {
+        if current <= max_rings {
             return 0;
         }
 
-        let to_evict = current - self.max_rings;
+        let to_evict = current - max_rings;
 
         // Collect (key, last_access) pairs.
         let mut entries: Vec<(Vec<u8>, std::time::Instant)> = self
@@ -429,6 +790,7 @@ impl TimeSeriesAggregator {
             evicted += 1;
         }
 
+        self.record_ring_evictions(evicted);
         evicted
     }
 }
@@ -438,30 +800,47 @@ mod tests {
     use super::*;
     use smallvec::SmallVec;
 
+    fn make_double_mutation(partition_key: &str, ts: i64, val: f64) -> Mutation {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        Mutation {
+            mutation_id: [0x57u8; 16],
+            keyspace: "ks".to_string(),
+            table: "sensor".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(partition_key.as_bytes().to_vec())),
+            rows: vec![Row {
+                clustering: ts.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        }
+    }
+
     #[test]
     fn consolidation_task_boundary_crossed() {
         let task = ConsolidationTask::BoundaryCrossed {
             table_id: TableId::new("ks", "sensor_1s"),
             partition_key: b"sensor-1".to_vec(),
-            window_entries: vec![RingEntry {
-                timestamp: 1_000_000,
-                values: SmallVec::from_slice(&[42.0]),
-            }],
             window_start_ts: 0,
+            window_end_ts: 10_000_000,
         };
 
         if let ConsolidationTask::BoundaryCrossed {
             table_id,
             partition_key,
-            window_entries,
             window_start_ts,
+            window_end_ts,
         } = &task
         {
             assert_eq!(table_id.keyspace, "ks");
             assert_eq!(table_id.table, "sensor_1s");
             assert_eq!(partition_key, b"sensor-1");
-            assert_eq!(window_entries.len(), 1);
             assert_eq!(*window_start_ts, 0);
+            assert_eq!(*window_end_ts, 10_000_000);
         } else {
             panic!("expected BoundaryCrossed");
         }
@@ -579,11 +958,11 @@ mod tests {
         match task {
             ConsolidationTask::BoundaryCrossed {
                 window_start_ts,
-                window_entries,
+                window_end_ts,
                 ..
             } => {
                 assert_eq!(window_start_ts, 0);
-                assert!(!window_entries.is_empty());
+                assert_eq!(window_end_ts, 10_000_000);
             }
             _ => panic!("expected BoundaryCrossed"),
         }
@@ -840,6 +1219,150 @@ mod tests {
         let evicted = aggregator.evict_cold_rings();
         assert_eq!(evicted, 0);
         assert_eq!(aggregator.ring_count(), 2);
+    }
+
+    #[test]
+    fn aggregator_skips_ring_allocation_when_budget_cannot_fit_one_ring() {
+        let metrics = Arc::new(ConsolidationMetrics::new());
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ring_memory_budget_bytes: Some(1),
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator =
+            TimeSeriesAggregator::with_metrics(config, table_id.clone(), vec![0], tx, metrics);
+
+        aggregator.on_write(&table_id, &make_double_mutation("pk1", 1_000_000, 1.0));
+
+        assert_eq!(aggregator.ring_count(), 0);
+        assert_eq!(
+            aggregator
+                .metrics()
+                .unwrap()
+                .ring_budget_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn aggregator_evicts_before_allocating_above_budget_capped_ring_limit() {
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 4,
+            max_rings: 10,
+            ring_memory_budget_bytes: Some(RingBuffer::estimated_heap_bytes(4, 1) * 2),
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::new(config, table_id.clone(), vec![0], tx);
+
+        aggregator.on_write(&table_id, &make_double_mutation("pk1", 1_000_000, 1.0));
+        aggregator.on_write(&table_id, &make_double_mutation("pk2", 1_000_000, 2.0));
+        aggregator.on_write(&table_id, &make_double_mutation("pk3", 1_000_000, 3.0));
+
+        assert_eq!(aggregator.ring_count(), 2);
+        assert_eq!(aggregator.effective_max_rings(), 2);
+    }
+
+    #[test]
+    fn aggregator_counts_and_warns_when_ring_evictions_thrash() {
+        let metrics = Arc::new(ConsolidationMetrics::new());
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 4,
+            max_rings: 1,
+            ring_thrash_warn_evictions: 2,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator =
+            TimeSeriesAggregator::with_metrics(config, table_id.clone(), vec![0], tx, metrics);
+
+        aggregator.on_write(&table_id, &make_double_mutation("pk1", 1_000_000, 1.0));
+        aggregator.on_write(&table_id, &make_double_mutation("pk2", 1_000_000, 2.0));
+        aggregator.on_write(&table_id, &make_double_mutation("pk3", 1_000_000, 3.0));
+
+        let snapshot = aggregator.metrics().unwrap().snapshot();
+        assert_eq!(snapshot.ring_evictions, 2);
+        assert_eq!(snapshot.ring_thrash_warnings, 1);
+    }
+
+    #[test]
+    fn aggregator_runtime_settings_adjust_ring_budget_without_rebuild() {
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 4,
+            max_rings: 10,
+            ring_memory_budget_bytes: Some(RingBuffer::estimated_heap_bytes(4, 1)),
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::new(config, table_id, vec![0], tx);
+
+        assert_eq!(aggregator.effective_max_rings(), 1);
+
+        aggregator
+            .runtime_settings()
+            .set_ring_memory_budget_bytes(Some(RingBuffer::estimated_heap_bytes(4, 1) * 3));
+
+        assert_eq!(aggregator.effective_max_rings(), 3);
+    }
+
+    #[test]
+    fn aggregator_uses_shared_runtime_settings_handle() {
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 4,
+            max_rings: 10,
+            ..ConsolidationConfig::default()
+        };
+        let settings = Arc::new(TimeSeriesRuntimeSettings::new(
+            Some(RingBuffer::estimated_heap_bytes(4, 1)),
+            100,
+        ));
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::with_runtime_settings(
+            config,
+            table_id,
+            vec![0],
+            tx,
+            Arc::clone(&settings),
+        );
+
+        assert_eq!(aggregator.effective_max_rings(), 1);
+
+        settings.set_ring_memory_budget_bytes(Some(RingBuffer::estimated_heap_bytes(4, 1) * 4));
+
+        assert_eq!(aggregator.effective_max_rings(), 4);
     }
 
     // --- Task 14: Late data detection in on_write ---

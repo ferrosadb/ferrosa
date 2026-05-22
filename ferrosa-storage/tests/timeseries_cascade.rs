@@ -16,7 +16,7 @@ use ferrosa_storage::timeseries::aggregator::{
     ConsolidationMetrics, ConsolidationTask, ConsolidationWorker, TimeSeriesAggregator,
 };
 use ferrosa_storage::timeseries::config::ConsolidationConfig;
-use ferrosa_storage::timeseries::consolidation::{consolidate_values, ConsolidationFn};
+use ferrosa_storage::timeseries::consolidation::ConsolidationFn;
 use ferrosa_storage::TableId;
 
 fn make_mutation(table: &str, pk: &[u8], ts: i64, value: f64) -> ferrosa_storage::Mutation {
@@ -67,26 +67,12 @@ fn single_tier_consolidation_produces_task() {
     let task = rx.try_recv().expect("expected consolidation task");
     match task {
         ConsolidationTask::BoundaryCrossed {
-            window_entries,
             window_start_ts,
+            window_end_ts,
             ..
         } => {
             assert_eq!(window_start_ts, 0);
-            // Verify window entries contain the [0, 10M) data.
-            assert!(!window_entries.is_empty());
-
-            // Consolidate the window.
-            let values: Vec<f64> = window_entries.iter().map(|e| e.values[0]).collect();
-            let funcs = vec![
-                ConsolidationFn::Min,
-                ConsolidationFn::Max,
-                ConsolidationFn::Avg,
-            ];
-            let results = consolidate_values(&values, &funcs);
-
-            assert!((results[0] - 0.0).abs() < f64::EPSILON); // min
-            assert!((results[1] - 9.0).abs() < f64::EPSILON); // max
-            assert!((results[2] - 4.5).abs() < f64::EPSILON); // avg
+            assert_eq!(window_end_ts, 10_000_000);
         }
         _ => panic!("expected BoundaryCrossed"),
     }
@@ -183,15 +169,18 @@ fn worker_consolidates_window_end_to_end() {
     // Cross boundary.
     aggregator.on_write(&table_id, &make_mutation("sensor", b"s1", 10_000_000, 10.0));
 
-    // Get the task and process it through the worker.
+    // Get the task. It must describe the completed window without carrying an
+    // owned copy of all window entries; the streaming worker is responsible for
+    // reading/folding that window.
     let task = worker.task_rx().try_recv().expect("expected task");
-    if let ConsolidationTask::BoundaryCrossed { window_entries, .. } = task {
-        let results = worker.consolidate_window(&window_entries, 0);
-        assert_eq!(results.len(), 4); // min, max, avg, stddev
-        assert!((results[0] - 0.0).abs() < f64::EPSILON); // min
-        assert!((results[1] - 9.0).abs() < f64::EPSILON); // max
-        assert!((results[2] - 4.5).abs() < f64::EPSILON); // avg
-        assert!(results[3] > 0.0); // stddev > 0
+    if let ConsolidationTask::BoundaryCrossed {
+        window_start_ts,
+        window_end_ts,
+        ..
+    } = task
+    {
+        assert_eq!(window_start_ts, 0);
+        assert_eq!(window_end_ts, 10_000_000);
     } else {
         panic!("expected BoundaryCrossed");
     }

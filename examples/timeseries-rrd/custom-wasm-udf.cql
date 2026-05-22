@@ -1,68 +1,68 @@
--- RRD Cascading Time-Series Aggregation: Custom WASM UDF
+-- RRD Cascading Time-Series Aggregation: WASM Stddev UDF
 --
--- Use a WASM UDF as a consolidation function for domain-specific logic
--- that cannot be expressed with the built-in functions.
+-- Use a WASM UDF when rollup math needs a domain-specific implementation or
+-- when teams want to version their own statistical routines. This example uses
+-- a stddev UDF so min/max/avg come from built-ins while volatility comes from
+-- a deployed WASM component.
 --
--- WASM UDFs are executed after the single-pass accumulator loop, receiving
--- the full batch of values for the window.
+-- Status: WASM function DDL and artifact loading are implemented, but WASM
+-- aggregate execution is not enabled for live materialization yet. The runnable
+-- sensor demo uses the built-in streaming stddev function until the streaming
+-- WASM aggregate ABI lands.
 
-USE sensors;
+USE plant;
 
--- Step 1: Register a WASM UDF that computes the 95th percentile.
--- The WASM binary is uploaded as a blob and referenced by name.
-CREATE FUNCTION sensors.percentile_95 (values list<double>)
-  RETURNS NULL ON NULL INPUT
+-- Inline hex loading form. Replace these tiny placeholder bytes with the
+-- compiled Component Model module that exports stddev(values: list<double>).
+CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
+  CALLED ON NULL INPUT
   RETURNS double
   LANGUAGE wasm
-  AS 'percentile_95.wasm';
+  AS '0x0061736d0d000100';
 
--- Step 2: Create a table with the WASM UDF as consolidation function.
--- The 'wasm:keyspace.function_name' syntax invokes the WASM UDF.
-CREATE TABLE api_latency (
-    endpoint text,
+-- Admin-only file loading form for pre-approved local artifacts.
+CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
+  CALLED ON NULL INPUT
+  RETURNS double
+  LANGUAGE wasm
+  AS FILE '/secure/udf/stddev.wasm';
+
+-- Admin-only URL loading form. Ferrosa verifies the fetched bytes against the
+-- required SHA-256 digest before storing the function metadata.
+CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
+  CALLED ON NULL INPUT
+  RETURNS double
+  LANGUAGE wasm
+  AS URL 'https://artifacts.example/ferrosa/stddev.wasm'
+  WITH SHA256 = '3dbe4f6fb3f44dfb11ad93f6c07f81a4b34d217f8dcf7dd06d80670d88e6b7c1';
+
+-- Future table syntax will reference the UDF through the
+-- wasm:keyspace.function_name consolidation function syntax. Current releases
+-- reject this CREATE TABLE with a clear "streaming WASM aggregate ABI" error
+-- because live RRD materialization cannot execute list-style WASM aggregates
+-- without materializing the whole window.
+CREATE TABLE vibration_with_wasm_stddev (
+    sensor_id uuid,
     ts timestamp,
-    latency_ms double,
-    PRIMARY KEY (endpoint, ts)
+    vibration_mm_s double,
+    PRIMARY KEY (sensor_id, ts)
 ) WITH CLUSTERING ORDER BY (ts DESC)
   AND extensions = {
     'consolidation.interval': '5m',
-    'consolidation.functions': 'avg,median,wasm:sensors.percentile_95',
-    'consolidation.target': 'api_latency_5m',
-    'consolidation.columns': 'latency_ms'
+    'consolidation.functions': 'min,max,avg,wasm:plant.stddev',
+    'consolidation.target': 'vibration_with_wasm_stddev_5m',
+    'consolidation.columns': 'vibration_mm_s'
   };
 
--- Output table api_latency_5m will have columns:
---   latency_ms_avg              double   (built-in avg)
---   latency_ms_median           double   (built-in median)
---   latency_ms_percentile_95    double   (from WASM UDF)
+-- Once the streaming ABI exists, output table vibration_with_wasm_stddev_5m
+-- will have columns:
+--   vibration_mm_s_min       double   (built-in min)
+--   vibration_mm_s_max       double   (built-in max)
+--   vibration_mm_s_avg       double   (built-in avg)
+--   vibration_mm_s_stddev    double   (from WASM UDF)
 
--- Sample data: mixed latency distribution.
-INSERT INTO api_latency (endpoint, ts, latency_ms)
-  VALUES ('/api/users', '2026-03-20 00:00:01', 12.0);
-INSERT INTO api_latency (endpoint, ts, latency_ms)
-  VALUES ('/api/users', '2026-03-20 00:00:02', 15.0);
-INSERT INTO api_latency (endpoint, ts, latency_ms)
-  VALUES ('/api/users', '2026-03-20 00:00:03', 11.0);
-INSERT INTO api_latency (endpoint, ts, latency_ms)
-  VALUES ('/api/users', '2026-03-20 00:00:04', 200.0);
-INSERT INTO api_latency (endpoint, ts, latency_ms)
-  VALUES ('/api/users', '2026-03-20 00:00:05', 14.0);
-
--- Query the consolidated results.
-SELECT endpoint, ts,
-       latency_ms_avg,
-       latency_ms_median,
-       latency_ms_percentile_95
-  FROM api_latency_5m
-  WHERE endpoint = '/api/users'
-  LIMIT 10;
-
--- Example WASM UDF source (Rust, compiled to wasm32-wasi):
+-- Sketch of the exported function:
 --
---   #[no_mangle]
---   pub extern "C" fn percentile_95(values: &[f64]) -> f64 {
---       let mut sorted = values.to_vec();
---       sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
---       let idx = ((sorted.len() as f64) * 0.95).ceil() as usize - 1;
---       sorted[idx.min(sorted.len() - 1)]
+--   export fn stddev(values: list<float64>) -> float64 {
+--       // Population standard deviation over the values in a rollup window.
 --   }
