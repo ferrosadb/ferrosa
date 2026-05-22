@@ -18,9 +18,11 @@ use indexmap::IndexMap;
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::pair::ddl::DdlOperation;
+use ferrosa_cluster::system_table_writer::SystemTableWriter;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
+use ferrosa_schema::system::persistence::SystemTableMutation;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
     query_role_members, query_role_permissions, query_tables, AuthContext,
@@ -5344,8 +5346,15 @@ async fn route_grant(
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
-        DdlPath::Direct { .. } => {
+        DdlPath::Direct { engine, .. } => {
+            let entry = GrantEntry {
+                role: s.role.clone(),
+                resource: resource.clone(),
+                permissions: perms.clone(),
+            };
             state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
+            SystemTableWriter::new(Arc::clone(engine))
+                .apply(SystemTableMutation::GrantUpdated(entry))?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::Grant(GrantEntry {
@@ -5391,8 +5400,18 @@ async fn route_revoke(
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
-        DdlPath::Direct { .. } => {
-            state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
+        DdlPath::Direct { engine, .. } => {
+            state
+                .schema
+                .revoke(&s.role, &resource, perms.clone(), ctx.auth)?;
+            let writer = SystemTableWriter::new(Arc::clone(engine));
+            for perm in perms {
+                writer.apply(SystemTableMutation::PermissionRevoked {
+                    role: s.role.clone(),
+                    resource: resource.clone(),
+                    permission: perm,
+                })?;
+            }
         }
         DdlPath::Pair(coordinator) => {
             // DdlOperation::Revoke carries one permission at a time; emit one
@@ -7768,6 +7787,7 @@ mod tests {
             memtable_num_shards: 64,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        engine.register_system_tables().unwrap();
 
         let schema = Arc::new(
             Schema::new(SchemaConfig {
@@ -13813,6 +13833,63 @@ mod tests {
             result.is_ok(),
             "GRANT SELECT ON TABLE should succeed: {:?}",
             result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_grant_persists_role_permissions_row() {
+        let (state, _dir) = setup();
+        state
+            .engine
+            .register_system_tables()
+            .expect("system_auth tables should register");
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE grks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE grks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE ROLE gr_user WITH PASSWORD = 'pass' AND LOGIN = true")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("GRANT SELECT ON grks.t TO gr_user").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let tid = ferrosa_storage::TableId::new("system_auth", "role_permissions");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"gr_user".to_vec(),
+        ));
+        let partition = state
+            .engine
+            .read(&tid, &key)
+            .expect("system_auth.role_permissions read should succeed")
+            .expect("GRANT must persist a role_permissions partition");
+
+        assert!(
+            partition
+                .rows
+                .iter()
+                .any(|row| row.clustering == b"table grks.t"
+                    && row
+                        .cells
+                        .iter()
+                        .any(|(_, cell)| cell.value.as_deref().is_some_and(|bytes| bytes
+                            .windows(b"SELECT".len())
+                            .any(|window| window == b"SELECT")))),
+            "GRANT must persist SELECT on table grks.t for gr_user"
         );
     }
 
