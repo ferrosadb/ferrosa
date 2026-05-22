@@ -7,7 +7,7 @@
 //! 4. Create Schema
 //! 5. Create ModeController (standalone WritePath + ClusterState)
 //! 6. Create PeerManager + RPC handlers + heartbeat loop
-//! 7. Start internode RPC server (port 7000)
+//! 7. Start internode RPC server (port 17000)
 //! 8. Start CQL server (port 9042)
 //! 9. Start web observability console (port 9090)
 //! 10. Create GraphEngine + HTTP server (if enabled)
