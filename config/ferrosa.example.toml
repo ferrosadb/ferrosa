@@ -16,7 +16,8 @@
 # ---------------------------------------------------------------------------
 [cql]
 bind = "127.0.0.1:9042"
-auth_disabled = false           # CQL role auth: false = enforce passwords
+auth_enabled = true             # CQL role auth: true = enforce passwords (preferred)
+# auth_disabled = false         # DEPRECATED — use auth_enabled above. See BUG-006.
 max_connections = 1024
 max_connections_per_ip = 64
 # tls_cert = "~/.ferrosa/config/tls/server.crt"
@@ -26,12 +27,15 @@ max_connections_per_ip = 64
 # ---------------------------------------------------------------------------
 # Internode RPC — used by multi-node clusters. A single-node install never
 # accepts inbound peers, but ferrosa-net still binds the listener at startup.
+# Port 17000 (not the historical Cassandra default 7000) avoids the
+# macOS ControlCenter clash that crashes ferrosa on fresh macOS installs
+# — see BUG-001.
 # ---------------------------------------------------------------------------
 [internode]
-bind          = "127.0.0.1:7000"
+bind          = "127.0.0.1:17000"
 cluster_name  = "ferrosa"
-# broadcast = "127.0.0.1:7000"   # advertised to peers; only matters in clusters
-# seed      = "10.0.0.2:7000"    # comma-separated list of seed peers
+# broadcast = "127.0.0.1:17000"  # advertised to peers; only matters in clusters
+# seed      = "10.0.0.2:17000"   # comma-separated list of seed peers
 # psk       = "shared-secret"    # pre-shared key for internode auth
 
 # ---------------------------------------------------------------------------
@@ -60,8 +64,9 @@ commit_log_segment_size  = 33554432   # 32 MiB
 # allow_http = false
 
 # ---------------------------------------------------------------------------
-# Graph engine (Cypher / Bolt). Disabled by default; flip `enabled` and set
-# FERROSA_GRAPH_ENABLED=true in the service unit's Environment to start it.
+# Graph engine (Cypher / Bolt). Disabled by default; flip `enabled` here OR
+# set FERROSA_GRAPH_ENABLED=true (env var wins). BUG-006 fixed: this field
+# was previously silently ignored unless the env var was also set.
 # ---------------------------------------------------------------------------
 [graph]
 enabled   = false
@@ -79,10 +84,10 @@ bind = "127.0.0.1:9090"
 # ---------------------------------------------------------------------------
 # Auth notes
 # ---------------------------------------------------------------------------
-# Auth is enabled by setting cql.auth_disabled = false (above) AND the
-# environment variable FERROSA_AUTH_ENABLED=true (set by the service unit).
+# Auth is enabled by `cql.auth_enabled = true` above. FERROSA_AUTH_ENABLED
+# may still override it when set by an operator or service unit.
 #
 # Roles and password hashes are stored INSIDE ferrosa, in the system_auth
 # keyspace (Cassandra-compatible) — there is NO external auth.yaml file.
-# install.sh seeds the default `cassandra` superuser; rotate that password
-# on first login via `ALTER ROLE cassandra WITH PASSWORD = '...'`.
+# install.sh seeds the default `ferrosa_admin` superuser; rotate that password
+# on first login via `ALTER ROLE ferrosa_admin WITH PASSWORD = '...'`.

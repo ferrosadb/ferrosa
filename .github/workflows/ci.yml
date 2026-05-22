@@ -170,7 +170,7 @@ jobs:
           FROM debian:trixie-slim
           RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
           COPY ferrosa /usr/local/bin/
-          EXPOSE 9042 7000 9090
+          EXPOSE 9042 17000 9090
           ENV FERROSA_DATA_DIR=/var/lib/ferrosa
           CMD ["ferrosa"]
           DEOF
@@ -187,8 +187,8 @@ jobs:
               environment:
                 RUSTFS_VOLUMES: /data/rustfs0
                 RUSTFS_ADDRESS: "0.0.0.0:9000"
-                RUSTFS_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
-                RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret  # noqa
+                RUSTFS_ACCESS_KEY: ferrosa_ci_access_key  # pragma: allowlist secret
+                RUSTFS_SECRET_KEY: ferrosa_ci_secret_key  # pragma: allowlist secret  # noqa
               healthcheck:
                 test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
                 interval: 5s
@@ -201,7 +201,7 @@ jobs:
                 rustfs:
                   condition: service_healthy
               entrypoint: >
-                sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+                sh -c "mc alias set local http://rustfs:9000 ferrosa_ci_access_key ferrosa_ci_secret_key &&
                        mc mb local/ferrosa-test --ignore-existing &&
                        echo 'bucket ready'"
               restart: "no"
@@ -223,8 +223,8 @@ jobs:
                 FERROSA_S3_ENDPOINT: "http://rustfs:9000"
                 FERROSA_S3_BUCKET: "ferrosa-test"
                 FERROSA_S3_ALLOW_HTTP: "true"
-                FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
-                FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+                FERROSA_S3_ACCESS_KEY_ID: "ferrosa_ci_access_key"
+                FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa_ci_secret_key"  # pragma: allowlist secret
           CEOF
           docker compose -f /tmp/docker-compose.ci.yml up -d
 

@@ -12,9 +12,9 @@ max_connections_per_ip = 64
 # require_tls = false
 
 [internode]
-bind = "0.0.0.0:7000"
-# broadcast = "192.168.1.1:7000"
-# seed = "192.168.1.2:7000"
+bind = "0.0.0.0:17000"
+# broadcast = "192.168.1.1:17000"
+# seed = "192.168.1.2:17000"
 cluster_name = "ferrosa"
 # psk = "shared-secret-key"
 

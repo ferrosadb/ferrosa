@@ -142,7 +142,11 @@ impl RpcServer {
                         server.accept_loop(listener, tls_acceptor).await;
                     }
                     Err(e) => {
-                        tracing::error!(%e, "failed to bind internode server");
+                        // Surface BUG-001-style guidance: a port-7000 EADDRINUSE
+                        // on macOS is almost certainly ControlCenter, not user
+                        // contention. The diagnostic prints the actionable fix.
+                        let diag = crate::error::bind_failure_diagnostic(&bind_addr, &e);
+                        tracing::error!(diag = %diag, %e, "failed to bind internode server");
                         // Notify the waiting caller so it doesn't hang forever.
                         if bound_addr_tx.send(None).is_err() {
                             tracing::error!(
@@ -165,7 +169,14 @@ impl RpcServer {
                 )),
             }
         } else {
-            let listener = TcpListener::bind(bind_addr).await?;
+            let listener = match TcpListener::bind(bind_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    let diag = crate::error::bind_failure_diagnostic(&bind_addr, &e);
+                    tracing::error!(diag = %diag, %e, "failed to bind internode server");
+                    return Err(NetError::Io(e));
+                }
+            };
             let addr = listener.local_addr()?;
             // No external waiter on this branch — bound_addr is updated for any
             // future subscribers and to keep the watch state coherent. If the
