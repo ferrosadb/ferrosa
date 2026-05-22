@@ -4746,7 +4746,7 @@ fn create_cascade_tables_if_needed(
             let fn_str: String = config
                 .functions
                 .iter()
-                .filter_map(|f| consolidation_fn_name(f))
+                .filter_map(consolidation_fn_name)
                 .collect::<Vec<_>>()
                 .join(",");
             extensions.insert("consolidation.functions".to_string(), fn_str);

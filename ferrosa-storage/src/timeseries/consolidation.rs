@@ -528,7 +528,7 @@ mod tests {
         let mut emitted = [0.0; 3];
         let mut emitted_len = 0;
 
-        emit_streaming_results(values.into_iter(), &functions, |value| {
+        emit_streaming_results(values, &functions, |value| {
             emitted[emitted_len] = value;
             emitted_len += 1;
         })
@@ -542,14 +542,10 @@ mod tests {
     fn streaming_consolidation_rejects_non_streaming_functions() {
         let mut emitted = [0.0; 1];
         let mut emitted_len = 0;
-        let err = emit_streaming_results(
-            [1.0, 2.0].into_iter(),
-            &[ConsolidationFn::Median],
-            |value| {
-                emitted[emitted_len] = value;
-                emitted_len += 1;
-            },
-        )
+        let err = emit_streaming_results([1.0, 2.0], &[ConsolidationFn::Median], |value| {
+            emitted[emitted_len] = value;
+            emitted_len += 1;
+        })
         .unwrap_err();
 
         assert!(matches!(

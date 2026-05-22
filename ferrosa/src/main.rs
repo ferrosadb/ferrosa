@@ -1142,6 +1142,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schema.clone(),
         ),
     ));
+    let materialization_provider =
+        Arc::new(ferrosa_cql::virtual_tables::StorageMaterializationProvider::new(storage.clone()));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::MaterializationQueuesTable::new(
+            materialization_provider.clone(),
+        ),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::MaterializationStatusTable::new(materialization_provider),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::RrdRuntimeSettingsTable::new(
+            storage.time_series_runtime_settings(),
+        ),
+    ));
     // Storage-backed virtual tables: StorageEngine implements the provider traits.
     schema.virtual_tables().register(Arc::new(
         ferrosa_storage::virtual_tables::StorageStatsTable::new(storage.clone()),

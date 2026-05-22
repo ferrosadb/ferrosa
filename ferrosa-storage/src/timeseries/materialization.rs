@@ -179,7 +179,10 @@ impl MaterializationQueue {
         }
     }
 
-    pub fn enqueue(&self, request: MaterializationRequest) -> Result<(), MaterializationRequest> {
+    pub fn enqueue(
+        &self,
+        request: MaterializationRequest,
+    ) -> Result<(), Box<MaterializationRequest>> {
         match self.tx.try_send(request) {
             Ok(()) => {
                 self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
@@ -188,7 +191,7 @@ impl MaterializationQueue {
             }
             Err(TrySendError::Full(request)) | Err(TrySendError::Disconnected(request)) => {
                 self.metrics.dropped_full.fetch_add(1, Ordering::Relaxed);
-                Err(request)
+                Err(Box::new(request))
             }
         }
     }

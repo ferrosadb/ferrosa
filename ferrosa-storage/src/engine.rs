@@ -38,6 +38,7 @@ use crate::store::TableStore;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
 use crate::timeseries::{
     ConsolidationTask, MaterializationTarget, MaterializedRollup, TimeSeriesAggregator,
+    TimeSeriesRuntimeSettings,
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
@@ -493,6 +494,7 @@ pub struct StorageEngine {
     observers: RwLock<Vec<Arc<dyn crate::observer::WriteObserver>>>,
     async_observers: RwLock<Vec<AsyncObserverState>>,
     time_series_consolidators: RwLock<HashMap<TableId, TimeSeriesConsolidatorHandle>>,
+    time_series_runtime_settings: Arc<TimeSeriesRuntimeSettings>,
     /// Default channel capacity for async observers.
     async_observer_capacity: usize,
     /// Index build scheduler — rebuilds secondary indexes after compaction.
@@ -652,6 +654,9 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -793,6 +798,9 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -915,6 +923,9 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -1813,6 +1824,11 @@ impl StorageEngine {
             .map(|handle| handle.aggregator.ring_count())
     }
 
+    /// Returns runtime-adjustable process-wide controls for RRD/time-series materialization.
+    pub fn time_series_runtime_settings(&self) -> Arc<TimeSeriesRuntimeSettings> {
+        Arc::clone(&self.time_series_runtime_settings)
+    }
+
     /// Visits rows in one partition and time window for a registered table.
     pub fn visit_time_series_window_rows<Cb>(
         &self,
@@ -1981,7 +1997,7 @@ impl StorageEngine {
                 partition_key,
                 window_start_ts,
             }
-            .encode_mutation_from_results_at(results.into_iter(), write_timestamp)
+            .encode_mutation_from_results_at(results, write_timestamp)
         };
 
         let target_table_id = TableId::new(&mutation.keyspace, &mutation.table);
@@ -2146,13 +2162,16 @@ impl StorageEngine {
             functions: config.functions.clone(),
         };
         let source_column_count = value_column_indices.len();
-        let aggregator = Arc::new(TimeSeriesAggregator::with_column_types(
-            config,
-            table_id.clone(),
-            value_column_indices,
-            column_types,
-            task_tx,
-        ));
+        let aggregator = Arc::new(
+            TimeSeriesAggregator::with_column_types_and_runtime_settings(
+                config,
+                table_id.clone(),
+                value_column_indices,
+                column_types,
+                task_tx,
+                Arc::clone(&self.time_series_runtime_settings),
+            ),
+        );
         let observer: Arc<dyn crate::observer::WriteObserver> = aggregator.clone();
 
         Ok(Some(TimeSeriesConsolidatorHandle {
@@ -4586,6 +4605,9 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             time_series_consolidators: RwLock::new(HashMap::new()),
+            time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
+                &ConsolidationConfig::default(),
+            )),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,

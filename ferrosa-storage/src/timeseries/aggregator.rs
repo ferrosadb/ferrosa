@@ -188,6 +188,31 @@ impl TimeSeriesAggregator {
         agg
     }
 
+    /// Create a new aggregator with CQL column type metadata and shared runtime settings.
+    pub fn with_column_types_and_runtime_settings(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        column_types: Vec<String>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+        runtime_settings: Arc<TimeSeriesRuntimeSettings>,
+    ) -> Self {
+        assert_eq!(
+            value_column_indices.len(),
+            column_types.len(),
+            "column_types must match value_column_indices length"
+        );
+        let mut agg = Self::with_runtime_settings(
+            config,
+            table_id,
+            value_column_indices,
+            task_tx,
+            runtime_settings,
+        );
+        agg.column_types = column_types;
+        agg
+    }
+
     /// Create a new aggregator with externally managed shared metrics.
     pub fn with_metrics(
         config: ConsolidationConfig,
