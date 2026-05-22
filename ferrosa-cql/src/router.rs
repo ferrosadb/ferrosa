@@ -7787,6 +7787,7 @@ mod tests {
             memtable_num_shards: 64,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        engine.register_system_tables().unwrap();
 
         let schema = Arc::new(
             Schema::new(SchemaConfig {
