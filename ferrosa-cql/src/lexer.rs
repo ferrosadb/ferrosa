@@ -778,6 +778,38 @@ impl<'input> Lexer<'input> {
             self.pos += 1;
         }
 
+        if self.pos < self.bytes.len()
+            && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E')
+        {
+            let mut exponent_end = self.pos + 1;
+            if exponent_end < self.bytes.len()
+                && (self.bytes[exponent_end] == b'+' || self.bytes[exponent_end] == b'-')
+            {
+                exponent_end += 1;
+            }
+            let digit_start = exponent_end;
+            while exponent_end < self.bytes.len() && self.bytes[exponent_end].is_ascii_digit() {
+                exponent_end += 1;
+            }
+            if exponent_end > digit_start && self.has_numeric_literal_boundary(exponent_end) {
+                let text = &self.input[start..exponent_end];
+                let looks_like_uuid_prefix = text.len() == 8
+                    && text.bytes().all(|b| b.is_ascii_hexdigit())
+                    && exponent_end < self.bytes.len()
+                    && self.bytes[exponent_end] == b'-';
+                if !looks_like_uuid_prefix {
+                    self.pos = exponent_end;
+                    let value: f64 = text.parse().map_err(|_| {
+                        CqlError::SyntaxError(format!("invalid float literal: {}", text))
+                    })?;
+                    return Ok(Token {
+                        kind: TokenKind::FloatLiteral(value),
+                        pos: start,
+                    });
+                }
+            }
+        }
+
         // If the next character is a letter or underscore, this is not a
         // pure number — it could be a UUID or a hex-prefixed identifier.
         // Read the full alphanumeric word and check for UUID.
@@ -838,7 +870,9 @@ impl<'input> Lexer<'input> {
             self.pos = saved_pos;
         }
 
-        // Check for decimal point → float
+        let mut is_float = false;
+
+        // Check for decimal point.
         if self.pos < self.bytes.len()
             && self.bytes[self.pos] == b'.'
             && self.pos + 1 < self.bytes.len()
@@ -848,6 +882,44 @@ impl<'input> Lexer<'input> {
             while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
+            is_float = true;
+        }
+
+        // CQL accepts standard scientific notation for floating-point
+        // literals. Avoid stealing UUID prefixes like `550e8400-...`: that
+        // shape is eight hex digits followed by a dash, so leave it for the
+        // UUID path above.
+        if self.pos < self.bytes.len()
+            && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E')
+        {
+            let exponent_start = self.pos;
+            let mut exponent_end = self.pos + 1;
+            if exponent_end < self.bytes.len()
+                && (self.bytes[exponent_end] == b'+' || self.bytes[exponent_end] == b'-')
+            {
+                exponent_end += 1;
+            }
+            let digit_start = exponent_end;
+            while exponent_end < self.bytes.len() && self.bytes[exponent_end].is_ascii_digit() {
+                exponent_end += 1;
+            }
+
+            if exponent_end > digit_start && self.has_numeric_literal_boundary(exponent_end) {
+                let text = &self.input[start..exponent_end];
+                let looks_like_uuid_prefix = text.len() == 8
+                    && text.bytes().all(|b| b.is_ascii_hexdigit())
+                    && exponent_end < self.bytes.len()
+                    && self.bytes[exponent_end] == b'-';
+                if !looks_like_uuid_prefix {
+                    self.pos = exponent_end;
+                    is_float = true;
+                } else {
+                    self.pos = exponent_start;
+                }
+            }
+        }
+
+        if is_float {
             let text = &self.input[start..self.pos];
             let value: f64 = text
                 .parse()
@@ -878,6 +950,12 @@ impl<'input> Lexer<'input> {
                 )))
             }
         }
+    }
+
+    fn has_numeric_literal_boundary(&self, pos: usize) -> bool {
+        self.bytes
+            .get(pos)
+            .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'-')
     }
 
     /// Read a string literal: `'hello'` with `''` escape.
@@ -1056,10 +1134,41 @@ mod tests {
     }
 
     #[test]
+    fn lex_scientific_float_literals() {
+        let tokens = lex_all("1.23456789e-05 9.87654321e-01 1e3 2E+4");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::FloatLiteral(1.23456789e-05),
+                TokenKind::FloatLiteral(9.87654321e-01),
+                TokenKind::FloatLiteral(1e3),
+                TokenKind::FloatLiteral(2E+4),
+            ]
+        );
+    }
+
+    #[test]
     fn lex_uuid() {
         let tokens = lex_all("550e8400-e29b-41d4-a716-446655440000");
         let expected_uuid: uuid::Uuid = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
         assert_eq!(tokens, vec![TokenKind::UuidLiteral(expected_uuid)]);
+    }
+
+    #[test]
+    fn lex_uuid_with_exponent_like_prefixes() {
+        let tokens = lex_all(
+            "6792702e-2a9c-4465-ba65-ba100b5aaafa \
+             909e2671-aea0-534a-83bc-bb5efc544b0f",
+        );
+        let first: uuid::Uuid = "6792702e-2a9c-4465-ba65-ba100b5aaafa".parse().unwrap();
+        let second: uuid::Uuid = "909e2671-aea0-534a-83bc-bb5efc544b0f".parse().unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::UuidLiteral(first),
+                TokenKind::UuidLiteral(second)
+            ]
+        );
     }
 
     #[test]

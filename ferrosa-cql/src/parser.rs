@@ -69,6 +69,7 @@ fn statement_type_name(stmt: &Statement) -> &'static str {
         Statement::Revoke(_) => "REVOKE",
         Statement::Use(_) => "USE",
         Statement::Truncate(_) => "TRUNCATE",
+        Statement::Compact(_) => "COMPACT",
         Statement::CreateIndex(_) => "CREATE_INDEX",
         Statement::DropIndex(_) => "DROP_INDEX",
         _ => "OTHER",
@@ -123,6 +124,7 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Commit) => self.parse_commit(),
             TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback(),
             TokenKind::Keyword(Keyword::Truncate) => self.parse_truncate().map(Statement::Truncate),
+            TokenKind::Keyword(Keyword::Compact) => self.parse_compact().map(Statement::Compact),
             TokenKind::Keyword(Keyword::Grant) => self.parse_grant().map(Statement::Grant),
             TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
             TokenKind::Keyword(Keyword::Subscribe) => self.parse_subscribe(),
@@ -1635,6 +1637,17 @@ impl<'input> Parser<'input> {
     }
 
     // ---------------------------------------------------------------
+    // COMPACT
+    // ---------------------------------------------------------------
+
+    fn parse_compact(&mut self) -> Result<CompactStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Compact))?;
+        self.lexer.eat(&TokenKind::Keyword(Keyword::Table))?;
+        let (keyspace, table) = self.parse_table_ref()?;
+        Ok(CompactStatement { keyspace, table })
+    }
+
+    // ---------------------------------------------------------------
     // GRANT / REVOKE
     // ---------------------------------------------------------------
 
@@ -2905,6 +2918,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_scientific_float_values_in_list_literal() {
+        let stmt = parse(
+            "INSERT INTO entity_embeddings (tenant_id, entity_id, embedding) \
+             VALUES (11111111-1111-1111-1111-111111111111, \
+                     22222222-2222-2222-2222-222222222222, \
+                     [1.23456789e-05, 9.87654321e-01])",
+        )
+        .unwrap();
+
+        match stmt {
+            Statement::Insert(s) => {
+                assert_eq!(
+                    s.values[2],
+                    Term::ListLiteral(vec![
+                        Term::FloatLiteral(1.23456789e-05),
+                        Term::FloatLiteral(9.87654321e-01),
+                    ])
+                );
+            }
+            other => panic!("expected Insert, got {:?}", other),
+        }
+    }
+
     // ---------------------------------------------------------------
     // DDL tests
     // ---------------------------------------------------------------
@@ -3153,6 +3190,18 @@ mod tests {
                 assert!(s.keyspace.is_none());
             }
             other => panic!("expected Truncate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_compact_table_statement() {
+        let stmt = parse("COMPACT agent_memory.entity_store").unwrap();
+        match stmt {
+            Statement::Compact(s) => {
+                assert_eq!(s.keyspace.as_deref(), Some("agent_memory"));
+                assert_eq!(s.table, "entity_store");
+            }
+            other => panic!("expected Compact, got {:?}", other),
         }
     }
 

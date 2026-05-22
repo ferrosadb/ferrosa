@@ -36,6 +36,7 @@ pub enum Statement {
     Revoke(RevokeStatement),
     Use(UseStatement),
     Truncate(TruncateStatement),
+    Compact(CompactStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
     CreateType {
@@ -143,6 +144,7 @@ impl Statement {
                 | Statement::CreateAggregate { .. }
                 | Statement::DropAggregate { .. }
                 | Statement::Truncate(_)
+                | Statement::Compact(_)
         )
     }
 }
@@ -482,6 +484,12 @@ pub struct UseStatement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateStatement {
+    pub keyspace: Option<String>,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactStatement {
     pub keyspace: Option<String>,
     pub table: String,
 }
