@@ -751,7 +751,8 @@ pub async fn route(
         | Statement::DropFunction { .. }
         | Statement::CreateAggregate { .. }
         | Statement::DropAggregate { .. }
-        | Statement::Truncate(_) => CqlOpcode::Ddl,
+        | Statement::Truncate(_)
+        | Statement::Compact(_) => CqlOpcode::Ddl,
         _ => CqlOpcode::Other,
     };
 
@@ -834,6 +835,7 @@ pub async fn route(
             Ok(RouteResult::SetKeyspace(u.keyspace, body))
         }
         Statement::Truncate(t) => route_truncate(state, ctx, t).await.map(RouteResult::Result),
+        Statement::Compact(c) => route_compact(state, ctx, c).await.map(RouteResult::Result),
         Statement::CreateIndex(ci) => route_create_index(state, ctx, ci)
             .await
             .map(RouteResult::Result),
@@ -5569,6 +5571,18 @@ async fn route_truncate(
     Ok(result::encode_void())
 }
 
+async fn route_compact(
+    _state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: CompactStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+    Err(CqlError::Invalid(format!(
+        "COMPACT is not supported for {ks}.{}; manual SSTable compaction is not implemented",
+        s.table
+    )))
+}
+
 // ── Helper functions ─────────────────────────────────────────────────────
 
 /// Resolve an explicit keyspace or fall back to the session's current keyspace.
@@ -9223,6 +9237,30 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    #[tokio::test]
+    async fn compact_returns_clear_unsupported_error() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse("COMPACT ks.t").unwrap();
+        let err = match route(&state, &ctx, stmt).await {
+            Ok(_) => panic!("COMPACT should return an unsupported error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, CqlError::Invalid(ref message) if message.contains("COMPACT is not supported for ks.t")),
+            "expected clear COMPACT unsupported error, got {err:?}"
+        );
     }
 
     #[tokio::test]
