@@ -7,7 +7,7 @@
 //! 4. Create Schema
 //! 5. Create ModeController (standalone WritePath + ClusterState)
 //! 6. Create PeerManager + RPC handlers + heartbeat loop
-//! 7. Start internode RPC server (port 7000)
+//! 7. Start internode RPC server (port 17000)
 //! 8. Start CQL server (port 9042)
 //! 9. Start web observability console (port 9090)
 //! 10. Create GraphEngine + HTTP server (if enabled)
@@ -88,6 +88,95 @@ fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str)
         .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
 }
 
+/// Apply TOML `[internode]` overrides to a `NetConfig`.
+///
+/// The env-var-then-TOML precedence already exists for storage / cql /
+/// graph fields via [`config_val`]; this helper closes BUG-006 for the
+/// internode subsystem, which previously read *only* env vars. Env var
+/// wins if set (i.e. `FERROSA_INTERNODE_BIND`); otherwise the TOML
+/// value is applied. Parse failures are logged but never fatal.
+///
+/// Generic over the env lookup so tests can drive the path without
+/// touching process-global environment.
+fn apply_internode_toml_overrides<F>(
+    cfg: &mut ferrosa_net::config::NetConfig,
+    file_config: &toml::Value,
+    env: F,
+) where
+    F: Fn(&str) -> Option<String>,
+{
+    let internode = match file_config.get("internode") {
+        Some(t) => t,
+        None => return,
+    };
+
+    if env("FERROSA_INTERNODE_BIND").is_none() {
+        if let Some(v) = internode.get("bind").and_then(|v| v.as_str()) {
+            match v.parse() {
+                Ok(addr) => cfg.bind_addr = addr,
+                Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].bind"),
+            }
+        }
+    }
+    if env("FERROSA_INTERNODE_BROADCAST").is_none() {
+        if let Some(v) = internode.get("broadcast").and_then(|v| v.as_str()) {
+            match v.parse() {
+                Ok(addr) => cfg.broadcast_addr = addr,
+                Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].broadcast"),
+            }
+        }
+    }
+    if env("FERROSA_CLUSTER_NAME").is_none() {
+        if let Some(v) = internode.get("cluster_name").and_then(|v| v.as_str()) {
+            cfg.cluster_name = v.to_string();
+        }
+    }
+    if env("FERROSA_INTERNODE_PSK").is_none() {
+        if let Some(v) = internode.get("psk").and_then(|v| v.as_str()) {
+            cfg.psk = Some(v.to_string());
+        }
+    }
+}
+
+/// Resolve the graph-enabled flag honouring TOML when the env var is unset.
+///
+/// Previously the binary only read `FERROSA_GRAPH_ENABLED`, so a user
+/// who set `[graph] enabled = true` in TOML saw the graph engine stay
+/// silently off — BUG-006.
+fn resolve_graph_enabled<F>(file_config: &toml::Value, env: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(v) = env("FERROSA_GRAPH_ENABLED") {
+        return v == "true" || v == "1";
+    }
+    file_config
+        .get("graph")
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Resolve the auth-enabled flag honouring TOML when the env var is unset.
+///
+/// BUG-006: `[cql] auth_enabled = true` in TOML was silently ignored;
+/// only `FERROSA_AUTH_ENABLED=true` activated the authenticator. Returns
+/// `Some(true|false)` when the operator made an explicit choice in
+/// either place, `None` when they did not (so downstream resolution can
+/// fall back to the storage default).
+fn resolve_auth_enabled_toml<F>(file_config: &toml::Value, env: F) -> Option<bool>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(v) = env("FERROSA_AUTH_ENABLED") {
+        return Some(v == "true" || v == "1");
+    }
+    file_config
+        .get("cql")
+        .and_then(|s| s.get("auth_enabled"))
+        .and_then(|v| v.as_bool())
+}
+
 /// Load TOML configuration from disk. Returns an empty table if the file does not exist.
 fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     if std::path::Path::new(path).exists() {
@@ -117,6 +206,73 @@ fn resolve_hinted_handoff_dir(
         .unwrap_or_else(|| data_dir.join("hints"))
 }
 
+/// Outcome of classifying the on-disk host_id state.
+///
+/// Extracted from [`load_or_generate_host_id_with`] so the decision
+/// logic is unit-testable without touching disk or env. Each variant
+/// carries enough context for the call site to emit a precise, actionable
+/// diagnostic (BUG-008: previously a stale/corrupt host_id was silently
+/// regenerated, leaving the operator with no breadcrumb).
+#[derive(Debug, Clone, PartialEq)]
+enum HostIdResolution {
+    /// Disk had a parseable UUID — use as-is.
+    LoadedFromDisk(Uuid),
+    /// Operator-supplied override (env var or test); regardless of disk state.
+    UsingOverride(Uuid),
+    /// File exists but is unparseable. Regenerate, warn, name the path.
+    InvalidFileRegenerated {
+        /// Path of the bad file (already on disk at this location).
+        path: std::path::PathBuf,
+        /// Trimmed file contents that failed to parse — included for
+        /// diagnostics. May be empty.
+        bad_content: String,
+        /// Newly generated UUID we will persist.
+        new_id: Uuid,
+    },
+    /// Disk file is empty (zero-byte) — most often a crash mid-write.
+    EmptyFileRegenerated {
+        path: std::path::PathBuf,
+        new_id: Uuid,
+    },
+    /// No file exists — fresh node. Generate.
+    GeneratedNew(Uuid),
+}
+
+/// Pure classification: read the file state and decide what to do.
+///
+/// `override_` is the FERROSA_HOST_ID env var (or test param). When set,
+/// it always wins — matches the documented behavior of FERROSA_HOST_ID
+/// as an explicit operator override.
+fn classify_host_id_state(path: &std::path::Path, override_: Option<&str>) -> HostIdResolution {
+    // Env override is authoritative when set + valid.
+    if let Some(s) = override_ {
+        if let Ok(id) = Uuid::parse_str(s.trim()) {
+            return HostIdResolution::UsingOverride(id);
+        }
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            if trimmed.is_empty() {
+                HostIdResolution::EmptyFileRegenerated {
+                    path: path.to_path_buf(),
+                    new_id: Uuid::new_v4(),
+                }
+            } else if let Ok(id) = Uuid::parse_str(trimmed) {
+                HostIdResolution::LoadedFromDisk(id)
+            } else {
+                HostIdResolution::InvalidFileRegenerated {
+                    path: path.to_path_buf(),
+                    bad_content: trimmed.to_string(),
+                    new_id: Uuid::new_v4(),
+                }
+            }
+        }
+        Err(_) => HostIdResolution::GeneratedNew(Uuid::new_v4()),
+    }
+}
+
 /// Load host_id from disk, env var, or generate a new one.
 fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     load_or_generate_host_id_with(data_dir, std::env::var("FERROSA_HOST_ID").ok())
@@ -127,32 +283,87 @@ fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
 fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) -> Uuid {
     let path = data_dir.join("host_id");
 
-    // Try reading existing host_id from disk.
-    if let Ok(contents) = std::fs::read_to_string(&path) {
-        if let Ok(id) = Uuid::parse_str(contents.trim()) {
-            tracing::info!(%id, "loaded host_id from disk");
-            return id;
-        }
-    }
+    let resolution = classify_host_id_state(&path, env_override.as_deref());
 
-    // Check explicit override (from FERROSA_HOST_ID env var or test parameter).
-    if let Some(id_str) = env_override {
-        if let Ok(id) = Uuid::parse_str(&id_str) {
+    match resolution {
+        HostIdResolution::LoadedFromDisk(id) => {
+            tracing::info!(%id, "loaded host_id from disk");
+            id
+        }
+        HostIdResolution::UsingOverride(id) => {
             if let Err(e) = std::fs::write(&path, id.to_string()) {
-                tracing::error!(%e, "startup: failed to persist host_id");
+                // BUG-008: persistence-failure diagnostic now names the path
+                // and the recovery action explicitly.
+                tracing::error!(
+                    %e,
+                    path = %path.display(),
+                    "startup: failed to persist host_id override — \
+                     re-run after fixing dir permissions or `rm {} && restart`",
+                    path.display(),
+                );
             }
             tracing::info!(%id, "using host_id from override");
-            return id;
+            id
+        }
+        HostIdResolution::InvalidFileRegenerated {
+            path: bad_path,
+            bad_content,
+            new_id,
+        } => {
+            // BUG-008: previously this was a silent regen. Now we name the
+            // file, show what was in it, and the new id — so an operator
+            // tracing a "why did the node change identity?" can see the
+            // breadcrumb in the journal.
+            tracing::error!(
+                path = %bad_path.display(),
+                bad_content = %bad_content,
+                %new_id,
+                "startup: host_id file at {} contained an unparseable value — \
+                 regenerated. If this node was part of a cluster, the old \
+                 identity is lost; investigate before bootstrapping.",
+                bad_path.display(),
+            );
+            if let Err(e) = std::fs::write(&bad_path, new_id.to_string()) {
+                tracing::error!(
+                    %e,
+                    path = %bad_path.display(),
+                    "startup: failed to persist regenerated host_id"
+                );
+            }
+            new_id
+        }
+        HostIdResolution::EmptyFileRegenerated {
+            path: empty_path,
+            new_id,
+        } => {
+            tracing::warn!(
+                path = %empty_path.display(),
+                %new_id,
+                "startup: host_id file at {} was empty (likely crash mid-write) — \
+                 regenerated",
+                empty_path.display(),
+            );
+            if let Err(e) = std::fs::write(&empty_path, new_id.to_string()) {
+                tracing::error!(
+                    %e,
+                    path = %empty_path.display(),
+                    "startup: failed to persist regenerated host_id"
+                );
+            }
+            new_id
+        }
+        HostIdResolution::GeneratedNew(new_id) => {
+            if let Err(e) = std::fs::write(&path, new_id.to_string()) {
+                tracing::error!(
+                    %e,
+                    path = %path.display(),
+                    "startup: failed to persist host_id"
+                );
+            }
+            tracing::info!(%new_id, "generated new host_id");
+            new_id
         }
     }
-
-    // Generate new host_id and persist.
-    let id = Uuid::new_v4();
-    if let Err(e) = std::fs::write(&path, id.to_string()) {
-        tracing::error!(%e, "startup: failed to persist host_id");
-    }
-    tracing::info!(%id, "generated new host_id");
-    id
 }
 
 /// Bootstrap schema and table registrations from S3.
@@ -424,6 +635,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             storage_config.memtable_num_shards = n;
         }
     }
+    // BUG-006: `[cql].auth_enabled` in ferrosa.toml was silently ignored.
+    // Apply it now if the env var did not already set it via from_env.
+    if let Some(toml_auth) = resolve_auth_enabled_toml(&file_config, |k| std::env::var(k).ok()) {
+        // Env wins inside the resolver, so if we got Some(_) it is the
+        // operator's authoritative choice (env or TOML); set on config.
+        storage_config.auth_enabled = toml_auth;
+    }
     let storage_auth_warn = storage_config.auth_warn;
     // Capture auth enablement before the config is consumed by `new`/`open`.
     // Used below to gate the seed-role bootstrap and the 5-minute
@@ -604,7 +822,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Capture num_tokens locally before cluster_config is consumed by
     // ModeController — needed downstream when populating system.local.tokens.
     let num_tokens = cluster_config.num_tokens as usize;
-    let net_config = Arc::new(ferrosa_net::config::NetConfig::from_env());
+    let mut net_config_mut = ferrosa_net::config::NetConfig::from_env();
+    // BUG-006: apply TOML overrides (env wins; TOML falls back). Previously
+    // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml were
+    // silently ignored.
+    apply_internode_toml_overrides(&mut net_config_mut, &file_config, |k| std::env::var(k).ok());
+    let net_config = Arc::new(net_config_mut);
 
     // Build handler registry — shared between RPC server and ModeController.
     // Catch-up handler is always available; pair write/role-swap handlers are
@@ -972,10 +1195,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let web_addr = web::start_web_server(&web_config, web_state).await?;
     tracing::info!(%web_addr, "web console listening");
 
-    // 10. Graph engine (check FERROSA_GRAPH_ENABLED)
-    let graph_enabled = std::env::var("FERROSA_GRAPH_ENABLED")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    // 10. Graph engine — FERROSA_GRAPH_ENABLED env var, then [graph] enabled
+    // in ferrosa.toml. BUG-006: prior code only checked the env var.
+    let graph_enabled = resolve_graph_enabled(&file_config, |k| std::env::var(k).ok());
 
     // Create a shutdown watch channel for services that need graceful shutdown
     // notification (e.g. the Bolt server).
@@ -1484,6 +1706,214 @@ mod tests {
 
         let result = config_val(key, &config, "cql", "auth_disabled", "false");
         assert_eq!(result, "true");
+    }
+
+    // ---- BUG-008 -----------------------------------------------------
+
+    /// Valid UUID on disk: load and return.
+    #[test]
+    fn classify_host_id_state_loads_valid_disk_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host_id");
+        let id = Uuid::new_v4();
+        std::fs::write(&path, id.to_string()).unwrap();
+        assert_eq!(
+            classify_host_id_state(&path, None),
+            HostIdResolution::LoadedFromDisk(id)
+        );
+    }
+
+    /// Missing file: generate new.
+    #[test]
+    fn classify_host_id_state_generates_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host_id");
+        match classify_host_id_state(&path, None) {
+            HostIdResolution::GeneratedNew(_) => {}
+            other => panic!("expected GeneratedNew, got {other:?}"),
+        }
+    }
+
+    /// Empty file: classify as EmptyFileRegenerated with the path.
+    #[test]
+    fn classify_host_id_state_handles_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host_id");
+        std::fs::write(&path, "").unwrap();
+        match classify_host_id_state(&path, None) {
+            HostIdResolution::EmptyFileRegenerated { path: p, new_id: _ } => {
+                assert_eq!(p, path);
+            }
+            other => panic!("expected EmptyFileRegenerated, got {other:?}"),
+        }
+    }
+
+    /// Unparseable contents: classify as InvalidFileRegenerated, preserving
+    /// the bad content so the diagnostic can name what was on disk.
+    #[test]
+    fn classify_host_id_state_handles_garbage_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host_id");
+        std::fs::write(&path, "not-a-uuid-at-all").unwrap();
+        match classify_host_id_state(&path, None) {
+            HostIdResolution::InvalidFileRegenerated {
+                path: p,
+                bad_content,
+                new_id: _,
+            } => {
+                assert_eq!(p, path);
+                assert_eq!(bad_content, "not-a-uuid-at-all");
+            }
+            other => panic!("expected InvalidFileRegenerated, got {other:?}"),
+        }
+    }
+
+    /// Env override beats disk — operator-supplied id wins.
+    #[test]
+    fn classify_host_id_state_override_wins_over_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host_id");
+        let on_disk = Uuid::new_v4();
+        let override_id = Uuid::new_v4();
+        std::fs::write(&path, on_disk.to_string()).unwrap();
+        assert_eq!(
+            classify_host_id_state(&path, Some(&override_id.to_string())),
+            HostIdResolution::UsingOverride(override_id)
+        );
+    }
+
+    /// Invalid override falls through to disk read.
+    #[test]
+    fn classify_host_id_state_invalid_override_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host_id");
+        let on_disk = Uuid::new_v4();
+        std::fs::write(&path, on_disk.to_string()).unwrap();
+        assert_eq!(
+            classify_host_id_state(&path, Some("not-a-uuid")),
+            HostIdResolution::LoadedFromDisk(on_disk)
+        );
+    }
+
+    /// load_or_generate_host_id_with rewrites a corrupt file with a fresh
+    /// UUID — the regenerated file must be valid on second load.
+    #[test]
+    fn load_or_generate_host_id_with_recovers_from_corrupt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("host_id"), "not-a-uuid").unwrap();
+        let first = load_or_generate_host_id_with(tmp.path(), None);
+        // Second call should now load the persisted UUID, not re-roll.
+        let second = load_or_generate_host_id_with(tmp.path(), None);
+        assert_eq!(first, second, "regenerated UUID was not persisted");
+    }
+
+    // ---- BUG-006 -----------------------------------------------------
+
+    /// Internode bind from TOML is honored when the env var is unset.
+    #[test]
+    fn apply_internode_toml_overrides_sets_bind_when_env_unset() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value =
+            toml::from_str("[internode]\nbind = \"127.0.0.1:18001\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        assert_eq!(cfg.bind_addr, "127.0.0.1:18001".parse().unwrap());
+    }
+
+    /// Env var beats TOML — env wins precedence as advertised.
+    #[test]
+    fn apply_internode_toml_overrides_env_wins() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let default_bind = cfg.bind_addr;
+        let toml: toml::Value =
+            toml::from_str("[internode]\nbind = \"127.0.0.1:18002\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |k| {
+            if k == "FERROSA_INTERNODE_BIND" {
+                Some("ignored".into())
+            } else {
+                None
+            }
+        });
+        // Env-set means we do NOT apply TOML; bind_addr is whatever it was.
+        assert_eq!(cfg.bind_addr, default_bind);
+    }
+
+    /// Cluster name + broadcast + psk also flow from TOML.
+    #[test]
+    fn apply_internode_toml_overrides_sets_other_fields() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value = toml::from_str(
+            r#"
+            [internode]
+            bind         = "127.0.0.1:18003"
+            broadcast    = "10.0.0.1:18003"
+            cluster_name = "team-cluster"
+            psk          = "abc"
+            "#,
+        )
+        .unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        assert_eq!(cfg.bind_addr, "127.0.0.1:18003".parse().unwrap());
+        assert_eq!(cfg.broadcast_addr, "10.0.0.1:18003".parse().unwrap());
+        assert_eq!(cfg.cluster_name, "team-cluster");
+        assert_eq!(cfg.psk.as_deref(), Some("abc"));
+    }
+
+    /// Invalid bind format in TOML must NOT panic — log and move on.
+    #[test]
+    fn apply_internode_toml_overrides_invalid_bind_is_ignored() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let default_bind = cfg.bind_addr;
+        let toml: toml::Value = toml::from_str("[internode]\nbind = \"not-an-addr\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        assert_eq!(cfg.bind_addr, default_bind);
+    }
+
+    /// Graph enable via TOML when env unset.
+    #[test]
+    fn resolve_graph_enabled_reads_toml_when_env_unset() {
+        let toml: toml::Value = toml::from_str("[graph]\nenabled = true\n").unwrap();
+        assert!(resolve_graph_enabled(&toml, |_| None));
+        let toml: toml::Value = toml::from_str("[graph]\nenabled = false\n").unwrap();
+        assert!(!resolve_graph_enabled(&toml, |_| None));
+    }
+
+    #[test]
+    fn resolve_graph_enabled_env_wins_over_toml() {
+        let toml: toml::Value = toml::from_str("[graph]\nenabled = false\n").unwrap();
+        assert!(resolve_graph_enabled(&toml, |k| {
+            (k == "FERROSA_GRAPH_ENABLED").then(|| "true".into())
+        }));
+    }
+
+    #[test]
+    fn resolve_graph_enabled_defaults_false_when_unset_everywhere() {
+        let toml = empty_config();
+        assert!(!resolve_graph_enabled(&toml, |_| None));
+    }
+
+    /// Auth enabled via TOML.
+    #[test]
+    fn resolve_auth_enabled_toml_reads_file_when_env_unset() {
+        let toml: toml::Value = toml::from_str("[cql]\nauth_enabled = true\n").unwrap();
+        assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), Some(true));
+        let toml: toml::Value = toml::from_str("[cql]\nauth_enabled = false\n").unwrap();
+        assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), Some(false));
+    }
+
+    #[test]
+    fn resolve_auth_enabled_toml_env_wins() {
+        let toml: toml::Value = toml::from_str("[cql]\nauth_enabled = false\n").unwrap();
+        assert_eq!(
+            resolve_auth_enabled_toml(&toml, |k| (k == "FERROSA_AUTH_ENABLED")
+                .then(|| "true".into())),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn resolve_auth_enabled_toml_returns_none_when_unspecified() {
+        let toml = empty_config();
+        assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), None);
     }
 
     #[test]
