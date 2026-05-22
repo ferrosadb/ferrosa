@@ -21,6 +21,7 @@ ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-udf = { path = "../ferrosa-udf" }
 futures = "0.3"
 indexmap = "2"
+libc = "0.2"
 lz4_flex = "0.11"
 md-5 = "0.11"
 moka = { version = "0.12", features = ["sync"] }

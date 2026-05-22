@@ -1798,6 +1798,7 @@ dependencies = [
  "ferrosa-udf",
  "futures",
  "indexmap 2.14.0",
+ "libc",
  "lz4_flex",
  "md-5 0.11.0",
  "moka",
