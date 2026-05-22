@@ -692,6 +692,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(%e, "failed to register system tables at startup");
     }
 
+    ferrosa_storage::StorageEngine::spawn_time_series_materialization_worker(storage.clone());
+
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
 
@@ -1138,6 +1140,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::consolidation_status::ConsolidationStatusTable::new(
             schema.clone(),
+        ),
+    ));
+    let materialization_provider =
+        Arc::new(ferrosa_cql::virtual_tables::StorageMaterializationProvider::new(storage.clone()));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::MaterializationQueuesTable::new(
+            materialization_provider.clone(),
+        ),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::MaterializationStatusTable::new(materialization_provider),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::RrdRuntimeSettingsTable::new(
+            storage.time_series_runtime_settings(),
         ),
     ));
     // Storage-backed virtual tables: StorageEngine implements the provider traits.

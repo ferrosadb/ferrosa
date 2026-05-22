@@ -1,48 +1,75 @@
--- RRD Cascading Time-Series Aggregation: Queries
+-- RRD Cascading Time-Series Aggregation: Sensor Queries
 --
 -- Query each tier to see progressively coarser aggregates.
 
-USE sensors;
+USE plant;
 
--- Raw 1-second data (most recent 10 readings).
-SELECT sensor_id, ts, value
-  FROM sensor_1s
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+-- Raw 1-second data for one pump.
+SELECT sensor_id, ts, vibration_mm_s, temperature_c
+  FROM sensor_readings_1s
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
   LIMIT 10;
 
--- 5-minute aggregates.
-SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
-  FROM sensor_5m
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+-- 5-minute aggregates show excursions, trend, and volatility.
+SELECT sensor_id, ts,
+       vibration_mm_s_min,
+       vibration_mm_s_max,
+       vibration_mm_s_avg,
+       vibration_mm_s_stddev,
+       temperature_c_min,
+       temperature_c_max,
+       temperature_c_avg,
+       temperature_c_stddev
+  FROM sensor_readings_5m
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
   LIMIT 10;
 
 -- 15-minute aggregates.
-SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
-  FROM sensor_15m
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+SELECT sensor_id, ts, vibration_mm_s_avg, vibration_mm_s_stddev,
+       temperature_c_avg, temperature_c_stddev
+  FROM sensor_readings_15m
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
   LIMIT 10;
 
 -- 1-hour aggregates.
-SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
-  FROM sensor_1h
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+SELECT sensor_id, ts, vibration_mm_s_avg, vibration_mm_s_stddev,
+       temperature_c_avg, temperature_c_stddev
+  FROM sensor_readings_1h
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
   LIMIT 10;
 
--- Time-range query across a specific day at 5-minute resolution.
-SELECT sensor_id, ts, value_avg
-  FROM sensor_5m
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
-    AND ts >= '2026-03-20 00:00:00'
-    AND ts <  '2026-03-21 00:00:00';
+-- Time-range query across a shift at 5-minute resolution.
+SELECT sensor_id, ts, vibration_mm_s_min, vibration_mm_s_max,
+       vibration_mm_s_avg, vibration_mm_s_stddev
+  FROM sensor_readings_5m
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
+    AND ts >= '2026-05-20 12:00:00'
+    AND ts <  '2026-05-20 20:00:00';
 
--- Cross-sensor comparison at 1-hour resolution.
-SELECT sensor_id, ts, value_avg
-  FROM sensor_1h
+-- Cross-sensor comparison at 5-minute resolution.
+SELECT sensor_id, ts, vibration_mm_s_avg, temperature_c_avg
+  FROM sensor_readings_5m
   WHERE sensor_id IN (
-    550e8400-e29b-41d4-a716-446655440001,
-    550e8400-e29b-41d4-a716-446655440002
+    2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34,
+    7c07fa8d-f630-4a32-a0d8-df48235ed6f2
   )
   LIMIT 48;
 
--- Observability: check consolidation status.
+-- Observability: check consolidation status, materialization queue health,
+-- and runtime RRD ring memory controls.
 SELECT * FROM system_observability.consolidation_status;
+SELECT keyspace_name, table_name, queue_depth, oldest_task_age_ms, alerting
+  FROM system_observability.materialization_queues
+  WHERE alerting = true;
+SELECT setting_name, setting_value, source
+  FROM system_observability.rrd_runtime_settings;
+
+-- Admin-only runtime tuning. The default ring memory budget is derived from
+-- detected memory and can be overridden at process start with
+-- FERROSA_RRD_RING_MEMORY_BUDGET_BYTES.
+UPDATE system_observability.rrd_runtime_settings
+  SET setting_value = 134217728
+  WHERE setting_name = 'ring_memory_budget_bytes';
+UPDATE system_observability.rrd_runtime_settings
+  SET setting_value = 50
+  WHERE setting_name = 'ring_thrash_warn_evictions';

@@ -1,71 +1,60 @@
--- RRD Cascading Time-Series Aggregation: Sample Data
+-- RRD Cascading Time-Series Aggregation: Sensor Data
 --
--- Insert 1-second sensor readings. Consolidation triggers automatically
+-- Insert factory equipment readings. Consolidation triggers automatically
 -- when data timestamps cross 5-minute boundaries.
 
-USE sensors;
+USE plant;
 
--- Sensor 1: temperature readings every second for 10 minutes.
--- (In production, these would come from the application layer.)
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:01', 22.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:02', 22.3);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:03', 22.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:30', 22.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:00', 23.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:30', 23.4);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:02:00', 22.8);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:02:30', 22.6);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:03:00', 22.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:03:30', 22.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:04:00', 21.8);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:04:30', 21.5);
+-- Pump A: rising vibration during the first 5-minute window, then recovery.
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:00:01', 4.2, 68.1);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:00:30', 4.4, 68.3);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:01:00', 4.1, 68.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:01:30', 4.7, 68.6);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:02:00', 5.0, 69.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:02:30', 5.4, 69.5);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:03:00', 5.9, 70.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:03:30', 6.2, 70.4);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:04:00', 5.8, 70.1);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:04:30', 5.1, 69.4);
 
--- After 300 rows (5 minutes), the first consolidation triggers automatically:
--- sensor_1s observer detects timestamp crossing the 5m boundary,
--- runs min/max/avg/stddev over the window, writes result to sensor_5m.
+-- Expected first 5-minute rollup for Pump A:
+--   vibration_mm_s_min    = 4.1
+--   vibration_mm_s_max    = 6.2
+--   vibration_mm_s_avg    = 5.08
+--   vibration_mm_s_stddev = computed by the built-in streaming stddev
+--   temperature_c_min     = 68.0
+--   temperature_c_max     = 70.4
+--   temperature_c_avg     = 69.14
+--   temperature_c_stddev  = computed by the built-in streaming stddev
 
--- Second 5-minute window: 00:05:00 - 00:09:59
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:05:00', 23.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:05:30', 23.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:06:00', 23.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:06:30', 24.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:07:00', 24.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:07:30', 23.8);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:08:00', 23.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:08:30', 23.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:09:00', 22.9);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:09:30', 22.7);
+-- Second 5-minute window: the same pump settles after inspection.
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:05:00', 4.8, 69.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:06:00', 4.6, 68.7);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:07:00', 4.5, 68.6);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:08:00', 4.3, 68.4);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:09:00', 4.2, 68.2);
 
--- Sensor 2: pressure readings (different sensor, same cascade).
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:01', 1013.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:02', 1013.3);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:03', 1013.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:05:00', 1013.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:05:30', 1013.7);
+-- Pump B: baseline readings for cross-sensor comparisons.
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:00:01', 2.1, 64.2);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:01:00', 2.3, 64.4);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:02:00', 2.2, 64.3);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:05:00', 2.4, 64.5);

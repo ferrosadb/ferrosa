@@ -1382,9 +1382,28 @@ impl<'input> Parser<'input> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Language))?;
         let language = self.parse_ident()?;
 
-        // AS 'body'
+        // AS 'body' | AS FILE 'path' | AS URL 'url' WITH SHA256 'hex'
         self.lexer.expect(&TokenKind::Keyword(Keyword::As))?;
-        let body = self.expect_string_literal()?;
+        let body = if self.eat_ident_ci("file")? {
+            FunctionBodySource::File(self.expect_string_literal()?)
+        } else if self.eat_ident_ci("url")? {
+            let url = self.expect_string_literal()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::With))?;
+            if !self.eat_ident_ci("sha256")? {
+                let tok = self.lexer.peek()?;
+                return Err(CqlError::SyntaxError(format!(
+                    "expected SHA256 after WITH, got {:?} at position {}",
+                    tok.kind, tok.pos
+                )));
+            }
+            self.lexer.eat(&TokenKind::Eq)?;
+            FunctionBodySource::Url {
+                url,
+                sha256: self.expect_string_literal()?,
+            }
+        } else {
+            FunctionBodySource::InlineHex(self.expect_string_literal()?)
+        };
 
         Ok(Statement::CreateFunction {
             keyspace,
@@ -1898,12 +1917,17 @@ impl<'input> Parser<'input> {
             let column = self.parse_ident()?;
 
             // Check for token(column) pattern: `token` followed by `(`.
-            let is_token_fn =
-                column.eq_ignore_ascii_case("token") && self.lexer.eat(&TokenKind::LParen)?;
+            let has_lparen = self.lexer.eat(&TokenKind::LParen)?;
+            let is_token_fn = column.eq_ignore_ascii_case("token") && has_lparen;
             let actual_column = if is_token_fn {
                 let col = self.parse_ident()?;
                 self.lexer.expect(&TokenKind::RParen)?;
                 col
+            } else if has_lparen {
+                return Err(CqlError::SyntaxError(
+                    "UDF calls on the left-hand side of WHERE predicates are not supported; place scalar UDF calls on the right-hand side with ALLOW FILTERING"
+                        .to_string(),
+                ));
             } else {
                 column
             };
@@ -2386,6 +2410,20 @@ impl<'input> Parser<'input> {
                 tok.kind, tok.pos
             ))),
         }
+    }
+
+    fn eat_ident_ci(&mut self, expected: &str) -> Result<bool, CqlError> {
+        let tok = self.lexer.peek()?;
+        let matches = match &tok.kind {
+            TokenKind::Ident(s) => s.eq_ignore_ascii_case(expected),
+            TokenKind::QuotedIdent(s) => s.eq_ignore_ascii_case(expected),
+            TokenKind::Keyword(kw) => Self::keyword_as_ident(*kw).eq_ignore_ascii_case(expected),
+            _ => false,
+        };
+        if matches {
+            self.lexer.next_token()?;
+        }
+        Ok(matches)
     }
 
     /// Convert a keyword to its lowercase string form for use as an identifier.
@@ -3983,7 +4021,7 @@ mod tests {
                 assert_eq!(params[0].0, "val");
                 assert!(called_on_null);
                 assert_eq!(language, "wasm");
-                assert_eq!(body, "deadbeef");
+                assert_eq!(body, FunctionBodySource::InlineHex("deadbeef".into()));
                 assert!(!or_replace);
                 assert!(!if_not_exists);
             }
@@ -4023,6 +4061,45 @@ mod tests {
         match stmt {
             Statement::CreateFunction { if_not_exists, .. } => {
                 assert!(if_not_exists);
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+    }
+
+    #[test]
+    fn parse_create_function_as_file() {
+        let stmt = parse(
+            "CREATE FUNCTION ks.f (a int) \
+             CALLED ON NULL INPUT \
+             RETURNS int LANGUAGE wasm AS FILE '/tmp/f.wasm'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateFunction { body, .. } => {
+                assert_eq!(body, FunctionBodySource::File("/tmp/f.wasm".into()));
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+    }
+
+    #[test]
+    fn parse_create_function_as_url_with_sha256() {
+        let stmt = parse(
+            "CREATE FUNCTION ks.f (a int) \
+             CALLED ON NULL INPUT \
+             RETURNS int LANGUAGE wasm AS URL 'https://example.invalid/f.wasm' \
+             WITH SHA256 = '0123456789abcdef'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateFunction { body, .. } => {
+                assert_eq!(
+                    body,
+                    FunctionBodySource::Url {
+                        url: "https://example.invalid/f.wasm".into(),
+                        sha256: "0123456789abcdef".into(),
+                    }
+                );
             }
             _ => panic!("expected CreateFunction"),
         }

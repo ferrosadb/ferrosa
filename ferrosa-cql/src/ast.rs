@@ -64,7 +64,7 @@ pub enum Statement {
         called_on_null: bool,
         return_type: CqlTypeName,
         language: String,
-        body: String,
+        body: FunctionBodySource,
     },
     DropFunction {
         keyspace: Option<String>,
@@ -104,6 +104,13 @@ pub enum Statement {
     Commit,
     /// ROLLBACK — aborts the current Accord transaction.
     Rollback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionBodySource {
+    InlineHex(String),
+    File(String),
+    Url { url: String, sha256: String },
 }
 
 impl Statement {

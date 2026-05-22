@@ -246,6 +246,9 @@ fn system_table_rows() -> Vec<TableRow> {
         ("system_observability", "connections"),
         ("system_observability", "active_queries"),
         ("system_observability", "consolidation_status"),
+        ("system_observability", "materialization_queues"),
+        ("system_observability", "materialization_status"),
+        ("system_observability", "rrd_runtime_settings"),
         ("system_observability", "storage_stats"),
         ("system_observability", "secondary_indexes"),
         ("system_observability", "archive_status"),
@@ -418,6 +421,85 @@ fn system_column_rows() -> Vec<ColumnRow> {
             } else {
                 "none".to_string()
             },
+        });
+    }
+
+    // system_observability.materialization_queues columns
+    let materialization_queue_cols: &[(&str, &str, &str, i32)] = &[
+        ("keyspace_name", "partition_key", "text", 0),
+        ("table_name", "clustering", "text", 0),
+        ("target_table", "clustering", "text", 1),
+        ("window_start_ms", "clustering", "bigint", 2),
+        ("window_end_ms", "regular", "bigint", -1),
+        ("task_type", "clustering", "text", 3),
+        ("enqueued_at_ms", "regular", "bigint", -1),
+        ("oldest_task_age_ms", "regular", "bigint", -1),
+        ("queue_depth", "regular", "bigint", -1),
+        ("retry_count", "regular", "bigint", -1),
+        ("last_error", "regular", "text", -1),
+        ("max_delay_ms", "regular", "bigint", -1),
+        ("alerting", "regular", "boolean", -1),
+    ];
+    for (name, kind, cql_type, pos) in materialization_queue_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "materialization_queues".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.materialization_status columns
+    let materialization_status_cols: &[(&str, &str, &str, i32)] = &[
+        ("keyspace_name", "partition_key", "text", 0),
+        ("table_name", "clustering", "text", 0),
+        ("target_table", "clustering", "text", 1),
+        ("status", "regular", "text", -1),
+        ("pending_tasks", "regular", "bigint", -1),
+        ("completed_tasks", "regular", "bigint", -1),
+        ("failed_tasks", "regular", "bigint", -1),
+        ("stale_drops_total", "regular", "bigint", -1),
+        ("last_materialized_window_end_ms", "regular", "bigint", -1),
+        ("last_error", "regular", "text", -1),
+    ];
+    for (name, kind, cql_type, pos) in materialization_status_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "materialization_status".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.rrd_runtime_settings columns
+    let rrd_runtime_settings_cols: &[(&str, &str, &str, i32)] = &[
+        ("setting_name", "partition_key", "text", 0),
+        ("setting_value", "regular", "bigint", -1),
+        ("source", "regular", "text", -1),
+    ];
+    for (name, kind, cql_type, pos) in rrd_runtime_settings_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "rrd_runtime_settings".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: "none".to_string(),
         });
     }
 
@@ -677,6 +759,60 @@ mod tests {
             .expect("system.local must have a 'tokens' column");
         assert_eq!(tokens_col.column_type, "set<varchar>");
         assert_eq!(tokens_col.kind, "regular");
+    }
+
+    #[test]
+    fn system_observability_includes_materialization_virtual_tables() {
+        let snap = SchemaSnapshot::new();
+        let tables = query_tables(&snap);
+        assert!(
+            tables.iter().any(|r| {
+                r.keyspace_name == "system_observability"
+                    && r.table_name == "materialization_queues"
+            }),
+            "system_schema.tables must include system_observability.materialization_queues"
+        );
+        assert!(
+            tables.iter().any(|r| {
+                r.keyspace_name == "system_observability"
+                    && r.table_name == "materialization_status"
+            }),
+            "system_schema.tables must include system_observability.materialization_status"
+        );
+        assert!(
+            tables.iter().any(|r| {
+                r.keyspace_name == "system_observability" && r.table_name == "rrd_runtime_settings"
+            }),
+            "system_schema.tables must include system_observability.rrd_runtime_settings"
+        );
+
+        let columns = query_columns(&snap);
+        let queue_columns: Vec<&str> = columns
+            .iter()
+            .filter(|r| {
+                r.keyspace_name == "system_observability"
+                    && r.table_name == "materialization_queues"
+            })
+            .map(|r| r.column_name.as_str())
+            .collect();
+        assert_eq!(
+            queue_columns,
+            [
+                "keyspace_name",
+                "table_name",
+                "target_table",
+                "window_start_ms",
+                "window_end_ms",
+                "task_type",
+                "enqueued_at_ms",
+                "oldest_task_age_ms",
+                "queue_depth",
+                "retry_count",
+                "last_error",
+                "max_delay_ms",
+                "alerting",
+            ]
+        );
     }
 
     /// Regression test for BUG-SYSTEM-PEERS-MISSING-TOKENS.

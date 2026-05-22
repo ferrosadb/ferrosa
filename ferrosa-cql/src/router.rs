@@ -9,27 +9,28 @@
 //! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use indexmap::IndexMap;
+use sha2::{Digest, Sha256};
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::pair::ddl::DdlOperation;
-use ferrosa_cluster::system_table_writer::SystemTableWriter;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
-use ferrosa_schema::system::persistence::SystemTableMutation;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
     query_role_members, query_role_permissions, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
-    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualRow,
+    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualColumnUpdate, VirtualRow,
+    VirtualTableUpdate,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -43,7 +44,7 @@ use crate::planner::{self, ScanPlan};
 use crate::prepared::PreparedCache;
 use crate::result;
 use crate::topology::ClientTopologyPolicy;
-use crate::types::{CqlType, CqlValue};
+use crate::types::{encode_value, CqlType, CqlValue};
 use crate::virtual_tables::active_queries::QueryTracker;
 use crate::virtual_tables::connections::ConnectionTracker;
 
@@ -325,11 +326,20 @@ fn row_matches_select_predicates(
     row: &[Option<CqlValue>],
     s: &SelectStatement,
     all_col_names: &[String],
+    all_col_types: &[CqlType],
     table_meta: &TableMetadata,
     ks: &str,
-    schema: &Schema,
-) -> bool {
-    evaluate_where_predicates(row, &s.where_clauses, all_col_names, table_meta, ks, schema)
+    state: &SharedState,
+) -> Result<bool, CqlError> {
+    evaluate_where_predicates(
+        row,
+        &s.where_clauses,
+        all_col_names,
+        all_col_types,
+        table_meta,
+        ks,
+        state,
+    )
 }
 
 struct PartitionRowContext<'a> {
@@ -343,14 +353,14 @@ struct SelectPredicateContext<'a> {
     statement: &'a SelectStatement,
     table_meta: &'a TableMetadata,
     keyspace: &'a str,
-    schema: &'a Schema,
+    state: &'a SharedState,
 }
 
 async fn count_rows_from_partitions(
     partitions: &[ferrosa_sstable::types::Partition],
     row_context: PartitionRowContext<'_>,
     predicate_context: SelectPredicateContext<'_>,
-) -> i64 {
+) -> Result<i64, CqlError> {
     let mut count = 0_i64;
     for (idx, partition) in partitions.iter().enumerate() {
         for row in bridge::partition_to_rows(
@@ -364,10 +374,11 @@ async fn count_rows_from_partitions(
                 &row,
                 predicate_context.statement,
                 row_context.all_col_names,
+                row_context.all_col_types,
                 predicate_context.table_meta,
                 predicate_context.keyspace,
-                predicate_context.schema,
-            ) {
+                predicate_context.state,
+            )? {
                 count += 1;
             }
         }
@@ -375,7 +386,34 @@ async fn count_rows_from_partitions(
             tokio::task::yield_now().await;
         }
     }
-    count
+    Ok(count)
+}
+
+fn filter_rows_by_select_predicates(
+    rows: &mut Vec<Vec<Option<CqlValue>>>,
+    statement: &SelectStatement,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    table_meta: &TableMetadata,
+    ks: &str,
+    state: &SharedState,
+) -> Result<(), CqlError> {
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if row_matches_select_predicates(
+            &row,
+            statement,
+            all_col_names,
+            all_col_types,
+            table_meta,
+            ks,
+            state,
+        )? {
+            kept.push(row);
+        }
+    }
+    *rows = kept;
+    Ok(())
 }
 
 async fn extend_rows_from_partitions(
@@ -2067,16 +2105,15 @@ async fn route_select_user_table(
                     &ck_indices,
                 );
                 // Post-filter: apply remaining (non-fts_match) WHERE predicates.
-                prows.retain(|row| {
-                    evaluate_where_predicates(
-                        row,
-                        &s.where_clauses,
-                        &all_col_names,
-                        table_meta,
-                        ks,
-                        &state.schema,
-                    )
-                });
+                filter_rows_by_select_predicates(
+                    &mut prows,
+                    s,
+                    &all_col_names,
+                    &all_col_types,
+                    table_meta,
+                    ks,
+                    state,
+                )?;
                 fts_rows.append(&mut prows);
             }
         }
@@ -2161,16 +2198,15 @@ async fn route_select_user_table(
             None => vec![],
         };
         // Apply clustering key and other non-PK WHERE predicates.
-        pk_rows.retain(|row| {
-            evaluate_where_predicates(
-                row,
-                &s.where_clauses,
-                &all_col_names,
-                table_meta,
-                ks,
-                &state.schema,
-            )
-        });
+        filter_rows_by_select_predicates(
+            &mut pk_rows,
+            s,
+            &all_col_names,
+            &all_col_types,
+            table_meta,
+            ks,
+            state,
+        )?;
         pk_rows
     } else if let Some(in_rows) = try_pk_in_lookup(
         &s.where_clauses,
@@ -2187,16 +2223,15 @@ async fn route_select_user_table(
         // PK IN (...) — multi-partition lookup.
         // Apply clustering key and other non-PK WHERE predicates.
         let mut filtered = in_rows;
-        filtered.retain(|row| {
-            evaluate_where_predicates(
-                row,
-                &s.where_clauses,
-                &all_col_names,
-                table_meta,
-                ks,
-                &state.schema,
-            )
-        });
+        filter_rows_by_select_predicates(
+            &mut filtered,
+            s,
+            &all_col_names,
+            &all_col_types,
+            table_meta,
+            ks,
+            state,
+        )?;
         filtered
     } else {
         // No PK — use the query planner to decide the access path.
@@ -2233,10 +2268,10 @@ async fn route_select_user_table(
                             statement: s,
                             table_meta,
                             keyspace: ks,
-                            schema: &state.schema,
+                            state,
                         },
                     )
-                    .await;
+                    .await?;
                     return Ok(SelectRawResult {
                         column_names: col_names.to_vec(),
                         column_types: col_types.to_vec(),
@@ -2256,16 +2291,15 @@ async fn route_select_user_table(
                     &ck_indices,
                 )
                 .await;
-                all_rows.retain(|row| {
-                    evaluate_where_predicates(
-                        row,
-                        &s.where_clauses,
-                        &all_col_names,
-                        table_meta,
-                        ks,
-                        &state.schema,
-                    )
-                });
+                filter_rows_by_select_predicates(
+                    &mut all_rows,
+                    s,
+                    &all_col_names,
+                    &all_col_types,
+                    table_meta,
+                    ks,
+                    state,
+                )?;
                 all_rows
             }
 
@@ -2338,10 +2372,10 @@ async fn route_select_user_table(
                             statement: s,
                             table_meta,
                             keyspace: ks,
-                            schema: &state.schema,
+                            state,
                         },
                     )
-                    .await;
+                    .await?;
                     return Ok(SelectRawResult {
                         column_names: col_names.to_vec(),
                         column_types: col_types.to_vec(),
@@ -2365,16 +2399,15 @@ async fn route_select_user_table(
 
                 // Always apply post-filter as defensive measure.
                 // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
-                all_rows.retain(|row| {
-                    evaluate_where_predicates(
-                        row,
-                        &s.where_clauses,
-                        &all_col_names,
-                        table_meta,
-                        ks,
-                        &state.schema,
-                    )
-                });
+                filter_rows_by_select_predicates(
+                    &mut all_rows,
+                    s,
+                    &all_col_names,
+                    &all_col_types,
+                    table_meta,
+                    ks,
+                    state,
+                )?;
 
                 all_rows
             }
@@ -2426,10 +2459,10 @@ async fn route_select_user_table(
                             statement: s,
                             table_meta,
                             keyspace: ks,
-                            schema: &state.schema,
+                            state,
                         },
                     )
-                    .await;
+                    .await?;
                     return Ok(SelectRawResult {
                         column_names: col_names.to_vec(),
                         column_types: col_types.to_vec(),
@@ -2450,17 +2483,15 @@ async fn route_select_user_table(
                     &ck_indices,
                 )
                 .await;
-
-                all_rows.retain(|row| {
-                    evaluate_where_predicates(
-                        row,
-                        &s.where_clauses,
-                        &all_col_names,
-                        table_meta,
-                        ks,
-                        &state.schema,
-                    )
-                });
+                filter_rows_by_select_predicates(
+                    &mut all_rows,
+                    s,
+                    &all_col_names,
+                    &all_col_types,
+                    table_meta,
+                    ks,
+                    state,
+                )?;
 
                 all_rows
             }
@@ -2601,10 +2632,10 @@ async fn route_select_user_table(
                             statement: s,
                             table_meta,
                             keyspace: ks,
-                            schema: &state.schema,
+                            state,
                         },
                     )
-                    .await;
+                    .await?;
                     return Ok(SelectRawResult {
                         column_names: col_names.to_vec(),
                         column_types: col_types.to_vec(),
@@ -2624,16 +2655,15 @@ async fn route_select_user_table(
                     &ck_indices,
                 )
                 .await;
-                all_rows.retain(|row| {
-                    evaluate_where_predicates(
-                        row,
-                        &s.where_clauses,
-                        &all_col_names,
-                        table_meta,
-                        ks,
-                        &state.schema,
-                    )
-                });
+                filter_rows_by_select_predicates(
+                    &mut all_rows,
+                    s,
+                    &all_col_names,
+                    &all_col_types,
+                    table_meta,
+                    ks,
+                    state,
+                )?;
                 all_rows
             }
         }
@@ -3289,6 +3319,94 @@ async fn route_insert(
     }
 }
 
+fn route_update_virtual_table(
+    ctx: &RequestContext<'_>,
+    vtable: &dyn ferrosa_schema::VirtualTable,
+    s: &UpdateStatement,
+) -> Result<BytesMut, CqlError> {
+    if !ctx.auth.is_superuser {
+        return Err(CqlError::Unauthorized(
+            "updating virtual control tables requires a superuser role".into(),
+        ));
+    }
+    if s.if_exists
+        || !s.if_conditions.is_empty()
+        || s.using_timestamp.is_some()
+        || s.using_ttl.is_some()
+    {
+        return Err(CqlError::Invalid(
+            "virtual table updates do not support IF or USING clauses".into(),
+        ));
+    }
+
+    let assignments = s
+        .assignments
+        .iter()
+        .map(|assignment| match assignment {
+            Assignment::Simple { column, value } => {
+                let col = vtable
+                    .columns()
+                    .iter()
+                    .find(|candidate| candidate.name == *column)
+                    .ok_or_else(|| {
+                        CqlError::Invalid(format!("unknown virtual column: {column}"))
+                    })?;
+                let cql_type = data_type_to_cql_type(&col.data_type);
+                let cql_value = bridge::term_to_cql_value(value, &cql_type)?;
+                Ok(VirtualColumnUpdate {
+                    column: column.clone(),
+                    value: ferrosa_common::CellValue::live(encode_value(&cql_value), 0),
+                })
+            }
+            _ => Err(CqlError::Invalid(
+                "virtual table updates only support simple assignments".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let filters = s
+        .where_clauses
+        .iter()
+        .map(|clause| {
+            let op = match clause.op {
+                ComparisonOp::Eq => ferrosa_schema::PredicateOp::Eq,
+                ComparisonOp::Gt => ferrosa_schema::PredicateOp::Gt,
+                ComparisonOp::Lt => ferrosa_schema::PredicateOp::Lt,
+                ComparisonOp::Ge => ferrosa_schema::PredicateOp::Gte,
+                ComparisonOp::Le => ferrosa_schema::PredicateOp::Lte,
+                _ => {
+                    return Err(CqlError::Invalid(
+                        "virtual table updates only support scalar WHERE comparisons".into(),
+                    ));
+                }
+            };
+            let col = vtable
+                .columns()
+                .iter()
+                .find(|candidate| candidate.name == clause.column)
+                .ok_or_else(|| {
+                    CqlError::Invalid(format!("unknown virtual column: {}", clause.column))
+                })?;
+            let cql_type = data_type_to_cql_type(&col.data_type);
+            let cql_value = bridge::term_to_cql_value(&clause.value, &cql_type)?;
+            Ok(ferrosa_schema::ColumnFilter {
+                column: clause.column.clone(),
+                op,
+                value: ferrosa_common::CellValue::live(encode_value(&cql_value), 0),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    vtable
+        .apply_update(&VirtualTableUpdate {
+            assignments,
+            predicate: ferrosa_schema::RowPredicate { filters },
+        })
+        .map_err(CqlError::Invalid)?;
+
+    Ok(result::encode_void())
+}
+
 /// Encode a lightweight-transaction `[applied]` result.
 ///
 /// CQL protocol returns a RESULT Rows frame with `[applied]` boolean plus
@@ -3334,6 +3452,10 @@ async fn route_update(
         Permission::Modify,
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
+
+    if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
+        return route_update_virtual_table(ctx, vtable.as_ref(), &s);
+    }
 
     let snap = state.schema.snapshot();
     let table_meta = snap
@@ -4626,7 +4748,7 @@ fn create_cascade_tables_if_needed(
             let fn_str: String = config
                 .functions
                 .iter()
-                .filter_map(|f| consolidation_fn_name(f))
+                .filter_map(consolidation_fn_name)
                 .collect::<Vec<_>>()
                 .join(",");
             extensions.insert("consolidation.functions".to_string(), fn_str);
@@ -4689,18 +4811,8 @@ fn format_consolidation_interval(d: &std::time::Duration) -> String {
 /// Map a ConsolidationFn to its string name for extension serialization.
 fn consolidation_fn_name(
     f: &ferrosa_storage::timeseries::consolidation::ConsolidationFn,
-) -> Option<&'static str> {
-    use ferrosa_storage::timeseries::consolidation::ConsolidationFn;
-    match f {
-        ConsolidationFn::Min => Some("min"),
-        ConsolidationFn::Max => Some("max"),
-        ConsolidationFn::Avg => Some("avg"),
-        ConsolidationFn::Median => Some("median"),
-        ConsolidationFn::StdDev => Some("stddev"),
-        ConsolidationFn::Count => Some("count"),
-        ConsolidationFn::Sum => Some("sum"),
-        _ => None,
-    }
+) -> Option<String> {
+    f.extension_name()
 }
 
 async fn route_alter_table(
@@ -5348,15 +5460,8 @@ async fn route_grant(
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
-        DdlPath::Direct { engine, .. } => {
-            let entry = GrantEntry {
-                role: s.role.clone(),
-                resource: resource.clone(),
-                permissions: perms.clone(),
-            };
+        DdlPath::Direct { .. } => {
             state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
-            SystemTableWriter::new(Arc::clone(engine))
-                .apply(SystemTableMutation::GrantUpdated(entry))?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::Grant(GrantEntry {
@@ -5402,18 +5507,8 @@ async fn route_revoke(
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
-        DdlPath::Direct { engine, .. } => {
-            state
-                .schema
-                .revoke(&s.role, &resource, perms.clone(), ctx.auth)?;
-            let writer = SystemTableWriter::new(Arc::clone(engine));
-            for perm in perms {
-                writer.apply(SystemTableMutation::PermissionRevoked {
-                    role: s.role.clone(),
-                    resource: resource.clone(),
-                    permission: perm,
-                })?;
-            }
+        DdlPath::Direct { .. } => {
+            state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
         }
         DdlPath::Pair(coordinator) => {
             // DdlOperation::Revoke carries one permission at a time; emit one
@@ -5888,15 +5983,59 @@ fn term_to_index_key(
     Ok(ferrosa_index::IndexKey(bytes))
 }
 
+fn evaluate_where_rhs_term(
+    term: &Term,
+    expected_type: &CqlType,
+    row: &[Option<CqlValue>],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    ks: &str,
+    state: &SharedState,
+) -> Result<CqlValue, CqlError> {
+    if let Term::FunctionCall {
+        keyspace,
+        name,
+        args,
+    } = term
+    {
+        if !args.is_empty() && term_has_udf_call(term) {
+            let func = resolve_select_function(
+                ks,
+                keyspace.as_deref(),
+                name,
+                args,
+                None,
+                all_col_names,
+                all_col_types,
+                &state.schema,
+            )?;
+            if !matches!(func.kind, ResolvedFunctionKind::Scalar) {
+                return Err(CqlError::Invalid(format!(
+                    "WHERE predicate RHS function {}.{} must be a scalar UDF",
+                    func.func_keyspace, func.func_name
+                )));
+            }
+            let mut results = evaluate_row_udfs(state, row, &[&func])?;
+            return results
+                .pop()
+                .flatten()
+                .ok_or_else(|| CqlError::Invalid("WHERE predicate RHS UDF returned NULL".into()));
+        }
+    }
+
+    bridge::term_to_cql_value(term, expected_type)
+}
+
 /// Evaluate WHERE predicates against a row for ALLOW FILTERING post-filter.
 fn evaluate_where_predicates(
     row: &[Option<CqlValue>],
     where_clauses: &[WhereClause],
     all_col_names: &[String],
+    all_col_types: &[CqlType],
     table_meta: &TableMetadata,
     ks: &str,
-    schema: &Schema,
-) -> bool {
+    state: &SharedState,
+) -> Result<bool, CqlError> {
     for wc in where_clauses {
         // Skip token() predicates — token range filtering is handled by
         // the scan bounds, not by post-filter row evaluation.
@@ -5912,19 +6051,19 @@ fn evaluate_where_predicates(
         }
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
             Some(i) => i,
-            None => return false,
+            None => return Ok(false),
         };
         let col_meta = match table_meta.columns.get(&wc.column) {
             Some(m) => m,
-            None => return false,
+            None => return Ok(false),
         };
-        let cql_type = match resolve_col_type(&col_meta.column_type, ks, schema) {
+        let cql_type = match resolve_col_type(&col_meta.column_type, ks, &state.schema) {
             Ok(t) => t,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
         let actual = match &row[col_idx] {
             Some(v) => v,
-            None => return false,
+            None => return Ok(false),
         };
 
         // IN requires special handling: the term is an InList, not a single
@@ -5933,7 +6072,7 @@ fn evaluate_where_predicates(
         if wc.op == ComparisonOp::In {
             let in_terms = match &wc.value {
                 Term::InList(terms) => terms,
-                _ => return false,
+                _ => return Ok(false),
             };
             let found = in_terms.iter().any(|t| {
                 if let Ok(v) = bridge::term_to_cql_value(t, &cql_type) {
@@ -5943,7 +6082,7 @@ fn evaluate_where_predicates(
                 }
             });
             if !found {
-                return false;
+                return Ok(false);
             }
             continue;
         }
@@ -5955,11 +6094,11 @@ fn evaluate_where_predicates(
             let element_type = match &cql_type {
                 CqlType::List(inner) | CqlType::Set(inner) => (**inner).clone(),
                 CqlType::Map(_, val_type) => (**val_type).clone(),
-                _ => return false,
+                _ => return Ok(false),
             };
             let needle = match bridge::term_to_cql_value(&wc.value, &element_type) {
                 Ok(v) => v,
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             };
             let found = match actual {
                 CqlValue::List(items) | CqlValue::Set(items) => items.contains(&needle),
@@ -5967,40 +6106,45 @@ fn evaluate_where_predicates(
                 _ => false,
             };
             if !found {
-                return false;
+                return Ok(false);
             }
             continue;
         }
         if wc.op == ComparisonOp::ContainsKey {
             let key_type = match &cql_type {
                 CqlType::Map(key_type, _) => (**key_type).clone(),
-                _ => return false,
+                _ => return Ok(false),
             };
             let needle = match bridge::term_to_cql_value(&wc.value, &key_type) {
                 Ok(v) => v,
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             };
             let found = match actual {
                 CqlValue::Map(entries) => entries.iter().any(|(k, _)| *k == needle),
                 _ => false,
             };
             if !found {
-                return false;
+                return Ok(false);
             }
             continue;
         }
 
-        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
+        let expected = evaluate_where_rhs_term(
+            &wc.value,
+            &cql_type,
+            row,
+            all_col_names,
+            all_col_types,
+            ks,
+            state,
+        )?;
 
         // Phonetic index support: when the predicate is Eq on a column that
         // has a phonetic index, use case-insensitive comparison as a partial
         // phonetic match. Full Double Metaphone matching requires the SOUNDS
         // LIKE syntax (deferred).
         let has_phonetic_index = if wc.op == ComparisonOp::Eq {
-            let snap = schema.snapshot();
+            let snap = state.schema.snapshot();
             snap.indexes.values().any(|idx| {
                 idx.keyspace == table_meta.keyspace
                     && idx.table == table_meta.name
@@ -6037,10 +6181,10 @@ fn evaluate_where_predicates(
             }
         };
         if !matches {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Apply column selection (with `toJson()` support) to system table query results.
@@ -6846,6 +6990,61 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, CqlError> {
         .collect()
 }
 
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode_bytes(&Sha256::digest(bytes))
+}
+
+async fn load_function_body(body: &FunctionBodySource) -> Result<(Vec<u8>, String), CqlError> {
+    match body {
+        FunctionBodySource::InlineHex(hex) => Ok((hex_decode(hex)?, hex.clone())),
+        FunctionBodySource::File(path) => {
+            let bytes = fs::read(path).map_err(|e| {
+                CqlError::Invalid(format!("failed to read WASM file '{path}': {e}"))
+            })?;
+            let stored_body = hex_encode_bytes(&bytes);
+            Ok((bytes, stored_body))
+        }
+        FunctionBodySource::Url { url, sha256 } => {
+            let response = reqwest::get(url)
+                .await
+                .map_err(|e| CqlError::Invalid(format!("failed to fetch WASM URL '{url}': {e}")))?;
+            if !response.status().is_success() {
+                return Err(CqlError::Invalid(format!(
+                    "failed to fetch WASM URL '{url}': HTTP {}",
+                    response.status()
+                )));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| CqlError::Invalid(format!("failed to read WASM URL '{url}': {e}")))?;
+            let bytes = bytes.to_vec();
+            let actual = sha256_hex(&bytes);
+            let expected = sha256
+                .strip_prefix("0x")
+                .or_else(|| sha256.strip_prefix("0X"))
+                .unwrap_or(sha256)
+                .to_ascii_lowercase();
+            if actual != expected {
+                return Err(CqlError::Invalid(format!(
+                    "WASM URL SHA-256 mismatch for '{url}': expected {expected}, got {actual}"
+                )));
+            }
+            Ok((bytes.clone(), hex_encode_bytes(&bytes)))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn route_create_function(
     state: &SharedState,
@@ -6858,16 +7057,11 @@ async fn route_create_function(
     called_on_null: bool,
     return_type: CqlTypeName,
     language: String,
-    body: String,
+    body: FunctionBodySource,
 ) -> Result<BytesMut, CqlError> {
     let ks = keyspace
         .or_else(|| ctx.current_keyspace.clone())
         .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
-
-    // Permission check (M8)
-    state
-        .schema
-        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
 
     // Only WASM language is supported
     if !language.eq_ignore_ascii_case("wasm") {
@@ -6876,6 +7070,16 @@ async fn route_create_function(
             language
         )));
     }
+    if !ctx.auth.is_superuser {
+        return Err(CqlError::Invalid(
+            "CREATE FUNCTION LANGUAGE wasm requires a superuser role".into(),
+        ));
+    }
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
 
     // Resolve parameter types
     let (arg_names, arg_types): (Vec<String>, Vec<ferrosa_common::CqlType>) = params
@@ -6892,6 +7096,32 @@ async fn route_create_function(
     let resolved_return = bridge::resolve_type_name(&return_type, &ks, &state.schema)?;
     let common_return = cql_type_to_common(&resolved_return);
 
+    // Check for existing function
+    let existing = state.schema.get_function(&ks, &name, &arg_types);
+    let replacing_existing = existing.is_some() && or_replace;
+    if existing.is_some() {
+        if if_not_exists {
+            let arg_type_names: Vec<String> = arg_types
+                .iter()
+                .map(bridge::cql_type_display_name)
+                .collect();
+            return Ok(result::encode_schema_change_with_args(
+                "CREATED",
+                "FUNCTION",
+                &[&ks, &name],
+                &arg_type_names,
+            ));
+        } else if or_replace {
+            // Continue. The new component is loaded and compiled before schema
+            // metadata is replaced, so invalid replacements leave the old
+            // schema entry intact.
+        } else {
+            return Err(CqlError::Invalid(format!(
+                "function {ks}.{name} already exists"
+            )));
+        }
+    }
+
     // Build arg type name strings for the SCHEMA_CHANGE response (CQL protocol
     // requires a [string list] of argument type names for FUNCTION targets).
     let arg_type_names: Vec<String> = arg_types
@@ -6899,32 +7129,13 @@ async fn route_create_function(
         .map(bridge::cql_type_display_name)
         .collect();
 
-    // Decode hex body to WASM bytes and compile
-    let wasm_bytes = hex_decode(&body)?;
+    // Load WASM bytes and compile only after existence semantics are settled.
+    let (wasm_bytes, stored_body) = load_function_body(&body).await?;
     state
         .udf_executor
-        .compile(&ks, &name, &wasm_bytes)
+        .compile(&ks, &name, &arg_types, &wasm_bytes)
         .map_err(CqlError::from)?;
-
-    // Check for existing function
-    let existing = state.schema.get_function(&ks, &name, &arg_types);
-    if existing.is_some() {
-        if or_replace {
-            // Drop the old one first, then create the new one
-            state.udf_executor.invalidate(&ks, &name);
-        } else if if_not_exists {
-            return Ok(result::encode_schema_change_with_args(
-                "CREATED",
-                "FUNCTION",
-                &[&ks, &name],
-                &arg_type_names,
-            ));
-        } else {
-            return Err(CqlError::Invalid(format!(
-                "function {ks}.{name} already exists"
-            )));
-        }
-    }
+    let drop_arg_types = arg_types.clone();
 
     let func_meta = UserFunctionMetadata {
         keyspace: ks.clone(),
@@ -6934,22 +7145,49 @@ async fn route_create_function(
         return_type: common_return,
         called_on_null,
         language: language.to_ascii_lowercase(),
-        body,
+        body: stored_body,
     };
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            if replacing_existing {
+                ddl.execute(DdlOperation::DropFunction {
+                    keyspace: ks.clone(),
+                    name: name.clone(),
+                    arg_types: drop_arg_types.clone(),
+                })
+                .await
+                .map_err(CqlError::from)?;
+            }
             ddl.execute(DdlOperation::CreateFunction(func_meta))
                 .await
                 .map_err(CqlError::from)?;
         }
         DdlPath::Pair(coordinator) => {
+            if replacing_existing {
+                coordinator
+                    .coordinate_ddl(DdlOperation::DropFunction {
+                        keyspace: ks.clone(),
+                        name: name.clone(),
+                        arg_types: drop_arg_types.clone(),
+                    })
+                    .await?;
+            }
             let op = DdlOperation::CreateFunction(func_meta);
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster { .. } => {
+            if replacing_existing {
+                ddl.execute(DdlOperation::DropFunction {
+                    keyspace: ks.clone(),
+                    name: name.clone(),
+                    arg_types: drop_arg_types.clone(),
+                })
+                .await
+                .map_err(CqlError::from)?;
+            }
             let op = DdlOperation::CreateFunction(func_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -7053,7 +7291,9 @@ async fn route_drop_function(
     }
 
     // Invalidate cached compilation
-    state.udf_executor.invalidate(&ks, &name);
+    state
+        .udf_executor
+        .invalidate(&ks, &name, &resolved_arg_types);
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
@@ -7801,7 +8041,6 @@ mod tests {
             memtable_num_shards: 64,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
-        engine.register_system_tables().unwrap();
 
         let schema = Arc::new(
             Schema::new(SchemaConfig {
@@ -7911,6 +8150,40 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_udf_on_where_lhs_with_clear_error() {
+        let err =
+            crate::parser::parse("SELECT * FROM ks.tbl WHERE is_hot(v) = true ALLOW FILTERING")
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("UDF calls on the left-hand side of WHERE predicates are not supported"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn where_rhs_udf_resolution_errors_instead_of_filtering_false() {
+        let (state, _dir) = setup();
+        let term = Term::FunctionCall {
+            keyspace: None,
+            name: "missing_fn".to_string(),
+            args: vec![Term::IntegerLiteral(7)],
+        };
+        let err = evaluate_where_rhs_term(
+            &term,
+            &CqlType::Int,
+            &[Some(CqlValue::Int(7))],
+            &["v".to_string()],
+            &[CqlType::Int],
+            "ks",
+            &state,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing_fn"), "unexpected error: {msg}");
+    }
+
+    #[test]
     fn keyspace_rf_returns_rf_for_simple_strategy() {
         let (state, _dir) = setup();
         let mut opts = std::collections::HashMap::new();
@@ -7997,6 +8270,106 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    #[tokio::test]
+    async fn cql_inserts_materialize_rrd_rollup_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for cql in [
+            "CREATE KEYSPACE rrd WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE rrd.sensor_10s (sensor_id text, ts bigint, value_avg double, PRIMARY KEY (sensor_id, ts))",
+            "CREATE TABLE rrd.sensor (sensor_id text, ts bigint, value double, PRIMARY KEY (sensor_id, ts)) WITH extensions = {'consolidation.interval': '10s', 'consolidation.functions': 'avg', 'consolidation.target': 'sensor_10s', 'consolidation.columns': 'value', 'consolidation.ring_capacity': '4'}",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        for ts in 0..=10 {
+            let micros = ts * 1_000_000;
+            let cql = format!(
+                "INSERT INTO rrd.sensor (sensor_id, ts, value) VALUES ('s1', {micros}, {ts}.0)"
+            );
+            route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            state
+                .engine
+                .process_pending_time_series_materializations(8)
+                .unwrap(),
+            1
+        );
+
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT value_avg FROM rrd.sensor_10s WHERE sensor_id = 's1'")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let RouteResult::Result(body) = result else {
+            panic!("expected Rows result");
+        };
+        let value = extract_first_double_value(&body);
+        assert!(
+            (value - 4.5).abs() < f64::EPSILON,
+            "CQL DDL/DML should produce the same full-window rollup as storage-level materialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_table_rejects_non_streaming_rrd_wasm_function() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE rrd_wasm WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let err = match route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE rrd_wasm.sensor (sensor_id text, ts bigint, value double, PRIMARY KEY (sensor_id, ts)) WITH extensions = {'consolidation.interval': '10s', 'consolidation.functions': 'wasm:rrd_wasm.stddev', 'consolidation.target': 'sensor_10s', 'consolidation.columns': 'value'}",
+            )
+            .unwrap(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected WASM RRD function DDL to fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("streaming WASM aggregate ABI"),
+            "WASM rollup DDL must fail clearly until the streaming ABI exists: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -8765,6 +9138,76 @@ mod tests {
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
         assert_eq!(state.query_tracker.total_executed(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_rrd_runtime_settings_virtual_table_adjusts_budget() {
+        let (state, _dir) = setup();
+        let settings = Arc::new(ferrosa_storage::timeseries::TimeSeriesRuntimeSettings::new(
+            Some(1024),
+            100,
+        ));
+        state.schema.virtual_tables().register(Arc::new(
+            crate::virtual_tables::RrdRuntimeSettingsTable::new(Arc::clone(&settings)),
+        ));
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "UPDATE system_observability.rrd_runtime_settings \
+             SET setting_value = 4096 \
+             WHERE setting_name = 'ring_memory_budget_bytes'",
+        )
+        .unwrap();
+
+        route(&state, &ctx, stmt).await.unwrap();
+
+        assert_eq!(settings.ring_memory_budget_bytes(), Some(4096));
+    }
+
+    #[tokio::test]
+    async fn update_rrd_runtime_settings_requires_superuser() {
+        let (state, _dir) = setup();
+        let settings = Arc::new(ferrosa_storage::timeseries::TimeSeriesRuntimeSettings::new(
+            Some(1024),
+            100,
+        ));
+        state.schema.virtual_tables().register(Arc::new(
+            crate::virtual_tables::RrdRuntimeSettingsTable::new(settings),
+        ));
+        let auth = AuthContext {
+            role: "operator".into(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "UPDATE system_observability.rrd_runtime_settings \
+             SET setting_value = 4096 \
+             WHERE setting_name = 'ring_memory_budget_bytes'",
+        )
+        .unwrap();
+
+        let err = match route(&state, &ctx, stmt).await {
+            Ok(_) => panic!("non-superuser virtual setting update should fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, CqlError::Unauthorized(_)));
     }
 
     #[tokio::test]
@@ -9688,6 +10131,42 @@ mod tests {
         off += 4;
         assert_eq!(value_len, 8, "expected bigint value length");
         i64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
+    }
+
+    fn extract_first_double_value(buf: &[u8]) -> f64 {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        let row_count = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        assert_eq!(row_count, 1, "expected exactly one aggregate row");
+        off += 4;
+        let value_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        off += 4;
+        assert_eq!(value_len, 8, "expected double value length");
+        f64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
     }
 
     /// Extract column names from a Rows result buffer.
@@ -11798,7 +12277,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_create_or_replace_function_invalidates_cache() {
+    async fn route_create_function_requires_superuser() {
+        let (state, _dir) = setup();
+        let admin_auth = dev_auth();
+        let admin_ctx = RequestContext {
+            auth: &admin_auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE udf_admin_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &admin_ctx, stmt).await.unwrap();
+
+        let user_auth = AuthContext {
+            role: "sensor_app".into(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        let user_ctx = RequestContext {
+            auth: &user_auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let hex_body = hex_encode(&minimal_wasm_component());
+        let cql = format!(
+            "CREATE FUNCTION udf_admin_ks.my_func(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{hex_body}'"
+        );
+        let stmt = crate::parser::parse(&cql).unwrap();
+        let err = match route(&state, &user_ctx, stmt).await {
+            Ok(_) => panic!("CREATE FUNCTION should require a superuser role"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("superuser"),
+            "expected superuser-only error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_create_or_replace_function_replaces_schema_entry() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -11831,28 +12357,75 @@ mod tests {
             .get_function("replace_ks", "my_func", &[CqlType::Int])
             .is_some());
 
-        // OR REPLACE invalidates the executor cache (the schema-level drop
-        // is not yet wired, so CREATE OR REPLACE currently errors on the DDL
-        // path when the function already exists — this tests the cache
-        // invalidation that does occur before that error).
         let cql = format!(
             "CREATE OR REPLACE FUNCTION replace_ks.my_func(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{hex_body}'"
         );
         let stmt = crate::parser::parse(&cql).unwrap();
-        // The OR REPLACE DDL path has a known limitation: it invalidates the
-        // executor cache but does not drop the schema entry before re-creating,
-        // so the schema layer returns FunctionExists. Verify the error is
-        // non-fatal and the original function remains intact.
-        let _result = route(&state, &ctx, stmt).await;
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "OR REPLACE should drop and recreate the schema entry, got: {:?}",
+            result.err()
+        );
 
-        // Original function should still exist in schema regardless
         assert!(
             state
                 .schema
                 .get_function("replace_ks", "my_func", &[CqlType::Int])
                 .is_some(),
-            "original function should remain in schema"
+            "function should remain in schema after replacement"
         );
+    }
+
+    #[tokio::test]
+    async fn route_create_function_from_url_verifies_sha256_and_stores_hex_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE url_udf_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let wasm = minimal_wasm_component();
+        let digest = sha256_hex(&wasm);
+        let body = wasm.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+
+        let cql = format!(
+            "CREATE FUNCTION url_udf_ks.from_url(val int) CALLED ON NULL INPUT RETURNS int \
+             LANGUAGE wasm AS URL 'http://{addr}/from-url.wasm' WITH SHA256 = '{digest}'"
+        );
+        let stmt = crate::parser::parse(&cql).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let func = state
+            .schema
+            .get_function("url_udf_ks", "from_url", &[CqlType::Int])
+            .expect("function should be stored");
+        assert_eq!(func.body, hex_encode(&wasm));
     }
 
     #[tokio::test]
@@ -11929,6 +12502,43 @@ mod tests {
         assert!(
             result.is_ok(),
             "IF NOT EXISTS should not error on duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_create_function_if_not_exists_duplicate_does_not_compile_body() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ine_order_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let hex_body = hex_encode(&minimal_wasm_component());
+        let cql = format!(
+            "CREATE FUNCTION ine_order_ks.ine_func(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{hex_body}'"
+        );
+        let stmt = crate::parser::parse(&cql).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE FUNCTION IF NOT EXISTS ine_order_ks.ine_func(val int) \
+             CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS 'not valid hex'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "duplicate IF NOT EXISTS should return before decoding or compiling body"
         );
     }
 
@@ -12813,6 +13423,17 @@ mod tests {
             Some(CqlValue::Text("rust programming language".to_string())),
         ];
         let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+        let all_col_types: Vec<CqlType> = all_col_names
+            .iter()
+            .map(|name| {
+                resolve_col_type(
+                    &table_meta.columns[name].column_type,
+                    "fts_ks",
+                    &state.schema,
+                )
+                .unwrap()
+            })
+            .collect();
 
         // WHERE clause with fts_match: body = fts_match('programming')
         let fts_clause = WhereClause {
@@ -12833,10 +13454,12 @@ mod tests {
             &row,
             std::slice::from_ref(&fts_clause),
             &all_col_names,
+            &all_col_types,
             table_meta,
             "fts_ks",
-            &state.schema,
-        );
+            &state,
+        )
+        .unwrap();
         assert!(
             result,
             "evaluate_where_predicates must skip fts_match() clauses; \
@@ -12854,10 +13477,12 @@ mod tests {
             &row,
             &[fts_clause, pk_clause],
             &all_col_names,
+            &all_col_types,
             table_meta,
             "fts_ks",
-            &state.schema,
-        );
+            &state,
+        )
+        .unwrap();
         assert!(
             result2,
             "evaluate_where_predicates with fts_match + matching PK clause \
@@ -13871,63 +14496,6 @@ mod tests {
             result.is_ok(),
             "GRANT SELECT ON TABLE should succeed: {:?}",
             result.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_grant_persists_role_permissions_row() {
-        let (state, _dir) = setup();
-        state
-            .engine
-            .register_system_tables()
-            .expect("system_auth tables should register");
-        let ctx = RequestContext {
-            auth: &dev_auth(),
-            current_keyspace: &None,
-            consistency: ConsistencyLevel::One,
-            serial_consistency: None,
-            paging: crate::paging::PagingParams::default(),
-            client_address: String::new(),
-        };
-
-        let stmt = crate::parser::parse(
-            "CREATE KEYSPACE grks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
-        ).unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        let stmt = crate::parser::parse("CREATE TABLE grks.t (k int PRIMARY KEY, v text)").unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        let stmt =
-            crate::parser::parse("CREATE ROLE gr_user WITH PASSWORD = 'pass' AND LOGIN = true")
-                .unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        let stmt = crate::parser::parse("GRANT SELECT ON grks.t TO gr_user").unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        let tid = ferrosa_storage::TableId::new("system_auth", "role_permissions");
-        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
-            b"gr_user".to_vec(),
-        ));
-        let partition = state
-            .engine
-            .read(&tid, &key)
-            .expect("system_auth.role_permissions read should succeed")
-            .expect("GRANT must persist a role_permissions partition");
-
-        assert!(
-            partition
-                .rows
-                .iter()
-                .any(|row| row.clustering == b"table grks.t"
-                    && row
-                        .cells
-                        .iter()
-                        .any(|(_, cell)| cell.value.as_deref().is_some_and(|bytes| bytes
-                            .windows(b"SELECT".len())
-                            .any(|window| window == b"SELECT")))),
-            "GRANT must persist SELECT on table grks.t for gr_user"
         );
     }
 

@@ -10,6 +10,9 @@
 
 use ferrosa_common::DataType;
 use ferrosa_schema::VirtualTableRegistry;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static EMFILE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Format a single Prometheus metric line.
 ///
@@ -52,6 +55,36 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
         .push_str("# HELP ferrosa_up Whether the Ferrosa node is up (always 1 when reachable).\n");
     output.push_str("# TYPE ferrosa_up gauge\n");
     output.push_str(&format_metric("ferrosa_up", &[], 1.0));
+
+    // File descriptor pressure metrics — always emitted so the
+    // macOS-launchd low-NOFILE failure mode is visible even before a
+    // table snapshot is available.
+    let (fd_soft, fd_hard) = read_fd_budget().unwrap_or((0, 0));
+    output.push_str(
+        "# HELP ferrosa_fd_budget_soft Soft process file descriptor limit (RLIMIT_NOFILE).\n",
+    );
+    output.push_str("# TYPE ferrosa_fd_budget_soft gauge\n");
+    output.push_str(&format_metric(
+        "ferrosa_fd_budget_soft",
+        &[],
+        fd_soft as f64,
+    ));
+    output.push_str(
+        "# HELP ferrosa_fd_budget_hard Hard process file descriptor limit (RLIMIT_NOFILE).\n",
+    );
+    output.push_str("# TYPE ferrosa_fd_budget_hard gauge\n");
+    output.push_str(&format_metric(
+        "ferrosa_fd_budget_hard",
+        &[],
+        fd_hard as f64,
+    ));
+    output.push_str("# HELP ferrosa_emfile_total Total observed EMFILE open-file-limit errors.\n");
+    output.push_str("# TYPE ferrosa_emfile_total counter\n");
+    output.push_str(&format_metric(
+        "ferrosa_emfile_total",
+        &[],
+        emfile_total() as f64,
+    ));
 
     // Process memory metrics — critical for diagnosing memory leaks.
     // On Linux (containers), read from /proc/self/status.
@@ -150,6 +183,34 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
     }
 
     output
+}
+
+/// Record an EMFILE ("too many open files") failure for metrics.
+pub fn record_emfile_error() {
+    EMFILE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+fn emfile_total() -> u64 {
+    EMFILE_TOTAL.load(Ordering::Relaxed)
+}
+
+#[cfg(unix)]
+fn read_fd_budget() -> Option<(u64, u64)> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes `limit` when it returns 0.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if rc == 0 {
+        // SAFETY: guarded by the successful getrlimit return code.
+        let limit = unsafe { limit.assume_init() };
+        Some((limit.rlim_cur, limit.rlim_max))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn read_fd_budget() -> Option<(u64, u64)> {
+    None
 }
 
 /// Read the current process's RSS and virtual memory size.
@@ -289,6 +350,29 @@ mod tests {
         // Even with no virtual tables, baseline metrics are always emitted.
         assert!(output.contains("ferrosa_up"));
         assert!(output.contains("ferrosa_virtual_tables_registered"));
+    }
+
+    #[test]
+    fn render_metrics_exposes_fd_budget_and_emfile() {
+        // Operators need these three families visible on every scrape
+        // so the macOS-launchd EMFILE failure mode (see spec
+        // p0-emfile-launchd-startup) shows up in dashboards.
+        let registry = VirtualTableRegistry::new();
+        let output = render_metrics(&registry);
+        assert!(output.contains("ferrosa_emfile_total"));
+        assert!(output.contains("ferrosa_fd_budget_soft"));
+        assert!(output.contains("ferrosa_fd_budget_hard"));
+    }
+
+    #[test]
+    fn record_emfile_error_increments_counter() {
+        let before = emfile_total();
+        record_emfile_error();
+
+        let registry = VirtualTableRegistry::new();
+        let output = render_metrics(&registry);
+
+        assert!(output.contains(&format!("ferrosa_emfile_total {}", before + 1)));
     }
 
     #[test]

@@ -1,9 +1,19 @@
 //! Configuration for time-series consolidation, parsed from table extensions.
 
 use std::collections::HashMap;
+use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::consolidation::ConsolidationFn;
+
+/// Environment override for the default RRD ring memory budget.
+pub const RING_MEMORY_BUDGET_ENV: &str = "FERROSA_RRD_RING_MEMORY_BUDGET_BYTES";
+
+const DEFAULT_RING_MEMORY_BUDGET_FRACTION_DENOMINATOR: usize = 20; // 5%
+const FALLBACK_RING_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const CGROUP_UNLIMITED_SENTINEL: usize = 1usize << 60;
+const NO_RING_MEMORY_BUDGET: u64 = u64::MAX;
 
 /// Configuration for time-series consolidation on a table.
 #[derive(Debug, Clone)]
@@ -24,10 +34,72 @@ pub struct ConsolidationConfig {
     pub ring_capacity: usize,
     /// Maximum number of ring buffers (default 10,000).
     pub max_rings: usize,
+    /// Optional heap budget for all active ring buffers.
+    pub ring_memory_budget_bytes: Option<usize>,
+    /// Emit a thrash warning every N ring evictions. Zero disables warnings.
+    pub ring_thrash_warn_evictions: u64,
     /// Cascade multipliers for auto-creating downstream tables.
     pub cascade_multipliers: Vec<u32>,
     /// Bounded channel capacity for consolidation tasks (default 1024).
     pub channel_capacity: usize,
+}
+
+/// Runtime-adjustable time-series consolidation controls.
+///
+/// These values are shared by active aggregators and can be changed without
+/// rebuilding table metadata. Table extensions and env/defaults initialize this
+/// state; writable control-plane virtual tables can update it later.
+#[derive(Debug)]
+pub struct TimeSeriesRuntimeSettings {
+    ring_memory_budget_bytes: AtomicU64,
+    ring_thrash_warn_evictions: AtomicU64,
+}
+
+impl TimeSeriesRuntimeSettings {
+    pub fn from_config(config: &ConsolidationConfig) -> Self {
+        Self::new(
+            config.ring_memory_budget_bytes,
+            config.ring_thrash_warn_evictions,
+        )
+    }
+
+    pub fn new(ring_memory_budget_bytes: Option<usize>, ring_thrash_warn_evictions: u64) -> Self {
+        Self {
+            ring_memory_budget_bytes: AtomicU64::new(
+                ring_memory_budget_bytes
+                    .map(|value| value as u64)
+                    .unwrap_or(NO_RING_MEMORY_BUDGET),
+            ),
+            ring_thrash_warn_evictions: AtomicU64::new(ring_thrash_warn_evictions),
+        }
+    }
+
+    pub fn ring_memory_budget_bytes(&self) -> Option<usize> {
+        let value = self.ring_memory_budget_bytes.load(Ordering::Relaxed);
+        if value == NO_RING_MEMORY_BUDGET {
+            None
+        } else {
+            Some(value as usize)
+        }
+    }
+
+    pub fn set_ring_memory_budget_bytes(&self, value: Option<usize>) {
+        self.ring_memory_budget_bytes.store(
+            value
+                .map(|value| value as u64)
+                .unwrap_or(NO_RING_MEMORY_BUDGET),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn ring_thrash_warn_evictions(&self) -> u64 {
+        self.ring_thrash_warn_evictions.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ring_thrash_warn_evictions(&self, value: u64) {
+        self.ring_thrash_warn_evictions
+            .store(value, Ordering::Relaxed);
+    }
 }
 
 impl Default for ConsolidationConfig {
@@ -41,6 +113,8 @@ impl Default for ConsolidationConfig {
             columns: vec![],
             ring_capacity: 512,
             max_rings: 10_000,
+            ring_memory_budget_bytes: default_ring_memory_budget_bytes(),
+            ring_thrash_warn_evictions: 100,
             cascade_multipliers: vec![3, 4],
             channel_capacity: 1024,
         }
@@ -76,6 +150,7 @@ impl ConsolidationConfig {
         // Required: functions.
         if let Some(funcs_str) = ext.get("consolidation.functions") {
             config.functions = ConsolidationFn::parse_list(funcs_str)?;
+            validate_live_materialization_functions(&config.functions)?;
         } else {
             return Err("consolidation.functions is required".to_string());
         }
@@ -124,6 +199,26 @@ impl ConsolidationConfig {
             config.max_rings = max_str
                 .parse()
                 .map_err(|_| format!("invalid max_rings: '{max_str}'"))?;
+            if config.max_rings == 0 {
+                return Err("max_rings must be greater than zero".to_string());
+            }
+        }
+
+        // Optional: ring_memory_budget_bytes. Some(0) means the configured
+        // budget cannot fit a ring and writes will skip ring allocation.
+        if let Some(budget_str) = ext.get("consolidation.ring_memory_budget_bytes") {
+            config.ring_memory_budget_bytes = Some(
+                budget_str
+                    .parse()
+                    .map_err(|_| format!("invalid ring_memory_budget_bytes: '{budget_str}'"))?,
+            );
+        }
+
+        // Optional: ring_thrash_warn_evictions.
+        if let Some(threshold_str) = ext.get("consolidation.ring_thrash_warn_evictions") {
+            config.ring_thrash_warn_evictions = threshold_str
+                .parse()
+                .map_err(|_| format!("invalid ring_thrash_warn_evictions: '{threshold_str}'"))?;
         }
 
         // Optional: channel_capacity (default 1024).
@@ -156,6 +251,111 @@ impl ConsolidationConfig {
     pub fn interval_micros(&self) -> i64 {
         self.interval.as_micros() as i64
     }
+}
+
+fn validate_live_materialization_functions(functions: &[ConsolidationFn]) -> Result<(), String> {
+    for function in functions {
+        match function {
+            ConsolidationFn::Median => {
+                return Err(
+                    "consolidation function 'median' requires materialized windows and is not supported for live RRD materialization yet".to_string()
+                );
+            }
+            ConsolidationFn::Wasm {
+                keyspace,
+                function_name,
+            } => {
+                return Err(format!(
+                    "consolidation function 'wasm:{keyspace}.{function_name}' requires the streaming WASM aggregate ABI, which is not implemented yet"
+                ));
+            }
+            ConsolidationFn::Composite(inner) => validate_live_materialization_functions(inner)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Derive the default active-ring heap budget.
+///
+/// The explicit environment override wins. Without an override, Ferrosa uses a
+/// conservative fraction of the cgroup/process memory limit. If no platform
+/// memory signal is available, it falls back to a bounded 64 MiB budget instead
+/// of leaving ring allocation unbounded.
+pub fn default_ring_memory_budget_bytes() -> Option<usize> {
+    derive_ring_memory_budget_bytes(
+        std::env::var(RING_MEMORY_BUDGET_ENV).ok().as_deref(),
+        detect_process_memory_limit_bytes(),
+    )
+}
+
+fn derive_ring_memory_budget_bytes(
+    env_override: Option<&str>,
+    memory_limit_bytes: Option<usize>,
+) -> Option<usize> {
+    if let Some(raw) = env_override {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            tracing::warn!(
+                env = RING_MEMORY_BUDGET_ENV,
+                "empty RRD ring memory budget override ignored"
+            );
+        } else if let Ok(value) = trimmed.parse::<usize>() {
+            return Some(value);
+        } else {
+            tracing::warn!(
+                env = RING_MEMORY_BUDGET_ENV,
+                value = trimmed,
+                "invalid RRD ring memory budget override ignored"
+            );
+        }
+    }
+
+    memory_limit_bytes
+        .map(|limit| limit / DEFAULT_RING_MEMORY_BUDGET_FRACTION_DENOMINATOR)
+        .filter(|budget| *budget > 0)
+        .or(Some(FALLBACK_RING_MEMORY_BUDGET_BYTES))
+}
+
+fn detect_process_memory_limit_bytes() -> Option<usize> {
+    read_cgroup_v2_memory_max()
+        .or_else(read_cgroup_v1_memory_limit)
+        .or_else(read_proc_mem_total)
+}
+
+fn read_cgroup_v2_memory_max() -> Option<usize> {
+    let raw = fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    parse_cgroup_memory_limit(raw.trim())
+}
+
+fn read_cgroup_v1_memory_limit() -> Option<usize> {
+    let raw = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?;
+    parse_cgroup_memory_limit(raw.trim())
+}
+
+fn parse_cgroup_memory_limit(raw: &str) -> Option<usize> {
+    if raw == "max" {
+        return None;
+    }
+    let value = raw.parse::<usize>().ok()?;
+    if value == 0 || value >= CGROUP_UNLIMITED_SENTINEL {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn read_proc_mem_total() -> Option<usize> {
+    let raw = fs::read_to_string("/proc/meminfo").ok()?;
+    parse_proc_mem_total(&raw)
+}
+
+fn parse_proc_mem_total(raw: &str) -> Option<usize> {
+    let line = raw.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let mut parts = line.split_whitespace();
+    let _label = parts.next()?;
+    let kib = parts.next()?.parse::<usize>().ok()?;
+    kib.checked_mul(1024)
 }
 
 /// Parse a duration string like "5m", "15m", "1h", "30s", "100ms".
@@ -310,16 +510,7 @@ pub fn generate_cascade_chain(
                 .functions
                 .iter()
                 .filter_map(|f| {
-                    let suffix = match f {
-                        ConsolidationFn::Min => Some("min"),
-                        ConsolidationFn::Max => Some("max"),
-                        ConsolidationFn::Avg => Some("avg"),
-                        ConsolidationFn::Median => Some("median"),
-                        ConsolidationFn::StdDev => Some("stddev"),
-                        ConsolidationFn::Count => Some("count"),
-                        ConsolidationFn::Sum => Some("sum"),
-                        _ => None,
-                    };
+                    let suffix = f.output_suffix();
                     suffix.map(|s| format!("{}_{}", col, s))
                 })
                 .collect::<Vec<_>>()
@@ -445,6 +636,31 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn config_rejects_non_streaming_materialization_functions() {
+        for (function, expected) in [
+            ("median", "requires materialized windows"),
+            (
+                "wasm:plant.stddev",
+                "requires the streaming WASM aggregate ABI",
+            ),
+        ] {
+            let mut ext = HashMap::new();
+            ext.insert("consolidation.interval".into(), "5m".into());
+            ext.insert("consolidation.functions".into(), function.into());
+            ext.insert("consolidation.target".into(), "sensor_5m".into());
+            ext.insert("consolidation.columns".into(), "value".into());
+
+            let err = ConsolidationConfig::from_extensions(&ext)
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                err.contains(expected),
+                "expected '{expected}' in error for {function}: {err}"
+            );
+        }
+    }
+
     // --- Task 16: Cascade and ring param parsing tests ---
 
     #[test]
@@ -473,6 +689,93 @@ mod tests {
         let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
         assert_eq!(config.ring_capacity, 1024);
         assert_eq!(config.max_rings, 5000);
+    }
+
+    #[test]
+    fn config_parses_ring_memory_budget_and_thrash_threshold() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "1m".into());
+        ext.insert("consolidation.functions".into(), "sum".into());
+        ext.insert("consolidation.target".into(), "t".into());
+        ext.insert("consolidation.columns".into(), "v".into());
+        ext.insert(
+            "consolidation.ring_memory_budget_bytes".into(),
+            "1048576".into(),
+        );
+        ext.insert(
+            "consolidation.ring_thrash_warn_evictions".into(),
+            "25".into(),
+        );
+
+        let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
+
+        assert_eq!(config.ring_memory_budget_bytes, Some(1_048_576));
+        assert_eq!(config.ring_thrash_warn_evictions, 25);
+    }
+
+    #[test]
+    fn ring_memory_budget_env_override_wins_over_detected_limit() {
+        assert_eq!(
+            derive_ring_memory_budget_bytes(Some("123456"), Some(2 * 1024 * 1024 * 1024)),
+            Some(123_456)
+        );
+    }
+
+    #[test]
+    fn ring_memory_budget_derives_from_detected_memory_limit() {
+        assert_eq!(
+            derive_ring_memory_budget_bytes(None, Some(2 * 1024 * 1024 * 1024)),
+            Some(107_374_182)
+        );
+    }
+
+    #[test]
+    fn ring_memory_budget_falls_back_when_no_memory_signal_exists() {
+        assert_eq!(
+            derive_ring_memory_budget_bytes(None, None),
+            Some(64 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn ring_memory_budget_ignores_invalid_env_override() {
+        assert_eq!(
+            derive_ring_memory_budget_bytes(Some("not-a-number"), Some(1024 * 1024 * 1024)),
+            Some(53_687_091)
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_memory_limit_rejects_unbounded_values() {
+        assert_eq!(parse_cgroup_memory_limit("max"), None);
+        assert_eq!(parse_cgroup_memory_limit("0"), None);
+        assert_eq!(parse_cgroup_memory_limit(&(1usize << 61).to_string()), None);
+        assert_eq!(parse_cgroup_memory_limit("2147483648"), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn parse_proc_mem_total_reads_kib() {
+        assert_eq!(
+            parse_proc_mem_total("MemTotal:       2048000 kB\nMemFree: 1 kB\n"),
+            Some(2_097_152_000)
+        );
+    }
+
+    #[test]
+    fn table_extension_ring_memory_budget_overrides_derived_default() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "1m".into());
+        ext.insert("consolidation.functions".into(), "sum".into());
+        ext.insert("consolidation.target".into(), "t".into());
+        ext.insert("consolidation.columns".into(), "v".into());
+        ext.insert(
+            "consolidation.ring_memory_budget_bytes".into(),
+            "4096".into(),
+        );
+
+        let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
+
+        assert_eq!(config.ring_memory_budget_bytes, Some(4096));
     }
 
     #[test]
@@ -608,6 +911,37 @@ mod tests {
         assert_eq!(chain[2].table_name, "sensor_1h");
         assert_eq!(chain[2].interval, Duration::from_secs(3600)); // 1h
         assert_eq!(chain[2].target, None);
+    }
+
+    #[test]
+    fn generate_cascade_chain_names_wasm_output_columns_by_function() {
+        let config = ConsolidationConfig {
+            interval: Duration::from_secs(300),
+            functions: vec![
+                super::super::consolidation::ConsolidationFn::Min,
+                super::super::consolidation::ConsolidationFn::Wasm {
+                    keyspace: "plant".to_string(),
+                    function_name: "stddev".to_string(),
+                },
+            ],
+            target_table: "sensor_5m".into(),
+            cascade: true,
+            columns: vec!["vibration_mm_s".into(), "temperature_c".into()],
+            cascade_multipliers: vec![3],
+            ..ConsolidationConfig::default()
+        };
+
+        let chain = generate_cascade_chain("sensor_1s", &config);
+
+        assert_eq!(
+            chain[0].output_columns,
+            vec![
+                "vibration_mm_s_min",
+                "vibration_mm_s_stddev",
+                "temperature_c_min",
+                "temperature_c_stddev",
+            ]
+        );
     }
 
     #[test]

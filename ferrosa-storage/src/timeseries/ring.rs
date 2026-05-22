@@ -51,6 +51,22 @@ pub enum BoundaryStatus {
 }
 
 impl RingBuffer {
+    /// Estimate the heap reserved by a ring of this shape.
+    ///
+    /// This is deliberately conservative. Values for up to eight numeric
+    /// columns stay inline in `SmallVec`; wider rows are charged for the
+    /// additional spilled value storage so memory-budget decisions degrade by
+    /// evicting/skipping rings before allocation rather than risking OOM.
+    pub fn estimated_heap_bytes(capacity: usize, column_count: usize) -> usize {
+        let capacity = capacity.checked_next_power_of_two().unwrap_or(usize::MAX);
+        let entry_bytes = std::mem::size_of::<RingEntry>();
+        let spilled_value_bytes = column_count
+            .saturating_sub(8)
+            .saturating_mul(std::mem::size_of::<f64>());
+
+        capacity.saturating_mul(entry_bytes.saturating_add(spilled_value_bytes))
+    }
+
     /// Create a new ring buffer with the given capacity (rounded up to power of 2).
     ///
     /// `interval_micros` is the consolidation interval in microseconds.
@@ -193,16 +209,33 @@ impl RingBuffer {
         result
     }
 
-    /// Extract owned copies of entries within `[start_ts, end_ts)`.
-    /// Used when sending window data to the async worker channel.
-    pub fn window_owned(&self, start_ts: i64, end_ts: i64) -> Vec<RingEntry> {
-        self.window(start_ts, end_ts)
-            .into_iter()
-            .map(|e| RingEntry {
-                timestamp: e.timestamp,
-                values: e.values.clone(),
-            })
-            .collect()
+    /// Visit entries within `[start_ts, end_ts)` without materializing a window.
+    ///
+    /// The callback order is ring scan order, not timestamp order. This is meant
+    /// for order-insensitive streaming aggregations such as min, max, avg, count,
+    /// sum, and Welford stddev. Order-sensitive functions need a separate
+    /// streaming contract instead of calling this helper and sorting in memory.
+    pub fn visit_window<F>(&self, start_ts: i64, end_ts: i64, mut visit: F)
+    where
+        F: FnMut(&RingEntry),
+    {
+        assert!(start_ts <= end_ts, "start_ts must be <= end_ts");
+
+        let count = self.len();
+        let capacity = self.capacity();
+        let start_idx = if self.write_cursor <= capacity {
+            0
+        } else {
+            self.write_cursor & self.capacity_mask
+        };
+
+        for i in 0..count {
+            let idx = (start_idx + i) & self.capacity_mask;
+            let entry = &self.entries[idx];
+            if entry.timestamp >= start_ts && entry.timestamp < end_ts {
+                visit(entry);
+            }
+        }
     }
 }
 
@@ -366,6 +399,24 @@ mod tests {
         assert_eq!(window.len(), 4);
         assert_eq!(window[0].timestamp, 2_000_000);
         assert_eq!(window[3].timestamp, 5_000_000);
+    }
+
+    #[test]
+    fn ring_buffer_visits_window_without_materializing_entries() {
+        let mut rb = RingBuffer::new(8, 10_000_000, vec![0]);
+        for i in 0..5 {
+            rb.insert(i * 1_000_000, SmallVec::from_slice(&[i as f64]));
+        }
+
+        let mut count = 0;
+        let mut sum = 0.0;
+        rb.visit_window(1_000_000, 4_000_000, |entry| {
+            count += 1;
+            sum += entry.values[0];
+        });
+
+        assert_eq!(count, 3);
+        assert_eq!(sum, 6.0);
     }
 
     // --- FMEA Fix 3: Cap boundary advance loop iterations ---

@@ -14,6 +14,7 @@ pub mod aggregator;
 pub mod config;
 pub mod consolidation;
 pub mod late_data;
+pub mod materialization;
 pub mod ring;
 
 // Re-export key types for convenience.
@@ -21,5 +22,10 @@ pub use aggregator::{
     ConsolidationMetrics, ConsolidationTask, ConsolidationWorker, MetricsSnapshot,
     TimeSeriesAggregator,
 };
-pub use config::ConsolidationConfig;
-pub use consolidation::ConsolidationFn;
+pub use config::{ConsolidationConfig, TimeSeriesRuntimeSettings};
+pub use consolidation::{emit_streaming_results, ConsolidationFn, StreamingConsolidationError};
+pub use materialization::{
+    LateWindowClassification, MaterializationQueue, MaterializationQueueMetrics,
+    MaterializationQueueSnapshot, MaterializationRequest, MaterializationTarget,
+    MaterializationTaskKind, MaterializedRollup,
+};

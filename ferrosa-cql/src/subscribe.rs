@@ -673,6 +673,32 @@ mod tests {
         assert_eq!(events[2].body, Bytes::from_static(b"late-apply"));
     }
 
+    #[test]
+    fn delta_diff_handles_materialization_observability_rows() {
+        let previous = vec![vec![
+            Some(CqlValue::Text("plant".to_string())),
+            Some(CqlValue::Text("sensor_readings_raw".to_string())),
+            Some(CqlValue::Text("sensor_readings_5m".to_string())),
+            Some(CqlValue::Bigint(1_774_032_000_000)),
+            Some(CqlValue::Bigint(2)),
+            Some(CqlValue::Boolean(false)),
+        ]];
+        let current = vec![vec![
+            Some(CqlValue::Text("plant".to_string())),
+            Some(CqlValue::Text("sensor_readings_raw".to_string())),
+            Some(CqlValue::Text("sensor_readings_5m".to_string())),
+            Some(CqlValue::Bigint(1_774_032_000_000)),
+            Some(CqlValue::Bigint(3)),
+            Some(CqlValue::Boolean(true)),
+        ]];
+
+        let delta = compute_delta(&current, &previous);
+
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0][4], Some(CqlValue::Bigint(3)));
+        assert_eq!(delta[0][5], Some(CqlValue::Boolean(true)));
+    }
+
     // ===================================================================
     // P0-02 — SUBSCRIBE DELTA row-level diff (acceptance criterion #3)
     // ===================================================================
