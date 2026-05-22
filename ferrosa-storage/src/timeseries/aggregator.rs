@@ -213,6 +213,29 @@ impl TimeSeriesAggregator {
         agg
     }
 
+    /// Create a new aggregator with CQL type metadata, shared runtime settings,
+    /// and externally managed metrics.
+    pub fn with_column_types_runtime_settings_and_metrics(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        column_types: Vec<String>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+        runtime_settings: Arc<TimeSeriesRuntimeSettings>,
+        metrics: Arc<ConsolidationMetrics>,
+    ) -> Self {
+        let mut agg = Self::with_column_types_and_runtime_settings(
+            config,
+            table_id,
+            value_column_indices,
+            column_types,
+            task_tx,
+            runtime_settings,
+        );
+        agg.shared_metrics = Some(metrics);
+        agg
+    }
+
     /// Create a new aggregator with externally managed shared metrics.
     pub fn with_metrics(
         config: ConsolidationConfig,
@@ -350,6 +373,15 @@ impl TimeSeriesAggregator {
         }
 
         self.max_rings.min(budget / per_ring)
+    }
+
+    /// Returns the latest fully closed window start for a partition, when the
+    /// partition still has an in-memory ring.
+    pub fn watermark_window_start(&self, partition_key: &[u8]) -> Option<i64> {
+        self.rings.get(partition_key).map(|ring| {
+            ring.boundary_ts()
+                .saturating_sub(self.config.interval_micros())
+        })
     }
 
     fn ensure_capacity_for_new_ring(&self, partition_key: &[u8]) -> bool {

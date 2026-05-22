@@ -169,6 +169,32 @@ fn live_consolidation_schema() -> TableSchema {
     schema
 }
 
+fn consolidation_schema_with_late_window(late_window: &str) -> TableSchema {
+    let mut schema = live_consolidation_schema();
+    schema.extensions.insert(
+        "consolidation.late_window".to_string(),
+        late_window.to_string(),
+    );
+    schema
+}
+
+fn consolidation_schema_with_ring_capacity(ring_capacity: &str) -> TableSchema {
+    let mut schema = live_consolidation_schema();
+    schema.extensions.insert(
+        "consolidation.ring_capacity".to_string(),
+        ring_capacity.to_string(),
+    );
+    schema
+}
+
+fn consolidation_schema_with_interval(interval: &str) -> TableSchema {
+    let mut schema = live_consolidation_schema();
+    schema
+        .extensions
+        .insert("consolidation.interval".to_string(), interval.to_string());
+    schema
+}
+
 fn rollup_schema(
     table: &str,
     columns: &[&str],
@@ -407,6 +433,35 @@ fn storage_materialization_observability_reports_live_queue_lag() {
 }
 
 #[test]
+fn storage_materialization_observability_reports_alerting_queue_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let table_id = TableId::new("ks", "sensor");
+    let sensor = key(b"sensor-1");
+    engine
+        .register_table(consolidation_schema_with_interval("1ms"))
+        .unwrap();
+
+    engine
+        .write(&table_id, &sensor, sensor_row(0, 1.0), 0)
+        .unwrap();
+    engine
+        .write(&table_id, &sensor, sensor_row(1_000, 2.0), 1_000)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+
+    let mut queues = Vec::new();
+    engine.visit_time_series_materialization_queues(&mut |snapshot| queues.push(snapshot));
+    assert_eq!(queues.len(), 1);
+    assert!(queues[0].oldest_task_age_ms > queues[0].max_delay_ms);
+    assert!(queues[0].alerting);
+
+    let mut statuses = Vec::new();
+    engine.visit_time_series_materialization_statuses(&mut |snapshot| statuses.push(snapshot));
+    assert_eq!(statuses[0].status, "degraded");
+}
+
+#[test]
 fn materialization_drain_writes_queryable_rollup_rows() {
     let dir = tempfile::tempdir().unwrap();
     let engine = make_engine(dir.path());
@@ -435,6 +490,94 @@ fn materialization_drain_writes_queryable_rollup_rows() {
     );
     let value = read_first_value(&engine, &target_table, &sensor).unwrap();
     assert!((value - 4.5).abs() < f64::EPSILON);
+}
+
+#[test]
+fn materialization_drain_recomputes_from_storage_when_ring_window_is_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let source_table = TableId::new("ks", "sensor");
+    let target_table = TableId::new("ks", "sensor_10s");
+    let sensor = key(b"sensor-1");
+    engine.register_table(sensor_10s_schema()).unwrap();
+    engine
+        .register_table(consolidation_schema_with_ring_capacity("4"))
+        .unwrap();
+
+    for ts in 0..=10 {
+        engine
+            .write(
+                &source_table,
+                &sensor,
+                sensor_row(ts * 1_000_000, ts as f64),
+                ts * 1_000_000,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        engine
+            .process_pending_time_series_materializations(8)
+            .unwrap(),
+        1
+    );
+    let value = read_first_value(&engine, &target_table, &sensor).unwrap();
+    assert!(
+        (value - 4.5).abs() < f64::EPSILON,
+        "materialization must not use a partial in-memory ring as the full source of truth"
+    );
+}
+
+#[test]
+fn stale_late_materialization_task_is_dropped_without_rewriting_rollup() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let source_table = TableId::new("ks", "sensor");
+    let target_table = TableId::new("ks", "sensor_10s");
+    let sensor = key(b"sensor-1");
+    engine.register_table(sensor_10s_schema()).unwrap();
+    engine
+        .register_table(consolidation_schema_with_late_window("5s"))
+        .unwrap();
+
+    for ts in 0..=30 {
+        engine
+            .write(
+                &source_table,
+                &sensor,
+                sensor_row(ts * 1_000_000, ts as f64),
+                ts * 1_000_000,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        engine
+            .process_pending_time_series_materializations(8)
+            .unwrap(),
+        3
+    );
+    let before = read_first_value(&engine, &target_table, &sensor).unwrap();
+    assert!((before - 4.5).abs() < f64::EPSILON);
+
+    engine
+        .write(&source_table, &sensor, sensor_row(0, 100.0), 40_000_000)
+        .unwrap();
+    assert_eq!(
+        engine
+            .process_pending_time_series_materializations(8)
+            .unwrap(),
+        1
+    );
+
+    let after = read_first_value(&engine, &target_table, &sensor).unwrap();
+    assert!(
+        (after - before).abs() < f64::EPSILON,
+        "stale late data outside late_window must not rewrite existing rollups"
+    );
+
+    let mut statuses = Vec::new();
+    engine.visit_time_series_materialization_statuses(&mut |snapshot| statuses.push(snapshot));
+    assert_eq!(statuses[0].stale_drops_total, 1);
 }
 
 #[test]

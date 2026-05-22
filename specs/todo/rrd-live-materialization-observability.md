@@ -1,9 +1,9 @@
 ---
 type: todo
 priority: P0
-status: draft
+status: in_progress
 created: 2026-05-20
-updated: 2026-05-20
+updated: 2026-05-22
 ---
 
 # Live materialization observability without snapshot Vecs
@@ -16,10 +16,22 @@ callback-shaped provider, but the global virtual table path still materializes
 
 ## Acceptance Criteria
 
-- Live queue/status providers read storage-backed metrics/descriptors.
-- CQL virtual table reads are paged or streamed so queue observability is
+- [x] Live queue/status providers read storage-backed metrics/descriptors.
+- [ ] CQL virtual table reads are paged or streamed so queue observability is
   bounded.
-- DELTA subscriptions can observe virtual table changes without retaining
+- [x] DELTA subscriptions can observe virtual table changes without retaining
   unbounded previous snapshots.
-- Tests prove queue lag, oldest task age, and alerting state are visible.
+- [x] Tests prove queue lag, oldest task age, and alerting state are visible.
 
+## Progress Notes
+
+- Startup registers `materialization_queues` and `materialization_status` with
+  a storage-backed provider.
+- Storage exposes bounded per-consolidator queue/status descriptors:
+  queue depth, oldest task age, max delay, alerting state, pending/completed
+  counters, and stale drops.
+- Subscription row-diff coverage includes materialization virtual-table rows.
+- Current limitation: the provider is callback-shaped, but the
+  `VirtualTable::read` trait still returns `Vec<VirtualRow>`. This is bounded
+  by active consolidator count today, not by queued task count, but the generic
+  CQL virtual-table boundary is not paged/streamed yet.

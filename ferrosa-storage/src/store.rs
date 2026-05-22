@@ -548,6 +548,11 @@ impl<F: FlushTarget> TableStore<F> {
     /// big-endian clustering timestamp falls in `[window_start_ts,
     /// window_end_ts)`. Missing partitions, empty windows, and rows with
     /// non time-series clustering shapes visit zero rows.
+    ///
+    /// Current limitation: this visitor is streaming at the public API
+    /// boundary, but this implementation still reads one partition internally
+    /// before visiting matching rows. Very large partitions need a lower-level
+    /// memtable/SSTable row cursor to avoid that internal materialization.
     pub fn visit_time_series_window_rows<Cb>(
         &self,
         key: &DecoratedKey,

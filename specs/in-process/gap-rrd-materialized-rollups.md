@@ -3,7 +3,7 @@ type: gap
 priority: P0
 status: in_progress
 created: 2026-05-20
-updated: 2026-05-20
+updated: 2026-05-22
 ---
 
 # RRD consolidation extensions must materialize rollup tables
@@ -80,9 +80,18 @@ Current branch limitations:
 - Active consolidators are registered from table DDL/schema rebuild.
 - The background materialization worker drains queues and writes target-table
   mutations through `StorageEngine`.
+- The materialization drain path now uses the keyed storage cursor as the
+  source of truth for window values instead of trusting the in-memory ring as a
+  complete window. This prevents small/evicted rings from producing partial
+  rollup rows.
+- Late materialization tasks outside `consolidation.late_window` are dropped in
+  the engine drain path, increment observable stale/drop counters, and do not
+  rewrite existing rollup rows.
 - Storage has an in-memory ring streaming path for current windows. Production
-  late-window recomputation still needs a disk-backed keyed storage cursor for
-  windows that have fallen out of RAM.
+  late-window recomputation uses the keyed cursor API, but the current
+  `TableStore` implementation still materializes one partition internally
+  before visiting rows. A true memtable/SSTable row-streaming implementation
+  remains required for very large partitions.
 - WASM consolidation functions still need a streaming UDF aggregation ABI before
   they can run in the worker; list/batch-style WASM rollups are intentionally
   rejected by the new streaming aggregation path.
@@ -169,15 +178,15 @@ Implement a real materialization path for tables configured with
 - [ ] Cascaded rollups materialize through at least two tiers in an integration
       test.
 - [ ] Late data inside `late_window` re-computes the affected target row.
-- [ ] Late data older than `late_window` increments an observable stale/drop
+- [x] Late data older than `late_window` increments an observable stale/drop
       counter and does not silently rewrite rollups.
-- [ ] Materialization remains asynchronous while exposing max observed lag,
+- [x] Materialization remains asynchronous while exposing max observed lag,
       oldest queued task age, and queue depth.
 - [ ] Queue and task virtual tables can be queried and subscribed with
       `SUBSCRIBE SELECT ... DELTA`.
 - [ ] A delayed materialization queue can be detected by an alert rule using
       only virtual-table state.
-- [ ] `system_observability.consolidation_status` reflects live counters rather
+- [x] `system_observability.consolidation_status` reflects live counters rather
       than configuration only.
 - [ ] `examples/timeseries-rrd/schema.cql`, `data.cql`, and `queries.cql`
       verify real target rows, not only table existence.

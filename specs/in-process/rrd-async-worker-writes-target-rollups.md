@@ -3,7 +3,7 @@ type: todo
 priority: P0
 status: in-process
 created: 2026-05-20
-updated: 2026-05-20
+updated: 2026-05-22
 ---
 
 # Async RRD worker writes target rollup rows
@@ -37,13 +37,20 @@ descriptor tasks and writes target table mutations through storage.
 - Derived rollup writes now dispatch storage observers, so downstream cascade
   tiers can enqueue their own materialization tasks.
 - Tests now cover background worker materialization and a two-tier cascade.
+- The drain path now computes rollups through
+  `StorageEngine::visit_time_series_window_rows`, so target rows are derived
+  from storage state rather than whichever subset of values remains in the
+  active ring.
+- Stale late-data tasks outside `consolidation.late_window` are dropped before
+  recomputation, increment `stale_drops_total`, and leave existing rollup rows
+  unchanged.
 
 ## Still Not Working
 
-- Late data is recomputed only from values still present in the ring. The keyed
-  storage cursor path for windows that have fallen out of RAM is not wired.
-- `consolidation.late_window` classification is specified/tested at the
-  descriptor level, but the engine drain path does not yet drop stale tasks.
+- The keyed storage cursor is callback-shaped and is wired into the worker, but
+  the current `TableStore` implementation still reads a full partition
+  internally before visiting matching rows. Very large partitions still need a
+  true memtable/SSTable streaming cursor.
 - WASM aggregate functions are still rejected by the streaming materialization
   path until the streaming WASM aggregate ABI is implemented.
 - CQL-level eventual rollup tests are not complete yet; current coverage is at

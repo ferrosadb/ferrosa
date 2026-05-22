@@ -21,7 +21,7 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 
-use ferrosa_common::key::DecoratedKey;
+use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::TableSchema;
 use ferrosa_schema::SchemaSnapshot;
 use ferrosa_sstable::types::{Partition, Row};
@@ -35,10 +35,12 @@ use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::FileFlushTarget;
 use crate::store::TableStore;
+use crate::timeseries::aggregator::decode_typed_numeric;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
+use crate::timeseries::consolidation::{emit_accumulated_streaming_results, Accumulator};
 use crate::timeseries::{
-    ConsolidationTask, MaterializationTarget, MaterializedRollup, TimeSeriesAggregator,
-    TimeSeriesRuntimeSettings,
+    ConsolidationMetrics, ConsolidationTask, LateWindowClassification, MaterializationTarget,
+    MaterializedRollup, TimeSeriesAggregator, TimeSeriesRuntimeSettings,
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
@@ -584,7 +586,10 @@ struct TimeSeriesConsolidatorHandle {
     observer: Arc<dyn crate::observer::WriteObserver>,
     task_rx: parking_lot::Mutex<std::sync::mpsc::Receiver<ConsolidationTask>>,
     target: MaterializationTarget,
+    late_window: std::time::Duration,
     source_column_count: usize,
+    source_column_indices: Vec<u16>,
+    source_column_types: Vec<String>,
 }
 
 fn normalize_consolidation_type(type_name: &str) -> String {
@@ -1959,6 +1964,29 @@ impl StorageEngine {
                 } => {
                     let interval_micros = handle.target.interval.as_micros() as i64;
                     let window_end_ts = window_start_ts.saturating_add(interval_micros);
+                    if let Some(watermark_window_start_ts) =
+                        handle.aggregator.watermark_window_start(&partition_key)
+                    {
+                        if handle.target.classify_late_window(
+                            window_start_ts,
+                            watermark_window_start_ts,
+                            handle.late_window,
+                        ) == LateWindowClassification::Drop
+                        {
+                            if let Some(metrics) = handle.aggregator.metrics() {
+                                metrics.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::warn!(
+                                %table_id,
+                                target_table = %handle.target.target_table,
+                                window_start_ts,
+                                watermark_window_start_ts,
+                                late_window_ms = handle.late_window.as_millis(),
+                                "dropping stale time-series materialization outside late_window"
+                            );
+                            return Ok(true);
+                        }
+                    }
                     let late_offset = late_timestamp.saturating_sub(window_start_ts).max(1);
                     (
                         partition_key,
@@ -1969,23 +1997,50 @@ impl StorageEngine {
                 }
             };
 
+            let source_key = DecoratedKey::new(PartitionKey::new(partition_key.clone()));
             let mut results: SmallVec<[f64; 8]> = SmallVec::new();
             for source_column_ordinal in 0..handle.source_column_count {
-                handle
-                    .aggregator
-                    .emit_ring_window_results(
-                        &partition_key,
-                        window_start_ts,
-                        window_end_ts,
-                        source_column_ordinal,
-                        &handle.target.functions,
-                        |value| results.push(value),
-                    )
-                    .map_err(|err| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "time-series materialization for {table_id} requires unsupported window materialization: {err:?}"
-                        ))
-                    })?;
+                let column_index = handle.source_column_indices[source_column_ordinal];
+                let column_type = &handle.source_column_types[source_column_ordinal];
+                let mut acc = Accumulator::new(false);
+                self.visit_time_series_window_rows(
+                    table_id,
+                    &source_key,
+                    window_start_ts,
+                    window_end_ts,
+                    |row| {
+                        let Some((_, cell)) =
+                            row.cells.iter().find(|(idx, _)| *idx == column_index)
+                        else {
+                            return Ok(());
+                        };
+                        let Some(bytes) = cell.value.as_deref() else {
+                            return Ok(());
+                        };
+                        let Some(value) = decode_typed_numeric(bytes, column_type) else {
+                            if let Some(metrics) = handle.aggregator.metrics() {
+                                metrics.decode_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::warn!(
+                                %table_id,
+                                column_index,
+                                byte_len = bytes.len(),
+                                "failed to decode numeric bytes for time-series materialization"
+                            );
+                            return Ok(());
+                        };
+                        acc.push(value);
+                        Ok(())
+                    },
+                )?;
+                emit_accumulated_streaming_results(&mut acc, &handle.target.functions, |value| {
+                    results.push(value);
+                })
+                .map_err(|err| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "time-series materialization for {table_id} requires unsupported window materialization: {err:?}"
+                    ))
+                })?;
             }
 
             if results.is_empty() {
@@ -2162,14 +2217,17 @@ impl StorageEngine {
             functions: config.functions.clone(),
         };
         let source_column_count = value_column_indices.len();
+        let late_window = config.late_window;
+        let metrics = Arc::new(ConsolidationMetrics::new());
         let aggregator = Arc::new(
-            TimeSeriesAggregator::with_column_types_and_runtime_settings(
+            TimeSeriesAggregator::with_column_types_runtime_settings_and_metrics(
                 config,
                 table_id.clone(),
-                value_column_indices,
-                column_types,
+                value_column_indices.clone(),
+                column_types.clone(),
                 task_tx,
                 Arc::clone(&self.time_series_runtime_settings),
+                metrics,
             ),
         );
         let observer: Arc<dyn crate::observer::WriteObserver> = aggregator.clone();
@@ -2179,7 +2237,10 @@ impl StorageEngine {
             observer,
             task_rx: parking_lot::Mutex::new(task_rx),
             target,
+            late_window,
             source_column_count,
+            source_column_indices: value_column_indices,
+            source_column_types: column_types,
         }))
     }
 
