@@ -4,6 +4,38 @@ All notable changes to Ferrosa are documented in this file. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-05-22
+
+### Fixed
+
+- **macOS port 7000 conflict.** Default internode bind address changed from
+  `:7000` to `:17000` to avoid colliding with macOS ControlCenter, which
+  listens on 7000 in macOS 13+. Startup now emits a diagnostic error message
+  if a bind on 7000 is attempted, identifying the conflict and suggesting
+  `:17000`.
+- **TOML config not honored for core settings.** `ferrosa.toml` values for
+  internode bind, graph, storage, and auth were silently ignored when the
+  corresponding `FERROSA_*` environment variables were not set. All four
+  setting groups now read from TOML when env vars are absent.
+- **Corrupt or empty `host_id` on startup.** Stale, corrupt, or zero-byte
+  single-node `host_id` files are now detected at startup and regenerated
+  automatically with an actionable log message, rather than crashing or
+  silently diverging into split-brain state.
+
+### Changed
+
+- Default internode bind port: **7000 → 17000**. Update any firewall rules,
+  launchd plists, or `[internode] bind_addr` TOML overrides that reference the
+  old port. The `FERROSA_INTERNODE_BIND` environment variable and TOML key
+  still accept arbitrary values.
+
+### Docs
+
+- Shipped config templates and source defaults updated to `:17000` internode
+  port and current auth role names (`ferrosa_admin`, `ferrosa_user`).
+
+[0.11.0]: https://github.com/ferrosadb/ferrosa/compare/v0.10.0...v0.11.0
+
 ## [0.10.0] - 2026-05-16
 
 ### Added
