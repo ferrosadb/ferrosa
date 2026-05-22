@@ -292,6 +292,18 @@ mod tests {
     }
 
     #[test]
+    fn render_metrics_exposes_fd_budget_and_emfile() {
+        // Operators need these three families visible on every scrape
+        // so the macOS-launchd EMFILE failure mode (see spec
+        // p0-emfile-launchd-startup) shows up in dashboards.
+        let registry = VirtualTableRegistry::new();
+        let output = render_metrics(&registry);
+        assert!(output.contains("ferrosa_emfile_total"));
+        assert!(output.contains("ferrosa_fd_budget_soft"));
+        assert!(output.contains("ferrosa_fd_budget_hard"));
+    }
+
+    #[test]
     fn render_metrics_includes_process_memory() {
         let registry = VirtualTableRegistry::new();
         let output = render_metrics(&registry);

@@ -540,6 +540,45 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(Some(merge::merge_partitions(sources)))
     }
 
+    /// Visit rows for one partition and timestamp window without returning an
+    /// owned [`Partition`] or result vector to the caller.
+    ///
+    /// This is the storage cursor used by RRD late-window recomputation. It is
+    /// keyed to one partition and invokes `cb` for each row whose 8-byte
+    /// big-endian clustering timestamp falls in `[window_start_ts,
+    /// window_end_ts)`. Missing partitions, empty windows, and rows with
+    /// non time-series clustering shapes visit zero rows.
+    pub fn visit_time_series_window_rows<Cb>(
+        &self,
+        key: &DecoratedKey,
+        window_start_ts: i64,
+        window_end_ts: i64,
+        mut cb: Cb,
+    ) -> Result<usize>
+    where
+        Cb: FnMut(&Row) -> Result<()>,
+    {
+        if window_start_ts >= window_end_ts {
+            return Ok(0);
+        }
+
+        let Some(partition) = self.read(key)? else {
+            return Ok(0);
+        };
+
+        let mut visited = 0;
+        for row in &partition.rows {
+            let Some(ts) = time_series_row_timestamp(row) else {
+                continue;
+            };
+            if ts >= window_start_ts && ts < window_end_ts {
+                cb(row)?;
+                visited += 1;
+            }
+        }
+        Ok(visited)
+    }
+
     /// Flush the active memtable to an SSTable.
     ///
     /// The flush sequence:
@@ -2321,6 +2360,11 @@ impl<F: FlushTarget> TableStore<F> {
             })
             .collect()
     }
+}
+
+fn time_series_row_timestamp(row: &Row) -> Option<i64> {
+    let bytes: [u8; 8] = row.clustering.as_slice().try_into().ok()?;
+    Some(i64::from_be_bytes(bytes))
 }
 
 fn late_partition_needs_replay(

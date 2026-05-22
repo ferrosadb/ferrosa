@@ -4,6 +4,37 @@ All notable changes to Ferrosa are documented in this file. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-05-22
+
+### Added
+
+- RRD-style time-series consolidation for built-in streaming rollups:
+  DDL-registered consolidators, bounded ring buffers, materialization queues,
+  background worker draining, derived target-table writes, and cascade
+  propagation.
+- Time-series materialization observability via
+  `system_observability.materialization_queues`,
+  `system_observability.materialization_status`, and
+  `system_observability.rrd_runtime_settings`.
+- Runnable `examples/timeseries-rrd` sensor demo with built-in
+  min/max/avg/stddev rollups and a static smoke contract.
+
+### Changed
+
+- Derived rollup rows now dispatch storage observers so downstream RRD tiers can
+  enqueue and materialize cascade windows.
+- Time-series write observers use the row clustering timestamp as the event
+  timestamp, so materialized rollup rows cascade by window start rather than by
+  worker write time.
+
+### Known Limitations
+
+- WASM aggregate loading syntax is documented, but live RRD materialization
+  rejects `wasm:` aggregate functions until the streaming aggregate ABI lands.
+- Late-data recomputation currently covers values still present in the
+  in-memory ring; disk-backed keyed window streaming remains tracked as
+  follow-up work.
+
 ## [0.11.0] - 2026-05-22
 
 ### Fixed
@@ -34,6 +65,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - Shipped config templates and source defaults updated to `:17000` internode
   port and current auth role names (`ferrosa_admin`, `ferrosa_user`).
 
+[0.12.0]: https://github.com/ferrosadb/ferrosa/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ferrosadb/ferrosa/compare/v0.10.0...v0.11.0
 
 ## [0.10.0] - 2026-05-16

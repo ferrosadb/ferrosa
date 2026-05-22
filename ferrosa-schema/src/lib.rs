@@ -51,6 +51,6 @@ pub use system::type_tables::SystemSchemaTypesTable;
 pub use system::TopologyView;
 pub use virtual_registry::VirtualTableRegistry;
 pub use virtual_table::{
-    ColumnFilter, PredicateOp, RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow,
-    VirtualTable, WireType,
+    ColumnFilter, PredicateOp, RowPredicate, SubscriptionMode, VirtualColumnDef,
+    VirtualColumnUpdate, VirtualRow, VirtualTable, VirtualTableUpdate, WireType,
 };

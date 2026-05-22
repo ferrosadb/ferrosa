@@ -1,0 +1,512 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ferrosa_common::cell::CellValue;
+use ferrosa_common::key::{DecoratedKey, PartitionKey};
+use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use ferrosa_storage::timeseries::{
+    ConsolidationFn, LateWindowClassification, MaterializationQueue, MaterializationRequest,
+    MaterializationTarget, MaterializationTaskKind, MaterializedRollup,
+};
+use ferrosa_storage::{
+    CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+    TableId,
+};
+
+fn target() -> MaterializationTarget {
+    MaterializationTarget {
+        source_table: TableId::new("ks", "sensor"),
+        target_table: TableId::new("ks", "sensor_10s"),
+        interval: Duration::from_secs(10),
+        source_columns: vec!["value".to_string()],
+        functions: vec![
+            ConsolidationFn::Min,
+            ConsolidationFn::Max,
+            ConsolidationFn::Avg,
+            ConsolidationFn::Wasm {
+                keyspace: "ks".to_string(),
+                function_name: "custom_rollup".to_string(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn materialized_rollup_encodes_target_mutation_rows() {
+    let rollup = MaterializedRollup {
+        target: target(),
+        partition_key: b"sensor-1".to_vec(),
+        window_start_ts: 1_000_000,
+    };
+
+    let mutation = rollup.encode_mutation_from_results([2.0, 8.0, 5.0, 2.5]);
+
+    assert_eq!(mutation.keyspace, "ks");
+    assert_eq!(mutation.table, "sensor_10s");
+    assert_eq!(mutation.key.key.as_bytes(), b"sensor-1");
+    assert_eq!(mutation.timestamp, 1_000_000);
+    assert_eq!(mutation.rows.len(), 1);
+
+    let row = &mutation.rows[0];
+    assert_eq!(row.clustering, 1_000_000_i64.to_be_bytes().to_vec());
+    assert_eq!(row.cells.len(), 4);
+
+    let decoded: Vec<f64> = row
+        .cells
+        .iter()
+        .map(|(_, cell)| {
+            let bytes = cell.value.as_ref().expect("rollup cells are live values");
+            f64::from_be_bytes(bytes.as_slice().try_into().unwrap())
+        })
+        .collect();
+
+    assert_eq!(decoded[0], 2.0);
+    assert_eq!(decoded[1], 8.0);
+    assert_eq!(decoded[2], 5.0);
+    assert_eq!(decoded[3], 2.5);
+}
+
+#[test]
+fn materialization_queue_tracks_descriptor_snapshots_and_drops_when_full() {
+    let queue = MaterializationQueue::new(1);
+    let request = MaterializationRequest {
+        target: target(),
+        partition_key: b"sensor-1".to_vec(),
+        window_start_ts: 0,
+        window_end_ts: 10_000_000,
+        kind: MaterializationTaskKind::FreshBoundary,
+        retry_count: 0,
+    };
+
+    assert!(queue.enqueue(request.clone()).is_ok());
+    assert!(queue.enqueue(request).is_err());
+
+    let snapshot = queue.metrics().snapshot();
+    assert_eq!(snapshot.enqueued, 1);
+    assert_eq!(snapshot.dropped_full, 1);
+    assert_eq!(snapshot.pending, 1);
+
+    let drained = queue.drain_next().expect("queued descriptor drains");
+    assert_eq!(drained.partition_key, b"sensor-1");
+    assert_eq!(drained.window_start_ts, 0);
+    assert_eq!(drained.window_end_ts, 10_000_000);
+    assert_eq!(drained.kind, MaterializationTaskKind::FreshBoundary);
+
+    let snapshot = queue.metrics().snapshot();
+    assert_eq!(snapshot.drained, 1);
+    assert_eq!(snapshot.pending, 0);
+}
+
+#[test]
+fn materialization_request_converts_descriptor_to_rollup_encoder() {
+    let request = MaterializationRequest {
+        target: target(),
+        partition_key: b"sensor-2".to_vec(),
+        window_start_ts: 20_000_000,
+        window_end_ts: 30_000_000,
+        kind: MaterializationTaskKind::LateDataRecalculation,
+        retry_count: 2,
+    };
+
+    let rollup = request.into_rollup();
+
+    assert_eq!(rollup.target.target_table.table, "sensor_10s");
+    assert_eq!(rollup.partition_key, b"sensor-2");
+    assert_eq!(rollup.window_start_ts, 20_000_000);
+}
+
+#[test]
+fn late_window_classifies_fresh_stale_and_drop_windows() {
+    let target = target();
+
+    assert_eq!(
+        target.classify_late_window(30_000_000, 20_000_000, Duration::from_micros(10_000_000),),
+        LateWindowClassification::Fresh
+    );
+    assert_eq!(
+        target.classify_late_window(10_000_000, 30_000_000, Duration::from_micros(25_000_000),),
+        LateWindowClassification::Stale
+    );
+    assert_eq!(
+        target.classify_late_window(0, 40_000_000, Duration::from_micros(20_000_000),),
+        LateWindowClassification::Drop
+    );
+}
+
+fn timeseries_schema() -> TableSchema {
+    TableSchema {
+        keyspace: "ks".to_string(),
+        table: "sensor".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![ColumnDefinition {
+            name: "ts".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.LongType".to_string(),
+        }],
+        static_columns: vec![],
+        regular_columns: vec![ColumnDefinition {
+            name: "value".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.DoubleType".to_string(),
+        }],
+        extensions: Default::default(),
+    }
+}
+
+fn live_consolidation_schema() -> TableSchema {
+    let mut schema = timeseries_schema();
+    schema.extensions = HashMap::from([
+        ("consolidation.interval".to_string(), "10s".to_string()),
+        ("consolidation.functions".to_string(), "avg".to_string()),
+        ("consolidation.target".to_string(), "sensor_10s".to_string()),
+        ("consolidation.columns".to_string(), "value".to_string()),
+        ("consolidation.ring_capacity".to_string(), "64".to_string()),
+        (
+            "consolidation.channel_capacity".to_string(),
+            "8".to_string(),
+        ),
+    ]);
+    schema
+}
+
+fn rollup_schema(
+    table: &str,
+    columns: &[&str],
+    extensions: HashMap<String, String>,
+) -> TableSchema {
+    TableSchema {
+        keyspace: "ks".to_string(),
+        table: table.to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![ColumnDefinition {
+            name: "ts".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.LongType".to_string(),
+        }],
+        static_columns: vec![],
+        regular_columns: columns
+            .iter()
+            .map(|name| ColumnDefinition {
+                name: (*name).to_string(),
+                type_name: "org.apache.cassandra.db.marshal.DoubleType".to_string(),
+            })
+            .collect(),
+        extensions,
+    }
+}
+
+fn sensor_10s_schema() -> TableSchema {
+    rollup_schema("sensor_10s", &["value_avg"], HashMap::new())
+}
+
+fn sensor_10s_cascade_schema() -> TableSchema {
+    rollup_schema(
+        "sensor_10s",
+        &["value_avg"],
+        HashMap::from([
+            ("consolidation.interval".to_string(), "20s".to_string()),
+            ("consolidation.functions".to_string(), "avg".to_string()),
+            ("consolidation.target".to_string(), "sensor_20s".to_string()),
+            ("consolidation.columns".to_string(), "value_avg".to_string()),
+            ("consolidation.ring_capacity".to_string(), "64".to_string()),
+            (
+                "consolidation.channel_capacity".to_string(),
+                "8".to_string(),
+            ),
+        ]),
+    )
+}
+
+fn sensor_20s_schema() -> TableSchema {
+    rollup_schema("sensor_20s", &["value_avg_avg"], HashMap::new())
+}
+
+fn make_engine(dir: &std::path::Path) -> StorageEngine {
+    let config = StorageEngineConfig {
+        commit_log: CommitLogConfig {
+            segment_size: 4096,
+            max_segment_age: Duration::from_secs(60),
+            sync_strategy: SyncStrategyConfig::Batch,
+            log_dir: dir.join("commitlog"),
+            checkpoint_dir: dir.join("commitlog"),
+            archive: None,
+        },
+        compaction: CompactionConfig::from_env(dir.join("compaction")),
+        object_store: None,
+        local_cache_max_bytes: 1024 * 1024,
+        flush_threshold_bytes: 4096,
+        memtable_backpressure_bytes: u64::MAX,
+        flush_max_age_secs: 5,
+        data_dir: dir.to_path_buf(),
+        index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
+        write_verify: false,
+    };
+    StorageEngine::new(config, None).unwrap()
+}
+
+fn key(bytes: &[u8]) -> DecoratedKey {
+    DecoratedKey::new(PartitionKey::new(bytes.to_vec()))
+}
+
+fn sensor_row(ts: i64, value: f64) -> Row {
+    Row {
+        clustering: ts.to_be_bytes().to_vec(),
+        cells: vec![(0, CellValue::live(value.to_be_bytes().to_vec(), ts))],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(ts),
+    }
+}
+
+fn row_double(row: &Row) -> f64 {
+    let bytes = row.cells[0].1.value.as_ref().expect("live value cell");
+    f64::from_be_bytes(bytes.as_slice().try_into().unwrap())
+}
+
+fn read_first_value(engine: &StorageEngine, table_id: &TableId, key: &DecoratedKey) -> Option<f64> {
+    engine
+        .read(table_id, key)
+        .unwrap()
+        .and_then(|partition| partition.rows.first().map(row_double))
+}
+
+#[test]
+fn keyed_time_series_window_cursor_streams_rows_without_returning_partitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let table_id = TableId::new("ks", "sensor");
+    let sensor = key(b"sensor-1");
+    let other = key(b"sensor-2");
+    engine.register_table(timeseries_schema()).unwrap();
+
+    engine
+        .write(&table_id, &sensor, sensor_row(0, 1.0), 0)
+        .unwrap();
+    engine
+        .write(&table_id, &sensor, sensor_row(5, 2.0), 5)
+        .unwrap();
+    engine
+        .write(&table_id, &other, sensor_row(7, 99.0), 7)
+        .unwrap();
+    engine.flush(&table_id).unwrap();
+    engine
+        .write(&table_id, &sensor, sensor_row(10, 3.0), 10)
+        .unwrap();
+    engine
+        .write(&table_id, &sensor, sensor_row(15, 4.0), 15)
+        .unwrap();
+
+    let mut values = Vec::new();
+    let visited = engine
+        .visit_time_series_window_rows(&table_id, &sensor, 5, 15, |row| {
+            values.push(row_double(row));
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(visited, 2);
+    assert_eq!(values, vec![2.0, 3.0]);
+}
+
+#[test]
+fn keyed_time_series_window_cursor_visits_zero_for_missing_or_empty_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let table_id = TableId::new("ks", "sensor");
+    let sensor = key(b"sensor-1");
+    engine.register_table(timeseries_schema()).unwrap();
+    engine
+        .write(&table_id, &sensor, sensor_row(10, 3.0), 10)
+        .unwrap();
+
+    let mut called = false;
+    assert_eq!(
+        engine
+            .visit_time_series_window_rows(&table_id, &key(b"missing"), 0, 20, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap(),
+        0
+    );
+    assert!(!called);
+
+    assert_eq!(
+        engine
+            .visit_time_series_window_rows(&table_id, &sensor, 20, 30, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap(),
+        0
+    );
+    assert!(!called);
+
+    assert_eq!(
+        engine
+            .visit_time_series_window_rows(&table_id, &sensor, 30, 30, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap(),
+        0
+    );
+    assert!(!called);
+}
+
+#[test]
+fn storage_materialization_observability_reports_live_queue_lag() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let table_id = TableId::new("ks", "sensor");
+    let sensor = key(b"sensor-1");
+    engine.register_table(live_consolidation_schema()).unwrap();
+
+    for ts in 0..10 {
+        engine
+            .write(
+                &table_id,
+                &sensor,
+                sensor_row(ts * 1_000_000, ts as f64),
+                ts,
+            )
+            .unwrap();
+    }
+    engine
+        .write(&table_id, &sensor, sensor_row(10_000_000, 10.0), 10_000_000)
+        .unwrap();
+
+    let mut queues = Vec::new();
+    engine.visit_time_series_materialization_queues(&mut |snapshot| queues.push(snapshot));
+    assert_eq!(queues.len(), 1);
+    assert_eq!(queues[0].source_table, table_id);
+    assert_eq!(queues[0].target_table, TableId::new("ks", "sensor_10s"));
+    assert_eq!(queues[0].window_start_ts, 0);
+    assert_eq!(queues[0].window_end_ts, 10_000_000);
+    assert_eq!(queues[0].task_type, "window_close");
+    assert_eq!(queues[0].queue_depth, 1);
+    assert!(queues[0].enqueued_at_ms > 0);
+    assert!(queues[0].max_delay_ms > 0);
+
+    let mut statuses = Vec::new();
+    engine.visit_time_series_materialization_statuses(&mut |snapshot| statuses.push(snapshot));
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].pending_tasks, 1);
+    assert_eq!(statuses[0].status, "pending");
+
+    assert!(engine
+        .process_one_time_series_materialization(&table_id)
+        .unwrap());
+
+    let mut drained = Vec::new();
+    engine.visit_time_series_materialization_queues(&mut |snapshot| drained.push(snapshot));
+    assert_eq!(drained[0].queue_depth, 0);
+    assert_eq!(drained[0].task_type, "empty");
+}
+
+#[test]
+fn materialization_drain_writes_queryable_rollup_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let source_table = TableId::new("ks", "sensor");
+    let target_table = TableId::new("ks", "sensor_10s");
+    let sensor = key(b"sensor-1");
+    engine.register_table(sensor_10s_schema()).unwrap();
+    engine.register_table(live_consolidation_schema()).unwrap();
+
+    for ts in 0..=10 {
+        engine
+            .write(
+                &source_table,
+                &sensor,
+                sensor_row(ts * 1_000_000, ts as f64),
+                ts * 1_000_000,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        engine
+            .process_pending_time_series_materializations(8)
+            .unwrap(),
+        1
+    );
+    let value = read_first_value(&engine, &target_table, &sensor).unwrap();
+    assert!((value - 4.5).abs() < f64::EPSILON);
+}
+
+#[test]
+fn materialization_drain_dispatches_rollup_writes_to_cascade_observers() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let source_table = TableId::new("ks", "sensor");
+    let tier1_table = TableId::new("ks", "sensor_10s");
+    let tier2_table = TableId::new("ks", "sensor_20s");
+    let sensor = key(b"sensor-1");
+    engine.register_table(sensor_20s_schema()).unwrap();
+    engine.register_table(sensor_10s_cascade_schema()).unwrap();
+    engine.register_table(live_consolidation_schema()).unwrap();
+
+    for ts in 0..=30 {
+        engine
+            .write(
+                &source_table,
+                &sensor,
+                sensor_row(ts * 1_000_000, ts as f64),
+                ts * 1_000_000,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        engine
+            .process_pending_time_series_materializations(8)
+            .unwrap(),
+        4
+    );
+    assert!(read_first_value(&engine, &tier1_table, &sensor).is_some());
+    let value = read_first_value(&engine, &tier2_table, &sensor).unwrap();
+    assert!((value - 9.5).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn background_materialization_worker_eventually_writes_rollups() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(make_engine(dir.path()));
+    let source_table = TableId::new("ks", "sensor");
+    let target_table = TableId::new("ks", "sensor_10s");
+    let sensor = key(b"sensor-1");
+    engine.register_table(sensor_10s_schema()).unwrap();
+    engine.register_table(live_consolidation_schema()).unwrap();
+    let worker = StorageEngine::spawn_time_series_materialization_worker_with_config(
+        engine.clone(),
+        Duration::from_millis(5),
+        8,
+    );
+
+    for ts in 0..=10 {
+        engine
+            .write(
+                &source_table,
+                &sensor,
+                sensor_row(ts * 1_000_000, ts as f64),
+                ts * 1_000_000,
+            )
+            .unwrap();
+    }
+
+    let mut value = None;
+    for _ in 0..40 {
+        if let Some(found) = read_first_value(&engine, &target_table, &sensor) {
+            value = Some(found);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    worker.abort();
+
+    let value = value.expect("background materialization worker wrote target row");
+    assert!((value - 4.5).abs() < f64::EPSILON);
+}

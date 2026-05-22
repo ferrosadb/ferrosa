@@ -692,6 +692,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(%e, "failed to register system tables at startup");
     }
 
+    ferrosa_storage::StorageEngine::spawn_time_series_materialization_worker(storage.clone());
+
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
 
