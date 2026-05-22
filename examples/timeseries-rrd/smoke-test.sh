@@ -46,6 +46,8 @@ require_text queries.cql "FERROSA_RRD_RING_MEMORY_BUDGET_BYTES"
 
 require_text custom-wasm-udf.cql "CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)"
 require_text custom-wasm-udf.cql "not enabled for live materialization"
+require_text custom-wasm-udf.cql "streaming WASM aggregate ABI"
+require_text median.cql "rejects median at DDL time"
 require_regex custom-wasm-udf.cql "AS '0x[0-9a-fA-F]+';"
 require_text custom-wasm-udf.cql "AS FILE '/secure/udf/stddev.wasm';"
 require_text custom-wasm-udf.cql "AS URL 'https://artifacts.example/ferrosa/stddev.wasm'"

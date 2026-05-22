@@ -95,8 +95,9 @@ Current branch limitations:
   before visiting rows. A true memtable/SSTable row-streaming implementation
   remains required for very large partitions.
 - WASM consolidation functions still need a streaming UDF aggregation ABI before
-  they can run in the worker; list/batch-style WASM rollups are intentionally
-  rejected by the new streaming aggregation path.
+  they can run in the worker. Live RRD DDL now rejects `wasm:keyspace.function`
+  rollups with a clear streaming-ABI error instead of accepting a table that
+  later fails during materialization.
 - Median remains non-streaming because it requires ordered/materialized window
   state; it needs a bounded approximate sketch or external sort design before
   production materialization.

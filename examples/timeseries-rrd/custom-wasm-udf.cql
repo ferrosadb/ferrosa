@@ -36,8 +36,11 @@ CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
   AS URL 'https://artifacts.example/ferrosa/stddev.wasm'
   WITH SHA256 = '3dbe4f6fb3f44dfb11ad93f6c07f81a4b34d217f8dcf7dd06d80670d88e6b7c1';
 
--- The source table references the UDF through the wasm:keyspace.function_name
--- consolidation function syntax:
+-- Future table syntax will reference the UDF through the
+-- wasm:keyspace.function_name consolidation function syntax. Current releases
+-- reject this CREATE TABLE with a clear "streaming WASM aggregate ABI" error
+-- because live RRD materialization cannot execute list-style WASM aggregates
+-- without materializing the whole window.
 CREATE TABLE vibration_with_wasm_stddev (
     sensor_id uuid,
     ts timestamp,
@@ -51,7 +54,8 @@ CREATE TABLE vibration_with_wasm_stddev (
     'consolidation.columns': 'vibration_mm_s'
   };
 
--- Output table vibration_with_wasm_stddev_5m will have columns:
+-- Once the streaming ABI exists, output table vibration_with_wasm_stddev_5m
+-- will have columns:
 --   vibration_mm_s_min       double   (built-in min)
 --   vibration_mm_s_max       double   (built-in max)
 --   vibration_mm_s_avg       double   (built-in avg)

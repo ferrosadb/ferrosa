@@ -1,7 +1,10 @@
 -- RRD Cascading Time-Series Aggregation: Median Example
 --
 -- Median requires sorting values within a window (O(n log n)).
--- It is computed separately from the single-pass Welford accumulator.
+-- Current live RRD materialization rejects median at DDL time because the
+-- worker is single-pass streaming only and does not materialize full windows.
+-- Treat this file as the future behavior contract for a bounded ordered/sketch
+-- implementation, not as a runnable script for this release.
 
 USE sensors;
 

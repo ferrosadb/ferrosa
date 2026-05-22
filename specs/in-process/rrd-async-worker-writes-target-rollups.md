@@ -53,7 +53,7 @@ descriptor tasks and writes target table mutations through storage.
   the current `TableStore` implementation still reads a full partition
   internally before visiting matching rows. Very large partitions still need a
   true memtable/SSTable streaming cursor.
-- WASM aggregate functions are still rejected by the streaming materialization
-  path until the streaming WASM aggregate ABI is implemented.
+- WASM aggregate functions are rejected during live RRD DDL until the streaming
+  WASM aggregate ABI is implemented.
 - End-to-end process supervision is still covered by the example script rather
   than an in-process router test with the background worker running.

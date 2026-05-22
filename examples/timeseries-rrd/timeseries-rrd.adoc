@@ -120,7 +120,7 @@ include::custom-wasm-udf.cql[lines=34..47]
 ----
 
 Do not use `wasm:` functions in live RRD materialization on this release.
-The worker rejects non-streaming WASM aggregate tasks rather than silently computing partial rollups.
+DDL rejects non-streaming WASM aggregate functions with a clear streaming-ABI error rather than creating a table that later computes partial rollups.
 The URL form requires a SHA-256 digest so artifact bytes cannot change between review and DDL apply.
 
 == Built-in Functions

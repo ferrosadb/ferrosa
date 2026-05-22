@@ -8317,6 +8317,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_table_rejects_non_streaming_rrd_wasm_function() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE rrd_wasm WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let err = match route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE rrd_wasm.sensor (sensor_id text, ts bigint, value double, PRIMARY KEY (sensor_id, ts)) WITH extensions = {'consolidation.interval': '10s', 'consolidation.functions': 'wasm:rrd_wasm.stddev', 'consolidation.target': 'sensor_10s', 'consolidation.columns': 'value'}",
+            )
+            .unwrap(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected WASM RRD function DDL to fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("streaming WASM aggregate ABI"),
+            "WASM rollup DDL must fail clearly until the streaming ABI exists: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn feedback_outcomes_boolean_is_stored_as_single_byte_at_succeeded_column() {
         let (state, _dir) = setup();
         let auth = dev_auth();

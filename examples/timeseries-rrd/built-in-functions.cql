@@ -71,7 +71,8 @@ CREATE TABLE demo_sum (
   };
 
 -- MEDIAN: middle value (requires sort, O(n log n)).
--- See also median.cql for a detailed median-only example.
+-- Current live RRD materialization rejects median at DDL time because the
+-- worker is single-pass streaming only. See median.cql for the future design.
 CREATE TABLE demo_median (
     id uuid, ts timestamp, value double,
     PRIMARY KEY (id, ts)
@@ -82,15 +83,16 @@ CREATE TABLE demo_median (
     'consolidation.columns': 'value'
   };
 
--- All functions combined in a single table.
+-- All streaming-safe functions combined in a single table. Do not include
+-- median here until the bounded ordered/sketch design lands.
 -- Produces columns: value_min, value_max, value_avg, value_stddev,
---                   value_count, value_sum, value_median.
+--                   value_count, value_sum.
 CREATE TABLE demo_all (
     id uuid, ts timestamp, value double,
     PRIMARY KEY (id, ts)
 ) WITH extensions = {
     'consolidation.interval': '5m',
-    'consolidation.functions': 'min,max,avg,stddev,count,sum,median',
+    'consolidation.functions': 'min,max,avg,stddev,count,sum',
     'consolidation.target': 'demo_all_5m',
     'consolidation.columns': 'value'
   };
@@ -114,4 +116,3 @@ INSERT INTO demo_all (id, ts, value)
 --   value_stddev = 14.142... (population stddev)
 --   value_count  = 5.0
 --   value_sum    = 150.0
---   value_median = 30.0

@@ -150,6 +150,7 @@ impl ConsolidationConfig {
         // Required: functions.
         if let Some(funcs_str) = ext.get("consolidation.functions") {
             config.functions = ConsolidationFn::parse_list(funcs_str)?;
+            validate_live_materialization_functions(&config.functions)?;
         } else {
             return Err("consolidation.functions is required".to_string());
         }
@@ -250,6 +251,29 @@ impl ConsolidationConfig {
     pub fn interval_micros(&self) -> i64 {
         self.interval.as_micros() as i64
     }
+}
+
+fn validate_live_materialization_functions(functions: &[ConsolidationFn]) -> Result<(), String> {
+    for function in functions {
+        match function {
+            ConsolidationFn::Median => {
+                return Err(
+                    "consolidation function 'median' requires materialized windows and is not supported for live RRD materialization yet".to_string()
+                );
+            }
+            ConsolidationFn::Wasm {
+                keyspace,
+                function_name,
+            } => {
+                return Err(format!(
+                    "consolidation function 'wasm:{keyspace}.{function_name}' requires the streaming WASM aggregate ABI, which is not implemented yet"
+                ));
+            }
+            ConsolidationFn::Composite(inner) => validate_live_materialization_functions(inner)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Derive the default active-ring heap budget.
@@ -610,6 +634,31 @@ mod tests {
         // Missing functions and target.
         let result = ConsolidationConfig::from_extensions(&ext).unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_rejects_non_streaming_materialization_functions() {
+        for (function, expected) in [
+            ("median", "requires materialized windows"),
+            (
+                "wasm:plant.stddev",
+                "requires the streaming WASM aggregate ABI",
+            ),
+        ] {
+            let mut ext = HashMap::new();
+            ext.insert("consolidation.interval".into(), "5m".into());
+            ext.insert("consolidation.functions".into(), function.into());
+            ext.insert("consolidation.target".into(), "sensor_5m".into());
+            ext.insert("consolidation.columns".into(), "value".into());
+
+            let err = ConsolidationConfig::from_extensions(&ext)
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                err.contains(expected),
+                "expected '{expected}' in error for {function}: {err}"
+            );
+        }
     }
 
     // --- Task 16: Cascade and ring param parsing tests ---
