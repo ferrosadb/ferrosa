@@ -1,9 +1,9 @@
 ---
 type: todo
 priority: P3
-status: draft
+status: implemented
 created: 2026-05-11
-updated: 2026-05-11
+updated: 2026-05-22
 ---
 
 # Bug: `PREPARE` rejects `?` bind markers on `system_schema.keyspaces`
@@ -82,3 +82,10 @@ present, type inference failed).
 `migrate --probe-only` switched to reading the full keyspace list and
 filtering client-side instead of using `WHERE keyspace_name = ?`. Cheap
 (handful of rows) and avoids the PREPARE failure entirely.
+
+## Implementation Notes
+
+- Added regression coverage for `SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?`.
+- Added system-schema column type fallback for PREPARE bind-marker and result-column metadata when the table is virtual/system metadata rather than a registered user table.
+- Preserved normal user-table metadata resolution and `SELECT *` result metadata behavior.
+- Verified with `cargo test -p ferrosa-cql prepare_metadata_resolves_system_schema_keyspace_bind_marker --lib`.
