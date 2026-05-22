@@ -44,6 +44,7 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+      RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS: "true"
     volumes:
       - jepsen-rustfs-data:/data
     healthcheck:
