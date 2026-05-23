@@ -2,10 +2,10 @@
 type: bug
 priority: P3
 reported-by: ferrosa-memory launch debugging
-implemented-by: ""
+implemented-by: "codex"
 verified-by: ""
 created: 2026-04-18
-updated: 2026-04-18
+updated: 2026-05-22
 ---
 
 # Lane reconnect may use stale IP when peer container restarts with new IP
@@ -37,3 +37,12 @@ to current hostname and update it when peers reconnect from new IPs.
 P3 — only affects container restarts with IP reassignment. The workaround
 is to restart the connecting node too, or use static IPs in the compose
 network.
+
+## Implementation Notes
+
+- Updated cluster peer tracking so reconnects replace an existing peer's
+  address instead of preserving the first observed container IP forever.
+- Added `ClusterInvite` connection planning that refuses to downgrade an
+  already-live peer to a conflicting stale address advertised by another node.
+- Added regression tests for stale `connected_peers` reuse and stale invite
+  address downgrades.

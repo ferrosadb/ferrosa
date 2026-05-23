@@ -1,4 +1,4 @@
--- RRD Cascading Time-Series Aggregation: Late-Arriving Data
+-- RRD Time-Series Aggregation: Late-Arriving Data
 --
 -- Demonstrates re-aggregation when late data arrives after a window
 -- has already been consolidated.
@@ -19,10 +19,10 @@ INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
 -- 3. Worker reads full window from disk
 -- 4. Re-runs consolidation with the late point included
 -- 5. Upserts corrected aggregate into sensor_readings_5m
--- 6. The upsert triggers sensor_readings_5m's observer -> cascade continues
 
 -- Late data is only accepted within the configured late_window (15m).
--- Data older than boundary_ts - late_window is silently dropped.
+-- Data older than boundary_ts - late_window is dropped and counted in
+-- materialization observability.
 
 -- Verify the corrected aggregates:
 SELECT * FROM sensor_readings_5m

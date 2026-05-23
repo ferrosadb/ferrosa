@@ -1552,17 +1552,17 @@ fn analyze_prepared_columns(
     }
 
     let snap = state.schema.snapshot();
-    let table_meta = match snap
+    let table_meta = snap
         .tables
-        .get(&(table_ks.to_string(), table_name.to_string()))
-    {
-        Some(tm) => tm,
-        None => return (Vec::new(), Vec::new()),
-    };
+        .get(&(table_ks.to_string(), table_name.to_string()));
 
     let resolve = |col_name: &str| -> Option<CqlType> {
-        let col = table_meta.columns.get(col_name)?;
-        bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+        table_meta
+            .and_then(|table_meta| table_meta.columns.get(col_name))
+            .and_then(|col| {
+                bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+            })
+            .or_else(|| system_schema_column_type(table_ks, table_name, col_name))
     };
 
     let mut bound_columns = Vec::new();
@@ -1578,7 +1578,8 @@ fn analyze_prepared_columns(
             }
 
             // Build result columns from the SELECT column list
-            let result_columns = build_result_columns(&s.columns, table_meta, table_ks, state);
+            let result_columns =
+                build_result_columns(&s.columns, table_meta, table_ks, table_name, state);
             return (bound_columns, result_columns);
         }
         Statement::Insert(i) => {
@@ -1700,6 +1701,105 @@ fn select_bind_marker_columns(s: &SelectStatement) -> Vec<&str> {
     columns
 }
 
+fn system_schema_column_type(table_ks: &str, table_name: &str, col_name: &str) -> Option<CqlType> {
+    system_schema_column_specs(table_ks, table_name)
+        .into_iter()
+        .find(|(name, _)| name == col_name)
+        .map(|(_, ty)| ty)
+}
+
+fn system_schema_column_specs(table_ks: &str, table_name: &str) -> Vec<(String, CqlType)> {
+    if table_ks != "system_schema" {
+        return Vec::new();
+    }
+
+    let text = || CqlType::Varchar;
+    let text_map = || CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar));
+    let text_list = || CqlType::List(Box::new(CqlType::Varchar));
+
+    let specs: Vec<(&str, CqlType)> = match table_name {
+        "keyspaces" => vec![
+            ("keyspace_name", text()),
+            ("durable_writes", CqlType::Boolean),
+            ("replication", text_map()),
+        ],
+        "tables" => vec![
+            ("keyspace_name", text()),
+            ("table_name", text()),
+            ("id", CqlType::Uuid),
+            ("cdc", CqlType::Boolean),
+            ("allow_auto_snapshot", CqlType::Boolean),
+            ("incremental_backups", CqlType::Boolean),
+        ],
+        "columns" => vec![
+            ("keyspace_name", text()),
+            ("table_name", text()),
+            ("column_name", text()),
+            ("kind", text()),
+            ("position", CqlType::Int),
+            ("type", text()),
+            ("clustering_order", text()),
+        ],
+        "types" => vec![
+            ("keyspace_name", text()),
+            ("type_name", text()),
+            ("field_names", text_list()),
+            ("field_types", text_list()),
+        ],
+        "indexes" => vec![
+            ("keyspace_name", text()),
+            ("table_name", text()),
+            ("index_name", text()),
+            ("kind", text()),
+            ("options", text_map()),
+        ],
+        "views" => vec![
+            ("keyspace_name", text()),
+            ("view_name", text()),
+            ("base_table_id", CqlType::Uuid),
+            ("base_table_name", text()),
+            ("cdc", CqlType::Boolean),
+            ("include_all_columns", CqlType::Boolean),
+            ("allow_auto_snapshot", CqlType::Boolean),
+            ("incremental_backups", CqlType::Boolean),
+            ("id", CqlType::Uuid),
+            ("where_clause", text()),
+        ],
+        "functions" => vec![
+            ("keyspace_name", text()),
+            ("function_name", text()),
+            ("argument_types", text_list()),
+            ("argument_names", text_list()),
+            ("body", text()),
+            ("called_on_null_input", CqlType::Boolean),
+            ("language", text()),
+            ("return_type", text()),
+        ],
+        "aggregates" => vec![
+            ("keyspace_name", text()),
+            ("aggregate_name", text()),
+            ("argument_types", text_list()),
+            ("final_func", text()),
+            ("initcond", text()),
+            ("return_type", text()),
+            ("state_func", text()),
+            ("state_type", text()),
+        ],
+        "triggers" => vec![
+            ("keyspace_name", text()),
+            ("table_name", text()),
+            ("trigger_name", text()),
+            ("options", text_map()),
+        ],
+        _ => Vec::new(),
+    };
+
+    specs
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect()
+}
+
 /// Count the number of `?` (positional) and `:name` (named) bind markers in
 /// a parsed statement, purely from the AST — no schema lookup needed.
 ///
@@ -1794,13 +1894,18 @@ fn count_bind_markers(stmt: &Statement) -> usize {
 /// Build result column metadata for SELECT statements.
 fn build_result_columns(
     select_columns: &[SelectColumn],
-    table_meta: &ferrosa_schema::TableMetadata,
+    table_meta: Option<&ferrosa_schema::TableMetadata>,
     table_ks: &str,
+    table_name: &str,
     state: &SharedState,
 ) -> Vec<(String, CqlType)> {
     let resolve = |col_name: &str| -> Option<CqlType> {
-        let col = table_meta.columns.get(col_name)?;
-        bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+        table_meta
+            .and_then(|table_meta| table_meta.columns.get(col_name))
+            .and_then(|col| {
+                bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+            })
+            .or_else(|| system_schema_column_type(table_ks, table_name, col_name))
     };
 
     let has_star = select_columns
@@ -1808,15 +1913,18 @@ fn build_result_columns(
         .any(|c| matches!(c, SelectColumn::Star));
 
     if has_star {
-        return table_meta
-            .columns
-            .iter()
-            .filter_map(|(name, col)| {
-                bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema)
-                    .ok()
-                    .map(|t| (name.clone(), t))
-            })
-            .collect();
+        if let Some(table_meta) = table_meta {
+            return table_meta
+                .columns
+                .iter()
+                .filter_map(|(name, col)| {
+                    bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema)
+                        .ok()
+                        .map(|t| (name.clone(), t))
+                })
+                .collect();
+        }
+        return system_schema_column_specs(table_ks, table_name);
     }
 
     let mut result = Vec::new();
@@ -2143,6 +2251,122 @@ mod tests {
         })
         .unwrap();
         Arc::new(schema)
+    }
+
+    fn shared_state_for_prepare_tests() -> (SharedState, tempfile::TempDir) {
+        use arc_swap::ArcSwap;
+        use ferrosa_cluster::{DdlPath, ModeController, WritePath};
+        use ferrosa_schema::audit::TestAuditSink;
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode, EnvSecretsProvider, NodeConfig, PasswordHasher,
+            PasswordPolicy, RateLimitConfig, Schema, SchemaConfig,
+        };
+        use ferrosa_storage::{
+            CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig,
+            SyncStrategyConfig,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine_config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 4096,
+                max_segment_age: std::time::Duration::from_secs(60),
+                sync_strategy: SyncStrategyConfig::Batch,
+                log_dir: dir.path().join("commitlog"),
+                checkpoint_dir: dir.path().join("commitlog"),
+                archive: None,
+            },
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.path().to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            auth_enabled: false,
+            auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+            write_verify: false,
+        };
+        let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        let schema = Arc::new(
+            Schema::new(SchemaConfig {
+                hasher: PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: PasswordPolicy::permissive(),
+                auth_method: AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(TestAuditSink::new()),
+                secrets: Box::new(EnvSecretsProvider),
+                mode: DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let node_config = Arc::new(NodeConfig {
+            cluster_name: "test".into(),
+            data_center: "datacenter1".into(),
+            rack: "rack1".into(),
+            rpc_port: 9042,
+            host_id: uuid::Uuid::new_v4(),
+            listen_address: "127.0.0.1".parse().unwrap(),
+            listen_port: 7000,
+            broadcast_address: "127.0.0.1".parse().unwrap(),
+            broadcast_port: 7000,
+            rpc_address: "127.0.0.1".parse().unwrap(),
+            internal_rpc_address: "127.0.0.1".parse().unwrap(),
+            internal_rpc_port: 9042,
+            tokens: vec![],
+        });
+        let mode_controller = ModeController::standalone_for_test(schema.clone(), engine.clone());
+        let udf_executor =
+            Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
+
+        (
+            SharedState {
+                engine: engine.clone(),
+                schema: schema.clone(),
+                node_config,
+                cluster_state: Arc::new(ArcSwap::from_pointee(
+                    ferrosa_cluster::ClusterStateHolder::Standalone,
+                )),
+                write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+                ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+                prepared_cache: Arc::new(PreparedCache::new(1024 * 1024)),
+                connection_tracker: Arc::new(ConnectionTracker::new()),
+                query_tracker: Arc::new(crate::virtual_tables::QueryTracker::new()),
+                udf_executor,
+                event_sender: tokio::sync::broadcast::channel(64).0,
+                mode_controller,
+                cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
+                topology_policy: crate::topology::ClientTopologyPolicy::default(),
+                auth_warn: false,
+                peer_manager: None,
+                accord_clock: None,
+            },
+            dir,
+        )
+    }
+
+    #[test]
+    fn prepare_metadata_resolves_system_schema_keyspace_bind_marker() {
+        let (state, _dir) = shared_state_for_prepare_tests();
+        let stmt = parser::parse(
+            "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?",
+        )
+        .unwrap();
+
+        let (bound_columns, result_columns) =
+            analyze_prepared_columns(&stmt, "system_schema", "keyspaces", &state);
+
+        assert_eq!(
+            bound_columns,
+            vec![("keyspace_name".to_string(), CqlType::Varchar)]
+        );
+        assert_eq!(
+            result_columns,
+            vec![("keyspace_name".to_string(), CqlType::Varchar)]
+        );
     }
 
     #[tokio::test]

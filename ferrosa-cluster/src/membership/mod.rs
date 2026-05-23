@@ -413,6 +413,34 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         Duration::from_secs(10),
     ];
 
+    async fn transfer_leadership_away_from(
+        &self,
+        node_id: u64,
+        target: u64,
+        context: &str,
+    ) -> Result<Option<u64>, MembershipError> {
+        let transfer_result = self.raft.trigger().transfer_to(target).await;
+        let deadline =
+            std::time::Instant::now() + Duration::from_millis(Self::LEADERSHIP_TRANSFER_OBSERVE_MS);
+        loop {
+            let m = self.raft.metrics().borrow().clone();
+            if m.current_leader.is_some() && m.current_leader != Some(node_id) {
+                return Ok(m.current_leader);
+            }
+            if std::time::Instant::now() >= deadline {
+                return match transfer_result {
+                    Ok(()) => Err(MembershipError::RaftError(format!(
+                        "{context}: leadership transfer dispatched but new leader not observed"
+                    ))),
+                    Err(e) => Err(MembershipError::RaftError(format!(
+                        "{context}: transfer_to({target}) failed and no replacement leader was observed: {e}"
+                    ))),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// W7.8 / I-30 — Drain in-flight Accord transactions for a DC swap.
     ///
     /// Polls `drain` for transactions referencing any of `leaving_voters`
@@ -689,28 +717,12 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
                     "demote_voter_to_learner: no eligible voter for leadership transfer".into(),
                 )
             })?;
-            self.raft
-                .trigger()
-                .transfer_to(target)
-                .await
-                .map_err(|e| MembershipError::RaftError(format!("transfer_to({target}): {e}")))?;
-            let deadline = std::time::Instant::now()
-                + Duration::from_millis(Self::LEADERSHIP_TRANSFER_OBSERVE_MS);
-            loop {
-                let m = self.raft.metrics().borrow().clone();
-                if m.current_leader.is_some() && m.current_leader != Some(node_id) {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(MembershipError::RaftError(
-                        "leadership transfer dispatched but new leader not observed".into(),
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let new_leader = self
+                .transfer_leadership_away_from(node_id, target, "demote_voter_to_learner")
+                .await?;
             // Caller must re-issue the demote on the new leader.
             return Err(MembershipError::NotLeader {
-                leader_node_id: self.raft.metrics().borrow().current_leader,
+                leader_node_id: new_leader,
             });
         }
 
@@ -837,35 +849,15 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
                         .into(),
                 )
             })?;
-            self.raft
-                .trigger()
-                .transfer_to(target)
-                .await
-                .map_err(|e| MembershipError::RaftError(format!("transfer_to({target}): {e}")))?;
-
-            // Wait until our metrics show we are no longer leader.
-            // openraft updates the watch synchronously inside the engine
-            // step that processes TimeoutNow; we observe via current_leader.
-            let deadline = std::time::Instant::now()
-                + Duration::from_millis(Self::LEADERSHIP_TRANSFER_OBSERVE_MS);
-            loop {
-                let m = self.raft.metrics().borrow().clone();
-                if m.current_leader.is_some() && m.current_leader != Some(node_id) {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(MembershipError::RaftError(
-                        "leadership transfer dispatched but new leader not observed".into(),
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let new_leader = self
+                .transfer_leadership_away_from(node_id, target, "remove_voter")
+                .await?;
             // After transfer the local node is a follower and Steps
             // 2-4 below will surface ForwardToLeader.  Caller drives
             // the forward via Message::ClusterMembershipForward as
             // for any non-leader change.
             return Err(MembershipError::NotLeader {
-                leader_node_id: self.raft.metrics().borrow().current_leader,
+                leader_node_id: new_leader,
             });
         }
 

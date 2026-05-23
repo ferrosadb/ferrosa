@@ -20,6 +20,7 @@ use super::config::{ConsolidationConfig, TimeSeriesRuntimeSettings};
 use super::consolidation::{
     emit_accumulated_streaming_results, Accumulator, ConsolidationFn, StreamingConsolidationError,
 };
+use super::materialization::TimeSeriesTimestampUnit;
 use super::ring::{BoundaryStatus, RingBuffer, RingEntry};
 
 /// A task sent from the inline write path to the async consolidation worker.
@@ -107,6 +108,8 @@ pub struct TimeSeriesAggregator {
     /// When present, enables type-aware decoding via `decode_typed_numeric`.
     /// Must be the same length as `value_column_indices`.
     column_types: Vec<String>,
+    /// Unit used by the first clustering column in storage bytes.
+    timestamp_unit: TimeSeriesTimestampUnit,
     /// Per-partition_key ring buffers. DashMap provides per-shard locking.
     rings: DashMap<Vec<u8>, RingBuffer>,
     /// Channel sender for async consolidation tasks.
@@ -152,6 +155,7 @@ impl TimeSeriesAggregator {
             table_id,
             value_column_indices,
             column_types: vec![],
+            timestamp_unit: TimeSeriesTimestampUnit::Micros,
             rings: DashMap::new(),
             task_tx,
             drop_count: AtomicU64::new(0),
@@ -186,6 +190,11 @@ impl TimeSeriesAggregator {
         let mut agg = Self::new(config, table_id, value_column_indices, task_tx);
         agg.column_types = column_types;
         agg
+    }
+
+    pub fn with_timestamp_unit(mut self, timestamp_unit: TimeSeriesTimestampUnit) -> Self {
+        self.timestamp_unit = timestamp_unit;
+        self
     }
 
     /// Create a new aggregator with CQL column type metadata and shared runtime settings.
@@ -490,7 +499,7 @@ impl TimeSeriesAggregator {
         row: &ferrosa_sstable::types::Row,
     ) -> Option<(i64, SmallVec<[f64; 8]>)> {
         let mut values = SmallVec::new();
-        let timestamp = row_timestamp_micros(row);
+        let timestamp = row_timestamp_micros(row, self.timestamp_unit);
         let has_types = !self.column_types.is_empty();
 
         for (i, &col_idx) in self.value_column_indices.iter().enumerate() {
@@ -529,11 +538,14 @@ impl TimeSeriesAggregator {
     }
 }
 
-fn row_timestamp_micros(row: &ferrosa_sstable::types::Row) -> i64 {
+fn row_timestamp_micros(
+    row: &ferrosa_sstable::types::Row,
+    timestamp_unit: TimeSeriesTimestampUnit,
+) -> i64 {
     if row.clustering.len() == std::mem::size_of::<i64>() {
         let mut bytes = [0_u8; 8];
         bytes.copy_from_slice(&row.clustering);
-        i64::from_be_bytes(bytes)
+        timestamp_unit.raw_to_micros(i64::from_be_bytes(bytes))
     } else {
         row.primary_key_liveness.timestamp
     }

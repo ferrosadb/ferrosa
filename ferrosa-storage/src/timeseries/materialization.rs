@@ -17,6 +17,38 @@ use crate::commitlog::mutation::Mutation;
 
 use super::consolidation::ConsolidationFn;
 
+/// Storage unit used by the time-series clustering key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeSeriesTimestampUnit {
+    /// Raw clustering bytes already contain Unix-epoch microseconds.
+    Micros,
+    /// CQL `timestamp` clustering bytes contain Unix-epoch milliseconds.
+    Millis,
+}
+
+impl TimeSeriesTimestampUnit {
+    pub fn from_storage_type(type_name: &str) -> Self {
+        match type_name {
+            "timestamp" | "org.apache.cassandra.db.marshal.TimestampType" => Self::Millis,
+            _ => Self::Micros,
+        }
+    }
+
+    pub fn raw_to_micros(self, raw: i64) -> i64 {
+        match self {
+            Self::Micros => raw,
+            Self::Millis => raw.saturating_mul(1_000),
+        }
+    }
+
+    pub fn micros_to_raw(self, micros: i64) -> i64 {
+        match self {
+            Self::Micros => micros,
+            Self::Millis => micros.div_euclid(1_000),
+        }
+    }
+}
+
 /// Target metadata needed to encode a consolidated window mutation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaterializationTarget {
@@ -25,6 +57,7 @@ pub struct MaterializationTarget {
     pub interval: Duration,
     pub source_columns: Vec<String>,
     pub functions: Vec<ConsolidationFn>,
+    pub target_timestamp_unit: TimeSeriesTimestampUnit,
 }
 
 impl MaterializationTarget {
@@ -131,6 +164,10 @@ impl MaterializedRollup {
     where
         I: IntoIterator<Item = f64>,
     {
+        let window_start_raw = self
+            .target
+            .target_timestamp_unit
+            .micros_to_raw(self.window_start_ts);
         let cells = results
             .into_iter()
             .enumerate()
@@ -152,7 +189,7 @@ impl MaterializedRollup {
             table: self.target.target_table.table.clone(),
             key: DecoratedKey::new(PartitionKey::new(self.partition_key.clone())),
             rows: vec![Row {
-                clustering: self.window_start_ts.to_be_bytes().to_vec(),
+                clustering: window_start_raw.to_be_bytes().to_vec(),
                 cells,
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(write_timestamp),
@@ -292,6 +329,7 @@ mod tests {
             interval: Duration::from_secs(10),
             source_columns: vec!["value".to_string()],
             functions: vec![ConsolidationFn::Avg],
+            target_timestamp_unit: TimeSeriesTimestampUnit::Micros,
         };
         let request = MaterializationRequest {
             target: target.clone(),

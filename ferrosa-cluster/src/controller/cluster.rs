@@ -68,6 +68,52 @@ use crate::streaming::{
 };
 use crate::write_path::WritePath;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum InvitePeerConnectionPlan {
+    SkipSelf,
+    KeepLiveKnownPeer {
+        known_addr: String,
+        invite_addr: SocketAddr,
+    },
+    AlreadyConnected,
+    Connect {
+        reverse_addr: SocketAddr,
+        previous_addr: Option<String>,
+    },
+}
+
+pub(super) fn plan_invite_peer_connection(
+    local_host_id: Uuid,
+    peer_id: Uuid,
+    peer_addr: SocketAddr,
+    internode_port: u16,
+    known_addr: Option<&str>,
+    live: bool,
+) -> InvitePeerConnectionPlan {
+    if peer_id == local_host_id {
+        return InvitePeerConnectionPlan::SkipSelf;
+    }
+
+    let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+    let invite_addr = reverse_addr.to_string();
+
+    if live {
+        return match known_addr {
+            Some(known) if known == invite_addr => InvitePeerConnectionPlan::AlreadyConnected,
+            Some(known) => InvitePeerConnectionPlan::KeepLiveKnownPeer {
+                known_addr: known.to_string(),
+                invite_addr: reverse_addr,
+            },
+            None => InvitePeerConnectionPlan::AlreadyConnected,
+        };
+    }
+
+    InvitePeerConnectionPlan::Connect {
+        reverse_addr,
+        previous_addr: known_addr.map(ToOwned::to_owned),
+    }
+}
+
 use super::{ClusterStateHolder, ModeController};
 
 pub(super) fn should_initialize_seed_membership(
@@ -2240,39 +2286,56 @@ impl RpcHandler for ClusterInviteHandler {
         let internode_port = self.net_config.bind_addr.port();
         let mut new_peers = Vec::new();
         for (peer_id, peer_addr) in &peers {
-            if *peer_id == self.local_host_id {
-                continue;
-            }
-            let expected_addr = SocketAddr::new(peer_addr.ip(), internode_port).to_string();
             let known_addr = self.peer_manager.peer_addr(*peer_id).await;
             let live = self.peer_manager.has_live_peer(*peer_id);
-            let addr_changed = known_addr.as_deref() != Some(expected_addr.as_str());
-            if live && !addr_changed {
-                continue;
+            match plan_invite_peer_connection(
+                self.local_host_id,
+                *peer_id,
+                *peer_addr,
+                internode_port,
+                known_addr.as_deref(),
+                live,
+            ) {
+                InvitePeerConnectionPlan::SkipSelf | InvitePeerConnectionPlan::AlreadyConnected => {
+                }
+                InvitePeerConnectionPlan::KeepLiveKnownPeer {
+                    known_addr,
+                    invite_addr,
+                } => {
+                    tracing::warn!(
+                        peer = %peer_id,
+                        %known_addr,
+                        %invite_addr,
+                        "cluster invite: ignoring conflicting address for live peer"
+                    );
+                }
+                InvitePeerConnectionPlan::Connect {
+                    reverse_addr,
+                    previous_addr,
+                } => {
+                    if previous_addr.as_deref() != Some(&reverse_addr.to_string()) {
+                        tracing::info!(
+                            peer = %peer_id,
+                            old_addr = ?previous_addr,
+                            new_addr = %reverse_addr,
+                            "cluster invite: peer address changed, refreshing reverse connection"
+                        );
+                    }
+                    new_peers.push((*peer_id, reverse_addr));
+                }
             }
-            if addr_changed {
-                tracing::info!(
-                    peer = %peer_id,
-                    old_addr = ?known_addr,
-                    new_addr = %expected_addr,
-                    "cluster invite: peer address changed, refreshing reverse connection"
-                );
-            }
-            new_peers.push((*peer_id, *peer_addr));
         }
 
         // Connect to unknown peers using a local JoinSet so we can await
         // completion before re-broadcasting (replaces raw tokio::spawn +
         // fixed 500ms sleep).
-        let internode_port = self.net_config.bind_addr.port();
         let mut connect_tasks = tokio::task::JoinSet::new();
-        for (peer_id, peer_addr) in &new_peers {
-            let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+        for (peer_id, reverse_addr) in &new_peers {
             let pm = self.peer_manager.clone();
             let cfg = self.net_config.clone();
             let local_id = self.local_host_id;
             let uuid = *peer_id;
-            let addr = reverse_addr;
+            let addr = *reverse_addr;
 
             connect_tasks.spawn(async move {
                 match PriorityPool::connect(cfg, local_id, &addr.to_string(), None, None).await {

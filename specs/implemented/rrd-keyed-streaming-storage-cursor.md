@@ -1,7 +1,7 @@
 ---
 type: todo
 priority: P0
-status: in_progress
+status: implemented
 created: 2026-05-20
 updated: 2026-05-22
 ---
@@ -39,3 +39,13 @@ time window)` into aggregation accumulators.
   invoking the callback.
 - Remaining hardening: skip directly to the first clustering timestamp in the
   requested window once row-index support is available for imported SSTables.
+- `TableStore::visit_time_series_window_rows` now streams matching SSTable
+  partitions through `PartitionIter::next_partition_header_only` and
+  `next_clustered_row`.
+- Overlapping active/flushing memtable and SSTable sources are merged by
+  clustering key with cell-level last-write-wins before the visitor sees each
+  row.
+- The cursor keeps one row head per contributing source instead of
+  materializing a full SSTable partition.
+- In-memory memtable sources still contribute cloned rows for the exact
+  partition key, which is acceptable because memtables are already resident.
