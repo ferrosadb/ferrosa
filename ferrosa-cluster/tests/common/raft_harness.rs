@@ -655,6 +655,68 @@ impl TestCluster {
         }
     }
 
+    /// Wait until a strict majority of bootstrap voters report the same
+    /// current leader. This is stronger than `wait_for_leader`, which is
+    /// useful for tests that assert election convergence rather than first
+    /// leader discovery.
+    pub async fn wait_for_majority_leader(&self, timeout: Duration) -> Option<u64> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(leader_id) = self.majority_leader_id() {
+                return Some(leader_id);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Return a leader id only when a strict majority of bootstrap voters
+    /// agree on it.
+    pub fn majority_leader_id(&self) -> Option<u64> {
+        let quorum = (self.nodes.len() / 2) + 1;
+        let mut counts = BTreeMap::<u64, usize>::new();
+        for n in &self.nodes {
+            if let Some(leader_id) = n.raft.metrics().borrow().current_leader {
+                let count = counts.entry(leader_id).or_insert(0);
+                *count += 1;
+                if *count >= quorum {
+                    return Some(leader_id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Wait until every bootstrap voter reports the same current leader.
+    pub async fn wait_for_all_voters_leader(&self, timeout: Duration) -> Option<u64> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(leader_id) = self.all_voters_leader_id() {
+                return Some(leader_id);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Return a leader id only when all bootstrap voters agree on it.
+    pub fn all_voters_leader_id(&self) -> Option<u64> {
+        let mut leader = None;
+        for n in &self.nodes {
+            let node_leader = n.raft.metrics().borrow().current_leader?;
+            match leader {
+                Some(existing) if existing != node_leader => return None,
+                Some(_) => {}
+                None => leader = Some(node_leader),
+            }
+        }
+        leader
+    }
+
     /// Locate the leader's `TestNode`. Panics if no leader is currently
     /// elected on any node — call `wait_for_leader` first.
     pub fn leader_node(&self) -> &TestNode {
