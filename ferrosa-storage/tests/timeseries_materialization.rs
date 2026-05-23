@@ -8,7 +8,7 @@ use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::timeseries::{
     ConsolidationFn, LateWindowClassification, MaterializationQueue, MaterializationRequest,
-    MaterializationTarget, MaterializationTaskKind, MaterializedRollup,
+    MaterializationTarget, MaterializationTaskKind, MaterializedRollup, TimeSeriesTimestampUnit,
 };
 use ferrosa_storage::{
     CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
@@ -30,6 +30,7 @@ fn target() -> MaterializationTarget {
                 function_name: "custom_rollup".to_string(),
             },
         ],
+        target_timestamp_unit: TimeSeriesTimestampUnit::Micros,
     }
 }
 
@@ -380,6 +381,37 @@ fn keyed_time_series_window_cursor_visits_zero_for_missing_or_empty_windows() {
         0
     );
     assert!(!called);
+}
+
+#[test]
+fn keyed_time_series_window_cursor_merges_overlapping_sources_by_clustering_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let table_id = TableId::new("ks", "sensor");
+    let sensor = key(b"sensor-1");
+    engine.register_table(timeseries_schema()).unwrap();
+
+    engine
+        .write(&table_id, &sensor, sensor_row(5, 1.0), 5)
+        .unwrap();
+    engine.flush(&table_id).unwrap();
+    engine
+        .write(&table_id, &sensor, sensor_row(5, 9.0), 50)
+        .unwrap();
+    engine
+        .write(&table_id, &sensor, sensor_row(7, 3.0), 70)
+        .unwrap();
+
+    let mut values = Vec::new();
+    let visited = engine
+        .visit_time_series_window_rows(&table_id, &sensor, 0, 10, |row| {
+            values.push(row_double(row));
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(visited, 2);
+    assert_eq!(values, vec![9.0, 3.0]);
 }
 
 #[test]

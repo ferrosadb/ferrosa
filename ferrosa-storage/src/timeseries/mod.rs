@@ -27,5 +27,5 @@ pub use consolidation::{emit_streaming_results, ConsolidationFn, StreamingConsol
 pub use materialization::{
     LateWindowClassification, MaterializationQueue, MaterializationQueueMetrics,
     MaterializationQueueSnapshot, MaterializationRequest, MaterializationTarget,
-    MaterializationTaskKind, MaterializedRollup,
+    MaterializationTaskKind, MaterializedRollup, TimeSeriesTimestampUnit,
 };

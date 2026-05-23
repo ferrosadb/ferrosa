@@ -49,10 +49,10 @@ descriptor tasks and writes target table mutations through storage.
 
 ## Still Not Working
 
-- The keyed storage cursor is callback-shaped and is wired into the worker, but
-  the current `TableStore` implementation still reads a full partition
-  internally before visiting matching rows. Very large partitions still need a
-  true memtable/SSTable streaming cursor.
+- The keyed storage cursor is callback-shaped and wired into the worker.
+  SSTable sources are streamed row-by-row through the existing partition
+  iterator, and overlapping sources are merged by clustering key before rows
+  reach the aggregation accumulator.
 - WASM aggregate functions are rejected during live RRD DDL until the streaming
   WASM aggregate ABI is implemented.
 - End-to-end process supervision is still covered by the example script rather
