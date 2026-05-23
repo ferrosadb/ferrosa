@@ -13,6 +13,7 @@
 use std::path::Path;
 
 use bytes::Bytes;
+use std::io::Read;
 use uuid::Uuid;
 
 use ferrosa_net::codec::Lane;
@@ -272,12 +273,23 @@ impl StreamSender {
 
         for component in &components {
             let file_path = sstable_dir.join(&component.name);
-            let data = std::fs::read(&file_path).map_err(|e| {
-                ClusterError::Internal(format!("sstable_stream: read {}: {e}", file_path.display()))
+            let mut file = std::fs::File::open(&file_path).map_err(|e| {
+                ClusterError::Internal(format!("sstable_stream: open {}: {e}", file_path.display()))
             })?;
+            let mut buffer = vec![0u8; chunk_size.max(1)];
 
             let mut offset = 0u64;
-            for slice in data.chunks(chunk_size) {
+            loop {
+                let read = file.read(&mut buffer).map_err(|e| {
+                    ClusterError::Internal(format!(
+                        "sstable_stream: read {}: {e}",
+                        file_path.display()
+                    ))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                let slice = &buffer[..read];
                 hasher.update(slice);
 
                 let chunk = SstableStreamChunkPayload {
@@ -574,5 +586,24 @@ mod tests {
         assert_eq!(total_data, 1000);
         let total_index: usize = index_mutations.iter().map(|m| m.row.len()).sum();
         assert_eq!(total_index, 200);
+    }
+
+    #[test]
+    fn send_sstable_files_reads_components_incrementally() {
+        let source = include_str!("sender.rs");
+        let body = source
+            .split("pub async fn send_sstable_files")
+            .nth(1)
+            .and_then(|rest| rest.split("// ---------------------------------------------------------------------------").next())
+            .expect("send_sstable_files body must be present");
+
+        assert!(
+            !body.contains("std::fs::read(&file_path)") && !body.contains(".chunks(chunk_size)"),
+            "SSTable bulk sender must stream component files through a bounded read buffer: {body}"
+        );
+        assert!(
+            body.contains("std::fs::File::open") && body.contains("file.read(&mut buffer)"),
+            "SSTable bulk sender must read components incrementally: {body}"
+        );
     }
 }

@@ -102,7 +102,8 @@ include::queries.cql[lines=27..34]
 == WASM Aggregate Status
 
 The runnable sensor demo uses the built-in streaming `stddev`.
-Ferrosa supports three WASM loading forms for function metadata, but WASM aggregate execution is not enabled for live RRD materialization yet because it needs the streaming aggregate ABI tracked in `specs/todo/rrd-streaming-wasm-aggregate-abi.md`.
+Ferrosa supports three WASM loading forms for function metadata, and the WASM executor now has a streaming aggregate ABI with `init`, `update(value)`, and `finalize`.
+WASM aggregate execution for live RRD materialization uses that ABI for each row in the rollup window.
 The `AS FILE` and `AS URL ... WITH SHA256` forms are admin-only artifact loading paths.
 
 [source,sql]
@@ -117,8 +118,8 @@ The accepted future table syntax references the function with `wasm:keyspace.fun
 include::custom-wasm-udf.cql[lines=34..47]
 ----
 
-Do not use `wasm:` functions in live RRD materialization on this release.
-DDL rejects non-streaming WASM aggregate functions with a clear streaming-ABI error rather than creating a table that later computes partial rollups.
+Use `wasm:` functions only for components that declare the `ferrosa:streaming-aggregate:v1` marker and export `init`, `update`, and `finalize`.
+Scalar WASM UDFs are rejected for aggregate execution rather than being called with a materialized list.
 The URL form requires a SHA-256 digest so artifact bytes cannot change between review and DDL apply.
 
 == Built-in Functions
@@ -190,8 +191,10 @@ The default ring memory budget is derived from the host or container memory limi
 
 | `schema.cql` | Keyspace, target rollup table, and raw sensor table with built-in streaming consolidation extensions
 | `data.cql` | Sample vibration and temperature data for two pumps across two 5-minute windows
-| `queries.cql` | Queries against raw data, 5-minute rollups, and operational observability
-| `custom-wasm-udf.cql` | WASM stddev loading forms and the current live-materialization limitation
+| `queries.cql` | Queries against raw data, rollup tiers, and operational observability
+| `custom-wasm-udf.cql` | WASM stddev loading forms and streaming aggregate registration
+| `wasm-rust/stddev` | Rust-authored Welford stddev aggregate with bounded streaming state
+| `wasm-rust/rms` | Rust-authored RMS aggregate for vibration energy rollups
 | `built-in-functions.cql` | Demonstrates each built-in function individually
 | `composite.cql` | Multi-column composite aggregation
 | `median.cql` | Median-specific example with latency monitoring

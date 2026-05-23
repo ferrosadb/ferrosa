@@ -103,10 +103,10 @@ Current branch limitations:
   Downstream avg/stddev cascades need explicit rollup state such as count, sum,
   and sum-of-squares. Cascade storage-registration errors now surface during DDL
   instead of leaving schema metadata without a registered storage table.
-- WASM consolidation functions still need a streaming UDF aggregation ABI before
-  they can run in the worker. Live RRD DDL now rejects `wasm:keyspace.function`
-  rollups with a clear streaming-ABI error instead of accepting a table that
-  later fails during materialization.
+- WASM consolidation functions require the streaming UDF aggregation ABI at
+  executor start. Live RRD DDL accepts `wasm:keyspace.function` rollups so
+  schema can reference registered aggregate components; materialization fails
+  clearly if the referenced function is missing or lacks the streaming ABI.
 - Median remains non-streaming because it requires ordered/materialized window
   state; it needs a bounded approximate sketch or external sort design before
   production materialization.

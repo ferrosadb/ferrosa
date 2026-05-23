@@ -49,7 +49,10 @@ pub use compaction::{
     CompactionConfig, CompactionExecutor, CompactionStrategy, SizeTieredStrategy,
 };
 pub use data_store::{DataStore, LocalDataStore};
-pub use engine::{StorageEngine, StorageEngineConfig, TempSortTableReservation};
+pub use engine::{
+    StorageEngine, StorageEngineConfig, TempSortTableReservation, TimeSeriesWasmAggregateExecutor,
+    TimeSeriesWasmAggregateInvocation,
+};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use manifest::{load_schema_snapshot, save_schema_snapshot, Manifest};
 pub use memtable::eager_index::{EagerIndexBuilder, FlushCompleteEvent};

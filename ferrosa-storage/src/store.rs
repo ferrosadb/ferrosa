@@ -700,6 +700,7 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
         }
+
         Ok(visited)
     }
 

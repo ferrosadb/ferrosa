@@ -124,6 +124,45 @@ pub fn encode_rows_paged(
     buf
 }
 
+/// Encode a Rows RESULT body by visiting rows one at a time.
+///
+/// The Cassandra protocol requires `rows_count` before row data, so this
+/// reserves four bytes and patches the final count after the writer finishes.
+/// Callers avoid building `Vec<Vec<Option<CqlValue>>>`; peak working set is the
+/// output buffer plus one row supplied to `emit`.
+pub fn encode_rows_with_writer<F>(
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+    mut write_rows: F,
+) -> BytesMut
+where
+    F: FnMut(&mut dyn FnMut(&[Option<CqlValue>])),
+{
+    let mut buf = BytesMut::new();
+    buf.put_i32(0x0002); // Rows kind
+
+    encode_rows_metadata(&mut buf, column_names, column_types, keyspace, table);
+
+    let rows_count_offset = buf.len();
+    buf.put_i32(0);
+
+    let mut row_count: i32 = 0;
+    {
+        let mut emit = |row: &[Option<CqlValue>]| {
+            row_count = row_count.saturating_add(1);
+            for cell in row {
+                encode_cell(&mut buf, cell);
+            }
+        };
+        write_rows(&mut emit);
+    }
+    buf[rows_count_offset..rows_count_offset + 4].copy_from_slice(&row_count.to_be_bytes());
+
+    buf
+}
+
 /// Encode a Prepared RESULT body.
 ///
 /// Contains:

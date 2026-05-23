@@ -261,14 +261,6 @@ fn validate_live_materialization_functions(functions: &[ConsolidationFn]) -> Res
                     "consolidation function 'median' requires materialized windows and is not supported for live RRD materialization yet".to_string()
                 );
             }
-            ConsolidationFn::Wasm {
-                keyspace,
-                function_name,
-            } => {
-                return Err(format!(
-                    "consolidation function 'wasm:{keyspace}.{function_name}' requires the streaming WASM aggregate ABI, which is not implemented yet"
-                ));
-            }
             ConsolidationFn::Composite(inner) => validate_live_materialization_functions(inner)?,
             _ => {}
         }
@@ -638,27 +630,37 @@ mod tests {
 
     #[test]
     fn config_rejects_non_streaming_materialization_functions() {
-        for (function, expected) in [
-            ("median", "requires materialized windows"),
-            (
-                "wasm:plant.stddev",
-                "requires the streaming WASM aggregate ABI",
-            ),
-        ] {
-            let mut ext = HashMap::new();
-            ext.insert("consolidation.interval".into(), "5m".into());
-            ext.insert("consolidation.functions".into(), function.into());
-            ext.insert("consolidation.target".into(), "sensor_5m".into());
-            ext.insert("consolidation.columns".into(), "value".into());
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "5m".into());
+        ext.insert("consolidation.functions".into(), "median".into());
+        ext.insert("consolidation.target".into(), "sensor_5m".into());
+        ext.insert("consolidation.columns".into(), "value".into());
 
-            let err = ConsolidationConfig::from_extensions(&ext)
-                .unwrap()
-                .unwrap_err();
-            assert!(
-                err.contains(expected),
-                "expected '{expected}' in error for {function}: {err}"
-            );
-        }
+        let err = ConsolidationConfig::from_extensions(&ext)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.contains("requires materialized windows"),
+            "expected materialized-window error for median: {err}"
+        );
+    }
+
+    #[test]
+    fn config_accepts_wasm_materialization_function_for_executor_validation() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "5m".into());
+        ext.insert("consolidation.functions".into(), "wasm:plant.stddev".into());
+        ext.insert("consolidation.target".into(), "sensor_5m".into());
+        ext.insert("consolidation.columns".into(), "value".into());
+
+        let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
+        assert_eq!(
+            config.functions,
+            vec![super::super::consolidation::ConsolidationFn::Wasm {
+                keyspace: "plant".to_string(),
+                function_name: "stddev".to_string(),
+            }]
+        );
     }
 
     // --- Task 16: Cascade and ring param parsing tests ---

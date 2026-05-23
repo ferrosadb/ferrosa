@@ -215,12 +215,17 @@ impl UploadManager {
                         tokio::time::sleep(grace_period).await;
 
                         let hex_prefix = hex_prefix_for(&sstable_id);
-                        // Standard SSTable component filenames.
+                        // Ferrosa SSTable component filenames. Keep `Index.db`
+                        // for compatibility with older/foreign layouts; missing
+                        // objects are treated as success below.
                         let components = [
                             "Data.db",
+                            "Partitions.db",
+                            "Rows.db",
                             "Index.db",
                             "Filter.db",
                             "Statistics.db",
+                            "CompressionInfo.db",
                             "TOC.txt",
                         ];
                         let mut delete_err: Option<String> = None;
@@ -951,6 +956,62 @@ mod tests {
                 store.get(&path).await.is_err(),
                 "missing component must not create an object"
             );
+        });
+    }
+
+    #[test]
+    fn delete_sstable_removes_ferrosa_components() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let store = Arc::new(InMemory::new());
+            let manager = UploadManager::new(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "pfx".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+            let table_id = "ks.t";
+            let sstable_id = "7";
+            let hex = hex_prefix_for(sstable_id);
+            let components = [
+                "Data.db",
+                "Partitions.db",
+                "Rows.db",
+                "Filter.db",
+                "Statistics.db",
+                "TOC.txt",
+                "CompressionInfo.db",
+            ];
+
+            for component in components {
+                let path = sstable_object_key("pfx", &hex, table_id, sstable_id, component);
+                store
+                    .put(&path, Bytes::from_static(b"component").into())
+                    .await
+                    .unwrap();
+            }
+
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            manager
+                .submit(UploadTask::DeleteSSTable {
+                    table_id: table_id.into(),
+                    sstable_id: sstable_id.into(),
+                    grace_period: Duration::from_millis(0),
+                    on_complete: Some(tx),
+                })
+                .await
+                .unwrap();
+
+            rx.await.unwrap().unwrap();
+            manager.shutdown().await;
+
+            for component in components {
+                let path = sstable_object_key("pfx", &hex, table_id, sstable_id, component);
+                assert!(
+                    store.get(&path).await.is_err(),
+                    "{component} should be deleted by DeleteSSTable"
+                );
+            }
         });
     }
 
