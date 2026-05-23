@@ -89,11 +89,10 @@ Current branch limitations:
   rewrite existing rollup rows.
 - Added CQL-router coverage proving normal CQL `CREATE TABLE` extensions and
   `INSERT` statements enqueue materialization and produce queryable target rows.
-- Storage has an in-memory ring streaming path for current windows. Production
-  late-window recomputation uses the keyed cursor API, but the current
-  `TableStore` implementation still materializes one partition internally
-  before visiting rows. A true memtable/SSTable row-streaming implementation
-  remains required for very large partitions.
+- Storage has an in-memory ring streaming path for boundary detection, and
+  production materialization uses a keyed storage cursor as the source of truth.
+  The cursor streams SSTable rows one at a time and merges overlapping sources
+  by clustering key.
 - WASM consolidation functions still need a streaming UDF aggregation ABI before
   they can run in the worker. Live RRD DDL now rejects `wasm:keyspace.function`
   rollups with a clear streaming-ABI error instead of accepting a table that
