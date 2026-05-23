@@ -59,6 +59,89 @@ pub struct StatsMetadata {
     pub data: Vec<u8>,
 }
 
+/// Build Cassandra 5 BTI StatsMetadata for a simple primary-key table.
+///
+/// Ferrosa only needs a small subset of Cassandra's full statistics model for
+/// import/read compatibility: sane histograms, no commit-log intervals, live
+/// deletion markers, no tombstones, an all-clustering slice, row/cell counts,
+/// and the actual first/last partition keys. The byte layout follows Apache
+/// Cassandra 5.0's `StatsMetadataSerializer` for BTI SSTables.
+///
+/// This intentionally returns `None` for clustered tables until the clustered
+/// min/max `Slice` serializer is implemented here. Callers must then either use
+/// their legacy path or surface that clustered Cassandra import is unsupported.
+pub fn build_simple_bti_stats_metadata(
+    header: &SerializationHeader,
+    first_key: &[u8],
+    last_key: &[u8],
+    partition_count: u64,
+    total_rows: u64,
+    total_columns_set: u64,
+    compression_ratio: f64,
+) -> Option<StatsMetadata> {
+    if !header.clustering_types.is_empty() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+
+    write_estimated_histogram(&mut out, 156, partition_count);
+    write_estimated_histogram(&mut out, 119, total_columns_set.max(partition_count));
+
+    // CommitLogPosition.NONE for the upper bound.
+    write_commitlog_position_none(&mut out);
+
+    let max_timestamp = if header.max_timestamp == i64::MAX {
+        header.min_timestamp
+    } else {
+        header.max_timestamp
+    };
+    out.extend_from_slice(&header.min_timestamp.to_be_bytes());
+    out.extend_from_slice(&max_timestamp.to_be_bytes());
+
+    // Cassandra 5 uses unsigned deletion-time ints in this format; -1 marks
+    // no local deletion time.
+    out.extend_from_slice(&(-1_i32).to_be_bytes());
+    out.extend_from_slice(&(-1_i32).to_be_bytes());
+
+    out.extend_from_slice(&header.min_ttl.to_be_bytes());
+    out.extend_from_slice(&0_i32.to_be_bytes());
+    out.extend_from_slice(&compression_ratio.to_be_bytes());
+
+    // Empty TombstoneHistogram: maxBinSize=0, size=0.
+    out.extend_from_slice(&0_i32.to_be_bytes());
+    out.extend_from_slice(&0_i32.to_be_bytes());
+
+    // sstableLevel=0, repairedAt=0.
+    out.extend_from_slice(&0_i32.to_be_bytes());
+    out.extend_from_slice(&0_i64.to_be_bytes());
+
+    // Improved min/max: empty clustering type list and Slice.ALL. With zero
+    // clustering columns this is start kind=INCL_START_BOUND,size=0 and end
+    // kind=INCL_END_BOUND,size=0.
+    out.push(0);
+    out.extend_from_slice(&[0x01, 0x00, 0x00, 0x06, 0x00, 0x00]);
+
+    out.push(0); // hasLegacyCounterShards=false
+    out.extend_from_slice(&(total_columns_set as i64).to_be_bytes());
+    out.extend_from_slice(&(total_rows as i64).to_be_bytes());
+
+    // Commit-log lower bound NONE and an empty interval set.
+    write_commitlog_position_none(&mut out);
+    out.extend_from_slice(&0_i32.to_be_bytes());
+
+    out.push(0); // pendingRepair absent
+    out.push(0); // isTransient=false
+    out.push(0); // originatingHostId absent
+    out.push(0); // hasPartitionLevelDeletions=false
+
+    write_vint_prefixed_bytes(&mut out, first_key);
+    write_vint_prefixed_bytes(&mut out, last_key);
+    out.extend_from_slice(&f64::NAN.to_be_bytes());
+
+    Some(StatsMetadata { data: out })
+}
+
 /// Ordinal 3 — column definitions needed for Data.db delta decoding.
 #[derive(Debug, Clone)]
 pub struct SerializationHeader {
@@ -506,6 +589,42 @@ fn write_vint_prefixed_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn write_commitlog_position_none(out: &mut Vec<u8>) {
+    out.extend_from_slice(&(-1_i64).to_be_bytes());
+    out.extend_from_slice(&0_i32.to_be_bytes());
+}
+
+fn write_estimated_histogram(out: &mut Vec<u8>, bucket_count: usize, count: u64) {
+    assert!(
+        bucket_count >= 2,
+        "estimated histogram needs an overflow bucket"
+    );
+    out.extend_from_slice(&(bucket_count as i32).to_be_bytes());
+
+    let offsets = estimated_histogram_offsets(bucket_count - 1);
+    for i in 0..bucket_count {
+        let offset = offsets[if i == 0 { 0 } else { i - 1 }];
+        let bucket_count = if i == 0 { count as i64 } else { 0 };
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.extend_from_slice(&bucket_count.to_be_bytes());
+    }
+}
+
+fn estimated_histogram_offsets(size: usize) -> Vec<i64> {
+    let mut offsets = Vec::with_capacity(size);
+    let mut last = 1_i64;
+    offsets.push(last);
+    while offsets.len() < size {
+        let mut next = ((last as f64) * 1.2).round() as i64;
+        if next == last {
+            next += 1;
+        }
+        offsets.push(next);
+        last = next;
+    }
+    offsets
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — primitive encoding
 // ---------------------------------------------------------------------------
@@ -763,6 +882,43 @@ mod tests {
         let decoded = read_statistics(&encoded).unwrap();
         assert!(decoded.compaction.data.is_empty());
         assert!(decoded.stats.data.is_empty());
+    }
+
+    #[test]
+    fn simple_bti_stats_metadata_records_key_range_and_counts() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: 1_000_123,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"v".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+
+        let stats = build_simple_bti_stats_metadata(&header, b"pk1", b"pk2", 2, 2, 2, 1.0).unwrap();
+
+        assert!(!stats.data.is_empty());
+        assert!(stats.data.ends_with(&[
+            0x03, b'p', b'k', b'1', 0x03, b'p', b'k', b'2', 0x7f, 0xf8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ]));
+        assert!(stats.data.windows(8).any(|w| w == 2_i64.to_be_bytes()));
+    }
+
+    #[test]
+    fn simple_bti_stats_metadata_declines_clustered_tables() {
+        let mut header = sample_header();
+        header.clustering_types = vec!["org.apache.cassandra.db.marshal.Int32Type".into()];
+
+        assert!(
+            build_simple_bti_stats_metadata(&header, b"a", b"b", 1, 1, 1, 1.0).is_none(),
+            "clustered-table StatsMetadata needs the clustered Slice serializer"
+        );
     }
 
     // -- CRC validation --

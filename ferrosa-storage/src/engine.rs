@@ -1616,6 +1616,10 @@ impl StorageEngine {
         schema: TableSchema,
         indexed_columns: Vec<(String, usize)>,
     ) -> ferrosa_common::Result<TableState> {
+        if let Some(warning) = schema.legacy_storage_column_order_warning() {
+            tracing::warn!("{warning}");
+        }
+
         let table_id = TableId::new(&schema.keyspace, &schema.table);
         let table_dir = config.data_dir.join("sstables").join(table_id.to_string());
         std::fs::create_dir_all(&table_dir).map_err(|e| {
@@ -1904,9 +1908,128 @@ impl StorageEngine {
     /// generation number descending) and the two vecs are parallel — position `i`
     /// in `sidecars` is the sidecar map for the SSTable at position `i`.
     ///
-    /// SSTables that fail to open are silently skipped — a corrupted SSTable is
-    /// better handled at compaction time than at startup. Sidecar files that fail
-    /// to open are replaced with empty maps (degraded: full scan fallback).
+    #[cfg(test)]
+    const TEST_FAIL_PROMOTION_AFTER_FIRST_COMPONENT: &str =
+        ".test-promotion-fail-after-first-component";
+
+    fn should_fail_promotion_after_first_component(_output_dir: &std::path::Path) -> bool {
+        #[cfg(test)]
+        {
+            _output_dir
+                .join(Self::TEST_FAIL_PROMOTION_AFTER_FIRST_COMPONENT)
+                .exists()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn temp_promotion_directory(
+        target_dir: &std::path::Path,
+        promoted_gen: u64,
+    ) -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or(0);
+        target_dir.join(format!(".promote-{promoted_gen}-{suffix}"))
+    }
+
+    fn generation_dir_path(table_dir: &std::path::Path, gen: u64) -> Option<std::path::PathBuf> {
+        let gen_str = gen.to_string();
+        let generation_dir = table_dir.join(&gen_str);
+        if generation_dir.exists() && generation_dir.join(format!("{gen_str}-Data.db")).exists() {
+            Some(generation_dir)
+        } else {
+            let flat = table_dir.join(format!("{gen_str}-Data.db"));
+            if flat.exists() {
+                Some(table_dir.to_path_buf())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn generation_component_path(
+        table_dir: &std::path::Path,
+        gen: &str,
+        component: &str,
+    ) -> Option<std::path::PathBuf> {
+        if let Some(dir) = Self::generation_dir_path(table_dir, gen.parse::<u64>().ok()?) {
+            let path = dir.join(format!("{gen}-{component}"));
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        let flat = table_dir.join(format!("{gen}-{component}"));
+        if flat.exists() {
+            Some(flat)
+        } else {
+            None
+        }
+    }
+
+    fn quarantine_generation(
+        table_dir: &std::path::Path,
+        gen: u64,
+        quarantine_dir: &std::path::Path,
+    ) -> ferrosa_common::Result<()> {
+        let gen_str = gen.to_string();
+        let source_dir =
+            Self::generation_dir_path(table_dir, gen).unwrap_or_else(|| table_dir.to_path_buf());
+        let prefix = format!("{gen_str}-");
+
+        for entry in std::fs::read_dir(&source_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&prefix) {
+                let dest = quarantine_dir.join(&*name);
+                std::fs::rename(entry.path(), dest).map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "failed to quarantine stale SSTable generation file {}: {e}",
+                        entry.path().display()
+                    ))
+                })?;
+            }
+        }
+
+        if source_dir != *table_dir {
+            let _ = std::fs::remove_dir(&source_dir);
+        }
+
+        Ok(())
+    }
+
+    fn generation_component_paths(
+        table_dir: &std::path::Path,
+        gen: u64,
+    ) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Some(dir) = Self::generation_dir_path(table_dir, gen) {
+            for component in [
+                "Data.db",
+                "Partitions.db",
+                "Rows.db",
+                "Filter.db",
+                "Statistics.db",
+                "TOC.txt",
+                "CompressionInfo.db",
+            ] {
+                let path = dir.join(format!("{}-{component}", gen));
+                if path.exists() {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     fn load_existing_sstables_and_sidecars(
         table_dir: &std::path::Path,
     ) -> (
@@ -1915,19 +2038,33 @@ impl StorageEngine {
         Vec<(String, std::path::PathBuf)>,
     ) {
         // Collect all generation numbers by looking for Data.db files.
-        let mut generations: Vec<u64> = std::fs::read_dir(table_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_str()?.to_string();
+        let mut generations: Vec<u64> = {
+            let mut values = std::collections::HashSet::new();
+
+            for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
                 if name.ends_with("-Data.db") {
-                    name.split('-').next()?.parse::<u64>().ok()
-                } else {
-                    None
+                    if let Some(gen) = name.split('-').next().and_then(|v| v.parse::<u64>().ok()) {
+                        values.insert(gen);
+                    }
+                    continue;
                 }
-            })
-            .collect();
+
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    if let Ok(gen) = name.parse::<u64>() {
+                        if table_dir
+                            .join(gen.to_string())
+                            .join(format!("{gen}-Data.db"))
+                            .exists()
+                        {
+                            values.insert(gen);
+                        }
+                    }
+                }
+            }
+
+            values.into_iter().collect()
+        };
 
         // Sort descending — newest generation first.
         generations.sort_by(|a, b| b.cmp(a));
@@ -1950,7 +2087,8 @@ impl StorageEngine {
             let critical_components = ["Data.db", "Partitions.db"];
             let mut quarantine = false;
             for comp in &critical_components {
-                let path = table_dir.join(format!("{gen_str}-{comp}"));
+                let path = Self::generation_component_path(table_dir, &gen_str, comp)
+                    .unwrap_or_else(|| table_dir.join(format!("{gen_str}-{comp}")));
                 match std::fs::metadata(&path) {
                     Ok(meta) if meta.len() == 0 => {
                         tracing::error!(
@@ -1971,13 +2109,8 @@ impl StorageEngine {
                 // Move to quarantine subdirectory.
                 let quarantine_dir = table_dir.join("quarantine");
                 let _ = std::fs::create_dir_all(&quarantine_dir);
-                for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with(&format!("{gen_str}-")) {
-                        let dest = quarantine_dir.join(&*name);
-                        let _ = std::fs::rename(entry.path(), dest);
-                    }
+                if let Err(e) = Self::quarantine_generation(table_dir, gen, &quarantine_dir) {
+                    tracing::warn!(%e, gen, "storage-engine: failed to quarantine stale SSTable generation");
                 }
                 quarantined_count += 1;
                 continue;
@@ -2026,7 +2159,9 @@ impl StorageEngine {
 
         let mut sidecars = HashMap::new();
 
-        let entries = match std::fs::read_dir(table_dir) {
+        let dir =
+            Self::generation_dir_path(table_dir, gen).unwrap_or_else(|| table_dir.to_path_buf());
+        let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => return sidecars,
         };
@@ -2579,18 +2714,54 @@ impl StorageEngine {
 
         let (task_tx, task_rx) = std::sync::mpsc::sync_channel(config.channel_capacity);
         let target_table_id = TableId::new(&schema.keyspace, &config.target_table);
-        let target_timestamp_unit = self
-            .tables
-            .read()
-            .get(&target_table_id)
+        let target_tables = self.tables.read();
+        let target_state = target_tables.get(&target_table_id);
+        let target_timestamp_unit = target_state
             .map(TableState::time_series_timestamp_unit)
             .unwrap_or(source_timestamp_unit);
+        let target_result_column_indices = if let Some(target_state) = target_state {
+            let mut target_indices_by_name = HashMap::new();
+            for (idx, column) in target_state
+                .schema
+                .static_columns
+                .iter()
+                .chain(target_state.schema.regular_columns.iter())
+                .enumerate()
+            {
+                target_indices_by_name.insert(column.name.as_str(), idx as u16);
+            }
+
+            let mut indices = Vec::with_capacity(config.columns.len() * config.functions.len());
+            for source_column in &config.columns {
+                for function in &config.functions {
+                    let Some(suffix) = function.output_suffix() else {
+                        continue;
+                    };
+                    let output_column = format!("{source_column}_{suffix}");
+                    let Some(&column_index) = target_indices_by_name.get(output_column.as_str())
+                    else {
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "invalid consolidation extensions for {table_id}: target table \
+                             '{target_table_id}' is missing rollup output column '{output_column}'"
+                        )));
+                    };
+                    indices.push(column_index);
+                }
+            }
+            indices
+        } else {
+            (0..config.columns.len() * config.functions.len())
+                .map(|idx| idx as u16)
+                .collect()
+        };
+        drop(target_tables);
         let target = MaterializationTarget {
             source_table: table_id.clone(),
             target_table: target_table_id,
             interval: config.interval,
             source_columns: config.columns.clone(),
             functions: config.functions.clone(),
+            target_result_column_indices,
             target_timestamp_unit,
         };
         let source_column_count = value_column_indices.len();
@@ -4291,12 +4462,41 @@ impl StorageEngine {
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::SSTableComponents;
 
-        let data = FileReadAt::open(dir.join(format!("{gen}-Data.db")))?;
-        let partitions = FileReadAt::open(dir.join(format!("{gen}-Partitions.db")))?;
-        let rows = FileReadAt::open(dir.join(format!("{gen}-Rows.db")))?;
-        let filter = std::fs::read(dir.join(format!("{gen}-Filter.db")))?;
-        let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db")))?;
-        let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+        let data = Self::generation_component_path(dir, gen, "Data.db").ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "missing required Data.db for sstable generation {gen} in {}",
+                dir.display()
+            ))
+        })?;
+        let data = FileReadAt::open(data)?;
+
+        let partitions =
+            Self::generation_component_path(dir, gen, "Partitions.db").ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "missing required Partitions.db for sstable generation {gen} in {}",
+                    dir.display()
+                ))
+            })?;
+        let partitions = FileReadAt::open(partitions)?;
+
+        let rows = Self::generation_component_path(dir, gen, "Rows.db").ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "missing required Rows.db for sstable generation {gen} in {}",
+                dir.display()
+            ))
+        })?;
+        let rows = FileReadAt::open(rows)?;
+
+        let filter = Self::generation_component_path(dir, gen, "Filter.db")
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+
+        let statistics = Self::generation_component_path(dir, gen, "Statistics.db")
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+
+        let compression_info = Self::generation_component_path(dir, gen, "CompressionInfo.db")
+            .and_then(|p| std::fs::read(p).ok());
 
         ferrosa_sstable::reader::SSTableReader::open(SSTableComponents {
             data,
@@ -4477,9 +4677,9 @@ impl StorageEngine {
         ];
         suffixes
             .iter()
-            .map(|s| {
-                let p = table_dir.join(format!("{gen}-{s}"));
-                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+            .filter_map(|s| {
+                Self::generation_component_path(table_dir, &gen.to_string(), s)
+                    .and_then(|p| std::fs::metadata(&p).ok().map(|m| m.len()))
             })
             .sum()
     }
@@ -4496,7 +4696,9 @@ impl StorageEngine {
             "CompressionInfo.db",
         ];
         for s in &suffixes {
-            let _ = std::fs::remove_file(table_dir.join(format!("{gen}-{s}")));
+            if let Some(path) = Self::generation_component_path(table_dir, gen, s) {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 
@@ -4951,19 +5153,35 @@ impl StorageEngine {
 
     /// Scan a table directory for SSTable generation numbers.
     fn scan_generations(table_dir: &std::path::Path) -> Vec<u64> {
-        std::fs::read_dir(table_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_str()?.to_string();
-                if name.ends_with("-Data.db") {
-                    name.split('-').next()?.parse::<u64>().ok()
-                } else {
-                    None
+        let mut generations = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with("-Data.db") {
+                if let Some(gen) = name.split('-').next().and_then(|v| v.parse::<u64>().ok()) {
+                    if seen.insert(gen) {
+                        generations.push(gen);
+                    }
                 }
-            })
-            .collect()
+                continue;
+            }
+
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Ok(gen) = name.parse::<u64>() {
+                    if table_dir
+                        .join(&name)
+                        .join(format!("{name}-Data.db"))
+                        .exists()
+                        && seen.insert(gen)
+                    {
+                        generations.push(gen);
+                    }
+                }
+            }
+        }
+
+        generations
     }
 
     fn promote_compaction_output(
@@ -4995,7 +5213,17 @@ impl StorageEngine {
         let promoted_gen = table_max_gen.max(output_gen).saturating_add(1);
         let promoted_id = promoted_gen.to_string();
         let old_prefix = format!("{}-", output.id);
+        let final_target = target_dir.join(&promoted_id);
+        let fail_after_first = Self::should_fail_promotion_after_first_component(&output.path);
 
+        if final_target.exists() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "promoted compaction target already exists: {}",
+                final_target.display()
+            )));
+        }
+
+        let staging_dir = Self::temp_promotion_directory(&target_dir, promoted_gen);
         let mut moves = Vec::new();
         for entry in std::fs::read_dir(source_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
@@ -5014,14 +5242,17 @@ impl StorageEngine {
             let Some(component_suffix) = name.strip_prefix(&old_prefix) else {
                 continue;
             };
-            let target = target_dir.join(format!("{promoted_id}-{component_suffix}"));
+            if component_suffix.is_empty() {
+                continue;
+            }
+            let target = staging_dir.join(format!("{promoted_id}-{component_suffix}"));
             if target.exists() {
                 return Err(ferrosa_common::Error::InvalidFormat(format!(
                     "promoted compaction target already exists: {}",
                     target.display()
                 )));
             }
-            moves.push((entry.path(), target));
+            moves.push((entry.path(), target, component_suffix.to_string()));
         }
 
         if moves.is_empty() {
@@ -5031,25 +5262,86 @@ impl StorageEngine {
             )));
         }
 
-        for (source, target) in &moves {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        std::fs::create_dir_all(&staging_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create compaction promotion staging dir {}: {e}",
+                staging_dir.display()
+            ))
+        })?;
+
+        let rollback_moved = |moved: &[(std::path::PathBuf, std::path::PathBuf)]| {
+            for (source, target) in moved.iter().rev() {
+                if target.exists() {
+                    let _ = std::fs::rename(target, source);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        };
+
+        let mut moved = Vec::new();
+        for (source, target, component_suffix) in &moves {
+            let bytes = std::fs::metadata(source).map(|m| m.len()).map_err(|e| {
+                let err = ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to inspect compaction component {} before promotion: {e}",
+                    source.display()
+                ));
+                rollback_moved(&moved);
+                err
+            })?;
+            if bytes == 0 && matches!(component_suffix.as_str(), "Data.db" | "Partitions.db") {
+                rollback_moved(&moved);
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "refusing to promote compaction component {}: critical component is zero bytes",
+                    source.display()
+                )));
+            }
+
             std::fs::rename(source, target).map_err(|e| {
-                ferrosa_common::Error::InvalidFormat(format!(
-                    "failed to promote compaction component {} to {}: {e}",
+                let err = ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to stage compaction component {} to {}: {e}",
                     source.display(),
                     target.display()
-                ))
+                ));
+                rollback_moved(&moved);
+                err
             })?;
-        }
-        let _ = std::fs::remove_dir(source_dir);
+            moved.push((source.clone(), target.clone()));
 
-        let size_bytes = moves
+            if fail_after_first && moved.len() == 1 {
+                rollback_moved(&moved);
+                return Err(ferrosa_common::Error::InvalidFormat(
+                    "simulated failure after first compaction component stage".to_string(),
+                ));
+            }
+        }
+
+        if final_target.exists() {
+            rollback_moved(&moved);
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "promoted compaction target already exists: {}",
+                final_target.display()
+            )));
+        }
+
+        std::fs::rename(&staging_dir, &final_target).map_err(|e| {
+            rollback_moved(&moved);
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to atomically promote compaction output to {}: {e}",
+                final_target.display()
+            ))
+        })?;
+
+        let _ = std::fs::remove_dir_all(source_dir);
+
+        let size_bytes = Self::generation_component_paths(&final_target, promoted_gen)
             .iter()
-            .filter_map(|(_, target)| std::fs::metadata(target).ok().map(|m| m.len()))
+            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
 
         let mut promoted = output.clone();
         promoted.id = promoted_id;
-        promoted.path = target_dir;
+        promoted.path = final_target;
         promoted.size_bytes = size_bytes;
         Ok(promoted)
     }
@@ -5066,7 +5358,8 @@ impl StorageEngine {
         ];
         for input in inputs {
             for component in &standard_components {
-                let file_path = input.path.join(format!("{}-{component}", input.id));
+                let file_path = Self::generation_component_path(&input.path, &input.id, component)
+                    .unwrap_or_else(|| input.path.join(format!("{}-{component}", input.id)));
                 let _ = std::fs::remove_file(&file_path);
             }
         }
@@ -5078,7 +5371,9 @@ impl StorageEngine {
         gen: u64,
     ) -> Vec<crate::upload::manager::SstableComponentFile> {
         let gen_str = gen.to_string();
-        std::fs::read_dir(table_dir)
+        let dir =
+            Self::generation_dir_path(table_dir, gen).unwrap_or_else(|| table_dir.to_path_buf());
+        std::fs::read_dir(&dir)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
@@ -5655,19 +5950,19 @@ mod tests {
             data: from_hex(CASSANDRA_COMPACTION_METADATA_HEX),
         };
 
-        // Replace the template StatsMetadata blob, then fix its tail.
-        // The last 12 bytes of CASSANDRA_STATS_METADATA_HEX are:
-        //   vint32(1)+"a" + vint32(1)+"b" + NaN_f64 (8 bytes)
-        // — keys from the SSTable the blob was extracted from.  Strip those and
-        // append the correct firstKey, lastKey, and tokenSpaceCoverage=NaN.
-        let mut stats_bytes = from_hex(CASSANDRA_STATS_METADATA_HEX);
-        stats_bytes.truncate(stats_bytes.len() - 12);
-        append_vint_prefixed_key(&mut stats_bytes, &first_key);
-        append_vint_prefixed_key(&mut stats_bytes, &last_key);
-        // tokenSpaceCoverage: NaN (f64 quiet NaN, big-endian)
-        stats_bytes.extend_from_slice(&[0x7f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        if stats.stats.data.is_empty() {
+            // Legacy clustered-table fallback: replace the empty StatsMetadata
+            // blob, then fix its key-range tail. New no-clustering SSTables are
+            // expected to carry writer-produced metadata, and this path must not
+            // overwrite it with a clustered-table template.
+            let mut stats_bytes = from_hex(CASSANDRA_STATS_METADATA_HEX);
+            stats_bytes.truncate(stats_bytes.len() - 12);
+            append_vint_prefixed_key(&mut stats_bytes, &first_key);
+            append_vint_prefixed_key(&mut stats_bytes, &last_key);
+            stats_bytes.extend_from_slice(&[0x7f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
 
-        stats.stats = StatsMetadata { data: stats_bytes };
+            stats.stats = StatsMetadata { data: stats_bytes };
+        }
 
         let patched = write_statistics(&stats);
         std::fs::write(&stats_path, patched).expect("write patched Statistics.db");
@@ -5680,7 +5975,7 @@ mod tests {
     /// ("da" is the BTI version prefix; "bti" is the format name.)
     /// This function:
     ///   1. Scans `src_dir` for files matching `{gen}-*.db` / `{gen}-*.txt`
-    ///   2. Copies them to `dst_dir` with `da-{gen}-bti-` prefix
+    ///   2. Copies them to `dst_dir` with a Cassandra-local `da-1-bti-` prefix
     ///   3. Rewrites the TOC.txt content to list the new filenames
     ///
     /// Returns the destination directory path.
@@ -5695,12 +5990,13 @@ mod tests {
             let src_path = entry.path();
             let fname = src_path.file_name().unwrap().to_str().unwrap().to_string();
 
-            // Split "{gen}-{Component}" → prefix = "da-{gen}-bti-{Component}"
-            // "da" is the BTI version string; "bti" is the format name.
+            // Split "{gen}-{Component}" and rewrite to a compact Cassandra
+            // descriptor generation. Ferrosa generations are node/timestamp
+            // sized; Cassandra import discovers normal BTI descriptors such as
+            // `da-1-bti-Data.db`.
             let cassandra_fname = if let Some(dash_pos) = fname.find('-') {
-                let gen = &fname[..dash_pos];
                 let component = &fname[dash_pos + 1..];
-                format!("da-{gen}-bti-{component}")
+                format!("da-1-bti-{component}")
             } else {
                 fname.clone()
             };
@@ -10957,7 +11253,6 @@ mod tests {
         let tid_str = tid.to_string();
 
         // Record the paths of all SSTable component files before compaction.
-        // Files are stored flat: {data_dir}/sstables/{table_id}/{gen}-Data.db etc.
         let sstable_dir = dir.path().join("sstables").join(&tid_str);
         let input_files_before: Vec<std::path::PathBuf> = std::fs::read_dir(&sstable_dir)
             .unwrap()
@@ -10977,20 +11272,14 @@ mod tests {
         // consumed: the compaction thread writes files before sending on the
         // channel, so a single poll may miss the result under parallel load.
         let table_compaction_dir = dir.path().join("compaction").join(&tid_str);
-        let mut data_files_after = vec![];
+        let mut generations_after = vec![];
         for _ in 0..40 {
             engine.poll_compactions().await;
-            data_files_after = std::fs::read_dir(&sstable_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && p.extension().map(|e| e == "db").unwrap_or(false))
-                .collect();
+            generations_after = StorageEngine::scan_generations(&sstable_dir);
             let input_files_evicted = input_files_before.iter().all(|path| !path.exists());
-            let promoted_data_file_present = data_files_after.iter().any(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with("-Data.db"))
+            let promoted_data_file_present = generations_after.iter().any(|gen| {
+                StorageEngine::generation_component_path(&sstable_dir, &gen.to_string(), "Data.db")
+                    .is_some()
             });
             let staging_drained = table_compaction_dir
                 .read_dir()
@@ -11016,14 +11305,13 @@ mod tests {
 
         // The compacted output must be durable in the normal SSTable directory.
         assert!(
-            data_files_after.iter().any(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with("-Data.db"))
+            generations_after.iter().any(|gen| {
+                StorageEngine::generation_component_path(&sstable_dir, &gen.to_string(), "Data.db")
+                    .is_some()
             }),
             "compacted output Data.db should be promoted into {:?}, got {:?}",
             sstable_dir,
-            data_files_after
+            generations_after
         );
 
         let staged_files: Vec<_> = table_compaction_dir
@@ -11037,6 +11325,89 @@ mod tests {
             staged_files.is_empty(),
             "compaction staging dir should be drained after promotion, got {:?}",
             staged_files
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_promotion_fail_after_first_component_is_atomic_and_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let tid_str = tid.to_string();
+
+        let sstable_dir = dir.path().join("sstables").join(&tid_str);
+        let pre_generations = StorageEngine::scan_generations(&sstable_dir);
+        assert!(
+            !pre_generations.is_empty(),
+            "setup should have at least one generation before compaction promotion"
+        );
+
+        // Wait for a completed compaction result to appear.
+        let result = {
+            let mut output = None;
+            for _ in 0..120 {
+                let mut results = engine.compaction_executor.poll_results();
+                if let Some(compaction_result) = results.pop() {
+                    output = Some(compaction_result.output);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            output.expect("compaction executor should produce output")
+        };
+
+        // Inject a synthetic first-component failure during promotion.
+        let marker_path = result
+            .path
+            .join(StorageEngine::TEST_FAIL_PROMOTION_AFTER_FIRST_COMPONENT);
+        std::fs::write(&marker_path, b"1").unwrap();
+
+        let failed = engine.promote_compaction_output(&tid, &result);
+        assert!(
+            failed.is_err(),
+            "promotion should fail with test marker present"
+        );
+
+        // No generation should become visible from a partial promotion.
+        let post_generations = StorageEngine::scan_generations(&sstable_dir);
+        assert_eq!(
+            post_generations, pre_generations,
+            "partial compaction generation must not be discoverable"
+        );
+
+        // Staging artifacts should be absent; the output can be retried from the
+        // original compaction directory.
+        let has_orphaned_stage = std::fs::read_dir(&sstable_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".promote-"));
+        assert!(
+            !has_orphaned_stage,
+            "simulated partial promotion should not leave orphaned staging directories"
+        );
+
+        std::fs::remove_file(&marker_path).unwrap();
+        let recovered = engine.promote_compaction_output(&tid, &result);
+        assert!(
+            recovered.is_ok(),
+            "promotion should recover from marker-cleared output: {:?}",
+            recovered.err()
+        );
+        let recovered = recovered.unwrap();
+
+        let recovered_generations = StorageEngine::scan_generations(&sstable_dir);
+        let recovered_gen = recovered.id.parse::<u64>().unwrap();
+        assert!(
+            recovered_generations.contains(&recovered_gen),
+            "recovered promotion should materialize a new generation"
+        );
+        assert!(
+            !pre_generations.contains(&recovered_gen),
+            "new generation should not replace preexisting generation IDs"
+        );
+        assert!(
+            !result.path.exists(),
+            "original compaction output directory should be removed after successful promotion"
         );
     }
 
@@ -11181,12 +11552,12 @@ mod tests {
             static_columns: vec![],
             regular_columns: vec![
                 ferrosa_common::schema::ColumnDefinition {
-                    name: "v_text".into(),
-                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
-                },
-                ferrosa_common::schema::ColumnDefinition {
                     name: "v_int".into(),
                     type_name: "org.apache.cassandra.db.marshal.Int32Type".into(),
+                },
+                ferrosa_common::schema::ColumnDefinition {
+                    name: "v_text".into(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
                 },
             ],
             extensions: Default::default(),
@@ -11199,7 +11570,7 @@ mod tests {
         let row1 = ferrosa_sstable::types::Row {
             clustering: vec![],
             cells: vec![(
-                0,
+                1,
                 ferrosa_common::cell::CellValue::live(b"hello".to_vec(), 1000),
             )],
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
@@ -11213,7 +11584,7 @@ mod tests {
         let int_bytes = 42i32.to_be_bytes().to_vec();
         let row2 = ferrosa_sstable::types::Row {
             clustering: vec![],
-            cells: vec![(1, ferrosa_common::cell::CellValue::live(int_bytes, 2000))],
+            cells: vec![(0, ferrosa_common::cell::CellValue::live(int_bytes, 2000))],
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
         };
@@ -11239,12 +11610,12 @@ mod tests {
                     static_columns: vec![],
                     regular_columns: vec![
                         ferrosa_common::schema::ColumnDefinition {
-                            name: "v_text".into(),
-                            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
-                        },
-                        ferrosa_common::schema::ColumnDefinition {
                             name: "v_int".into(),
                             type_name: "org.apache.cassandra.db.marshal.Int32Type".into(),
+                        },
+                        ferrosa_common::schema::ColumnDefinition {
+                            name: "v_text".into(),
+                            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
                         },
                     ],
                     extensions: Default::default(),
@@ -11350,12 +11721,32 @@ mod tests {
             .unwrap_or(false);
         assert!(schema_ok, "failed to create keyspace/table in Cassandra");
 
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let tid_str = tid.to_string();
+        let entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
+        assert_eq!(
+            entries.len(),
+            1,
+            "manifest should contain exactly one promoted compacted SSTable"
+        );
+        let promoted_gen = entries[0].id.clone();
+        let sstable_dir = dir.path().join("sstables").join(&tid_str);
+        let import_source = StorageEngine::generation_dir_path(
+            &sstable_dir,
+            promoted_gen
+                .parse::<u64>()
+                .expect("numeric promoted generation"),
+        )
+        .expect("promoted compaction generation should be visible in SSTable directory");
+
         // ── Step 5: copy SSTable files into container and run nodetool import ──
         // Ferrosa names files `{gen}-Data.db`; Cassandra's SSTableLoader expects
         // the BTI descriptor prefix `da-{gen}-bti-`.  prepare_cassandra_import_dir
         // renames the files and rewrites the TOC.txt.
         let import_staging = dir.path().join("cassandra-import");
-        prepare_cassandra_import_dir(&compaction_dir, &import_staging);
+        prepare_cassandra_import_dir(&import_source, &import_staging);
 
         // Replace ferrosa's empty CompactionMetadata/StatsMetadata with real
         // Cassandra 5 bytes so nodetool import can deserialize Statistics.db.
@@ -11403,8 +11794,46 @@ mod tests {
             .unwrap_or(false);
         assert!(import_ok, "nodetool import failed");
 
-        // ── Step 6: verify rows via SELECT ──
-        let cql_output = Command::new(container_runtime())
+        // ── Step 6: verify rows via exact partition reads and full scan ──
+        let pk1_output = Command::new(container_runtime())
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "cqlsh",
+                "--execute",
+                "SELECT pk, v_text, v_int FROM test_ks.mixed_cells WHERE pk='pk1';",
+            ])
+            .output()
+            .expect("cqlsh failed");
+
+        let pk1_stdout = String::from_utf8_lossy(&pk1_output.stdout);
+        let pk1_stderr = String::from_utf8_lossy(&pk1_output.stderr);
+
+        assert!(
+            pk1_stdout.contains("pk1") && pk1_stdout.contains("hello"),
+            "Cassandra output missing pk1/v_text row.\nstdout: {pk1_stdout}\nstderr: {pk1_stderr}"
+        );
+
+        let pk2_output = Command::new(container_runtime())
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "cqlsh",
+                "--execute",
+                "SELECT pk, v_text, v_int FROM test_ks.mixed_cells WHERE pk='pk2';",
+            ])
+            .output()
+            .expect("cqlsh failed");
+
+        let pk2_stdout = String::from_utf8_lossy(&pk2_output.stdout);
+        let pk2_stderr = String::from_utf8_lossy(&pk2_output.stderr);
+
+        assert!(
+            pk2_stdout.contains("pk2") && pk2_stdout.contains("42"),
+            "Cassandra output missing pk2/v_int row.\nstdout: {pk2_stdout}\nstderr: {pk2_stderr}"
+        );
+
+        let scan_output = Command::new(container_runtime())
             .args([
                 "exec",
                 "ferrosa-cassandra-test",
@@ -11413,18 +11842,18 @@ mod tests {
                 "SELECT pk, v_text, v_int FROM test_ks.mixed_cells;",
             ])
             .output()
-            .expect("cqlsh failed");
+            .expect("cqlsh full scan failed");
 
-        let stdout = String::from_utf8_lossy(&cql_output.stdout);
-        let stderr = String::from_utf8_lossy(&cql_output.stderr);
+        let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
+        let scan_stderr = String::from_utf8_lossy(&scan_output.stderr);
 
         assert!(
-            stdout.contains("pk1") && stdout.contains("hello"),
-            "Cassandra output missing pk1/v_text row.\nstdout: {stdout}\nstderr: {stderr}"
-        );
-        assert!(
-            stdout.contains("pk2") && stdout.contains("42"),
-            "Cassandra output missing pk2/v_int row.\nstdout: {stdout}\nstderr: {stderr}"
+            scan_output.status.success()
+                && scan_stdout.contains("pk1")
+                && scan_stdout.contains("hello")
+                && scan_stdout.contains("pk2")
+                && scan_stdout.contains("42"),
+            "Cassandra full scan must read both imported rows.\nstdout: {scan_stdout}\nstderr: {scan_stderr}"
         );
 
         // Cleanup.
@@ -11467,8 +11896,14 @@ mod tests {
         let prefix = "ferrosa-e2e".to_string();
         let rt = tokio::runtime::Handle::current();
 
-        // Use min_threshold=4 (default STCS) so 4 flushes trigger compaction.
-        let config = StorageEngineConfig::test_config(dir.path());
+        // Use min_threshold=4 and a deliberately wide test bucket so these
+        // tiny fixture SSTables compact as one STCS group. The production
+        // default bucket ratio may correctly split very small files whose
+        // fixed component overhead dominates their logical data size.
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 4;
+        config.compaction.bucket_low = 0.0;
+        config.compaction.bucket_high = 2.0;
         let engine =
             StorageEngine::new_with_upload_store(config, Arc::clone(&store), prefix.clone(), &rt)
                 .unwrap();
@@ -11491,6 +11926,20 @@ mod tests {
             // flush() calls maybe_compact(); on the 4th flush STCS will submit a task.
         }
 
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            let strategy = engine.strategy_for_table(state);
+            let selected = strategy.select(&metadata, &state.schema, &tid);
+            assert_eq!(
+                selected.len(),
+                1,
+                "configured STCS bucket should select the four E2E fixture SSTables; sizes={:?}",
+                metadata.iter().map(|m| m.size_bytes).collect::<Vec<_>>()
+            );
+        }
+
         // Wait for the compaction executor background thread to finish.
         let compaction_dir = dir.path().join("compaction");
         for _ in 0..60 {
@@ -11507,7 +11956,23 @@ mod tests {
         }
 
         // ── poll_compactions: upload, manifest update, local eviction ──
-        engine.poll_compactions().await;
+        //
+        // The executor writes compaction components before publishing the
+        // completed result on its channel. A single non-blocking poll can race
+        // that handoff; the production contract is eventual pickup by the
+        // periodic poller, so this test waits for the observable upload.
+        for _ in 0..100 {
+            engine.poll_compactions().await;
+            if engine
+                .compaction_metrics
+                .s3_uploads_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // Upload confirmed — exactly 1 output SSTable uploaded.
         assert_eq!(
@@ -11541,8 +12006,16 @@ mod tests {
             "manifest should have exactly 1 SSTable entry after STCS compaction"
         );
 
-        // Local input files must be evicted.
+        // Local input files must be evicted while the promoted output remains live.
         let sstable_dir = dir.path().join("sstables").join(&tid_str);
+        let output_gen = entries[0].id.parse::<u64>().expect("numeric output id");
+        let import_source = StorageEngine::generation_dir_path(&sstable_dir, output_gen)
+            .expect("promoted compaction generation should be visible in SSTable directory");
+        assert!(
+            StorageEngine::generation_component_path(&sstable_dir, &entries[0].id, "Data.db")
+                .is_some(),
+            "promoted compacted SSTable Data.db should remain live"
+        );
         if sstable_dir.exists() {
             let remaining_db_files: Vec<_> = std::fs::read_dir(&sstable_dir)
                 .unwrap()
@@ -11621,7 +12094,7 @@ mod tests {
         assert!(schema_ok, "failed to create keyspace/table in Cassandra");
 
         let import_staging = dir.path().join("cassandra-import");
-        prepare_cassandra_import_dir(&compaction_dir, &import_staging);
+        prepare_cassandra_import_dir(&import_source, &import_staging);
 
         // Replace ferrosa's empty CompactionMetadata/StatsMetadata with real
         // Cassandra 5 bytes so nodetool import can deserialize Statistics.db.

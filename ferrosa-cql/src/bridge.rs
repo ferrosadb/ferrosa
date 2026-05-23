@@ -1058,17 +1058,34 @@ pub fn partition_to_rows(
     pk_columns: &[usize],
     ck_columns: &[usize],
 ) -> Vec<Vec<Option<CqlValue>>> {
-    let mut result = Vec::new();
-
-    // Build mapping from storage column index (0-based within static+regular
-    // columns) to full-table column index.  Storage columns are every column
-    // that is NOT a partition key or clustering key, in their original table
-    // order.
     let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
     let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
     let storage_to_table: Vec<usize> = (0..column_names.len())
         .filter(|i| !pk_set.contains(i) && !ck_set.contains(i))
         .collect();
+
+    partition_to_rows_with_storage_mapping(
+        partition,
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        &storage_to_table,
+    )
+}
+
+/// Convert a storage `Partition` using an explicit storage-index to table-index
+/// map. New schemas use Cassandra column-name order for storage cells, which can
+/// differ from original CQL declaration order.
+pub fn partition_to_rows_with_storage_mapping(
+    partition: &ferrosa_sstable::types::Partition,
+    column_names: &[String],
+    column_types: &[CqlType],
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+    storage_to_table: &[usize],
+) -> Vec<Vec<Option<CqlValue>>> {
+    let mut result = Vec::new();
 
     // Pre-decode PK values from the partition key
     let pk_values = decode_pk(&partition.key, pk_columns.len());
@@ -1175,14 +1192,32 @@ pub fn partition_to_rows_with_metadata(
     pk_columns: &[usize],
     ck_columns: &[usize],
 ) -> (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>) {
-    let mut result = Vec::new();
-    let mut meta_result = Vec::new();
-
     let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
     let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
     let storage_to_table: Vec<usize> = (0..column_names.len())
         .filter(|i| !pk_set.contains(i) && !ck_set.contains(i))
         .collect();
+
+    partition_to_rows_with_metadata_storage_mapping(
+        partition,
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        &storage_to_table,
+    )
+}
+
+pub fn partition_to_rows_with_metadata_storage_mapping(
+    partition: &ferrosa_sstable::types::Partition,
+    column_names: &[String],
+    column_types: &[CqlType],
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+    storage_to_table: &[usize],
+) -> (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>) {
+    let mut result = Vec::new();
+    let mut meta_result = Vec::new();
 
     let pk_values = decode_pk(&partition.key, pk_columns.len());
 

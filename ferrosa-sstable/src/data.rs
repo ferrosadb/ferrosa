@@ -751,8 +751,8 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
     /// Skip a row after its flags and extended flags have already been consumed.
     fn skip_row_body(&mut self, _flags: u8, is_static: bool) -> Result<()> {
-        if !is_static {
-            let num_clustering = self.header.clustering_types.len();
+        let num_clustering = self.header.clustering_types.len();
+        if !is_static && num_clustering > 0 {
             let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
 
@@ -800,38 +800,41 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             Vec::new()
         } else {
             let num_clustering = self.header.clustering_types.len();
-            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-            self.pos += n as u64;
 
             let mut ck_bytes = Vec::new();
-            for i in 0..num_clustering {
-                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
-                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+            if num_clustering > 0 {
+                let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
 
-                if is_null || is_empty {
-                    continue;
-                }
+                for i in 0..num_clustering {
+                    let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                    let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
 
-                let type_name = &self.header.clustering_types[i];
-                let vlen = match marshal::value_length_if_fixed(type_name) {
-                    Some(fixed_len) => fixed_len,
-                    None => {
-                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-                        self.pos += n as u64;
-                        len as usize
+                    if is_null || is_empty {
+                        continue;
                     }
-                };
-                let mut vbuf = vec![0u8; vlen];
-                self.reader.read_exact_at(&mut vbuf, self.pos)?;
-                self.pos += vlen as u64;
 
-                // For multi-column CK, add u16 BE length prefix per component
-                // so the CQL layer's decode_clustering can split them back.
-                // Single-column CK uses raw bytes (no prefix).
-                if num_clustering > 1 {
-                    ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                    let type_name = &self.header.clustering_types[i];
+                    let vlen = match marshal::value_length_if_fixed(type_name) {
+                        Some(fixed_len) => fixed_len,
+                        None => {
+                            let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                            self.pos += n as u64;
+                            len as usize
+                        }
+                    };
+                    let mut vbuf = vec![0u8; vlen];
+                    self.reader.read_exact_at(&mut vbuf, self.pos)?;
+                    self.pos += vlen as u64;
+
+                    // For multi-column CK, add u16 BE length prefix per component
+                    // so the CQL layer's decode_clustering can split them back.
+                    // Single-column CK uses raw bytes (no prefix).
+                    if num_clustering > 1 {
+                        ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                    }
+                    ck_bytes.extend_from_slice(&vbuf);
                 }
-                ck_bytes.extend_from_slice(&vbuf);
             }
             ck_bytes
         };
@@ -892,28 +895,13 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
             (0..num_columns).collect()
         } else {
-            // Bitmap: ceil(num_columns / 8) bytes, one bit per column (MSB first).
-            // A SET bit means the column IS present (Cassandra BooleanArraySerializer).
-            let bitmap_bytes = num_columns.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_bytes];
-            self.reader.read_exact_at(&mut bitmap, self.pos)?;
-            self.pos += bitmap_bytes as u64;
-
-            let mut present = Vec::new();
-            for i in 0..num_columns {
-                let byte_idx = i / 8;
-                let bit_idx = 7 - (i % 8); // MSB first
-                if bitmap[byte_idx] & (1 << bit_idx) != 0 {
-                    present.push(i);
-                }
-            }
-            present
+            self.read_columns_subset(num_columns)?
         };
 
         // Read cells for present columns
         let mut cells = Vec::with_capacity(present_columns.len());
         for &col_idx in &present_columns {
-            let cell = self.read_cell(&liveness)?;
+            let cell = self.read_cell(&liveness, &columns[col_idx].1)?;
             cells.push((col_idx as u16, cell));
         }
 
@@ -1003,33 +991,36 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             Vec::new()
         } else {
             let num_clustering = self.header.clustering_types.len();
-            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-            self.pos += n as u64;
 
             let mut ck_bytes = Vec::new();
-            for i in 0..num_clustering {
-                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
-                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
-                if is_null || is_empty {
-                    continue;
-                }
-                let type_name = &self.header.clustering_types[i];
-                let vlen = match marshal::value_length_if_fixed(type_name) {
-                    Some(fixed_len) => fixed_len,
-                    None => {
-                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-                        self.pos += n as u64;
-                        len as usize
-                    }
-                };
-                let mut vbuf = vec![0u8; vlen];
-                self.reader.read_exact_at(&mut vbuf, self.pos)?;
-                self.pos += vlen as u64;
+            if num_clustering > 0 {
+                let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
 
-                if num_clustering > 1 {
-                    ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                for i in 0..num_clustering {
+                    let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                    let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+                    if is_null || is_empty {
+                        continue;
+                    }
+                    let type_name = &self.header.clustering_types[i];
+                    let vlen = match marshal::value_length_if_fixed(type_name) {
+                        Some(fixed_len) => fixed_len,
+                        None => {
+                            let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                            self.pos += n as u64;
+                            len as usize
+                        }
+                    };
+                    let mut vbuf = vec![0u8; vlen];
+                    self.reader.read_exact_at(&mut vbuf, self.pos)?;
+                    self.pos += vlen as u64;
+
+                    if num_clustering > 1 {
+                        ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                    }
+                    ck_bytes.extend_from_slice(&vbuf);
                 }
-                ck_bytes.extend_from_slice(&vbuf);
             }
             ck_bytes
         };
@@ -1086,20 +1077,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
             (0..num_columns).collect()
         } else {
-            let bitmap_bytes = num_columns.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_bytes];
-            self.reader.read_exact_at(&mut bitmap, self.pos)?;
-            self.pos += bitmap_bytes as u64;
-
-            let mut present = Vec::new();
-            for i in 0..num_columns {
-                let byte_idx = i / 8;
-                let bit_idx = 7 - (i % 8);
-                if bitmap[byte_idx] & (1 << bit_idx) != 0 {
-                    present.push(i);
-                }
-            }
-            present
+            self.read_columns_subset(num_columns)?
         };
 
         // For each present column: decode if wanted, skip otherwise.
@@ -1110,10 +1088,10 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         for &col_idx in &present_columns {
             let col_u16 = col_idx as u16;
             if wanted.contains(&col_u16) {
-                let cell = self.read_cell(&liveness)?;
+                let cell = self.read_cell(&liveness, &columns[col_idx].1)?;
                 cells.push((col_u16, cell));
             } else {
-                self.read_cell_skip(&liveness)?;
+                self.read_cell_skip(&liveness, &columns[col_idx].1)?;
             }
         }
 
@@ -1123,6 +1101,62 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             deletion,
             primary_key_liveness: liveness,
         })
+    }
+
+    fn read_columns_subset(&mut self, num_columns: usize) -> Result<Vec<usize>> {
+        let (encoded, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        if encoded == 0 {
+            return Ok((0..num_columns).collect());
+        }
+
+        if num_columns < 64 {
+            let mut missing = encoded;
+            let mut present = Vec::with_capacity(num_columns);
+            for idx in 0..num_columns {
+                if missing & 1 == 0 {
+                    present.push(idx);
+                }
+                missing >>= 1;
+            }
+            if missing != 0 {
+                return Err(Error::InvalidData(format!(
+                    "columns subset has bits beyond {num_columns} columns"
+                )));
+            }
+            return Ok(present);
+        }
+
+        let missing_count = encoded as usize;
+        if missing_count > num_columns {
+            return Err(Error::InvalidData(format!(
+                "columns subset missing count {missing_count} exceeds {num_columns}"
+            )));
+        }
+        let present_count = num_columns - missing_count;
+        if present_count < num_columns / 2 {
+            let mut present = Vec::with_capacity(present_count);
+            for _ in 0..present_count {
+                let (idx, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                present.push(idx as usize);
+            }
+            Ok(present)
+        } else {
+            let mut is_missing = vec![false; num_columns];
+            for _ in 0..missing_count {
+                let (idx, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                let idx = idx as usize;
+                if idx >= num_columns {
+                    return Err(Error::InvalidData(format!(
+                        "columns subset missing index {idx} exceeds {num_columns}"
+                    )));
+                }
+                is_missing[idx] = true;
+            }
+            Ok((0..num_columns).filter(|idx| !is_missing[*idx]).collect())
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1139,7 +1173,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// projection-aware decode path so cells outside the SELECT list
     /// never pay the read+decode cost (especially big values like
     /// vector embeddings).
-    fn read_cell_skip(&mut self, row_liveness: &LivenessInfo) -> Result<()> {
+    fn read_cell_skip(&mut self, row_liveness: &LivenessInfo, column_type: &str) -> Result<()> {
         let mut cell_flags_buf = [0u8; 1];
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
@@ -1165,8 +1199,13 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.pos += n as u64;
         }
         if !has_empty_value {
-            let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-            self.pos += n as u64;
+            let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(column_type) {
+                fixed_len as u64
+            } else {
+                let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                vlen
+            };
             // Same corruption guard as read_cell so a bogus vlen
             // doesn't carry us past EOF silently.
             const MAX_CELL_VALUE_LEN: u64 = 256 * 1024 * 1024;
@@ -1184,7 +1223,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     }
 
     /// Read a single cell value.
-    fn read_cell(&mut self, row_liveness: &LivenessInfo) -> Result<CellValue> {
+    fn read_cell(&mut self, row_liveness: &LivenessInfo, column_type: &str) -> Result<CellValue> {
         let mut cell_flags_buf = [0u8; 1];
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
@@ -1233,9 +1272,13 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let value = if has_empty_value {
             None
         } else {
-            let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-            self.pos += n as u64;
-            let vlen = vlen as usize;
+            let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(column_type) {
+                fixed_len
+            } else {
+                let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                vlen as usize
+            };
             // Guard against corrupt length values that would cause capacity overflow.
             // A single cell value should never exceed 256 MB.
             const MAX_CELL_VALUE_LEN: usize = 256 * 1024 * 1024;
@@ -1516,7 +1559,7 @@ mod tests {
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
-        push_unsigned_vint(&mut data, 20);
+        push_unsigned_vint(&mut data, 10);
         push_unsigned_vint(&mut data, 0);
 
         // Liveness timestamp delta = 50 (unsigned)
@@ -1687,11 +1730,10 @@ mod tests {
         // Liveness timestamp delta = 10 (unsigned)
         push_unsigned_vint(&mut data, 10);
 
-        // Missing-column bitmap: 2 columns -> 1 byte
+        // Cassandra Columns subset: unsigned vint missing-column bitmap.
         // We want column 0 present, column 1 missing.
-        // Bitmap: bit 7 = col 0 (1 = present), bit 6 = col 1 (0 = missing)
-        // = 0b10000000 = 0x80
-        data.push(0x80);
+        // For <64 columns, bit i = 1 means column i is missing.
+        push_unsigned_vint(&mut data, 0b10);
 
         // Only column 0's cell: use row timestamp
         data.push(CELL_USE_ROW_TIMESTAMP);
@@ -1711,6 +1753,106 @@ mod tests {
         assert_eq!(row.cells.len(), 1);
         assert_eq!(row.cells[0].0, 0); // column index 0
         assert_eq!(row.cells[0].1.value.as_deref(), Some(b"only_a".as_slice()));
+    }
+
+    #[test]
+    fn read_partition_without_clustering_columns_starts_at_row_body_length() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+
+        let mut row_body = Vec::new();
+        push_unsigned_vint(&mut row_body, 42);
+        row_body.push(CELL_USE_ROW_TIMESTAMP);
+        let value = b"hello";
+        push_unsigned_vint(&mut row_body, value.len() as u64);
+        row_body.extend_from_slice(value);
+
+        let mut data = Vec::new();
+        let key = b"pk_no_ck";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
+        push_unsigned_vint(&mut data, row_body.len() as u64);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&row_body);
+        data.push(END_OF_PARTITION);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let partition = reader
+            .read_partition()
+            .unwrap()
+            .expect("expected partition");
+
+        let row = &partition.rows[0];
+        assert!(row.clustering.is_empty());
+        assert_eq!(row.primary_key_liveness.timestamp, 1_000_042);
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(value.as_slice()));
+    }
+
+    #[test]
+    fn read_partition_with_fixed_width_cell_without_value_length_prefix() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"v_int".to_vec(),
+                    "org.apache.cassandra.db.marshal.Int32Type".into(),
+                ),
+                (
+                    b"v_text".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+            ],
+        };
+
+        let mut row_body = Vec::new();
+        push_unsigned_vint(&mut row_body, 42);
+        push_unsigned_vint(&mut row_body, 0b10);
+        row_body.push(CELL_USE_ROW_TIMESTAMP);
+        row_body.extend_from_slice(&42i32.to_be_bytes());
+
+        let mut data = Vec::new();
+        let key = b"pk_fixed";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP);
+        push_unsigned_vint(&mut data, row_body.len() as u64);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&row_body);
+        data.push(END_OF_PARTITION);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let partition = reader
+            .read_partition()
+            .unwrap()
+            .expect("expected partition");
+
+        let row = &partition.rows[0];
+        assert_eq!(row.cells.len(), 1);
+        assert_eq!(row.cells[0].0, 0);
+        assert_eq!(
+            row.cells[0].1.value.as_deref(),
+            Some(42i32.to_be_bytes().as_slice())
+        );
     }
 
     #[test]

@@ -62,9 +62,44 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
 - [x] Time-series materialization must exclude deleted rows and cells.
   - Verify: `cargo test -p ferrosa-storage --test timeseries_materialization materialization_drain_excludes_row_deleted_source_values`.
 
+## SSTable / Cassandra Compatibility Follow-Up
+
+- [x] Cassandra OSS50 byte-comparable partition-index keys must not add an escape terminator after the fixed token component.
+  - Verify: `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-sstable --lib -- --nocapture` (214 passed).
+
+- [x] No-clustering-row SSTable encoding must not serialize a clustering prefix before row body length.
+  - Verify: `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-sstable --lib -- --nocapture` (214 passed).
+
+- [x] Sparse regular/static cells must use Cassandra's subset unsigned-vint missing-column encoding, not Ferrosa's previous raw bitmap.
+  - Verify: `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-sstable --lib -- --nocapture` (214 passed).
+
+- [x] Fixed-width cells must be serialized without a value-length prefix and read back by fixed type width.
+  - Verify: `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-sstable --lib -- --nocapture` (214 passed).
+
+- [x] New storage schemas must assign static/regular cell ordinals in Cassandra column-name order.
+  - Verify: `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-schema --lib regular_and_static_storage_ordinals_follow_cassandra_column_name_order -- --nocapture`.
+
+- [x] Existing non-canonical storage schemas must warn on startup/registration rather than silently pretending they are Cassandra-import compatible.
+  - Verify: `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-common --lib storage_columns -- --nocapture`.
+
+- [x] Cassandra 5 must import and read compacted Ferrosa SSTables for exact partition reads.
+  - Verify: `COMPOSE_PROJECT_NAME=ferrosa_compaction_cassandra_test FERROSA_TEST_CONTAINERS=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-storage --lib cassandra_reads_compacted_sstable_from_s3 -- --nocapture` with Podman cleanup.
+
+- [x] Compaction end-to-end pipeline must use a deterministic STCS fixture and pass through upload, manifest update, local eviction, and Cassandra import/readback.
+  - Verify: `COMPOSE_PROJECT_NAME=ferrosa_compaction_cassandra_test FERROSA_TEST_CONTAINERS=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-storage --lib compaction_end_to_end_pipeline -- --nocapture` with Podman cleanup.
+
+- [x] Cassandra full table range-scan compatibility must be fixed with shape-correct StatsMetadata for no-clustering SSTables, not the clustered-table test-only blob.
+  - Red: Podman Cassandra import test imported exact partition reads but failed `SELECT pk, v_text, v_int FROM test_ks.mixed_cells;` with a replica read failure.
+  - Fix: writer emits Cassandra 5 BTI StatsMetadata for simple primary-key tables, including actual key range, row/cell counts, empty commit-log intervals, no tombstones, and zero-clustering `Slice.ALL`; the import helper preserves writer-produced stats.
+  - Verify: `COMPOSE_PROJECT_NAME=ferrosa_compaction_cassandra_test FERROSA_TEST_CONTAINERS=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUSTFLAGS='-Cdebuginfo=0' cargo +stable test -p ferrosa-storage --lib cassandra_reads_compacted_sstable_from_s3 -- --nocapture` with Podman cleanup.
+  - Remaining documented limitation: clustered-table StatsMetadata still uses the legacy fallback in the Cassandra import helper until the clustered `Slice` serializer is implemented.
+
 ## CI Gate
 
 - [x] `cargo fmt --check`
 - [x] `cargo clippy --all-targets -- -D warnings`
-- [x] `cargo test`
+- [x] `./scripts/pre-push-mirror-ci.sh`
+- [x] Podman/Cassandra compaction compatibility tests:
+  - `cassandra_reads_compacted_sstable_from_s3`
+  - `compaction_end_to_end_pipeline`
 - [ ] PR opened and GitHub CI monitored every 15 minutes until green.
