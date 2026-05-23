@@ -4784,8 +4784,12 @@ fn create_cascade_tables_if_needed(
             .map_err(|e| CqlError::ServerError(format!("cascade table creation failed: {e}")))?;
 
         let storage_schema = cascade_table.to_storage_schema();
-        // Ignore error if already registered.
-        let _ = state.engine.register_table(storage_schema);
+        state.engine.register_table(storage_schema).map_err(|e| {
+            CqlError::ServerError(format!(
+                "cascade table storage registration failed for {}.{}: {e}",
+                source.keyspace, spec.table_name
+            ))
+        })?;
 
         tracing::info!(
             cascade_table = %spec.table_name,
@@ -8331,6 +8335,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeseries_rrd_example_executes_real_rollup_rows() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let mut current_keyspace: Option<String> = None;
+
+        for cql in example_cql_statements(include_str!("../../examples/timeseries-rrd/schema.cql"))
+            .into_iter()
+            .chain(example_cql_statements(include_str!(
+                "../../examples/timeseries-rrd/data.cql"
+            )))
+        {
+            let ctx = RequestContext {
+                auth: &auth,
+                current_keyspace: &current_keyspace,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            };
+            match route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap()
+            {
+                RouteResult::SetKeyspace(ks, _) => current_keyspace = Some(ks),
+                RouteResult::Result(_) => {}
+                _ => panic!("unexpected route result for example statement {cql:?}"),
+            }
+        }
+
+        assert!(
+            state
+                .engine
+                .process_pending_time_series_materializations(16)
+                .unwrap()
+                >= 1,
+            "the runnable RRD example must enqueue at least one materialized 5-minute rollup"
+        );
+
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &Some("plant".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let full_scan = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT vibration_mm_s_avg FROM sensor_readings_5m").unwrap(),
+        )
+        .await
+        .unwrap();
+        let RouteResult::Result(full_scan_body) = full_scan else {
+            panic!("expected Rows result");
+        };
+        assert!(
+            extract_row_count(&full_scan_body) >= 1,
+            "example materialization should write at least one 5-minute target row"
+        );
+
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "SELECT vibration_mm_s_avg \
+                 FROM sensor_readings_5m \
+                 WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let RouteResult::Result(body) = result else {
+            panic!("expected Rows result");
+        };
+        let value = extract_first_double_value(&body);
+        assert!(
+            (value - 5.08).abs() < 0.000_000_1,
+            "example first 5-minute rollup should match the documented Pump A average"
+        );
+    }
+
+    #[tokio::test]
     async fn create_table_rejects_non_streaming_rrd_wasm_function() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -10167,6 +10255,19 @@ mod tests {
         off += 4;
         assert_eq!(value_len, 8, "expected double value length");
         f64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
+    }
+
+    fn example_cql_statements(script: &str) -> Vec<String> {
+        script
+            .lines()
+            .map(|line| line.split_once("--").map_or(line, |(cql, _)| cql))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split(';')
+            .map(str::trim)
+            .filter(|stmt| !stmt.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     /// Extract column names from a Rows result buffer.

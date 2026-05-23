@@ -1,10 +1,10 @@
-= RRD Cascading Time-Series Aggregation
+= RRD Time-Series Aggregation
 :toc: left
 :toclevels: 3
 :stylesheet: ../theme/ferrosa.css
 
-Automatic multi-tier aggregation for high-frequency sensor data.
-Write raw factory equipment readings at 1-second resolution and let Ferrosa consolidate them into 5-minute, 15-minute, and 1-hour summaries using RRD-style cascading.
+Automatic aggregation for high-frequency sensor data.
+Write raw factory equipment readings at 1-second resolution and let Ferrosa consolidate them into 5-minute summaries.
 
 NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
 
@@ -18,10 +18,10 @@ Raw readings are useful for diagnosis, but dashboards and alerting usually need 
 * `avg` shows the baseline trend.
 * `stddev` shows volatility, which is often the earliest sign of bearing wear or imbalance.
 
-Ferrosa automates those rollups with *cascading consolidation*.
+Ferrosa automates those rollups with built-in streaming consolidation.
 You define the aggregation rules in the table's `extensions` map at `CREATE TABLE` time, and the storage engine handles the rest.
 
-== The 4-Tier Cascade
+== The Runnable Rollup
 
 [cols="1,1,1,1"]
 |===
@@ -29,13 +29,11 @@ You define the aggregation rules in the table's `extensions` map at `CREATE TABL
 
 | 0 | `sensor_readings_1s` | 1 second (raw) | None (source)
 | 1 | `sensor_readings_5m` | 5 minutes | min, max, avg, stddev
-| 2 | `sensor_readings_15m` | 15 minutes | min, max, avg, stddev
-| 3 | `sensor_readings_1h` | 1 hour | min, max, avg, stddev
 |===
 
-Each tier consolidates data from the tier above it.
 When 5 minutes of raw data accumulates in `sensor_readings_1s`, the aggregator computes summary statistics and writes them to `sensor_readings_5m`.
-When three 5-minute windows accumulate in `sensor_readings_5m`, they are consolidated into `sensor_readings_15m`, and so on.
+Multi-tier cascade auto-creation is not enabled in this runnable contract.
+Correct `avg` and `stddev` cascades require carrying rollup state such as count, sum, and sum-of-squares between tiers; creating downstream tables without that state would produce misleading results.
 
 == Create the Schema
 
@@ -98,7 +96,7 @@ include::queries.cql[lines=13..25]
 
 [source,sql]
 ----
-include::queries.cql[lines=41..48]
+include::queries.cql[lines=27..34]
 ----
 
 == WASM Aggregate Status
@@ -163,12 +161,12 @@ When a data point falls into an already-consolidated window:
 
 1. The aggregator detects that the timestamp is before the current boundary.
 2. A `LateData` task is sent to the async worker.
-3. The worker re-runs consolidation for values still present in the in-memory ring.
+3. The worker streams the affected source window from storage.
 4. The corrected aggregate is upserted into the downstream table.
-5. The cascade continues: the upsert triggers the next tier's observer.
+5. The corrected aggregate is visible in the target table.
 
 Late data is only accepted within the `late_window`.
-The disk-backed keyed cursor for windows that have fallen out of the ring is still tracked in `specs/todo/rrd-keyed-streaming-storage-cursor.md`.
+The disk-backed keyed cursor streams source rows by partition and window for recomputation when a window has fallen out of the in-memory ring.
 
 == Observability
 
@@ -176,7 +174,7 @@ Monitor consolidation health, delayed materialization, and runtime ring-memory c
 
 [source,sql]
 ----
-include::queries.cql[lines=58..75]
+include::queries.cql[lines=46..61]
 ----
 
 `consolidation_status` shows per-table rollup counters.
@@ -190,13 +188,13 @@ The default ring memory budget is derived from the host or container memory limi
 |===
 | File | Purpose
 
-| `schema.cql` | Keyspace and raw sensor table with built-in streaming consolidation extensions
+| `schema.cql` | Keyspace, target rollup table, and raw sensor table with built-in streaming consolidation extensions
 | `data.cql` | Sample vibration and temperature data for two pumps across two 5-minute windows
-| `queries.cql` | Queries against raw data, rollup tiers, and operational observability
+| `queries.cql` | Queries against raw data, 5-minute rollups, and operational observability
 | `custom-wasm-udf.cql` | WASM stddev loading forms and the current live-materialization limitation
 | `built-in-functions.cql` | Demonstrates each built-in function individually
 | `composite.cql` | Multi-column composite aggregation
 | `median.cql` | Median-specific example with latency monitoring
-| `late-data.cql` | Late-arriving data and re-aggregation cascade
+| `late-data.cql` | Late-arriving data and re-aggregation
 | `smoke-test.sh` | Static contract test for the sensor example and WASM loading snippets
 |===

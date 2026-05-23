@@ -8,7 +8,7 @@ use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::timeseries::{
     ConsolidationFn, LateWindowClassification, MaterializationQueue, MaterializationRequest,
-    MaterializationTarget, MaterializationTaskKind, MaterializedRollup,
+    MaterializationTarget, MaterializationTaskKind, MaterializedRollup, TimeSeriesTimestampUnit,
 };
 use ferrosa_storage::{
     CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
@@ -30,6 +30,7 @@ fn target() -> MaterializationTarget {
                 function_name: "custom_rollup".to_string(),
             },
         ],
+        target_timestamp_unit: TimeSeriesTimestampUnit::Micros,
     }
 }
 

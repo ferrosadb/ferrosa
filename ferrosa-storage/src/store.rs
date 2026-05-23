@@ -557,6 +557,7 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         window_start_ts: i64,
         window_end_ts: i64,
+        timestamp_unit: crate::timeseries::TimeSeriesTimestampUnit,
         mut cb: Cb,
     ) -> Result<usize>
     where
@@ -692,7 +693,7 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
 
-            if let Some(ts) = time_series_row_timestamp(&row) {
+            if let Some(ts) = time_series_row_timestamp(&row, timestamp_unit) {
                 if ts >= window_start_ts && ts < window_end_ts {
                     cb(&row)?;
                     visited += 1;
@@ -2485,9 +2486,12 @@ impl<F: FlushTarget> TableStore<F> {
     }
 }
 
-fn time_series_row_timestamp(row: &Row) -> Option<i64> {
+fn time_series_row_timestamp(
+    row: &Row,
+    timestamp_unit: crate::timeseries::TimeSeriesTimestampUnit,
+) -> Option<i64> {
     let bytes: [u8; 8] = row.clustering.as_slice().try_into().ok()?;
-    Some(i64::from_be_bytes(bytes))
+    Some(timestamp_unit.raw_to_micros(i64::from_be_bytes(bytes)))
 }
 
 fn late_partition_needs_replay(

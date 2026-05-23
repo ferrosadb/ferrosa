@@ -1,4 +1,4 @@
--- RRD Cascading Time-Series Aggregation: Sensor Data
+-- RRD Time-Series Aggregation: Sensor Data
 --
 -- Insert factory equipment readings. Consolidation triggers automatically
 -- when data timestamps cross 5-minute boundaries.

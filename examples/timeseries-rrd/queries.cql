@@ -1,6 +1,6 @@
--- RRD Cascading Time-Series Aggregation: Sensor Queries
+-- RRD Time-Series Aggregation: Sensor Queries
 --
--- Query each tier to see progressively coarser aggregates.
+-- Query raw readings and the materialized 5-minute aggregate tier.
 
 USE plant;
 
@@ -21,20 +21,6 @@ SELECT sensor_id, ts,
        temperature_c_avg,
        temperature_c_stddev
   FROM sensor_readings_5m
-  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
-  LIMIT 10;
-
--- 15-minute aggregates.
-SELECT sensor_id, ts, vibration_mm_s_avg, vibration_mm_s_stddev,
-       temperature_c_avg, temperature_c_stddev
-  FROM sensor_readings_15m
-  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
-  LIMIT 10;
-
--- 1-hour aggregates.
-SELECT sensor_id, ts, vibration_mm_s_avg, vibration_mm_s_stddev,
-       temperature_c_avg, temperature_c_stddev
-  FROM sensor_readings_1h
   WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
   LIMIT 10;
 
