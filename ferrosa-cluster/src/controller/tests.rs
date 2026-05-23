@@ -594,6 +594,24 @@ fn reconnect_invite_plan_includes_self_and_excludes_recipient() {
 }
 
 #[test]
+fn connected_peer_tracking_updates_existing_peer_address() {
+    let peer = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let old_addr = "10.89.1.14:7000".parse().unwrap();
+    let new_addr = "10.89.1.17:7000".parse().unwrap();
+    let other = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let other_addr = "10.89.1.18:7000".parse().unwrap();
+    let mut peers = vec![(peer, old_addr), (other, other_addr)];
+
+    super::peer_events::track_connected_peer(&mut peers, peer, new_addr, 16);
+
+    assert_eq!(
+        peers,
+        vec![(peer, new_addr), (other, other_addr)],
+        "reconnects with a new container IP must update connected_peers; otherwise later ClusterInvite payloads re-advertise dead addresses"
+    );
+}
+
+#[test]
 fn reconnect_invite_plan_returns_none_when_no_peer_addresses_available() {
     let local = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
     let recipient = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
@@ -609,6 +627,31 @@ fn reconnect_invite_plan_returns_none_when_no_peer_addresses_available() {
     assert!(
         plan.is_none(),
         "an invite with no reachable peers would only echo the recipient"
+    );
+}
+
+#[test]
+fn cluster_invite_keeps_live_peer_when_payload_advertises_older_address() {
+    let local = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let peer = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let stale_invite_addr = "10.89.1.14:9042".parse().unwrap();
+
+    let plan = super::cluster::plan_invite_peer_connection(
+        local,
+        peer,
+        stale_invite_addr,
+        7000,
+        Some("10.89.1.17:7000"),
+        true,
+    );
+
+    assert_eq!(
+        plan,
+        super::cluster::InvitePeerConnectionPlan::KeepLiveKnownPeer {
+            known_addr: "10.89.1.17:7000".to_string(),
+            invite_addr: "10.89.1.14:7000".parse().unwrap(),
+        },
+        "third-party ClusterInvite metadata must not downgrade an already-live peer to a dead address"
     );
 }
 
