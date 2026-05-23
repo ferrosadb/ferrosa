@@ -12,6 +12,27 @@ use crate::mode::DeploymentMode;
 use super::peer_plan::{self, PeerConnectPlanInput, PeerEventAction, PeerRecoveredPlanInput};
 use super::ModeController;
 
+pub(super) fn track_connected_peer(
+    peers: &mut Vec<(uuid::Uuid, std::net::SocketAddr)>,
+    host_id: uuid::Uuid,
+    addr: std::net::SocketAddr,
+    capacity: usize,
+) {
+    if let Some((_, existing_addr)) = peers.iter_mut().find(|(id, _)| *id == host_id) {
+        *existing_addr = addr;
+        return;
+    }
+
+    if peers.len() >= capacity {
+        tracing::warn!(
+            cap = capacity,
+            "connected_peers at capacity — evicting oldest entry"
+        );
+        peers.remove(0);
+    }
+    peers.push((host_id, addr));
+}
+
 #[cfg(test)]
 pub(super) fn should_send_cluster_invite_after_join_trigger(
     join_enqueued: bool,
@@ -110,16 +131,7 @@ impl PeerEventListener for ModeController {
         // Track this peer
         {
             let mut peers = self.connected_peers.lock();
-            if !peers.iter().any(|(id, _)| *id == host_id) {
-                if peers.len() >= super::MAX_CONNECTED_PEERS {
-                    tracing::warn!(
-                        cap = super::MAX_CONNECTED_PEERS,
-                        "connected_peers at capacity — evicting oldest entry"
-                    );
-                    peers.remove(0);
-                }
-                peers.push((host_id, addr));
-            }
+            track_connected_peer(&mut peers, host_id, addr, super::MAX_CONNECTED_PEERS);
         }
 
         // Hold the transition guard across mode-check-and-transition to prevent
@@ -257,16 +269,12 @@ impl InboundPeerCallback for ModeController {
         // Track this peer
         {
             let mut peers = self.connected_peers.lock();
-            if !peers.iter().any(|(id, _)| *id == host_id) {
-                if peers.len() >= super::MAX_CONNECTED_PEERS {
-                    tracing::warn!(
-                        cap = super::MAX_CONNECTED_PEERS,
-                        "connected_peers at capacity — evicting oldest entry"
-                    );
-                    peers.remove(0);
-                }
-                peers.push((host_id, addr));
-            }
+            track_connected_peer(
+                &mut peers,
+                host_id,
+                reverse_addr,
+                super::MAX_CONNECTED_PEERS,
+            );
         }
 
         let _guard = self.transition_guard.lock();

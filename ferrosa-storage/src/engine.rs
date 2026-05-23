@@ -616,6 +616,81 @@ fn normalize_consolidation_type(type_name: &str) -> String {
 }
 
 impl StorageEngine {
+    /// Remove stale local compaction staging files from previous processes.
+    ///
+    /// Compaction output is only live while an in-process compaction result is
+    /// waiting to be promoted. On startup there are no such in-memory results,
+    /// so any files under `compaction/` are disk-only debris. Durable SSTables
+    /// used for reads and pending S3 replay live under `sstables/`; replay drops
+    /// missing-file entries instead of treating staging files as authoritative.
+    fn cleanup_stale_compaction_staging(
+        config: &StorageEngineConfig,
+    ) -> ferrosa_common::Result<()> {
+        let output_dir = &config.compaction.output_dir;
+        if !output_dir.exists() {
+            std::fs::create_dir_all(output_dir).map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to create compaction staging dir {}: {e}",
+                    output_dir.display()
+                ))
+            })?;
+            return Ok(());
+        }
+
+        let removed_files = Self::count_regular_files(output_dir)?;
+        std::fs::remove_dir_all(output_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to remove stale compaction staging dir {}: {e}",
+                output_dir.display()
+            ))
+        })?;
+        std::fs::create_dir_all(output_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to recreate compaction staging dir {}: {e}",
+                output_dir.display()
+            ))
+        })?;
+
+        if removed_files > 0 {
+            tracing::info!(
+                removed_files,
+                path = %output_dir.display(),
+                "storage startup: cleaned stale compaction staging files"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn count_regular_files(dir: &Path) -> ferrosa_common::Result<usize> {
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to read compaction staging dir {}: {e}",
+                dir.display()
+            ))
+        })? {
+            let entry = entry.map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to read compaction staging entry in {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            let file_type = entry.file_type().map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to inspect compaction staging entry {}: {e}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_file() {
+                count += 1;
+            } else if file_type.is_dir() {
+                count += Self::count_regular_files(&entry.path())?;
+            }
+        }
+        Ok(count)
+    }
+
     /// Creates a new storage engine. Initializes the commit log, compaction
     /// executor, and optional upload manager.
     pub fn new(
@@ -636,6 +711,7 @@ impl StorageEngine {
         std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
+        Self::cleanup_stale_compaction_staging(&config)?;
 
         let commit_log = CommitLog::new(config.commit_log.clone())?;
         let compaction_executor = CompactionExecutor::new();
@@ -734,6 +810,7 @@ impl StorageEngine {
         std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
+        Self::cleanup_stale_compaction_staging(&config)?;
 
         let mut commit_log = CommitLog::new(config.commit_log.clone())?;
         let compaction_executor = CompactionExecutor::new();
@@ -847,6 +924,7 @@ impl StorageEngine {
         std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
+        Self::cleanup_stale_compaction_staging(&config)?;
 
         let compaction_executor = CompactionExecutor::new();
 
@@ -1012,6 +1090,13 @@ impl StorageEngine {
                 sstable = sstable_id,
                 "pending upload: SSTable files not found on disk — cannot replay"
             );
+            if let Err(e) = pending_log.remove_entry(sstable_id) {
+                tracing::warn!(
+                    table = table_id_str,
+                    sstable = sstable_id,
+                    "pending upload: failed to remove missing-file entry from pending-uploads.log: {e}"
+                );
+            }
         }
 
         for (table_id_str, sstable_id, error) in &report.submit_failures {
@@ -5148,6 +5233,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replay_pending_uploads_removes_entries_whose_files_are_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table_id = "agent_memory.entity_store";
+
+        let pending_log =
+            crate::upload::PendingUploadsLog::open(&config.data_dir.join("pending-uploads.log"))
+                .unwrap();
+        pending_log.add_entry(table_id, "missing-101").unwrap();
+
+        let upload_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let engine = StorageEngine::new_with_upload_store_and_queue_depth(
+            config,
+            store,
+            "test-prefix".to_string(),
+            upload_runtime.handle(),
+            1,
+        )
+        .unwrap();
+
+        let replay_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        replay_runtime.block_on(engine.replay_pending_uploads());
+
+        let remaining = crate::upload::PendingUploadsLog::open(
+            &engine.config.data_dir.join("pending-uploads.log"),
+        )
+        .unwrap()
+        .pending_entries()
+        .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "missing SSTable uploads cannot be retried and should be pruned from pending-uploads.log"
+        );
+    }
+
     /// Read the first and last raw partition key bytes from Partitions.db.
     ///
     /// Footer (last 24 bytes): key_bounds_offset (i64 BE) | key_count (i64 BE) | root_pos (i64 BE).
@@ -5331,6 +5459,83 @@ mod tests {
 
     fn table_id() -> TableId {
         TableId::new("test_ks", "test_table")
+    }
+
+    #[test]
+    fn storage_engine_new_removes_stale_compaction_staging_without_touching_sstables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table = table_id().to_string();
+        let compaction_table_dir = config.compaction.output_dir.join(&table);
+        let sstable_table_dir = config.data_dir.join("sstables").join(&table);
+        std::fs::create_dir_all(&compaction_table_dir).unwrap();
+        std::fs::create_dir_all(&sstable_table_dir).unwrap();
+
+        let stale_data = compaction_table_dir.join("101-Data.db");
+        let stale_toc = compaction_table_dir.join("101-TOC.txt");
+        let live_data = sstable_table_dir.join("99-Data.db");
+        std::fs::write(&stale_data, b"stale compaction output").unwrap();
+        std::fs::write(&stale_toc, b"TOC").unwrap();
+        std::fs::write(&live_data, b"live sstable output").unwrap();
+
+        let _engine = StorageEngine::new(config, None).unwrap();
+
+        assert!(
+            !stale_data.exists() && !stale_toc.exists(),
+            "startup must remove stale compaction staging files"
+        );
+        assert!(
+            live_data.exists(),
+            "startup cleanup must not remove normal SSTable files"
+        );
+    }
+
+    #[test]
+    fn storage_engine_open_removes_stale_compaction_staging_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table = table_id().to_string();
+        let compaction_table_dir = config.compaction.output_dir.join(&table);
+        std::fs::create_dir_all(&compaction_table_dir).unwrap();
+
+        let stale_data = compaction_table_dir.join("202-Data.db");
+        std::fs::write(&stale_data, b"stale compaction output").unwrap();
+
+        let (_engine, _pending) = StorageEngine::open(config, None).unwrap();
+
+        assert!(
+            !stale_data.exists(),
+            "restart must remove stale compaction staging files"
+        );
+    }
+
+    #[test]
+    fn startup_removes_legacy_pending_upload_compaction_staging_without_sstable_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table = table_id().to_string();
+        let compaction_table_dir = config.compaction.output_dir.join(&table);
+        std::fs::create_dir_all(&compaction_table_dir).unwrap();
+
+        let legacy_pending_data = compaction_table_dir.join("303-Data.db");
+        let stale_data = compaction_table_dir.join("404-Data.db");
+        std::fs::write(&legacy_pending_data, b"legacy pending upload output").unwrap();
+        std::fs::write(&stale_data, b"stale compaction output").unwrap();
+        crate::upload::PendingUploadsLog::open(&config.data_dir.join("pending-uploads.log"))
+            .unwrap()
+            .add_entry(&table, "303")
+            .unwrap();
+
+        let _engine = StorageEngine::new(config, None).unwrap();
+
+        assert!(
+            !legacy_pending_data.exists(),
+            "startup must remove legacy compaction-only pending upload staging files"
+        );
+        assert!(
+            !stale_data.exists(),
+            "startup must still remove unrelated stale staging files"
+        );
     }
 
     #[test]
