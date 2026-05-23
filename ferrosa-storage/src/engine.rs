@@ -40,7 +40,7 @@ use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
 use crate::timeseries::consolidation::{emit_accumulated_streaming_results, Accumulator};
 use crate::timeseries::{
     ConsolidationMetrics, ConsolidationTask, LateWindowClassification, MaterializationTarget,
-    MaterializedRollup, TimeSeriesAggregator, TimeSeriesRuntimeSettings,
+    MaterializedRollup, TimeSeriesAggregator, TimeSeriesRuntimeSettings, TimeSeriesTimestampUnit,
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
@@ -547,6 +547,16 @@ struct TableState {
     /// plus an atomic pointer swap, with no mutex contention even when
     /// many threads write to the same table concurrently.
     last_commit_log_position: ArcSwap<Option<CommitLogPosition>>,
+}
+
+impl TableState {
+    fn time_series_timestamp_unit(&self) -> TimeSeriesTimestampUnit {
+        self.schema
+            .clustering_columns
+            .first()
+            .map(|column| TimeSeriesTimestampUnit::from_storage_type(&column.type_name))
+            .unwrap_or(TimeSeriesTimestampUnit::Micros)
+    }
 }
 
 /// Process-wide reference instant used as the base for
@@ -1850,9 +1860,13 @@ impl StorageEngine {
         let Some(state) = tables.get(table_id) else {
             return Ok(0);
         };
-        state
-            .store
-            .visit_time_series_window_rows(key, window_start_ts, window_end_ts, cb)
+        state.store.visit_time_series_window_rows(
+            key,
+            window_start_ts,
+            window_end_ts,
+            state.time_series_timestamp_unit(),
+            cb,
+        )
     }
 
     /// Visits bounded live queue snapshots for time-series materialization observability.
@@ -2191,6 +2205,12 @@ impl StorageEngine {
             ))
         })?;
 
+        let source_timestamp_unit = schema
+            .clustering_columns
+            .first()
+            .map(|column| TimeSeriesTimestampUnit::from_storage_type(&column.type_name))
+            .unwrap_or(TimeSeriesTimestampUnit::Micros);
+
         let mut value_column_indices = Vec::with_capacity(config.columns.len());
         let mut column_types = Vec::with_capacity(config.columns.len());
         for column_name in &config.columns {
@@ -2209,12 +2229,20 @@ impl StorageEngine {
         }
 
         let (task_tx, task_rx) = std::sync::mpsc::sync_channel(config.channel_capacity);
+        let target_table_id = TableId::new(&schema.keyspace, &config.target_table);
+        let target_timestamp_unit = self
+            .tables
+            .read()
+            .get(&target_table_id)
+            .map(TableState::time_series_timestamp_unit)
+            .unwrap_or(source_timestamp_unit);
         let target = MaterializationTarget {
             source_table: table_id.clone(),
-            target_table: TableId::new(&schema.keyspace, &config.target_table),
+            target_table: target_table_id,
             interval: config.interval,
             source_columns: config.columns.clone(),
             functions: config.functions.clone(),
+            target_timestamp_unit,
         };
         let source_column_count = value_column_indices.len();
         let late_window = config.late_window;
@@ -2228,7 +2256,8 @@ impl StorageEngine {
                 task_tx,
                 Arc::clone(&self.time_series_runtime_settings),
                 metrics,
-            ),
+            )
+            .with_timestamp_unit(source_timestamp_unit),
         );
         let observer: Arc<dyn crate::observer::WriteObserver> = aggregator.clone();
 

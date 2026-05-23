@@ -25,8 +25,13 @@ require_regex() {
 
 require_text schema.cql "CREATE KEYSPACE IF NOT EXISTS plant"
 require_text schema.cql "CREATE TABLE sensor_readings_1s"
+require_text schema.cql "CREATE TABLE sensor_readings_5m"
 require_text schema.cql "'consolidation.functions': 'min,max,avg,stddev'"
 require_text schema.cql "'consolidation.columns': 'vibration_mm_s,temperature_c'"
+if grep -Fq "'consolidation.cascade': 'true'" schema.cql; then
+  echo "FAIL: schema.cql must not enable cascade until multi-tier rollup state is implemented" >&2
+  exit 1
+fi
 if grep -Fq "wasm:plant.stddev" schema.cql; then
   echo "FAIL: schema.cql must use only streaming built-ins for the runnable demo" >&2
   exit 1

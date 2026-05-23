@@ -1,6 +1,6 @@
 # Example Documentation Blueprint — Time-Series Sensor Rollups
 
-> Last updated: 2026-05-20
+> Last updated: 2026-05-22
 > Status: Draft example docs plan
 
 ## Purpose
@@ -13,6 +13,10 @@ The example should make the value obvious for sensor data:
 - standard deviation shows volatility and anomaly risk;
 - WASM UDFs let teams add domain-specific math without shipping raw data to an
   external processor.
+
+Current runnable scope: one source tier materializes one 5-minute target tier.
+Multi-tier cascade examples are intentionally excluded until rollup state for
+correct `avg` and `stddev` cascades is designed and implemented.
 
 ## Target Example Story
 
@@ -31,7 +35,6 @@ CREATE TABLE plant.sensor_readings_1s (
     'consolidation.interval': '5m',
     'consolidation.functions': 'min,max,avg,stddev',
     'consolidation.target': 'sensor_readings_5m',
-    'consolidation.cascade': 'true',
     'consolidation.late_window': '15m',
     'consolidation.columns': 'vibration_mm_s,temperature_c'
   };
@@ -41,7 +44,7 @@ The rollup table exposes one row per sensor per 5-minute window:
 
 ```text
 sensor_id
-window_start
+ts
 vibration_mm_s_min
 vibration_mm_s_max
 vibration_mm_s_avg
@@ -89,10 +92,10 @@ SELECT window_start,
        vibration_mm_s_stddev
 FROM plant.sensor_readings_5m
 WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
-  AND window_start >= '2026-05-20T12:00:00Z';
+  AND ts >= '2026-05-20T12:00:00Z';
 
 -- Subscribe to new rollups as each window materializes.
-SUBSCRIBE SELECT sensor_id, window_start, vibration_mm_s_avg, vibration_mm_s_stddev
+SUBSCRIBE SELECT sensor_id, ts, vibration_mm_s_avg, vibration_mm_s_stddev
 FROM plant.sensor_readings_5m
 EVERY 5s DELTA;
 
