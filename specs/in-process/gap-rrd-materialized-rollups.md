@@ -89,11 +89,20 @@ Current branch limitations:
   rewrite existing rollup rows.
 - Added CQL-router coverage proving normal CQL `CREATE TABLE` extensions and
   `INSERT` statements enqueue materialization and produce queryable target rows.
-- Storage has an in-memory ring streaming path for current windows. Production
-  late-window recomputation uses the keyed cursor API, but the current
-  `TableStore` implementation still materializes one partition internally
-  before visiting rows. A true memtable/SSTable row-streaming implementation
-  remains required for very large partitions.
+- Added CQL-router coverage that executes
+  `examples/timeseries-rrd/schema.cql` and `data.cql`, drains pending
+  materialization tasks, and verifies a real 5-minute target row.
+- CQL `timestamp` clustering keys are converted from their storage unit
+  (milliseconds) into the RRD internal microsecond window unit, and target
+  rollup rows are encoded back into the target table's clustering unit.
+- Storage has an in-memory ring streaming path for boundary detection, and
+  production materialization uses a keyed storage cursor as the source of truth.
+  The cursor streams SSTable rows one at a time and merges overlapping sources
+  by clustering key.
+- Multi-tier cascade auto-creation is not part of the runnable example.
+  Downstream avg/stddev cascades need explicit rollup state such as count, sum,
+  and sum-of-squares. Cascade storage-registration errors now surface during DDL
+  instead of leaving schema metadata without a registered storage table.
 - WASM consolidation functions still need a streaming UDF aggregation ABI before
   they can run in the worker. Live RRD DDL now rejects `wasm:keyspace.function`
   rollups with a clear streaming-ABI error instead of accepting a table that
@@ -149,10 +158,10 @@ Implement a real materialization path for tables configured with
    key columns, the rollup window start timestamp as clustering key, and one
    `double` column per `(source_column, function)` pair, for example
    `value_min`, `value_max`, `value_avg`, `value_stddev`.
-5. Repair cascade metadata generation so each downstream tier's
-   `consolidation.columns` names match the columns actually emitted by the
-   previous tier, or define terminal tiers explicitly if re-aggregating aggregate
-   columns is not desired.
+5. Design and repair cascade metadata generation so each downstream tier has
+   source columns and rollup state that make its outputs mathematically valid.
+   Correct `avg` and `stddev` cascades require state beyond the visible double
+   output columns.
 6. Recompute stale windows for late-arriving data up to a configurable window.
    `consolidation.late_window` remains the per-table control. Late writes inside
    the window enqueue a re-materialization task for the affected target row;
@@ -173,10 +182,10 @@ Implement a real materialization path for tables configured with
 
 ## Acceptance criteria
 
-- [ ] `CREATE TABLE ... WITH extensions = {'consolidation.interval': '5m', ...}`
+- [x] `CREATE TABLE ... WITH extensions = {'consolidation.interval': '5m', ...}`
       registers an active consolidator without process restart.
 - [ ] Invalid consolidation extension sets fail DDL with a useful error.
-- [ ] Inserts that cross a window boundary create queryable rows in the target
+- [x] Inserts that cross a window boundary create queryable rows in the target
       table.
 - [ ] Cascaded rollups materialize through at least two tiers in an integration
       test.
@@ -191,9 +200,9 @@ Implement a real materialization path for tables configured with
       only virtual-table state.
 - [x] `system_observability.consolidation_status` reflects live counters rather
       than configuration only.
-- [ ] `examples/timeseries-rrd/schema.cql`, `data.cql`, and `queries.cql`
+- [x] `examples/timeseries-rrd/schema.cql`, `data.cql`, and `queries.cql`
       verify real target rows, not only table existence.
-- [ ] At least one extra RRD demo script is either made harness-visible or
+- [x] At least one extra RRD demo script is either made harness-visible or
       explicitly documented as non-testable example material.
 
 ## Verification commands
