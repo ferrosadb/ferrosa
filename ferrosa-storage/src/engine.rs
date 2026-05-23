@@ -3538,9 +3538,17 @@ impl StorageEngine {
                 .collect();
             let table_id = &result.task.table_id;
 
-            // Open the compacted output SSTable.
-            let gen = &result.output.id;
-            let dir = &result.output.path;
+            let output = match self.promote_compaction_output(table_id, &result.output) {
+                Ok(output) => output,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, "compaction: failed to promote output SSTable");
+                    continue;
+                }
+            };
+
+            // Open the promoted compacted output SSTable.
+            let gen = &output.id;
+            let dir = &output.path;
             let reader = match Self::open_sstable_from_dir(dir, gen) {
                 Ok(r) => Arc::new(r),
                 Err(e) => {
@@ -3566,7 +3574,7 @@ impl StorageEngine {
                     if let Err(e) = state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
-                        result.output.path.clone(),
+                        output.path.clone(),
                         reader,
                         std::collections::HashMap::new(),
                     ) {
@@ -3587,7 +3595,7 @@ impl StorageEngine {
                     if let Some(ref scheduler) = self.index_scheduler {
                         for (index_name, col_pos) in state.store.indexed_columns() {
                             let job = crate::index::IndexBuildJob {
-                                sstable_id: result.output.id.clone(),
+                                sstable_id: output.id.clone(),
                                 index_name: index_name.clone(),
                                 index_type: ferrosa_index::IndexType::BTree,
                                 table: (
@@ -3607,11 +3615,9 @@ impl StorageEngine {
             }
 
             // Register in local cache.
-            self.local_cache.register(
-                &result.output.id,
-                result.output.path.clone(),
-                result.output.size_bytes,
-            );
+            self.local_cache
+                .register(&output.id, output.path.clone(), output.size_bytes);
+            Self::evict_local_input_sstable_files(&result.task.inputs);
 
             // ── Skip S3 upload for pinned tables ────────────────────────────
             //
@@ -3622,8 +3628,8 @@ impl StorageEngine {
                 tables.get(table_id).is_some_and(|s| s.pin_config.is_some())
             };
             if is_compaction_pinned {
-                let size = result.output.size_bytes;
-                let sstable_id = result.output.id.clone();
+                let size = output.size_bytes;
+                let sstable_id = output.id.clone();
                 {
                     let mut tables = self.tables.write();
                     if let Some(state) = tables.get_mut(table_id) {
@@ -3659,7 +3665,7 @@ impl StorageEngine {
             };
 
             let table_id_str = table_id.to_string();
-            let sstable_id = result.output.id.clone();
+            let sstable_id = output.id.clone();
 
             // Parse the generation number — output id is always a decimal u64.
             let gen_u64: u64 = match sstable_id.parse() {
@@ -3670,8 +3676,8 @@ impl StorageEngine {
                 }
             };
 
-            // The compaction output lives in result.output.path.
-            let output_dir = result.output.path.clone();
+            // The compaction output has been promoted into the table SSTable directory.
+            let output_dir = output.path.clone();
 
             let files = Self::collect_sstable_files(&output_dir, gen_u64);
             if files.is_empty() {
@@ -3768,7 +3774,7 @@ impl StorageEngine {
             let manifest_plan = crate::compaction::finalize::plan_manifest_update(
                 &table_id_str,
                 &result.task.inputs,
-                &result.output,
+                &output,
                 total_size,
             );
             let input_ids = manifest_plan.remove_input_ids.clone();
@@ -3868,24 +3874,6 @@ impl StorageEngine {
                 if deletion_plan.fire_and_forget {
                     // Fire-and-forget: S3 deletions are best-effort.
                     drop(del_rx);
-                }
-            }
-
-            // Evict local input SSTable component files (best-effort).
-            // Each input carries its own path (flush dir or compaction dir).
-            for input in &result.task.inputs {
-                let standard_components = [
-                    "Data.db",
-                    "Partitions.db",
-                    "Rows.db",
-                    "Filter.db",
-                    "Statistics.db",
-                    "TOC.txt",
-                    "CompressionInfo.db",
-                ];
-                for component in &standard_components {
-                    let file_path = input.path.join(format!("{}-{component}", input.id));
-                    let _ = std::fs::remove_file(&file_path);
                 }
             }
         }
@@ -4574,6 +4562,112 @@ impl StorageEngine {
                 }
             })
             .collect()
+    }
+
+    fn promote_compaction_output(
+        &self,
+        table_id: &TableId,
+        output: &crate::compaction::metadata::SSTableMetadata,
+    ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
+        let source_dir = &output.path;
+        let target_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
+        std::fs::create_dir_all(&target_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create promoted compaction directory: {e}"
+            ))
+        })?;
+
+        let output_gen = output.id.parse::<u64>().map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "compaction output SSTable id is not a u64: {e}"
+            ))
+        })?;
+        let table_max_gen = Self::scan_generations(&target_dir)
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let promoted_gen = table_max_gen.max(output_gen).saturating_add(1);
+        let promoted_id = promoted_gen.to_string();
+        let old_prefix = format!("{}-", output.id);
+
+        let mut moves = Vec::new();
+        for entry in std::fs::read_dir(source_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to read compaction output directory: {e}"
+            ))
+        })? {
+            let entry = entry.map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to read compaction output entry: {e}"
+                ))
+            })?;
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(component_suffix) = name.strip_prefix(&old_prefix) else {
+                continue;
+            };
+            let target = target_dir.join(format!("{promoted_id}-{component_suffix}"));
+            if target.exists() {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "promoted compaction target already exists: {}",
+                    target.display()
+                )));
+            }
+            moves.push((entry.path(), target));
+        }
+
+        if moves.is_empty() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "compaction output has no component files in {}",
+                source_dir.display()
+            )));
+        }
+
+        for (source, target) in &moves {
+            std::fs::rename(source, target).map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to promote compaction component {} to {}: {e}",
+                    source.display(),
+                    target.display()
+                ))
+            })?;
+        }
+        let _ = std::fs::remove_dir(source_dir);
+
+        let size_bytes = moves
+            .iter()
+            .filter_map(|(_, target)| std::fs::metadata(target).ok().map(|m| m.len()))
+            .sum();
+
+        let mut promoted = output.clone();
+        promoted.id = promoted_id;
+        promoted.path = target_dir;
+        promoted.size_bytes = size_bytes;
+        Ok(promoted)
+    }
+
+    fn evict_local_input_sstable_files(inputs: &[crate::compaction::metadata::SSTableMetadata]) {
+        let standard_components = [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+            "CompressionInfo.db",
+        ];
+        for input in inputs {
+            for component in &standard_components {
+                let file_path = input.path.join(format!("{}-{component}", input.id));
+                let _ = std::fs::remove_file(&file_path);
+            }
+        }
     }
 
     /// Collect local component file paths for an SSTable generation.
@@ -9781,7 +9875,7 @@ mod tests {
 
         // Manually submit a compaction task.
         {
-            let compaction_output_dir = dir.path().join("compaction");
+            let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
             let tables = engine.tables.read();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
@@ -10129,9 +10223,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_inputs_evicted_locally() {
-        // After poll_compactions() the input SSTable component files must be deleted
-        // from the table directory, while the compaction output directory must still exist.
+    async fn compaction_outputs_are_promoted_and_compaction_dir_drained() {
+        // After poll_compactions(), input SSTable component files must be deleted
+        // from the table directory, the compacted output must be promoted into
+        // that same table directory, and the compaction staging directory must
+        // not retain orphaned output files.
         let dir = tempfile::tempdir().unwrap();
         let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
 
@@ -10157,6 +10253,7 @@ mod tests {
         // Run compaction + local eviction. Retry until the channel result is
         // consumed: the compaction thread writes files before sending on the
         // channel, so a single poll may miss the result under parallel load.
+        let table_compaction_dir = dir.path().join("compaction").join(&tid_str);
         let mut data_files_after = vec![];
         for _ in 0..40 {
             engine.poll_compactions().await;
@@ -10166,26 +10263,57 @@ mod tests {
                 .map(|e| e.path())
                 .filter(|p| p.is_file() && p.extension().map(|e| e == "db").unwrap_or(false))
                 .collect();
-            if data_files_after.is_empty() {
+            let input_files_evicted = input_files_before.iter().all(|path| !path.exists());
+            let promoted_data_file_present = data_files_after.iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-Data.db"))
+            });
+            let staging_drained = table_compaction_dir
+                .read_dir()
+                .into_iter()
+                .flatten()
+                .next()
+                .is_none();
+            if input_files_evicted && promoted_data_file_present && staging_drained {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        // All input SSTable component files must have been evicted.
-        // The sstable_dir may be empty or contain only output-generation files
-        // (but the output goes into dir/compaction, not sstable_dir).
+        // The old input generations must be gone from the table directory.
         assert!(
-            data_files_after.is_empty(),
-            "input SSTable files should be evicted, remaining: {:?}",
+            input_files_before.iter().all(|path| !path.exists()),
+            "input SSTable files should be evicted, still present: {:?}",
+            input_files_before
+                .iter()
+                .filter(|path| path.exists())
+                .collect::<Vec<_>>()
+        );
+
+        // The compacted output must be durable in the normal SSTable directory.
+        assert!(
+            data_files_after.iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-Data.db"))
+            }),
+            "compacted output Data.db should be promoted into {:?}, got {:?}",
+            sstable_dir,
             data_files_after
         );
 
-        // The compaction output directory must still exist.
-        let output_dir = dir.path().join("compaction");
+        let staged_files: Vec<_> = table_compaction_dir
+            .read_dir()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
         assert!(
-            output_dir.exists(),
-            "compaction output directory must still exist after poll_compactions"
+            staged_files.is_empty(),
+            "compaction staging dir should be drained after promotion, got {:?}",
+            staged_files
         );
     }
 
