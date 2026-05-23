@@ -34,8 +34,8 @@ use crate::bloom::BloomFilter;
 use crate::byte_comparable;
 use crate::compression::{Compression, CompressionInfo};
 use crate::statistics::{
-    write_statistics, CompactionMetadata, SerializationHeader, Statistics, StatsMetadata,
-    ValidationMetadata,
+    build_simple_bti_stats_metadata, write_statistics, CompactionMetadata, SerializationHeader,
+    Statistics, StatsMetadata, ValidationMetadata,
 };
 use crate::toc;
 use crate::trie::builder::{TrieBuilder, TriePayload};
@@ -135,6 +135,10 @@ pub struct SSTableWriter {
     first_key: Option<Vec<u8>>,
     /// Last partition key bytes (for key bounds footer).
     last_key: Option<Vec<u8>>,
+    /// Number of rows written to Data.db.
+    total_rows: u64,
+    /// Number of regular/static cells written to Data.db.
+    total_columns_set: u64,
 }
 
 impl SSTableWriter {
@@ -152,6 +156,8 @@ impl SSTableWriter {
             partition_count: 0,
             first_key: None,
             last_key: None,
+            total_rows: 0,
+            total_columns_set: 0,
         }
     }
 
@@ -214,6 +220,16 @@ impl SSTableWriter {
         }
         self.last_key = Some(partition.key.key.as_bytes().to_vec());
         self.partition_count += 1;
+        self.total_rows += partition.rows.len() as u64;
+        self.total_columns_set += partition
+            .static_row
+            .as_ref()
+            .map_or(0, |row| row.cells.len() as u64);
+        self.total_columns_set += partition
+            .rows
+            .iter()
+            .map(|row| row.cells.len() as u64)
+            .sum::<u64>();
 
         Ok(())
     }
@@ -223,6 +239,8 @@ impl SSTableWriter {
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone().unwrap_or_default();
         let partition_count = self.partition_count;
+        let total_rows = self.total_rows;
+        let total_columns_set = self.total_columns_set;
         let bloom_fp_chance = self.options.bloom_fp_chance;
         let has_compression = self.options.compression.is_some()
             && !matches!(self.options.compression, Some(Compression::None));
@@ -237,7 +255,15 @@ impl SSTableWriter {
         let filter = self.bloom.write();
 
         // 3. Build statistics -> Statistics.db
-        let statistics = Self::build_statistics_db(&self.header, bloom_fp_chance);
+        let statistics = Self::build_statistics_db(
+            &self.header,
+            bloom_fp_chance,
+            &first_key,
+            &last_key,
+            partition_count,
+            total_rows,
+            total_columns_set,
+        );
 
         // 4. Optionally compress data chunks -> Data.db + CompressionInfo.db
         let (data, compression_info) = Self::build_data_db(self.data_buf, &self.options)?;
@@ -533,7 +559,8 @@ impl SSTableWriter {
             self.data_buf.push(extended_flags);
         }
 
-        // Clustering key (not for static rows)
+        // Clustering key (not for static rows and absent for schemas with
+        // no clustering columns).
         //
         // Cassandra 5.x ClusteringPrefix format:
         //   header varint (0 = all non-null/non-empty) + per-component value bytes.
@@ -543,10 +570,10 @@ impl SSTableWriter {
         // For multi-column CK, the CQL bridge encodes as u16-prefixed
         // per-component: [u16 len][bytes][u16 len][bytes]...
         // We must extract each component and write it in BTI format.
-        if !is_static {
+        let num_ck = self.header.clustering_types.len();
+        if !is_static && num_ck > 0 {
             push_unsigned_vint_to(&mut self.data_buf, 0); // header: all non-null, non-empty
 
-            let num_ck = self.header.clustering_types.len();
             if num_ck == 1 {
                 // Single CK column: raw bytes (no u16 prefix).
                 let type_name = &self.header.clustering_types[0];
@@ -566,7 +593,6 @@ impl SSTableWriter {
                     self.data_buf.extend_from_slice(component);
                 }
             }
-            // num_ck == 0: no clustering columns — header varint only, no data.
         }
 
         // Serialize the row body to a temporary buffer to compute its size.
@@ -603,26 +629,19 @@ impl SSTableWriter {
             push_unsigned_vint_to(&mut row_body, ldt_delta);
         }
 
-        // Missing-column bitmap (only if not HAS_ALL_COLUMNS)
+        // Missing-column subset (only if not HAS_ALL_COLUMNS). Cassandra's
+        // Columns.Serializer writes an unsigned vint, not a raw MSB-first
+        // bitmap: for <64 columns, bit i set means column i is missing.
         if flags & HAS_ALL_COLUMNS == 0 {
-            let bitmap_bytes = num_columns.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_bytes];
-            // Mark present columns (bit set = present)
-            let present_set: std::collections::HashSet<usize> =
+            let present_columns: Vec<usize> =
                 row.cells.iter().map(|(idx, _)| *idx as usize).collect();
-            for i in 0..num_columns {
-                if present_set.contains(&i) {
-                    let byte_idx = i / 8;
-                    let bit_idx = 7 - (i % 8);
-                    bitmap[byte_idx] |= 1 << bit_idx;
-                }
-            }
-            row_body.extend_from_slice(&bitmap);
+            write_columns_subset(&mut row_body, &present_columns, num_columns);
         }
 
         // Cells
-        for (_, cell) in &row.cells {
-            serialize_cell(&mut row_body, cell, row, &self.header);
+        for (col_idx, cell) in &row.cells {
+            let column_type = &column_defs[*col_idx as usize].1;
+            serialize_cell(&mut row_body, cell, row, &self.header, column_type);
         }
 
         // Write row body size + previous unfiltered size + row body
@@ -669,14 +688,31 @@ impl SSTableWriter {
     }
 
     /// Build Statistics.db.
-    fn build_statistics_db(header: &SerializationHeader, bloom_fp_chance: f64) -> Vec<u8> {
+    fn build_statistics_db(
+        header: &SerializationHeader,
+        bloom_fp_chance: f64,
+        first_key: &[u8],
+        last_key: &[u8],
+        partition_count: u64,
+        total_rows: u64,
+        total_columns_set: u64,
+    ) -> Vec<u8> {
         let stats = Statistics {
             validation: ValidationMetadata {
                 partitioner_class: "org.apache.cassandra.dht.Murmur3Partitioner".into(),
                 bloom_fp_chance,
             },
             compaction: CompactionMetadata { data: vec![] },
-            stats: StatsMetadata { data: vec![] },
+            stats: build_simple_bti_stats_metadata(
+                header,
+                first_key,
+                last_key,
+                partition_count,
+                total_rows,
+                total_columns_set,
+                1.0,
+            )
+            .unwrap_or_else(|| StatsMetadata { data: vec![] }),
             header: header.clone(),
         };
         write_statistics(&stats)
@@ -760,6 +796,7 @@ fn serialize_cell(
     cell: &CellValue,
     row: &crate::types::Row,
     header: &SerializationHeader,
+    column_type: &str,
 ) {
     let is_tombstone = cell.is_tombstone();
     let is_expiring = !is_tombstone
@@ -834,7 +871,15 @@ fn serialize_cell(
                  this is a bug in the write path, not user data",
                 value.len()
             );
-            push_unsigned_vint_to(buf, value.len() as u64);
+            if let Some(fixed_len) = crate::marshal::value_length_if_fixed(column_type) {
+                assert!(
+                    value.len() == fixed_len,
+                    "SSTable writer: fixed-width column {column_type} expects {fixed_len} bytes, got {}",
+                    value.len()
+                );
+            } else {
+                push_unsigned_vint_to(buf, value.len() as u64);
+            }
             buf.extend_from_slice(value);
         }
     }
@@ -845,6 +890,39 @@ fn push_unsigned_vint_to(buf: &mut Vec<u8>, value: u64) {
     let mut vbuf = [0u8; 9];
     let n = varint::write_unsigned_vint(&mut vbuf, value);
     buf.extend_from_slice(&vbuf[..n]);
+}
+
+fn write_columns_subset(buf: &mut Vec<u8>, present_columns: &[usize], num_columns: usize) {
+    if num_columns < 64 {
+        let mut missing_bitmap = 0u64;
+        let mut present_iter = present_columns.iter().copied().peekable();
+        for idx in 0..num_columns {
+            if present_iter.peek() == Some(&idx) {
+                present_iter.next();
+            } else {
+                missing_bitmap |= 1u64 << idx;
+            }
+        }
+        push_unsigned_vint_to(buf, missing_bitmap);
+        return;
+    }
+
+    let missing_count = num_columns.saturating_sub(present_columns.len());
+    push_unsigned_vint_to(buf, missing_count as u64);
+    if present_columns.len() < num_columns / 2 {
+        for &idx in present_columns {
+            push_unsigned_vint_to(buf, idx as u64);
+        }
+    } else {
+        let mut present_iter = present_columns.iter().copied().peekable();
+        for idx in 0..num_columns {
+            if present_iter.peek() == Some(&idx) {
+                present_iter.next();
+            } else {
+                push_unsigned_vint_to(buf, idx as u64);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1847,6 +1925,138 @@ mod tests {
             "key bounds last={:?} should match token-sorted last={:?}",
             last_key, write_last
         );
+    }
+
+    #[test]
+    fn writer_serializes_sparse_columns_as_cassandra_subset_vint() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"v_text".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"v_int".to_vec(),
+                    "org.apache.cassandra.db.marshal.Int32Type".into(),
+                ),
+            ],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+            verify_output: true,
+        };
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"pk1".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), 1_005))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_005),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header);
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        let data = output.data.as_slice();
+        let mut pos = 2 + b"pk1".len() + 1;
+        let flags = data[pos];
+        pos += 1;
+        assert_eq!(flags & HAS_ALL_COLUMNS, 0);
+
+        let (row_body_len, n) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        assert!(
+            row_body_len > 0,
+            "tables without clustering columns must not serialize an empty clustering prefix before the row body length"
+        );
+        pos += n;
+        let (_prev_size, n) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        pos += n;
+        let (timestamp_delta, n) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        assert_eq!(timestamp_delta, 5);
+        pos += n;
+
+        let (columns_subset, _) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        assert_eq!(
+            columns_subset, 0b10,
+            "Cassandra Columns.Serializer encodes bit i=1 as column i missing"
+        );
+    }
+
+    #[test]
+    fn writer_serializes_fixed_width_cells_without_value_length_prefix() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"v_int".to_vec(),
+                    "org.apache.cassandra.db.marshal.Int32Type".into(),
+                ),
+                (
+                    b"v_text".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+            ],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+            verify_output: true,
+        };
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"pk2".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(42i32.to_be_bytes().to_vec(), 1_005))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_005),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header);
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        let data = output.data.as_slice();
+        let mut pos = 2 + b"pk2".len() + 1;
+        let flags = data[pos];
+        pos += 1;
+        assert_eq!(flags & HAS_ALL_COLUMNS, 0);
+
+        let (_row_body_len, n) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        pos += n;
+        let (_prev_size, n) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        pos += n;
+        let (timestamp_delta, n) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        assert_eq!(timestamp_delta, 5);
+        pos += n;
+        let (columns_subset, n) = varint::read_unsigned_vint_at(&data, pos as u64).unwrap();
+        assert_eq!(columns_subset, 0b10);
+        pos += n;
+        assert_eq!(data[pos], CELL_USE_ROW_TIMESTAMP);
+        pos += 1;
+        assert_eq!(&data[pos..pos + 4], &42i32.to_be_bytes());
     }
 
     /// RED TEST: A partition with a row whose deletion timestamp is lower

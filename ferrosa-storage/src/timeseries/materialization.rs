@@ -57,6 +57,7 @@ pub struct MaterializationTarget {
     pub interval: Duration,
     pub source_columns: Vec<String>,
     pub functions: Vec<ConsolidationFn>,
+    pub target_result_column_indices: Vec<u16>,
     pub target_timestamp_unit: TimeSeriesTimestampUnit,
 }
 
@@ -172,8 +173,14 @@ impl MaterializedRollup {
             .into_iter()
             .enumerate()
             .map(|(idx, value)| {
+                let column_index = self
+                    .target
+                    .target_result_column_indices
+                    .get(idx)
+                    .copied()
+                    .expect("materialization target result column mapping covers all results");
                 (
-                    idx as u16,
+                    column_index,
                     CellValue::live(value.to_be_bytes().to_vec(), write_timestamp),
                 )
             })
@@ -329,6 +336,7 @@ mod tests {
             interval: Duration::from_secs(10),
             source_columns: vec!["value".to_string()],
             functions: vec![ConsolidationFn::Avg],
+            target_result_column_indices: vec![0],
             target_timestamp_unit: TimeSeriesTimestampUnit::Micros,
         };
         let request = MaterializationRequest {
@@ -345,5 +353,28 @@ mod tests {
         assert_eq!(rollup.target, target);
         assert_eq!(rollup.partition_key, b"sensor-1");
         assert_eq!(rollup.window_start_ts, 0);
+    }
+
+    #[test]
+    fn rollup_encoder_uses_target_storage_column_indices() {
+        let target = MaterializationTarget {
+            source_table: TableId::new("ks", "sensor"),
+            target_table: TableId::new("ks", "sensor_10s"),
+            interval: Duration::from_secs(10),
+            source_columns: vec!["value".to_string()],
+            functions: vec![ConsolidationFn::Min, ConsolidationFn::Avg],
+            target_result_column_indices: vec![3, 1],
+            target_timestamp_unit: TimeSeriesTimestampUnit::Micros,
+        };
+        let rollup = MaterializedRollup {
+            target,
+            partition_key: b"sensor-1".to_vec(),
+            window_start_ts: 0,
+        };
+
+        let mutation = rollup.encode_mutation_from_results([1.0, 2.0]);
+        let cells: Vec<u16> = mutation.rows[0].cells.iter().map(|(idx, _)| *idx).collect();
+
+        assert_eq!(cells, vec![3, 1]);
     }
 }

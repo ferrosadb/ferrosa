@@ -25,7 +25,7 @@ use ferrosa_cluster::raft::handlers::{
 };
 use ferrosa_cluster::raft::{NodeInfo, NodeState};
 use ferrosa_cluster::ring::TokenRing;
-use ferrosa_common::schema::TableSchema;
+use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_graph::engine::GraphEngine;
 use ferrosa_graph::executor::expand::GraphEngineConfig;
 use ferrosa_graph::http::{build_router, AppState};
@@ -113,18 +113,43 @@ fn basic_auth_header() -> String {
 /// (CREATE, MERGE) can locate the memtable. Must be called after
 /// `create_social_graph_schema` for any test that writes to storage.
 fn register_social_tables_with_storage(storage: &StorageEngine) {
-    for (keyspace, table) in [("social", "person_v"), ("social", "knows_e")] {
-        let schema = TableSchema {
-            keyspace: keyspace.to_string(),
-            table: table.to_string(),
+    storage
+        .register_table(TableSchema {
+            keyspace: "social".to_string(),
+            table: "person_v".to_string(),
             key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
             clustering_columns: vec![],
             static_columns: vec![],
-            regular_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "age".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
             extensions: HashMap::new(),
-        };
-        storage.register_table(schema).unwrap();
-    }
+        })
+        .unwrap();
+    storage
+        .register_table(TableSchema {
+            keyspace: "social".to_string(),
+            table: "knows_e".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "dst_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "since".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            extensions: HashMap::new(),
+        })
+        .unwrap();
 }
 
 fn register_social_likes_table_with_storage(storage: &StorageEngine) {
@@ -132,9 +157,15 @@ fn register_social_likes_table_with_storage(storage: &StorageEngine) {
         keyspace: "social".to_string(),
         table: "likes_e".to_string(),
         key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
-        clustering_columns: vec![],
+        clustering_columns: vec![ColumnDefinition {
+            name: "dst_id".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+        }],
         static_columns: vec![],
-        regular_columns: vec![],
+        regular_columns: vec![ColumnDefinition {
+            name: "weight".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+        }],
         extensions: HashMap::new(),
     };
     storage.register_table(schema).unwrap();
@@ -552,7 +583,7 @@ async fn cluster_anchor_full_primary_key_match_reads_remote_vertex_without_range
         static_row: None,
         rows: vec![Row {
             clustering: vec![],
-            cells: vec![(0, ferrosa_common::CellValue::live(b"Alice".to_vec(), 1000))],
+            cells: vec![(1, ferrosa_common::CellValue::live(b"Alice".to_vec(), 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         }],

@@ -113,7 +113,8 @@ impl TableMetadata {
     /// Convert this table metadata to a `TableSchema` suitable for the storage layer.
     ///
     /// Maps partition key columns to a single `key_type` (or `CompositeType` for
-    /// compound keys), and sorts clustering/static/regular columns by position.
+    /// compound keys), keeps clustering columns in clustering-key position,
+    /// and orders static/regular cells by Cassandra's column-name comparator.
     /// Compute the storage-layer column index for a given column name.
     ///
     /// Storage column indices are 0-based within `[static_columns... regular_columns...]`,
@@ -127,21 +128,22 @@ impl TableMetadata {
         match col.kind {
             ColumnKind::PartitionKey | ColumnKind::Clustering => None,
             ColumnKind::Static => {
-                // Static columns are indexed first. Count how many static
-                // columns (sorted by position) precede this one.
+                // Static columns are indexed first and sorted by Cassandra's
+                // column-name comparator.
                 let mut static_cols: Vec<_> = self
                     .columns
                     .values()
                     .filter(|c| c.kind == ColumnKind::Static)
                     .collect();
-                static_cols.sort_by_key(|c| c.position);
+                static_cols.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
                 static_cols
                     .iter()
                     .position(|c| c.name == col_name)
                     .map(|p| p as u16)
             }
             ColumnKind::Regular => {
-                // Regular columns follow static columns.
+                // Regular columns follow static columns and are sorted by
+                // Cassandra's column-name comparator.
                 let num_statics = self
                     .columns
                     .values()
@@ -152,7 +154,7 @@ impl TableMetadata {
                     .values()
                     .filter(|c| c.kind == ColumnKind::Regular)
                     .collect();
-                regulars.sort_by_key(|c| c.position);
+                regulars.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
                 regulars
                     .iter()
                     .position(|c| c.name == col_name)
@@ -164,7 +166,8 @@ impl TableMetadata {
     /// Convert this table metadata to a `TableSchema` suitable for the storage layer.
     ///
     /// Maps partition key columns to a single `key_type` (or `CompositeType` for
-    /// compound keys), and sorts clustering/static/regular columns by position.
+    /// compound keys), keeps clustering columns in clustering-key position,
+    /// and orders static/regular cells by Cassandra's column-name comparator.
     pub fn to_storage_schema(&self) -> TableSchema {
         // Build key_type
         let key_type = if self.partition_key.len() == 1 {
@@ -202,13 +205,13 @@ impl TableMetadata {
             })
             .collect();
 
-        // Collect and sort static columns by position
+        // Collect and sort static columns by Cassandra's column-name comparator.
         let mut static_cols: Vec<_> = self
             .columns
             .values()
             .filter(|c| c.kind == ColumnKind::Static)
             .collect();
-        static_cols.sort_by_key(|c| c.position);
+        static_cols.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         let static_columns: Vec<ColumnDefinition> = static_cols
             .iter()
             .map(|c| ColumnDefinition {
@@ -217,13 +220,13 @@ impl TableMetadata {
             })
             .collect();
 
-        // Collect and sort regular columns by position
+        // Collect and sort regular columns by Cassandra's column-name comparator.
         let mut regulars: Vec<_> = self
             .columns
             .values()
             .filter(|c| c.kind == ColumnKind::Regular)
             .collect();
-        regulars.sort_by_key(|c| c.position);
+        regulars.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         let regular_columns: Vec<ColumnDefinition> = regulars
             .iter()
             .map(|c| ColumnDefinition {
@@ -410,6 +413,89 @@ mod tests {
         );
         assert!(schema.clustering_columns.is_empty());
         assert!(schema.static_columns.is_empty());
+    }
+
+    #[test]
+    fn regular_and_static_storage_ordinals_follow_cassandra_column_name_order() {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "pk".to_string(),
+            ColumnMetadata {
+                name: "pk".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "z_static".to_string(),
+            ColumnMetadata {
+                name: "z_static".to_string(),
+                kind: ColumnKind::Static,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "a_static".to_string(),
+            ColumnMetadata {
+                name: "a_static".to_string(),
+                kind: ColumnKind::Static,
+                position: 1,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "v_text".to_string(),
+            ColumnMetadata {
+                name: "v_text".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        columns.insert(
+            "v_int".to_string(),
+            ColumnMetadata {
+                name: "v_int".to_string(),
+                kind: ColumnKind::Regular,
+                position: 1,
+                column_type: "int".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+
+        let table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "mixed_cells".to_string(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["pk".to_string()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+
+        let schema = table.to_storage_schema();
+        assert_eq!(schema.static_columns[0].name, "a_static");
+        assert_eq!(schema.static_columns[1].name, "z_static");
+        assert_eq!(schema.regular_columns[0].name, "v_int");
+        assert_eq!(schema.regular_columns[1].name, "v_text");
+        assert_eq!(table.storage_column_index("a_static"), Some(0));
+        assert_eq!(table.storage_column_index("z_static"), Some(1));
+        assert_eq!(table.storage_column_index("v_int"), Some(2));
+        assert_eq!(table.storage_column_index("v_text"), Some(3));
     }
 
     #[test]

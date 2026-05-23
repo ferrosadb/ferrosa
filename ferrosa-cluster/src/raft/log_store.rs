@@ -12,8 +12,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::fs;
 use std::ops::RangeBounds;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use openraft::storage::LogFlushed;
 use openraft::{
@@ -280,12 +282,17 @@ pub struct SledLogStore {
 }
 
 /// Counts of entries cleared by [`SledLogStore::reset`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetCounts {
-    /// Entries removed from the `log` tree.
-    pub log_entries: u64,
-    /// Keys removed from the `meta` tree (vote / committed / last_purged).
-    pub meta_keys: u64,
+    /// Entries removed from the `log` tree, when counted.
+    ///
+    /// Atomic directory replacement does not open sled, so normal reset
+    /// reports `None` here rather than taking sled's exclusive directory lock.
+    pub log_entries: Option<u64>,
+    /// Keys removed from the `meta` tree (vote / committed / last_purged), when counted.
+    pub meta_keys: Option<u64>,
+    /// Previous raft directory retained for rollback/debugging.
+    pub backup_path: Option<PathBuf>,
 }
 
 #[allow(clippy::result_large_err)] // StorageIOError is 224 bytes — dictated by openraft
@@ -331,62 +338,63 @@ impl SledLogStore {
         Ok(())
     }
 
-    /// Wipe a node's persisted Raft state at `path`.
+    /// Wipe a stopped node's persisted Raft state at `path`.
     ///
-    /// Clears the `log` and `meta` trees so the node rejoins the cluster as
-    /// an empty learner: no persisted vote/term, no log entries, no purge
-    /// marker. The leader's `InstallSnapshot` / `AppendEntries` will replay
-    /// committed history onto the reset node.
-    ///
-    /// # When to use
-    ///
-    /// Recovery for the disruptor-partition failure mode (see
-    /// `specs/in-process/bug-raft-stale-candidate-runaway-term-no-prevote.md`):
-    /// a node whose term has run away past the live quorum and whose log is
-    /// behind cannot self-recover, because peers reject its votes (its log
-    /// is too short) AND it rejects the leader's heartbeats (its term is too
-    /// high). Wiping local Raft state and rejoining is the only escape.
-    ///
-    /// # Lock contention
-    ///
-    /// Sled holds an exclusive lock on the database directory. If a Ferrosa
-    /// process is still using `path`, this call returns
-    /// `sled::Error::Io(...)` from `flock(2)`. Stop the node before reset.
+    /// Atomically renames the existing raft directory aside, recreates an
+    /// empty directory at the original path, and returns the backup path. This
+    /// deliberately does not open sled, so reset itself does not acquire sled's
+    /// exclusive database lock and callers can immediately reopen a fresh store.
     ///
     /// # Safety
+    ///
+    /// The node must be stopped before reset. Do not run this against a live
+    /// process: POSIX filesystems may allow renaming a directory that another
+    /// process still has open.
     ///
     /// Only uncommitted writes — those Raft never replicated to a quorum —
     /// can be lost. By Raft's durability guarantee, committed writes survive
     /// on the remaining majority and are replayed back to this node.
     pub fn reset(path: &Path) -> Result<ResetCounts, sled::Error> {
-        let db = sled::open(path)?;
-        let log = db.open_tree("log")?;
-        let meta = db.open_tree("meta")?;
-
-        let log_entries = log.len() as u64;
-        let meta_keys = meta.len() as u64;
-
-        log.clear()?;
-        meta.clear()?;
-        log.flush()?;
-        meta.flush()?;
-        db.flush()?;
-
-        // Release sled's exclusive directory lock before reporting reset
-        // success. CI immediately reopens the same log-store path to prove
-        // the reset result, and returning while tree/db handles are still
-        // alive can race with sled's lock release on slower runners.
-        drop(log);
-        drop(meta);
-        drop(db);
+        let backup_path = if path.exists() {
+            let backup = Self::unique_reset_backup_path(path);
+            fs::rename(path, &backup).map_err(sled::Error::Io)?;
+            if let Err(err) = fs::create_dir_all(path) {
+                let _ = fs::rename(&backup, path);
+                return Err(sled::Error::Io(err));
+            }
+            Some(backup)
+        } else {
+            fs::create_dir_all(path).map_err(sled::Error::Io)?;
+            None
+        };
 
         Ok(ResetCounts {
-            log_entries,
-            meta_keys,
+            log_entries: None,
+            meta_keys: None,
+            backup_path,
         })
     }
 
     // -- helpers ----------------------------------------------------------
+
+    fn unique_reset_backup_path(path: &Path) -> PathBuf {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("raft");
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+
+        for attempt in 0..u32::MAX {
+            let candidate = parent.join(format!("{name}.reset-{pid}-{nanos}-{attempt}"));
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+
+        parent.join(format!("{name}.reset-{pid}-{nanos}"))
+    }
 
     fn index_key(index: u64) -> [u8; 8] {
         index.to_be_bytes()
@@ -1307,7 +1315,7 @@ mod tests {
     // -- reset ------------------------------------------------------------
 
     #[tokio::test]
-    async fn reset_clears_log_and_meta_and_counts_what_was_removed() {
+    async fn reset_replaces_log_and_meta_with_empty_store() {
         let dir = tempfile::tempdir().unwrap();
 
         // Pre-populate: 3 log entries + a vote + a committed marker.
@@ -1340,10 +1348,11 @@ mod tests {
         } // drop releases sled lock
 
         let counts = SledLogStore::reset(dir.path()).expect("reset must succeed on a free dir");
-        assert_eq!(counts.log_entries, 3, "all 3 log entries should be cleared");
-        assert_eq!(
-            counts.meta_keys, 2,
-            "vote + committed keys should be cleared"
+        assert_eq!(counts.log_entries, None);
+        assert_eq!(counts.meta_keys, None);
+        assert!(
+            counts.backup_path.as_ref().is_some_and(|p| p.exists()),
+            "reset must retain the previous raft dir as a backup"
         );
 
         // Reopen and confirm trees are empty.
@@ -1360,14 +1369,47 @@ mod tests {
     }
 
     #[test]
-    fn reset_on_empty_store_is_a_noop_with_zero_counts() {
+    fn reset_replaces_raft_dir_and_leaves_fresh_dir_immediately_openable() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_path = dir.path().to_path_buf();
+        let marker = original_path.join("operator-note.txt");
+        std::fs::write(&marker, b"kept with reset backup").unwrap();
+
+        {
+            let db = sled::open(&original_path).unwrap();
+            let log = db.open_tree("log").unwrap();
+            log.insert(1u64.to_be_bytes(), b"entry".to_vec()).unwrap();
+            db.flush().unwrap();
+        }
+
+        let summary = SledLogStore::reset(&original_path).expect("reset must replace raft dir");
+        let backup = summary
+            .backup_path
+            .expect("reset must report the retained backup path");
+
+        assert!(original_path.exists(), "reset must recreate the raft dir");
+        assert!(backup.exists(), "previous raft dir must be retained");
+        assert!(
+            backup.join("operator-note.txt").exists(),
+            "backup must contain the previous directory contents"
+        );
+
+        let fresh = SledLogStore::new(&original_path)
+            .expect("fresh raft dir must be immediately openable without sled lock race");
+        assert_eq!(fresh.log.len(), 0, "fresh log tree must be empty");
+        assert_eq!(fresh.meta.len(), 0, "fresh meta tree must be empty");
+    }
+
+    #[test]
+    fn reset_on_empty_store_replaces_dir_and_reports_backup() {
         let dir = tempfile::tempdir().unwrap();
         // Touch a store so the on-disk layout exists, then drop.
         let _ = SledLogStore::new(dir.path()).unwrap();
 
         let counts = SledLogStore::reset(dir.path()).expect("reset on empty store must succeed");
-        assert_eq!(counts.log_entries, 0);
-        assert_eq!(counts.meta_keys, 0);
+        assert_eq!(counts.log_entries, None);
+        assert_eq!(counts.meta_keys, None);
+        assert!(counts.backup_path.as_ref().is_some_and(|p| p.exists()));
     }
 
     /// W1.19b: save_committed must flush the meta tree so the committed
@@ -1471,17 +1513,15 @@ mod tests {
     }
 
     #[test]
-    fn reset_fails_if_sled_lock_is_held() {
+    fn reset_missing_dir_creates_fresh_dir_without_backup() {
         let dir = tempfile::tempdir().unwrap();
-        // Hold an open store: this keeps sled's flock on the dir.
-        let _live = SledLogStore::new(dir.path()).unwrap();
+        let missing = dir.path().join("raft");
 
-        let err = SledLogStore::reset(dir.path())
-            .expect_err("reset must refuse while a Ferrosa node still holds the sled lock");
-        let msg = format!("{err}");
-        assert!(
-            msg.to_lowercase().contains("lock") || msg.to_lowercase().contains("io"),
-            "expected lock/io error, got: {msg}"
-        );
+        let counts = SledLogStore::reset(&missing).expect("reset must create missing raft dir");
+
+        assert!(missing.is_dir());
+        assert_eq!(counts.log_entries, None);
+        assert_eq!(counts.meta_keys, None);
+        assert_eq!(counts.backup_path, None);
     }
 }

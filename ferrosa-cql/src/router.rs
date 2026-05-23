@@ -347,6 +347,7 @@ struct PartitionRowContext<'a> {
     all_col_types: &'a [CqlType],
     pk_indices: &'a [usize],
     ck_indices: &'a [usize],
+    storage_to_table: &'a [usize],
 }
 
 struct SelectPredicateContext<'a> {
@@ -363,12 +364,13 @@ async fn count_rows_from_partitions(
 ) -> Result<i64, CqlError> {
     let mut count = 0_i64;
     for (idx, partition) in partitions.iter().enumerate() {
-        for row in bridge::partition_to_rows(
+        for row in bridge::partition_to_rows_with_storage_mapping(
             partition,
             row_context.all_col_names,
             row_context.all_col_types,
             row_context.pk_indices,
             row_context.ck_indices,
+            row_context.storage_to_table,
         ) {
             if row_matches_select_predicates(
                 &row,
@@ -423,20 +425,37 @@ async fn extend_rows_from_partitions(
     all_col_types: &[CqlType],
     pk_indices: &[usize],
     ck_indices: &[usize],
+    storage_to_table: &[usize],
 ) {
     for (idx, partition) in partitions.iter().enumerate() {
-        let mut prows = bridge::partition_to_rows(
+        let mut prows = bridge::partition_to_rows_with_storage_mapping(
             partition,
             all_col_names,
             all_col_types,
             pk_indices,
             ck_indices,
+            storage_to_table,
         );
         all_rows.append(&mut prows);
         if should_yield_during_partition_scan(idx + 1, cooperative_scan_yield_every_partitions()) {
             tokio::task::yield_now().await;
         }
     }
+}
+
+fn storage_to_table_indices(table_meta: &TableMetadata) -> Vec<usize> {
+    let mut pairs: Vec<(u16, usize)> = table_meta
+        .columns
+        .iter()
+        .filter(|(_, col)| matches!(col.kind, ColumnKind::Regular | ColumnKind::Static))
+        .filter_map(|(name, _)| {
+            let storage_idx = table_meta.storage_column_index(name)?;
+            let table_idx = table_meta.columns.get_index_of(name)?;
+            Some((storage_idx, table_idx))
+        })
+        .collect();
+    pairs.sort_by_key(|(storage_idx, _)| *storage_idx);
+    pairs.into_iter().map(|(_, table_idx)| table_idx).collect()
 }
 
 fn should_yield_during_partition_scan(processed_partitions: usize, yield_every: usize) -> bool {
@@ -2051,6 +2070,7 @@ async fn route_select_user_table(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let storage_to_table = storage_to_table_indices(table_meta);
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
     // ── fts_match(): full-text index search ───────────────────────────────────
@@ -2096,12 +2116,13 @@ async fn route_select_user_table(
                 .await
                 .map_err(|e| CqlError::ServerError(format!("{e}")))?
             {
-                let mut prows = bridge::partition_to_rows(
+                let mut prows = bridge::partition_to_rows_with_storage_mapping(
                     &partition,
                     &all_col_names,
                     &all_col_types,
                     &pk_indices,
                     &ck_indices,
+                    &storage_to_table,
                 );
                 // Post-filter: apply remaining (non-fts_match) WHERE predicates.
                 filter_rows_by_select_predicates(
@@ -2187,12 +2208,13 @@ async fn route_select_user_table(
             .pk_read(&table_id, &decorated_key, ctx.consistency, &read_strategy)
             .await?
         {
-            Some(partition) => bridge::partition_to_rows(
+            Some(partition) => bridge::partition_to_rows_with_storage_mapping(
                 &partition,
                 &all_col_names,
                 &all_col_types,
                 &pk_indices,
                 &ck_indices,
+                &storage_to_table,
             ),
             None => vec![],
         };
@@ -2218,6 +2240,7 @@ async fn route_select_user_table(
         &all_col_types,
         &pk_indices,
         &ck_indices,
+        &storage_to_table,
     )? {
         // PK IN (...) — multi-partition lookup.
         // Apply clustering key and other non-PK WHERE predicates.
@@ -2262,6 +2285,7 @@ async fn route_select_user_table(
                             all_col_types: &all_col_types,
                             pk_indices: &pk_indices,
                             ck_indices: &ck_indices,
+                            storage_to_table: &storage_to_table,
                         },
                         SelectPredicateContext {
                             statement: s,
@@ -2288,6 +2312,7 @@ async fn route_select_user_table(
                     &all_col_types,
                     &pk_indices,
                     &ck_indices,
+                    &storage_to_table,
                 )
                 .await;
                 filter_rows_by_select_predicates(
@@ -2366,6 +2391,7 @@ async fn route_select_user_table(
                             all_col_types: &all_col_types,
                             pk_indices: &pk_indices,
                             ck_indices: &ck_indices,
+                            storage_to_table: &storage_to_table,
                         },
                         SelectPredicateContext {
                             statement: s,
@@ -2393,6 +2419,7 @@ async fn route_select_user_table(
                     &all_col_types,
                     &pk_indices,
                     &ck_indices,
+                    &storage_to_table,
                 )
                 .await;
 
@@ -2453,6 +2480,7 @@ async fn route_select_user_table(
                             all_col_types: &all_col_types,
                             pk_indices: &pk_indices,
                             ck_indices: &ck_indices,
+                            storage_to_table: &storage_to_table,
                         },
                         SelectPredicateContext {
                             statement: s,
@@ -2480,6 +2508,7 @@ async fn route_select_user_table(
                     &all_col_types,
                     &pk_indices,
                     &ck_indices,
+                    &storage_to_table,
                 )
                 .await;
                 filter_rows_by_select_predicates(
@@ -2626,6 +2655,7 @@ async fn route_select_user_table(
                             all_col_types: &all_col_types,
                             pk_indices: &pk_indices,
                             ck_indices: &ck_indices,
+                            storage_to_table: &storage_to_table,
                         },
                         SelectPredicateContext {
                             statement: s,
@@ -2652,6 +2682,7 @@ async fn route_select_user_table(
                     &all_col_types,
                     &pk_indices,
                     &ck_indices,
+                    &storage_to_table,
                 )
                 .await;
                 filter_rows_by_select_predicates(
@@ -3249,12 +3280,14 @@ async fn route_insert(
                 .iter()
                 .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
                 .collect();
-            let rows = bridge::partition_to_rows(
+            let storage_to_table = storage_to_table_indices(table_meta);
+            let rows = bridge::partition_to_rows_with_storage_mapping(
                 &partition,
                 &all_col_names,
                 &all_col_types,
                 &pk_indices,
                 &ck_indices,
+                &storage_to_table,
             );
             let matching = if ck_values.is_empty() {
                 rows.into_iter().next()
@@ -3524,6 +3557,7 @@ async fn route_update(
             .iter()
             .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
             .collect();
+        let storage_to_table = storage_to_table_indices(table_meta);
 
         if let Some(partition) = state
             .write_path
@@ -3532,12 +3566,13 @@ async fn route_update(
             .await
             .map_err(|e| CqlError::ServerError(format!("{e}")))?
         {
-            let rows = bridge::partition_to_rows(
+            let rows = bridge::partition_to_rows_with_storage_mapping(
                 &partition,
                 &all_col_names,
                 &all_col_types,
                 &pk_indices,
                 &ck_indices,
+                &storage_to_table,
             );
             // Find the row matching our CK values
             if ck_values.is_empty() {
@@ -5862,6 +5897,7 @@ fn try_pk_in_lookup(
     all_col_types: &[CqlType],
     pk_indices: &[usize],
     ck_indices: &[usize],
+    storage_to_table: &[usize],
 ) -> Result<Option<Vec<Vec<Option<CqlValue>>>>, CqlError> {
     let pk_names = &table_meta.partition_key;
 
@@ -5947,12 +5983,13 @@ fn try_pk_in_lookup(
 
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
         if let Some(partition) = engine.read(table_id, &decorated_key)? {
-            let mut prows = bridge::partition_to_rows(
+            let mut prows = bridge::partition_to_rows_with_storage_mapping(
                 &partition,
                 all_col_names,
                 all_col_types,
                 pk_indices,
                 ck_indices,
+                storage_to_table,
             );
             all_rows.append(&mut prows);
         }
@@ -8520,11 +8557,19 @@ mod tests {
             .unwrap()
             .expect("feedback_outcomes partition should exist");
         let row = partition.rows.first().expect("insert should write one row");
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&("agent_memory".to_string(), "feedback_outcomes".to_string()))
+            .expect("feedback_outcomes schema exists");
+        let succeeded_storage_idx = table_meta
+            .storage_column_index("succeeded")
+            .expect("succeeded has storage column index");
         let succeeded = row
             .cells
             .iter()
-            .find(|(idx, _)| *idx == 4)
-            .expect("succeeded should be storage column index 4")
+            .find(|(idx, _)| *idx == succeeded_storage_idx)
+            .expect("succeeded should be present at its schema storage column index")
             .1
             .value
             .as_deref();
