@@ -17,9 +17,9 @@ async fn harness_3_node_cluster_elects_leader_and_commits() {
 
     // Wait for leader election.
     let leader = cluster
-        .wait_for_leader(Duration::from_secs(10))
+        .wait_for_all_voters_leader(Duration::from_secs(10))
         .await
-        .expect("leader should elect within 10 s");
+        .expect("all voters should agree on a leader within 10 s");
 
     // The leader must be one of the three nodes.
     assert!(
