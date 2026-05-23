@@ -755,15 +755,14 @@ pub async fn restore(
 
 // ── Raft administration (offline) ─────────────────────────────────────────────
 
-/// W1.11: wipe a stopped node's persisted Raft state (sled `log` and
-/// `meta` trees). The node must be stopped before this runs — sled
-/// holds an exclusive flock(2) on the data directory and reset will
-/// fail if a Ferrosa process is still using it.
+/// Wipe a stopped node's persisted Raft state by atomically replacing
+/// the raft directory.
 ///
-/// On `dry_run = true`, the function opens the trees just to count
-/// what *would* be cleared, prints the counts, and returns without
-/// mutating. (sled does open the trees here, which acquires the lock
-/// briefly, so even dry-run requires the node to be stopped.)
+/// The node must be stopped before this runs. Reset deliberately does
+/// not open the sled database, so it does not take sled's exclusive
+/// directory lock and the next startup can immediately open a fresh store.
+/// On `dry_run = true`, the function reports the planned replacement
+/// without opening or mutating the database.
 pub fn raft_reset(
     data_dir: &std::path::Path,
     dry_run: bool,
@@ -771,34 +770,30 @@ pub fn raft_reset(
     use ferrosa_cluster::raft::log_store::SledLogStore;
 
     if dry_run {
-        // Open read-only-ish: we just want to enumerate counts. The
-        // ResetCounts type isn't accessible without calling reset(),
-        // so for dry-run we open and inspect the trees directly.
-        let db = sled::open(data_dir)?;
-        let log = db.open_tree("log")?;
-        let meta = db.open_tree("meta")?;
         println!(
             "ferrosa-ctl raft reset --dry-run\n\
-             would clear: log entries = {}, meta keys = {}\n\
-             path: {}",
-            log.len(),
-            meta.len(),
+             would replace raft directory at: {}\n\
+             note: exact log/meta counts are not reported because dry-run does not open sled",
             data_dir.display()
         );
-        // Drop is enough — sled flushes on drop.
         return Ok(());
     }
 
     let counts = SledLogStore::reset(data_dir)?;
+    let backup = counts
+        .backup_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<none; directory was missing>".to_string());
     println!(
         "ferrosa-ctl raft reset\n\
-         cleared: log entries = {}, meta keys = {}\n\
          path: {}\n\
+         backup: {}\n\
+         counts: unavailable; reset did not open sled\n\
          next start: this node will rejoin as a learner; \
          the leader's snapshot/append will replay committed history.",
-        counts.log_entries,
-        counts.meta_keys,
-        data_dir.display()
+        data_dir.display(),
+        backup
     );
     Ok(())
 }

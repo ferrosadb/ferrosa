@@ -1,4 +1,4 @@
-//! Inbound streaming: accumulates chunks and applies mutations to storage.
+//! Inbound streaming: stages chunks and applies mutations to storage.
 //!
 //! # Protocol
 //!
@@ -7,12 +7,12 @@
 //! 1. The caller passes a decoded `StreamStartPayload` to `StreamReceiver::begin`.
 //! 2. Each decoded `StreamChunkPayload` is passed to `session.apply_chunk`.
 //! 3. The decoded `StreamEndPayload` is passed to `session.finish`, which
-//!    validates the CRC32 and applies all accumulated mutations to storage.
+//!    validates the CRC32 and replays staged mutations to storage.
 //!
 //! # Checksum validation
 //!
-//! The receiver recomputes the CRC32 over accumulated mutations and compares
-//! against the value in `StreamEnd`. A mismatch returns
+//! The receiver recomputes the CRC32 as chunks arrive and compares against the
+//! value in `StreamEnd`. A mismatch returns
 //! `ClusterError::Internal` and mutations are **not** applied.
 //!
 //! # Apply strategy
@@ -21,7 +21,26 @@
 //! normal writes. This means the commit log and memtable both receive each
 //! mutation, providing the same durability guarantees.
 
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+const DEFAULT_STREAM_MAX_MUTATIONS: u64 = 50_000;
+const DEFAULT_STREAM_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamSessionLimits {
+    max_mutations: u64,
+    max_bytes: u64,
+}
+
+impl Default for StreamSessionLimits {
+    fn default() -> Self {
+        Self {
+            max_mutations: DEFAULT_STREAM_MAX_MUTATIONS,
+            max_bytes: DEFAULT_STREAM_MAX_BYTES,
+        }
+    }
+}
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::{PartitionKey, Token};
@@ -31,9 +50,9 @@ use ferrosa_storage::TableId;
 use crate::error::{ClusterError, Result};
 
 use super::{
-    compute_checksum, sstable_transfer::SSTableAssembler, SstableStreamChunkPayload,
-    SstableStreamEndPayload, SstableStreamStartPayload, StreamChunkPayload, StreamEndPayload,
-    StreamStartPayload, StreamedMutation,
+    sstable_transfer::SSTableAssembler, SstableStreamChunkPayload, SstableStreamEndPayload,
+    SstableStreamStartPayload, StreamChunkPayload, StreamEndPayload, StreamStartPayload,
+    StreamedMutation,
 };
 
 // ---------------------------------------------------------------------------
@@ -52,29 +71,91 @@ pub struct StreamResult {
 // StreamSession — mutable per-session state
 // ---------------------------------------------------------------------------
 
-/// In-progress streaming session accumulating mutations from chunks.
+/// In-progress streaming session staging mutations from chunks.
 pub struct StreamSession {
     pub(crate) start: StreamStartPayload,
-    pub(crate) mutations: Vec<StreamedMutation>,
+    pub(crate) staging_path: PathBuf,
+    pub(crate) staging_file: Option<std::fs::File>,
+    pub(crate) staging_error: Option<String>,
+    pub(crate) checksum: crc32fast::Hasher,
+    pub(crate) received_mutations: u64,
+    pub(crate) received_bytes: u64,
+    pub(crate) limits: StreamSessionLimits,
 }
 
 impl StreamSession {
     /// Accept the mutations from one `StreamChunk`.
     pub fn apply_chunk(&mut self, chunk: StreamChunkPayload) -> Result<()> {
+        if let Some(error) = self.staging_error.as_deref() {
+            return Err(ClusterError::Internal(format!(
+                "stream: staging unavailable: {error}"
+            )));
+        }
+
         if chunk.session_id != self.start.session_id {
             return Err(ClusterError::Internal(format!(
                 "stream: session_id mismatch in chunk: expected {}, got {}",
                 self.start.session_id, chunk.session_id
             )));
         }
-        self.mutations.extend(chunk.mutations);
+
+        if self.received_mutations + chunk.mutations.len() as u64 > self.limits.max_mutations {
+            return Err(ClusterError::Internal(format!(
+                "stream: mutation budget exceeded: limit {}, received {}",
+                self.limits.max_mutations,
+                self.received_mutations + chunk.mutations.len() as u64
+            )));
+        }
+
+        let Some(file) = self.staging_file.as_mut() else {
+            return Err(ClusterError::Internal(
+                "stream: staging file is not open".to_string(),
+            ));
+        };
+        for mutation in &chunk.mutations {
+            let encoded = bincode::serialize(mutation).map_err(|e| {
+                ClusterError::Internal(format!("stream: failed to serialize mutation: {e}"))
+            })?;
+            let len = encoded.len() as u64;
+            if self.received_bytes + len > self.limits.max_bytes {
+                self.staging_error = Some(format!(
+                    "byte budget exceeded: limit {}, received {}",
+                    self.limits.max_bytes,
+                    self.received_bytes + len
+                ));
+                return Err(ClusterError::Internal(format!(
+                    "stream: byte budget exceeded: limit {}, received {}",
+                    self.limits.max_bytes,
+                    self.received_bytes + len
+                )));
+            }
+            self.checksum.update(&encoded);
+            file.write_all(&len.to_le_bytes()).map_err(|e| {
+                ClusterError::Internal(format!("stream: failed to write mutation length: {e}"))
+            })?;
+            file.write_all(&encoded).map_err(|e| {
+                ClusterError::Internal(format!("stream: failed to write staged mutation: {e}"))
+            })?;
+            self.received_mutations += 1;
+            self.received_bytes += len;
+        }
         Ok(())
     }
 
     /// Validate `StreamEnd` and apply all accumulated mutations to `storage`.
     ///
     /// On checksum failure the mutations are discarded and an error is returned.
-    pub fn finish(self, end: StreamEndPayload, storage: &StorageEngine) -> Result<StreamResult> {
+    pub fn finish(
+        mut self,
+        end: StreamEndPayload,
+        storage: &StorageEngine,
+    ) -> Result<StreamResult> {
+        if let Some(error) = self.staging_error.as_deref() {
+            return Err(ClusterError::Internal(format!(
+                "stream: staging unavailable: {error}"
+            )));
+        }
+
         if end.session_id != self.start.session_id {
             return Err(ClusterError::Internal(format!(
                 "stream: session_id mismatch in StreamEnd: expected {}, got {}",
@@ -83,11 +164,58 @@ impl StreamSession {
         }
 
         // Validate checksum before touching storage.
-        StreamReceiver::validate_end(&self.mutations, &end)?;
+        if self.received_mutations != end.total_mutations {
+            return Err(ClusterError::Internal(format!(
+                "stream: mutation count mismatch: accumulated {}, StreamEnd says {}",
+                self.received_mutations, end.total_mutations
+            )));
+        }
 
-        // Apply mutations to storage.
+        let computed_checksum = self.checksum.clone().finalize();
+        if computed_checksum != end.checksum {
+            return Err(ClusterError::Internal(format!(
+                "stream: checksum mismatch: computed {:#010x}, StreamEnd says {:#010x}",
+                computed_checksum, end.checksum
+            )));
+        }
+
+        if let Some(mut file) = self.staging_file.take() {
+            file.flush().map_err(|e| {
+                ClusterError::Internal(format!("stream: failed to flush staged mutations: {e}"))
+            })?;
+            file.sync_all().map_err(|e| {
+                ClusterError::Internal(format!("stream: failed to sync staged mutations: {e}"))
+            })?;
+        }
+
         let mut applied = 0u64;
-        for mutation in &self.mutations {
+        let mut staged = std::fs::File::open(&self.staging_path).map_err(|e| {
+            ClusterError::Internal(format!(
+                "stream: failed to open staged mutations {}: {e}",
+                self.staging_path.display()
+            ))
+        })?;
+        while applied < self.received_mutations {
+            let mut len_buf = [0u8; 8];
+            staged.read_exact(&mut len_buf).map_err(|e| {
+                ClusterError::Internal(format!(
+                    "stream: failed to read staged mutation length: {e}"
+                ))
+            })?;
+            let len = u64::from_le_bytes(len_buf);
+            if len > self.limits.max_bytes {
+                return Err(ClusterError::Internal(format!(
+                    "stream: staged mutation length {len} exceeds session byte limit {}",
+                    self.limits.max_bytes
+                )));
+            }
+            let mut encoded = vec![0u8; len as usize];
+            staged.read_exact(&mut encoded).map_err(|e| {
+                ClusterError::Internal(format!("stream: failed to read staged mutation: {e}"))
+            })?;
+            let mutation: StreamedMutation = bincode::deserialize(&encoded).map_err(|e| {
+                ClusterError::Internal(format!("stream: failed to decode staged mutation: {e}"))
+            })?;
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
             // Reconstruct a minimal DecoratedKey from the raw key bytes.
             // We use Token(0) as a placeholder — the storage engine uses the
@@ -144,6 +272,17 @@ impl StreamSession {
     }
 }
 
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        if let Some(mut file) = self.staging_file.take() {
+            let _ = file.flush();
+        }
+        if self.staging_path.exists() {
+            let _ = std::fs::remove_file(&self.staging_path);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StreamReceiver — stateless namespace + helpers
 // ---------------------------------------------------------------------------
@@ -162,9 +301,30 @@ impl StreamReceiver {
             estimated_bytes = start.estimated_bytes,
             "stream: session started"
         );
+        let staging_path = std::env::temp_dir().join(format!(
+            "ferrosa-row-stream-{}-{}-{}.bin",
+            std::process::id(),
+            start.source_node,
+            start.session_id
+        ));
+        let _ = std::fs::remove_file(&staging_path);
+        let (staging_file, staging_error) = match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staging_path)
+        {
+            Ok(file) => (Some(file), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         StreamSession {
             start,
-            mutations: Vec::new(),
+            checksum: crc32fast::Hasher::new(),
+            staging_path,
+            staging_file,
+            staging_error,
+            received_mutations: 0,
+            received_bytes: 0,
+            limits: StreamSessionLimits::default(),
         }
     }
 
@@ -191,6 +351,7 @@ impl StreamReceiver {
     /// Returns `ClusterError::Internal` if the checksum or count does not match.
     ///
     /// This is `pub(crate)` so that `mod.rs` tests can call it directly.
+    #[cfg(test)]
     pub(crate) fn validate_end(
         mutations: &[StreamedMutation],
         end: &StreamEndPayload,
@@ -205,7 +366,7 @@ impl StreamReceiver {
         }
 
         // Checksum check.
-        let computed = compute_checksum(mutations);
+        let computed = super::compute_checksum(mutations);
         if computed != end.checksum {
             return Err(ClusterError::Internal(format!(
                 "stream: checksum mismatch: computed {:#010x}, StreamEnd says {:#010x}",
@@ -235,10 +396,25 @@ pub struct SstableStreamResult {
 pub struct SstableStreamSession {
     pub(crate) start: SstableStreamStartPayload,
     pub(crate) assembler: SSTableAssembler,
+    /// Staging directory used while bytes are being received.
+    /// Files are moved to `final_dir` only after checksum/size verification.
+    pub(crate) staging_dir: PathBuf,
+    pub(crate) final_dir: PathBuf,
     /// Running CRC32 hasher — fed chunk data in receive order.
     pub(crate) hasher: crc32fast::Hasher,
     /// Running count of bytes received.
     pub(crate) bytes_received: u64,
+}
+
+fn staging_dir_for_session(dest_dir: &Path, source_node: u64, session_id: u64) -> PathBuf {
+    let final_name = dest_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sstable");
+    let parent = dest_dir.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".{final_name}.node-{source_node}.session-{session_id}.staging"
+    ))
 }
 
 impl SstableStreamSession {
@@ -276,39 +452,106 @@ impl SstableStreamSession {
 
         // Validate total bytes.
         if self.bytes_received != end.total_bytes {
-            return Err(ClusterError::Internal(format!(
+            let err = ClusterError::Internal(format!(
                 "sstable_stream: byte count mismatch: received {}, end says {}",
                 self.bytes_received, end.total_bytes
-            )));
+            ));
+            self.cleanup_staging()?;
+            return Err(err);
         }
 
         // Validate checksum.
-        let computed = self.hasher.finalize();
+        let computed = self.hasher.clone().finalize();
         if computed != end.checksum {
-            return Err(ClusterError::Internal(format!(
+            let err = ClusterError::Internal(format!(
                 "sstable_stream: checksum mismatch: computed {:#010x}, end says {:#010x}",
                 computed, end.checksum
-            )));
+            ));
+            self.cleanup_staging()?;
+            return Err(err);
         }
 
-        // Write files to disk.
+        // Write files to staging, then promote atomically.
         let written_files = self
             .assembler
             .write_all()
             .map_err(|e| ClusterError::Internal(format!("sstable_stream: write files: {e}")))?;
+        let promoted_files = self.promote_staged(written_files)?;
 
         tracing::info!(
             session_id = self.start.session_id,
-            files = written_files.len(),
+            files = promoted_files.len(),
             bytes = self.bytes_received,
-            "sstable_stream: session written to disk"
+            "sstable_stream: session promoted to live SSTable directory"
         );
 
         Ok(SstableStreamResult {
             session_id: self.start.session_id,
-            written_files,
+            written_files: promoted_files,
             total_bytes: self.bytes_received,
         })
+    }
+
+    fn promote_staged(&self, written_files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+        if let Some(parent) = self.final_dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ClusterError::Internal(format!(
+                    "sstable_stream: create final parent {} failed: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        if self.final_dir.exists() {
+            self.cleanup_staging()?;
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: destination already exists: {}",
+                self.final_dir.display()
+            )));
+        }
+
+        std::fs::rename(&self.staging_dir, &self.final_dir).map_err(|e| {
+            let _ = self.cleanup_staging();
+            ClusterError::Internal(format!(
+                "sstable_stream: promote staging directory {} -> {} failed: {e}",
+                self.staging_dir.display(),
+                self.final_dir.display()
+            ))
+        })?;
+
+        let mut promoted_files = Vec::with_capacity(written_files.len());
+        for file in written_files {
+            let component_name = file.file_name().ok_or_else(|| {
+                ClusterError::Internal(
+                    "sstable_stream: staged component missing file name".to_string(),
+                )
+            })?;
+            promoted_files.push(self.final_dir.join(component_name));
+        }
+
+        Ok(promoted_files)
+    }
+
+    fn cleanup_staging(&self) -> Result<()> {
+        if self.staging_dir.exists() {
+            std::fs::remove_dir_all(&self.staging_dir).map_err(|e| {
+                ClusterError::Internal(format!(
+                    "sstable_stream: cleanup {} failed: {e}",
+                    self.staging_dir.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SstableStreamSession {
+    fn drop(&mut self) {
+        if self.staging_dir.exists() {
+            if let Err(e) = self.cleanup_staging() {
+                tracing::warn!("sstable_stream: failed to cleanup staging directory: {e}");
+            }
+        }
     }
 }
 
@@ -321,6 +564,7 @@ impl SstableStreamReceiver {
     /// `dest_dir` is the directory where SSTable component files will be
     /// written. Typically `{data_dir}/sstables/{keyspace}.{table}/{sstable_id}`.
     pub fn begin(start: SstableStreamStartPayload, dest_dir: PathBuf) -> SstableStreamSession {
+        let staging_dir = staging_dir_for_session(&dest_dir, start.source_node, start.session_id);
         tracing::info!(
             session_id = start.session_id,
             source_node = start.source_node,
@@ -333,13 +577,15 @@ impl SstableStreamReceiver {
         );
         SstableStreamSession {
             start,
-            assembler: SSTableAssembler::new(dest_dir),
+            assembler: SSTableAssembler::new(staging_dir.clone()),
+            staging_dir: staging_dir.clone(),
+            final_dir: dest_dir,
             hasher: crc32fast::Hasher::new(),
             bytes_received: 0,
         }
     }
 
-    /// Convenience: accumulate all chunks and finish in one call.
+    /// Convenience: accumulate all chunks, verify integrity, and promote on success.
     pub fn receive_and_write(
         start: SstableStreamStartPayload,
         chunks: Vec<SstableStreamChunkPayload>,
@@ -591,6 +837,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.applied, 9);
+    }
+
+    // -----------------------------------------------------------------------
+    // 4b. Exceeding limits is rejected before unbounded growth
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_chunk_rejects_when_limits_are_exceeded() {
+        let row = vec![0u8; 1024];
+        let start = StreamStartPayload {
+            session_id: 5,
+            source_node: 10,
+            token_range_start: 0,
+            token_range_end: 100,
+            estimated_bytes: 0,
+        };
+
+        let mut session = StreamReceiver::begin(start);
+        session.limits = StreamSessionLimits {
+            max_mutations: 2,
+            max_bytes: 2048,
+        };
+
+        let first_chunk = StreamChunkPayload {
+            session_id: 5,
+            mutations: vec![StreamedMutation {
+                keyspace: "ks".to_string(),
+                table: "tbl".to_string(),
+                key: vec![0],
+                row: row.clone(),
+                timestamp: 0,
+            }],
+        };
+        assert!(session.apply_chunk(first_chunk).is_ok());
+
+        let second_chunk = StreamChunkPayload {
+            session_id: 5,
+            mutations: vec![
+                StreamedMutation {
+                    keyspace: "ks".to_string(),
+                    table: "tbl".to_string(),
+                    key: vec![1],
+                    row: row.clone(),
+                    timestamp: 1,
+                },
+                StreamedMutation {
+                    keyspace: "ks".to_string(),
+                    table: "tbl".to_string(),
+                    key: vec![2],
+                    row,
+                    timestamp: 2,
+                },
+            ],
+        };
+
+        let result = session.apply_chunk(second_chunk);
+        assert!(
+            matches!(result, Err(ClusterError::Internal(_))),
+            "mutations and bytes over limit should be rejected"
+        );
+    }
+
+    #[test]
+    fn apply_chunk_rejects_when_byte_limit_is_exceeded() {
+        let start = StreamStartPayload {
+            session_id: 6,
+            source_node: 10,
+            token_range_start: 0,
+            token_range_end: 100,
+            estimated_bytes: 0,
+        };
+
+        let mut session = StreamReceiver::begin(start);
+        session.limits = StreamSessionLimits {
+            max_mutations: 10,
+            max_bytes: 64,
+        };
+
+        let big_row = vec![0u8; 128];
+        let chunk = StreamChunkPayload {
+            session_id: 6,
+            mutations: vec![StreamedMutation {
+                keyspace: "ks".to_string(),
+                table: "tbl".to_string(),
+                key: vec![0],
+                row: big_row,
+                timestamp: 0,
+            }],
+        };
+
+        let result = session.apply_chunk(chunk);
+        assert!(matches!(result, Err(ClusterError::Internal(_))));
+    }
+
+    #[test]
+    fn row_stream_session_does_not_materialize_all_mutations() {
+        let source = include_str!("receiver.rs");
+        let session_start = source
+            .find("pub struct StreamSession")
+            .expect("StreamSession must exist");
+        let session_tail = &source[session_start..];
+        let session_end = session_tail
+            .find("// ---------------------------------------------------------------------------\n// StreamReceiver")
+            .unwrap_or(session_tail.len());
+        let session_source = &session_tail[..session_end];
+
+        assert!(
+            !session_source.contains("Vec<StreamedMutation>"),
+            "row streaming sessions must stage and replay mutations instead of accumulating them in memory"
+        );
+        assert!(
+            !session_source.contains("self.mutations"),
+            "row streaming sessions must not append chunks to a session-wide mutation Vec"
+        );
+        assert!(
+            session_source.contains("staging_path") && session_source.contains("staging_file"),
+            "row streaming sessions should use a staging file between chunks and storage replay"
+        );
+        assert!(
+            !session_source.contains("Vec::with_capacity(chunk.mutations.len())"),
+            "row streaming must not duplicate a whole chunk into an encoded Vec before staging"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -871,6 +1238,129 @@ mod tests {
         assert!(
             matches!(result, Err(ClusterError::Internal(ref msg)) if msg.contains("checksum")),
             "bad checksum must produce ClusterError::Internal with checksum message"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 9b. Bad checksum leaves no live/staged SSTable files
+    // -----------------------------------------------------------------------
+    #[test]
+    fn sstable_stream_bad_checksum_cleans_staging_and_does_not_promote() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("bad-checksum-cleanup");
+
+        let start = SstableStreamStartPayload {
+            session_id: 201,
+            source_node: 7,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-002".to_string(),
+            components: vec![SSTableComponent {
+                name: "Data.db".to_string(),
+                size: 4,
+            }],
+            total_bytes: 4,
+        };
+
+        let mut session = SstableStreamReceiver::begin(start.clone(), dest_path.clone());
+        let staging_path = session.staging_dir.clone();
+
+        let chunks = vec![SstableStreamChunkPayload {
+            session_id: 201,
+            component: "Data.db".to_string(),
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+        }];
+        for chunk in chunks {
+            session.apply_chunk(chunk).unwrap();
+        }
+
+        let end = SstableStreamEndPayload {
+            session_id: 201,
+            total_bytes: 4,
+            checksum: 0xBAD_BEEF, // intentionally wrong
+        };
+
+        let result = session.finish(end);
+        assert!(
+            matches!(result, Err(ClusterError::Internal(ref msg)) if msg.contains("checksum")),
+            "bad checksum must produce ClusterError::Internal with checksum message"
+        );
+        assert!(
+            !dest_path.join("Data.db").exists(),
+            "bad checksum should not promote component files into final location"
+        );
+        assert!(
+            !staging_path.exists(),
+            "bad checksum should remove staging directory"
+        );
+    }
+
+    #[test]
+    fn sstable_stream_existing_destination_is_not_deleted() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("existing-sstable");
+        std::fs::create_dir_all(&dest_path).unwrap();
+        let existing_component = dest_path.join("Data.db");
+        std::fs::write(&existing_component, b"live").unwrap();
+
+        let start = SstableStreamStartPayload {
+            session_id: 202,
+            source_node: 7,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-003".to_string(),
+            components: vec![SSTableComponent {
+                name: "Data.db".to_string(),
+                size: 4,
+            }],
+            total_bytes: 4,
+        };
+
+        let mut session = SstableStreamReceiver::begin(start, dest_path.clone());
+        let staging_path = session.staging_dir.clone();
+        session
+            .apply_chunk(SstableStreamChunkPayload {
+                session_id: 202,
+                component: "Data.db".to_string(),
+                offset: 0,
+                data: b"new!".to_vec(),
+            })
+            .unwrap();
+
+        let checksum = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(b"new!");
+            hasher.finalize()
+        };
+        let result = session.finish(SstableStreamEndPayload {
+            session_id: 202,
+            total_bytes: 4,
+            checksum,
+        });
+
+        assert!(
+            matches!(result, Err(ClusterError::Internal(ref msg)) if msg.contains("destination already exists")),
+            "existing destinations should fail closed instead of being replaced"
+        );
+        assert_eq!(
+            std::fs::read(&existing_component).unwrap(),
+            b"live",
+            "failed stream promotion must not delete or replace existing live data"
+        );
+        assert!(
+            !staging_path.exists(),
+            "failed stream promotion should remove staging"
         );
     }
 

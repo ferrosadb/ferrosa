@@ -6,11 +6,10 @@
 //!
 //! 1. `0x40` (NEXT_COMPONENT separator)
 //! 2. Token bytes (8 bytes, big-endian, XOR sign bit)
-//! 3. `0x00` (ESCAPE — end of token component)
-//! 4. `0x40` (NEXT_COMPONENT separator)
-//! 5. Partition key bytes with null-escape encoding
-//! 6. `0x00` (ESCAPE — end of key component)
-//! 7. `0x38` (TERMINATOR)
+//! 3. `0x40` (NEXT_COMPONENT separator)
+//! 4. Partition key bytes with null-escape encoding
+//! 5. `0x00` (ESCAPE — end of key component)
+//! 6. `0x38` (TERMINATOR)
 //!
 //! **Null-escape encoding**: `0x00` in key data becomes `0x00 0xFF`.
 //! Consecutive zeros become `0x00` + (n-1) `0xFE` + `0xFF`.
@@ -29,8 +28,8 @@
 //!     key: PartitionKey::from(b"AB".as_slice()),
 //! };
 //! let encoded = byte_comparable::encode(&dk);
-//! // 0x40, token(1 XOR sign bit), 0x00, 0x40, 0x41, 0x42, 0x00, 0x38
-//! assert_eq!(encoded.len(), 15);
+//! // 0x40, token(1 XOR sign bit), 0x40, 0x41, 0x42, 0x00, 0x38
+//! assert_eq!(encoded.len(), 14);
 //!
 //! let decoded = byte_comparable::decode(&encoded).unwrap();
 //! assert_eq!(decoded.token, dk.token);
@@ -57,9 +56,9 @@ pub fn encode(key: &DecoratedKey) -> Vec<u8> {
     buf.push(NEXT_COMPONENT);
     let token_bytes = ((key.token.0 as u64) ^ SIGN_BIT).to_be_bytes();
     buf.extend_from_slice(&token_bytes);
-    buf.push(ESCAPE); // end of token component
-
-    // Component 2: Partition key with null-escape encoding
+    // Component 2: Partition key with null-escape encoding. Cassandra's
+    // fixed-length token source ends without an ESCAPE byte; Multi emits the
+    // next component marker immediately after the eight token bytes.
     buf.push(NEXT_COMPONENT);
     encode_bytes_with_null_escape(&mut buf, key.key.as_bytes());
     buf.push(ESCAPE); // end of key component
@@ -91,12 +90,6 @@ pub fn decode(data: &[u8]) -> Result<DecoratedKey> {
     let token_unsigned = u64::from_be_bytes(token_bytes);
     let token = Token((token_unsigned ^ SIGN_BIT) as i64);
     pos += 8;
-
-    // Expect ESCAPE (end of token component)
-    if data.get(pos) != Some(&ESCAPE) {
-        return Err(Error::InvalidFormat("expected ESCAPE after token".into()));
-    }
-    pos += 1;
 
     // Expect NEXT_COMPONENT
     if data.get(pos) != Some(&NEXT_COMPONENT) {
@@ -208,18 +201,32 @@ mod tests {
         };
         let encoded = encode(&dk);
 
-        // Expected: 40 80_00_00_00_00_00_00_01 00 40 41_42 00 38
+        // Expected: 40 80_00_00_00_00_00_00_01 40 41_42 00 38
         assert_eq!(encoded[0], NEXT_COMPONENT);
         // Token 1 XOR sign bit = 0x8000000000000001
         assert_eq!(
             &encoded[1..9],
             &[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
         );
-        assert_eq!(encoded[9], ESCAPE);
-        assert_eq!(encoded[10], NEXT_COMPONENT);
-        assert_eq!(&encoded[11..13], b"AB");
-        assert_eq!(encoded[13], ESCAPE);
-        assert_eq!(encoded[14], TERMINATOR);
+        assert_eq!(encoded[9], NEXT_COMPONENT);
+        assert_eq!(&encoded[10..12], b"AB");
+        assert_eq!(encoded[12], ESCAPE);
+        assert_eq!(encoded[13], TERMINATOR);
+    }
+
+    #[test]
+    fn oss50_fixed_token_component_has_no_escape_terminator() {
+        let dk = DecoratedKey {
+            token: Token(1),
+            key: PartitionKey::from(b"AB".as_slice()),
+        };
+        let encoded = encode(&dk);
+
+        assert_eq!(
+            encoded[9], NEXT_COMPONENT,
+            "Cassandra OSS50 emits the key component marker immediately after the fixed 8-byte token"
+        );
+        assert_eq!(encoded.len(), 14);
     }
 
     #[test]

@@ -252,6 +252,57 @@ impl TableSchema {
         }
         None
     }
+
+    /// Returns a startup warning for schemas whose stored static/regular
+    /// column order does not match Cassandra's column-name comparator.
+    ///
+    /// Ferrosa preserves the stored schema order when reading existing
+    /// SSTables, because reordering the schema without remapping row-cell
+    /// ordinals would corrupt old data. New schema creation should use the
+    /// canonical order so exported/imported SSTables match Cassandra.
+    pub fn legacy_storage_column_order_warning(&self) -> Option<String> {
+        fn names(cols: &[ColumnDefinition]) -> Vec<&str> {
+            cols.iter().map(|c| c.name.as_str()).collect()
+        }
+
+        fn sorted_names(cols: &[ColumnDefinition]) -> Vec<&str> {
+            let mut sorted = names(cols);
+            sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            sorted
+        }
+
+        let mut mismatches = Vec::new();
+        let static_names = names(&self.static_columns);
+        let sorted_static_names = sorted_names(&self.static_columns);
+        if static_names != sorted_static_names {
+            mismatches.push(format!(
+                "static_columns stored=[{}] canonical=[{}]",
+                static_names.join(","),
+                sorted_static_names.join(",")
+            ));
+        }
+
+        let regular_names = names(&self.regular_columns);
+        let sorted_regular_names = sorted_names(&self.regular_columns);
+        if regular_names != sorted_regular_names {
+            mismatches.push(format!(
+                "regular_columns stored=[{}] canonical=[{}]",
+                regular_names.join(","),
+                sorted_regular_names.join(",")
+            ));
+        }
+
+        if mismatches.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "table {}.{} has legacy non-canonical storage column order: {}; existing SSTables may not be Cassandra-import compatible. Do not reorder this schema without remapping row cell ordinals.",
+                self.keyspace,
+                self.table,
+                mismatches.join("; ")
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -528,5 +579,59 @@ mod tests {
         };
         assert_eq!(schema.column_index("a"), Some(0));
         assert_eq!(schema.column_index("b"), Some(1));
+    }
+
+    #[test]
+    fn warns_when_storage_columns_are_not_cassandra_name_ordered() {
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "legacy".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "v_text".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "v_int".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+
+        let warning = schema
+            .legacy_storage_column_order_warning()
+            .expect("declaration-order v_text/v_int should be detected as legacy");
+        assert!(warning.contains("ks.legacy"));
+        assert!(warning.contains("regular_columns"));
+        assert!(warning.contains("v_text,v_int"));
+        assert!(warning.contains("v_int,v_text"));
+    }
+
+    #[test]
+    fn no_warning_when_storage_columns_are_cassandra_name_ordered() {
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "canonical".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "v_int".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "v_text".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+
+        assert!(schema.legacy_storage_column_order_warning().is_none());
     }
 }

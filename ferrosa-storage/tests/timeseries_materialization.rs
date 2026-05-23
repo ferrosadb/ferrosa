@@ -30,6 +30,7 @@ fn target() -> MaterializationTarget {
                 function_name: "custom_rollup".to_string(),
             },
         ],
+        target_result_column_indices: vec![0, 1, 2, 3],
         target_timestamp_unit: TimeSeriesTimestampUnit::Micros,
     }
 }

@@ -1633,11 +1633,13 @@ pub(super) fn row_to_json(
         }
     }
 
-    let mut cell_idx = 0u16;
-    for column in meta.columns.values() {
+    for column in storage_cell_columns(meta) {
         match column.kind {
             ferrosa_schema::metadata::column::ColumnKind::Regular
             | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                let Some(cell_idx) = meta.storage_column_index(&column.name) else {
+                    continue;
+                };
                 if let Some((_, cell)) = row.cells.iter().find(|(idx, _)| *idx == cell_idx) {
                     let value = match &cell.value {
                         Some(bytes) => decode_bytes_to_json(&column.column_type, bytes),
@@ -1645,7 +1647,6 @@ pub(super) fn row_to_json(
                     };
                     map.insert(column.name.clone(), value);
                 }
-                cell_idx += 1;
             }
             _ => {}
         }
@@ -1825,24 +1826,11 @@ pub(super) fn extract_column_bytes_from_row(
         }
         ferrosa_schema::metadata::column::ColumnKind::Regular
         | ferrosa_schema::metadata::column::ColumnKind::Static => {
-            let mut regular_idx = 0u16;
-            for meta_col in meta.columns.values() {
-                match meta_col.kind {
-                    ferrosa_schema::metadata::column::ColumnKind::Regular
-                    | ferrosa_schema::metadata::column::ColumnKind::Static => {
-                        if meta_col.name == column_name {
-                            return row
-                                .cells
-                                .iter()
-                                .find(|(idx, _)| *idx == regular_idx)
-                                .and_then(|(_, cell)| cell.value.clone());
-                        }
-                        regular_idx += 1;
-                    }
-                    _ => {}
-                }
-            }
-            None
+            let cell_idx = meta.storage_column_index(column_name)?;
+            row.cells
+                .iter()
+                .find(|(idx, _)| *idx == cell_idx)
+                .and_then(|(_, cell)| cell.value.clone())
         }
     }
 }
@@ -2279,26 +2267,12 @@ fn create_row_from_schema(
         encode_components(&clustering_components)
     };
 
-    let mut cells = Vec::new();
-    let mut regular_idx = 0u16;
-    for column in meta.columns.values() {
-        match column.kind {
-            ferrosa_schema::metadata::column::ColumnKind::Regular
-            | ferrosa_schema::metadata::column::ColumnKind::Static => {
-                if let Some(expr) = prop(&column.name) {
-                    cells.push((
-                        regular_idx,
-                        CellValue::live(
-                            expr_to_column_bytes(expr, &column.column_type)?,
-                            timestamp,
-                        ),
-                    ));
-                }
-                regular_idx += 1;
-            }
-            _ => {}
-        }
-    }
+    let property_exprs = op
+        .props
+        .iter()
+        .map(|(name, expr)| (name.clone(), expr.clone()))
+        .collect();
+    let cells = encode_storage_ordered_cells(meta, &property_exprs, timestamp)?;
 
     Ok((
         DecoratedKey::new(PartitionKey::new(key_bytes)),
@@ -2928,16 +2902,42 @@ fn build_merge_write_shape(
         vec![]
     };
 
-    let create_cells: Vec<(u16, CellValue)> = op
-        .match_props
-        .iter()
-        .chain(op.create_props.iter())
-        .enumerate()
-        .map(|(idx, (_name, expr))| {
-            let bytes = expr_to_bytes(expr).unwrap_or_default();
-            (idx as u16, CellValue::live(bytes, timestamp))
-        })
-        .collect();
+    let create_cells: Vec<(u16, CellValue)> = if let Some(schema) = schema {
+        let snap = schema.snapshot();
+        if let Some(meta) = snap
+            .tables
+            .get(&(op.table.keyspace.clone(), op.table.table.clone()))
+        {
+            let property_exprs: HashMap<String, Expr> = op
+                .match_props
+                .iter()
+                .chain(op.create_props.iter())
+                .chain(set_props.iter())
+                .map(|(name, expr)| (name.clone(), expr.clone()))
+                .collect();
+            encode_storage_ordered_cells(meta, &property_exprs, timestamp)?
+        } else {
+            op.match_props
+                .iter()
+                .chain(op.create_props.iter())
+                .enumerate()
+                .map(|(idx, (_name, expr))| {
+                    let bytes = expr_to_bytes(expr).unwrap_or_default();
+                    (idx as u16, CellValue::live(bytes, timestamp))
+                })
+                .collect()
+        }
+    } else {
+        op.match_props
+            .iter()
+            .chain(op.create_props.iter())
+            .enumerate()
+            .map(|(idx, (_name, expr))| {
+                let bytes = expr_to_bytes(expr).unwrap_or_default();
+                (idx as u16, CellValue::live(bytes, timestamp))
+            })
+            .collect()
+    };
 
     Ok(MergeWriteShape {
         key: DecoratedKey::new(PartitionKey::new(key_bytes)),
@@ -3049,21 +3049,7 @@ fn build_schema_aware_merge_shape(
 
     let partition_key = encode_partition_components(&partition_components);
     let clustering = encode_clustering_components(&clustering_components);
-    let mut create_cells = Vec::new();
-    let mut regular_idx = 0u16;
-    for column in meta.columns.values() {
-        match column.kind {
-            ferrosa_schema::metadata::column::ColumnKind::Regular
-            | ferrosa_schema::metadata::column::ColumnKind::Static => {
-                if let Some(expr) = property_exprs.get(&column.name) {
-                    let bytes = encode_expr_for_column_type(expr, &column.column_type)?;
-                    create_cells.push((regular_idx, CellValue::live(bytes, timestamp)));
-                }
-                regular_idx += 1;
-            }
-            _ => {}
-        }
-    }
+    let create_cells = encode_storage_ordered_cells(meta, &property_exprs, timestamp)?;
 
     Ok(Some(MergeWriteShape {
         key: DecoratedKey::new(PartitionKey::new(partition_key)),
@@ -3259,21 +3245,7 @@ async fn infer_schema_aware_merge_shape(
 
     let partition_key = encode_partition_components(&partition_components);
     let clustering = encode_clustering_components(&clustering_components);
-    let mut create_cells = Vec::new();
-    let mut regular_idx = 0u16;
-    for column in meta.columns.values() {
-        match column.kind {
-            ferrosa_schema::metadata::column::ColumnKind::Regular
-            | ferrosa_schema::metadata::column::ColumnKind::Static => {
-                if let Some(expr) = property_exprs.get(&column.name) {
-                    let bytes = encode_expr_for_column_type(expr, &column.column_type)?;
-                    create_cells.push((regular_idx, CellValue::live(bytes, timestamp)));
-                }
-                regular_idx += 1;
-            }
-            _ => {}
-        }
-    }
+    let create_cells = encode_storage_ordered_cells(&meta, &property_exprs, timestamp)?;
 
     Ok(Some(MergeWriteShape {
         key: DecoratedKey::new(PartitionKey::new(partition_key)),
@@ -3281,6 +3253,49 @@ async fn infer_schema_aware_merge_shape(
         create_cells,
         used_schema_layout: true,
     }))
+}
+
+fn encode_storage_ordered_cells(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    property_exprs: &HashMap<String, Expr>,
+    timestamp: i64,
+) -> Result<Vec<(u16, CellValue)>> {
+    let mut create_cells = Vec::new();
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some(expr) = property_exprs.get(&column.name) {
+                    let storage_idx = meta.storage_column_index(&column.name).ok_or_else(|| {
+                        GraphError::Validation(format!(
+                            "table '{}.{}' column '{}' has no storage column index",
+                            meta.keyspace, meta.name, column.name
+                        ))
+                    })?;
+                    let bytes = encode_expr_for_column_type(expr, &column.column_type)?;
+                    create_cells.push((storage_idx, CellValue::live(bytes, timestamp)));
+                }
+            }
+            _ => {}
+        }
+    }
+    create_cells.sort_by_key(|(idx, _)| *idx);
+    Ok(create_cells)
+}
+
+fn storage_cell_columns(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+) -> Vec<&ferrosa_schema::metadata::column::ColumnMetadata> {
+    let mut columns: Vec<_> = meta
+        .columns
+        .values()
+        .filter(|column| {
+            column.kind == ferrosa_schema::metadata::column::ColumnKind::Regular
+                || column.kind == ferrosa_schema::metadata::column::ColumnKind::Static
+        })
+        .collect();
+    columns.sort_by_key(|column| meta.storage_column_index(&column.name).unwrap_or(u16::MAX));
+    columns
 }
 
 fn schema_merge_requires_hidden_key_resolution(
@@ -4181,9 +4196,8 @@ fn expr_to_column_name(expr: &Expr) -> String {
 /// Look up regular column names for a table from the schema.
 ///
 /// Returns the names of regular (non-key, non-static) columns in the order
-/// they appear in the schema's `IndexMap`, which matches the cell index
-/// positions used by the storage engine. Falls back to an empty vec when
-/// the schema or table is unavailable.
+/// they appear in storage column order. Falls back to an empty vec when the
+/// schema or table is unavailable.
 pub fn column_names_for_table(schema: Option<&Schema>, keyspace: &str, table: &str) -> Vec<String> {
     let schema = match schema {
         Some(s) => s,
@@ -4193,12 +4207,8 @@ pub fn column_names_for_table(schema: Option<&Schema>, keyspace: &str, table: &s
     snap.tables
         .get(&(keyspace.to_string(), table.to_string()))
         .map(|meta| {
-            meta.columns
-                .values()
-                .filter(|col| {
-                    col.kind == ferrosa_schema::metadata::column::ColumnKind::Regular
-                        || col.kind == ferrosa_schema::metadata::column::ColumnKind::Static
-                })
+            storage_cell_columns(meta)
+                .into_iter()
                 .map(|col| col.name.clone())
                 .collect()
         })
@@ -4217,14 +4227,7 @@ fn regular_column_index_for_property(
         .tables
         .get(&(keyspace.to_string(), table.to_string()))?;
 
-    meta.columns
-        .values()
-        .filter(|col| {
-            col.kind == ferrosa_schema::metadata::column::ColumnKind::Regular
-                || col.kind == ferrosa_schema::metadata::column::ColumnKind::Static
-        })
-        .enumerate()
-        .find_map(|(idx, col)| (col.name == property).then_some(idx as u16))
+    meta.storage_column_index(property)
 }
 
 fn column_kind_for_property(

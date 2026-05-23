@@ -850,7 +850,10 @@ async fn s_28_transfer_to_lagging_target_catches_up_first() {
     // S-28: `transfer_to` catches up the target before sending
     // TimeoutNow.  Engine-level test in the openraft fork
     // (`raft/trigger.rs::transfer_to`); here we smoke a transfer to
-    // confirm the catch-up branch is reachable.
+    // confirm the catch-up branch is reachable.  The smoke must not
+    // dispatch before the leader has populated replication metrics for the
+    // target: in that state openraft fails loud with `matched=None`, which
+    // proves the harness raced readiness rather than the catch-up path.
     let cluster = TestCluster::with_voters(3).await;
     let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
     let leader_id = cluster.leader_node().node_id;
@@ -859,13 +862,54 @@ async fn s_28_transfer_to_lagging_target_catches_up_first() {
         let voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
         voters.into_iter().find(|&v| v != leader_id).unwrap()
     };
-    cluster
-        .leader_node()
-        .raft
-        .trigger()
-        .transfer_to(target)
-        .await
-        .unwrap();
+
+    let replication_ready = || {
+        let m = cluster.leader_node().metrics();
+        m.last_log_index.is_some()
+            && m.replication
+                .as_ref()
+                .and_then(|r| r.get(&target))
+                .is_some()
+    };
+    assert!(
+        wait_until(replication_ready, Duration::from_secs(5)).await,
+        "leader must expose replication progress for target before transfer_to(target={target})"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while tokio::time::Instant::now() < deadline {
+        let source = cluster
+            .current_leader_id()
+            .and_then(|leader_id| cluster.raft_for_node_id(leader_id))
+            .unwrap_or_else(|| cluster.leader_node().raft.clone());
+        match source.trigger().transfer_to(target).await {
+            Ok(()) => break,
+            Err(e) => {
+                last_error = Some(format!("{e:?}"));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if cluster
+            .nodes()
+            .iter()
+            .any(|n| n.metrics().current_leader == Some(target))
+        {
+            break;
+        }
+    }
+
+    let target_is_leader = || {
+        cluster.leader_node().metrics().current_leader == Some(target)
+            || cluster
+                .nodes()
+                .iter()
+                .any(|n| n.metrics().current_leader == Some(target))
+    };
+    assert!(
+        wait_until(target_is_leader, Duration::from_secs(10)).await,
+        "target must become leader after transfer_to(target={target}); last transfer error: {last_error:?}"
+    );
     cluster.shutdown().await;
 }
 
