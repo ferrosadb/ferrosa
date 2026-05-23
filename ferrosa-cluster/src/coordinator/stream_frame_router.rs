@@ -15,7 +15,9 @@
 //! [`StreamRouter`]: ferrosa_net::stream_router::StreamRouter
 //! [`stream_consumer`]: super::stream_consumer
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -24,17 +26,85 @@ use ferrosa_net::message::Message;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_net::stream_router::{RouteError, StreamRouter};
 
+use crate::raft::handlers::{RangeReadStreamChunkPayload, RangeReadStreamDonePayload};
+
+type StreamSeqKey = (u32, uuid::Uuid, SocketAddr);
+
 /// Inbound dispatch handler for the three streaming range-read
 /// response frame types. Decodes the leading `request_id` from each
 /// frame's bincode payload and pushes the whole `Message` through
 /// the shared [`StreamRouter`].
 pub struct StreamFrameRouter {
     router: Arc<StreamRouter>,
+    next_chunk_seq: Mutex<HashMap<StreamSeqKey, u32>>,
 }
 
 impl StreamFrameRouter {
     pub fn new(router: Arc<StreamRouter>) -> Self {
-        Self { router }
+        Self {
+            router,
+            next_chunk_seq: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn clear_request_state(&self, request_id: u32) {
+        self.next_chunk_seq
+            .lock()
+            .expect("stream sequence mutex poisoned")
+            .retain(|(id, _, _), _| *id != request_id);
+    }
+
+    fn validate_chunk_seq(&self, from: PeerId, request_id: u32, bytes: &[u8]) -> bool {
+        let Ok(payload) = bincode::deserialize::<RangeReadStreamChunkPayload>(bytes) else {
+            return true;
+        };
+        let key = (request_id, from.0, from.1);
+        let mut guard = self
+            .next_chunk_seq
+            .lock()
+            .expect("stream sequence mutex poisoned");
+        let expected = guard.entry(key).or_insert(0);
+        if payload.seq != *expected {
+            tracing::warn!(
+                request_id,
+                peer = %from.0,
+                expected_seq = *expected,
+                observed_seq = payload.seq,
+                "stream chunk sequence gap/reorder; closing stream route"
+            );
+            drop(guard);
+            self.router.unregister(request_id);
+            self.clear_request_state(request_id);
+            return false;
+        }
+        *expected = expected.saturating_add(1);
+        true
+    }
+
+    fn validate_done_seq(&self, from: PeerId, request_id: u32, bytes: &[u8]) -> bool {
+        let Ok(payload) = bincode::deserialize::<RangeReadStreamDonePayload>(bytes) else {
+            return true;
+        };
+        let key = (request_id, from.0, from.1);
+        let mut guard = self
+            .next_chunk_seq
+            .lock()
+            .expect("stream sequence mutex poisoned");
+        let observed = guard.remove(&key).unwrap_or(0);
+        if payload.total_chunks != observed {
+            tracing::warn!(
+                request_id,
+                peer = %from.0,
+                observed_chunks = observed,
+                reported_chunks = payload.total_chunks,
+                "stream Done chunk count mismatch; closing stream route"
+            );
+            drop(guard);
+            self.router.unregister(request_id);
+            self.clear_request_state(request_id);
+            return false;
+        }
+        true
     }
 }
 
@@ -56,7 +126,7 @@ fn peek_request_id(bytes: &[u8]) -> Option<u32> {
 
 #[async_trait]
 impl RpcHandler for StreamFrameRouter {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
         let (request_id, msg_type) = match &msg {
             Message::RangeReadStreamChunk(b) => (peek_request_id(b), MsgType::RangeReadStreamChunk),
             Message::RangeReadStreamHeartbeat(b) => {
@@ -77,9 +147,23 @@ impl RpcHandler for StreamFrameRouter {
             return None;
         };
 
+        let sequence_valid = match &msg {
+            Message::RangeReadStreamChunk(bytes) => {
+                self.validate_chunk_seq(from, request_id, bytes.as_ref())
+            }
+            Message::RangeReadStreamDone(bytes) => {
+                self.validate_done_seq(from, request_id, bytes.as_ref())
+            }
+            _ => true,
+        };
+        if !sequence_valid {
+            return None;
+        }
+
         match self.router.route(request_id, msg) {
             Ok(()) => {}
             Err(RouteError::NoRoute(id)) => {
+                self.clear_request_state(id);
                 // Stale frame for a request the consumer already
                 // finished or never registered. Common after
                 // cancellation; debug level only.
@@ -90,6 +174,7 @@ impl RpcHandler for StreamFrameRouter {
                 );
             }
             Err(RouteError::ChannelClosed(id)) => {
+                self.clear_request_state(id);
                 tracing::debug!(
                     request_id = id,
                     ?msg_type,
@@ -97,10 +182,11 @@ impl RpcHandler for StreamFrameRouter {
                 );
             }
             Err(RouteError::ChannelFull(id)) => {
+                self.clear_request_state(id);
                 tracing::warn!(
                     request_id = id,
                     ?msg_type,
-                    "stream consumer buffer full; dropping frame — coordinator falling behind"
+                    "stream consumer buffer full; closing route so consumer fails instead of returning partial data"
                 );
             }
         }
@@ -131,9 +217,13 @@ mod tests {
     }
 
     fn encoded_chunk(id: u32) -> Message {
+        encoded_chunk_seq(id, 0)
+    }
+
+    fn encoded_chunk_seq(id: u32, seq: u32) -> Message {
         let payload = RangeReadStreamChunkPayload {
             request_id: id,
-            seq: 0,
+            seq,
             partitions: vec![],
         };
         Message::RangeReadStreamChunk(Bytes::from(bincode::serialize(&payload).unwrap()))
@@ -147,10 +237,10 @@ mod tests {
         Message::RangeReadStreamHeartbeat(Bytes::from(bincode::serialize(&payload).unwrap()))
     }
 
-    fn encoded_done(id: u32) -> Message {
+    fn encoded_done(id: u32, total_chunks: u32) -> Message {
         let payload = RangeReadStreamDonePayload {
             request_id: id,
-            total_chunks: 0,
+            total_chunks,
             truncated: false,
         };
         Message::RangeReadStreamDone(Bytes::from(bincode::serialize(&payload).unwrap()))
@@ -184,7 +274,7 @@ mod tests {
 
         handler.handle(peer(), encoded_chunk(REQ_ID)).await;
         handler.handle(peer(), encoded_heartbeat(REQ_ID)).await;
-        handler.handle(peer(), encoded_done(REQ_ID)).await;
+        handler.handle(peer(), encoded_done(REQ_ID, 1)).await;
 
         let f1 = rx.recv().await.unwrap();
         let f2 = rx.recv().await.unwrap();
@@ -205,6 +295,65 @@ mod tests {
         assert!(reply.is_none());
         // No panic, nothing in the routing table either.
         assert!(router.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_stream_buffer_closes_route_so_consumer_fails_loudly() {
+        let router = Arc::new(StreamRouter::new());
+        let mut rx = router.register(REQ_ID, 1);
+        let handler = StreamFrameRouter::new(router.clone());
+
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 0)).await;
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 1)).await;
+
+        assert!(
+            router.is_empty(),
+            "full stream buffer must close the route instead of dropping a chunk and allowing partial success"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::RangeReadStreamChunk(_))
+        ));
+        assert_eq!(
+            rx.recv().await,
+            None,
+            "consumer must observe channel close after route is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_chunk_sequence_closes_route_so_consumer_fails_loudly() {
+        let router = Arc::new(StreamRouter::new());
+        let mut rx = router.register(REQ_ID, 8);
+        let handler = StreamFrameRouter::new(router.clone());
+
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 1)).await;
+
+        assert!(
+            router.is_empty(),
+            "seq=1 as the first chunk proves a missing chunk and must close the route"
+        );
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn reordered_chunk_sequence_closes_route_so_consumer_fails_loudly() {
+        let router = Arc::new(StreamRouter::new());
+        let mut rx = router.register(REQ_ID, 8);
+        let handler = StreamFrameRouter::new(router.clone());
+
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 0)).await;
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 0)).await;
+
+        assert!(
+            router.is_empty(),
+            "duplicate seq=0 after seq=0 was already accepted proves reorder/duplication and must close the route"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::RangeReadStreamChunk(_))
+        ));
+        assert_eq!(rx.recv().await, None);
     }
 
     /// Non-streaming frames are not ours — handler returns None

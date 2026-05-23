@@ -32,6 +32,13 @@ time window)` into aggregation accumulators.
   `TableStore` visitor.
 - The RRD materialization worker now uses this visitor as the source of truth
   for rollup windows, including when the in-memory ring is incomplete.
+- `TableStore::visit_time_series_window_rows` no longer calls
+  `TableStore::read`. It reads memtable rows by reference and uses
+  `PartitionIter::next_partition_header_only` + `next_clustered_row` for
+  SSTables, k-way merging duplicate clustering rows across sources before
+  invoking the callback.
+- Remaining hardening: skip directly to the first clustering timestamp in the
+  requested window once row-index support is available for imported SSTables.
 - `TableStore::visit_time_series_window_rows` now streams matching SSTable
   partitions through `PartitionIter::next_partition_header_only` and
   `next_clustered_row`.

@@ -2109,6 +2109,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]

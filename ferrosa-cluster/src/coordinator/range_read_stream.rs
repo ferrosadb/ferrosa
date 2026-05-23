@@ -22,8 +22,8 @@ use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
+use futures::StreamExt;
 
-use super::read::read_local_range_limited_rows;
 use super::stream_consumer::{consume_range_stream, StreamConsumeError};
 use super::ClusterCoordinator;
 use crate::error::ClusterError;
@@ -137,6 +137,29 @@ fn dedup_by_token(partitions: Vec<Partition>) -> Vec<Partition> {
         .collect()
 }
 
+async fn read_local_range_stream_limited_rows(
+    storage: &ferrosa_storage::StorageEngine,
+    table_id: &TableId,
+    limit: usize,
+    row_limit: usize,
+) -> ferrosa_common::Result<Vec<Partition>> {
+    let mut stream = storage.range_iter(table_id, None, None);
+    let mut partitions = Vec::with_capacity(limit);
+
+    while partitions.len() < limit {
+        let Some(next) = stream.next().await else {
+            break;
+        };
+        let mut partition = next?;
+        if row_limit > 0 {
+            partition.rows.truncate(row_limit);
+        }
+        partitions.push(partition);
+    }
+
+    Ok(partitions)
+}
+
 impl ClusterCoordinator {
     /// ADR-020 streaming range-read entry point.
     ///
@@ -202,12 +225,14 @@ impl ClusterCoordinator {
         let expected_done = remotes.len();
 
         // Local read goes direct — no internode hop.
-        let mut all_partitions = match read_local_range_limited_rows(
+        let mut all_partitions = match read_local_range_stream_limited_rows(
             self.storage.as_ref(),
             table_id,
             limit,
             row_limit,
-        ) {
+        )
+        .await
+        {
             Ok(ps) => ps,
             Err(e) => return Err(ClusterError::Storage(e)),
         };
@@ -339,5 +364,33 @@ mod tests {
         assert_eq!(remote_count_for_cl(CL::One, 3, 5, 4), 4);
         assert_eq!(remote_count_for_cl(CL::Quorum, 3, 5, 4), 4);
         assert_eq!(remote_count_for_cl(CL::All, 3, 5, 4), 4);
+    }
+
+    #[test]
+    fn coordinate_streaming_range_read_does_not_call_vec_local_read() {
+        let source = include_str!("range_read_stream.rs");
+        let body = source
+            .split("pub async fn coordinate_range_read_stream_limited_rows")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("streaming coordinator body must be present");
+
+        assert!(
+            !body.contains("read_local_range_limited_rows"),
+            "streaming range coordinator must not call the Vec-returning local read helper: {body}"
+        );
+        assert!(
+            body.contains("read_local_range_stream_limited_rows"),
+            "streaming range coordinator must route local reads through the bounded streaming helper: {body}"
+        );
+        let helper = source
+            .split("async fn read_local_range_stream_limited_rows")
+            .nth(1)
+            .and_then(|rest| rest.split("impl ClusterCoordinator").next())
+            .expect("streaming local read helper must be present");
+        assert!(
+            helper.contains("range_iter") && helper.contains("while partitions.len() < limit"),
+            "streaming local read helper must pull from range_iter under the requested limit: {helper}"
+        );
     }
 }

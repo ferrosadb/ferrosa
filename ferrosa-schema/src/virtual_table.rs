@@ -14,9 +14,9 @@ use std::time::Duration;
 /// A virtual table backed by live code instead of SSTables.
 ///
 /// Implementers supply schema metadata (`name`, `keyspace`, `columns`,
-/// `primary_key_columns`) and a `read` method that materialises rows on
-/// demand. The query layer applies any remaining predicates after the
-/// implementation has done its own filtering.
+/// `primary_key_columns`) and a `read` method for compatibility. Tables with
+/// large or live result sets should override [`VirtualTable::visit_rows`] so
+/// callers can consume rows without first building a `Vec<VirtualRow>`.
 ///
 /// # Object Safety
 ///
@@ -41,6 +41,16 @@ pub trait VirtualTable: Send + Sync {
     /// Implementations may apply as much or as little of the predicate as
     /// convenient; the query layer will re-apply it for correctness.
     fn read(&self, predicate: Option<&RowPredicate>) -> Vec<VirtualRow>;
+
+    /// Visit rows without requiring the implementation to return a vector.
+    ///
+    /// The default adapter preserves all existing virtual tables. Streaming or
+    /// live tables should override this method and emit one row at a time.
+    fn visit_rows(&self, predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for row in self.read(predicate) {
+            visit(row);
+        }
+    }
 
     /// How the table should be kept fresh when watched by a subscriber.
     fn subscription_mode(&self) -> SubscriptionMode;

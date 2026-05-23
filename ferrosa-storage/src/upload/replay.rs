@@ -68,7 +68,7 @@ where
     report
 }
 
-fn find_pending_upload_files(
+pub(crate) fn find_pending_upload_files(
     data_dir: &Path,
     compaction_output_dir: &Path,
     table_id: &str,

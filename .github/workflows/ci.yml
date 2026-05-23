@@ -231,6 +231,10 @@ jobs:
       - name: Install cqlsh
         run: pip install cqlsh
 
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: wasm32-unknown-unknown
+
       - name: Wait for CQL port
         run: |
           echo "Waiting for Ferrosa CQL port (9042)..."
@@ -273,6 +277,14 @@ jobs:
                 fi
               fi
             done
+
+            if [ -x "$dir/smoke-test.sh" ]; then
+              echo "  Running smoke-test.sh..."
+              if ! (cd "$dir" && bash "./smoke-test.sh"); then
+                echo "  FAIL: $dir/smoke-test.sh"
+                ok=false
+              fi
+            fi
 
             if $ok; then
               echo "  => $name: PASS"

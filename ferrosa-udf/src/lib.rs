@@ -13,5 +13,5 @@ pub mod sandbox;
 
 pub use arena::UdfArena;
 pub use error::UdfError;
-pub use executor::UdfExecutor;
+pub use executor::{FunctionKind, StreamingAggregateInvocation, UdfExecutor};
 pub use sandbox::SandboxConfig;

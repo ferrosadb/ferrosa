@@ -28,9 +28,9 @@ use ferrosa_schema::{
     query_role_members, query_role_permissions, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
-    Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
-    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualColumnUpdate, VirtualRow,
-    VirtualTableUpdate,
+    Resource, RoleMetadata, RoleUpdates, RowPredicate, Schema, TableMetadata, TableParams,
+    TableUpdates, UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata,
+    VirtualColumnUpdate, VirtualTableUpdate,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -1968,8 +1968,7 @@ async fn route_select(
         _ => {
             // Virtual table: check registry before storage lookup.
             if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
-                let rows = vtable.read(None);
-                return encode_virtual_rows(ks, &s.table, vtable.as_ref(), &rows);
+                return encode_virtual_rows_streaming(ks, &s.table, vtable.as_ref(), None);
             }
 
             // User table: permission check + bridge + storage
@@ -3031,15 +3030,11 @@ fn decode_list_text_cell(cell: &ferrosa_common::CellValue) -> Option<CqlValue> {
     Some(CqlValue::List(items))
 }
 
-/// Encode virtual table rows as a CQL ROWS result body.
-///
-/// Converts `VirtualRow` cells (raw `CellValue` bytes) into typed `CqlValue`s
-/// using the column definitions, then delegates to `result::encode_rows`.
-fn encode_virtual_rows(
+fn encode_virtual_rows_streaming(
     keyspace: &str,
     table: &str,
     vtable: &dyn ferrosa_schema::VirtualTable,
-    rows: &[VirtualRow],
+    predicate: Option<&RowPredicate>,
 ) -> Result<BytesMut, CqlError> {
     let columns = vtable.columns();
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
@@ -3047,32 +3042,30 @@ fn encode_virtual_rows(
         .iter()
         .enumerate()
         .map(|(idx, c)| match vtable.wire_type_for(idx) {
-            // p1-37: virtual columns whose CQL type is a collection
-            // bypass the scalar `DataType` mapping.
             Some(ferrosa_schema::WireType::ListText) => CqlType::List(Box::new(CqlType::Varchar)),
             None => data_type_to_cql_type(&c.data_type),
         })
         .collect();
 
-    let cql_rows: Vec<Vec<Option<CqlValue>>> = rows
-        .iter()
-        .map(|row| {
-            row.cells
-                .iter()
-                .zip(columns.iter().enumerate())
-                .map(|(cell, (idx, col))| match vtable.wire_type_for(idx) {
-                    // p1-37: cell already holds CQL-list-encoded bytes;
-                    // decode them into a typed `CqlValue::List` for the
-                    // result encoder.
-                    Some(ferrosa_schema::WireType::ListText) => decode_list_text_cell(cell),
-                    None => cell_to_cql_value(cell, &col.data_type),
-                })
-                .collect()
-        })
-        .collect();
-
-    Ok(result::encode_rows(
-        &col_names, &col_types, keyspace, table, &cql_rows,
+    Ok(result::encode_rows_with_writer(
+        &col_names,
+        &col_types,
+        keyspace,
+        table,
+        |emit| {
+            vtable.visit_rows(predicate, &mut |row| {
+                let cql_row: Vec<Option<CqlValue>> = row
+                    .cells
+                    .iter()
+                    .zip(columns.iter().enumerate())
+                    .map(|(cell, (idx, col))| match vtable.wire_type_for(idx) {
+                        Some(ferrosa_schema::WireType::ListText) => decode_list_text_cell(cell),
+                        None => cell_to_cql_value(cell, &col.data_type),
+                    })
+                    .collect();
+                emit(&cql_row);
+            });
+        },
     ))
 }
 
@@ -7135,10 +7128,17 @@ async fn route_create_function(
 
     // Load WASM bytes and compile only after existence semantics are settled.
     let (wasm_bytes, stored_body) = load_function_body(&body).await?;
-    state
-        .udf_executor
-        .compile(&ks, &name, &arg_types, &wasm_bytes)
-        .map_err(CqlError::from)?;
+    if ferrosa_udf::UdfExecutor::wasm_declares_streaming_aggregate_abi(&wasm_bytes) {
+        state
+            .udf_executor
+            .compile_streaming_aggregate(&ks, &name, &arg_types, &wasm_bytes)
+            .map_err(CqlError::from)?;
+    } else {
+        state
+            .udf_executor
+            .compile(&ks, &name, &arg_types, &wasm_bytes)
+            .map_err(CqlError::from)?;
+    }
     let drop_arg_types = arg_types.clone();
 
     let func_meta = UserFunctionMetadata {
@@ -8077,6 +8077,9 @@ mod tests {
 
         let udf_executor =
             Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
+        engine.set_time_series_wasm_aggregate_executor(Arc::new(
+            crate::wasm_aggregate::UdfTimeSeriesAggregateExecutor::new(Arc::clone(&udf_executor)),
+        ));
 
         let mode_controller =
             ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
@@ -8419,7 +8422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_table_rejects_non_streaming_rrd_wasm_function() {
+    async fn create_table_accepts_rrd_wasm_function_after_streaming_abi_exists() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -8440,7 +8443,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = match route(
+        route(
             &state,
             &ctx,
             crate::parser::parse(
@@ -8449,15 +8452,8 @@ mod tests {
             .unwrap(),
         )
         .await
-        {
-            Ok(_) => panic!("expected WASM RRD function DDL to fail"),
-            Err(err) => err,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("streaming WASM aggregate ABI"),
-            "WASM rollup DDL must fail clearly until the streaming ABI exists: {msg}"
-        );
+        .expect("RRD WASM function DDL should parse/register after streaming ABI exists");
+        assert_eq!(state.engine.time_series_consolidator_count(), 1);
     }
 
     #[tokio::test]
@@ -9431,6 +9427,77 @@ mod tests {
                 // The result should contain data (more than just the header)
                 assert!(b.len() > 4);
             }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_virtual_table_uses_streaming_visit_rows() {
+        use ferrosa_common::{CellValue, DataType};
+        use ferrosa_schema::{
+            RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
+        };
+
+        struct StreamingOnlyVTable;
+
+        impl VirtualTable for StreamingOnlyVTable {
+            fn name(&self) -> &str {
+                "streaming_vtable"
+            }
+
+            fn keyspace(&self) -> &str {
+                "test_ks"
+            }
+
+            fn columns(&self) -> &[VirtualColumnDef] {
+                static COLS: std::sync::OnceLock<Vec<VirtualColumnDef>> =
+                    std::sync::OnceLock::new();
+                COLS.get_or_init(|| {
+                    vec![VirtualColumnDef {
+                        name: "name".into(),
+                        data_type: DataType::Text,
+                    }]
+                })
+            }
+
+            fn primary_key_columns(&self) -> &[usize] {
+                &[0]
+            }
+
+            fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
+                panic!("virtual table route must not require Vec materialization")
+            }
+
+            fn visit_rows(&self, _: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+                visit(VirtualRow {
+                    cells: vec![CellValue::live(b"streamed".to_vec(), 0)],
+                });
+            }
+
+            fn subscription_mode(&self) -> SubscriptionMode {
+                SubscriptionMode::Pollable
+            }
+        }
+
+        let (state, _dir) = setup();
+        state
+            .schema
+            .virtual_tables()
+            .register(Arc::new(StreamingOnlyVTable));
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse("SELECT * FROM test_ks.streaming_vtable").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
     }
@@ -12328,6 +12395,41 @@ mod tests {
         ]
     }
 
+    fn minimal_streaming_aggregate_component() -> Vec<u8> {
+        let mut bytes = minimal_wasm_component();
+        append_component_custom_section(
+            &mut bytes,
+            "ferrosa:streaming-aggregate:v1",
+            b"contract=init/update/finalize;value=f64;state=bounded",
+        );
+        bytes
+    }
+
+    fn append_component_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) {
+        let mut section = Vec::new();
+        push_uleb128(&mut section, name.len() as u32);
+        section.extend_from_slice(name.as_bytes());
+        section.extend_from_slice(payload);
+
+        bytes.push(0);
+        push_uleb128(bytes, section.len() as u32);
+        bytes.extend_from_slice(&section);
+    }
+
+    fn push_uleb128(out: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn route_create_function_valid_wasm_stores_in_schema() {
         let (state, _dir) = setup();
@@ -12375,6 +12477,46 @@ mod tests {
         assert_eq!(func.return_type, CqlType::Int);
         assert!(func.called_on_null);
         assert_eq!(func.language, "wasm");
+    }
+
+    #[tokio::test]
+    async fn route_create_function_with_streaming_marker_compiles_aggregate() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE udf_agg_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let hex_body = hex_encode(&minimal_streaming_aggregate_component());
+        let cql = format!(
+            "CREATE FUNCTION udf_agg_ks.stddev(val double) CALLED ON NULL INPUT RETURNS double LANGUAGE wasm AS '{hex_body}'"
+        );
+        route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .udf_executor
+                .get_kind("udf_agg_ks", "stddev", &[CqlType::Double])
+                .unwrap(),
+            ferrosa_udf::FunctionKind::Aggregate
+        );
     }
 
     #[tokio::test]

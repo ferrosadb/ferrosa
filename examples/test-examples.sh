@@ -125,14 +125,24 @@ for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluste
     fi
   fi
 
+  # smoke-test.sh
+  if [ -x "${dir}/smoke-test.sh" ]; then
+    echo "  -> ${dir}/smoke-test.sh"
+    if ! (cd "${dir}" && bash "./smoke-test.sh"); then
+      echo "  FAIL: ${dir}/smoke-test.sh"
+      dir_ok=false
+    fi
+  fi
+
   if [ "$dir_ok" = true ]; then
     # Only count directories that had at least one script to run
     if [ -f "${dir}/schema.cql" ] || [ -f "${dir}/data.cql" ] || \
-       [ -f "${dir}/queries.cql" ] || [ -x "${dir}/cypher-queries.sh" ]; then
+       [ -f "${dir}/queries.cql" ] || [ -x "${dir}/cypher-queries.sh" ] || \
+       [ -x "${dir}/smoke-test.sh" ]; then
       echo "  PASS: ${dir}"
       passed=$((passed + 1))
     else
-      echo "  SKIP: ${dir} (no CQL or Cypher scripts found)"
+      echo "  SKIP: ${dir} (no runnable example scripts found)"
     fi
   else
     echo "  FAIL: ${dir}"

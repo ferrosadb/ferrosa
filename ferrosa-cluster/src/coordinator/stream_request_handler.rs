@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::stream::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
@@ -35,7 +37,8 @@ use ferrosa_storage::TableId;
 
 use super::stream_producer::ChunkSink;
 use crate::raft::handlers::{
-    RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
+    RangeReadStreamCancelPayload, RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload,
+    RangeReadStreamRequestPayload,
 };
 
 /// How often to emit a `RangeReadStreamHeartbeat` while a slow
@@ -103,6 +106,20 @@ pub async fn handle_stream_request<R, S>(
     R: StreamRangeReader + 'static,
     S: ChunkSink,
 {
+    handle_stream_request_with_cancel(req, reader, sink, chunk_size, CancellationToken::new())
+        .await;
+}
+
+pub async fn handle_stream_request_with_cancel<R, S>(
+    req: RangeReadStreamRequestPayload,
+    reader: Arc<R>,
+    sink: &S,
+    chunk_size: usize,
+    cancel: CancellationToken,
+) where
+    R: StreamRangeReader + 'static,
+    S: ChunkSink,
+{
     assert!(chunk_size >= 1, "chunk_size must be >= 1");
 
     let table_id = TableId::new(&req.keyspace, &req.table);
@@ -141,6 +158,14 @@ pub async fn handle_stream_request<R, S>(
     'pull: loop {
         tokio::select! {
             biased;
+            _ = cancel.cancelled() => {
+                tracing::debug!(
+                    request_id = req.request_id,
+                    total_chunks_emitted,
+                    "stream request: cancelled"
+                );
+                return;
+            }
             next = stream.next() => match next {
                 Some(Ok(partition)) => {
                     batch.push(partition);
@@ -247,6 +272,7 @@ where
     reader: Arc<R>,
     sink_factory: Arc<F>,
     chunk_size: usize,
+    cancellations: Arc<DashMap<u32, CancellationToken>>,
 }
 
 /// Builds a per-request `ChunkSink` targeting the originating peer.
@@ -322,6 +348,7 @@ where
             reader,
             sink_factory,
             chunk_size,
+            cancellations: Arc::new(DashMap::new()),
         }
     }
 }
@@ -335,6 +362,19 @@ where
     async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
         let bytes = match msg {
             Message::RangeReadStreamRequest(b) => b,
+            Message::RangeReadStreamCancel(b) => {
+                let cancel: RangeReadStreamCancelPayload = match bincode::deserialize(&b) {
+                    Ok(cancel) => cancel,
+                    Err(e) => {
+                        tracing::warn!("RangeReadStreamRequestHandler: cancel decode failed: {e}");
+                        return None;
+                    }
+                };
+                if let Some((_request_id, token)) = self.cancellations.remove(&cancel.request_id) {
+                    token.cancel();
+                }
+                return None;
+            }
             _ => return None,
         };
 
@@ -349,9 +389,14 @@ where
         let sink = self.sink_factory.for_peer(from, req.request_id);
         let reader = self.reader.clone();
         let chunk_size = self.chunk_size;
+        let token = CancellationToken::new();
+        self.cancellations.insert(req.request_id, token.clone());
+        let cancellations = self.cancellations.clone();
 
         tokio::spawn(async move {
-            handle_stream_request(req, reader, &sink, chunk_size).await;
+            let request_id = req.request_id;
+            handle_stream_request_with_cancel(req, reader, &sink, chunk_size, token).await;
+            cancellations.remove(&request_id);
         });
 
         // Streaming responses ride on fire-and-forget chunks; no
@@ -671,6 +716,55 @@ mod tests {
             watermark <= CHUNK,
             "handler materialized {watermark} partitions before emitting the first chunk; \
              ADR-020 requires lazy iteration (chunk_size={CHUNK})"
+        );
+    }
+
+    struct CancelAfterFirstChunkSink {
+        cancel: tokio_util::sync::CancellationToken,
+        frames: Mutex<Vec<Message>>,
+    }
+
+    #[async_trait]
+    impl ChunkSink for CancelAfterFirstChunkSink {
+        async fn send(&self, msg: Message) {
+            if matches!(msg, Message::RangeReadStreamChunk(_)) {
+                self.cancel.cancel();
+            }
+            self.frames.lock().unwrap().push(msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_request_cancel_stops_reader_within_one_batch() {
+        const CHUNK: usize = 4;
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let partitions: Vec<Partition> =
+            (0u8..=255).cycle().take(100).map(make_partition).collect();
+        let reader = Arc::new(LazyContractReader::new(partitions, yielded.clone()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let sink = CancelAfterFirstChunkSink {
+            cancel: cancel.clone(),
+            frames: Mutex::new(Vec::new()),
+        };
+
+        handle_stream_request_with_cancel(req(2), reader, &sink, CHUNK, cancel).await;
+
+        let frames = sink.frames.lock().unwrap();
+        let chunks = frames
+            .iter()
+            .filter(|msg| matches!(msg, Message::RangeReadStreamChunk(_)))
+            .count();
+        assert_eq!(chunks, 1, "producer must stop after observing cancel");
+        assert!(
+            !frames
+                .iter()
+                .any(|msg| matches!(msg, Message::RangeReadStreamDone(_))),
+            "cancelled streams must stop without sending a successful Done terminator"
+        );
+        assert!(
+            yielded.load(AtomicOrdering::Relaxed) <= CHUNK * 2,
+            "producer pulled too far after cancel; yielded={}",
+            yielded.load(AtomicOrdering::Relaxed)
         );
     }
 
