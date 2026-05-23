@@ -469,6 +469,22 @@ impl TimeSeriesAggregator {
         }
     }
 
+    fn enqueue_materialization_task(&self, task: &ConsolidationTask) -> bool {
+        match self.task_tx.send(task.clone()) {
+            Ok(()) => {
+                self.note_materialization_task_enqueued(task);
+                true
+            }
+            Err(_) => {
+                self.drop_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref m) = self.shared_metrics {
+                    m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                }
+                false
+            }
+        }
+    }
+
     fn extract_values(
         &self,
         row: &ferrosa_sstable::types::Row,
@@ -617,13 +633,7 @@ impl WriteObserver for TimeSeriesAggregator {
                         window_start_ts: window_start,
                         window_end_ts: boundary_before,
                     };
-                    if self.task_tx.try_send(task.clone()).is_err() {
-                        self.drop_count.fetch_add(1, Ordering::Relaxed);
-                        if let Some(ref m) = self.shared_metrics {
-                            m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else {
-                        self.note_materialization_task_enqueued(&task);
+                    if self.enqueue_materialization_task(&task) {
                         if let Some(ref m) = self.shared_metrics {
                             m.windows_consolidated.fetch_add(1, Ordering::Relaxed);
                         }
@@ -638,13 +648,7 @@ impl WriteObserver for TimeSeriesAggregator {
                         window_start_ts: window_start,
                         late_timestamp: timestamp,
                     };
-                    if self.task_tx.try_send(task.clone()).is_err() {
-                        self.drop_count.fetch_add(1, Ordering::Relaxed);
-                        if let Some(ref m) = self.shared_metrics {
-                            m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else {
-                        self.note_materialization_task_enqueued(&task);
+                    if self.enqueue_materialization_task(&task) {
                         if let Some(ref m) = self.shared_metrics {
                             m.late_arrivals.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1422,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_drop_count_tracks_channel_full() {
+    fn aggregator_drop_count_tracks_disconnected_task_queue() {
         let config = ConsolidationConfig {
             interval: std::time::Duration::from_secs(10),
             functions: vec![super::super::consolidation::ConsolidationFn::Avg],
@@ -1433,8 +1437,8 @@ mod tests {
             ..ConsolidationConfig::default()
         };
 
-        // Channel with capacity 0 -- every send will fail.
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(1);
+        drop(rx);
         let table_id = TableId::new("ks", "sensor_1s");
         let aggregator = TimeSeriesAggregator::new(config, table_id.clone(), vec![0], tx);
 
@@ -1460,8 +1464,93 @@ mod tests {
         aggregator.on_write(&table_id, &make_mutation(1_000_000, 1.0));
         aggregator.on_write(&table_id, &make_mutation(10_000_000, 2.0));
 
-        // The boundary crossing should have tried to send and been dropped.
+        // The boundary crossing should have tried to send and recorded the disconnected worker.
         assert!(aggregator.drop_count() >= 1);
+    }
+
+    #[test]
+    fn aggregator_backpressures_instead_of_dropping_when_task_queue_is_full() {
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "sensor_10s".to_string(),
+            columns: vec!["value".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(1);
+        let table_id = TableId::new("ks", "sensor_1s");
+        let aggregator = std::sync::Arc::new(TimeSeriesAggregator::new(
+            config,
+            table_id.clone(),
+            vec![0],
+            tx,
+        ));
+
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let make_mutation = |ts: i64, val: f64| Mutation {
+            mutation_id: [0x53u8; 16],
+            keyspace: "ks".to_string(),
+            table: "sensor_1s".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
+            rows: vec![Row {
+                clustering: ts.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        };
+
+        aggregator.on_write(&table_id, &make_mutation(1_000_000, 1.0));
+        aggregator.on_write(&table_id, &make_mutation(10_000_000, 2.0));
+        let first = rx.try_recv().expect("first boundary task was enqueued");
+
+        aggregator.on_write(&table_id, &make_mutation(20_000_000, 3.0));
+        let _second = rx.try_recv().expect("second boundary task was enqueued");
+
+        // Fill the channel with one pending task.
+        aggregator.on_write(&table_id, &make_mutation(30_000_000, 4.0));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_aggregator = std::sync::Arc::clone(&aggregator);
+        let worker_table = table_id.clone();
+        let worker_mutation = make_mutation(40_000_000, 5.0);
+        let handle = std::thread::spawn(move || {
+            worker_aggregator.on_write(&worker_table, &worker_mutation);
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "full task queue should backpressure the write instead of dropping the rollup task"
+        );
+
+        assert!(matches!(
+            first,
+            ConsolidationTask::BoundaryCrossed {
+                window_start_ts: 0,
+                ..
+            }
+        ));
+        let _third = rx.recv().expect("draining the queue unblocks sender");
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("blocked write should complete after queue space is available");
+        handle.join().unwrap();
+        let _fourth = rx.recv().expect("blocked write enqueued its task");
+        assert_eq!(
+            aggregator.drop_count(),
+            0,
+            "backpressure must preserve rollup tasks instead of dropping them"
+        );
     }
 
     // --- Task 22: ConsolidationMetrics tests ---

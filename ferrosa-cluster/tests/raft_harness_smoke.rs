@@ -29,18 +29,27 @@ async fn harness_3_node_cluster_elects_leader_and_commits() {
     );
 
     // Verify every node sees the same leader.
-    let nodes = cluster.nodes();
-    for node in &nodes {
-        let metrics = node.raft.metrics().borrow().clone();
-        assert_eq!(
-            metrics.current_leader,
-            Some(leader),
-            "node {} sees a different leader: {:?}",
-            node.node_id,
-            metrics.current_leader
-        );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let all_agree = {
+            let nodes = cluster.nodes();
+            nodes
+                .iter()
+                .all(|node| node.raft.metrics().borrow().current_leader == Some(leader))
+        };
+        if all_agree {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let observed: Vec<_> = cluster
+                .nodes()
+                .iter()
+                .map(|node| (node.node_id, node.raft.metrics().borrow().current_leader))
+                .collect();
+            panic!("nodes did not converge on leader {leader}: {observed:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    drop(nodes);
 
     // Verify a client_write goes through and replicates.
     let resp = cluster

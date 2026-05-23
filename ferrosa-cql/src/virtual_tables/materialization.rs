@@ -180,26 +180,14 @@ impl VirtualTable for MaterializationQueuesTable {
 
     fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
         let mut rows = Vec::new();
-        self.provider.visit_queue_snapshots(&mut |snapshot| {
-            rows.push(VirtualRow {
-                cells: vec![
-                    text(&snapshot.keyspace_name),
-                    text(&snapshot.table_name),
-                    text(&snapshot.target_table),
-                    bigint(snapshot.window_start_ms),
-                    bigint(snapshot.window_end_ms),
-                    text(&snapshot.task_type),
-                    bigint(snapshot.enqueued_at_ms),
-                    bigint(snapshot.oldest_task_age_ms),
-                    bigint(snapshot.queue_depth),
-                    bigint(snapshot.retry_count),
-                    optional_text(snapshot.last_error.as_deref()),
-                    bigint(snapshot.max_delay_ms),
-                    boolean(snapshot.alerting),
-                ],
-            });
-        });
+        self.visit_rows(None, &mut |row| rows.push(row));
         rows
+    }
+
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        self.provider.visit_queue_snapshots(&mut |snapshot| {
+            visit(queue_virtual_row(snapshot));
+        });
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
@@ -240,23 +228,14 @@ impl VirtualTable for MaterializationStatusTable {
 
     fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
         let mut rows = Vec::new();
-        self.provider.visit_status_snapshots(&mut |snapshot| {
-            rows.push(VirtualRow {
-                cells: vec![
-                    text(&snapshot.keyspace_name),
-                    text(&snapshot.table_name),
-                    text(&snapshot.target_table),
-                    text(&snapshot.status),
-                    bigint(snapshot.pending_tasks),
-                    bigint(snapshot.completed_tasks),
-                    bigint(snapshot.failed_tasks),
-                    bigint(snapshot.stale_drops_total),
-                    optional_bigint(snapshot.last_materialized_window_end_ms),
-                    optional_text(snapshot.last_error.as_deref()),
-                ],
-            });
-        });
+        self.visit_rows(None, &mut |row| rows.push(row));
         rows
+    }
+
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        self.provider.visit_status_snapshots(&mut |snapshot| {
+            visit(status_virtual_row(snapshot));
+        });
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
@@ -295,6 +274,43 @@ fn status_columns() -> Vec<VirtualColumnDef> {
         col("last_materialized_window_end_ms", DataType::BigInt),
         col("last_error", DataType::Text),
     ]
+}
+
+fn queue_virtual_row(snapshot: &MaterializationQueueSnapshot) -> VirtualRow {
+    VirtualRow {
+        cells: vec![
+            text(&snapshot.keyspace_name),
+            text(&snapshot.table_name),
+            text(&snapshot.target_table),
+            bigint(snapshot.window_start_ms),
+            bigint(snapshot.window_end_ms),
+            text(&snapshot.task_type),
+            bigint(snapshot.enqueued_at_ms),
+            bigint(snapshot.oldest_task_age_ms),
+            bigint(snapshot.queue_depth),
+            bigint(snapshot.retry_count),
+            optional_text(snapshot.last_error.as_deref()),
+            bigint(snapshot.max_delay_ms),
+            boolean(snapshot.alerting),
+        ],
+    }
+}
+
+fn status_virtual_row(snapshot: &MaterializationStatusSnapshot) -> VirtualRow {
+    VirtualRow {
+        cells: vec![
+            text(&snapshot.keyspace_name),
+            text(&snapshot.table_name),
+            text(&snapshot.target_table),
+            text(&snapshot.status),
+            bigint(snapshot.pending_tasks),
+            bigint(snapshot.completed_tasks),
+            bigint(snapshot.failed_tasks),
+            bigint(snapshot.stale_drops_total),
+            optional_bigint(snapshot.last_materialized_window_end_ms),
+            optional_text(snapshot.last_error.as_deref()),
+        ],
+    }
 }
 
 fn col(name: &str, data_type: DataType) -> VirtualColumnDef {

@@ -16,3 +16,4 @@ bumpalo = { version = "3", features = ["collections"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+wat = "1.248"

@@ -20,6 +20,9 @@
 //! once all components are received.
 
 use std::collections::BTreeMap;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -91,62 +94,66 @@ pub struct FileChunk {
 /// Accumulates file chunks and writes complete SSTable components to disk.
 pub struct SSTableAssembler {
     pub sstable_dir: PathBuf,
-    /// Accumulated chunks per component, keyed by (component_name, offset).
-    chunks: BTreeMap<String, BTreeMap<u64, Vec<u8>>>,
+    /// Component names already written by this receiver.
+    components: BTreeMap<String, PathBuf>,
+    bytes_written: u64,
 }
 
 impl SSTableAssembler {
     pub fn new(sstable_dir: PathBuf) -> Self {
         Self {
             sstable_dir,
-            chunks: BTreeMap::new(),
+            components: BTreeMap::new(),
+            bytes_written: 0,
         }
     }
 
-    /// Add a file chunk to the assembler.
-    pub fn add_chunk(&mut self, chunk: FileChunk) {
-        self.chunks
-            .entry(chunk.component_name)
-            .or_default()
-            .insert(chunk.offset, chunk.data);
-    }
-
-    /// Write all accumulated components to disk.
-    ///
-    /// Returns the paths of all written files.
-    pub fn write_all(&self) -> std::io::Result<Vec<PathBuf>> {
+    /// Write a file chunk directly to its component path at the given offset.
+    pub fn add_chunk(&mut self, chunk: FileChunk) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.sstable_dir)?;
-        let mut paths = Vec::new();
+        let file_path = self.sstable_dir.join(&chunk.component_name);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&file_path)?;
+        write_all_at(&file, &chunk.data, chunk.offset)?;
+        self.bytes_written = self.bytes_written.saturating_add(chunk.data.len() as u64);
+        self.components.insert(chunk.component_name, file_path);
+        Ok(())
+    }
 
-        for (component_name, offset_map) in &self.chunks {
-            let file_path = self.sstable_dir.join(component_name);
-            let mut file_data = Vec::new();
-
-            // Concatenate chunks in offset order.
-            for data in offset_map.values() {
-                file_data.extend_from_slice(data);
-            }
-
-            std::fs::write(&file_path, &file_data)?;
-            paths.push(file_path);
-        }
-
-        Ok(paths)
+    /// Return all component paths written so far.
+    ///
+    pub fn write_all(&self) -> std::io::Result<Vec<PathBuf>> {
+        Ok(self.components.values().cloned().collect())
     }
 
     /// Number of components accumulated so far.
     pub fn component_count(&self) -> usize {
-        self.chunks.len()
+        self.components.len()
     }
 
     /// Total bytes accumulated across all components.
     pub fn total_bytes(&self) -> u64 {
-        self.chunks
-            .values()
-            .flat_map(|m| m.values())
-            .map(|d| d.len() as u64)
-            .sum()
+        self.bytes_written
     }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &std::fs::File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let written = file.write_at(data, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write SSTable chunk",
+            ));
+        }
+        offset += written as u64;
+        data = &data[written..];
+    }
+    Ok(())
 }
 
 /// Read an SSTable component from disk and split it into chunks.
@@ -163,11 +170,17 @@ pub fn read_sstable_component(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    let data = std::fs::read(component_path)?;
     let mut mutations = Vec::new();
     let mut offset = 0u64;
+    let mut file = std::fs::File::open(component_path)?;
+    let mut buffer = vec![0u8; chunk_size.max(1)];
 
-    for chunk in data.chunks(chunk_size) {
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
         mutations.push(encode_file_chunk(
             keyspace,
             table,
@@ -201,21 +214,27 @@ mod tests {
         let mut assembler = SSTableAssembler::new(dir.path().join("sstable-001"));
 
         // Add chunks for two components.
-        assembler.add_chunk(FileChunk {
-            component_name: "Data.db".to_string(),
-            offset: 0,
-            data: vec![0xDE, 0xAD],
-        });
-        assembler.add_chunk(FileChunk {
-            component_name: "Data.db".to_string(),
-            offset: 2,
-            data: vec![0xBE, 0xEF],
-        });
-        assembler.add_chunk(FileChunk {
-            component_name: "Index.db".to_string(),
-            offset: 0,
-            data: vec![0xCA, 0xFE],
-        });
+        assembler
+            .add_chunk(FileChunk {
+                component_name: "Data.db".to_string(),
+                offset: 0,
+                data: vec![0xDE, 0xAD],
+            })
+            .unwrap();
+        assembler
+            .add_chunk(FileChunk {
+                component_name: "Data.db".to_string(),
+                offset: 2,
+                data: vec![0xBE, 0xEF],
+            })
+            .unwrap();
+        assembler
+            .add_chunk(FileChunk {
+                component_name: "Index.db".to_string(),
+                offset: 0,
+                data: vec![0xCA, 0xFE],
+            })
+            .unwrap();
 
         assert_eq!(assembler.component_count(), 2);
         assert_eq!(assembler.total_bytes(), 6);

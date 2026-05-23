@@ -1084,6 +1084,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default())
             .expect("failed to initialize UDF executor"),
     );
+    storage.set_time_series_wasm_aggregate_executor(Arc::new(
+        ferrosa_cql::wasm_aggregate::UdfTimeSeriesAggregateExecutor::new(Arc::clone(&udf_executor)),
+    ));
     let shared_state = Arc::new(ferrosa_cql::router::SharedState {
         engine: storage.clone(),
         schema: schema.clone(),

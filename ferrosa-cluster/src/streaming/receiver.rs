@@ -259,7 +259,8 @@ impl SstableStreamSession {
                 component_name: chunk.component,
                 offset: chunk.offset,
                 data: chunk.data,
-            });
+            })
+            .map_err(|e| ClusterError::Internal(format!("sstable_stream: write chunk: {e}")))?;
 
         Ok(())
     }

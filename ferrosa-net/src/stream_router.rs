@@ -37,9 +37,9 @@ pub enum RouteError {
     /// "consumer gave up" and (if it's the producer side) cancel the
     /// upstream operation.
     ChannelClosed(u32),
-    /// The receiver's buffer is full. The frame is dropped; the
-    /// dispatcher should consider this back-pressure and slow the
-    /// inbound side (or cancel if the consumer is genuinely stuck).
+    /// The receiver's buffer is full. The route has been removed so
+    /// the consumer observes channel close instead of returning a
+    /// partial success after a dropped frame.
     ChannelFull(u32),
 }
 
@@ -71,7 +71,7 @@ impl StreamRouter {
     /// of a bounded mpsc channel with the given `buffer` capacity.
     /// The caller owns the [`mpsc::Receiver`] and is responsible for
     /// draining it; back-pressure on a slow consumer surfaces as
-    /// [`RouteError::ChannelFull`] on the producer side.
+    /// [`RouteError::ChannelFull`] and closes the route.
     ///
     /// If `request_id` is already registered, the prior registration
     /// is replaced and its sender is dropped — the previous consumer
@@ -107,7 +107,10 @@ impl StreamRouter {
                 routes.remove(&request_id);
                 Err(RouteError::ChannelClosed(request_id))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => Err(RouteError::ChannelFull(request_id)),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                routes.remove(&request_id);
+                Err(RouteError::ChannelFull(request_id))
+            }
         }
     }
 
@@ -184,9 +187,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_buffer_returns_channel_full_without_removing_entry() {
+    async fn full_buffer_returns_channel_full_and_closes_route() {
         let router = StreamRouter::new();
-        let _rx = router.register(11, 2);
+        let mut rx = router.register(11, 2);
 
         // Fill the buffer (capacity 2)
         router.route(11, chunk(1)).unwrap();
@@ -196,9 +199,12 @@ mod tests {
         assert_eq!(err, RouteError::ChannelFull(11));
         assert_eq!(
             router.len(),
-            1,
-            "Full does NOT evict — consumer may catch up"
+            0,
+            "Full must close the route so the consumer fails rather than returning partial data"
         );
+        assert_eq!(rx.recv().await, Some(chunk(1)));
+        assert_eq!(rx.recv().await, Some(chunk(2)));
+        assert_eq!(rx.recv().await, None);
     }
 
     #[tokio::test]

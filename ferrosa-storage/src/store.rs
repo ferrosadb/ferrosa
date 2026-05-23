@@ -549,10 +549,11 @@ impl<F: FlushTarget> TableStore<F> {
     /// window_end_ts)`. Missing partitions, empty windows, and rows with
     /// non time-series clustering shapes visit zero rows.
     ///
-    /// Current limitation: this visitor is streaming at the public API
-    /// boundary, but this implementation still reads one partition internally
-    /// before visiting matching rows. Very large partitions need a lower-level
-    /// memtable/SSTable row cursor to avoid that internal materialization.
+    /// SSTable rows are decoded one at a time through [`PartitionIter`]'s
+    /// header/row streaming API. When a partition is present in multiple LSM
+    /// sources, rows are k-way merged by clustering key before the callback sees
+    /// them, preserving `read`'s cell-level LWW semantics without building a
+    /// full merged [`Partition`] or result vector.
     pub fn visit_time_series_window_rows<Cb>(
         &self,
         key: &DecoratedKey,
@@ -567,20 +568,176 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(0);
         }
 
-        let Some(partition) = self.read(key)? else {
+        let guard = self.view.load();
+
+        let mut mem_sources: Vec<Arc<Partition>> = Vec::with_capacity(2);
+        if let Some(partition) = guard.active.get(key)? {
+            mem_sources.push(partition);
+        }
+        if let Some(flushing) = guard.flushing.as_ref() {
+            if let Some(partition) = flushing.get(key)? {
+                mem_sources.push(partition);
+            }
+        }
+
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, F::Reader>> =
+            Vec::with_capacity(guard.sstables.len());
+        for (i, sstable) in guard.sstables.iter().enumerate() {
+            let mut iter = match sstable.partitions_iter() {
+                Ok(iter) => iter,
+                Err(e) => {
+                    let id_info = guard
+                        .sstable_ids
+                        .get(i)
+                        .map(|(id, path)| format!("id={id} path={path:?}"))
+                        .unwrap_or_else(|| format!("index={i}"));
+                    tracing::error!(
+                        %e,
+                        %id_info,
+                        sstable_count = guard.sstables.len(),
+                        key = ?key.key.as_bytes(),
+                        "SSTable iterator error: skipping source for time-series window cursor"
+                    );
+                    self.sstable_read_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+            };
+
+            if iter.seek_to_token(key.token.0).is_err() {
+                continue;
+            }
+            loop {
+                let peeked = match iter.peek_partition_key() {
+                    Ok(Some(peeked)) => peeked,
+                    Ok(None) => break,
+                    Err(e) => {
+                        let id_info = guard
+                            .sstable_ids
+                            .get(i)
+                            .map(|(id, path)| format!("id={id} path={path:?}"))
+                            .unwrap_or_else(|| format!("index={i}"));
+                        tracing::error!(
+                            %e,
+                            %id_info,
+                            key = ?key.key.as_bytes(),
+                            "SSTable peek error: skipping source for time-series window cursor"
+                        );
+                        self.sstable_read_errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                };
+                if peeked == *key {
+                    sst_iters.push(iter);
+                    break;
+                }
+                if peeked > *key {
+                    break;
+                }
+                if iter.skip_to_next_partition().is_err() {
+                    break;
+                }
+            }
+        }
+
+        if mem_sources.is_empty() && sst_iters.is_empty() {
             return Ok(0);
-        };
+        }
+
+        let mut parked_sst_iters = Vec::with_capacity(sst_iters.len());
+        for mut iter in sst_iters {
+            match iter.next_partition_header_only()? {
+                Some((decoded_key, _deletion, _static_row)) if decoded_key == *key => {
+                    parked_sst_iters.push(iter);
+                }
+                Some(_) | None => {}
+            }
+        }
+
+        let mut mem_iters: Vec<_> = mem_sources
+            .iter()
+            .map(|partition| partition.rows.iter())
+            .collect();
+        let mut mem_heads: Vec<Option<&Row>> = mem_iters.iter_mut().map(|it| it.next()).collect();
+        let mut sst_heads: Vec<Option<Row>> = Vec::with_capacity(parked_sst_iters.len());
+        for iter in parked_sst_iters.iter_mut() {
+            sst_heads.push(iter.next_clustered_row()?);
+        }
 
         let mut visited = 0;
-        for row in &partition.rows {
-            let Some(ts) = time_series_row_timestamp(row) else {
+        loop {
+            let mut smallest_clustering: Option<Vec<u8>> = None;
+            for row in mem_heads.iter().flatten() {
+                if smallest_clustering
+                    .as_ref()
+                    .map(|clustering| row.clustering < *clustering)
+                    .unwrap_or(true)
+                {
+                    smallest_clustering = Some(row.clustering.clone());
+                }
+            }
+            for row in sst_heads.iter().flatten() {
+                if smallest_clustering
+                    .as_ref()
+                    .map(|clustering| row.clustering < *clustering)
+                    .unwrap_or(true)
+                {
+                    smallest_clustering = Some(row.clustering.clone());
+                }
+            }
+            let Some(clustering) = smallest_clustering else {
+                break;
+            };
+
+            let mut merged_row: Option<Row> = None;
+            for idx in 0..mem_heads.len() {
+                if mem_heads[idx]
+                    .as_ref()
+                    .map(|row| row.clustering == clustering)
+                    .unwrap_or(false)
+                {
+                    let row = mem_heads[idx].take().expect("checked").clone();
+                    merged_row = match merged_row.take() {
+                        Some(prev) => Some(merge::merge_rows(prev, row)),
+                        None => Some(row),
+                    };
+                    mem_heads[idx] = mem_iters[idx].next();
+                }
+            }
+            for idx in 0..sst_heads.len() {
+                if sst_heads[idx]
+                    .as_ref()
+                    .map(|row| row.clustering == clustering)
+                    .unwrap_or(false)
+                {
+                    let row = sst_heads[idx].take().expect("checked");
+                    merged_row = match merged_row.take() {
+                        Some(prev) => Some(merge::merge_rows(prev, row)),
+                        None => Some(row),
+                    };
+                    sst_heads[idx] = parked_sst_iters[idx].next_clustered_row()?;
+                }
+            }
+
+            let mut row = merged_row.expect("at least one source matched clustering");
+            if !row.deletion.is_live() {
+                let row_delete_at = row.deletion.marked_for_delete_at;
+                row.cells
+                    .retain(|(_col, cell)| cell.timestamp >= row_delete_at);
+                if row.cells.is_empty() {
+                    continue;
+                }
+            }
+            let Some(ts) = time_series_row_timestamp(&row) else {
                 continue;
             };
             if ts >= window_start_ts && ts < window_end_ts {
-                cb(row)?;
+                cb(&row)?;
                 visited += 1;
             }
         }
+
         Ok(visited)
     }
 

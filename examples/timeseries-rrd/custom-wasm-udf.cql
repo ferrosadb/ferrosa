@@ -5,23 +5,24 @@
 -- a stddev UDF so min/max/avg come from built-ins while volatility comes from
 -- a deployed WASM component.
 --
--- Status: WASM function DDL and artifact loading are implemented, but WASM
--- aggregate execution is not enabled for live materialization yet. The runnable
--- sensor demo uses the built-in streaming stddev function until the streaming
--- WASM aggregate ABI lands.
+-- Status: WASM function DDL, artifact loading, and streaming aggregate
+-- execution are implemented. The runnable sensor demo still uses the built-in
+-- streaming stddev function so it runs without an external WASM artifact.
+-- Rust-authored examples live under wasm-rust/stddev and wasm-rust/rms.
 
 USE plant;
 
--- Inline hex loading form. Replace these tiny placeholder bytes with the
--- compiled Component Model module that exports stddev(values: list<double>).
-CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
+-- Inline hex loading form. Replace these tiny placeholder bytes with a
+-- compiled Component Model module that carries the
+-- ferrosa:streaming-aggregate:v1 marker and exports init/update/finalize.
+CREATE OR REPLACE FUNCTION plant.stddev(value double)
   CALLED ON NULL INPUT
   RETURNS double
   LANGUAGE wasm
   AS '0x0061736d0d000100';
 
 -- Admin-only file loading form for pre-approved local artifacts.
-CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
+CREATE OR REPLACE FUNCTION plant.stddev(value double)
   CALLED ON NULL INPUT
   RETURNS double
   LANGUAGE wasm
@@ -29,18 +30,16 @@ CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
 
 -- Admin-only URL loading form. Ferrosa verifies the fetched bytes against the
 -- required SHA-256 digest before storing the function metadata.
-CREATE OR REPLACE FUNCTION plant.stddev(values list<double>)
+CREATE OR REPLACE FUNCTION plant.stddev(value double)
   CALLED ON NULL INPUT
   RETURNS double
   LANGUAGE wasm
   AS URL 'https://artifacts.example/ferrosa/stddev.wasm'
   WITH SHA256 = '3dbe4f6fb3f44dfb11ad93f6c07f81a4b34d217f8dcf7dd06d80670d88e6b7c1';
 
--- Future table syntax will reference the UDF through the
--- wasm:keyspace.function_name consolidation function syntax. Current releases
--- reject this CREATE TABLE with a clear "streaming WASM aggregate ABI" error
--- because live RRD materialization cannot execute list-style WASM aggregates
--- without materializing the whole window.
+-- RRD table syntax references the UDF through the wasm:keyspace.function_name
+-- consolidation function syntax. The RRD worker streams window rows through
+-- init/update/finalize.
 CREATE TABLE vibration_with_wasm_stddev (
     sensor_id uuid,
     ts timestamp,
@@ -54,15 +53,29 @@ CREATE TABLE vibration_with_wasm_stddev (
     'consolidation.columns': 'vibration_mm_s'
   };
 
--- Once the streaming ABI exists, output table vibration_with_wasm_stddev_5m
--- will have columns:
+-- Output table vibration_with_wasm_stddev_5m will have columns:
 --   vibration_mm_s_min       double   (built-in min)
 --   vibration_mm_s_max       double   (built-in max)
 --   vibration_mm_s_avg       double   (built-in avg)
 --   vibration_mm_s_stddev    double   (from WASM UDF)
 
--- Sketch of the exported function:
+-- The complete Rust examples live in wasm-rust/stddev and wasm-rust/rms.
+-- Sketch of the stddev guest logic exported through the Component Model:
 --
---   export fn stddev(values: list<float64>) -> float64 {
---       // Population standard deviation over the values in a rollup window.
+--   struct Stddev { count: f64, mean: f64, m2: f64 }
+--
+--   export fn init() {
+--       STATE = Stddev { count: 0.0, mean: 0.0, m2: 0.0 };
+--   }
+--
+--   export fn update(value: f64) {
+--       STATE.count += 1.0;
+--       let delta = value - STATE.mean;
+--       STATE.mean += delta / STATE.count;
+--       let delta2 = value - STATE.mean;
+--       STATE.m2 += delta * delta2;
+--   }
+--
+--   export fn finalize() -> f64 {
+--       (STATE.m2 / STATE.count).sqrt()
 --   }

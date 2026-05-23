@@ -17,7 +17,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
-use ferrosa_common::Result;
+use ferrosa_common::{Error, Result};
 use ferrosa_sstable::reader::{PartitionIter, SSTableReader};
 use ferrosa_sstable::types::Partition;
 use ferrosa_sstable::ReadAt;
@@ -219,14 +219,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 }
                 match self.sstables[self.cursor].partitions_iter() {
                     Ok(it) => self.current = Some(it),
-                    Err(e) => {
-                        tracing::warn!(
-                            cursor = self.cursor,
-                            "SsTableRunIter: skip open failed, skipping table: {e}"
-                        );
-                        self.cursor += 1;
-                        continue;
-                    }
+                    Err(e) => return Err(e),
                 }
             }
             let it = self.current.as_mut().expect("just initialised");
@@ -256,14 +249,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 }
                 match self.sstables[self.cursor].partitions_iter() {
                     Ok(it) => self.current = Some(it),
-                    Err(e) => {
-                        tracing::warn!(
-                            cursor = self.cursor,
-                            "SsTableRunIter: open failed, skipping table: {e}"
-                        );
-                        self.cursor += 1;
-                        continue;
-                    }
+                    Err(e) => return Err(e),
                 }
             }
             let it = self.current.as_mut().expect("just initialised");
@@ -273,14 +259,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                     self.current = None;
                     self.cursor += 1;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        cursor = self.cursor,
-                        "SsTableRunIter: peek failed, dropping rest of table: {e}"
-                    );
-                    self.current = None;
-                    self.cursor += 1;
-                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -293,14 +272,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 }
                 match self.sstables[self.cursor].partitions_iter() {
                     Ok(it) => self.current = Some(it),
-                    Err(e) => {
-                        tracing::warn!(
-                            cursor = self.cursor,
-                            "SsTableRunIter: open failed, skipping table: {e}"
-                        );
-                        self.cursor += 1;
-                        continue;
-                    }
+                    Err(e) => return Err(e),
                 }
             }
             let it = self.current.as_mut().expect("just initialised");
@@ -316,14 +288,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                     self.current = None;
                     self.cursor += 1;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        cursor = self.cursor,
-                        "SsTableRunIter: read failed, dropping rest of table: {e}"
-                    );
-                    self.current = None;
-                    self.cursor += 1;
-                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -422,14 +387,14 @@ pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
-    Ok(build_merger_with_runs(
+    build_merger_with_runs(
         active_iter,
         flushing_iter,
         sstables,
         RunMode::Full,
         start,
         end,
-    ))
+    )
 }
 
 /// Projection variant: SSTables decode only the cells whose
@@ -447,14 +412,14 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
-    Ok(build_merger_with_runs(
+    build_merger_with_runs(
         active_iter,
         flushing_iter,
         sstables,
         RunMode::Projected(wanted),
         start,
         end,
-    ))
+    )
 }
 
 /// Metadata-only variant: SSTables use `next_partition_metadata`
@@ -471,14 +436,14 @@ pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
-    Ok(build_merger_with_runs(
+    build_merger_with_runs(
         active_iter,
         flushing_iter,
         sstables,
         RunMode::Metadata,
         start,
         end,
-    ))
+    )
 }
 
 /// Shared back-end for the three `merger_for_*_sources` constructors:
@@ -495,7 +460,7 @@ fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     mode: RunMode<'a>,
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
-) -> RangeMerger<'a, R> {
+) -> Result<RangeMerger<'a, R>> {
     // We can't actually keep the runs as `Vec<Vec<Arc<...>>>` because
     // SsTableRunIter borrows from a slice (`&'a [Arc<...>]`), and a
     // freshly allocated Vec<Arc<...>> wouldn't have the same lifetime
@@ -555,9 +520,9 @@ fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
             peeked_key: None,
         });
     }
-    let mut merger = RangeMerger::new(sources, start, end);
+    let mut merger = RangeMerger::new(sources, start, end)?;
     merger.runs_arena = Some(runs_ptr);
-    merger
+    Ok(merger)
 }
 
 /// Heap entry: one peeked KEY per still-active source. The heap is
@@ -646,7 +611,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         sources: Vec<MergeSource<'a, R>>,
         start: Option<DecoratedKey>,
         end: Option<DecoratedKey>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut merger = Self {
             sources,
             heap: BinaryHeap::new(),
@@ -659,9 +624,9 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         // We need a Vec of indices to avoid double-borrowing `merger.sources`.
         let n = merger.sources.len();
         for src in 0..n {
-            merger.refill_source(src);
+            merger.refill_source(src)?;
         }
-        merger
+        Ok(merger)
     }
 
     /// Peek the next key from `src`, skipping entries below `start`,
@@ -669,27 +634,28 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
     /// here — only the cheap header read is performed. If `peek_key`
     /// returns a key below `start`, we pop it (consuming the body to
     /// advance the source) and try again.
-    fn refill_source(&mut self, src: usize) {
+    fn refill_source(&mut self, src: usize) -> Result<()> {
         loop {
-            let peeked = match self.sources[src].peek_key() {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!(src, "range_merger: source peek error, dropping source: {e}");
-                    return;
-                }
-            };
+            let peeked = self.sources[src].peek_key()?;
             let key = match peeked {
                 Some(k) => k,
-                None => return,
+                None => return Ok(()),
             };
             if let Some(ref s) = self.start {
                 if key < *s {
-                    let _ = self.sources[src].pop_partition();
+                    match self.sources[src].pop_partition()? {
+                        Some(_) => {}
+                        None => {
+                            return Err(Error::InvalidFormat(
+                                "range_merger: source ended after a successful peek while skipping start-bound partition".into(),
+                            ));
+                        }
+                    }
                     continue;
                 }
             }
             self.heap.push(HeapEntry { key, src });
-            return;
+            return Ok(());
         }
     }
 
@@ -718,7 +684,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         let first_partition = match self.sources[first_src].pop_partition() {
             Ok(Some(p)) => p,
             Ok(None) => {
-                self.refill_source(first_src);
+                self.refill_source(first_src)?;
                 return self.next_merged_partition();
             }
             Err(e) => return Err(e),
@@ -743,7 +709,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         }
 
         for src in popped_srcs {
-            self.refill_source(src);
+            self.refill_source(src)?;
         }
 
         let mut merged = if group.len() == 1 {
@@ -757,10 +723,96 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
 }
 #[cfg(test)]
 mod tests {
-    use super::group_disjoint_runs;
+    use std::sync::Arc;
+
+    use super::{group_disjoint_runs, merger_for_sources};
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
     fn b(s: &[u8]) -> Vec<u8> {
         s.to_vec()
+    }
+
+    fn test_header() -> SerializationHeader {
+        SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        }
+    }
+
+    fn test_partition(key: &[u8], clustering: i32, value: &[u8]) -> Partition {
+        Partition {
+            key: DecoratedKey::new(PartitionKey::from(key)),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: clustering.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(value.to_vec(), 1_000_042))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_042),
+            }],
+        }
+    }
+
+    fn reader_from_partitions(partitions: &[Partition]) -> SSTableReader<Vec<u8>> {
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                verify_output: false,
+                ..WriteOptions::default()
+            },
+            test_header(),
+        );
+        for partition in partitions {
+            writer.add_partition(partition).unwrap();
+        }
+        let output = writer.finish().unwrap();
+        SSTableReader::open(SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })
+        .unwrap()
+    }
+
+    fn reader_with_truncated_tail(partitions: &[Partition]) -> SSTableReader<Vec<u8>> {
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                verify_output: false,
+                ..WriteOptions::default()
+            },
+            test_header(),
+        );
+        for partition in partitions {
+            writer.add_partition(partition).unwrap();
+        }
+        let mut output = writer.finish().unwrap();
+        output.data.truncate(output.data.len() - 1);
+        SSTableReader::open(SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })
+        .unwrap()
     }
 
     /// Token-disjoint SSTables in input order collapse into a
@@ -872,5 +924,30 @@ mod tests {
                 "run not sorted: {prev_smallest:?} > {next_smallest:?}",
             );
         }
+    }
+
+    #[test]
+    fn range_merger_propagates_truncated_sstable_tail_error() {
+        let first = test_partition(b"pk1", 1, b"first");
+        let second = test_partition(b"pk2", 1, b"second");
+        let good_reader = reader_from_partitions(std::slice::from_ref(&first));
+        let corrupt_reader = reader_with_truncated_tail(&[first, second]);
+        let sstables = vec![Arc::new(good_reader), Arc::new(corrupt_reader)];
+        let mut merger =
+            merger_for_sources(Box::new(std::iter::empty()), None, &sstables, None, None).unwrap();
+
+        assert!(
+            merger.next_merged_partition().unwrap().is_some(),
+            "first partition should still be readable"
+        );
+        let err = merger
+            .next_merged_partition()
+            .expect_err("corrupt SSTable tail must fail the range scan");
+        assert!(
+            err.to_string().contains("read_exact_at")
+                || err.to_string().contains("unexpected EOF")
+                || err.to_string().contains("UnexpectedEof"),
+            "error should identify the SSTable read failure, got: {err}"
+        );
     }
 }

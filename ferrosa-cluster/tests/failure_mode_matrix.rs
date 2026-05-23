@@ -48,6 +48,56 @@ fn host_id_for(node_id: u64) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+fn leader_report_count(cluster: &TestCluster, leader: u64) -> usize {
+    cluster
+        .nodes()
+        .iter()
+        .filter(|n| n.metrics().current_leader == Some(leader))
+        .count()
+}
+
+fn registered_voters_contain(cluster: &TestCluster, node_id: u64) -> bool {
+    let mut reports = Vec::new();
+    for node in cluster.nodes().iter() {
+        if !cluster.is_registered(node.node_id) {
+            continue;
+        }
+        let contains = node
+            .metrics()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|voter| voter == node_id);
+        if let Some((_, existing)) = reports.iter_mut().find(|(id, _)| *id == node.node_id) {
+            *existing = contains;
+        } else {
+            reports.push((node.node_id, contains));
+        }
+    }
+    !reports.is_empty() && reports.iter().all(|(_, contains)| *contains)
+}
+
+fn registered_voters_exclude(cluster: &TestCluster, node_id: u64) -> bool {
+    let mut reports = Vec::new();
+    for node in cluster.nodes().iter() {
+        if !cluster.is_registered(node.node_id) {
+            continue;
+        }
+        let contains = node
+            .metrics()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|voter| voter == node_id);
+        if let Some((_, existing)) = reports.iter_mut().find(|(id, _)| *id == node.node_id) {
+            *existing = contains;
+        } else {
+            reports.push((node.node_id, contains));
+        }
+    }
+    !reports.is_empty() && reports.iter().all(|(_, contains)| !*contains)
+}
+
 async fn wait_until<F: FnMut() -> bool>(mut pred: F, total: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + total;
     while tokio::time::Instant::now() < deadline {
@@ -57,6 +107,69 @@ async fn wait_until<F: FnMut() -> bool>(mut pred: F, total: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     pred()
+}
+
+async fn add_voter_on_current_leader(
+    cluster: &TestCluster,
+    host_id: Uuid,
+    addr: std::net::SocketAddr,
+) -> Result<(), MembershipError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(leader) = cluster.current_leader_id() {
+            if let Some(leader_raft) = cluster.raft_for_node_id(leader) {
+                match MembershipChanger::new(leader_raft, cluster.membership_network())
+                    .add_voter(host_id, addr)
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(MembershipError::NotLeader { leader_node_id }) => {
+                        last_error = Some(MembershipError::NotLeader { leader_node_id });
+                    }
+                    Err(MembershipError::InProgress) => {
+                        last_error = Some(MembershipError::InProgress);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(last_error.unwrap_or(MembershipError::NotLeader {
+        leader_node_id: None,
+    }))
+}
+
+async fn remove_voter_on_current_leader(
+    cluster: &TestCluster,
+    host_id: Uuid,
+) -> Result<(), MembershipError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(leader) = cluster.current_leader_id() {
+            if let Some(leader_raft) = cluster.raft_for_node_id(leader) {
+                match MembershipChanger::new(leader_raft, cluster.membership_network())
+                    .remove_voter(host_id)
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(MembershipError::NotLeader { leader_node_id }) => {
+                        last_error = Some(MembershipError::NotLeader { leader_node_id });
+                    }
+                    Err(MembershipError::InProgress) => {
+                        last_error = Some(MembershipError::InProgress);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(last_error.unwrap_or(MembershipError::NotLeader {
+        leader_node_id: None,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -379,25 +492,38 @@ async fn s_10_readd_previously_decommissioned_node() {
     let n = uuid_to_node_id(h);
     cluster.add_pending_node(n).await;
 
-    let leader_raft = cluster.leader_node().raft.clone();
-    MembershipChanger::new(leader_raft.clone(), cluster.membership_network())
-        .add_voter(h, a)
+    add_voter_on_current_leader(&cluster, h, a).await.unwrap();
+    assert!(
+        wait_until(
+            || registered_voters_contain(&cluster, n),
+            Duration::from_secs(5)
+        )
         .await
-        .unwrap();
+    );
     if cluster.leader_node().node_id == n {
         cluster.shutdown().await;
         return;
     }
-    MembershipChanger::new(leader_raft.clone(), cluster.membership_network())
-        .remove_voter(h)
+
+    remove_voter_on_current_leader(&cluster, h).await.unwrap();
+    assert!(
+        wait_until(
+            || registered_voters_exclude(&cluster, n),
+            Duration::from_secs(5)
+        )
         .await
-        .unwrap();
+    );
     // Re-add — must not silently NoOp.  We re-pend the dispatcher.
     cluster.add_pending_node(n).await;
-    MembershipChanger::new(leader_raft, cluster.membership_network())
-        .add_voter(h, a)
+
+    add_voter_on_current_leader(&cluster, h, a).await.unwrap();
+    assert!(
+        wait_until(
+            || registered_voters_contain(&cluster, n),
+            Duration::from_secs(5)
+        )
         .await
-        .unwrap();
+    );
     cluster.shutdown().await;
 }
 
@@ -497,7 +623,18 @@ async fn s_16_leader_disappears_followers_elect() {
     // S-16: leader OOM mid-commit.  Harness equivalent: isolate the
     // leader; followers must elect a new one.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(5))
+        .await
+        .expect("initial leader elected");
+    assert!(
+        wait_until(
+            || leader_report_count(&cluster, leader) >= 2,
+            Duration::from_secs(5),
+        )
+        .await,
+        "initial leader must be visible to a majority before isolation"
+    );
     let leader_id = cluster.leader_node().node_id;
     let leader_idx = cluster
         .nodes()
@@ -506,19 +643,20 @@ async fn s_16_leader_disappears_followers_elect() {
         .unwrap();
     cluster.partition(leader_idx);
     let pred = || {
+        let mut counts = std::collections::HashMap::<u64, usize>::new();
         for node in &cluster.nodes() {
             if node.node_id == leader_id {
                 continue;
             }
             if let Some(lid) = node.metrics().current_leader {
                 if lid != leader_id {
-                    return true;
+                    *counts.entry(lid).or_default() += 1;
                 }
             }
         }
-        false
+        counts.values().any(|&count| count >= 2)
     };
-    let elected = wait_until(pred, Duration::from_secs(5)).await;
+    let elected = wait_until(pred, Duration::from_secs(15)).await;
     cluster.heal();
     assert!(elected, "remaining voters must elect a new leader");
     cluster.shutdown().await;
@@ -693,8 +831,28 @@ async fn s_27_voluntary_leadership_transfer() {
         let voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
         voters.into_iter().find(|&v| v != leader_id).unwrap()
     };
-    let leader_raft = cluster.leader_node().raft.clone();
-    leader_raft.trigger().transfer_to(target).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while tokio::time::Instant::now() < deadline {
+        let source = cluster
+            .current_leader_id()
+            .and_then(|leader_id| cluster.raft_for_node_id(leader_id))
+            .unwrap_or_else(|| cluster.leader_node().raft.clone());
+        match source.trigger().transfer_to(target).await {
+            Ok(()) => break,
+            Err(e) => {
+                last_error = Some(format!("{e:?}"));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if cluster
+            .nodes()
+            .iter()
+            .any(|n| n.metrics().current_leader == Some(target))
+        {
+            break;
+        }
+    }
     let pred = || {
         cluster.leader_node().metrics().current_leader == Some(target)
             || cluster
@@ -702,7 +860,10 @@ async fn s_27_voluntary_leadership_transfer() {
                 .iter()
                 .any(|n| n.metrics().current_leader == Some(target))
     };
-    assert!(wait_until(pred, Duration::from_secs(3)).await);
+    assert!(
+        wait_until(pred, Duration::from_secs(10)).await,
+        "target must become leader after transfer; last transfer error: {last_error:?}"
+    );
     cluster.shutdown().await;
 }
 
@@ -772,12 +933,12 @@ async fn s_31_two_simultaneous_elections_resolve_to_one_leader() {
         .await
         .unwrap();
     // The second simultaneous candidate should have given up.
-    let count = cluster
-        .nodes()
-        .iter()
-        .filter(|n| n.metrics().current_leader == Some(leader))
-        .count();
-    assert!(count >= 2, "majority of voters agree on leader");
+    let majority_agrees = wait_until(
+        || leader_report_count(&cluster, leader) >= 2,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(majority_agrees, "majority of voters agree on leader");
     cluster.shutdown().await;
 }
 

@@ -41,3 +41,4 @@ pub mod transaction_keys;
 pub mod transaction_limits;
 pub mod types;
 pub mod virtual_tables;
+pub mod wasm_aggregate;

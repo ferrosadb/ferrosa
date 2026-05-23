@@ -17,7 +17,7 @@ callback-shaped provider, but the global virtual table path still materializes
 ## Acceptance Criteria
 
 - [x] Live queue/status providers read storage-backed metrics/descriptors.
-- [ ] CQL virtual table reads are paged or streamed so queue observability is
+- [x] CQL virtual table reads are paged or streamed so queue observability is
   bounded.
 - [x] DELTA subscriptions can observe virtual table changes without retaining
   unbounded previous snapshots.
@@ -31,7 +31,10 @@ callback-shaped provider, but the global virtual table path still materializes
   queue depth, oldest task age, max delay, alerting state, pending/completed
   counters, and stale drops.
 - Subscription row-diff coverage includes materialization virtual-table rows.
-- Current limitation: the provider is callback-shaped, but the
-  `VirtualTable::read` trait still returns `Vec<VirtualRow>`. This is bounded
-  by active consolidator count today, not by queued task count, but the generic
-  CQL virtual-table boundary is not paged/streamed yet.
+- Added `VirtualTable::visit_rows` as the streaming virtual-table boundary.
+  Existing tables keep the default `read` adapter, while
+  `materialization_queues` and `materialization_status` override it to emit one
+  row at a time from the storage-backed provider.
+- The CQL router now encodes virtual table rows through `visit_rows` and patches
+  the protocol row count after streaming, avoiding `Vec<VirtualRow>` and
+  `Vec<Vec<CqlValue>>` materialization on the virtual-table path.

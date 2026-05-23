@@ -12,7 +12,7 @@ use ferrosa_storage::timeseries::{
 };
 use ferrosa_storage::{
     CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
-    TableId,
+    TableId, TimeSeriesWasmAggregateExecutor, TimeSeriesWasmAggregateInvocation,
 };
 
 fn target() -> MaterializationTarget {
@@ -224,6 +224,19 @@ fn sensor_10s_schema() -> TableSchema {
     rollup_schema("sensor_10s", &["value_avg"], HashMap::new())
 }
 
+fn sensor_10s_wasm_stddev_schema() -> TableSchema {
+    rollup_schema("sensor_10s", &["value_stddev"], HashMap::new())
+}
+
+fn wasm_stddev_consolidation_schema() -> TableSchema {
+    let mut schema = live_consolidation_schema();
+    schema.extensions.insert(
+        "consolidation.functions".to_string(),
+        "wasm:ks.stddev".to_string(),
+    );
+    schema
+}
+
 fn sensor_10s_cascade_schema() -> TableSchema {
     rollup_schema(
         "sensor_10s",
@@ -278,11 +291,27 @@ fn key(bytes: &[u8]) -> DecoratedKey {
 }
 
 fn sensor_row(ts: i64, value: f64) -> Row {
+    sensor_row_with_cell_timestamp(ts, value, ts)
+}
+
+fn sensor_row_with_cell_timestamp(ts: i64, value: f64, cell_timestamp: i64) -> Row {
     Row {
         clustering: ts.to_be_bytes().to_vec(),
-        cells: vec![(0, CellValue::live(value.to_be_bytes().to_vec(), ts))],
+        cells: vec![(
+            0,
+            CellValue::live(value.to_be_bytes().to_vec(), cell_timestamp),
+        )],
         deletion: DeletionTime::LIVE,
-        primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        primary_key_liveness: LivenessInfo::with_timestamp(cell_timestamp),
+    }
+}
+
+fn deleted_sensor_row(ts: i64, delete_timestamp: i64) -> Row {
+    Row {
+        clustering: ts.to_be_bytes().to_vec(),
+        cells: vec![],
+        deletion: DeletionTime::new(delete_timestamp, 0),
+        primary_key_liveness: LivenessInfo::with_timestamp(delete_timestamp),
     }
 }
 
@@ -296,6 +325,47 @@ fn read_first_value(engine: &StorageEngine, table_id: &TableId, key: &DecoratedK
         .read(table_id, key)
         .unwrap()
         .and_then(|partition| partition.rows.first().map(row_double))
+}
+
+struct RustStddevExecutor;
+
+struct RustStddevInvocation {
+    count: f64,
+    mean: f64,
+    m2: f64,
+}
+
+impl TimeSeriesWasmAggregateExecutor for RustStddevExecutor {
+    fn start(
+        &self,
+        keyspace: &str,
+        function_name: &str,
+        arg_type: &str,
+    ) -> Result<Box<dyn TimeSeriesWasmAggregateInvocation>, String> {
+        assert_eq!(keyspace, "ks");
+        assert_eq!(function_name, "stddev");
+        assert_eq!(arg_type, "double");
+        Ok(Box::new(RustStddevInvocation {
+            count: 0.0,
+            mean: 0.0,
+            m2: 0.0,
+        }))
+    }
+}
+
+impl TimeSeriesWasmAggregateInvocation for RustStddevInvocation {
+    fn update(&mut self, value: f64) -> Result<(), String> {
+        self.count += 1.0;
+        let delta = value - self.mean;
+        self.mean += delta / self.count;
+        let delta2 = value - self.mean;
+        self.m2 += delta * delta2;
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> Result<f64, String> {
+        Ok((self.m2 / self.count).sqrt())
+    }
 }
 
 #[test]
@@ -334,6 +404,39 @@ fn keyed_time_series_window_cursor_streams_rows_without_returning_partitions() {
 
     assert_eq!(visited, 2);
     assert_eq!(values, vec![2.0, 3.0]);
+}
+
+#[test]
+fn keyed_time_series_window_cursor_merges_duplicate_rows_across_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let table_id = TableId::new("ks", "sensor");
+    let sensor = key(b"sensor-1");
+    engine.register_table(timeseries_schema()).unwrap();
+
+    engine
+        .write(&table_id, &sensor, sensor_row(5, 2.0), 5)
+        .unwrap();
+    engine.flush(&table_id).unwrap();
+    engine
+        .write(
+            &table_id,
+            &sensor,
+            sensor_row_with_cell_timestamp(5, 7.0, 50),
+            50,
+        )
+        .unwrap();
+
+    let mut values = Vec::new();
+    let visited = engine
+        .visit_time_series_window_rows(&table_id, &sensor, 0, 10, |row| {
+            values.push(row_double(row));
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(visited, 1);
+    assert_eq!(values, vec![7.0]);
 }
 
 #[test]
@@ -493,6 +596,100 @@ fn materialization_drain_writes_queryable_rollup_rows() {
 }
 
 #[test]
+fn materialization_drain_streams_values_into_wasm_stddev_rollup() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let source_table = TableId::new("ks", "sensor");
+    let target_table = TableId::new("ks", "sensor_10s");
+    let sensor = key(b"sensor-1");
+    engine.set_time_series_wasm_aggregate_executor(Arc::new(RustStddevExecutor));
+    engine
+        .register_table(sensor_10s_wasm_stddev_schema())
+        .unwrap();
+    engine
+        .register_table(wasm_stddev_consolidation_schema())
+        .unwrap();
+
+    for (ts, value) in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+        .into_iter()
+        .enumerate()
+    {
+        engine
+            .write(
+                &source_table,
+                &sensor,
+                sensor_row(ts as i64 * 1_000_000, value),
+                ts as i64 * 1_000_000,
+            )
+            .unwrap();
+    }
+    engine
+        .write(
+            &source_table,
+            &sensor,
+            sensor_row(10_000_000, 11.0),
+            10_000_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .process_pending_time_series_materializations(8)
+            .unwrap(),
+        1
+    );
+    let value = read_first_value(&engine, &target_table, &sensor).unwrap();
+    assert!((value - 2.0).abs() < 1e-10);
+}
+
+#[test]
+fn rrd_materialization_failure_is_visible_in_status_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let source_table = TableId::new("ks", "sensor");
+    let sensor = key(b"sensor-1");
+    engine
+        .register_table(sensor_10s_wasm_stddev_schema())
+        .unwrap();
+    engine
+        .register_table(wasm_stddev_consolidation_schema())
+        .unwrap();
+
+    engine
+        .write(&source_table, &sensor, sensor_row(0, 2.0), 0)
+        .unwrap();
+    engine
+        .write(
+            &source_table,
+            &sensor,
+            sensor_row(10_000_000, 4.0),
+            10_000_000,
+        )
+        .unwrap();
+
+    let err = engine
+        .process_one_time_series_materialization(&source_table)
+        .expect_err("missing WASM aggregate executor must fail materialization");
+    assert!(
+        err.to_string().contains("requires WASM aggregate executor"),
+        "unexpected materialization error: {err}"
+    );
+
+    let mut statuses = Vec::new();
+    engine.visit_time_series_materialization_statuses(&mut |snapshot| statuses.push(snapshot));
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].status, "failed");
+    assert_eq!(statuses[0].failed_tasks, 1);
+    assert!(
+        statuses[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("requires WASM aggregate executor")),
+        "failed RRD worker state must expose the last materialization error: {statuses:?}"
+    );
+}
+
+#[test]
 fn materialization_drain_recomputes_from_storage_when_ring_window_is_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let engine = make_engine(dir.path());
@@ -525,6 +722,49 @@ fn materialization_drain_recomputes_from_storage_when_ring_window_is_incomplete(
     assert!(
         (value - 4.5).abs() < f64::EPSILON,
         "materialization must not use a partial in-memory ring as the full source of truth"
+    );
+}
+
+#[test]
+fn materialization_drain_excludes_row_deleted_source_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = make_engine(dir.path());
+    let source_table = TableId::new("ks", "sensor");
+    let target_table = TableId::new("ks", "sensor_10s");
+    let sensor = key(b"sensor-1");
+    engine.register_table(sensor_10s_schema()).unwrap();
+    engine.register_table(live_consolidation_schema()).unwrap();
+
+    engine
+        .write(&source_table, &sensor, sensor_row(0, 10.0), 0)
+        .unwrap();
+    engine
+        .write(
+            &source_table,
+            &sensor,
+            deleted_sensor_row(0, 5_000_000),
+            5_000_000,
+        )
+        .unwrap();
+    engine
+        .write(
+            &source_table,
+            &sensor,
+            sensor_row(10_000_000, 20.0),
+            10_000_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .process_pending_time_series_materializations(8)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        read_first_value(&engine, &target_table, &sensor),
+        None,
+        "RRD materialization must not aggregate values suppressed by a row tombstone"
     );
 }
 

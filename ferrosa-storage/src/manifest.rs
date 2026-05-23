@@ -63,7 +63,7 @@ pub struct Manifest {
 }
 
 /// Metadata for a single SSTable in the manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub id: String,
     pub size: u64,

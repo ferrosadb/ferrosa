@@ -37,10 +37,10 @@ use crate::flush::FileFlushTarget;
 use crate::store::TableStore;
 use crate::timeseries::aggregator::decode_typed_numeric;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
-use crate::timeseries::consolidation::{emit_accumulated_streaming_results, Accumulator};
+use crate::timeseries::consolidation::Accumulator;
 use crate::timeseries::{
-    ConsolidationMetrics, ConsolidationTask, LateWindowClassification, MaterializationTarget,
-    MaterializedRollup, TimeSeriesAggregator, TimeSeriesRuntimeSettings,
+    ConsolidationFn, ConsolidationMetrics, ConsolidationTask, LateWindowClassification,
+    MaterializationTarget, MaterializedRollup, TimeSeriesAggregator, TimeSeriesRuntimeSettings,
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
@@ -73,6 +73,37 @@ pub struct TimeSeriesMaterializationStatusSnapshot {
     pub stale_drops_total: i64,
     pub last_materialized_window_end_ms: Option<i64>,
     pub last_error: Option<String>,
+}
+
+struct PendingUploadReplayFinalize {
+    store: Arc<dyn object_store::ObjectStore>,
+    prefix: String,
+    pending_log_path: PathBuf,
+    table_id: String,
+    sstable_id: String,
+    total_size: u64,
+    compaction: Option<crate::upload::pending_log::PendingCompactionUpload>,
+    cas_supported: bool,
+}
+
+/// Host hook used by RRD materialization to run custom WASM aggregate rollups.
+///
+/// `ferrosa-storage` owns the streaming materialization loop but intentionally
+/// does not depend on the WASM executor crate. The CQL/runtime layer injects an
+/// implementation that starts a bounded aggregate invocation, then receives one
+/// numeric sample per source row through [`TimeSeriesWasmAggregateInvocation`].
+pub trait TimeSeriesWasmAggregateExecutor: Send + Sync {
+    fn start(
+        &self,
+        keyspace: &str,
+        function_name: &str,
+        arg_type: &str,
+    ) -> Result<Box<dyn TimeSeriesWasmAggregateInvocation>, String>;
+}
+
+pub trait TimeSeriesWasmAggregateInvocation: Send {
+    fn update(&mut self, value: f64) -> Result<(), String>;
+    fn finalize(self: Box<Self>) -> Result<f64, String>;
 }
 
 /// Configuration for NVMe pin mode on a table.
@@ -497,6 +528,7 @@ pub struct StorageEngine {
     async_observers: RwLock<Vec<AsyncObserverState>>,
     time_series_consolidators: RwLock<HashMap<TableId, TimeSeriesConsolidatorHandle>>,
     time_series_runtime_settings: Arc<TimeSeriesRuntimeSettings>,
+    time_series_wasm_aggregates: RwLock<Option<Arc<dyn TimeSeriesWasmAggregateExecutor>>>,
     /// Default channel capacity for async observers.
     async_observer_capacity: usize,
     /// Index build scheduler — rebuilds secondary indexes after compaction.
@@ -590,6 +622,22 @@ struct TimeSeriesConsolidatorHandle {
     source_column_count: usize,
     source_column_indices: Vec<u16>,
     source_column_types: Vec<String>,
+    failed_tasks: AtomicU64,
+    last_error: RwLock<Option<String>>,
+}
+
+impl TimeSeriesConsolidatorHandle {
+    fn note_materialization_failure(&self, error: &ferrosa_common::Error) {
+        self.failed_tasks.fetch_add(1, Ordering::Relaxed);
+        *self.last_error.write() = Some(error.to_string());
+    }
+
+    fn failure_snapshot(&self) -> (u64, Option<String>) {
+        (
+            self.failed_tasks.load(Ordering::Relaxed),
+            self.last_error.read().clone(),
+        )
+    }
 }
 
 fn normalize_consolidation_type(type_name: &str) -> String {
@@ -662,6 +710,7 @@ impl StorageEngine {
             time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
                 &ConsolidationConfig::default(),
             )),
+            time_series_wasm_aggregates: RwLock::new(None),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -806,6 +855,7 @@ impl StorageEngine {
             time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
                 &ConsolidationConfig::default(),
             )),
+            time_series_wasm_aggregates: RwLock::new(None),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -931,6 +981,7 @@ impl StorageEngine {
             time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
                 &ConsolidationConfig::default(),
             )),
+            time_series_wasm_aggregates: RwLock::new(None),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -960,7 +1011,7 @@ impl StorageEngine {
             Err(_) => return, // No log file — nothing to replay
         };
 
-        let entries = match pending_log.pending_entries() {
+        let records = match pending_log.pending_records() {
             Ok(e) if e.is_empty() => return,
             Ok(e) => e,
             Err(e) => {
@@ -973,51 +1024,185 @@ impl StorageEngine {
             tracing::warn!(
                 "pending-uploads.log has {} entries but no upload manager configured — \
                  these SSTables may not be in S3",
-                entries.len()
+                records.len()
             );
             return;
         };
 
         tracing::info!(
-            count = entries.len(),
+            count = records.len(),
             "replaying pending S3 uploads from crash recovery"
         );
 
-        let report = crate::upload::replay::replay_pending_upload_entries(
-            &entries,
-            &self.config.data_dir,
-            &self.config.compaction.output_dir,
-            |task| match upload_mgr.try_submit(task) {
-                Ok(()) => crate::upload::replay::PendingUploadReplaySubmit::Submitted,
-                Err(e) if e.to_string().contains("upload queue full") => {
-                    crate::upload::replay::PendingUploadReplaySubmit::QueueFull
+        let Some((store, prefix)) = self.resolve_store_and_prefix() else {
+            tracing::warn!(
+                "pending-uploads.log has {} entries but no object store configured — \
+                 these SSTables may not be in S3",
+                records.len()
+            );
+            return;
+        };
+        let cas_supported = self.cas_supported();
+
+        for (idx, record) in records.iter().enumerate() {
+            let Some(files) = crate::upload::replay::find_pending_upload_files(
+                &self.config.data_dir,
+                &self.config.compaction.output_dir,
+                &record.table_id,
+                &record.sstable_id,
+            ) else {
+                tracing::warn!(
+                    table = record.table_id,
+                    sstable = record.sstable_id,
+                    "pending upload: SSTable files not found on disk — cannot replay"
+                );
+                continue;
+            };
+            let total_size = files.iter().map(|file| file.size_bytes).sum();
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            let task = crate::upload::UploadTask::SSTable {
+                table_id: record.table_id.clone(),
+                sstable_id: record.sstable_id.clone(),
+                files,
+                on_complete: Some(tx),
+            };
+            match upload_mgr.try_submit(task) {
+                Ok(()) => {
+                    tokio::spawn(Self::finalize_replayed_pending_upload(
+                        PendingUploadReplayFinalize {
+                            store: Arc::clone(&store),
+                            prefix: prefix.clone(),
+                            pending_log_path: pending_log_path.clone(),
+                            table_id: record.table_id.clone(),
+                            sstable_id: record.sstable_id.clone(),
+                            total_size,
+                            compaction: record.compaction.clone(),
+                            cas_supported,
+                        },
+                        rx,
+                    ));
                 }
-                Err(e) => crate::upload::replay::PendingUploadReplaySubmit::Failed(e.to_string()),
-            },
-        );
+                Err(e) if e.to_string().contains("upload queue full") => {
+                    tracing::warn!(
+                        sstable = record.sstable_id,
+                        remaining_entries = records.len() - idx,
+                        "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        table = record.table_id,
+                        sstable = record.sstable_id,
+                        "pending upload replay could not enqueue without blocking; leaving entry for later retry: {e}"
+                    );
+                }
+            }
+        }
+    }
 
-        for (table_id_str, sstable_id) in &report.missing_files {
-            tracing::warn!(
-                table = table_id_str,
-                sstable = sstable_id,
-                "pending upload: SSTable files not found on disk — cannot replay"
-            );
+    async fn finalize_replayed_pending_upload(
+        ctx: PendingUploadReplayFinalize,
+        rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ) {
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                tracing::warn!(
+                    table = ctx.table_id,
+                    sstable = ctx.sstable_id,
+                    "pending upload replay failed; leaving entry for later retry: {message}"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    table = ctx.table_id,
+                    sstable = ctx.sstable_id,
+                    "pending upload replay worker dropped completion channel; leaving entry for later retry"
+                );
+                return;
+            }
         }
 
-        for (table_id_str, sstable_id, error) in &report.submit_failures {
+        let mut manifest = match crate::manifest::Manifest::load(ctx.store.as_ref(), &ctx.prefix)
+            .await
+        {
+            Ok((manifest, _version)) => manifest,
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    table = ctx.table_id,
+                    sstable = ctx.sstable_id,
+                    "pending upload replay could not load manifest; leaving entry for later retry"
+                );
+                return;
+            }
+        };
+
+        let removals_for_cas_retry = if let Some(compaction) = ctx.compaction {
+            manifest.remove_sstables(&ctx.table_id, &compaction.remove_input_ids);
+            manifest.add_sstable(&ctx.table_id, compaction.output);
+            vec![(ctx.table_id.clone(), compaction.remove_input_ids)]
+        } else {
             tracing::warn!(
-                table = table_id_str,
-                sstable = sstable_id,
-                "pending upload replay could not enqueue without blocking; leaving entry for later retry: {error}"
+                table = ctx.table_id,
+                sstable = ctx.sstable_id,
+                "pending upload replay entry has no compaction context; adding SSTable to manifest without input cleanup"
             );
+            manifest.add_sstable(
+                &ctx.table_id,
+                crate::manifest::ManifestEntry {
+                    id: ctx.sstable_id.clone(),
+                    size: ctx.total_size,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+            Vec::new()
+        };
+
+        let save_result = if ctx.cas_supported {
+            manifest
+                .save_with_retry_and_removals(
+                    ctx.store.as_ref(),
+                    &ctx.prefix,
+                    &removals_for_cas_retry,
+                )
+                .await
+        } else {
+            manifest
+                .save_without_cas_and_removals(
+                    ctx.store.as_ref(),
+                    &ctx.prefix,
+                    &removals_for_cas_retry,
+                )
+                .await
+        };
+        if let Err(e) = save_result {
+            tracing::warn!(
+                %e,
+                table = ctx.table_id,
+                sstable = ctx.sstable_id,
+                "pending upload replay uploaded SSTable but could not save manifest; leaving entry for later retry"
+            );
+            return;
         }
 
-        if let Some(sstable_id) = &report.queue_full_at {
-            tracing::warn!(
-                sstable = sstable_id,
-                remaining_entries = report.remaining_entries,
-                "pending upload replay stopped early because upload queue is full; remaining entries stay durable for later retry"
-            );
+        match crate::upload::PendingUploadsLog::open(&ctx.pending_log_path)
+            .and_then(|log| log.remove_entry(&ctx.table_id, &ctx.sstable_id))
+        {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    table = ctx.table_id,
+                    sstable = ctx.sstable_id,
+                    "pending upload replay finalized manifest but could not remove log entry"
+                );
+            }
         }
     }
 
@@ -1834,6 +2019,14 @@ impl StorageEngine {
         Arc::clone(&self.time_series_runtime_settings)
     }
 
+    /// Install the process-local WASM aggregate executor used by RRD rollups.
+    pub fn set_time_series_wasm_aggregate_executor(
+        &self,
+        executor: Arc<dyn TimeSeriesWasmAggregateExecutor>,
+    ) {
+        *self.time_series_wasm_aggregates.write() = Some(executor);
+    }
+
     /// Visits rows in one partition and time window for a registered table.
     pub fn visit_time_series_window_rows<Cb>(
         &self,
@@ -1862,6 +2055,7 @@ impl StorageEngine {
     ) {
         for handle in self.time_series_consolidators.read().values() {
             let queue = handle.aggregator.queue_snapshot();
+            let (_failed_tasks, last_error) = handle.failure_snapshot();
             let max_delay_ms = handle.target.interval.as_millis().min(i64::MAX as u128) as i64;
             visit(TimeSeriesMaterializationQueueSnapshot {
                 source_table: handle.target.source_table.clone(),
@@ -1873,7 +2067,7 @@ impl StorageEngine {
                 oldest_task_age_ms: queue.oldest_task_age_ms,
                 queue_depth: queue.pending_tasks.min(i64::MAX as u64) as i64,
                 retry_count: 0,
-                last_error: None,
+                last_error,
                 max_delay_ms,
                 alerting: queue.oldest_task_age_ms > max_delay_ms,
             });
@@ -1891,11 +2085,16 @@ impl StorageEngine {
                 .aggregator
                 .metrics()
                 .map(|metrics| metrics.snapshot());
+            let (worker_failed_tasks, last_error) = handle.failure_snapshot();
             let max_delay_ms = handle.target.interval.as_millis().min(i64::MAX as u128) as i64;
+            let failed_tasks = worker_failed_tasks
+                .saturating_add(metrics.as_ref().map(|m| m.decode_failures).unwrap_or(0));
             visit(TimeSeriesMaterializationStatusSnapshot {
                 source_table: handle.target.source_table.clone(),
                 target_table: handle.target.target_table.clone(),
-                status: if queue.pending_tasks == 0 {
+                status: if failed_tasks > 0 {
+                    "failed".to_string()
+                } else if queue.pending_tasks == 0 {
                     "idle".to_string()
                 } else if queue.oldest_task_age_ms > max_delay_ms {
                     "degraded".to_string()
@@ -1907,10 +2106,7 @@ impl StorageEngine {
                     .as_ref()
                     .map(|metrics| metrics.windows_consolidated.min(i64::MAX as u64) as i64)
                     .unwrap_or(0),
-                failed_tasks: metrics
-                    .as_ref()
-                    .map(|metrics| metrics.decode_failures.min(i64::MAX as u64) as i64)
-                    .unwrap_or(0),
+                failed_tasks: failed_tasks.min(i64::MAX as u64) as i64,
                 stale_drops_total: metrics
                     .as_ref()
                     .map(|metrics| metrics.consolidation_drops.min(i64::MAX as u64) as i64)
@@ -1920,7 +2116,7 @@ impl StorageEngine {
                 } else {
                     Some(queue.oldest_window_end_ts)
                 },
-                last_error: None,
+                last_error,
             });
         }
     }
@@ -1949,110 +2145,184 @@ impl StorageEngine {
                 }
             };
 
-            let (partition_key, window_start_ts, window_end_ts, write_timestamp) = match task {
-                ConsolidationTask::BoundaryCrossed {
-                    partition_key,
-                    window_start_ts,
-                    window_end_ts,
-                    ..
-                } => (partition_key, window_start_ts, window_end_ts, window_end_ts),
-                ConsolidationTask::LateData {
-                    partition_key,
-                    window_start_ts,
-                    late_timestamp,
-                    ..
-                } => {
-                    let interval_micros = handle.target.interval.as_micros() as i64;
-                    let window_end_ts = window_start_ts.saturating_add(interval_micros);
-                    if let Some(watermark_window_start_ts) =
-                        handle.aggregator.watermark_window_start(&partition_key)
-                    {
-                        if handle.target.classify_late_window(
-                            window_start_ts,
-                            watermark_window_start_ts,
-                            handle.late_window,
-                        ) == LateWindowClassification::Drop
-                        {
-                            if let Some(metrics) = handle.aggregator.metrics() {
-                                metrics.consolidation_drops.fetch_add(1, Ordering::Relaxed);
-                            }
-                            tracing::warn!(
-                                %table_id,
-                                target_table = %handle.target.target_table,
-                                window_start_ts,
-                                watermark_window_start_ts,
-                                late_window_ms = handle.late_window.as_millis(),
-                                "dropping stale time-series materialization outside late_window"
-                            );
-                            return Ok(true);
-                        }
-                    }
-                    let late_offset = late_timestamp.saturating_sub(window_start_ts).max(1);
-                    (
+            let materialization_result = (|| -> ferrosa_common::Result<Option<Mutation>> {
+                let (partition_key, window_start_ts, window_end_ts, write_timestamp) = match task {
+                    ConsolidationTask::BoundaryCrossed {
                         partition_key,
                         window_start_ts,
                         window_end_ts,
-                        window_end_ts.saturating_add(late_offset),
-                    )
-                }
-            };
-
-            let source_key = DecoratedKey::new(PartitionKey::new(partition_key.clone()));
-            let mut results: SmallVec<[f64; 8]> = SmallVec::new();
-            for source_column_ordinal in 0..handle.source_column_count {
-                let column_index = handle.source_column_indices[source_column_ordinal];
-                let column_type = &handle.source_column_types[source_column_ordinal];
-                let mut acc = Accumulator::new(false);
-                self.visit_time_series_window_rows(
-                    table_id,
-                    &source_key,
-                    window_start_ts,
-                    window_end_ts,
-                    |row| {
-                        let Some((_, cell)) =
-                            row.cells.iter().find(|(idx, _)| *idx == column_index)
-                        else {
-                            return Ok(());
-                        };
-                        let Some(bytes) = cell.value.as_deref() else {
-                            return Ok(());
-                        };
-                        let Some(value) = decode_typed_numeric(bytes, column_type) else {
-                            if let Some(metrics) = handle.aggregator.metrics() {
-                                metrics.decode_failures.fetch_add(1, Ordering::Relaxed);
+                        ..
+                    } => (partition_key, window_start_ts, window_end_ts, window_end_ts),
+                    ConsolidationTask::LateData {
+                        partition_key,
+                        window_start_ts,
+                        late_timestamp,
+                        ..
+                    } => {
+                        let interval_micros = handle.target.interval.as_micros() as i64;
+                        let window_end_ts = window_start_ts.saturating_add(interval_micros);
+                        if let Some(watermark_window_start_ts) =
+                            handle.aggregator.watermark_window_start(&partition_key)
+                        {
+                            if handle.target.classify_late_window(
+                                window_start_ts,
+                                watermark_window_start_ts,
+                                handle.late_window,
+                            ) == LateWindowClassification::Drop
+                            {
+                                if let Some(metrics) = handle.aggregator.metrics() {
+                                    metrics.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                                }
+                                tracing::warn!(
+                                    %table_id,
+                                    target_table = %handle.target.target_table,
+                                    window_start_ts,
+                                    watermark_window_start_ts,
+                                    late_window_ms = handle.late_window.as_millis(),
+                                    "dropping stale time-series materialization outside late_window"
+                                );
+                                return Ok(None);
                             }
-                            tracing::warn!(
-                                %table_id,
-                                column_index,
-                                byte_len = bytes.len(),
-                                "failed to decode numeric bytes for time-series materialization"
-                            );
-                            return Ok(());
-                        };
-                        acc.push(value);
-                        Ok(())
-                    },
-                )?;
-                emit_accumulated_streaming_results(&mut acc, &handle.target.functions, |value| {
-                    results.push(value);
-                })
-                .map_err(|err| {
-                    ferrosa_common::Error::InvalidFormat(format!(
-                        "time-series materialization for {table_id} requires unsupported window materialization: {err:?}"
-                    ))
-                })?;
-            }
+                        }
+                        let late_offset = late_timestamp.saturating_sub(window_start_ts).max(1);
+                        (
+                            partition_key,
+                            window_start_ts,
+                            window_end_ts,
+                            window_end_ts.saturating_add(late_offset),
+                        )
+                    }
+                };
 
-            if results.is_empty() {
-                return Ok(true);
-            }
+                let source_key = DecoratedKey::new(PartitionKey::new(partition_key.clone()));
+                let mut results: SmallVec<[f64; 8]> = SmallVec::new();
+                for source_column_ordinal in 0..handle.source_column_count {
+                    let column_index = handle.source_column_indices[source_column_ordinal];
+                    let column_type = &handle.source_column_types[source_column_ordinal];
+                    let mut acc = Accumulator::new(false);
+                    let mut wasm_invocations: SmallVec<
+                        [(usize, Box<dyn TimeSeriesWasmAggregateInvocation>); 4],
+                    > = SmallVec::new();
+                    for (function_index, function) in handle.target.functions.iter().enumerate() {
+                        if let ConsolidationFn::Wasm {
+                            keyspace,
+                            function_name,
+                        } = function
+                        {
+                            let executor = self
+                            .time_series_wasm_aggregates
+                            .read()
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "time-series materialization for {table_id} requires WASM aggregate executor for wasm:{keyspace}.{function_name}"
+                                ))
+                            })?;
+                            let invocation = executor
+                            .start(keyspace, function_name, column_type)
+                            .map_err(|err| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "failed to start WASM aggregate wasm:{keyspace}.{function_name} for {table_id}: {err}"
+                                ))
+                            })?;
+                            wasm_invocations.push((function_index, invocation));
+                        }
+                    }
 
-            MaterializedRollup {
-                target: handle.target.clone(),
-                partition_key,
-                window_start_ts,
+                    self.visit_time_series_window_rows(
+                        table_id,
+                        &source_key,
+                        window_start_ts,
+                        window_end_ts,
+                        |row| {
+                            let Some((_, cell)) =
+                                row.cells.iter().find(|(idx, _)| *idx == column_index)
+                            else {
+                                return Ok(());
+                            };
+                            let Some(bytes) = cell.value.as_deref() else {
+                                return Ok(());
+                            };
+                            let Some(value) = decode_typed_numeric(bytes, column_type) else {
+                                if let Some(metrics) = handle.aggregator.metrics() {
+                                    metrics.decode_failures.fetch_add(1, Ordering::Relaxed);
+                                }
+                                tracing::warn!(
+                                    %table_id,
+                                    column_index,
+                                    byte_len = bytes.len(),
+                                    "failed to decode numeric bytes for time-series materialization"
+                                );
+                                return Ok(());
+                            };
+                            acc.push(value);
+                            for (_, invocation) in wasm_invocations.iter_mut() {
+                                invocation.update(value).map_err(|err| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to update WASM aggregate for {table_id}: {err}"
+                                    ))
+                                })?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    if acc.count() == 0 {
+                        continue;
+                    }
+
+                    let mut wasm_invocations = wasm_invocations.into_iter().peekable();
+                    for (function_index, function) in handle.target.functions.iter().enumerate() {
+                        match function {
+                            ConsolidationFn::Wasm { .. } => {
+                                let Some((idx, invocation)) = wasm_invocations.next() else {
+                                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                                        "missing WASM aggregate invocation for {table_id}"
+                                    )));
+                                };
+                                if idx != function_index {
+                                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                                        "WASM aggregate invocation order mismatch for {table_id}"
+                                    )));
+                                }
+                                results.push(invocation.finalize().map_err(|err| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to finalize WASM aggregate for {table_id}: {err}"
+                                    ))
+                                })?);
+                            }
+                            ConsolidationFn::Median | ConsolidationFn::Composite(_) => {
+                                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                                "time-series materialization for {table_id} requires unsupported window materialization function: {function:?}"
+                            )));
+                            }
+                            other => results.push(acc.result_for(other)),
+                        }
+                    }
+                }
+
+                if results.is_empty() {
+                    return Ok(None);
+                }
+
+                Ok(Some(
+                    MaterializedRollup {
+                        target: handle.target.clone(),
+                        partition_key,
+                        window_start_ts,
+                    }
+                    .encode_mutation_from_results_at(results, write_timestamp),
+                ))
+            })();
+
+            match materialization_result {
+                Ok(Some(mutation)) => mutation,
+                Ok(None) => return Ok(true),
+                Err(e) => {
+                    handle.note_materialization_failure(&e);
+                    return Err(e);
+                }
             }
-            .encode_mutation_from_results_at(results, write_timestamp)
         };
 
         let target_table_id = TableId::new(&mutation.keyspace, &mutation.table);
@@ -2241,6 +2511,8 @@ impl StorageEngine {
             source_column_count,
             source_column_indices: value_column_indices,
             source_column_types: column_types,
+            failed_tasks: AtomicU64::new(0),
+            last_error: RwLock::new(None),
         }))
     }
 
@@ -3680,12 +3952,24 @@ impl StorageEngine {
             }
 
             let total_size: u64 = files.iter().map(|file| file.size_bytes).sum();
+            let manifest_plan = crate::compaction::finalize::plan_manifest_update(
+                &table_id_str,
+                &result.task.inputs,
+                &result.output,
+                total_size,
+            );
 
             // Step 1: record the pending upload (best-effort).
             let pending_log_path = self.config.data_dir.join("pending-uploads.log");
             let pending_log_result = crate::upload::PendingUploadsLog::open(&pending_log_path);
             if let Ok(ref pending_log) = pending_log_result {
-                if let Err(e) = pending_log.add_entry(&table_id_str, &sstable_id) {
+                let compaction = crate::upload::pending_log::PendingCompactionUpload {
+                    remove_input_ids: manifest_plan.remove_input_ids.clone(),
+                    output: manifest_plan.add_output.clone(),
+                };
+                if let Err(e) =
+                    pending_log.add_compaction_entry(&table_id_str, &sstable_id, compaction)
+                {
                     tracing::warn!(%e, %sstable_id, "compaction: failed to write pending-log entry");
                 }
             }
@@ -3748,29 +4032,15 @@ impl StorageEngine {
                 }
             }
 
-            // Step 4: remove the pending-log entry only after S3 confirmation.
-            match crate::compaction::finalize::pending_log_decision_after_upload(confirmation) {
-                crate::compaction::finalize::PendingLogDecision::RemoveConfirmed => {
-                    if let Ok(ref pending_log) = pending_log_result {
-                        if let Err(e) = pending_log.remove_entry(&sstable_id) {
-                            tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
-                            // Non-fatal: replay will re-upload (idempotent).
-                        }
-                    }
-                }
-                crate::compaction::finalize::PendingLogDecision::KeepForReplay => {
-                    continue;
-                }
+            if !matches!(
+                confirmation,
+                crate::compaction::finalize::UploadConfirmation::Confirmed
+            ) {
+                continue;
             }
 
-            // Step 5: update manifest — load fresh copy, remove inputs, add output, save.
+            // Step 4: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
-            let manifest_plan = crate::compaction::finalize::plan_manifest_update(
-                &table_id_str,
-                &result.task.inputs,
-                &result.output,
-                total_size,
-            );
             let input_ids = manifest_plan.remove_input_ids.clone();
 
             // Compute total input bytes for metrics (used after manifest update).
@@ -3808,6 +4078,7 @@ impl StorageEngine {
                 }
             };
 
+            let mut manifest_saved = false;
             match crate::manifest::Manifest::load(store.as_ref(), &prefix).await {
                 Ok((mut manifest, _version)) => {
                     manifest
@@ -3836,6 +4107,7 @@ impl StorageEngine {
                     if let Err(e) = save_result {
                         tracing::error!(%e, %sstable_id, "compaction: manifest save failed");
                     } else {
+                        manifest_saved = true;
                         tracing::info!(%sstable_id, removed = input_ids.len(), "compaction: manifest updated");
                         // Record bytes freed by this compaction in the metrics gauge.
                         self.compaction_metrics
@@ -3844,6 +4116,28 @@ impl StorageEngine {
                 }
                 Err(e) => {
                     tracing::error!(%e, "compaction: failed to load manifest for update");
+                }
+            }
+
+            // Step 5: remove the pending-log entry only after both S3 upload
+            // confirmation and manifest save. If the process crashes or manifest
+            // persistence fails between those events, the durable marker must
+            // remain so startup replay can retry rather than strand an uploaded
+            // SSTable outside the manifest.
+            match crate::compaction::finalize::pending_log_decision_after_manifest_save(
+                confirmation,
+                manifest_saved,
+            ) {
+                crate::compaction::finalize::PendingLogDecision::RemoveConfirmed => {
+                    if let Ok(ref pending_log) = pending_log_result {
+                        if let Err(e) = pending_log.remove_entry(&table_id_str, &sstable_id) {
+                            tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
+                            // Non-fatal: replay will re-upload (idempotent).
+                        }
+                    }
+                }
+                crate::compaction::finalize::PendingLogDecision::KeepForReplay => {
+                    continue;
                 }
             }
 
@@ -4669,6 +4963,7 @@ impl StorageEngine {
             time_series_runtime_settings: Arc::new(TimeSeriesRuntimeSettings::from_config(
                 &ConsolidationConfig::default(),
             )),
+            time_series_wasm_aggregates: RwLock::new(None),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
@@ -9912,6 +10207,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_pending_compaction_upload_finalizes_manifest_and_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, store, prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let tid_str = tid.to_string();
+
+        let input_metadata = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            engine.collect_sstable_metadata(&tid, state)
+        };
+        assert_eq!(input_metadata.len(), 2, "test setup should have two inputs");
+
+        let mut manifest = crate::manifest::Manifest::new();
+        for input in &input_metadata {
+            manifest.add_sstable(
+                &tid_str,
+                crate::manifest::ManifestEntry {
+                    id: input.id.clone(),
+                    size: input.size_bytes,
+                    min_token: input.min_token,
+                    max_token: input.max_token,
+                    min_timestamp: input.min_timestamp,
+                    max_timestamp: input.max_timestamp,
+                },
+            );
+        }
+        manifest
+            .save_without_cas(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+
+        let compaction_root = dir.path().join("compaction");
+        let output_gen = {
+            let mut ready_gen = None;
+            for _ in 0..60 {
+                for gen in StorageEngine::scan_generations(&compaction_root) {
+                    if StorageEngine::open_sstable_from_dir(&compaction_root, &gen.to_string())
+                        .is_ok()
+                    {
+                        ready_gen = Some(gen);
+                        break;
+                    }
+                }
+                if ready_gen.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            ready_gen.expect("readable compaction output generation")
+        };
+
+        let table_compaction_dir = compaction_root.join(&tid_str);
+        std::fs::create_dir_all(&table_compaction_dir).unwrap();
+        for file in StorageEngine::collect_sstable_files(&compaction_root, output_gen) {
+            let file_name = file
+                .path
+                .file_name()
+                .expect("component file name")
+                .to_owned();
+            std::fs::rename(&file.path, table_compaction_dir.join(file_name)).unwrap();
+        }
+        let output_id = output_gen.to_string();
+        let output_files = StorageEngine::collect_sstable_files(&table_compaction_dir, output_gen);
+        let output_size = output_files.iter().map(|file| file.size_bytes).sum();
+        let output_metadata = crate::compaction::metadata::SSTableMetadata {
+            id: output_id.clone(),
+            path: table_compaction_dir,
+            size_bytes: output_size,
+            min_token: i64::MIN,
+            max_token: i64::MAX,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            partition_count: 2,
+        };
+        let manifest_plan = crate::compaction::finalize::plan_manifest_update(
+            &tid_str,
+            &input_metadata,
+            &output_metadata,
+            output_size,
+        );
+
+        let pending_log_path = engine.config.data_dir.join("pending-uploads.log");
+        let pending_log = crate::upload::PendingUploadsLog::open(&pending_log_path).unwrap();
+        pending_log
+            .add_compaction_entry(
+                &tid_str,
+                &output_id,
+                crate::upload::pending_log::PendingCompactionUpload {
+                    remove_input_ids: manifest_plan.remove_input_ids.clone(),
+                    output: manifest_plan.add_output.clone(),
+                },
+            )
+            .unwrap();
+
+        engine.replay_pending_uploads().await;
+
+        let mut final_entries = Vec::new();
+        for _ in 0..40 {
+            let (loaded, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            final_entries = loaded.sstables.get(&tid_str).cloned().unwrap_or_default();
+            if final_entries.len() == 1
+                && final_entries[0].id == output_id
+                && pending_log.pending_records().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            final_entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![output_id.as_str()],
+            "replay must remove compacted inputs and add the output manifest entry"
+        );
+        assert!(
+            pending_log.pending_records().unwrap().is_empty(),
+            "replay must remove the pending log entry only after manifest save"
+        );
+    }
+
+    #[tokio::test]
     async fn manifest_compaction_concurrent_flush() {
         // Two independent compaction + flush operations run concurrently.
         // Neither must corrupt the manifest; both must complete without panicking.
@@ -10011,6 +10432,74 @@ mod tests {
             !entries.is_empty(),
             "manifest should have at least one SSTable entry after concurrent compaction+flush"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_cleanup_updates_manifest_enqueues_deletes_and_evicts_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, store, prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+
+        let tid_str = tid.to_string();
+        let mut entries = Vec::new();
+        for _ in 0..60 {
+            engine.poll_compactions().await;
+            let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
+            if entries.len() == 1
+                && engine
+                    .compaction_metrics
+                    .s3_deletes_total
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 2
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "manifest should contain only the compacted output after cleanup"
+        );
+        assert_eq!(
+            engine
+                .compaction_metrics
+                .s3_uploads_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "compacted output must be uploaded before manifest cleanup"
+        );
+        assert_eq!(
+            engine
+                .compaction_metrics
+                .s3_deletes_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each compacted-away input must get a delete task"
+        );
+
+        let sstable_dir = dir.path().join("sstables").join(&tid_str);
+        let remaining_components: Vec<_> = std::fs::read_dir(&sstable_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        assert!(
+            remaining_components.is_empty(),
+            "input SSTable components should be evicted after manifest cleanup: {remaining_components:?}"
+        );
+
+        for suffix in ["k1", "k2"] {
+            assert!(
+                engine.read(&tid, &make_key(suffix)).unwrap().is_some(),
+                "key {suffix} must remain readable from the compacted output"
+            );
+        }
     }
 
     // ── T-026: input SSTable deletion tests ──────────────────────────────────

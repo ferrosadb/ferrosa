@@ -60,6 +60,16 @@ pub fn pending_log_decision_after_upload(confirmation: UploadConfirmation) -> Pe
     }
 }
 
+pub fn pending_log_decision_after_manifest_save(
+    confirmation: UploadConfirmation,
+    manifest_saved: bool,
+) -> PendingLogDecision {
+    match (confirmation, manifest_saved) {
+        (UploadConfirmation::Confirmed, true) => PendingLogDecision::RemoveConfirmed,
+        _ => PendingLogDecision::KeepForReplay,
+    }
+}
+
 pub fn upload_confirmation_from_result(
     result: Result<Result<(), String>, tokio::sync::oneshot::error::RecvError>,
 ) -> UploadConfirmation {
@@ -142,6 +152,14 @@ mod tests {
         let decision = pending_log_decision_after_upload(UploadConfirmation::Confirmed);
 
         assert_eq!(decision, PendingLogDecision::RemoveConfirmed);
+    }
+
+    #[test]
+    fn compaction_finalize_keeps_pending_log_when_manifest_save_fails() {
+        let decision =
+            pending_log_decision_after_manifest_save(UploadConfirmation::Confirmed, false);
+
+        assert_eq!(decision, PendingLogDecision::KeepForReplay);
     }
 
     #[test]

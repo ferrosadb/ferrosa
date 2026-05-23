@@ -132,6 +132,51 @@ pub struct UdfExecutor {
     pool: RwLock<InstancePool>,
 }
 
+/// Live invocation of one streaming aggregate component.
+///
+/// The instance owns its Wasmtime store and component instance so callers can
+/// feed values one row at a time, then finalize exactly once.
+pub struct StreamingAggregateInvocation {
+    store: Store<()>,
+    instance: Instance,
+}
+
+impl StreamingAggregateInvocation {
+    pub fn update(&mut self, value: f64) -> Result<(), UdfError> {
+        let update = self
+            .instance
+            .get_func(&mut self.store, "update")
+            .ok_or_else(|| {
+                UdfError::ExecutionFailed("component does not export 'update' function".into())
+            })?;
+        update
+            .call(&mut self.store, &[Val::Float64(value)], &mut [])
+            .map_err(map_component_call_error)
+    }
+
+    pub fn finalize(mut self) -> Result<f64, UdfError> {
+        let finalize = self
+            .instance
+            .get_func(&mut self.store, "finalize")
+            .ok_or_else(|| {
+                UdfError::ExecutionFailed("component does not export 'finalize' function".into())
+            })?;
+        let mut results = vec![Val::Float64(f64::NAN)];
+        finalize
+            .call(&mut self.store, &[], &mut results)
+            .map_err(map_component_call_error)?;
+        match results.pop() {
+            Some(Val::Float64(value)) => Ok(value),
+            Some(other) => Err(UdfError::TypeMismatch(format!(
+                "finalize returned non-f64 value: {other:?}"
+            ))),
+            None => Err(UdfError::ExecutionFailed(
+                "finalize returned no result".into(),
+            )),
+        }
+    }
+}
+
 impl UdfExecutor {
     /// Create a new executor with the given sandbox configuration.
     ///
@@ -233,6 +278,10 @@ impl UdfExecutor {
             component,
             FunctionKind::Aggregate,
         )
+    }
+
+    pub fn wasm_declares_streaming_aggregate_abi(wasm_bytes: &[u8]) -> bool {
+        has_streaming_aggregate_abi_marker(wasm_bytes)
     }
 
     fn register_compiled_function(
@@ -503,6 +552,68 @@ impl UdfExecutor {
         val_to_cql_result(&result_val, return_type)
     }
 
+    /// Invoke a streaming aggregate component with `init`/`update`/`finalize`.
+    ///
+    /// This RRD rollup path drives one numeric sample per `update` call and
+    /// never materializes the input window inside the executor. The v1 ABI is
+    /// intentionally narrow: `init()`, `update(value: f64)`, and
+    /// `finalize() -> f64`, with component-instance state bounded by the guest.
+    pub fn call_streaming_aggregate(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+        values: impl IntoIterator<Item = f64>,
+    ) -> Result<f64, UdfError> {
+        let mut aggregate = self.start_streaming_aggregate(keyspace, name, arg_types)?;
+        for value in values {
+            aggregate.update(value)?;
+        }
+        aggregate.finalize()
+    }
+
+    /// Start a streaming aggregate invocation and call the guest `init` export.
+    pub fn start_streaming_aggregate(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+    ) -> Result<StreamingAggregateInvocation, UdfError> {
+        let key = (keyspace.to_string(), name.to_string(), arg_types.to_vec());
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            let fk = reg.index.get(&key).ok_or_else(|| UdfError::NotFound {
+                keyspace: keyspace.to_string(),
+                name: name.to_string(),
+            })?;
+            Arc::clone(reg.slots.get(fk.0).expect("index/slots out of sync"))
+        };
+        if compiled.kind != FunctionKind::Aggregate {
+            return Err(UdfError::TypeMismatch(format!(
+                "{keyspace}.{name} is not a streaming aggregate"
+            )));
+        }
+
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(self.config.max_aggregate_fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+
+        let linker = Linker::<()>::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &compiled.component)
+            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+
+        let init = instance.get_func(&mut store, "init").ok_or_else(|| {
+            UdfError::ExecutionFailed("component does not export 'init' function".into())
+        })?;
+        init.call(&mut store, &[], &mut [])
+            .map_err(map_component_call_error)?;
+        Ok(StreamingAggregateInvocation { store, instance })
+    }
+
     /// Create a fresh UDA instance by opaque key (hot path — O(1) SlotMap lookup).
     ///
     /// Returns a `(Store, Instance)` pair ready for UDA state accumulation.
@@ -577,6 +688,17 @@ fn has_streaming_aggregate_abi_marker(wasm_bytes: &[u8]) -> bool {
     wasm_bytes
         .windows(STREAMING_AGGREGATE_ABI_MARKER.len())
         .any(|window| window == STREAMING_AGGREGATE_ABI_MARKER)
+}
+
+fn map_component_call_error(error: wasmtime::Error) -> UdfError {
+    let msg = error.to_string();
+    if msg.contains("fuel") {
+        UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
+    } else if msg.contains("epoch") {
+        UdfError::ResourceExhausted(format!("execution timeout: {msg}"))
+    } else {
+        UdfError::ExecutionFailed(msg)
+    }
 }
 
 /// The kind of a compiled function — scalar UDF or aggregate UDA.
@@ -1431,6 +1553,77 @@ mod tests {
     }
 
     #[test]
+    fn streaming_stddev_aggregate_consumes_values_one_at_a_time() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile_streaming_aggregate(
+                "ks",
+                "stddev",
+                &[CqlType::Double],
+                &stddev_streaming_aggregate_component_bytes(),
+            )
+            .unwrap();
+
+        let result = executor
+            .call_streaming_aggregate(
+                "ks",
+                "stddev",
+                &[CqlType::Double],
+                [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0],
+            )
+            .unwrap();
+
+        assert!((result - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn streaming_stddev_aggregate_can_be_driven_by_row_updates() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile_streaming_aggregate(
+                "ks",
+                "stddev",
+                &[CqlType::Double],
+                &stddev_streaming_aggregate_component_bytes(),
+            )
+            .unwrap();
+
+        let mut aggregate = executor
+            .start_streaming_aggregate("ks", "stddev", &[CqlType::Double])
+            .unwrap();
+        for value in [10.0, 10.0, 14.0, 14.0] {
+            aggregate.update(value).unwrap();
+        }
+
+        let result = aggregate.finalize().unwrap();
+        assert!((result - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn streaming_aggregate_start_rejects_scalar_function_registration() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile(
+                "ks",
+                "scalar_stddev",
+                &[CqlType::Double],
+                &minimal_component_bytes(),
+            )
+            .unwrap();
+
+        let err =
+            match executor.start_streaming_aggregate("ks", "scalar_stddev", &[CqlType::Double]) {
+                Ok(_) => panic!("scalar function must not start as streaming aggregate"),
+                Err(err) => err,
+            };
+
+        assert!(
+            matches!(err, UdfError::TypeMismatch(ref msg) if msg.contains("not a streaming aggregate")),
+            "expected streaming aggregate kind rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn compile_valid_component_populates_cache() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
 
@@ -1578,6 +1771,60 @@ mod tests {
             &mut bytes,
             "ferrosa:streaming-aggregate:v1",
             b"contract=init/update/finalize;value=f64;state=bounded",
+        );
+        bytes
+    }
+
+    fn stddev_streaming_aggregate_component_bytes() -> Vec<u8> {
+        let mut bytes = wat::parse_str(
+            r#"
+            (component
+              (core module $m
+                (global $count (mut f64) (f64.const 0))
+                (global $mean (mut f64) (f64.const 0))
+                (global $m2 (mut f64) (f64.const 0))
+
+                (func $init (export "init")
+                  (global.set $count (f64.const 0))
+                  (global.set $mean (f64.const 0))
+                  (global.set $m2 (f64.const 0)))
+
+                (func $update (export "update") (param $value f64)
+                  (local $count f64)
+                  (local $delta f64)
+                  (local $new_mean f64)
+                  (local $delta2 f64)
+                  (local.set $count (f64.add (global.get $count) (f64.const 1)))
+                  (local.set $delta (f64.sub (local.get $value) (global.get $mean)))
+                  (local.set $new_mean
+                    (f64.add
+                      (global.get $mean)
+                      (f64.div (local.get $delta) (local.get $count))))
+                  (local.set $delta2 (f64.sub (local.get $value) (local.get $new_mean)))
+                  (global.set $m2
+                    (f64.add
+                      (global.get $m2)
+                      (f64.mul (local.get $delta) (local.get $delta2))))
+                  (global.set $mean (local.get $new_mean))
+                  (global.set $count (local.get $count)))
+
+                (func $finalize (export "finalize") (result f64)
+                  (if (result f64) (f64.eq (global.get $count) (f64.const 0))
+                    (then (f64.const nan))
+                    (else (f64.sqrt (f64.div (global.get $m2) (global.get $count))))))
+              )
+              (core instance $i (instantiate $m))
+              (func (export "init") (canon lift (core func $i "init")))
+              (func (export "update") (param "value" f64) (canon lift (core func $i "update")))
+              (func (export "finalize") (result f64) (canon lift (core func $i "finalize")))
+            )
+            "#,
+        )
+        .expect("component WAT must parse");
+        append_component_custom_section(
+            &mut bytes,
+            "ferrosa:streaming-aggregate:v1",
+            b"contract=init/update/finalize;value=f64;state=component-instance",
         );
         bytes
     }
