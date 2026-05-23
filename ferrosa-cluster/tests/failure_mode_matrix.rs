@@ -497,27 +497,17 @@ async fn s_16_leader_disappears_followers_elect() {
     // S-16: leader OOM mid-commit.  Harness equivalent: isolate the
     // leader; followers must elect a new one.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
-    let leader_id = cluster.leader_node().node_id;
+    let leader_id = cluster
+        .wait_for_majority_leader(Duration::from_secs(5))
+        .await
+        .expect("initial leader must converge before isolation");
     let leader_idx = cluster
         .nodes()
         .iter()
         .position(|n| n.node_id == leader_id)
         .unwrap();
     cluster.partition(leader_idx);
-    let pred = || {
-        for node in &cluster.nodes() {
-            if node.node_id == leader_id {
-                continue;
-            }
-            if let Some(lid) = node.metrics().current_leader {
-                if lid != leader_id {
-                    return true;
-                }
-            }
-        }
-        false
-    };
+    let pred = || matches!(cluster.majority_leader_id(), Some(lid) if lid != leader_id);
     let elected = wait_until(pred, Duration::from_secs(5)).await;
     cluster.heal();
     assert!(elected, "remaining voters must elect a new leader");
@@ -768,7 +758,7 @@ async fn s_31_two_simultaneous_elections_resolve_to_one_leader() {
     // S-31: even under a fresh start, exactly one leader emerges.
     let cluster = TestCluster::with_voters(3).await;
     let leader = cluster
-        .wait_for_leader(Duration::from_secs(5))
+        .wait_for_majority_leader(Duration::from_secs(5))
         .await
         .unwrap();
     // The second simultaneous candidate should have given up.

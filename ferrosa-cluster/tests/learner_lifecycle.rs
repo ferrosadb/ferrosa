@@ -338,7 +338,7 @@ async fn demote_voter_to_learner_transfers_leader_first_if_needed() {
     // target's `matched_idx` may still trail the leader's `last_log_index`.
     // openraft's `transfer_to` has an internal catch-up budget of
     // `election_timeout_max × 2` which can run short under contention
-    // (this was a CI flake before the explicit pre-wait — see Sprint 8
+    // (this exposed a leadership-transfer readiness bug before the explicit pre-wait — see Sprint 8
     // W8.3 follow-up). Block until either the indices align or 4s elapse.
     {
         let leader = cluster.leader_node();
