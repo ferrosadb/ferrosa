@@ -372,6 +372,24 @@ impl ClusterCoordinator {
         table_id: &TableId,
         row_limit: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
+        self.coordinate_range_read_stream_all_with(
+            table_id,
+            row_limit,
+            self.default_cl,
+            self.default_rf,
+        )
+        .await
+    }
+
+    /// Uncapped streaming range-read entry point with per-query consistency
+    /// and keyspace replication factor.
+    pub async fn coordinate_range_read_stream_all_with(
+        &self,
+        table_id: &TableId,
+        row_limit: usize,
+        cl: crate::consistency::ConsistencyLevel,
+        replication_factor: usize,
+    ) -> crate::error::Result<ClusterPartitionStream> {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
         let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
@@ -387,12 +405,8 @@ impl ClusterCoordinator {
             .filter(|(id, _)| *id != local_id)
             .filter_map(|(_, host)| host.clone())
             .collect();
-        let cl_remote_count = remote_count_for_cl(
-            self.default_cl,
-            self.default_rf,
-            node_count,
-            all_remotes.len(),
-        );
+        let cl_remote_count =
+            remote_count_for_cl(cl, replication_factor, node_count, all_remotes.len());
         let remotes: Vec<(uuid::Uuid, String)> =
             all_remotes.into_iter().take(cl_remote_count).collect();
         let expected_done = remotes.len();

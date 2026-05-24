@@ -2090,6 +2090,7 @@ async fn route_select_user_table(
         .tables
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+    let table_strategy = keyspace_strategy(&state.schema, ks);
 
     // ALLOW FILTERING: permit full-table scans with post-filter when the
     // client explicitly opts in.  Log a warning so operators can identify
@@ -2747,7 +2748,12 @@ async fn route_select_user_table(
                         let stream = state
                             .write_path
                             .load()
-                            .range_read_stream_all(&table_id, row_limit)
+                            .range_read_stream_all_with(
+                                &table_id,
+                                row_limit,
+                                ctx.consistency,
+                                &table_strategy,
+                            )
                             .await?;
                         count_rows_from_partition_stream(stream, row_context, predicate_context)
                             .await?
@@ -2777,7 +2783,12 @@ async fn route_select_user_table(
                     let stream = state
                         .write_path
                         .load()
-                        .range_read_stream_all(&table_id, row_limit)
+                        .range_read_stream_all_with(
+                            &table_id,
+                            row_limit,
+                            ctx.consistency,
+                            &table_strategy,
+                        )
                         .await?;
                     extend_rows_from_partition_stream(
                         stream,
@@ -15827,6 +15838,12 @@ mod tests {
         assert!(
             broad_scan.contains("range_read_stream_all"),
             "broad SELECT scans must use the stream boundary for unbounded scans"
+        );
+        assert!(
+            broad_scan.contains("range_read_stream_all_with")
+                && broad_scan.contains("ctx.consistency")
+                && broad_scan.contains("&table_strategy"),
+            "broad SELECT streams must propagate the request consistency and keyspace replication strategy"
         );
     }
 }

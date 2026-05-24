@@ -218,6 +218,26 @@ impl WritePath {
         table_id: &TableId,
         row_limit: usize,
     ) -> crate::error::Result<PartitionResultStream> {
+        self.range_read_stream_all_with(
+            table_id,
+            row_limit,
+            ConsistencyLevel::One,
+            &ReplicationStrategy::Simple {
+                replication_factor: 1,
+            },
+        )
+        .await
+    }
+
+    /// Stream every partition with the caller's requested consistency and
+    /// table/keyspace replication strategy.
+    pub async fn range_read_stream_all_with(
+        &self,
+        table_id: &TableId,
+        row_limit: usize,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<PartitionResultStream> {
         match self {
             Self::Direct(engine) => Ok(local_range_stream(engine.clone(), table_id, row_limit)),
             Self::Pair(coordinator) => Ok(local_range_stream(
@@ -228,7 +248,12 @@ impl WritePath {
             Self::Cluster(coordinator) => {
                 if coordinator.streaming_range_reads {
                     coordinator
-                        .coordinate_range_read_stream_all(table_id, row_limit)
+                        .coordinate_range_read_stream_all_with(
+                            table_id,
+                            row_limit,
+                            cl,
+                            strategy.replication_factor(),
+                        )
                         .await
                 } else {
                     Err(crate::error::ClusterError::Internal(
@@ -628,6 +653,12 @@ mod tests {
         assert!(
             !range_read_body.contains("coordinate_range_read_stream_all(table_id, 0)"),
             "cluster range_read must not call the Vec-returning unbounded streaming coordinator"
+        );
+        assert!(
+            source.contains("pub async fn range_read_stream_all_with")
+                && source.contains("strategy.replication_factor()")
+                && source.contains("coordinate_range_read_stream_all_with"),
+            "cluster streaming full scans must carry caller consistency and keyspace replication into the coordinator"
         );
     }
 }
