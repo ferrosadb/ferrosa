@@ -23,10 +23,10 @@ Goal: fix the concrete rust-streaming audit findings with tests first, run local
   at the coordinator boundary before returning to CQL.
   - Red: coordinator regression test fails while `coordinate_range_read_stream_all`
     and `consume_range_stream` return aggregate vectors.
-  - Fix: local-satisfied cluster reads now return a partition stream. Cluster
-    reads that require remote replica merge/dedup now fail loudly instead of
-    materializing a full result vector; token-aware remote stream merge remains
-    a follow-up design item.
+  - Fix: local-satisfied cluster reads now return a partition stream. LOCAL_QUORUM
+    reads with one remote stream now merge local and remote token-ordered streams
+    with one-partition lookahead. Reads requiring multiple remote streams still
+    fail loudly until the k-way token merge lands.
   - Verify: `cargo test -p ferrosa-cluster unbounded_streaming_range_read_boundary_must_not_return_vec -- --nocapture`.
 
 - [x] Rebalance, repair, and decommission paths must stream table/range contents

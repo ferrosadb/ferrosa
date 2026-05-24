@@ -20,15 +20,20 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ferrosa_net::codec::Lane;
+use ferrosa_net::idle_timeout::IdleTimeoutWatchdog;
 use ferrosa_net::message::Message;
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
 use futures::{Stream, StreamExt};
+use tokio::sync::mpsc;
 
 use super::stream_consumer::{consume_range_stream, StreamConsumeError};
 use super::ClusterCoordinator;
 use crate::error::ClusterError;
-use crate::raft::handlers::RangeReadStreamRequestPayload;
+use crate::raft::handlers::{
+    partition_from_wire, RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
+    RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
+};
 
 /// Idle deadline on the streaming receiver. Reset on every chunk OR
 /// heartbeat. A producer that stops sending entirely for longer
@@ -164,6 +169,196 @@ async fn read_local_range_stream_limited_rows(
     Ok(partitions)
 }
 
+fn apply_row_limit(mut partition: Partition, row_limit: usize) -> Partition {
+    if row_limit > 0 {
+        partition.rows.truncate(row_limit);
+    }
+    partition
+}
+
+fn next_remote_error(err: StreamConsumeError) -> crate::error::Result<Partition> {
+    Err(ClusterError::Internal(format!(
+        "streaming range read: {err:?}"
+    )))
+}
+
+async fn forward_remote_range_stream(
+    receiver: mpsc::Receiver<Message>,
+    request_id: u32,
+    expected_done: usize,
+    tx: mpsc::Sender<crate::error::Result<Partition>>,
+) {
+    if let Err(err) =
+        forward_remote_range_stream_inner(receiver, request_id, expected_done, tx.clone()).await
+    {
+        let _ = tx.send(next_remote_error(err)).await;
+    }
+}
+
+async fn forward_remote_range_stream_inner(
+    receiver: mpsc::Receiver<Message>,
+    request_id: u32,
+    expected_done: usize,
+    tx: mpsc::Sender<crate::error::Result<Partition>>,
+) -> Result<(), StreamConsumeError> {
+    let mut watchdog = IdleTimeoutWatchdog::new(receiver, STREAMING_IDLE_TIMEOUT);
+    let mut delivered_done = 0usize;
+
+    loop {
+        if delivered_done >= expected_done {
+            return Ok(());
+        }
+
+        let next = watchdog
+            .next()
+            .await
+            .map_err(|elapsed| StreamConsumeError::IdleTimeout {
+                request_id,
+                idle_timeout: elapsed.idle_timeout,
+            })?;
+
+        let frame = match next {
+            Some(msg) => msg,
+            None => {
+                return Err(StreamConsumeError::ChannelClosedBeforeDone {
+                    delivered_done,
+                    expected_done,
+                });
+            }
+        };
+
+        match frame {
+            Message::RangeReadStreamChunk(bytes) => {
+                let chunk =
+                    bincode::deserialize::<RangeReadStreamChunkPayload>(&bytes).map_err(|e| {
+                        StreamConsumeError::Decode {
+                            request_id,
+                            which: "RangeReadStreamChunk",
+                            message: e.to_string(),
+                        }
+                    })?;
+                for partition in chunk.partitions.into_iter().map(partition_from_wire) {
+                    if tx.send(Ok(partition)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Message::RangeReadStreamHeartbeat(bytes) => {
+                let _heartbeat = bincode::deserialize::<RangeReadStreamHeartbeatPayload>(&bytes)
+                    .map_err(|e| StreamConsumeError::Decode {
+                        request_id,
+                        which: "RangeReadStreamHeartbeat",
+                        message: e.to_string(),
+                    })?;
+            }
+            Message::RangeReadStreamDone(bytes) => {
+                let done =
+                    bincode::deserialize::<RangeReadStreamDonePayload>(&bytes).map_err(|e| {
+                        StreamConsumeError::Decode {
+                            request_id,
+                            which: "RangeReadStreamDone",
+                            message: e.to_string(),
+                        }
+                    })?;
+                if done.truncated {
+                    tracing::warn!(
+                        request_id,
+                        "streaming range read: remote replica reported truncated stream"
+                    );
+                }
+                delivered_done += 1;
+            }
+            other => {
+                return Err(StreamConsumeError::UnexpectedFrame {
+                    msg_type: other.msg_type(),
+                });
+            }
+        }
+    }
+}
+
+async fn merge_local_and_single_remote_stream(
+    storage: std::sync::Arc<ferrosa_storage::StorageEngine>,
+    table_id: TableId,
+    row_limit: usize,
+    mut remote_rx: mpsc::Receiver<crate::error::Result<Partition>>,
+    out_tx: mpsc::Sender<crate::error::Result<Partition>>,
+) {
+    let mut local_stream = storage.range_iter(&table_id, None, None);
+    let mut local_next = local_stream.next().await;
+    let mut remote_next = remote_rx.recv().await;
+
+    loop {
+        match (local_next.take(), remote_next.take()) {
+            (None, None) => return,
+            (Some(Err(err)), _) => {
+                let _ = out_tx.send(Err(ClusterError::Storage(err))).await;
+                return;
+            }
+            (_, Some(Err(err))) => {
+                let _ = out_tx.send(Err(err)).await;
+                return;
+            }
+            (Some(Ok(local)), None) => {
+                if out_tx
+                    .send(Ok(apply_row_limit(local, row_limit)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                local_next = local_stream.next().await;
+            }
+            (None, Some(Ok(remote))) => {
+                if out_tx
+                    .send(Ok(apply_row_limit(remote, row_limit)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                remote_next = remote_rx.recv().await;
+            }
+            (Some(Ok(local)), Some(Ok(remote))) => {
+                let local_token = local.key.token.0;
+                let remote_token = remote.key.token.0;
+                if local_token < remote_token {
+                    if out_tx
+                        .send(Ok(apply_row_limit(local, row_limit)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    local_next = local_stream.next().await;
+                    remote_next = Some(Ok(remote));
+                } else if remote_token < local_token {
+                    if out_tx
+                        .send(Ok(apply_row_limit(remote, row_limit)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    local_next = Some(Ok(local));
+                    remote_next = remote_rx.recv().await;
+                } else {
+                    let merged = ferrosa_storage::merge::merge_partitions(vec![local, remote]);
+                    if out_tx
+                        .send(Ok(apply_row_limit(merged, row_limit)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    local_next = local_stream.next().await;
+                    remote_next = remote_rx.recv().await;
+                }
+            }
+        }
+    }
+}
+
 impl ClusterCoordinator {
     /// Uncapped streaming range-read entry point.
     ///
@@ -202,22 +397,73 @@ impl ClusterCoordinator {
             all_remotes.into_iter().take(cl_remote_count).collect();
         let expected_done = remotes.len();
 
-        if expected_done > 0 {
+        if expected_done > 1 {
             return Err(ClusterError::Internal(
-                "unbounded cluster range scan would require replica merge/dedup across remote streams; refusing to materialize full results".into(),
+                "unbounded cluster range scan with multiple remote replicas requires token-aware k-way stream merge; refusing to materialize full results".into(),
             ));
         }
 
-        let stream = self
-            .storage
-            .range_iter(table_id, None, None)
-            .map(move |item| {
-                let mut partition = item.map_err(ClusterError::Storage)?;
-                if row_limit > 0 {
-                    partition.rows.truncate(row_limit);
-                }
-                Ok(partition)
-            });
+        if expected_done == 0 {
+            let stream = self
+                .storage
+                .range_iter(table_id, None, None)
+                .map(move |item| {
+                    let partition = item.map_err(ClusterError::Storage)?;
+                    Ok(apply_row_limit(partition, row_limit))
+                });
+            return Ok(Box::pin(stream));
+        }
+
+        let request_id = self.next_stream_request_id();
+        let receiver = self
+            .stream_router
+            .register(request_id, STREAM_RECEIVER_BUFFER);
+
+        let req_payload = RangeReadStreamRequestPayload {
+            request_id,
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+        };
+        let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
+            ClusterError::Internal(format!("streaming range read: encode request: {e}"))
+        })?);
+
+        let (host_id, _addr) = remotes.first().ok_or_else(|| {
+            ClusterError::Internal("streaming range read: missing remote replica".into())
+        })?;
+        if let Err(e) = self
+            .peer_manager
+            .fire(
+                *host_id,
+                Message::RangeReadStreamRequest(req_body),
+                Lane::Bulk,
+            )
+            .await
+        {
+            self.stream_router.unregister(request_id);
+            return Err(ClusterError::Internal(format!(
+                "streaming range read: remote replica fire failed ({host_id}): {e}"
+            )));
+        }
+
+        let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let router = self.stream_router.clone();
+        tokio::spawn(async move {
+            forward_remote_range_stream(receiver, request_id, 1, remote_tx).await;
+            router.unregister(request_id);
+        });
+
+        let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let storage = self.storage.clone();
+        let table_id = table_id.clone();
+        tokio::spawn(async move {
+            merge_local_and_single_remote_stream(storage, table_id, row_limit, remote_rx, out_tx)
+                .await;
+        });
+
+        let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
         Ok(Box::pin(stream))
     }
 
