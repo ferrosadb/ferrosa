@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use ferrosa_net::pool::PriorityPool;
+use futures::StreamExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -30,6 +31,21 @@ fn cluster_member_metadata_changed(
         (Some(current), Some(new)) => current != new,
         (None, Some(_)) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod streaming_contract_tests {
+    #[test]
+    fn decommission_streaming_must_not_materialize_all_partitions() {
+        let source = include_str!("membership.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production membership source must be present");
+        assert!(
+            !source.contains("read_range(&table_id, None, None, usize::MAX)"),
+            "decommission must stream partitions instead of materializing every partition with usize::MAX"
+        );
     }
 }
 
@@ -179,15 +195,16 @@ impl ModeController {
                     continue;
                 }
                 let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
-                let partitions = match self.storage.read_range(&table_id, None, None, usize::MAX) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(%e, ks, tbl, "decommission: failed to read table");
-                        continue;
-                    }
-                };
+                let mut partitions = self.storage.range_iter(&table_id, None, None);
 
-                for partition in &partitions {
+                while let Some(partition) = partitions.next().await {
+                    let partition = match partition {
+                        Ok(partition) => partition,
+                        Err(e) => {
+                            tracing::warn!(%e, ks, tbl, "decommission: failed to read partition");
+                            continue;
+                        }
+                    };
                     let token = partition.key.token.0;
                     if ring.primary_owner(token) == Some(node_id) {
                         // This partition is owned by the leaving node — find next replica

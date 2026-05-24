@@ -2,7 +2,7 @@
 title: Streaming audit bugfix checklist
 status: in-process
 created: 2026-05-23
-updated: 2026-05-23
+updated: 2026-05-24
 ---
 
 # Streaming Audit Bugfix Checklist
@@ -10,6 +10,32 @@ updated: 2026-05-23
 Goal: fix the concrete rust-streaming audit findings with tests first, run local CI, then push a PR and monitor GitHub CI until green.
 
 ## P0
+
+- [x] CQL full-table/range reads must not materialize `Vec<Partition>` before
+  filtering, projection, LIMIT, or paging.
+  - Red: source-level regression test fails if the router's broad scan branch
+    calls `range_read(&table_id)` and then pages a `Vec`.
+  - Fix: expose a cancellable partition stream from `WritePath` and consume it
+    into protocol pages incrementally.
+  - Verify: `cargo test -p ferrosa-cql broad_select_paths_must_not_materialize_full_range_before_paging -- --nocapture`.
+
+- [x] Cluster streaming range reads must not collect local and remote partitions
+  at the coordinator boundary before returning to CQL.
+  - Red: coordinator regression test fails while `coordinate_range_read_stream_all`
+    and `consume_range_stream` return aggregate vectors.
+  - Fix: local-satisfied cluster reads now return a partition stream. Cluster
+    reads that require remote replica merge/dedup now fail loudly instead of
+    materializing a full result vector; token-aware remote stream merge remains
+    a follow-up design item.
+  - Verify: `cargo test -p ferrosa-cluster unbounded_streaming_range_read_boundary_must_not_return_vec -- --nocapture`.
+
+- [x] Rebalance, repair, and decommission paths must stream table/range contents
+  instead of using capped `read_range` materialization.
+  - Red: source-level tests cover `rebalance.rs`, `repair/executor.rs`, and
+    `controller/membership.rs`.
+  - Fix: move those paths to token/range iterators or explicit chunked transfer
+    cursors with visible partial-failure semantics.
+  - Verify: `cargo test -p ferrosa-cluster streaming_contract_tests -- --nocapture`.
 
 - [x] Pending upload log removal must match both `table_id` and `sstable_id`.
   - Test: two tables with the same SSTable generation id; removing one entry preserves the other.

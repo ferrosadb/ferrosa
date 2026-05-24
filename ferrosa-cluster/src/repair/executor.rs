@@ -142,29 +142,25 @@ impl RepairStore for StorageEngineRepairStore {
         range_start: i64,
         range_end: i64,
     ) -> Result<Vec<Partition>, String> {
-        // StorageEngine::read_range is sync + does file I/O; offload so we
-        // don't block the async worker on a potentially-large scan.
-        let engine = self.engine.clone();
-        let table = table.clone();
-        let result: Result<Vec<Partition>, String> = tokio::task::spawn_blocking(move || {
-            // Use the token-bounded primitive so we don't read a key-
-            // ordered prefix of the whole table per session. Limit
-            // matches the storage materialisation cap; the typical
-            // Merkle leaf on a ~10 k-partition table is sparse so this
-            // budget is comfortably above what any single leaf needs.
-            const REPAIR_LEAF_READ_LIMIT: usize = 10_000;
-            StorageEngine::read_token_range(
-                &engine,
-                &table,
-                range_start,
-                range_end,
-                REPAIR_LEAF_READ_LIMIT,
-            )
-            .map_err(|e| format!("read_token_range: {e}"))
-        })
-        .await
-        .map_err(|e| format!("read_range join: {e}"))?;
-        result
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (mut chunk, next) = self
+                .read_range_chunked(
+                    table,
+                    range_start,
+                    range_end,
+                    cursor,
+                    REPAIR_FETCH_CHUNK_PARTITIONS,
+                )
+                .await?;
+            out.append(&mut chunk);
+            let Some(next_cursor) = next else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(out)
     }
 
     async fn read_range_chunked(
@@ -869,5 +865,29 @@ mod tests {
         let b_val = value_for_key(&b.snapshot().await, b"k").unwrap().to_vec();
         assert_eq!(a_val, b"a-value");
         assert_eq!(b_val, b"b-value");
+    }
+}
+
+#[cfg(test)]
+mod streaming_contract_tests {
+    #[test]
+    fn repair_leaf_reads_must_not_use_fixed_materialization_cap() {
+        let source = include_str!("executor.rs");
+        let read_range_body = source
+            .split("impl RepairStore for StorageEngineRepairStore")
+            .nth(1)
+            .expect("StorageEngineRepairStore impl must be present")
+            .split("async fn read_range(\n        &self,\n        table: &TableId,")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn read_range_chunked").next())
+            .expect("StorageEngineRepairStore read_range body must be present");
+        assert!(
+            !read_range_body.contains("REPAIR_LEAF_READ_LIMIT"),
+            "repair must stream token ranges or fail loudly instead of using a fixed materialization cap"
+        );
+        assert!(
+            read_range_body.contains("read_range_chunked"),
+            "one-shot repair reads must be implemented as a chunked loop over the bounded repair cursor"
+        );
     }
 }

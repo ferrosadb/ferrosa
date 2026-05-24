@@ -7,13 +7,14 @@
 //! - `WritePath::Direct` — standalone mode, writes directly to `StorageEngine`.
 //! - `WritePath::Pair` — pair mode, delegates to `PairCoordinator::coordinate_write()`.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::{Mutation, TableId};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
@@ -23,6 +24,24 @@ use crate::ring::strategy::ReplicationStrategy;
 /// Default upper bound for unordered range reads when the caller does not
 /// provide a tighter page/limit bound.
 pub const DEFAULT_RANGE_READ_LIMIT: usize = 10_000;
+
+pub type PartitionResultStream =
+    Pin<Box<dyn Stream<Item = crate::error::Result<Partition>> + Send>>;
+
+fn local_range_stream(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    row_limit: usize,
+) -> PartitionResultStream {
+    let stream = engine.range_iter(table_id, None, None).map(move |item| {
+        let mut partition = item.map_err(crate::error::ClusterError::Storage)?;
+        if row_limit > 0 {
+            partition.rows.truncate(row_limit);
+        }
+        Ok(partition)
+    });
+    Box::pin(stream)
+}
 
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
@@ -38,18 +57,6 @@ pub enum WritePath {
     Cluster(Arc<ClusterCoordinator>),
     /// Degraded: peer lost, writes rejected until operator promotes.
     Unavailable,
-}
-
-async fn collect_uncapped_local_range(
-    engine: &StorageEngine,
-    table_id: &TableId,
-) -> crate::error::Result<Vec<Partition>> {
-    let mut stream = engine.range_iter(table_id, None, None);
-    let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        out.push(item.map_err(crate::error::ClusterError::Storage)?);
-    }
-    Ok(out)
 }
 
 impl WritePath {
@@ -191,15 +198,37 @@ impl WritePath {
     /// empty results on failure causes data loss (see BUG: large-write-causes-
     /// data-loss-in-partition).
     pub async fn range_read(&self, table_id: &TableId) -> crate::error::Result<Vec<Partition>> {
+        let mut stream = self.range_read_stream_all(table_id, 0).await?;
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Stream every partition for full-scan consumers.
+    ///
+    /// This is the unbounded counterpart to `range_read_limited_rows`: callers
+    /// pull one partition at a time and can cancel once protocol LIMIT/page
+    /// semantics are satisfied. Cluster mode currently supports only local-only
+    /// unbounded scans; if the configured CL/RF would require remote duplicate
+    /// merge, it fails loudly instead of materializing the entire result.
+    pub async fn range_read_stream_all(
+        &self,
+        table_id: &TableId,
+        row_limit: usize,
+    ) -> crate::error::Result<PartitionResultStream> {
         match self {
-            Self::Direct(engine) => collect_uncapped_local_range(engine.as_ref(), table_id).await,
-            Self::Pair(coordinator) => {
-                collect_uncapped_local_range(coordinator.local_storage().as_ref(), table_id).await
-            }
+            Self::Direct(engine) => Ok(local_range_stream(engine.clone(), table_id, row_limit)),
+            Self::Pair(coordinator) => Ok(local_range_stream(
+                coordinator.local_storage().clone(),
+                table_id,
+                row_limit,
+            )),
             Self::Cluster(coordinator) => {
                 if coordinator.streaming_range_reads {
                     coordinator
-                        .coordinate_range_read_stream_all(table_id, 0)
+                        .coordinate_range_read_stream_all(table_id, row_limit)
                         .await
                 } else {
                     Err(crate::error::ClusterError::Internal(
@@ -578,6 +607,27 @@ mod tests {
             partitions.len(),
             4,
             "index_read must return all 4 rows with label='shared'"
+        );
+    }
+
+    #[test]
+    fn unbounded_write_path_range_read_must_not_collect_local_streams() {
+        let source = include_str!("write_path.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production write_path source must be present");
+        assert!(
+            !source.contains("async fn collect_uncapped_local_range"),
+            "unbounded local range reads must be exposed as streams, not collected into Vec<Partition>"
+        );
+        let range_read_body = source
+            .split("pub async fn range_read(&self, table_id: &TableId)")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn read").next())
+            .expect("range_read body must be present");
+        assert!(
+            !range_read_body.contains("coordinate_range_read_stream_all(table_id, 0)"),
+            "cluster range_read must not call the Vec-returning unbounded streaming coordinator"
         );
     }
 }

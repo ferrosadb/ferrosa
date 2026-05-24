@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
+use futures::StreamExt;
 use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 
@@ -441,6 +442,78 @@ async fn extend_rows_from_partitions(
             tokio::task::yield_now().await;
         }
     }
+}
+
+async fn count_rows_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> Result<i64, CqlError> {
+    let mut count = 0_i64;
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        for row in bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                count += 1;
+            }
+        }
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(count)
+}
+
+async fn extend_rows_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    all_rows: &mut Vec<Vec<Option<CqlValue>>>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+    storage_to_table: &[usize],
+) -> Result<(), CqlError> {
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let mut prows = bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            all_col_names,
+            all_col_types,
+            pk_indices,
+            ck_indices,
+            storage_to_table,
+        );
+        all_rows.append(&mut prows);
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
 }
 
 fn storage_to_table_indices(table_meta: &TableMetadata) -> Vec<usize> {
@@ -2623,48 +2696,62 @@ async fn route_select_user_table(
                     // Push partition-count cap down to the merger so
                     // `LIMIT N` stops the scan after N partitions
                     // rather than walking every SSTable.
-                    state
-                        .write_path
-                        .load()
-                        .range_read_projected(&table_id, wanted, scan_bound)
-                        .await?
+                    Some(
+                        state
+                            .write_path
+                            .load()
+                            .range_read_projected(&table_id, wanted, scan_bound)
+                            .await?,
+                    )
                 } else if let Some(bound) = scan_bound {
-                    state
-                        .write_path
-                        .load()
-                        .range_read_limited_rows(&table_id, bound, row_limit)
-                        .await?
+                    Some(
+                        state
+                            .write_path
+                            .load()
+                            .range_read_limited_rows(&table_id, bound, row_limit)
+                            .await?,
+                    )
                 } else if row_limit > 0 {
-                    state
-                        .write_path
-                        .load()
-                        .range_read_limited_rows(
-                            &table_id,
-                            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
-                            row_limit,
-                        )
-                        .await?
+                    Some(
+                        state
+                            .write_path
+                            .load()
+                            .range_read_limited_rows(
+                                &table_id,
+                                ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
+                                row_limit,
+                            )
+                            .await?,
+                    )
                 } else {
-                    state.write_path.load().range_read(&table_id).await?
+                    None
                 };
                 if count_only_select {
-                    let count = count_rows_from_partitions(
-                        &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
-                    )
-                    .await?;
+                    let row_context = PartitionRowContext {
+                        all_col_names: &all_col_names,
+                        all_col_types: &all_col_types,
+                        pk_indices: &pk_indices,
+                        ck_indices: &ck_indices,
+                        storage_to_table: &storage_to_table,
+                    };
+                    let predicate_context = SelectPredicateContext {
+                        statement: s,
+                        table_meta,
+                        keyspace: ks,
+                        state,
+                    };
+                    let count = if let Some(partitions) = partitions.as_ref() {
+                        count_rows_from_partitions(partitions, row_context, predicate_context)
+                            .await?
+                    } else {
+                        let stream = state
+                            .write_path
+                            .load()
+                            .range_read_stream_all(&table_id, row_limit)
+                            .await?;
+                        count_rows_from_partition_stream(stream, row_context, predicate_context)
+                            .await?
+                    };
                     return Ok(SelectRawResult {
                         column_names: col_names.to_vec(),
                         column_types: col_types.to_vec(),
@@ -2675,16 +2762,34 @@ async fn route_select_user_table(
                     });
                 }
                 let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
+                if let Some(partitions) = partitions.as_ref() {
+                    extend_rows_from_partitions(
+                        partitions,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await;
+                } else {
+                    let stream = state
+                        .write_path
+                        .load()
+                        .range_read_stream_all(&table_id, row_limit)
+                        .await?;
+                    extend_rows_from_partition_stream(
+                        stream,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await?;
+                }
                 filter_rows_by_select_predicates(
                     &mut all_rows,
                     s,
@@ -15704,5 +15809,24 @@ mod tests {
             );
         }
         // Any other outcome (Ok or a different error) is acceptable.
+    }
+
+    #[test]
+    fn broad_select_paths_must_not_materialize_full_range_before_paging() {
+        let source = include_str!("router.rs");
+        let broad_scan = source
+            .split("let scan_bound =")
+            .nth(1)
+            .and_then(|rest| rest.split("let mut all_rows = Vec::new();").next())
+            .expect("broad select scan block must be present");
+
+        assert!(
+            !broad_scan.contains(".range_read(&table_id).await?"),
+            "broad SELECT scans must consume a partition stream directly instead of materializing range_read Vec<Partition>"
+        );
+        assert!(
+            broad_scan.contains("range_read_stream_all"),
+            "broad SELECT scans must use the stream boundary for unbounded scans"
+        );
     }
 }
