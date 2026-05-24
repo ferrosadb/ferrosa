@@ -2350,7 +2350,11 @@ async fn route_select_user_table(
                 // values that can't be coerced to the PK column type) but
                 // the planner still sees Eq predicates on all PK columns.
                 // Fall through to a full scan rather than panicking.
-                let partitions = state.write_path.load().range_read(&table_id).await?;
+                let partitions = state
+                    .write_path
+                    .load()
+                    .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                    .await?;
                 if count_only_select {
                     let count = count_rows_from_partitions(
                         &partitions,
@@ -2452,7 +2456,11 @@ async fn route_select_user_table(
                 // may not be wired yet (Sprint I-3). Fall back to full scan so
                 // queries still return correct results.
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await?
+                    state
+                        .write_path
+                        .load()
+                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                        .await?
                 } else {
                     partitions
                 };
@@ -2541,7 +2549,11 @@ async fn route_select_user_table(
                     .await?;
 
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await?
+                    state
+                        .write_path
+                        .load()
+                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                        .await?
                 } else {
                     partitions
                 };
@@ -15844,6 +15856,25 @@ mod tests {
                 && broad_scan.contains("ctx.consistency")
                 && broad_scan.contains("&table_strategy"),
             "broad SELECT streams must propagate the request consistency and keyspace replication strategy"
+        );
+    }
+
+    #[test]
+    fn planner_fallback_range_reads_must_propagate_replication_strategy() {
+        let source = include_str!("router.rs");
+        let planner_fallback = source
+            .split("match scan_plan {")
+            .nth(1)
+            .and_then(|rest| rest.split("ScanPlan::FullScan =>").next())
+            .expect("planner fallback block must be present");
+
+        assert!(
+            !planner_fallback.contains(".range_read(&table_id).await?"),
+            "planner fallback range reads must not use coordinator bootstrap RF/CL defaults"
+        );
+        assert!(
+            planner_fallback.contains("range_read_with(&table_id, ctx.consistency, &table_strategy)"),
+            "planner fallback range reads must carry request consistency and keyspace replication strategy"
         );
     }
 }

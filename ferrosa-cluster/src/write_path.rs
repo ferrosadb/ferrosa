@@ -198,7 +198,27 @@ impl WritePath {
     /// empty results on failure causes data loss (see BUG: large-write-causes-
     /// data-loss-in-partition).
     pub async fn range_read(&self, table_id: &TableId) -> crate::error::Result<Vec<Partition>> {
-        let mut stream = self.range_read_stream_all(table_id, 0).await?;
+        self.range_read_with(
+            table_id,
+            ConsistencyLevel::One,
+            &ReplicationStrategy::Simple {
+                replication_factor: 1,
+            },
+        )
+        .await
+    }
+
+    /// Scatter a full-table range read with caller consistency and keyspace
+    /// replication strategy, then collect the streamed partitions.
+    pub async fn range_read_with(
+        &self,
+        table_id: &TableId,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<Vec<Partition>> {
+        let mut stream = self
+            .range_read_stream_all_with(table_id, 0, cl, strategy)
+            .await?;
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             out.push(item?);
@@ -659,6 +679,11 @@ mod tests {
                 && source.contains("strategy.replication_factor()")
                 && source.contains("coordinate_range_read_stream_all_with"),
             "cluster streaming full scans must carry caller consistency and keyspace replication into the coordinator"
+        );
+        assert!(
+            source.contains("pub async fn range_read_with")
+                && source.contains(".range_read_stream_all_with(table_id, 0, cl, strategy)"),
+            "materializing range reads must collect from the per-query streaming boundary"
         );
     }
 }
