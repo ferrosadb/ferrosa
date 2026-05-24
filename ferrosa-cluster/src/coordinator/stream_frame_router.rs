@@ -239,19 +239,13 @@ impl RpcHandler for StreamFrameRouter {
 
         let pending_after_chunk = match msg {
             Message::RangeReadStreamChunk(bytes) => {
-                let Some(pending_done) = self.accept_chunk_seq(from, request_id, bytes.as_ref())
-                else {
-                    return None;
-                };
+                let pending_done = self.accept_chunk_seq(from, request_id, bytes.as_ref())?;
                 self.route_frame(request_id, msg_type, Message::RangeReadStreamChunk(bytes));
                 pending_done
             }
             Message::RangeReadStreamDone(bytes) => {
                 let msg = Message::RangeReadStreamDone(bytes.clone());
-                let Some(route_done) = self.accept_done_seq(from, request_id, bytes.as_ref(), msg)
-                else {
-                    return None;
-                };
+                let route_done = self.accept_done_seq(from, request_id, bytes.as_ref(), msg)?;
                 if let Some(done) = route_done {
                     self.route_frame(request_id, msg_type, done);
                 }

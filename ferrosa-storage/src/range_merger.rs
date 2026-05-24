@@ -1280,7 +1280,7 @@ mod tests {
         let second = test_partition(b"pk2", 1, b"second");
         let third = test_partition(b"pk3", 1, b"third");
         let good_before = reader_from_partitions(std::slice::from_ref(&first));
-        let corrupt_reader = reader_with_truncated_tail(&[second.clone()]);
+        let corrupt_reader = reader_with_truncated_tail(std::slice::from_ref(&second));
         let good_after = reader_from_partitions(std::slice::from_ref(&third));
         let sstables = vec![
             Arc::new(good_before),

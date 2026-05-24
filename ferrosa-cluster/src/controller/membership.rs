@@ -34,21 +34,6 @@ fn cluster_member_metadata_changed(
     }
 }
 
-#[cfg(test)]
-mod streaming_contract_tests {
-    #[test]
-    fn decommission_streaming_must_not_materialize_all_partitions() {
-        let source = include_str!("membership.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production membership source must be present");
-        assert!(
-            !source.contains("read_range(&table_id, None, None, usize::MAX)"),
-            "decommission must stream partitions instead of materializing every partition with usize::MAX"
-        );
-    }
-}
-
 impl ModeController {
     /// Record that a node has been approved to join the cluster.
     ///
@@ -583,5 +568,20 @@ impl ModeController {
         });
 
         true
+    }
+}
+
+#[cfg(test)]
+mod streaming_contract_tests {
+    #[test]
+    fn decommission_streaming_must_not_materialize_all_partitions() {
+        let source = include_str!("membership.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production membership source must be present");
+        assert!(
+            !source.contains("read_range(&table_id, None, None, usize::MAX)"),
+            "decommission must stream partitions instead of materializing every partition with usize::MAX"
+        );
     }
 }
