@@ -3055,7 +3055,7 @@ mod tests {
     }
 
     #[test]
-    fn count_range_skips_truncated_sstable_and_counts_readable_sources() {
+    fn count_range_propagates_truncated_sstable_error() {
         // Given one readable SSTable and one legacy/truncated SSTable loaded
         // into the store view, matching a restart over already-corrupt files.
         let store = test_store();
@@ -3084,14 +3084,18 @@ mod tests {
             vector_indexes: Arc::clone(&current.vector_indexes),
         }));
 
-        // When COUNT(*) uses the metadata-only streaming path.
-        let count = store
+        // When COUNT(*) uses the metadata-only streaming path, the query must
+        // fail closed instead of returning a lower count that looks exact.
+        let err = store
             .count_range(None, None)
-            .expect("corrupt SSTable should not make COUNT(*) unavailable");
+            .expect_err("corrupt SSTable must make COUNT(*) fail closed");
 
-        // Then it returns the readable row count instead of surfacing
-        // read_exact_at and failing the whole query.
-        assert_eq!(count, 1);
+        assert!(
+            err.to_string().contains("read_exact_at")
+                || err.to_string().contains("unexpected EOF")
+                || err.to_string().contains("UnexpectedEof"),
+            "error should identify the SSTable read failure, got: {err}"
+        );
     }
 
     // -------------------------------------------------------------------------

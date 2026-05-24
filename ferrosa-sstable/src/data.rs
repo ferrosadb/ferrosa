@@ -1173,16 +1173,6 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             DeletionTime::LIVE
         };
 
-        if wanted.is_empty() {
-            self.pos = body_end;
-            return Ok(Row {
-                clustering,
-                cells: Vec::new(),
-                deletion,
-                primary_key_liveness: liveness,
-            });
-        }
-
         // Columns present (same as read_row).
         let columns = if is_static {
             &self.header.static_columns
@@ -1190,6 +1180,31 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             &self.header.regular_columns
         };
         let num_columns = columns.len();
+
+        if wanted.is_empty() {
+            let skipped_cells = (|| -> Result<()> {
+                let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
+                    (0..num_columns).collect()
+                } else {
+                    self.read_columns_subset(num_columns)?
+                };
+                for &col_idx in &present_columns {
+                    self.read_cell_skip(&liveness, &columns[col_idx].1)?;
+                }
+                Ok(())
+            })();
+
+            if skipped_cells.is_err() {
+                self.pos = body_end;
+            }
+
+            return Ok(Row {
+                clustering,
+                cells: Vec::new(),
+                deletion,
+                primary_key_liveness: liveness,
+            });
+        }
 
         let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
             (0..num_columns).collect()
@@ -2237,6 +2252,68 @@ mod tests {
         assert_eq!(partition.rows[0].clustering, clustering);
         assert!(partition.rows[0].cells.is_empty());
         assert!(reader.read_partition_projected(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn projected_empty_projection_counts_rows_when_legacy_row_size_overstates_body() {
+        let header = test_header();
+
+        fn row_bytes(
+            clustering_value: i32,
+            value: &[u8],
+            row_size_override: Option<u64>,
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            push_unsigned_vint(&mut body, clustering_value as u64);
+            body.push(CELL_USE_ROW_TIMESTAMP);
+            push_unsigned_vint(&mut body, value.len() as u64);
+            body.extend_from_slice(value);
+
+            let mut row = Vec::new();
+            row.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
+            push_unsigned_vint(&mut row, 0);
+            row.extend_from_slice(&clustering_value.to_be_bytes());
+            push_unsigned_vint(&mut row, row_size_override.unwrap_or(body.len() as u64));
+            push_unsigned_vint(&mut row, 0);
+            row.extend_from_slice(&body);
+            row
+        }
+
+        let second_row = row_bytes(2, b"two", None);
+        let first_body_len = {
+            let mut body = Vec::new();
+            push_unsigned_vint(&mut body, 1);
+            body.push(CELL_USE_ROW_TIMESTAMP);
+            push_unsigned_vint(&mut body, 3);
+            body.extend_from_slice(b"one");
+            body.len() as u64
+        };
+        let first_row = row_bytes(1, b"one", Some(first_body_len + second_row.len() as u64));
+
+        let mut data = Vec::new();
+        let key = b"pk_legacy_oversized_row";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.extend_from_slice(&first_row);
+        data.extend_from_slice(&second_row);
+        data.push(END_OF_PARTITION);
+
+        let full = DataReader::new(&data, &header, 0)
+            .read_partition()
+            .unwrap()
+            .expect("expected full partition");
+        assert_eq!(full.rows.len(), 2, "full decode establishes row truth");
+
+        let projected = DataReader::new(&data, &header, 0)
+            .read_partition_projected(&[])
+            .unwrap()
+            .expect("expected projected partition");
+        assert_eq!(
+            projected.rows.len(),
+            full.rows.len(),
+            "key-only projection must not skip later rows when a legacy SSTable overstates row_size"
+        );
     }
 
     #[test]

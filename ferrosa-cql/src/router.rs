@@ -284,6 +284,17 @@ fn projection_storage_ordinals(
     Some(wanted)
 }
 
+fn projection_storage_ordinals_for_count_predicates(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+) -> Option<Vec<u16>> {
+    let names: Vec<SelectColumn> = where_clauses
+        .iter()
+        .map(|wc| SelectColumn::Column(wc.column.clone()))
+        .collect();
+    projection_storage_ordinals(&names, table_meta)
+}
+
 fn is_count_only_select(columns: &[SelectColumn]) -> bool {
     !columns.is_empty()
         && columns.iter().all(|c| {
@@ -2688,20 +2699,24 @@ async fn route_select_user_table(
                 let row_limit =
                     safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
                         .unwrap_or(0);
-                // ADR-020 projection fast path. If the SELECT names
-                // a subset of regular columns and has no WHERE, route
-                // through range_read_projected so the SSTable layer
-                // byte-skips cell payloads for unprojected columns.
-                // Big win on wide tables with bulky cells (e.g.
-                // entity_store's entity_embedding column).
+                // ADR-020 projection fast path. Route through
+                // range_read_projected whenever the query only needs a subset
+                // of regular cells, so the SSTable layer byte-skips bulky
+                // unneeded payloads. Big win on wide tables with bulky cells
+                // (e.g. entity_store's entity_embedding column).
                 //
-                // Requires no WHERE (a predicate on an unprojected
-                // regular column would see NULL after the cell strip
-                // and evaluate incorrectly). LIMIT and ORDER BY are
-                // applied downstream against the projected rows
-                // unchanged — both work on whatever cells are present.
+                // Non-count SELECT requires no WHERE because predicates over
+                // unprojected regular columns would evaluate against NULL.
                 let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
                     projection_storage_ordinals(&s.columns, table_meta)
+                } else {
+                    None
+                };
+                // Count-only filtered scans project predicate columns only and
+                // fold over a partition stream, so COUNT(*) avoids decoding
+                // unrelated cells without first collecting partitions in a Vec.
+                let count_projection_wanted = if count_only_select {
+                    projection_storage_ordinals_for_count_predicates(&s.where_clauses, table_meta)
                 } else {
                     None
                 };
@@ -2755,6 +2770,20 @@ async fn route_select_user_table(
                     };
                     let count = if let Some(partitions) = partitions.as_ref() {
                         count_rows_from_partitions(partitions, row_context, predicate_context)
+                            .await?
+                    } else if let Some(wanted) = count_projection_wanted {
+                        let stream = state
+                            .write_path
+                            .load()
+                            .range_read_projected_stream_all_with(
+                                &table_id,
+                                wanted,
+                                scan_bound,
+                                ctx.consistency,
+                                &table_strategy,
+                            )
+                            .await?;
+                        count_rows_from_partition_stream(stream, row_context, predicate_context)
                             .await?
                     } else {
                         let stream = state
@@ -14197,6 +14226,74 @@ mod tests {
         assert_eq!(value, 2, "COUNT(*) should aggregate matching rows only");
     }
 
+    #[tokio::test]
+    async fn count_star_key_filtered_matches_equivalent_streamed_key_scan() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cnt_key_filter WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt = crate::parser::parse(
+            "CREATE TABLE cnt_key_filter.entities (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let tenant_a = "00000000-0000-0000-0000-000000000001";
+        let tenant_b = "00000000-0000-0000-0000-000000000002";
+        for i in 0..11 {
+            let tenant = if i < 7 { tenant_a } else { tenant_b };
+            let session = format!("10000000-0000-0000-0000-{i:012}");
+            let entity = format!("20000000-0000-0000-0000-{i:012}");
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO cnt_key_filter.entities \
+                 (tenant_id, session_id, entity_id, body) \
+                 VALUES ({tenant}, {session}, {entity}, 'row-{i}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        let count_stmt = crate::parser::parse(&format!(
+            "SELECT COUNT(*) FROM cnt_key_filter.entities \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let count_result = route(&state, &ctx, count_stmt).await.unwrap();
+        let count_value = match &count_result {
+            RouteResult::Result(b) => extract_first_bigint_value(b),
+            _ => panic!("expected count result"),
+        };
+
+        let scan_stmt = crate::parser::parse(&format!(
+            "SELECT tenant_id, session_id, entity_id FROM cnt_key_filter.entities \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let scan_result = route(&state, &ctx, scan_stmt).await.unwrap();
+        let streamed_rows = match &scan_result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected scan result"),
+        };
+
+        assert_eq!(
+            count_value, streamed_rows as i64,
+            "COUNT(*) over key-filtered broad scans must match the equivalent streamed key-column scan"
+        );
+        assert_eq!(count_value, 7);
+    }
+
     // ── ferrosa_bugs: phonetic match ────────────────────────────────────
 
     /// With a phonetic index on a text column, WHERE col = 'Jon Smyth'
@@ -15856,6 +15953,35 @@ mod tests {
                 && broad_scan.contains("ctx.consistency")
                 && broad_scan.contains("&table_strategy"),
             "broad SELECT streams must propagate the request consistency and keyspace replication strategy"
+        );
+    }
+
+    #[test]
+    fn count_filtering_scans_project_only_predicate_columns() {
+        let source = include_str!("router.rs");
+        let broad_scan = source
+            .split("let projection_wanted =")
+            .nth(1)
+            .and_then(|rest| rest.split("let partitions =").next())
+            .expect("projection decision block must be present");
+        let projected_scan = source
+            .split("let partitions = if let Some(wanted) = projection_wanted")
+            .nth(1)
+            .and_then(|rest| rest.split("if count_only_select {").next())
+            .expect("projected scan block must be present");
+
+        assert!(
+            broad_scan.contains("count_projection_wanted")
+                && broad_scan.contains("projection_storage_ordinals_for_count_predicates"),
+            "COUNT(*) filtered scans must push predicate-only projection into storage"
+        );
+        assert!(
+            source.contains("range_read_projected_stream_all_with"),
+            "COUNT(*) filtered scans must use the projected streaming range path when possible"
+        );
+        assert!(
+            !projected_scan.contains("range_read(&table_id).await?"),
+            "COUNT(*) filtered scans must not materialize full partitions"
         );
     }
 

@@ -281,10 +281,24 @@ async fn merge_local_and_single_remote_stream(
     storage: std::sync::Arc<ferrosa_storage::StorageEngine>,
     table_id: TableId,
     row_limit: usize,
+    projected_regular_ordinals: Option<Vec<u16>>,
     mut remote_rx: mpsc::Receiver<crate::error::Result<Partition>>,
     out_tx: mpsc::Sender<crate::error::Result<Partition>>,
 ) {
-    let mut local_stream = storage.range_iter(&table_id, None, None);
+    let mut local_stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals
+    {
+        Box::pin(
+            storage
+                .range_iter_projected(&table_id, wanted, None, None, None)
+                .map(|item| item.map_err(ClusterError::Storage)),
+        )
+    } else {
+        Box::pin(
+            storage
+                .range_iter(&table_id, None, None)
+                .map(|item| item.map_err(ClusterError::Storage)),
+        )
+    };
     let mut local_next = local_stream.next().await;
     let mut remote_next = remote_rx.recv().await;
 
@@ -292,7 +306,7 @@ async fn merge_local_and_single_remote_stream(
         match (local_next.take(), remote_next.take()) {
             (None, None) => return,
             (Some(Err(err)), _) => {
-                let _ = out_tx.send(Err(ClusterError::Storage(err))).await;
+                let _ = out_tx.send(Err(err)).await;
                 return;
             }
             (_, Some(Err(err))) => {
@@ -390,6 +404,41 @@ impl ClusterCoordinator {
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
+        self.coordinate_range_read_stream_all_with_projection(
+            table_id,
+            row_limit,
+            cl,
+            replication_factor,
+            None,
+        )
+        .await
+    }
+
+    pub async fn coordinate_range_read_projected_stream_all_with(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        cl: crate::consistency::ConsistencyLevel,
+        replication_factor: usize,
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        self.coordinate_range_read_stream_all_with_projection(
+            table_id,
+            0,
+            cl,
+            replication_factor,
+            Some(wanted),
+        )
+        .await
+    }
+
+    async fn coordinate_range_read_stream_all_with_projection(
+        &self,
+        table_id: &TableId,
+        row_limit: usize,
+        cl: crate::consistency::ConsistencyLevel,
+        replication_factor: usize,
+        projected_regular_ordinals: Option<Vec<u16>>,
+    ) -> crate::error::Result<ClusterPartitionStream> {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
         let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
@@ -418,14 +467,26 @@ impl ClusterCoordinator {
         }
 
         if expected_done == 0 {
-            let stream = self
-                .storage
-                .range_iter(table_id, None, None)
-                .map(move |item| {
-                    let partition = item.map_err(ClusterError::Storage)?;
-                    Ok(apply_row_limit(partition, row_limit))
-                });
-            return Ok(Box::pin(stream));
+            let stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals {
+                Box::pin(
+                    self.storage
+                        .range_iter_projected(table_id, wanted, None, None, None)
+                        .map(move |item| {
+                            let partition = item.map_err(ClusterError::Storage)?;
+                            Ok(apply_row_limit(partition, row_limit))
+                        }),
+                )
+            } else {
+                Box::pin(
+                    self.storage
+                        .range_iter(table_id, None, None)
+                        .map(move |item| {
+                            let partition = item.map_err(ClusterError::Storage)?;
+                            Ok(apply_row_limit(partition, row_limit))
+                        }),
+                )
+            };
+            return Ok(stream);
         }
 
         let request_id = self.next_stream_request_id();
@@ -437,6 +498,7 @@ impl ClusterCoordinator {
             request_id,
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
+            projected_regular_ordinals: projected_regular_ordinals.clone(),
         };
         let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
             ClusterError::Internal(format!("streaming range read: encode request: {e}"))
@@ -471,8 +533,15 @@ impl ClusterCoordinator {
         let storage = self.storage.clone();
         let table_id = table_id.clone();
         tokio::spawn(async move {
-            merge_local_and_single_remote_stream(storage, table_id, row_limit, remote_rx, out_tx)
-                .await;
+            merge_local_and_single_remote_stream(
+                storage,
+                table_id,
+                row_limit,
+                projected_regular_ordinals,
+                remote_rx,
+                out_tx,
+            )
+            .await;
         });
 
         let stream = futures::stream::unfold(out_rx, |mut rx| async move {
@@ -572,6 +641,7 @@ impl ClusterCoordinator {
             request_id,
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
+            projected_regular_ordinals: None,
         };
         let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
             ClusterError::Internal(format!("streaming range read: encode request: {e}"))

@@ -43,6 +43,18 @@ fn local_range_stream(
     Box::pin(stream)
 }
 
+fn local_projected_range_stream(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    wanted: Vec<u16>,
+    partition_limit: Option<usize>,
+) -> PartitionResultStream {
+    let stream = engine
+        .range_iter_projected(table_id, wanted, partition_limit, None, None)
+        .map(|item| item.map_err(crate::error::ClusterError::Storage));
+    Box::pin(stream)
+}
+
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
 ///
@@ -305,6 +317,52 @@ impl WritePath {
             Self::Cluster(coordinator) => coordinator.coordinate_range_count(table_id),
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "count_range unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
+    /// Projection-aware streaming range read for query shapes that only need a
+    /// subset of regular cells to evaluate predicates. This keeps COUNT(*) with
+    /// ALLOW FILTERING on wide tables out of the Vec-returning materialization
+    /// path while preserving fail-closed consistency semantics.
+    pub async fn range_read_projected_stream_all_with(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        partition_limit: Option<usize>,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<PartitionResultStream> {
+        match self {
+            Self::Direct(engine) => Ok(local_projected_range_stream(
+                engine.clone(),
+                table_id,
+                wanted,
+                partition_limit,
+            )),
+            Self::Pair(coordinator) => Ok(local_projected_range_stream(
+                coordinator.local_storage().clone(),
+                table_id,
+                wanted,
+                partition_limit,
+            )),
+            Self::Cluster(coordinator) => {
+                if partition_limit.is_some() {
+                    return Err(crate::error::ClusterError::Internal(
+                        "projected cluster range scan with partition_limit is not implemented; refusing to return partial results".into(),
+                    ));
+                }
+                coordinator
+                    .coordinate_range_read_projected_stream_all_with(
+                        table_id,
+                        wanted,
+                        cl,
+                        strategy.replication_factor(),
+                    )
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range_read_projected unavailable: write path is in degraded mode".into(),
             )),
         }
     }
@@ -684,6 +742,16 @@ mod tests {
             source.contains("pub async fn range_read_with")
                 && source.contains(".range_read_stream_all_with(table_id, 0, cl, strategy)"),
             "materializing range reads must collect from the per-query streaming boundary"
+        );
+        let projected_body = source
+            .split("pub async fn range_read_projected_stream_all_with")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Projection-aware range read").next())
+            .expect("projected streaming range-read body must be present");
+        assert!(
+            projected_body.contains("local_projected_range_stream")
+                && projected_body.contains("coordinate_range_read_projected_stream_all_with"),
+            "projected scans must expose a stream and fail clearly when cluster semantics would under-read"
         );
     }
 }

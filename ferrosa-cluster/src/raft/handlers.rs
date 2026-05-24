@@ -1138,6 +1138,11 @@ pub struct RangeReadStreamRequestPayload {
     pub request_id: u32,
     pub keyspace: String,
     pub table: String,
+    /// Optional current-schema regular-column ordinals to decode. `None`
+    /// streams full partitions; `Some` uses the projected SSTable reader so
+    /// wide cells not needed by the query are byte-skipped on remote replicas.
+    #[serde(default)]
+    pub projected_regular_ordinals: Option<Vec<u16>>,
 }
 
 /// Handler → coordinator: one batch of partitions belonging to a
@@ -1859,6 +1864,7 @@ mod tests {
             request_id: 7,
             keyspace: "agent_memory".into(),
             table: "entity_store".into(),
+            projected_regular_ordinals: None,
         };
         let encoded = bincode::serialize(&req).expect("encode request");
         let decoded: RangeReadStreamRequestPayload =

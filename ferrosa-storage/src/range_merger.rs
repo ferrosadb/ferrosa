@@ -355,7 +355,7 @@ pub enum RunMode<'a> {
 
 impl<'a> RunMode<'a> {
     fn is_fail_soft(self) -> bool {
-        matches!(self, Self::Metadata | Self::Projected(_))
+        false
     }
 
     fn label(self) -> &'static str {
@@ -1275,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_range_merger_skips_truncated_sstable_tail_and_keeps_streaming() {
+    fn projected_range_merger_propagates_truncated_sstable_tail_error() {
         let first = test_partition(b"pk1", 1, b"first");
         let second = test_partition(b"pk2", 1, b"second");
         let third = test_partition(b"pk3", 1, b"third");
@@ -1299,14 +1299,18 @@ mod tests {
         )
         .unwrap();
 
-        let mut keys = Vec::new();
-        while let Some(partition) = merger
+        assert!(
+            merger.next_merged_partition().unwrap().is_some(),
+            "first readable partition should still be emitted"
+        );
+        let err = merger
             .next_merged_partition()
-            .expect("projected range stream should skip corrupt SSTable sources")
-        {
-            keys.push(partition.key.key.as_bytes().to_vec());
-        }
-
-        assert_eq!(keys, vec![b"pk1".to_vec(), b"pk3".to_vec()]);
+            .expect_err("projected range scan must fail closed on corrupt SSTable data");
+        assert!(
+            err.to_string().contains("read_exact_at")
+                || err.to_string().contains("unexpected EOF")
+                || err.to_string().contains("UnexpectedEof"),
+            "error should identify the SSTable read failure, got: {err}"
+        );
     }
 }
