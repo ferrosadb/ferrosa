@@ -93,6 +93,7 @@ pub struct DataReader<'a, R: ReadAt> {
     reader: &'a R,
     header: &'a SerializationHeader,
     pos: u64,
+    legacy_fixed_value_lengths: bool,
 }
 
 impl<'a, R: ReadAt> DataReader<'a, R> {
@@ -102,7 +103,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             reader,
             header,
             pos: start_pos,
+            legacy_fixed_value_lengths: false,
         }
+    }
+
+    fn missing_partition_end_error() -> Error {
+        Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "unexpected EOF: missing END_OF_PARTITION marker after row data",
+        ))
     }
 
     /// Read the next partition from the data file.
@@ -166,6 +175,9 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // `stream_clustered_rows` sees the same byte we just
         // peeked at.
         let saved_pos = self.pos;
+        if saved_pos >= file_len {
+            return Ok(Some((key, deletion, None)));
+        }
         let mut flags_buf = [0u8; 1];
         self.reader.read_exact_at(&mut flags_buf, self.pos)?;
         let flags = flags_buf[0];
@@ -272,7 +284,11 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     where
         F: FnMut(&Row) -> Result<()>,
     {
+        let file_len = self.reader.len()?;
         loop {
+            if self.pos >= file_len {
+                return Err(Self::missing_partition_end_error());
+            }
             let mut flags_buf = [0u8; 1];
             self.reader.read_exact_at(&mut flags_buf, self.pos)?;
             self.pos += 1;
@@ -327,6 +343,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
         let mut static_row: Option<Row> = None;
         loop {
+            if self.pos >= file_len {
+                if static_row.is_some() {
+                    return Err(Self::missing_partition_end_error());
+                }
+                break;
+            }
             let mut flags_buf = [0u8; 1];
             self.reader.read_exact_at(&mut flags_buf, self.pos)?;
             self.pos += 1;
@@ -414,6 +436,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
         let mut row_count: u64 = 0;
         loop {
+            if self.pos >= file_len {
+                if row_count > 0 {
+                    return Err(Self::missing_partition_end_error());
+                }
+                break;
+            }
             let mut flags_buf = [0u8; 1];
             self.reader.read_exact_at(&mut flags_buf, self.pos)?;
             self.pos += 1;
@@ -498,6 +526,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let mut rows = Vec::new();
 
         loop {
+            if self.pos >= file_len {
+                if static_row.is_some() || !rows.is_empty() {
+                    return Err(Self::missing_partition_end_error());
+                }
+                break;
+            }
             let mut flags_buf = [0u8; 1];
             self.reader.read_exact_at(&mut flags_buf, self.pos)?;
             self.pos += 1;
@@ -540,41 +574,46 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// then byte-skip past the cells. The returned `Row` has
     /// `cells: Vec::new()`. Used by `read_partition_metadata`.
     fn read_row_metadata(&mut self, flags: u8, is_static: bool) -> Result<Row> {
+        self.legacy_fixed_value_lengths = false;
         // Clustering (same shape as read_row).
         let clustering = if is_static {
             Vec::new()
         } else {
             let num_clustering = self.header.clustering_types.len();
-            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-            self.pos += n as u64;
 
             let mut ck_bytes = Vec::new();
-            for i in 0..num_clustering {
-                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
-                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
-                if is_null || is_empty {
-                    continue;
-                }
-                let type_name = &self.header.clustering_types[i];
-                let vlen = match marshal::value_length_if_fixed(type_name) {
-                    Some(fixed_len) => fixed_len,
-                    None => {
-                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-                        self.pos += n as u64;
-                        len as usize
-                    }
-                };
-                let mut vbuf = vec![0u8; vlen];
-                self.reader.read_exact_at(&mut vbuf, self.pos)?;
-                self.pos += vlen as u64;
+            if num_clustering > 0 {
+                let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
 
-                if num_clustering > 1 {
-                    ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                for i in 0..num_clustering {
+                    let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                    let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+                    if is_null || is_empty {
+                        continue;
+                    }
+                    let type_name = &self.header.clustering_types[i];
+                    let vlen = match marshal::value_length_if_fixed(type_name) {
+                        Some(fixed_len) => fixed_len,
+                        None => {
+                            let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                            self.pos += n as u64;
+                            len as usize
+                        }
+                    };
+                    let mut vbuf = vec![0u8; vlen];
+                    self.reader.read_exact_at(&mut vbuf, self.pos)?;
+                    self.pos += vlen as u64;
+
+                    if num_clustering > 1 {
+                        ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                    }
+                    ck_bytes.extend_from_slice(&vbuf);
                 }
-                ck_bytes.extend_from_slice(&vbuf);
             }
             ck_bytes
         };
+        self.maybe_skip_legacy_empty_clustering_prefix(flags, is_static)?;
 
         // Row body size — pins where the body ends so we can skip
         // cells regardless of liveness/deletion encoding length.
@@ -696,10 +735,17 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// Read rows until `END_OF_PARTITION`, retaining at most `row_limit`
     /// clustered rows while still advancing to the next partition boundary.
     fn read_rows_limited(&mut self, row_limit: usize) -> Result<(Option<Row>, Vec<Row>)> {
+        let file_len = self.reader.len()?;
         let mut static_row = None;
         let mut rows = Vec::new();
 
         loop {
+            if self.pos >= file_len {
+                if static_row.is_some() || !rows.is_empty() {
+                    return Err(Self::missing_partition_end_error());
+                }
+                break;
+            }
             let mut flags_buf = [0u8; 1];
             self.reader.read_exact_at(&mut flags_buf, self.pos)?;
             self.pos += 1;
@@ -750,7 +796,8 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     }
 
     /// Skip a row after its flags and extended flags have already been consumed.
-    fn skip_row_body(&mut self, _flags: u8, is_static: bool) -> Result<()> {
+    fn skip_row_body(&mut self, flags: u8, is_static: bool) -> Result<()> {
+        self.legacy_fixed_value_lengths = false;
         let num_clustering = self.header.clustering_types.len();
         if !is_static && num_clustering > 0 {
             let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -776,6 +823,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 self.pos += vlen as u64;
             }
         }
+        self.maybe_skip_legacy_empty_clustering_prefix(flags, is_static)?;
 
         let (row_body_len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
@@ -785,8 +833,51 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         Ok(())
     }
 
+    /// Older Ferrosa SSTables wrote an empty ClusteringPrefix varint (`0`) even
+    /// for tables with no clustering columns. Current files correctly start the
+    /// row body with `row_body_len`. Treat an otherwise-invalid zero body length
+    /// followed by a positive, in-bounds candidate body size as that legacy
+    /// prefix, but keep true in-row truncation as an error.
+    fn maybe_skip_legacy_empty_clustering_prefix(
+        &mut self,
+        flags: u8,
+        is_static: bool,
+    ) -> Result<()> {
+        if is_static || !self.header.clustering_types.is_empty() {
+            return Ok(());
+        }
+
+        let saved = self.pos;
+        let (first, n1) = varint::read_unsigned_vint_at(self.reader, saved)?;
+        if first != 0 || flags & (HAS_TIMESTAMP | HAS_TTL | HAS_DELETION | HAS_ALL_COLUMNS) == 0 {
+            return Ok(());
+        }
+
+        let file_len = self.reader.len()?;
+        let candidate_pos = saved + n1 as u64;
+        if candidate_pos >= file_len {
+            return Ok(());
+        }
+        let (candidate_row_size, n2) = varint::read_unsigned_vint_at(self.reader, candidate_pos)?;
+        if candidate_row_size == 0 {
+            return Ok(());
+        }
+        let prev_pos = candidate_pos + n2 as u64;
+        if prev_pos >= file_len {
+            return Ok(());
+        }
+        let (_prev_size, n3) = varint::read_unsigned_vint_at(self.reader, prev_pos)?;
+        let body_start = prev_pos + n3 as u64;
+        if body_start.saturating_add(candidate_row_size) <= file_len {
+            self.legacy_fixed_value_lengths = true;
+            self.pos = candidate_pos;
+        }
+        Ok(())
+    }
+
     /// Read a single row given its already-consumed flags byte.
     fn read_row(&mut self, flags: u8, is_static: bool) -> Result<Row> {
+        self.legacy_fixed_value_lengths = false;
         // Clustering key (not present for static rows)
         //
         // Cassandra 5.x ClusteringPrefix format:
@@ -838,6 +929,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
             ck_bytes
         };
+        self.maybe_skip_legacy_empty_clustering_prefix(flags, is_static)?;
 
         // Row body size (serialized row size varint — we skip this, it's used
         // for skipping rows during filtering but we always read fully).
@@ -942,6 +1034,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let mut rows = Vec::new();
 
         loop {
+            if self.pos >= file_len {
+                if static_row.is_some() || !rows.is_empty() {
+                    return Err(Self::missing_partition_end_error());
+                }
+                break;
+            }
             let mut flags_buf = [0u8; 1];
             self.reader.read_exact_at(&mut flags_buf, self.pos)?;
             self.pos += 1;
@@ -986,6 +1084,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// returned `Row.cells` contains only the cells the caller asked
     /// for.
     fn read_row_projected(&mut self, flags: u8, is_static: bool, wanted: &[u16]) -> Result<Row> {
+        self.legacy_fixed_value_lengths = false;
         // Clustering (same as read_row).
         let clustering = if is_static {
             Vec::new()
@@ -1024,12 +1123,20 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
             ck_bytes
         };
+        self.maybe_skip_legacy_empty_clustering_prefix(flags, is_static)?;
 
-        // Row body size + prev size (same as read_row).
-        let (_row_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        // Row body size + prev size. The size bounds the liveness,
+        // deletion, missing-column subset, and cell bytes. Key-only
+        // projections must be able to skip the cell area without decoding it;
+        // older Ferrosa SSTables can contain legacy sparse rows whose body
+        // metadata is sufficient for clustering-key scans but whose cell area
+        // is not decodable by the current cell reader.
+        let (row_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
         let (_prev_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
+        let body_start = self.pos;
+        let body_end = body_start + row_size;
 
         // Liveness.
         let mut liveness = LivenessInfo::NONE;
@@ -1065,6 +1172,16 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         } else {
             DeletionTime::LIVE
         };
+
+        if wanted.is_empty() {
+            self.pos = body_end;
+            return Ok(Row {
+                clustering,
+                cells: Vec::new(),
+                deletion,
+                primary_key_liveness: liveness,
+            });
+        }
 
         // Columns present (same as read_row).
         let columns = if is_static {
@@ -1104,6 +1221,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     }
 
     fn read_columns_subset(&mut self, num_columns: usize) -> Result<Vec<usize>> {
+        let saved_pos = self.pos;
         let (encoded, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
         if encoded == 0 {
@@ -1120,9 +1238,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 missing >>= 1;
             }
             if missing != 0 {
-                return Err(Error::InvalidData(format!(
-                    "columns subset has bits beyond {num_columns} columns"
-                )));
+                return self.read_legacy_raw_present_columns_subset(saved_pos, num_columns);
             }
             return Ok(present);
         }
@@ -1157,6 +1273,33 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
             Ok((0..num_columns).filter(|idx| !is_missing[*idx]).collect())
         }
+    }
+
+    fn read_legacy_raw_present_columns_subset(
+        &mut self,
+        start_pos: u64,
+        num_columns: usize,
+    ) -> Result<Vec<usize>> {
+        let bitmap_bytes = num_columns.div_ceil(8);
+        if bitmap_bytes == 0 {
+            self.pos = start_pos;
+            return Ok(Vec::new());
+        }
+
+        let mut bitmap = vec![0u8; bitmap_bytes];
+        self.reader.read_exact_at(&mut bitmap, start_pos)?;
+        self.pos = start_pos + bitmap_bytes as u64;
+        self.legacy_fixed_value_lengths = true;
+
+        let mut present = Vec::with_capacity(num_columns);
+        for idx in 0..num_columns {
+            let byte_idx = idx / 8;
+            let bit_idx = 7 - (idx % 8);
+            if bitmap[byte_idx] & (1 << bit_idx) != 0 {
+                present.push(idx);
+            }
+        }
+        Ok(present)
     }
 
     // -----------------------------------------------------------------------
@@ -1200,6 +1343,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         }
         if !has_empty_value {
             let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(column_type) {
+                if self.legacy_fixed_value_lengths {
+                    let saved = self.pos;
+                    let (encoded_len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                    if encoded_len == fixed_len as u64 {
+                        self.pos += n as u64;
+                    } else {
+                        self.pos = saved;
+                    }
+                }
                 fixed_len as u64
             } else {
                 let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1273,6 +1425,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             None
         } else {
             let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(column_type) {
+                if self.legacy_fixed_value_lengths {
+                    let saved = self.pos;
+                    let (encoded_len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                    if encoded_len == fixed_len as u64 {
+                        self.pos += n as u64;
+                    } else {
+                        self.pos = saved;
+                    }
+                }
                 fixed_len
             } else {
                 let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1756,6 +1917,114 @@ mod tests {
     }
 
     #[test]
+    fn read_partition_accepts_legacy_raw_present_column_bitmap() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"col_a".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"col_b".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+            ],
+        };
+
+        let mut row_body = Vec::new();
+        push_unsigned_vint(&mut row_body, 10);
+        // Legacy Ferrosa raw bitmap: bit 7 = column 0 present,
+        // bit 6 = column 1 missing. This is not a Cassandra vint.
+        row_body.push(0x80);
+        row_body.push(CELL_USE_ROW_TIMESTAMP);
+        let value = b"legacy_a";
+        push_unsigned_vint(&mut row_body, value.len() as u64);
+        row_body.extend_from_slice(value);
+
+        let mut data = Vec::new();
+        let key = b"pk_legacy_bitmap";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP);
+        let clustering = [0x00u8, 0x00, 0x00, 0x06];
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&clustering);
+        push_unsigned_vint(&mut data, row_body.len() as u64);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&row_body);
+        data.push(END_OF_PARTITION);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let partition = reader
+            .read_partition()
+            .expect("legacy raw present bitmap must be readable")
+            .expect("expected partition");
+
+        let row = &partition.rows[0];
+        assert_eq!(row.cells.len(), 1);
+        assert_eq!(row.cells[0].0, 0);
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(value.as_slice()));
+    }
+
+    #[test]
+    fn legacy_raw_bitmap_rows_accept_fixed_width_value_length_prefixes() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"created_at".to_vec(),
+                "org.apache.cassandra.db.marshal.TimestampType".into(),
+            )],
+        };
+
+        let created_at = 1_800_000i64.to_be_bytes();
+        let mut row_body = Vec::new();
+        push_unsigned_vint(&mut row_body, 10);
+        row_body.push(0x80); // legacy raw bitmap: column 0 present
+        row_body.push(CELL_USE_ROW_TIMESTAMP);
+        row_body.push(8); // legacy writer length-prefixed fixed-width values
+        row_body.extend_from_slice(&created_at);
+
+        let mut data = Vec::new();
+        let key = b"pk_legacy_fixed";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP);
+        let clustering = [0x00u8, 0x00, 0x00, 0x07];
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&clustering);
+        push_unsigned_vint(&mut data, row_body.len() as u64);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&row_body);
+        data.push(END_OF_PARTITION);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let partition = reader
+            .read_partition()
+            .expect("legacy fixed-width cell must be readable")
+            .expect("expected partition");
+
+        let row = &partition.rows[0];
+        assert_eq!(row.cells.len(), 1);
+        assert_eq!(row.cells[0].0, 0);
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(created_at.as_slice()));
+    }
+
+    #[test]
     fn read_partition_without_clustering_columns_starts_at_row_body_length() {
         let header = SerializationHeader {
             min_timestamp: 1_000_000,
@@ -1799,6 +2068,64 @@ mod tests {
         assert!(row.clustering.is_empty());
         assert_eq!(row.primary_key_liveness.timestamp, 1_000_042);
         assert_eq!(row.cells[0].1.value.as_deref(), Some(value.as_slice()));
+    }
+
+    #[test]
+    fn read_projected_without_clustering_columns_accepts_legacy_empty_prefix() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"applied_at".to_vec(),
+                    "org.apache.cassandra.db.marshal.TimestampType".into(),
+                ),
+                (
+                    b"val".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+            ],
+        };
+
+        let mut row_body = Vec::new();
+        push_unsigned_vint(&mut row_body, 42);
+        row_body.push(CELL_USE_ROW_TIMESTAMP);
+        row_body.push(8);
+        let timestamp = 1_800_000i64.to_be_bytes();
+        row_body.extend_from_slice(&timestamp);
+        row_body.push(CELL_USE_ROW_TIMESTAMP);
+        let value = b"legacy";
+        push_unsigned_vint(&mut row_body, value.len() as u64);
+        row_body.extend_from_slice(value);
+
+        let mut data = Vec::new();
+        let key = b"pk_no_ck_legacy";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
+        push_unsigned_vint(&mut data, 0);
+        push_unsigned_vint(&mut data, row_body.len() as u64);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&row_body);
+        data.push(END_OF_PARTITION);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let partition = reader
+            .read_partition_projected(&[0, 1])
+            .unwrap()
+            .expect("expected partition");
+
+        let row = &partition.rows[0];
+        assert!(row.clustering.is_empty());
+        assert_eq!(row.primary_key_liveness.timestamp, 1_000_042);
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(timestamp.as_slice()));
+        assert_eq!(row.cells[1].1.value.as_deref(), Some(value.as_slice()));
     }
 
     #[test]
@@ -1853,6 +2180,63 @@ mod tests {
             row.cells[0].1.value.as_deref(),
             Some(42i32.to_be_bytes().as_slice())
         );
+    }
+
+    #[test]
+    fn projected_empty_projection_skips_sparse_row_body_without_cell_decode() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.UUIDType".into()],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"entity_name".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"entity_type".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+            ],
+        };
+
+        let clustering = [0x33u8; 16];
+        let mut row_body = Vec::new();
+        push_unsigned_vint(&mut row_body, 42);
+        // Legacy sparse row marker observed in old entity_store SSTables:
+        // parsing this as "all regular columns are present" forces cell
+        // decoding into the END_OF_PARTITION byte and drops the whole SSTable.
+        push_unsigned_vint(&mut row_body, 0);
+        row_body.push(0);
+
+        let mut data = Vec::new();
+        let key = b"pk_projected_keys";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&clustering);
+        push_unsigned_vint(&mut data, row_body.len() as u64);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&row_body);
+        data.push(END_OF_PARTITION);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let partition = reader
+            .read_partition_projected(&[])
+            .expect("key-only projection must not decode sparse row cells")
+            .expect("expected partition");
+
+        assert_eq!(partition.key.key.as_bytes(), key);
+        assert_eq!(partition.rows.len(), 1);
+        assert_eq!(partition.rows[0].clustering, clustering);
+        assert!(partition.rows[0].cells.is_empty());
+        assert!(reader.read_partition_projected(&[]).unwrap().is_none());
     }
 
     #[test]

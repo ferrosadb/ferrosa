@@ -2553,18 +2553,18 @@ async fn route_select_user_table(
 
                 // Use a bounded upstream partition cap for unordered,
                 // non-aggregate scans so first pages do not wait behind an
-                // unbounded table materialization.  When ALLOW FILTERING has
-                // post-filter predicates, the SQL LIMIT cannot safely be used
-                // as the storage partition cap: LIMIT 1 may need to inspect
-                // many non-matching partitions before finding the first
-                // matching row.  In that shape, keep the existing hard range
-                // cap and apply LIMIT after filtering.  Ordered and aggregate
-                // queries still materialize their scan window before
-                // sorting/counting.
+                // unbounded table materialization. When ALLOW FILTERING has
+                // post-filter predicates, no upstream partition cap is safe:
+                // LIMIT 1 may need to inspect many non-matching partitions
+                // before finding the first matching row, and a fixed cap would
+                // silently drop later matches. In that shape, stream the full
+                // table and apply LIMIT/page semantics after filtering.
+                // Ordered and aggregate queries still materialize their scan
+                // window before sorting/counting.
                 let scan_bound = if s.order_by.is_empty() && !count_only_select {
                     let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
                     if has_post_filter {
-                        Some(ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT)
+                        None
                     } else {
                         let page_size = ctx
                             .paging
@@ -2918,6 +2918,16 @@ async fn route_select_user_table(
     // Apply toJson() built-in on projected columns.
     let selected_rows =
         apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
+
+    let selected_rows = if s.distinct {
+        let mut seen = std::collections::BTreeSet::new();
+        selected_rows
+            .into_iter()
+            .filter(|row| seen.insert(row.clone()))
+            .collect()
+    } else {
+        selected_rows
+    };
 
     // Apply LIMIT
     let limit_val = s.limit.as_ref().and_then(|l| l.as_literal());
@@ -11832,6 +11842,192 @@ mod tests {
         assert_eq!(
             limited_count, 1,
             "tenant-only partition-key LIMIT should return exactly one row, got {limited_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_filtering_partial_composite_partition_key_scans_all_matching_partitions() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE edge_scan WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE edge_scan.typed_edges (
+                    tenant_id uuid,
+                    session_id uuid,
+                    src_id uuid,
+                    edge_type text,
+                    dst_id uuid,
+                    weight double,
+                    PRIMARY KEY ((tenant_id, session_id), src_id, edge_type, dst_id)
+                )",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let tenant_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let tenant_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let matching_rows = ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT + 2;
+        for i in 0..matching_rows {
+            let suffix = format!("{:012x}", i + 1);
+            let session = format!("00000000-0000-0000-0000-{suffix}");
+            let src = format!("10000000-0000-0000-0000-{suffix}");
+            let dst = format!("20000000-0000-0000-0000-{suffix}");
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO edge_scan.typed_edges \
+                     (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                     VALUES ({tenant_a}, {session}, {src}, 'related_to', {dst}, 1.0)"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(&format!(
+                "INSERT INTO edge_scan.typed_edges \
+                 (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                 VALUES ({tenant_b}, 00000000-0000-0000-0000-000000000001, \
+                         30000000-0000-0000-0000-000000000001, 'related_to', \
+                         40000000-0000-0000-0000-000000000001, 1.0)"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let stmt = crate::parser::parse(&format!(
+            "SELECT src_id, edge_type, dst_id FROM edge_scan.typed_edges \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, matching_rows as i32,
+            "ALLOW FILTERING on the first component of a composite partition key must scan every matching tenant/session partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_distinct_tenant_id_returns_unique_partition_key_components() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE distinct_scan WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE distinct_scan.typed_edges (
+                    tenant_id uuid,
+                    session_id uuid,
+                    src_id uuid,
+                    edge_type text,
+                    dst_id uuid,
+                    weight double,
+                    PRIMARY KEY ((tenant_id, session_id), src_id, edge_type, dst_id)
+                )",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        for (tenant, session, src, dst) in [
+            (
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "00000000-0000-0000-0000-000000000001",
+                "10000000-0000-0000-0000-000000000001",
+                "20000000-0000-0000-0000-000000000001",
+            ),
+            (
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "00000000-0000-0000-0000-000000000002",
+                "10000000-0000-0000-0000-000000000002",
+                "20000000-0000-0000-0000-000000000002",
+            ),
+            (
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "00000000-0000-0000-0000-000000000003",
+                "10000000-0000-0000-0000-000000000003",
+                "20000000-0000-0000-0000-000000000003",
+            ),
+        ] {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO distinct_scan.typed_edges \
+                     (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                     VALUES ({tenant}, {session}, {src}, 'related_to', {dst}, 1.0)"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT DISTINCT tenant_id FROM distinct_scan.typed_edges")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, 2,
+            "SELECT DISTINCT tenant_id must deduplicate repeated tenant partition-key components"
         );
     }
 

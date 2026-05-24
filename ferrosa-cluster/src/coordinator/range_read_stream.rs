@@ -160,7 +160,151 @@ async fn read_local_range_stream_limited_rows(
     Ok(partitions)
 }
 
+async fn read_local_range_stream_all(
+    storage: &ferrosa_storage::StorageEngine,
+    table_id: &TableId,
+    row_limit: usize,
+) -> ferrosa_common::Result<Vec<Partition>> {
+    let mut stream = storage.range_iter(table_id, None, None);
+    let mut partitions = Vec::new();
+
+    while let Some(next) = stream.next().await {
+        let mut partition = next?;
+        if row_limit > 0 {
+            partition.rows.truncate(row_limit);
+        }
+        partitions.push(partition);
+    }
+
+    Ok(partitions)
+}
+
 impl ClusterCoordinator {
+    /// Uncapped streaming range-read entry point.
+    ///
+    /// This is used by full-table CQL scans whose result must be complete
+    /// (`ALLOW FILTERING`, `SELECT DISTINCT`, and uncapped `SELECT *`). The
+    /// legacy materializing range RPC is intentionally not used here because it
+    /// applies `DEFAULT_RANGE_READ_LIMIT` and would silently return partial
+    /// query results.
+    pub async fn coordinate_range_read_stream_all(
+        &self,
+        table_id: &TableId,
+        row_limit: usize,
+    ) -> crate::error::Result<Vec<Partition>> {
+        let ring = self.ring.load();
+        let node_ids = ring.node_ids();
+        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
+            .iter()
+            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
+            .collect();
+        drop(ring);
+
+        let local_id = self.local_node_id;
+        let node_count = nodes.len();
+        let all_remotes: Vec<(uuid::Uuid, String)> = nodes
+            .iter()
+            .filter(|(id, _)| *id != local_id)
+            .filter_map(|(_, host)| host.clone())
+            .collect();
+        let cl_remote_count = remote_count_for_cl(
+            self.default_cl,
+            self.default_rf,
+            node_count,
+            all_remotes.len(),
+        );
+        let remotes: Vec<(uuid::Uuid, String)> =
+            all_remotes.into_iter().take(cl_remote_count).collect();
+        let expected_done = remotes.len();
+
+        let mut all_partitions =
+            match read_local_range_stream_all(self.storage.as_ref(), table_id, row_limit).await {
+                Ok(ps) => ps,
+                Err(e) => return Err(ClusterError::Storage(e)),
+            };
+
+        if expected_done == 0 {
+            return Ok(dedup_by_token(all_partitions));
+        }
+
+        let request_id = self.next_stream_request_id();
+        let receiver = self
+            .stream_router
+            .register(request_id, STREAM_RECEIVER_BUFFER);
+
+        let req_payload = RangeReadStreamRequestPayload {
+            request_id,
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+        };
+        let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
+            ClusterError::Internal(format!("streaming range read: encode request: {e}"))
+        })?);
+
+        let mut fire_failures: Vec<(uuid::Uuid, String)> = Vec::new();
+        for (host_id, _addr) in &remotes {
+            if let Err(e) = self
+                .peer_manager
+                .fire(
+                    *host_id,
+                    Message::RangeReadStreamRequest(req_body.clone()),
+                    Lane::Bulk,
+                )
+                .await
+            {
+                fire_failures.push((
+                    *host_id,
+                    format!("streaming range read: failed to fire request: {e}"),
+                ));
+            }
+        }
+
+        if fire_failures.len() == expected_done && expected_done > 0 {
+            self.stream_router.unregister(request_id);
+            return Err(ClusterError::Internal(format!(
+                "streaming range read: every replica fire failed ({fire_failures:?})"
+            )));
+        }
+
+        let result = consume_range_stream(
+            receiver,
+            STREAMING_IDLE_TIMEOUT,
+            expected_done.saturating_sub(fire_failures.len()),
+            request_id,
+        )
+        .await;
+        self.stream_router.unregister(request_id);
+
+        match result {
+            Ok(outcome) => {
+                all_partitions.extend(outcome.partitions);
+                if outcome.any_truncated || !fire_failures.is_empty() {
+                    tracing::warn!(
+                        request_id,
+                        fire_failures = ?fire_failures,
+                        any_truncated = outcome.any_truncated,
+                        "streaming range read: partial — some replicas could not be reached"
+                    );
+                }
+                Ok(dedup_by_token(all_partitions))
+            }
+            Err(StreamConsumeError::IdleTimeout { idle_timeout, .. }) => {
+                Err(ClusterError::Internal(format!(
+                    "streaming range read: idle timeout after {idle_timeout:?}"
+                )))
+            }
+            Err(StreamConsumeError::ChannelClosedBeforeDone {
+                delivered_done,
+                expected_done,
+            }) => Err(ClusterError::Internal(format!(
+                "streaming range read: channel closed after {delivered_done}/{expected_done} Done frames"
+            ))),
+            Err(e) => Err(ClusterError::Internal(format!(
+                "streaming range read: {e:?}"
+            ))),
+        }
+    }
+
     /// ADR-020 streaming range-read entry point.
     ///
     /// Registers a per-call route on the shared `StreamRouter`,

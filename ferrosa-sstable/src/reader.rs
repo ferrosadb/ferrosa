@@ -833,6 +833,14 @@ mod tests {
         data
     }
 
+    fn build_legacy_header_only_partition(key: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        data.push(DELETION_IS_LIVE);
+        data
+    }
+
     /// Build a Partitions.db file from entries.
     ///
     /// Each entry is `(DecoratedKey, data_position)`. The position is encoded
@@ -1750,5 +1758,36 @@ mod tests {
                 assert!(r.cells.is_empty(), "empty projection leaves cells empty");
             }
         }
+    }
+
+    #[test]
+    fn next_partition_projected_accepts_legacy_header_only_partition_at_eof() {
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"pk-header-only".as_slice()));
+        let data_bytes = build_legacy_header_only_partition(b"pk-header-only");
+        let partitions_bytes = build_partition_index(&[(&dk, 0)]);
+        let filter_bytes = build_bloom_filter(&[&dk]);
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+        let mut iter = reader.partitions_iter().unwrap();
+
+        let partition = iter
+            .next_partition_projected(&[])
+            .expect("header-only legacy partition should not error")
+            .expect("partition should be returned");
+
+        assert_eq!(partition.key.key.as_bytes(), b"pk-header-only");
+        assert!(partition.rows.is_empty());
+        assert!(partition.static_row.is_none());
+        assert!(iter.next_partition_projected(&[]).unwrap().is_none());
     }
 }

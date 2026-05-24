@@ -612,6 +612,32 @@ type FileSSTableReader =
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
 type SSTableSidecarMap = Arc<HashMap<String, crate::index::sidecar::SidecarReader>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupSstableRepairMode {
+    Off,
+    Warn,
+    Quarantine,
+}
+
+impl StartupSstableRepairMode {
+    fn from_env(value: &str) -> Self {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off") || value == "0"
+        {
+            Self::Off
+        } else if value.eq_ignore_ascii_case("quarantine")
+            || value.eq_ignore_ascii_case("repair")
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("on")
+            || value == "1"
+        {
+            Self::Quarantine
+        } else {
+            Self::Warn
+        }
+    }
+}
+
 const DEFAULT_TIME_SERIES_MATERIALIZATION_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
 const DEFAULT_TIME_SERIES_MATERIALIZATION_BATCH_LIMIT: usize = 128;
@@ -1132,6 +1158,7 @@ impl StorageEngine {
             return;
         };
         let cas_supported = self.cas_supported();
+        let mut finalize_handles = Vec::new();
 
         for (idx, record) in records.iter().enumerate() {
             let Some(files) = crate::upload::replay::find_pending_upload_files(
@@ -1157,7 +1184,7 @@ impl StorageEngine {
             };
             match upload_mgr.try_submit(task) {
                 Ok(()) => {
-                    tokio::spawn(Self::finalize_replayed_pending_upload(
+                    finalize_handles.push(tokio::spawn(Self::finalize_replayed_pending_upload(
                         PendingUploadReplayFinalize {
                             store: Arc::clone(&store),
                             prefix: prefix.clone(),
@@ -1169,7 +1196,7 @@ impl StorageEngine {
                             cas_supported,
                         },
                         rx,
-                    ));
+                    )));
                 }
                 Err(e) if e.to_string().contains("upload queue full") => {
                     tracing::warn!(
@@ -1187,6 +1214,15 @@ impl StorageEngine {
                     );
                 }
             }
+        }
+
+        if !finalize_handles.is_empty() {
+            let drain = async move {
+                for handle in finalize_handles {
+                    let _ = handle.await;
+                }
+            };
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), drain).await;
         }
     }
 
@@ -2030,8 +2066,78 @@ impl StorageEngine {
         out
     }
 
+    fn startup_sstable_repair_mode() -> StartupSstableRepairMode {
+        std::env::var("FERROSA_STARTUP_SMOKE_TEST")
+            .map(|value| StartupSstableRepairMode::from_env(&value))
+            .unwrap_or(StartupSstableRepairMode::Warn)
+    }
+
+    fn validate_sstable_for_startup_repair<R: ferrosa_sstable::io::ReadAt>(
+        reader: &ferrosa_sstable::reader::SSTableReader<R>,
+    ) -> ferrosa_common::Result<()> {
+        use ferrosa_common::NO_TIMESTAMP;
+
+        let partitions = reader.read_all_partitions()?;
+        for partition in &partitions {
+            if let Some(static_row) = &partition.static_row {
+                Self::validate_startup_row_timestamps(static_row, true)?;
+            }
+            for row in &partition.rows {
+                Self::validate_startup_row_timestamps(row, false)?;
+            }
+        }
+        if reader.header().min_timestamp == NO_TIMESTAMP
+            && partitions.iter().any(|partition| {
+                partition
+                    .static_row
+                    .iter()
+                    .chain(partition.rows.iter())
+                    .flat_map(|row| row.cells.iter())
+                    .any(|(_, cell)| cell.timestamp != NO_TIMESTAMP)
+            })
+        {
+            return Err(ferrosa_common::Error::InvalidFormat(
+                "startup smoke test found real cell timestamps with NO_TIMESTAMP serialization header".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_startup_row_timestamps(
+        row: &ferrosa_sstable::types::Row,
+        is_static: bool,
+    ) -> ferrosa_common::Result<()> {
+        use ferrosa_common::NO_TIMESTAMP;
+
+        let row_kind = if is_static { "static row" } else { "row" };
+        for (column_idx, cell) in &row.cells {
+            let uses_row_timestamp = row.primary_key_liveness.has_timestamp()
+                && cell.timestamp == row.primary_key_liveness.timestamp;
+            if !uses_row_timestamp && cell.timestamp == NO_TIMESTAMP {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "startup smoke test found {row_kind} cell at column {column_idx} with NO_TIMESTAMP"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn load_existing_sstables_and_sidecars(
         table_dir: &std::path::Path,
+    ) -> (
+        Vec<FileSSTableReader>,
+        Vec<SSTableSidecarMap>,
+        Vec<(String, std::path::PathBuf)>,
+    ) {
+        Self::load_existing_sstables_and_sidecars_with_repair_mode(
+            table_dir,
+            Self::startup_sstable_repair_mode(),
+        )
+    }
+
+    fn load_existing_sstables_and_sidecars_with_repair_mode(
+        table_dir: &std::path::Path,
+        repair_mode: StartupSstableRepairMode,
     ) -> (
         Vec<FileSSTableReader>,
         Vec<SSTableSidecarMap>,
@@ -2073,7 +2179,10 @@ impl StorageEngine {
         let mut sidecars = Vec::new();
         let mut ids: Vec<(String, std::path::PathBuf)> = Vec::new();
         let mut quarantined_count = 0usize;
-
+        let mut excluded_count = 0usize;
+        let mut smoke_tested_count = 0usize;
+        let mut smoke_quarantined_count = 0usize;
+        let smoke_start = std::time::Instant::now();
         for gen in generations {
             let gen_str = gen.to_string();
 
@@ -2091,12 +2200,6 @@ impl StorageEngine {
                     .unwrap_or_else(|| table_dir.join(format!("{gen_str}-{comp}")));
                 match std::fs::metadata(&path) {
                     Ok(meta) if meta.len() == 0 => {
-                        tracing::error!(
-                            gen,
-                            component = comp,
-                            dir = %table_dir.display(),
-                            "storage-engine: quarantining SSTable with zero-byte {comp}"
-                        );
                         quarantine = true;
                     }
                     Err(_) => {
@@ -2106,26 +2209,123 @@ impl StorageEngine {
                 }
             }
             if quarantine {
-                // Move to quarantine subdirectory.
-                let quarantine_dir = table_dir.join("quarantine");
-                let _ = std::fs::create_dir_all(&quarantine_dir);
-                if let Err(e) = Self::quarantine_generation(table_dir, gen, &quarantine_dir) {
-                    tracing::warn!(%e, gen, "storage-engine: failed to quarantine stale SSTable generation");
+                match repair_mode {
+                    StartupSstableRepairMode::Quarantine => {
+                        tracing::error!(
+                            gen,
+                            dir = %table_dir.display(),
+                            "storage-engine: startup repair quarantining SSTable with zero-byte critical component"
+                        );
+                        let quarantine_dir = table_dir.join("quarantine");
+                        let _ = std::fs::create_dir_all(&quarantine_dir);
+                        if let Err(e) = Self::quarantine_generation(table_dir, gen, &quarantine_dir)
+                        {
+                            tracing::warn!(%e, gen, "storage-engine: failed to quarantine stale SSTable generation");
+                        }
+                        quarantined_count += 1;
+                    }
+                    StartupSstableRepairMode::Warn | StartupSstableRepairMode::Off => {
+                        tracing::error!(
+                            gen,
+                            dir = %table_dir.display(),
+                            mode = ?repair_mode,
+                            "storage-engine: startup repair excluded SSTable with zero-byte critical component from active readers; files remain in place for salvage"
+                        );
+                        excluded_count += 1;
+                    }
                 }
-                quarantined_count += 1;
                 continue;
             }
 
             match Self::open_sstable_from_dir(table_dir, &gen_str) {
                 Ok(reader) => {
+                    if repair_mode != StartupSstableRepairMode::Off {
+                        smoke_tested_count += 1;
+                        if let Err(e) = Self::validate_sstable_for_startup_repair(&reader) {
+                            match repair_mode {
+                                StartupSstableRepairMode::Warn => {
+                                    tracing::error!(
+                                        %e,
+                                        gen,
+                                        dir = %table_dir.display(),
+                                        "storage-engine: startup smoke test found corrupt SSTable; excluded from active readers, files remain in place for salvage"
+                                    );
+                                    excluded_count += 1;
+                                    continue;
+                                }
+                                StartupSstableRepairMode::Quarantine => {
+                                    tracing::error!(
+                                        %e,
+                                        gen,
+                                        dir = %table_dir.display(),
+                                        "storage-engine: startup smoke test quarantining corrupt SSTable"
+                                    );
+                                    let quarantine_dir = table_dir.join("quarantine");
+                                    let _ = std::fs::create_dir_all(&quarantine_dir);
+                                    if let Err(qe) =
+                                        Self::quarantine_generation(table_dir, gen, &quarantine_dir)
+                                    {
+                                        tracing::warn!(%qe, gen, "storage-engine: failed to quarantine SSTable after startup smoke-test failure");
+                                    }
+                                    quarantined_count += 1;
+                                    smoke_quarantined_count += 1;
+                                    continue;
+                                }
+                                StartupSstableRepairMode::Off => {}
+                            }
+                        }
+                    }
                     sstables.push(Arc::new(reader));
                     sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
                     ids.push((gen_str.clone(), table_dir.to_path_buf()));
                 }
-                Err(e) => {
-                    tracing::warn!(%e, gen, dir = %table_dir.display(), "storage-engine: skipping corrupt SSTable");
-                }
+                Err(e) => match repair_mode {
+                    StartupSstableRepairMode::Quarantine => {
+                        tracing::warn!(%e, gen, dir = %table_dir.display(), "storage-engine: quarantining corrupt SSTable that failed to open");
+                        let quarantine_dir = table_dir.join("quarantine");
+                        let _ = std::fs::create_dir_all(&quarantine_dir);
+                        if let Err(qe) =
+                            Self::quarantine_generation(table_dir, gen, &quarantine_dir)
+                        {
+                            tracing::warn!(%qe, gen, "storage-engine: failed to quarantine SSTable that failed to open");
+                        }
+                        quarantined_count += 1;
+                    }
+                    StartupSstableRepairMode::Warn | StartupSstableRepairMode::Off => {
+                        tracing::error!(
+                            %e,
+                            gen,
+                            dir = %table_dir.display(),
+                            mode = ?repair_mode,
+                            "storage-engine: startup repair excluded SSTable that failed to open from active readers; files remain in place for salvage"
+                        );
+                        excluded_count += 1;
+                    }
+                },
             }
+        }
+
+        if repair_mode != StartupSstableRepairMode::Off {
+            tracing::info!(
+                smoke_tested = smoke_tested_count,
+                smoke_quarantined = smoke_quarantined_count,
+                excluded = excluded_count,
+                elapsed_ms = smoke_start.elapsed().as_millis(),
+                loaded = sstables.len(),
+                dir = %table_dir.display(),
+                mode = ?repair_mode,
+                "storage-engine: startup SSTable smoke test complete"
+            );
+        }
+
+        if excluded_count > 0 {
+            tracing::error!(
+                excluded = excluded_count,
+                loaded = sstables.len(),
+                dir = %table_dir.display(),
+                "storage-engine: excluded {excluded_count} corrupt SSTable(s) from active readers during startup. \
+                 Files were not moved or deleted; rows present only in those generations are unavailable until salvage or operator-controlled quarantine/repair."
+            );
         }
 
         if quarantined_count > 0 {
@@ -2133,8 +2333,8 @@ impl StorageEngine {
                 quarantined = quarantined_count,
                 loaded = sstables.len(),
                 dir = %table_dir.display(),
-                "storage-engine: quarantined {quarantined_count} corrupt SSTable(s) \
-                 with zero-byte component files — moved to {}/quarantine/. \
+                "storage-engine: quarantined {quarantined_count} corrupt SSTable(s) during startup repair \
+                 — moved to {}/quarantine/. \
                  Data in quarantined SSTables is unrecoverable.",
                 table_dir.display(),
             );
@@ -5332,7 +5532,7 @@ impl StorageEngine {
             ))
         })?;
 
-        let _ = std::fs::remove_dir_all(source_dir);
+        Self::cleanup_promoted_compaction_output(source_dir, &old_prefix);
 
         let size_bytes = Self::generation_component_paths(&final_target, promoted_gen)
             .iter()
@@ -5344,6 +5544,33 @@ impl StorageEngine {
         promoted.path = final_target;
         promoted.size_bytes = size_bytes;
         Ok(promoted)
+    }
+
+    fn cleanup_promoted_compaction_output(source_dir: &std::path::Path, promoted_prefix: &str) {
+        let Ok(entries) = std::fs::read_dir(source_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(promoted_prefix) {
+                let path = entry.path();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(
+                        %e,
+                        path = %path.display(),
+                        "compaction: failed to remove promoted output source component"
+                    );
+                }
+            }
+        }
+
+        let is_empty = std::fs::read_dir(source_dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if is_empty {
+            let _ = std::fs::remove_dir(source_dir);
+        }
     }
 
     fn evict_local_input_sstable_files(inputs: &[crate::compaction::metadata::SSTableMetadata]) {
@@ -7326,6 +7553,256 @@ mod tests {
                 "data must survive restart after zero-byte Rows.db"
             );
         }
+    }
+
+    /// Regression: the default startup smoke test must not quarantine
+    /// SSTables whose component headers open but whose Data.db contents cannot
+    /// be fully iterated. It also must not admit them into the active reader
+    /// set: a known-corrupt immutable file must not poison every range read
+    /// until an operator manually moves it aside.
+    #[test]
+    fn startup_warn_mode_excludes_sstable_that_opens_but_fails_full_iteration_without_moving_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "truncated_data".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("test_ks", "truncated_data");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            let pk = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine.write(&tid, &pk, row, 1000).unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let data_file = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("-Data.db")
+            })
+            .expect("flush must produce a Data.db");
+        let original_len = std::fs::metadata(&data_file).unwrap().len();
+        assert!(
+            original_len > 8,
+            "test needs enough Data.db bytes to truncate"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_file)
+            .unwrap()
+            .set_len(original_len / 2)
+            .unwrap();
+
+        let (_sstables, _sidecars, ids) =
+            StorageEngine::load_existing_sstables_and_sidecars(&table_dir);
+        assert!(
+            ids.is_empty(),
+            "default warn-mode startup smoke test must not admit a corrupt SSTable into the live view"
+        );
+
+        let quarantine_dir = table_dir.join("quarantine");
+        assert!(
+            !quarantine_dir.exists(),
+            "default warn-mode startup smoke test must not create quarantine"
+        );
+        assert!(
+            data_file.exists(),
+            "default warn-mode startup smoke test must leave corrupt components in place for salvage"
+        );
+    }
+
+    /// Explicit quarantine mode is still available for an operator-controlled
+    /// repair run once they have accepted that unreadable SSTables will be
+    /// removed from the live view.
+    #[test]
+    fn startup_quarantine_mode_moves_sstable_that_opens_but_fails_full_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "truncated_data".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("test_ks", "truncated_data");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            let pk = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine.write(&tid, &pk, row, 1000).unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let data_file = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("-Data.db")
+            })
+            .expect("flush must produce a Data.db");
+        let original_len = std::fs::metadata(&data_file).unwrap().len();
+        assert!(
+            original_len > 8,
+            "test needs enough Data.db bytes to truncate"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_file)
+            .unwrap()
+            .set_len(original_len / 2)
+            .unwrap();
+
+        let (_sstables, _sidecars, ids) =
+            StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode(
+                &table_dir,
+                StartupSstableRepairMode::Quarantine,
+            );
+        assert!(
+            ids.is_empty(),
+            "explicit quarantine-mode repair must not admit the truncated SSTable"
+        );
+
+        let quarantine_dir = table_dir.join("quarantine");
+        assert!(
+            quarantine_dir.exists(),
+            "explicit quarantine-mode repair must create the quarantine directory"
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(&quarantine_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            quarantined.iter().any(|name| name.ends_with("-Data.db")),
+            "explicit quarantine-mode repair must move the corrupt generation components to quarantine; got {quarantined:?}"
+        );
+    }
+
+    /// Given a table with one healthy SSTable and one corrupt SSTable, restart
+    /// must keep the healthy generation queryable while retaining the corrupt
+    /// generation on disk for salvage. This is the production recovery contract:
+    /// corrupt immutable inputs degrade completeness, not availability.
+    #[test]
+    fn startup_warn_mode_excludes_corrupt_sstable_but_keeps_healthy_sstables_queryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let schema = test_schema();
+        let healthy_key = make_key("healthy");
+        let corrupt_key = make_key("corrupt");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            engine
+                .write(&tid, &healthy_key, make_row(b"healthy", 1000), 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+
+            engine
+                .write(&tid, &corrupt_key, make_row(b"corrupt", 2000), 2000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let mut data_files: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("-Data.db")
+            })
+            .collect();
+        data_files.sort();
+        assert_eq!(data_files.len(), 2, "test requires exactly two SSTables");
+        let corrupt_data_file = data_files.pop().unwrap();
+        let original_len = std::fs::metadata(&corrupt_data_file).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&corrupt_data_file)
+            .unwrap()
+            .set_len(original_len / 2)
+            .unwrap();
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(schema).unwrap();
+
+        let healthy = engine
+            .read(&tid, &healthy_key)
+            .expect("healthy SSTable read must not be poisoned by corrupt SSTable")
+            .expect("healthy partition must remain readable");
+        assert_eq!(healthy.rows.len(), 1);
+        assert_eq!(
+            healthy.rows[0].cells[0].1.value.as_deref(),
+            Some(&b"healthy"[..])
+        );
+
+        let range = engine
+            .read_range(&tid, None, None, 10)
+            .expect("range read must skip excluded corrupt SSTable");
+        assert_eq!(
+            range.len(),
+            1,
+            "range read should return the healthy partition and not fail on the excluded corrupt generation"
+        );
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "only the healthy SSTable should be in the active reader set"
+        );
+        assert!(
+            corrupt_data_file.exists(),
+            "excluded corrupt SSTable component must remain on disk for salvage"
+        );
     }
 
     /// Multiple flushes → drop engine → re-open from disk → read back.
@@ -11409,6 +11886,104 @@ mod tests {
             !result.path.exists(),
             "original compaction output directory should be removed after successful promotion"
         );
+    }
+
+    #[test]
+    fn compaction_promotion_preserves_other_pending_outputs_in_shared_staging_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        let tid_str = tid.to_string();
+        let compaction_dir = dir.path().join("compaction").join(&tid_str);
+        std::fs::create_dir_all(&compaction_dir).unwrap();
+
+        let output_a = write_fake_compaction_output(&compaction_dir, "101");
+        let output_b = write_fake_compaction_output(&compaction_dir, "202");
+
+        let promoted_a = engine
+            .promote_compaction_output(&tid, &output_a)
+            .expect("first compaction output should promote");
+        assert!(
+            promoted_a
+                .path
+                .join(format!("{}-Data.db", promoted_a.id))
+                .exists(),
+            "first output should be durable in the normal SSTable directory"
+        );
+
+        for component in [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ] {
+            let pending = compaction_dir.join(format!("202-{component}"));
+            assert!(
+                pending.exists(),
+                "promoting one output must not delete pending component {}",
+                pending.display()
+            );
+        }
+
+        let promoted_b = engine
+            .promote_compaction_output(&tid, &output_b)
+            .expect("second output should still promote after the first output");
+        assert!(
+            promoted_b
+                .path
+                .join(format!("{}-Data.db", promoted_b.id))
+                .exists(),
+            "second output should be durable in the normal SSTable directory"
+        );
+
+        let remaining: Vec<_> = compaction_dir
+            .read_dir()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "shared compaction directory should be empty after all outputs promote"
+        );
+    }
+
+    fn write_fake_compaction_output(
+        compaction_dir: &std::path::Path,
+        id: &str,
+    ) -> crate::compaction::metadata::SSTableMetadata {
+        for component in [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+        ] {
+            std::fs::write(
+                compaction_dir.join(format!("{id}-{component}")),
+                format!("{id}-{component}"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            compaction_dir.join(format!("{id}-TOC.txt")),
+            b"Data.db\nPartitions.db\nRows.db\nFilter.db\nStatistics.db\n",
+        )
+        .unwrap();
+
+        crate::compaction::metadata::SSTableMetadata {
+            id: id.to_string(),
+            path: compaction_dir.to_path_buf(),
+            size_bytes: 128,
+            min_token: 0,
+            max_token: 1,
+            min_timestamp: 10,
+            max_timestamp: 20,
+            partition_count: 1,
+        }
     }
 
     // ── T-027: metrics + end-to-end tests ────────────────────────────────────

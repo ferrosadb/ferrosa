@@ -896,13 +896,12 @@ impl ClusterCoordinator {
         limit: usize,
         row_limit: usize,
     ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
-        // ADR-020: when streaming range reads are enabled at startup
-        // (FERROSA_BULK_STREAMING_RANGE_READ=1), delegate to the
-        // multi-message lane that does not depend on a wall-clock
-        // BULK_READ_TIMEOUT. The legacy materializing path below
-        // stays as the default during rolling upgrade so older peers
-        // (which lack the RangeReadStream* MsgType variants) keep
-        // working until every node is upgraded.
+        // ADR-020: streaming range reads use the multi-message lane
+        // that does not depend on a wall-clock BULK_READ_TIMEOUT.
+        // Operators can temporarily disable this with
+        // FERROSA_BULK_STREAMING_RANGE_READ=0 during mixed-version
+        // rolling upgrades, but the legacy materializing path applies
+        // a hard partition cap and is not correct for complete scans.
         if self.streaming_range_reads {
             return self
                 .coordinate_range_read_stream_limited_rows(table_id, limit, row_limit)
@@ -2601,12 +2600,12 @@ mod tests {
     // BUG: coordinate_range_read silent data loss
     // -----------------------------------------------------------------------
 
-    /// When remote nodes are unreachable, coordinate_range_read returns
-    /// partial results (local data) with a warning — NOT hang for 120s.
-    /// Previously this returned Err, but that caused startup hangs when
-    /// the CQL client timed out waiting for all nodes to connect.
+    /// When a complete streaming range read needs remote token owners
+    /// and every remote fire fails, coordinate_range_read must fail
+    /// loudly instead of returning local-only partial results as if the
+    /// scan were complete.
     #[tokio::test]
-    async fn coordinate_range_read_returns_partial_when_remote_nodes_unreachable() {
+    async fn coordinate_range_read_errors_when_every_required_remote_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         register_test_table(&storage);
@@ -2654,19 +2653,15 @@ mod tests {
             .write(&table_id, &key, test_row(1000), 1000)
             .unwrap();
 
-        // coordinate_range_read fans out to all 3 nodes.
-        // Remote nodes have no pools → sends fail after 5s timeout.
-        // Returns Ok(local_data) with a warning — NOT Err or 120s hang.
         let result = coordinator.coordinate_range_read(&table_id).await;
         assert!(
-            result.is_ok(),
-            "range read should return partial results when remotes fail: {:?}",
-            result.err()
+            result.is_err(),
+            "complete streaming range read must not report local-only partial data as success"
         );
-        let partitions = result.unwrap();
+        let message = result.err().unwrap().to_string();
         assert!(
-            !partitions.is_empty(),
-            "should return local data even when remote nodes are unreachable"
+            message.contains("every replica fire failed"),
+            "error should name the remote fanout failure, got: {message}"
         );
     }
 
@@ -2804,7 +2799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinate_range_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
+    async fn legacy_range_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         register_test_table(&storage);
@@ -2837,8 +2832,9 @@ mod tests {
         ring.add_node(2u64, remote);
         ring.assign_tokens(2u64, &[42]);
 
-        let coordinator =
+        let mut coordinator =
             make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+        coordinator.streaming_range_reads = false;
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let partitions = coordinator.coordinate_range_read(&table_id).await.unwrap();

@@ -472,6 +472,7 @@ mod tests {
             keyspace: Some("ks".into()),
             table: "t".into(),
             columns: vec![SelectColumn::Star],
+            distinct: false,
             where_clauses: vec![WhereClause {
                 column: "id".into(),
                 op: ComparisonOp::Eq,
@@ -511,6 +512,7 @@ mod tests {
             keyspace: Some("ks".into()),
             table: "t".into(),
             columns: vec![SelectColumn::Star],
+            distinct: false,
             where_clauses: vec![],
             order_by: vec![],
             limit: None,

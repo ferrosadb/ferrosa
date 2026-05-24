@@ -13,6 +13,7 @@ use ferrosa_common::key::DecoratedKey;
 use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::{Mutation, TableId};
+use futures::StreamExt;
 
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
@@ -37,6 +38,18 @@ pub enum WritePath {
     Cluster(Arc<ClusterCoordinator>),
     /// Degraded: peer lost, writes rejected until operator promotes.
     Unavailable,
+}
+
+async fn collect_uncapped_local_range(
+    engine: &StorageEngine,
+    table_id: &TableId,
+) -> crate::error::Result<Vec<Partition>> {
+    let mut stream = engine.range_iter(table_id, None, None);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(item.map_err(crate::error::ClusterError::Storage)?);
+    }
+    Ok(out)
 }
 
 impl WritePath {
@@ -178,8 +191,26 @@ impl WritePath {
     /// empty results on failure causes data loss (see BUG: large-write-causes-
     /// data-loss-in-partition).
     pub async fn range_read(&self, table_id: &TableId) -> crate::error::Result<Vec<Partition>> {
-        self.range_read_limited(table_id, DEFAULT_RANGE_READ_LIMIT)
-            .await
+        match self {
+            Self::Direct(engine) => collect_uncapped_local_range(engine.as_ref(), table_id).await,
+            Self::Pair(coordinator) => {
+                collect_uncapped_local_range(coordinator.local_storage().as_ref(), table_id).await
+            }
+            Self::Cluster(coordinator) => {
+                if coordinator.streaming_range_reads {
+                    coordinator
+                        .coordinate_range_read_stream_all(table_id, 0)
+                        .await
+                } else {
+                    Err(crate::error::ClusterError::Internal(
+                        "uncapped range_read is unavailable because FERROSA_BULK_STREAMING_RANGE_READ=0 selected the legacy capped range RPC; refusing to return a partial scan".into(),
+                    ))
+                }
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range read unavailable: write path is in degraded mode".into(),
+            )),
+        }
     }
 
     /// COUNT(*) fast path. Returns the total row count for

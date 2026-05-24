@@ -143,6 +143,7 @@ impl CompactionExecutor {
     {
         use crate::flush::{FileFlushTarget, FlushTarget};
         use crate::merge;
+        use crate::range_merger::ColumnOrdinalMapping;
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
         use ferrosa_sstable::writer::SSTableWriter;
@@ -215,6 +216,10 @@ impl CompactionExecutor {
         if readers.is_empty() {
             return Err("no input SSTables to compact".into());
         }
+        let mappings: Vec<ColumnOrdinalMapping> = readers
+            .iter()
+            .map(|reader| ColumnOrdinalMapping::for_header(&task.schema, reader.header()))
+            .collect();
 
         // 2. Build the output serialization header by combining the inputs'
         //    own headers.  Each input header records the min/max ts and
@@ -225,8 +230,9 @@ impl CompactionExecutor {
         //    column model from the schema mirrors the legacy
         //    `flush::build_serialization_header` behaviour.
         let header = combine_input_headers(&task.schema, &readers);
-        let header_min_ts = header.min_timestamp;
-        let header_max_ts = header.max_timestamp;
+        let output_header = header.clone();
+        let header_min_ts = output_header.min_timestamp;
+        let header_max_ts = output_header.max_timestamp;
         tracing::info!(
             min_ts = header_min_ts,
             max_ts = header_max_ts,
@@ -237,7 +243,7 @@ impl CompactionExecutor {
             compression: None,
             ..WriteOptions::default()
         };
-        let mut writer = SSTableWriter::new(options, header);
+        let mut writer = SSTableWriter::new(options, output_header.clone());
 
         // 3. K-way streaming merge across the input partition iterators.
         //
@@ -284,7 +290,10 @@ impl CompactionExecutor {
 
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(iters.len());
         for (idx, it) in iters.iter_mut().enumerate() {
-            if let Some(partition) = it.next_partition().map_err(|e| format!("iter init: {e}"))? {
+            if let Some(mut partition) =
+                it.next_partition().map_err(|e| format!("iter init: {e}"))?
+            {
+                mappings[idx].remap_partition(&mut partition);
                 heap.push(HeapEntry {
                     partition,
                     reader_idx: idx,
@@ -319,6 +328,8 @@ impl CompactionExecutor {
                 .next_partition()
                 .map_err(|e| format!("iter advance: {e}"))?
             {
+                let mut next = next;
+                mappings[first_idx].remap_partition(&mut next);
                 heap.push(HeapEntry {
                     partition: next,
                     reader_idx: first_idx,
@@ -336,6 +347,8 @@ impl CompactionExecutor {
                     .next_partition()
                     .map_err(|e| format!("iter advance: {e}"))?
                 {
+                    let mut next = next;
+                    mappings[reader_idx].remap_partition(&mut next);
                     heap.push(HeapEntry {
                         partition: next,
                         reader_idx,
@@ -355,6 +368,8 @@ impl CompactionExecutor {
             if token > max_token {
                 max_token = token;
             }
+            validate_partition_writable(&merged, &output_header)
+                .map_err(|e| format!("write partition: {e}"))?;
             writer
                 .add_partition(&merged)
                 .map_err(|e| format!("write partition: {e}"))?;
@@ -493,13 +508,10 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
     use ferrosa_common::{NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
     use ferrosa_sstable::statistics::SerializationHeader;
 
-    // Use the first reader's column model as the template; the schema
-    // shape is identical across all inputs by definition (compaction
-    // never mixes SSTables from different tables).
-    let template = readers
-        .first()
-        .map(|r| r.header().clone())
-        .unwrap_or_else(|| crate::flush::build_serialization_header(schema, &[]));
+    // The output SSTable must use the current schema's column model. Inputs
+    // may have legacy physical column order, and the executor remaps decoded
+    // cells to this schema before merge/write.
+    let template = crate::flush::build_serialization_header(schema, &[]);
 
     let mut min_timestamp = NO_TIMESTAMP;
     let mut max_timestamp = i64::MIN;
@@ -538,6 +550,71 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
         min_ttl,
         ..template
     }
+}
+
+fn validate_partition_writable(
+    partition: &ferrosa_sstable::types::Partition,
+    header: &ferrosa_sstable::statistics::SerializationHeader,
+) -> std::result::Result<(), String> {
+    if let Some(static_row) = &partition.static_row {
+        validate_row_writable(static_row, true, partition, header)?;
+    }
+    for row in &partition.rows {
+        validate_row_writable(row, false, partition, header)?;
+    }
+    Ok(())
+}
+
+fn validate_row_writable(
+    row: &ferrosa_sstable::types::Row,
+    is_static: bool,
+    partition: &ferrosa_sstable::types::Partition,
+    header: &ferrosa_sstable::statistics::SerializationHeader,
+) -> std::result::Result<(), String> {
+    use ferrosa_common::NO_TIMESTAMP;
+
+    let row_kind = if is_static { "static row" } else { "row" };
+    if row.primary_key_liveness.has_timestamp()
+        && row.primary_key_liveness.timestamp < header.min_timestamp
+    {
+        return Err(format!(
+            "invalid {row_kind} primary-key timestamp {} is below output header min_timestamp {} for partition token {}; original SSTables are preserved and startup repair/quarantine should remove the corrupt input",
+            row.primary_key_liveness.timestamp,
+            header.min_timestamp,
+            partition.key.token.0
+        ));
+    }
+    if !row.deletion.is_live() && row.deletion.marked_for_delete_at < header.min_timestamp {
+        return Err(format!(
+            "invalid {row_kind} deletion timestamp {} is below output header min_timestamp {} for partition token {}; original SSTables are preserved and startup repair/quarantine should remove the corrupt input",
+            row.deletion.marked_for_delete_at,
+            header.min_timestamp,
+            partition.key.token.0
+        ));
+    }
+
+    for (column_idx, cell) in &row.cells {
+        let uses_row_timestamp = row.primary_key_liveness.has_timestamp()
+            && cell.timestamp == row.primary_key_liveness.timestamp;
+        if !uses_row_timestamp {
+            if cell.timestamp == NO_TIMESTAMP {
+                return Err(format!(
+                    "invalid {row_kind} cell at column {column_idx} has NO_TIMESTAMP for partition token {}; original SSTables are preserved and startup repair/quarantine should remove the corrupt input",
+                    partition.key.token.0
+                ));
+            }
+            if cell.timestamp < header.min_timestamp {
+                return Err(format!(
+                    "invalid {row_kind} cell timestamp {} is below output header min_timestamp {} at column {column_idx} for partition token {}; original SSTables are preserved and startup repair/quarantine should remove the corrupt input",
+                    cell.timestamp,
+                    header.min_timestamp,
+                    partition.key.token.0
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -689,6 +766,45 @@ mod tests {
             }],
             extensions: Default::default(),
         }
+    }
+
+    fn column_order_schema(
+        regular_columns: Vec<ferrosa_common::schema::ColumnDefinition>,
+    ) -> ferrosa_common::schema::TableSchema {
+        ferrosa_common::schema::TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "column_order".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns,
+            extensions: Default::default(),
+        }
+    }
+
+    fn column_order_partition(
+        key: &str,
+        cells: Vec<(u16, ferrosa_common::CellValue)>,
+        timestamp: i64,
+    ) -> ferrosa_sstable::types::Partition {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        ferrosa_sstable::types::Partition {
+            key: DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![],
+                cells,
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        }
+    }
+
+    fn timestamp_bytes(ms: i64) -> Vec<u8> {
+        ms.to_be_bytes().to_vec()
     }
 
     /// RED TEST: compaction must fail (not silently skip) when an input
@@ -915,5 +1031,152 @@ mod tests {
             inputs.len(),
             "streaming compaction may hold at most one partition per input for a key"
         );
+    }
+
+    #[test]
+    fn compaction_remaps_legacy_input_column_ordinals_before_write() {
+        use ferrosa_common::schema::ColumnDefinition;
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::io::FileReadAt;
+        use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let current_schema = column_order_schema(vec![
+            ColumnDefinition {
+                name: "created_at".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.TimestampType".to_string(),
+            },
+            ColumnDefinition {
+                name: "description".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+        ]);
+        let legacy_schema = column_order_schema(vec![
+            ColumnDefinition {
+                name: "description".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "created_at".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.TimestampType".to_string(),
+            },
+        ]);
+
+        let current_dir = tmp.path().join("current");
+        std::fs::create_dir_all(&current_dir).unwrap();
+        let current = column_order_partition(
+            "same-key",
+            vec![
+                (0, CellValue::live(timestamp_bytes(111), 1000)),
+                (1, CellValue::live(b"current".to_vec(), 1000)),
+            ],
+            1000,
+        );
+        let current_meta = write_sstable_to_dir(&current_dir, &[current], &current_schema);
+
+        let legacy_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = column_order_partition(
+            "same-key",
+            vec![
+                (0, CellValue::live(b"legacy".to_vec(), 2000)),
+                (1, CellValue::live(timestamp_bytes(222), 2000)),
+            ],
+            2000,
+        );
+        let legacy_meta = write_sstable_to_dir(&legacy_dir, &[legacy], &legacy_schema);
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: vec![legacy_meta, current_meta],
+            output_dir: output_dir.clone(),
+            schema: current_schema,
+            table_id: crate::TableId::new("test_ks", "column_order"),
+        };
+
+        let meta = CompactionExecutor::execute_task(&task)
+            .expect("compaction must remap legacy ordinals before writing current-schema output");
+        assert_eq!(meta.partition_count, 1);
+
+        let gen = &meta.id;
+        let reader = SSTableReader::open(SSTableComponents {
+            data: FileReadAt::open(output_dir.join(format!("{gen}-Data.db"))).unwrap(),
+            partitions: FileReadAt::open(output_dir.join(format!("{gen}-Partitions.db"))).unwrap(),
+            rows: FileReadAt::open(output_dir.join(format!("{gen}-Rows.db"))).unwrap(),
+            filter: std::fs::read(output_dir.join(format!("{gen}-Filter.db"))).unwrap(),
+            compression_info: std::fs::read(output_dir.join(format!("{gen}-CompressionInfo.db")))
+                .ok(),
+            statistics: std::fs::read(output_dir.join(format!("{gen}-Statistics.db"))).unwrap(),
+        })
+        .unwrap();
+        let partitions = reader.read_all_partitions().unwrap();
+        assert_eq!(partitions.len(), 1);
+        let cells = &partitions[0].rows[0].cells;
+        assert_eq!(cells[0].0, 0);
+        assert_eq!(
+            cells[0].1.value.as_deref(),
+            Some(timestamp_bytes(222).as_slice())
+        );
+        assert_eq!(cells[1].0, 1);
+        assert_eq!(cells[1].1.value.as_deref(), Some(b"legacy".as_slice()));
+    }
+
+    #[test]
+    fn compaction_rejects_no_timestamp_cells_before_writer_panic() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, NO_TIMESTAMP};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+
+        let schema = test_schema_with_columns();
+        let header = crate::flush::build_serialization_header(
+            &schema,
+            &[make_test_partition("good", "value", 1000)],
+        );
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"bad".to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: 1i32.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(b"missing-ts".to_vec(), NO_TIMESTAMP))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::NONE,
+            }],
+        };
+
+        let err = validate_partition_writable(&partition, &header).unwrap_err();
+        assert!(
+            err.contains("NO_TIMESTAMP"),
+            "error must make the corrupt timestamp explicit: {err}"
+        );
+        assert!(
+            err.contains("original SSTables are preserved"),
+            "error must describe repair-safe compaction semantics: {err}"
+        );
+    }
+
+    #[test]
+    fn compaction_accepts_static_rows_without_liveness_when_cells_have_timestamps() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+
+        let schema = test_schema_with_columns();
+        let header = crate::flush::build_serialization_header(
+            &schema,
+            &[make_test_partition("good", "value", 1000)],
+        );
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"static".to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: Some(Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"static-value".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::NONE,
+            }),
+            rows: vec![],
+        };
+
+        validate_partition_writable(&partition, &header).unwrap();
     }
 }
