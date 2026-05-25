@@ -3426,6 +3426,20 @@ impl StorageEngine {
         table_id: &TableId,
         key: &DecoratedKey,
     ) -> ferrosa_common::Result<Option<Partition>> {
+        self.read_limited_rows(table_id, key, 0)
+    }
+
+    /// Reads a partition from a table with an optional clustered-row cap.
+    ///
+    /// A non-zero `row_limit` is pushed into memtable/SSTable sources so
+    /// single-partition `LIMIT` queries do not materialize the full
+    /// partition before returning the first page.
+    pub fn read_limited_rows(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Option<Partition>> {
         let _span = tracing::info_span!(
             "storage.read",
             table = %table_id,
@@ -3433,7 +3447,27 @@ impl StorageEngine {
         .entered();
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read(key),
+            Some(state) => state.store.read_limited_rows(key, row_limit),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads exactly one clustered row from a table partition, merging matching
+    /// rows across memtable and SSTable sources.
+    pub fn read_clustering_row(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        clustering: &[u8],
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        let _span = tracing::info_span!(
+            "storage.read_clustering_row",
+            table = %table_id,
+        )
+        .entered();
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.read_clustering_row(key, clustering),
             None => Ok(None),
         }
     }

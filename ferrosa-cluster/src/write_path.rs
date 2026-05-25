@@ -137,19 +137,95 @@ impl WritePath {
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
     ) -> ferrosa_common::Result<Option<Partition>> {
+        self.pk_read_limited_rows(table_id, key, cl, strategy, 0)
+            .await
+    }
+
+    /// Read a single partition by key with CL enforcement, optionally
+    /// retaining only the first `row_limit` clustered rows.
+    pub async fn pk_read_limited_rows(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Option<Partition>> {
         match self {
-            Self::Direct(engine) => engine.read(table_id, key),
-            Self::Pair(coordinator) => coordinator.local_storage().read(table_id, key),
+            Self::Direct(engine) => engine.read_limited_rows(table_id, key, row_limit),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .read_limited_rows(table_id, key, row_limit),
             Self::Cluster(coordinator) => {
                 let rows_opt = match strategy {
                     ReplicationStrategy::Simple { replication_factor } => {
                         coordinator
-                            .coordinate_read_with(table_id, key, cl, *replication_factor)
+                            .coordinate_read_with_limited_rows(
+                                table_id,
+                                key,
+                                cl,
+                                *replication_factor,
+                                row_limit,
+                            )
                             .await
                     }
                     ReplicationStrategy::NetworkTopology { .. } => {
                         coordinator
-                            .coordinate_read_nts(table_id, key, cl, strategy)
+                            .coordinate_read_nts_limited_rows(
+                                table_id, key, cl, strategy, row_limit,
+                            )
+                            .await
+                    }
+                };
+                match rows_opt {
+                    Ok(Some(rows)) if !rows.is_empty() => Ok(Some(Partition {
+                        key: key.clone(),
+                        deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                        static_row: None,
+                        rows,
+                    })),
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                }
+            }
+            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, reads rejected until operator promotes".into(),
+            )),
+        }
+    }
+
+    /// Read exactly one clustered row by full primary key with CL enforcement.
+    pub async fn pk_read_clustering_row(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        clustering: &[u8],
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        match self {
+            Self::Direct(engine) => engine.read_clustering_row(table_id, key, clustering),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .read_clustering_row(table_id, key, clustering),
+            Self::Cluster(coordinator) => {
+                let rows_opt = match strategy {
+                    ReplicationStrategy::Simple { replication_factor } => {
+                        coordinator
+                            .coordinate_read_clustering_row(
+                                table_id,
+                                key,
+                                clustering,
+                                cl,
+                                *replication_factor,
+                            )
+                            .await
+                    }
+                    ReplicationStrategy::NetworkTopology { .. } => {
+                        coordinator
+                            .coordinate_read_nts_clustering_row(
+                                table_id, key, clustering, cl, strategy,
+                            )
                             .await
                     }
                 };

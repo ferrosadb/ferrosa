@@ -119,20 +119,29 @@ impl<R: ReadAt> RowIndex<R> {
             ))
         })?;
 
-        let result = walker::lookup(&self.reader, entry.trie_root, clustering_key)?;
+        lookup_clustering_in_entry(&self.reader, entry, clustering_key)
+    }
+}
 
-        match result {
-            walker::LookupResult::Found {
-                payload_pb,
-                payload_bytes,
-            } => {
-                // Row index trie payloads encode block offsets without a hash byte
-                // (pb < 8 means no hash, the value is a signed integer).
-                let (_hash, offset) = node::decode_payload(payload_pb, &payload_bytes)?;
-                Ok(Some(offset as u64))
-            }
-            walker::LookupResult::NotFound => Ok(None),
+/// Look up a clustering key using an already-parsed row-index entry.
+pub fn lookup_clustering_in_entry<R: ReadAt>(
+    reader: &R,
+    entry: &RowIndexEntry,
+    clustering_key: &[u8],
+) -> Result<Option<u64>> {
+    let result = walker::lookup(reader, entry.trie_root, clustering_key)?;
+
+    match result {
+        walker::LookupResult::Found {
+            payload_pb,
+            payload_bytes,
+        } => {
+            // Row index trie payloads encode block offsets without a hash byte
+            // (pb < 8 means no hash, the value is a signed integer).
+            let (_hash, offset) = node::decode_payload(payload_pb, &payload_bytes)?;
+            Ok(Some(offset as u64))
         }
+        walker::LookupResult::NotFound => Ok(None),
     }
 }
 

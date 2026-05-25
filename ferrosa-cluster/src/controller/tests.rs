@@ -656,6 +656,58 @@ fn cluster_invite_keeps_live_peer_when_payload_advertises_older_address() {
 }
 
 #[test]
+fn inbound_peer_address_change_refreshes_live_outbound_pool() {
+    let current_inbound_addr = "10.89.1.174:7000".parse().unwrap();
+
+    assert!(
+        super::peer_events::should_refresh_outbound_peer_for_inbound(
+            Some("10.89.1.171:7000"),
+            true,
+            current_inbound_addr,
+        ),
+        "an inbound connection from a recreated peer is authoritative enough to replace a stale live outbound pool"
+    );
+    assert!(
+        !super::peer_events::should_refresh_outbound_peer_for_inbound(
+            Some("10.89.1.174:7000"),
+            true,
+            current_inbound_addr,
+        ),
+        "matching live outbound pools should not be churned"
+    );
+    assert!(
+        super::peer_events::should_refresh_outbound_peer_for_inbound(
+            Some("10.89.1.174:7000"),
+            false,
+            current_inbound_addr,
+        ),
+        "a non-live pool should be rebuilt even when the stored address is current"
+    );
+}
+
+#[test]
+fn stale_inbound_refresh_cannot_overwrite_newer_peer_address() {
+    assert!(
+        super::peer_events::should_install_refreshed_outbound_peer(
+            Some("10.89.1.178:7000"),
+            Some("10.89.1.178:7000"),
+        ),
+        "a refresh may install when the peer address has not changed while it was connecting"
+    );
+    assert!(
+        !super::peer_events::should_install_refreshed_outbound_peer(
+            Some("10.89.1.178:7000"),
+            Some("10.89.1.181:7000"),
+        ),
+        "a stale refresh must not overwrite a newer inbound address"
+    );
+    assert!(
+        !super::peer_events::should_install_refreshed_outbound_peer(None, Some("10.89.1.181:7000"),),
+        "a first-observed refresh must not install after another task already learned the peer"
+    );
+}
+
+#[test]
 fn reconnect_invite_reservation_is_atomic_under_burst_callbacks() {
     let peer = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
     let now = std::time::Instant::now();
@@ -714,6 +766,71 @@ fn invite_cooldown_allows_retry_after_interval() {
         "reconnect invites must be retried once the cooldown interval has elapsed"
     );
     assert_eq!(recent.get(&peer).copied(), Some(after_cooldown));
+}
+
+#[test]
+fn cluster_membership_forward_handler_is_registered_before_waiting_for_leader() {
+    let source = include_str!("cluster.rs");
+    let forward_registration = source
+        .find("MsgType::ClusterMembershipForward")
+        .expect("cluster transition must register ClusterMembershipForward");
+    let leader_wait = source
+        .find("// Wait for leader election.")
+        .expect("cluster transition must wait for leader election");
+
+    assert!(
+        forward_registration < leader_wait,
+        "membership refresh forwarding can happen during reconnect before leader-election waits finish; \
+         the ClusterMembershipForward handler must already be registered or peers log no-handler and topology refresh times out"
+    );
+}
+
+#[tokio::test]
+async fn peer_manager_registration_installs_membership_forward_nack_before_cluster_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry.clone(),
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+
+    controller.set_peer_manager(pm);
+
+    assert!(
+        registry.has_handler(MsgType::ClusterMembershipForward),
+        "membership-forward must have a startup handler before cluster transition; otherwise rolling restart races drop UpdateNodeInfo forwards"
+    );
+
+    let response = registry
+        .dispatch(
+            (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap()),
+            MsgType::ClusterMembershipForward,
+            Message::ClusterMembershipForward(bytes::Bytes::from_static(b"not decoded")),
+        )
+        .await;
+
+    let Some(Message::ClusterMembershipForwardAck(body)) = response else {
+        panic!("expected explicit ClusterMembershipForwardAck nack, not a dropped request");
+    };
+    let ack: crate::raft_forward::ForwardAckBody =
+        bincode::deserialize(&body).expect("nack body must decode");
+    assert_eq!(
+        ack,
+        crate::raft_forward::ForwardAckBody::Err(
+            "ClusterMembershipForward: node has not entered cluster mode".to_string()
+        )
+    );
 }
 
 #[test]

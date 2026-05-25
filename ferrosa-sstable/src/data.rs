@@ -404,6 +404,35 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         }))
     }
 
+    /// Read the next partition, retaining at most `row_limit` clustered rows
+    /// without advancing to the partition boundary after the cap is reached.
+    ///
+    /// This is only valid for point lookups where the reader is discarded after
+    /// the partition is returned. Range iterators must use
+    /// [`Self::read_partition_limited_rows`] so the reader remains aligned on
+    /// the next partition.
+    pub fn read_partition_prefix_rows(&mut self, row_limit: usize) -> Result<Option<Partition>> {
+        if row_limit == 0 {
+            return self.read_partition_limited_rows(0);
+        }
+
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+
+        let (key_bytes, deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+        let (static_row, rows) = self.read_rows_prefix_limited(row_limit)?;
+
+        Ok(Some(Partition {
+            key,
+            deletion,
+            static_row,
+            rows,
+        }))
+    }
+
     /// Returns the current read position in the data file.
     pub fn position(&self) -> u64 {
         self.pos
@@ -789,6 +818,58 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 static_row = Some(row);
             } else {
                 rows.push(row);
+            }
+        }
+
+        Ok((static_row, rows))
+    }
+
+    /// Read rows for a point lookup and stop as soon as the requested clustered
+    /// row prefix is decoded. Unlike `read_rows_limited`, this deliberately
+    /// does not skip the unretained tail of the partition because there is no
+    /// subsequent partition iteration to keep aligned.
+    fn read_rows_prefix_limited(&mut self, row_limit: usize) -> Result<(Option<Row>, Vec<Row>)> {
+        let file_len = self.reader.len()?;
+        let mut static_row = None;
+        let mut rows = Vec::new();
+
+        loop {
+            if self.pos >= file_len {
+                if static_row.is_some() || !rows.is_empty() {
+                    return Err(Self::missing_partition_end_error());
+                }
+                break;
+            }
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+
+            if flags & END_OF_PARTITION != 0 {
+                break;
+            }
+            if flags & IS_MARKER != 0 {
+                break;
+            }
+
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row = self.read_row(flags, is_static)?;
+            if is_static {
+                static_row = Some(row);
+            } else {
+                rows.push(row);
+                if rows.len() >= row_limit {
+                    break;
+                }
             }
         }
 

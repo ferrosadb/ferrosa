@@ -788,13 +788,13 @@ mod tests {
     fn unbounded_streaming_range_read_boundary_must_not_return_vec() {
         let source = include_str!("range_read_stream.rs");
         let body = source
-            .split("pub async fn coordinate_range_read_stream_all")
+            .split("async fn coordinate_range_read_stream_all_with_projection")
             .nth(1)
             .and_then(|rest| {
                 rest.split("pub async fn coordinate_range_read_stream_limited_rows")
                     .next()
             })
-            .expect("unbounded streaming range-read body must be present");
+            .expect("unbounded streaming range-read implementation body must be present");
 
         assert!(
             !body.contains("Result<Vec<Partition>>"),

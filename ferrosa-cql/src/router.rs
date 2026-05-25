@@ -2287,12 +2287,37 @@ async fn route_select_user_table(
             .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-        let mut pk_rows = match state
-            .write_path
-            .load()
-            .pk_read(&table_id, &decorated_key, ctx.consistency, &read_strategy)
-            .await?
-        {
+        let row_limit =
+            safe_partition_key_filter_row_limit(s, table_meta, count_only_select).unwrap_or(0);
+        let exact_clustering =
+            extract_clustering_key_values(&s.where_clauses, table_meta, ks, &state.schema)?
+                .map(|values| bridge::build_clustering_key(&values));
+        let partition = if let Some(clustering) = exact_clustering {
+            state
+                .write_path
+                .load()
+                .pk_read_clustering_row(
+                    &table_id,
+                    &decorated_key,
+                    &clustering,
+                    ctx.consistency,
+                    &read_strategy,
+                )
+                .await?
+        } else {
+            state
+                .write_path
+                .load()
+                .pk_read_limited_rows(
+                    &table_id,
+                    &decorated_key,
+                    ctx.consistency,
+                    &read_strategy,
+                    row_limit,
+                )
+                .await?
+        };
+        let mut pk_rows = match partition {
             Some(partition) => bridge::partition_to_rows_with_storage_mapping(
                 &partition,
                 &all_col_names,
@@ -6042,6 +6067,36 @@ fn extract_pk_values(
         values.push(val);
     }
     Ok(values)
+}
+
+/// Extract clustering-key equality values in clustering-column order.
+///
+/// Returns `Ok(None)` when the statement is not an exact full primary-key
+/// lookup. Type conversion errors still propagate because those predicates
+/// are present and invalid.
+fn extract_clustering_key_values(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> Result<Option<Vec<CqlValue>>, CqlError> {
+    if table_meta.clustering_key.is_empty() {
+        return Ok(None);
+    }
+
+    let mut values = Vec::with_capacity(table_meta.clustering_key.len());
+    for (ck_name, _) in &table_meta.clustering_key {
+        let Some(wc) = where_clauses
+            .iter()
+            .find(|w| w.column == *ck_name && w.op == ComparisonOp::Eq)
+        else {
+            return Ok(None);
+        };
+        let col_meta = &table_meta.columns[ck_name];
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, schema)?;
+        values.push(bridge::term_to_cql_value(&wc.value, &cql_type)?);
+    }
+    Ok(Some(values))
 }
 
 /// Try to handle `WHERE partition_key IN (v1, v2, ...)` by performing a
@@ -15953,6 +16008,44 @@ mod tests {
                 && broad_scan.contains("ctx.consistency")
                 && broad_scan.contains("&table_strategy"),
             "broad SELECT streams must propagate the request consistency and keyspace replication strategy"
+        );
+    }
+
+    #[test]
+    fn single_partition_limit_pushes_row_cap_into_point_read() {
+        let source = include_str!("router.rs");
+        let pk_lookup = source
+            .split("let decorated_key = bridge::build_decorated_key")
+            .nth(1)
+            .and_then(|rest| rest.split("} else if let Some(in_rows)").next())
+            .expect("single-partition lookup block must be present");
+
+        assert!(
+            pk_lookup.contains("safe_partition_key_filter_row_limit"),
+            "single-partition SELECT must derive a safe row cap from CQL LIMIT before reading storage"
+        );
+        assert!(
+            pk_lookup.contains(".pk_read_limited_rows("),
+            "single-partition SELECT ... LIMIT must push the row cap into the point-read path instead of materializing the whole partition"
+        );
+    }
+
+    #[test]
+    fn full_primary_key_lookup_pushes_clustering_key_into_point_read() {
+        let source = include_str!("router.rs");
+        let pk_lookup = source
+            .split("let decorated_key = bridge::build_decorated_key")
+            .nth(1)
+            .and_then(|rest| rest.split("} else if let Some(in_rows)").next())
+            .expect("single-partition lookup block must be present");
+
+        assert!(
+            pk_lookup.contains("extract_clustering_key_values"),
+            "single-partition SELECT with equality on every clustering column must detect a full primary-key lookup"
+        );
+        assert!(
+            pk_lookup.contains(".pk_read_clustering_row("),
+            "full primary-key SELECT must read the exact clustering row instead of scanning the whole partition"
         );
     }
 

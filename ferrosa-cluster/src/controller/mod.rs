@@ -474,6 +474,10 @@ impl ModeController {
         ));
         self.registry
             .register(MsgType::ClusterInvite, invite_handler);
+        self.registry.register(
+            MsgType::ClusterMembershipForward,
+            Arc::new(crate::raft_forward::ClusterMembershipForwardUnavailableHandler),
+        );
 
         self.peer_manager.store(Arc::new(Some(pm)));
     }

@@ -233,6 +233,29 @@ fn next_remapped_clustered_row<R: ReadAt + Send + Sync + 'static>(
     Ok(row)
 }
 
+fn partition_with_matching_clustering(
+    partition: &Partition,
+    clustering: &[u8],
+) -> Option<Partition> {
+    let rows: Vec<Row> = partition
+        .rows
+        .iter()
+        .filter(|row| row.clustering == clustering)
+        .cloned()
+        .collect();
+
+    if rows.is_empty() && partition.deletion.is_live() && partition.static_row.is_none() {
+        return None;
+    }
+
+    Some(Partition {
+        key: partition.key.clone(),
+        deletion: partition.deletion,
+        static_row: partition.static_row.clone(),
+        rows,
+    })
+}
+
 /// Filters sidecar entries to remove references to deleted partitions.
 ///
 /// After compaction merges partitions, some entries in the collected
@@ -507,6 +530,21 @@ impl<F: FlushTarget> TableStore<F> {
     /// return data for the same key, `merge_partitions` applies cell-level
     /// last-write-wins semantics.
     pub fn read(&self, key: &DecoratedKey) -> Result<Option<Partition>> {
+        self.read_limited_rows(key, 0)
+    }
+
+    /// Read a partition by merging all sources while retaining at most
+    /// `row_limit` clustered rows from each source when non-zero.
+    ///
+    /// For single-partition CQL `LIMIT` queries this avoids decoding an
+    /// entire wide partition before the router applies the row limit. Each
+    /// immutable source is asked for only the needed prefix; the merged
+    /// result is trimmed again after last-write-wins reconciliation.
+    pub fn read_limited_rows(
+        &self,
+        key: &DecoratedKey,
+        row_limit: usize,
+    ) -> Result<Option<Partition>> {
         let guard = self.view.load();
         let schema = self.schema.load();
 
@@ -514,13 +552,21 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
-            sources.push((*p).clone());
+            let mut p = (*p).clone();
+            if row_limit > 0 {
+                p.rows.truncate(row_limit);
+            }
+            sources.push(p);
         }
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
             if let Some(p) = flushing.get(key)? {
-                sources.push((*p).clone());
+                let mut p = (*p).clone();
+                if row_limit > 0 {
+                    p.rows.truncate(row_limit);
+                }
+                sources.push(p);
             }
         }
 
@@ -529,7 +575,7 @@ impl<F: FlushTarget> TableStore<F> {
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for (i, sstable) in guard.sstables.iter().enumerate() {
-            match sstable.get_partition(key) {
+            match sstable.get_partition_limited_rows(key, row_limit) {
                 Ok(Some(mut p)) => {
                     ColumnOrdinalMapping::for_header(&schema, sstable.header())
                         .remap_partition(&mut p);
@@ -562,7 +608,82 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(None);
         }
 
-        Ok(Some(merge::merge_partitions(sources)))
+        let mut merged = merge::merge_partitions(sources);
+        if row_limit > 0 {
+            merge::apply_deletions(&mut merged);
+            merged.rows.truncate(row_limit);
+        }
+        Ok(Some(merged))
+    }
+
+    /// Read exactly one clustered row from a partition by clustering-key
+    /// bytes, merging only matching rows across memtable and SSTable sources.
+    ///
+    /// Full primary-key CQL lookups use this path so equality on every
+    /// clustering column does not decode a wide partition before the router
+    /// applies its predicates. Reads still use an atomic [`StoreView`]
+    /// snapshot and tolerate corrupt SSTables the same way as partition reads.
+    pub fn read_clustering_row(
+        &self,
+        key: &DecoratedKey,
+        clustering: &[u8],
+    ) -> Result<Option<Partition>> {
+        let guard = self.view.load();
+        let schema = self.schema.load();
+        let mut sources: Vec<Partition> = Vec::new();
+
+        if let Some(p) = guard.active.get(key)? {
+            if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
+                sources.push(filtered);
+            }
+        }
+
+        if let Some(ref flushing) = guard.flushing {
+            if let Some(p) = flushing.get(key)? {
+                if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
+                    sources.push(filtered);
+                }
+            }
+        }
+
+        for (i, sstable) in guard.sstables.iter().enumerate() {
+            match sstable.get_clustering_row(key, clustering) {
+                Ok(Some(mut p)) => {
+                    ColumnOrdinalMapping::for_header(&schema, sstable.header())
+                        .remap_partition(&mut p);
+                    sources.push(p);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let id_info = guard
+                        .sstable_ids
+                        .get(i)
+                        .map(|(id, path)| format!("id={id} path={path:?}"))
+                        .unwrap_or_else(|| format!("index={i}"));
+                    tracing::error!(
+                        %e,
+                        %id_info,
+                        key = ?key.key.as_bytes(),
+                        clustering = ?clustering,
+                        "SSTable exact clustering read error: skipping corrupt source — data may be incomplete"
+                    );
+                    self.sstable_read_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        if sources.is_empty() {
+            return Ok(None);
+        }
+
+        let mut merged = merge::merge_partitions(sources);
+        merged.rows.retain(|row| row.clustering == clustering);
+        if merged.rows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(merged))
+        }
     }
 
     /// Visit rows for one partition and timestamp window without returning an
@@ -3751,6 +3872,43 @@ mod tests {
             "rows must be in sorted clustering key order after flush merge, \
              got {:?}",
             clustering_keys
+        );
+    }
+
+    #[test]
+    fn exact_clustering_row_read_returns_only_matching_row_across_sources() {
+        let store = test_store();
+        let key = make_key("wide");
+
+        for ck in 0..100i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("sst-{ck}").as_bytes(), 1000),
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        store
+            .write(&key, make_row_with_ck(42, b"mem-newer", 2000))
+            .unwrap();
+
+        let partition = store
+            .read_clustering_row(&key, &42i32.to_be_bytes())
+            .unwrap()
+            .expect("matching clustering row should be found");
+
+        assert_eq!(
+            partition.rows.len(),
+            1,
+            "exact clustering read must not return or materialize the rest of a wide partition"
+        );
+        assert_eq!(partition.rows[0].clustering, 42i32.to_be_bytes());
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(b"mem-newer".as_slice()),
+            "newer memtable data must merge over the SSTable row for the same clustering key"
         );
     }
 

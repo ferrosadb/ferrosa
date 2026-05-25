@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,12 +197,13 @@ pub(crate) fn spawn_alive_watcher(
 /// that assign a new IP are handled transparently.
 ///
 /// Returns `None` when `MAX_RECONNECT_ATTEMPTS` is reached without success.
-pub(crate) async fn connect_with_retry(
+pub(crate) async fn connect_with_retry_cancelable(
     config: Arc<NetConfig>,
     local_host_id: Uuid,
     peer_host: &str,
     lane: Lane,
     tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> Option<RpcClient> {
     let mut backoff = ExponentialBackoff::new(
         Duration::from_millis(BACKOFF_INITIAL_MS),
@@ -210,6 +211,13 @@ pub(crate) async fn connect_with_retry(
     );
 
     for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+        if cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+        {
+            tracing::debug!(?lane, peer = peer_host, "reconnect cancelled");
+            return None;
+        }
         let delay = backoff.next_delay();
         tracing::debug!(
             ?lane,
@@ -219,6 +227,13 @@ pub(crate) async fn connect_with_retry(
             "reconnecting lane"
         );
         tokio::time::sleep(delay).await;
+        if cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+        {
+            tracing::debug!(?lane, peer = peer_host, "reconnect cancelled");
+            return None;
+        }
         inc_total_reconnect_attempts();
 
         // Re-resolve on every attempt so a container restart (new IP) is
@@ -354,5 +369,33 @@ mod tests {
             )
         };
         const { assert!(DORMANT_AFTER_EXHAUSTIONS >= 1, "must transition eventually") };
+    }
+
+    #[tokio::test]
+    async fn cancelled_reconnect_exits_before_first_attempt() {
+        let before = total_reconnect_attempts();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let start = std::time::Instant::now();
+
+        let result = connect_with_retry_cancelable(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            "127.0.0.1:9",
+            Lane::Data,
+            None,
+            Some(cancelled),
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "cancelled reconnect should not wait for backoff"
+        );
+        assert_eq!(
+            total_reconnect_attempts(),
+            before,
+            "cancelled reconnect should not record an attempt"
+        );
     }
 }

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use ferrosa_net::pool::PriorityPool;
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -9,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::{ClusterError, Result};
 use crate::raft::{uuid_to_node_id, NodeInfo, NodeState, RaftCommand, RaftOp};
+use crate::ring::TokenRing;
 
 use super::token::generate_deterministic_token;
 use super::ModeController;
@@ -32,6 +34,41 @@ fn cluster_member_metadata_changed(
         (None, Some(_)) => true,
         _ => false,
     }
+}
+
+fn apply_existing_member_metadata_to_ring(
+    ring_holder: &Arc<ArcSwap<Option<Arc<TokenRing>>>>,
+    peer_node_id: u64,
+    existing: &NodeInfo,
+    host_id: Uuid,
+    addr: std::net::SocketAddr,
+    cql_broadcast: Option<String>,
+) -> bool {
+    let desired_addr = addr.to_string();
+    let desired_cql_broadcast = cql_broadcast.or_else(|| existing.cql_broadcast.clone());
+    if !cluster_member_metadata_changed(existing, addr, desired_cql_broadcast.as_deref()) {
+        return false;
+    }
+
+    let ring_snapshot = ring_holder.load();
+    let Some(current_ring) = (**ring_snapshot).as_ref() else {
+        return false;
+    };
+
+    let mut updated_ring = (**current_ring).clone();
+    updated_ring.add_node(
+        peer_node_id,
+        NodeInfo {
+            host_id,
+            addr: desired_addr,
+            data_center: existing.data_center.clone(),
+            rack: existing.rack.clone(),
+            state: existing.state,
+            cql_broadcast: desired_cql_broadcast,
+        },
+    );
+    ring_holder.store(Arc::new(Some(Arc::new(updated_ring))));
+    true
 }
 
 impl ModeController {
@@ -385,6 +422,24 @@ impl ModeController {
                 }
             }
 
+            if let Some(existing) = existing_member.as_ref() {
+                if apply_existing_member_metadata_to_ring(
+                    &ring_holder,
+                    peer_node_id,
+                    existing,
+                    host_id,
+                    addr,
+                    cql_broadcast.clone(),
+                ) {
+                    tracing::info!(
+                        peer = %host_id,
+                        node_id = peer_node_id,
+                        %addr,
+                        "peer metadata applied optimistically to local token ring before Raft convergence"
+                    );
+                }
+            }
+
             let mut raft = None;
             for attempt in 0..60 {
                 let groups = raft_groups.load();
@@ -573,6 +628,14 @@ impl ModeController {
 
 #[cfg(test)]
 mod streaming_contract_tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use uuid::Uuid;
+
+    use crate::raft::{uuid_to_node_id, NodeInfo, NodeState};
+    use crate::ring::TokenRing;
+
     #[test]
     fn decommission_streaming_must_not_materialize_all_partitions() {
         let source = include_str!("membership.rs")
@@ -582,6 +645,57 @@ mod streaming_contract_tests {
         assert!(
             !source.contains("read_range(&table_id, None, None, usize::MAX)"),
             "decommission must stream partitions instead of materializing every partition with usize::MAX"
+        );
+    }
+
+    #[test]
+    fn existing_member_metadata_refresh_updates_local_ring_snapshot_without_losing_tokens() {
+        let host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let node_id = uuid_to_node_id(host_id);
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            node_id,
+            NodeInfo {
+                host_id,
+                addr: "10.89.1.151:17000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        ring.assign_tokens(node_id, &[100, 200]);
+        let existing = ring.get_node(node_id).unwrap().clone();
+        let ring_holder = Arc::new(ArcSwap::from_pointee(Some(Arc::new(ring))));
+
+        let changed = super::apply_existing_member_metadata_to_ring(
+            &ring_holder,
+            node_id,
+            &existing,
+            host_id,
+            "10.89.1.201:17000".parse().unwrap(),
+            Some("127.0.0.1:19045".to_string()),
+        );
+
+        assert!(changed);
+        let updated = ring_holder
+            .load()
+            .as_ref()
+            .as_ref()
+            .unwrap()
+            .get_node(node_id)
+            .unwrap()
+            .clone();
+        assert_eq!(updated.addr, "10.89.1.201:17000");
+        assert_eq!(updated.cql_broadcast.as_deref(), Some("127.0.0.1:19045"));
+        assert_eq!(
+            ring_holder
+                .load()
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .tokens_for_node(node_id),
+            vec![100, 200]
         );
     }
 }

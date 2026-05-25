@@ -153,6 +153,19 @@ fn encode_read_request(payload: &ReadRequestPayload) -> Bytes {
     Bytes::from(bincode::serialize(payload).unwrap_or_default())
 }
 
+fn read_local_partition(
+    storage: &ferrosa_storage::StorageEngine,
+    table_id: &TableId,
+    key: &DecoratedKey,
+    row_limit: usize,
+    clustering: Option<&[u8]>,
+) -> ferrosa_common::Result<Option<Partition>> {
+    match clustering {
+        Some(clustering) => storage.read_clustering_row(table_id, key, clustering),
+        None => storage.read_limited_rows(table_id, key, row_limit),
+    }
+}
+
 /// Decode a [`ReadResponsePayload`] from raw bytes, or return `None`.
 fn decode_read_response(bytes: &[u8]) -> Option<ReadResponsePayload> {
     bincode::deserialize(bytes)
@@ -161,7 +174,10 @@ fn decode_read_response(bytes: &[u8]) -> Option<ReadResponsePayload> {
 }
 
 fn should_retry_missing_peer_error(err: &str) -> bool {
-    err.contains("unknown peer") || err.contains("no connection pool")
+    err.contains("unknown peer")
+        || err.contains("no connection pool")
+        || err.contains("lane is reconnecting")
+        || err.contains("lane permanently failed")
 }
 
 // ---------------------------------------------------------------------------
@@ -232,16 +248,13 @@ impl ClusterCoordinator {
             .await
     }
 
-    /// Full re-fetch from a remote replica identified by `host_id`.
-    ///
-    /// Called during digest-mismatch resolution when a remote replica has
-    /// a newer timestamp than the full-read replica. Returns the remote
-    /// partition, or `None` if the fetch fails.
-    async fn full_refetch(
+    async fn full_refetch_limited_rows(
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
         host_id: uuid::Uuid,
+        row_limit: usize,
+        clustering: Option<&[u8]>,
     ) -> Option<Partition> {
         let addr = {
             let ring = self.ring.load();
@@ -256,8 +269,9 @@ impl ClusterCoordinator {
             table: table_id.table.clone(),
             key: key.key.as_bytes().to_vec(),
             digest_only: false,
-            page_size: 0,
+            page_size: row_limit.min(u32::MAX as usize) as u32,
             page_state: vec![],
+            clustering: clustering.unwrap_or_default().to_vec(),
         };
         let body = encode_read_request(&payload);
         match self
@@ -272,6 +286,17 @@ impl ClusterCoordinator {
         }
     }
 
+    #[cfg(test)]
+    async fn full_refetch(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        host_id: uuid::Uuid,
+    ) -> Option<Partition> {
+        self.full_refetch_limited_rows(table_id, key, host_id, 0, None)
+            .await
+    }
+
     /// Coordinate a read with explicit consistency level and replication factor.
     ///
     /// Use this when the query specifies a CL or the keyspace has a non-default RF.
@@ -281,6 +306,50 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         rf: usize,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_with_limited_rows(table_id, key, cl, rf, 0)
+            .await
+    }
+
+    /// Coordinate a read while retaining at most `row_limit` clustered rows
+    /// from the requested partition when the limit is non-zero.
+    ///
+    /// The digest protocol hashes the same bounded slice returned to the
+    /// client, which keeps `SELECT ... LIMIT N` over a wide partition from
+    /// waiting on full-partition decode while preserving quorum agreement for
+    /// the requested result slice.
+    pub async fn coordinate_read_with_limited_rows(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        rf: usize,
+        row_limit: usize,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_with_filter(table_id, key, cl, rf, row_limit, None)
+            .await
+    }
+
+    pub async fn coordinate_read_clustering_row(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        clustering: &[u8],
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_with_filter(table_id, key, cl, rf, 0, Some(clustering.to_vec()))
+            .await
+    }
+
+    async fn coordinate_read_with_filter(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        rf: usize,
+        row_limit: usize,
+        clustering: Option<Vec<u8>>,
     ) -> crate::error::Result<Option<Vec<Row>>> {
         let ring = self.ring.load();
         let raw_replicas = ring.replicas(key.token.0, rf);
@@ -314,7 +383,16 @@ impl ClusterCoordinator {
         // CL = ONE fast path: single replica, prefer local.
         // -------------------------------------------------------------------
         if cl == ConsistencyLevel::One || cl == ConsistencyLevel::LocalOne {
-            return self.read_one_replica(table_id, key, &replicas, &ring).await;
+            return self
+                .read_one_replica_limited_rows(
+                    table_id,
+                    key,
+                    &replicas,
+                    &ring,
+                    row_limit,
+                    clustering.as_deref(),
+                )
+                .await;
         }
 
         // -------------------------------------------------------------------
@@ -363,11 +441,18 @@ impl ClusterCoordinator {
                 let keyspace = table_id.keyspace.clone();
                 let table_name = table_id.table.clone();
                 let key_bytes = key.key.as_bytes().to_vec();
+                let clustering = clustering.clone();
 
                 async move {
                     if full_replica == local_node_id {
                         // Local full read.
-                        match storage.read(&table_id, &key) {
+                        match read_local_partition(
+                            &storage,
+                            &table_id,
+                            &key,
+                            row_limit,
+                            clustering.as_deref(),
+                        ) {
                             Ok(opt) => ReplicaRead::Full(opt),
                             Err(_) => ReplicaRead::Failed,
                         }
@@ -378,8 +463,9 @@ impl ClusterCoordinator {
                             table: table_name,
                             key: key_bytes,
                             digest_only: false,
-                            page_size: 0,
+                            page_size: row_limit.min(u32::MAX as usize) as u32,
                             page_state: vec![],
+                            clustering: clustering.unwrap_or_default(),
                         };
                         let body = encode_read_request(&payload);
                         match full_remote {
@@ -422,11 +508,18 @@ impl ClusterCoordinator {
                 let keyspace = table_id.keyspace.clone();
                 let table_name = table_id.table.clone();
                 let key_bytes = key.key.as_bytes().to_vec();
+                let clustering = clustering.clone();
 
                 async move {
                     if replica_id == local_node_id {
                         // Local digest read.
-                        match storage.read(&table_id, &key) {
+                        match read_local_partition(
+                            &storage,
+                            &table_id,
+                            &key,
+                            row_limit,
+                            clustering.as_deref(),
+                        ) {
                             Ok(Some(p)) => {
                                 use crate::raft::handlers::compute_partition_digest;
                                 let ts = p
@@ -456,8 +549,9 @@ impl ClusterCoordinator {
                             table: table_name,
                             key: key_bytes,
                             digest_only: true,
-                            page_size: 0,
+                            page_size: row_limit.min(u32::MAX as usize) as u32,
                             page_state: vec![],
+                            clustering: clustering.unwrap_or_default(),
                         };
                         let body = encode_read_request(&payload);
                         match remote {
@@ -597,7 +691,10 @@ impl ClusterCoordinator {
             );
 
             if let Some(hid) = newest_remote_host_id {
-                if let Some(newer_partition) = self.full_refetch(table_id, key, hid).await {
+                if let Some(newer_partition) = self
+                    .full_refetch_limited_rows(table_id, key, hid, row_limit, clustering.as_deref())
+                    .await
+                {
                     // The full-read replica (and any other mismatched digests
                     // except the one we just fetched from) are stale.
                     let mut stale: Vec<uuid::Uuid> = digest_responses
@@ -692,12 +789,14 @@ impl ClusterCoordinator {
     ///
     /// Tries the local node first (if it's a replica), then iterates through
     /// remaining replicas in order until one returns data or all are exhausted.
-    async fn read_one_replica(
+    async fn read_one_replica_limited_rows(
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
         replicas: &[u64],
         ring: &crate::ring::TokenRing,
+        row_limit: usize,
+        clustering: Option<&[u8]>,
     ) -> crate::error::Result<Option<Vec<Row>>> {
         // Build an ordered candidate list: local node first, then remaining replicas.
         let mut candidates: Vec<u64> = Vec::with_capacity(replicas.len());
@@ -712,9 +811,7 @@ impl ClusterCoordinator {
 
         for &target in &candidates {
             if target == self.local_node_id {
-                match self
-                    .storage
-                    .read(table_id, key)
+                match read_local_partition(&self.storage, table_id, key, row_limit, clustering)
                     .map(|opt| opt.map(|p| p.rows))
                     .map_err(ClusterError::Storage)
                 {
@@ -738,6 +835,11 @@ impl ClusterCoordinator {
             /// response well under the Data lane timeout (10s) and frame
             /// size limit (256MB). 5000 rows × ~3KB each ≈ 15MB per page.
             const READ_PAGE_SIZE: u32 = 5000;
+            let read_page_size = if row_limit > 0 {
+                row_limit.min(u32::MAX as usize) as u32
+            } else {
+                READ_PAGE_SIZE
+            };
 
             let mut all_rows: Vec<Row> = Vec::new();
             let mut page_state: Vec<u8> = vec![];
@@ -749,8 +851,9 @@ impl ClusterCoordinator {
                     table: table_id.table.clone(),
                     key: key.key.as_bytes().to_vec(),
                     digest_only: false,
-                    page_size: READ_PAGE_SIZE,
+                    page_size: read_page_size,
                     page_state: page_state.clone(),
+                    clustering: clustering.unwrap_or_default().to_vec(),
                 };
                 let body = encode_read_request(&payload);
                 match self
@@ -764,6 +867,9 @@ impl ClusterCoordinator {
                                 all_rows.extend(p.rows);
                             }
                             if resp.has_more && !resp.next_page_state.is_empty() {
+                                if row_limit > 0 {
+                                    break;
+                                }
                                 page_state = resp.next_page_state;
                                 continue; // fetch next page
                             }
@@ -787,6 +893,18 @@ impl ClusterCoordinator {
         Ok(None)
     }
 
+    #[cfg(test)]
+    async fn read_one_replica(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        replicas: &[u64],
+        ring: &crate::ring::TokenRing,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.read_one_replica_limited_rows(table_id, key, replicas, ring, 0, None)
+            .await
+    }
+
     /// Coordinate a read using NetworkTopologyStrategy with DC-aware consistency.
     ///
     /// For `LOCAL_QUORUM` / `LOCAL_ONE`: only replicas in the local DC
@@ -799,6 +917,43 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_nts_limited_rows(table_id, key, cl, strategy, 0)
+            .await
+    }
+
+    pub async fn coordinate_read_nts_limited_rows(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        row_limit: usize,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_nts_filtered(table_id, key, cl, strategy, row_limit, None)
+            .await
+    }
+
+    pub async fn coordinate_read_nts_clustering_row(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        clustering: &[u8],
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_nts_filtered(table_id, key, cl, strategy, 0, Some(clustering.to_vec()))
+            .await
+    }
+
+    async fn coordinate_read_nts_filtered(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        row_limit: usize,
+        clustering: Option<Vec<u8>>,
     ) -> crate::error::Result<Option<Vec<Row>>> {
         let ring = self.ring.load();
         let all_replicas = ring.replicas_for_strategy(key.token.0, strategy);
@@ -855,8 +1010,15 @@ impl ClusterCoordinator {
 
         // Delegate to the existing coordinate_read_with logic using
         // the effective replica set and required count.
-        self.coordinate_read_with(table_id, key, cl, effective_replicas.len())
-            .await
+        self.coordinate_read_with_filter(
+            table_id,
+            key,
+            cl,
+            effective_replicas.len(),
+            row_limit,
+            clustering,
+        )
+        .await
     }
 
     /// Scatter a full-table range read to every node in the ring.
@@ -1309,6 +1471,18 @@ mod tests {
     // -----------------------------------------------------------------------
     // Helpers (mirrors write.rs test helpers)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn stale_lane_errors_trigger_peer_refresh_for_reads() {
+        assert!(should_retry_missing_peer_error("unknown peer"));
+        assert!(should_retry_missing_peer_error("no connection pool"));
+        assert!(should_retry_missing_peer_error(
+            "lane is reconnecting; retry later"
+        ));
+        assert!(should_retry_missing_peer_error(
+            "lane permanently failed after max reconnection attempts"
+        ));
+    }
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {
