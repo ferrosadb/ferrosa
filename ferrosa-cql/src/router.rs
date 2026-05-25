@@ -2289,9 +2289,16 @@ async fn route_select_user_table(
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
         let row_limit =
             safe_partition_key_filter_row_limit(s, table_meta, count_only_select).unwrap_or(0);
-        let exact_clustering =
+        let exact_clustering = if clustering_key_equality_has_phonetic_index(
+            &s.where_clauses,
+            table_meta,
+            &state.schema,
+        ) {
+            None
+        } else {
             extract_clustering_key_values(&s.where_clauses, table_meta, ks, &state.schema)?
-                .map(|values| bridge::build_clustering_key(&values));
+                .map(|values| bridge::build_clustering_key(&values))
+        };
         let partition = if let Some(clustering) = exact_clustering {
             state
                 .write_path
@@ -6097,6 +6104,25 @@ fn extract_clustering_key_values(
         values.push(bridge::term_to_cql_value(&wc.value, &cql_type)?);
     }
     Ok(Some(values))
+}
+
+fn clustering_key_equality_has_phonetic_index(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    schema: &Schema,
+) -> bool {
+    let snap = schema.snapshot();
+    table_meta.clustering_key.iter().any(|(ck_name, _)| {
+        where_clauses
+            .iter()
+            .any(|wc| wc.column == *ck_name && wc.op == ComparisonOp::Eq)
+            && snap.indexes.values().any(|idx| {
+                idx.keyspace == table_meta.keyspace
+                    && idx.table == table_meta.name
+                    && idx.index_type == IndexType::Phonetic
+                    && idx.target_columns.contains(ck_name)
+            })
+    })
 }
 
 /// Try to handle `WHERE partition_key IN (v1, v2, ...)` by performing a
