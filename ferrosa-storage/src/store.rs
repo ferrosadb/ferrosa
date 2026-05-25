@@ -935,8 +935,12 @@ impl<F: FlushTarget> TableStore<F> {
                 .collect();
             for p in prev_parts {
                 if let Some(&idx) = existing_map.get(&p.key) {
-                    // Same partition key: merge rows from both.
-                    partitions[idx].rows.extend(p.rows);
+                    // Same partition key: merge rows from both sources using
+                    // the normal read-path semantics. A raw append preserves
+                    // data but can leave clustering rows out of order
+                    // (current flush rows followed by previous flushing rows),
+                    // which corrupts wide-row row-index construction.
+                    partitions[idx] = merge::merge_partitions(vec![partitions[idx].clone(), p]);
                 } else {
                     let idx = partitions.len();
                     existing_map.insert(p.key.clone(), idx);
@@ -3873,6 +3877,45 @@ mod tests {
              got {:?}",
             clustering_keys
         );
+    }
+
+    /// Wide-row version of the previous regression: once a partition has
+    /// enough clustered rows to build a Rows.db trie, an append-merge of the
+    /// previous flushing memtable makes `SSTableWriter` reject the second flush
+    /// with "keys must be added in sorted order".
+    #[test]
+    fn consecutive_flushes_with_wide_partition_preserve_row_index_order() {
+        let store = test_store();
+        let key = make_key("wide-pk");
+
+        for ck in 0..100i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("batch1-{ck}").as_bytes(), 1000 + ck as i64),
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        for ck in 100..150i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("batch2-{ck}").as_bytes(), 2000 + ck as i64),
+                )
+                .unwrap();
+        }
+        store
+            .flush()
+            .expect("wide-row second flush must keep clustering rows sorted for row-index build");
+
+        let result = store.read(&key).unwrap().expect("partition must exist");
+        assert_eq!(result.rows.len(), 150);
+        assert!(result
+            .rows
+            .windows(2)
+            .all(|pair| pair[0].clustering < pair[1].clustering));
     }
 
     #[test]
