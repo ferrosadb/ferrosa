@@ -621,7 +621,7 @@ impl<F: FlushTarget> TableStore<F> {
     ///
     /// Full primary-key CQL lookups use this path so equality on every
     /// clustering column does not decode a wide partition before the router
-    /// applies its predicates. Reads still use an atomic [`StoreView`]
+    /// applies its predicates. Reads still use an atomic store view
     /// snapshot and tolerate corrupt SSTables the same way as partition reads.
     pub fn read_clustering_row(
         &self,
