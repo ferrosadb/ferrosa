@@ -48,6 +48,98 @@ pub(super) fn should_send_cluster_invite_after_join_trigger(
     peer_plan::should_send_cluster_invite(join_enqueued, last_sent, now)
 }
 
+#[cfg(test)]
+pub(super) fn should_refresh_outbound_peer_for_inbound(
+    known_addr: Option<&str>,
+    live: bool,
+    inbound_reverse_addr: std::net::SocketAddr,
+) -> bool {
+    should_refresh_outbound_peer_for_inbound_impl(known_addr, live, inbound_reverse_addr)
+}
+
+#[cfg(test)]
+pub(super) fn should_install_refreshed_outbound_peer(
+    observed_addr: Option<&str>,
+    current_addr: Option<&str>,
+) -> bool {
+    should_install_refreshed_outbound_peer_impl(observed_addr, current_addr)
+}
+
+fn should_refresh_outbound_peer_for_inbound_impl(
+    known_addr: Option<&str>,
+    live: bool,
+    inbound_reverse_addr: std::net::SocketAddr,
+) -> bool {
+    let desired = inbound_reverse_addr.to_string();
+    !matches!((known_addr, live), (Some(known), true) if known == desired)
+}
+
+fn should_install_refreshed_outbound_peer_impl(
+    observed_addr: Option<&str>,
+    current_addr: Option<&str>,
+) -> bool {
+    observed_addr == current_addr
+}
+
+async fn refresh_outbound_peer_for_inbound(
+    peer_manager: Arc<ferrosa_net::peer::PeerManager>,
+    net_config: Arc<ferrosa_net::config::NetConfig>,
+    local_host_id: uuid::Uuid,
+    raft_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    data_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    host_id: uuid::Uuid,
+    reverse_addr: std::net::SocketAddr,
+) {
+    let known_addr = peer_manager.peer_addr(host_id).await;
+    let live = peer_manager.has_live_peer(host_id);
+    if !should_refresh_outbound_peer_for_inbound_impl(known_addr.as_deref(), live, reverse_addr) {
+        return;
+    }
+
+    match ferrosa_net::pool::PriorityPool::connect(
+        net_config,
+        local_host_id,
+        &reverse_addr.to_string(),
+        raft_runtime.as_deref(),
+        data_runtime.as_deref(),
+    )
+    .await
+    {
+        Ok(pool) => {
+            let current_addr = peer_manager.peer_addr(host_id).await;
+            if !should_install_refreshed_outbound_peer_impl(
+                known_addr.as_deref(),
+                current_addr.as_deref(),
+            ) {
+                tracing::info!(
+                    peer = %host_id,
+                    observed_addr = ?known_addr,
+                    current_addr = ?current_addr,
+                    attempted_addr = %reverse_addr,
+                    "skipping stale inbound peer refresh; peer address changed while connecting"
+                );
+                return;
+            }
+            peer_manager.add_peer((host_id, reverse_addr), pool).await;
+            tracing::info!(
+                peer = %host_id,
+                previous_addr = ?known_addr,
+                new_addr = %reverse_addr,
+                "inbound peer address refreshed outbound connection"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                peer = %host_id,
+                previous_addr = ?known_addr,
+                new_addr = %reverse_addr,
+                %e,
+                "failed to refresh outbound connection from inbound peer address"
+            );
+        }
+    }
+}
+
 impl ModeController {
     fn execute_peer_event_plan(
         &self,
@@ -264,6 +356,22 @@ impl InboundPeerCallback for ModeController {
                     pm.set_peer_cql_broadcast(hid, broadcast).await;
                 });
             }
+        }
+        if let Some(pm) = &**self.peer_manager.load() {
+            let pm = pm.clone();
+            let net_config = self.net_config.clone();
+            let local_host_id = self.local_host_id;
+            let raft_runtime = self.raft_runtime.get().cloned();
+            let data_runtime = self.data_runtime.get().cloned();
+            self.spawn_tracked(refresh_outbound_peer_for_inbound(
+                pm,
+                net_config,
+                local_host_id,
+                raft_runtime,
+                data_runtime,
+                host_id,
+                reverse_addr,
+            ));
         }
 
         // Track this peer

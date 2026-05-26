@@ -1,9 +1,9 @@
 ---
 type: todo
 priority: P1
-status: draft
+status: in_progress
 created: 2026-04-19
-updated: 2026-04-20
+updated: 2026-05-24
 ---
 
 # Startup smoke-test: detect-and-quarantine SSTables whose open() succeeds but whose row iteration fails
@@ -50,15 +50,31 @@ so operators can turn it off if startup time becomes a concern at scale.
 
 ## Acceptance criteria
 
-- [ ] Unit test: synthesise an SSTable whose Data.db is truncated
+- [x] Unit test: synthesise an SSTable whose Data.db is truncated
       relative to Partitions.db offsets, verify startup quarantines it
       and does not include it in the view.
-- [ ] Startup log emits a clear message showing how many SSTables were
+- [x] Startup log emits a clear message showing how many SSTables were
       smoke-tested, how long the pass took, and how many were
       quarantined.
 - [ ] Re-running the cluster on the 2026-04-19 corrupted data directory
       should quarantine all 82 known-bad files automatically without
       manual intervention.
+
+## Implementation Notes
+
+Implemented in `ferrosa-storage/src/engine.rs` by running a default-on
+startup SSTable smoke test after `open_sstable_from_dir` succeeds and before
+the reader is admitted into the live view. The smoke test performs a full
+partition iteration and rejects unreadable SSTables plus decoded cells with
+`NO_TIMESTAMP` values that cannot be safely compacted. Open failures are now
+quarantined through the same generation-moving path instead of being skipped
+forever.
+
+Added a compaction-side guard in `ferrosa-storage/src/compaction/executor.rs`
+so a remaining malformed partition returns a clear task failure stating that
+the original SSTables are preserved and startup repair/quarantine should remove
+the corrupt input, instead of reaching the SSTable writer assertion and killing
+the compaction worker.
 
 ## Relationship to the writer-validation fix
 

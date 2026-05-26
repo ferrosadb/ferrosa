@@ -174,6 +174,7 @@ mod tests {
             request_id: id,
             keyspace: "ks".into(),
             table: "tbl".into(),
+            projected_regular_ordinals: None,
         }
     }
 

@@ -7,12 +7,14 @@
 //! - `WritePath::Direct` — standalone mode, writes directly to `StorageEngine`.
 //! - `WritePath::Pair` — pair mode, delegates to `PairCoordinator::coordinate_write()`.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::{Mutation, TableId};
+use futures::{Stream, StreamExt};
 
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
@@ -22,6 +24,36 @@ use crate::ring::strategy::ReplicationStrategy;
 /// Default upper bound for unordered range reads when the caller does not
 /// provide a tighter page/limit bound.
 pub const DEFAULT_RANGE_READ_LIMIT: usize = 10_000;
+
+pub type PartitionResultStream =
+    Pin<Box<dyn Stream<Item = crate::error::Result<Partition>> + Send>>;
+
+fn local_range_stream(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    row_limit: usize,
+) -> PartitionResultStream {
+    let stream = engine.range_iter(table_id, None, None).map(move |item| {
+        let mut partition = item.map_err(crate::error::ClusterError::Storage)?;
+        if row_limit > 0 {
+            partition.rows.truncate(row_limit);
+        }
+        Ok(partition)
+    });
+    Box::pin(stream)
+}
+
+fn local_projected_range_stream(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    wanted: Vec<u16>,
+    partition_limit: Option<usize>,
+) -> PartitionResultStream {
+    let stream = engine
+        .range_iter_projected(table_id, wanted, partition_limit, None, None)
+        .map(|item| item.map_err(crate::error::ClusterError::Storage));
+    Box::pin(stream)
+}
 
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
@@ -105,19 +137,95 @@ impl WritePath {
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
     ) -> ferrosa_common::Result<Option<Partition>> {
+        self.pk_read_limited_rows(table_id, key, cl, strategy, 0)
+            .await
+    }
+
+    /// Read a single partition by key with CL enforcement, optionally
+    /// retaining only the first `row_limit` clustered rows.
+    pub async fn pk_read_limited_rows(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Option<Partition>> {
         match self {
-            Self::Direct(engine) => engine.read(table_id, key),
-            Self::Pair(coordinator) => coordinator.local_storage().read(table_id, key),
+            Self::Direct(engine) => engine.read_limited_rows(table_id, key, row_limit),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .read_limited_rows(table_id, key, row_limit),
             Self::Cluster(coordinator) => {
                 let rows_opt = match strategy {
                     ReplicationStrategy::Simple { replication_factor } => {
                         coordinator
-                            .coordinate_read_with(table_id, key, cl, *replication_factor)
+                            .coordinate_read_with_limited_rows(
+                                table_id,
+                                key,
+                                cl,
+                                *replication_factor,
+                                row_limit,
+                            )
                             .await
                     }
                     ReplicationStrategy::NetworkTopology { .. } => {
                         coordinator
-                            .coordinate_read_nts(table_id, key, cl, strategy)
+                            .coordinate_read_nts_limited_rows(
+                                table_id, key, cl, strategy, row_limit,
+                            )
+                            .await
+                    }
+                };
+                match rows_opt {
+                    Ok(Some(rows)) if !rows.is_empty() => Ok(Some(Partition {
+                        key: key.clone(),
+                        deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                        static_row: None,
+                        rows,
+                    })),
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                }
+            }
+            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, reads rejected until operator promotes".into(),
+            )),
+        }
+    }
+
+    /// Read exactly one clustered row by full primary key with CL enforcement.
+    pub async fn pk_read_clustering_row(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        clustering: &[u8],
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        match self {
+            Self::Direct(engine) => engine.read_clustering_row(table_id, key, clustering),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .read_clustering_row(table_id, key, clustering),
+            Self::Cluster(coordinator) => {
+                let rows_opt = match strategy {
+                    ReplicationStrategy::Simple { replication_factor } => {
+                        coordinator
+                            .coordinate_read_clustering_row(
+                                table_id,
+                                key,
+                                clustering,
+                                cl,
+                                *replication_factor,
+                            )
+                            .await
+                    }
+                    ReplicationStrategy::NetworkTopology { .. } => {
+                        coordinator
+                            .coordinate_read_nts_clustering_row(
+                                table_id, key, clustering, cl, strategy,
+                            )
                             .await
                     }
                 };
@@ -178,8 +286,93 @@ impl WritePath {
     /// empty results on failure causes data loss (see BUG: large-write-causes-
     /// data-loss-in-partition).
     pub async fn range_read(&self, table_id: &TableId) -> crate::error::Result<Vec<Partition>> {
-        self.range_read_limited(table_id, DEFAULT_RANGE_READ_LIMIT)
-            .await
+        self.range_read_with(
+            table_id,
+            ConsistencyLevel::One,
+            &ReplicationStrategy::Simple {
+                replication_factor: 1,
+            },
+        )
+        .await
+    }
+
+    /// Scatter a full-table range read with caller consistency and keyspace
+    /// replication strategy, then collect the streamed partitions.
+    pub async fn range_read_with(
+        &self,
+        table_id: &TableId,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<Vec<Partition>> {
+        let mut stream = self
+            .range_read_stream_all_with(table_id, 0, cl, strategy)
+            .await?;
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Stream every partition for full-scan consumers.
+    ///
+    /// This is the unbounded counterpart to `range_read_limited_rows`: callers
+    /// pull one partition at a time and can cancel once protocol LIMIT/page
+    /// semantics are satisfied. Cluster mode currently supports only local-only
+    /// unbounded scans; if the configured CL/RF would require remote duplicate
+    /// merge, it fails loudly instead of materializing the entire result.
+    pub async fn range_read_stream_all(
+        &self,
+        table_id: &TableId,
+        row_limit: usize,
+    ) -> crate::error::Result<PartitionResultStream> {
+        self.range_read_stream_all_with(
+            table_id,
+            row_limit,
+            ConsistencyLevel::One,
+            &ReplicationStrategy::Simple {
+                replication_factor: 1,
+            },
+        )
+        .await
+    }
+
+    /// Stream every partition with the caller's requested consistency and
+    /// table/keyspace replication strategy.
+    pub async fn range_read_stream_all_with(
+        &self,
+        table_id: &TableId,
+        row_limit: usize,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<PartitionResultStream> {
+        match self {
+            Self::Direct(engine) => Ok(local_range_stream(engine.clone(), table_id, row_limit)),
+            Self::Pair(coordinator) => Ok(local_range_stream(
+                coordinator.local_storage().clone(),
+                table_id,
+                row_limit,
+            )),
+            Self::Cluster(coordinator) => {
+                if coordinator.streaming_range_reads {
+                    coordinator
+                        .coordinate_range_read_stream_all_with(
+                            table_id,
+                            row_limit,
+                            cl,
+                            strategy.replication_factor(),
+                        )
+                        .await
+                } else {
+                    Err(crate::error::ClusterError::Internal(
+                        "uncapped range_read is unavailable because FERROSA_BULK_STREAMING_RANGE_READ=0 selected the legacy capped range RPC; refusing to return a partial scan".into(),
+                    ))
+                }
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range read unavailable: write path is in degraded mode".into(),
+            )),
+        }
     }
 
     /// COUNT(*) fast path. Returns the total row count for
@@ -200,6 +393,52 @@ impl WritePath {
             Self::Cluster(coordinator) => coordinator.coordinate_range_count(table_id),
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "count_range unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
+    /// Projection-aware streaming range read for query shapes that only need a
+    /// subset of regular cells to evaluate predicates. This keeps COUNT(*) with
+    /// ALLOW FILTERING on wide tables out of the Vec-returning materialization
+    /// path while preserving fail-closed consistency semantics.
+    pub async fn range_read_projected_stream_all_with(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        partition_limit: Option<usize>,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<PartitionResultStream> {
+        match self {
+            Self::Direct(engine) => Ok(local_projected_range_stream(
+                engine.clone(),
+                table_id,
+                wanted,
+                partition_limit,
+            )),
+            Self::Pair(coordinator) => Ok(local_projected_range_stream(
+                coordinator.local_storage().clone(),
+                table_id,
+                wanted,
+                partition_limit,
+            )),
+            Self::Cluster(coordinator) => {
+                if partition_limit.is_some() {
+                    return Err(crate::error::ClusterError::Internal(
+                        "projected cluster range scan with partition_limit is not implemented; refusing to return partial results".into(),
+                    ));
+                }
+                coordinator
+                    .coordinate_range_read_projected_stream_all_with(
+                        table_id,
+                        wanted,
+                        cl,
+                        strategy.replication_factor(),
+                    )
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range_read_projected unavailable: write path is in degraded mode".into(),
             )),
         }
     }
@@ -547,6 +786,48 @@ mod tests {
             partitions.len(),
             4,
             "index_read must return all 4 rows with label='shared'"
+        );
+    }
+
+    #[test]
+    fn unbounded_write_path_range_read_must_not_collect_local_streams() {
+        let source = include_str!("write_path.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production write_path source must be present");
+        assert!(
+            !source.contains("async fn collect_uncapped_local_range"),
+            "unbounded local range reads must be exposed as streams, not collected into Vec<Partition>"
+        );
+        let range_read_body = source
+            .split("pub async fn range_read(&self, table_id: &TableId)")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn read").next())
+            .expect("range_read body must be present");
+        assert!(
+            !range_read_body.contains("coordinate_range_read_stream_all(table_id, 0)"),
+            "cluster range_read must not call the Vec-returning unbounded streaming coordinator"
+        );
+        assert!(
+            source.contains("pub async fn range_read_stream_all_with")
+                && source.contains("strategy.replication_factor()")
+                && source.contains("coordinate_range_read_stream_all_with"),
+            "cluster streaming full scans must carry caller consistency and keyspace replication into the coordinator"
+        );
+        assert!(
+            source.contains("pub async fn range_read_with")
+                && source.contains(".range_read_stream_all_with(table_id, 0, cl, strategy)"),
+            "materializing range reads must collect from the per-query streaming boundary"
+        );
+        let projected_body = source
+            .split("pub async fn range_read_projected_stream_all_with")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Projection-aware range read").next())
+            .expect("projected streaming range-read body must be present");
+        assert!(
+            projected_body.contains("local_projected_range_stream")
+                && projected_body.contains("coordinate_range_read_projected_stream_all_with"),
+            "projected scans must expose a stream and fail clearly when cluster semantics would under-read"
         );
     }
 }

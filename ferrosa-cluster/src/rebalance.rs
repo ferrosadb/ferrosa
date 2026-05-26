@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use ferrosa_net::peer::PeerManager;
+use futures::StreamExt;
 
 use crate::raft::Token;
 use crate::ring::TokenRing;
@@ -195,24 +196,21 @@ pub async fn execute_rebalance(
 
             let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
 
-            // Read all partitions for this table from local storage.
-            // Cap to prevent OOM; anti-entropy repair covers the rest.
-            const REBALANCE_READ_LIMIT: usize = 100_000;
-            let partitions = match storage.read_range(&table_id, None, None, REBALANCE_READ_LIMIT) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(%e, ks, tbl, "rebalance: failed to read table");
-                    continue;
-                }
-            };
-
             // Stream partitions directly to each target instead of grouping
             // the whole table into a map-of-Vec first. A partition belongs to
             // a reassignment if the token ring currently maps it to the local
             // node AND its token is in the set being moved to a target.
             let mut streamed_for_table = 0usize;
+            let mut partitions = storage.range_iter(&table_id, None, None);
 
-            for partition in &partitions {
+            while let Some(partition) = partitions.next().await {
+                let partition = match partition {
+                    Ok(partition) => partition,
+                    Err(e) => {
+                        tracing::warn!(%e, ks, tbl, "rebalance: failed to read partition");
+                        continue;
+                    }
+                };
                 let token = partition.key.token.0; // Token(i64) -> i64
 
                 // Check if this token is being reassigned to any target.
@@ -484,5 +482,24 @@ mod tests {
                 "reassigned token should be from the original set"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_contract_tests {
+    #[test]
+    fn rebalance_must_not_read_tables_with_capped_materialized_range() {
+        let source = include_str!("rebalance.rs")
+            .split("#[cfg(test)]\nmod streaming_contract_tests")
+            .next()
+            .expect("production rebalance source must be present");
+        assert!(
+            !source.contains("REBALANCE_READ_LIMIT"),
+            "rebalance must stream table contents instead of using a hard row cap"
+        );
+        assert!(
+            !source.contains("storage.read_range(&table_id, None, None"),
+            "rebalance must not materialize whole table ranges before streaming mutations"
+        );
     }
 }

@@ -42,6 +42,8 @@ use crate::trie::builder::{TrieBuilder, TriePayload};
 use crate::types::Partition;
 use crate::varint;
 
+const ROW_INDEX_MIN_ROWS: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Row / cell flag constants (matching data.rs reader)
 // Reference: UnfilteredSerializer.java, Cell.java
@@ -125,6 +127,9 @@ pub struct SSTableWriter {
     header: SerializationHeader,
     /// Raw (uncompressed) data buffer — the Data.db content.
     data_buf: Vec<u8>,
+    /// Raw Rows.db buffer containing per-partition clustering row indexes for
+    /// wide clustered partitions.
+    rows_buf: Vec<u8>,
     /// Bloom filter for partition keys.
     bloom: BloomFilter,
     /// Trie builder for the partition index (Partitions.db).
@@ -151,6 +156,7 @@ impl SSTableWriter {
             options,
             header,
             data_buf: Vec::new(),
+            rows_buf: Vec::new(),
             bloom,
             trie_builder: TrieBuilder::new(),
             partition_count: 0,
@@ -194,7 +200,7 @@ impl SSTableWriter {
         let data_pos = self.data_buf.len() as i64;
 
         // 1. Serialize partition data to the data buffer.
-        self.serialize_partition(partition);
+        let row_index_pos = self.serialize_partition(partition, data_pos as u64)?;
 
         // 2. Add key to bloom filter.
         let (h1, h2) = partition.key.filter_hash();
@@ -203,9 +209,9 @@ impl SSTableWriter {
         // 3. Add to trie builder: encode key with byte_comparable, use data position as payload.
         let encoded = byte_comparable::encode(&partition.key);
         let hash_byte = (h2 & 0xFF) as u8;
-        // Use negative idxpos (bitwise NOT) for DataDirect entries — simple partitions
-        // don't need a row index indirection.
-        let idxpos = !data_pos; // negative = DataDirect
+        // Use a positive idxpos when Rows.db has a per-partition row index;
+        // otherwise use negative idxpos (bitwise NOT) for direct Data.db lookup.
+        let idxpos = row_index_pos.map_or(!data_pos, |pos| pos as i64);
         self.trie_builder.add(
             &encoded,
             TriePayload {
@@ -268,8 +274,9 @@ impl SSTableWriter {
         // 4. Optionally compress data chunks -> Data.db + CompressionInfo.db
         let (data, compression_info) = Self::build_data_db(self.data_buf, &self.options)?;
 
-        // 5. Rows.db: empty for simple cases (no per-partition row index)
-        let rows: Vec<u8> = Vec::new();
+        // 5. Rows.db: empty for simple partitions, indexed for wide clustered
+        // partitions.
+        let rows = self.rows_buf;
 
         // 6. Build TOC -> TOC.txt
         let toc_bytes = Self::build_toc(has_compression);
@@ -451,7 +458,11 @@ impl SSTableWriter {
     // -----------------------------------------------------------------------
 
     /// Serialize a single partition to the data buffer.
-    fn serialize_partition(&mut self, partition: &Partition) {
+    fn serialize_partition(&mut self, partition: &Partition, data_pos: u64) -> Result<Option<u64>> {
+        let build_row_index =
+            !self.header.clustering_types.is_empty() && partition.rows.len() >= ROW_INDEX_MIN_ROWS;
+        let mut row_trie = build_row_index.then(TrieBuilder::new);
+
         // Key: u16 BE length + key bytes
         let key_bytes = partition.key.key.as_bytes();
         self.data_buf
@@ -476,11 +487,41 @@ impl SSTableWriter {
 
         // Clustered rows
         for row in &partition.rows {
+            if let Some(trie) = row_trie.as_mut() {
+                let row_offset = self.data_buf.len() as u64 - data_pos;
+                trie.add(
+                    &row.clustering,
+                    TriePayload {
+                        hash: None,
+                        position: row_offset as i64,
+                    },
+                )?;
+            }
             self.serialize_row(row, false);
         }
 
         // END_OF_PARTITION marker
         self.data_buf.push(END_OF_PARTITION);
+
+        if let Some(trie) = row_trie {
+            let rows_start = self.rows_buf.len() as u64;
+            let (trie_data, root_pos) = trie.finish()?;
+            self.rows_buf.extend_from_slice(&trie_data);
+            let footer_offset = self.rows_buf.len() as u64;
+            let entry = crate::row_index::RowIndexEntry {
+                partition_key: key_bytes.to_vec(),
+                data_position: data_pos,
+                trie_root: rows_start + root_pos,
+                block_count: partition.rows.len() as u32,
+                local_deletion_time: partition.deletion.local_deletion_time as i32,
+                marked_for_delete_at: partition.deletion.marked_for_delete_at,
+            };
+            self.rows_buf
+                .extend_from_slice(&crate::row_index::serialize_entry(&entry));
+            Ok(Some(footer_offset))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Serialize a single row to the data buffer.
@@ -983,6 +1024,28 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
             }],
+        }
+    }
+
+    fn make_wide_partition(key: &[u8], rows: usize) -> Partition {
+        Partition {
+            key: DecoratedKey::new(PartitionKey::from(key)),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..rows as i32)
+                .map(|idx| {
+                    let timestamp = 1_000_000 + i64::from(idx);
+                    Row {
+                        clustering: (idx + 1).to_be_bytes().to_vec(),
+                        cells: vec![(
+                            0,
+                            CellValue::live(format!("value-{idx}").into_bytes(), timestamp),
+                        )],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1499,6 +1562,44 @@ mod tests {
 
         // Verify compression_info is None (no compression)
         assert!(output.compression_info.is_none());
+    }
+
+    #[test]
+    fn wide_clustered_partition_writes_rows_index() {
+        let header = test_header();
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+            verify_output: true,
+        };
+        let partition = make_wide_partition(b"wide-index", ROW_INDEX_MIN_ROWS);
+        let key = partition.key.clone();
+
+        let mut writer = SSTableWriter::new(options, header);
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        assert!(
+            !output.rows.is_empty(),
+            "wide clustered partitions need a Rows.db row index"
+        );
+
+        let partition_index =
+            crate::partition_index::PartitionIndex::open(output.partitions).unwrap();
+        let row_index_position = match partition_index.lookup(&key).unwrap() {
+            crate::partition_index::PartitionLookup::RowIndex { position } => position,
+            other => panic!("expected RowIndex, got {other:?}"),
+        };
+        let entry = crate::row_index::RowIndex::read_entry(&output.rows, row_index_position)
+            .expect("row-index footer should decode");
+        assert_eq!(entry.data_position, 0);
+
+        let target = 17_i32.to_be_bytes();
+        let offset = crate::row_index::lookup_clustering_in_entry(&output.rows, &entry, &target)
+            .unwrap()
+            .expect("target clustering row should be indexed");
+        assert!(offset > 0);
     }
 
     #[test]

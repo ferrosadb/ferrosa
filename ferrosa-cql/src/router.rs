@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
+use futures::StreamExt;
 use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 
@@ -283,6 +284,17 @@ fn projection_storage_ordinals(
     Some(wanted)
 }
 
+fn projection_storage_ordinals_for_count_predicates(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+) -> Option<Vec<u16>> {
+    let names: Vec<SelectColumn> = where_clauses
+        .iter()
+        .map(|wc| SelectColumn::Column(wc.column.clone()))
+        .collect();
+    projection_storage_ordinals(&names, table_meta)
+}
+
 fn is_count_only_select(columns: &[SelectColumn]) -> bool {
     !columns.is_empty()
         && columns.iter().all(|c| {
@@ -441,6 +453,78 @@ async fn extend_rows_from_partitions(
             tokio::task::yield_now().await;
         }
     }
+}
+
+async fn count_rows_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> Result<i64, CqlError> {
+    let mut count = 0_i64;
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        for row in bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                count += 1;
+            }
+        }
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(count)
+}
+
+async fn extend_rows_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    all_rows: &mut Vec<Vec<Option<CqlValue>>>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+    storage_to_table: &[usize],
+) -> Result<(), CqlError> {
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let mut prows = bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            all_col_names,
+            all_col_types,
+            pk_indices,
+            ck_indices,
+            storage_to_table,
+        );
+        all_rows.append(&mut prows);
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
 }
 
 fn storage_to_table_indices(table_meta: &TableMetadata) -> Vec<usize> {
@@ -2017,6 +2101,7 @@ async fn route_select_user_table(
         .tables
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+    let table_strategy = keyspace_strategy(&state.schema, ks);
 
     // ALLOW FILTERING: permit full-table scans with post-filter when the
     // client explicitly opts in.  Log a warning so operators can identify
@@ -2202,12 +2287,44 @@ async fn route_select_user_table(
             .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-        let mut pk_rows = match state
-            .write_path
-            .load()
-            .pk_read(&table_id, &decorated_key, ctx.consistency, &read_strategy)
-            .await?
-        {
+        let row_limit =
+            safe_partition_key_filter_row_limit(s, table_meta, count_only_select).unwrap_or(0);
+        let exact_clustering = if clustering_key_equality_has_phonetic_index(
+            &s.where_clauses,
+            table_meta,
+            &state.schema,
+        ) {
+            None
+        } else {
+            extract_clustering_key_values(&s.where_clauses, table_meta, ks, &state.schema)?
+                .map(|values| bridge::build_clustering_key(&values))
+        };
+        let partition = if let Some(clustering) = exact_clustering {
+            state
+                .write_path
+                .load()
+                .pk_read_clustering_row(
+                    &table_id,
+                    &decorated_key,
+                    &clustering,
+                    ctx.consistency,
+                    &read_strategy,
+                )
+                .await?
+        } else {
+            state
+                .write_path
+                .load()
+                .pk_read_limited_rows(
+                    &table_id,
+                    &decorated_key,
+                    ctx.consistency,
+                    &read_strategy,
+                    row_limit,
+                )
+                .await?
+        };
+        let mut pk_rows = match partition {
             Some(partition) => bridge::partition_to_rows_with_storage_mapping(
                 &partition,
                 &all_col_names,
@@ -2276,7 +2393,11 @@ async fn route_select_user_table(
                 // values that can't be coerced to the PK column type) but
                 // the planner still sees Eq predicates on all PK columns.
                 // Fall through to a full scan rather than panicking.
-                let partitions = state.write_path.load().range_read(&table_id).await?;
+                let partitions = state
+                    .write_path
+                    .load()
+                    .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                    .await?;
                 if count_only_select {
                     let count = count_rows_from_partitions(
                         &partitions,
@@ -2378,7 +2499,11 @@ async fn route_select_user_table(
                 // may not be wired yet (Sprint I-3). Fall back to full scan so
                 // queries still return correct results.
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await?
+                    state
+                        .write_path
+                        .load()
+                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                        .await?
                 } else {
                     partitions
                 };
@@ -2467,7 +2592,11 @@ async fn route_select_user_table(
                     .await?;
 
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await?
+                    state
+                        .write_path
+                        .load()
+                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                        .await?
                 } else {
                     partitions
                 };
@@ -2553,18 +2682,18 @@ async fn route_select_user_table(
 
                 // Use a bounded upstream partition cap for unordered,
                 // non-aggregate scans so first pages do not wait behind an
-                // unbounded table materialization.  When ALLOW FILTERING has
-                // post-filter predicates, the SQL LIMIT cannot safely be used
-                // as the storage partition cap: LIMIT 1 may need to inspect
-                // many non-matching partitions before finding the first
-                // matching row.  In that shape, keep the existing hard range
-                // cap and apply LIMIT after filtering.  Ordered and aggregate
-                // queries still materialize their scan window before
-                // sorting/counting.
+                // unbounded table materialization. When ALLOW FILTERING has
+                // post-filter predicates, no upstream partition cap is safe:
+                // LIMIT 1 may need to inspect many non-matching partitions
+                // before finding the first matching row, and a fixed cap would
+                // silently drop later matches. In that shape, stream the full
+                // table and apply LIMIT/page semantics after filtering.
+                // Ordered and aggregate queries still materialize their scan
+                // window before sorting/counting.
                 let scan_bound = if s.order_by.is_empty() && !count_only_select {
                     let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
                     if has_post_filter {
-                        Some(ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT)
+                        None
                     } else {
                         let page_size = ctx
                             .paging
@@ -2602,20 +2731,24 @@ async fn route_select_user_table(
                 let row_limit =
                     safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
                         .unwrap_or(0);
-                // ADR-020 projection fast path. If the SELECT names
-                // a subset of regular columns and has no WHERE, route
-                // through range_read_projected so the SSTable layer
-                // byte-skips cell payloads for unprojected columns.
-                // Big win on wide tables with bulky cells (e.g.
-                // entity_store's entity_embedding column).
+                // ADR-020 projection fast path. Route through
+                // range_read_projected whenever the query only needs a subset
+                // of regular cells, so the SSTable layer byte-skips bulky
+                // unneeded payloads. Big win on wide tables with bulky cells
+                // (e.g. entity_store's entity_embedding column).
                 //
-                // Requires no WHERE (a predicate on an unprojected
-                // regular column would see NULL after the cell strip
-                // and evaluate incorrectly). LIMIT and ORDER BY are
-                // applied downstream against the projected rows
-                // unchanged — both work on whatever cells are present.
+                // Non-count SELECT requires no WHERE because predicates over
+                // unprojected regular columns would evaluate against NULL.
                 let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
                     projection_storage_ordinals(&s.columns, table_meta)
+                } else {
+                    None
+                };
+                // Count-only filtered scans project predicate columns only and
+                // fold over a partition stream, so COUNT(*) avoids decoding
+                // unrelated cells without first collecting partitions in a Vec.
+                let count_projection_wanted = if count_only_select {
+                    projection_storage_ordinals_for_count_predicates(&s.where_clauses, table_meta)
                 } else {
                     None
                 };
@@ -2623,48 +2756,81 @@ async fn route_select_user_table(
                     // Push partition-count cap down to the merger so
                     // `LIMIT N` stops the scan after N partitions
                     // rather than walking every SSTable.
-                    state
-                        .write_path
-                        .load()
-                        .range_read_projected(&table_id, wanted, scan_bound)
-                        .await?
+                    Some(
+                        state
+                            .write_path
+                            .load()
+                            .range_read_projected(&table_id, wanted, scan_bound)
+                            .await?,
+                    )
                 } else if let Some(bound) = scan_bound {
-                    state
-                        .write_path
-                        .load()
-                        .range_read_limited_rows(&table_id, bound, row_limit)
-                        .await?
+                    Some(
+                        state
+                            .write_path
+                            .load()
+                            .range_read_limited_rows(&table_id, bound, row_limit)
+                            .await?,
+                    )
                 } else if row_limit > 0 {
-                    state
-                        .write_path
-                        .load()
-                        .range_read_limited_rows(
-                            &table_id,
-                            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
-                            row_limit,
-                        )
-                        .await?
+                    Some(
+                        state
+                            .write_path
+                            .load()
+                            .range_read_limited_rows(
+                                &table_id,
+                                ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
+                                row_limit,
+                            )
+                            .await?,
+                    )
                 } else {
-                    state.write_path.load().range_read(&table_id).await?
+                    None
                 };
                 if count_only_select {
-                    let count = count_rows_from_partitions(
-                        &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
-                    )
-                    .await?;
+                    let row_context = PartitionRowContext {
+                        all_col_names: &all_col_names,
+                        all_col_types: &all_col_types,
+                        pk_indices: &pk_indices,
+                        ck_indices: &ck_indices,
+                        storage_to_table: &storage_to_table,
+                    };
+                    let predicate_context = SelectPredicateContext {
+                        statement: s,
+                        table_meta,
+                        keyspace: ks,
+                        state,
+                    };
+                    let count = if let Some(partitions) = partitions.as_ref() {
+                        count_rows_from_partitions(partitions, row_context, predicate_context)
+                            .await?
+                    } else if let Some(wanted) = count_projection_wanted {
+                        let stream = state
+                            .write_path
+                            .load()
+                            .range_read_projected_stream_all_with(
+                                &table_id,
+                                wanted,
+                                scan_bound,
+                                ctx.consistency,
+                                &table_strategy,
+                            )
+                            .await?;
+                        count_rows_from_partition_stream(stream, row_context, predicate_context)
+                            .await?
+                    } else {
+                        let stream = state
+                            .write_path
+                            .load()
+                            .range_read_stream_all_with(
+                                &table_id,
+                                row_limit,
+                                ctx.consistency,
+                                &table_strategy,
+                            )
+                            .await?;
+                        count_rows_from_partition_stream(stream, row_context, predicate_context)
+                            .await?
+                    };
                     return Ok(SelectRawResult {
                         column_names: col_names.to_vec(),
                         column_types: col_types.to_vec(),
@@ -2675,16 +2841,39 @@ async fn route_select_user_table(
                     });
                 }
                 let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
+                if let Some(partitions) = partitions.as_ref() {
+                    extend_rows_from_partitions(
+                        partitions,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await;
+                } else {
+                    let stream = state
+                        .write_path
+                        .load()
+                        .range_read_stream_all_with(
+                            &table_id,
+                            row_limit,
+                            ctx.consistency,
+                            &table_strategy,
+                        )
+                        .await?;
+                    extend_rows_from_partition_stream(
+                        stream,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await?;
+                }
                 filter_rows_by_select_predicates(
                     &mut all_rows,
                     s,
@@ -2918,6 +3107,16 @@ async fn route_select_user_table(
     // Apply toJson() built-in on projected columns.
     let selected_rows =
         apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
+
+    let selected_rows = if s.distinct {
+        let mut seen = std::collections::BTreeSet::new();
+        selected_rows
+            .into_iter()
+            .filter(|row| seen.insert(row.clone()))
+            .collect()
+    } else {
+        selected_rows
+    };
 
     // Apply LIMIT
     let limit_val = s.limit.as_ref().and_then(|l| l.as_literal());
@@ -5875,6 +6074,55 @@ fn extract_pk_values(
         values.push(val);
     }
     Ok(values)
+}
+
+/// Extract clustering-key equality values in clustering-column order.
+///
+/// Returns `Ok(None)` when the statement is not an exact full primary-key
+/// lookup. Type conversion errors still propagate because those predicates
+/// are present and invalid.
+fn extract_clustering_key_values(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> Result<Option<Vec<CqlValue>>, CqlError> {
+    if table_meta.clustering_key.is_empty() {
+        return Ok(None);
+    }
+
+    let mut values = Vec::with_capacity(table_meta.clustering_key.len());
+    for (ck_name, _) in &table_meta.clustering_key {
+        let Some(wc) = where_clauses
+            .iter()
+            .find(|w| w.column == *ck_name && w.op == ComparisonOp::Eq)
+        else {
+            return Ok(None);
+        };
+        let col_meta = &table_meta.columns[ck_name];
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, schema)?;
+        values.push(bridge::term_to_cql_value(&wc.value, &cql_type)?);
+    }
+    Ok(Some(values))
+}
+
+fn clustering_key_equality_has_phonetic_index(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    schema: &Schema,
+) -> bool {
+    let snap = schema.snapshot();
+    table_meta.clustering_key.iter().any(|(ck_name, _)| {
+        where_clauses
+            .iter()
+            .any(|wc| wc.column == *ck_name && wc.op == ComparisonOp::Eq)
+            && snap.indexes.values().any(|idx| {
+                idx.keyspace == table_meta.keyspace
+                    && idx.table == table_meta.name
+                    && idx.index_type == IndexType::Phonetic
+                    && idx.target_columns.contains(ck_name)
+            })
+    })
 }
 
 /// Try to handle `WHERE partition_key IN (v1, v2, ...)` by performing a
@@ -11836,6 +12084,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allow_filtering_partial_composite_partition_key_scans_all_matching_partitions() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE edge_scan WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE edge_scan.typed_edges (
+                    tenant_id uuid,
+                    session_id uuid,
+                    src_id uuid,
+                    edge_type text,
+                    dst_id uuid,
+                    weight double,
+                    PRIMARY KEY ((tenant_id, session_id), src_id, edge_type, dst_id)
+                )",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let tenant_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let tenant_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let matching_rows = ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT + 2;
+        for i in 0..matching_rows {
+            let suffix = format!("{:012x}", i + 1);
+            let session = format!("00000000-0000-0000-0000-{suffix}");
+            let src = format!("10000000-0000-0000-0000-{suffix}");
+            let dst = format!("20000000-0000-0000-0000-{suffix}");
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO edge_scan.typed_edges \
+                     (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                     VALUES ({tenant_a}, {session}, {src}, 'related_to', {dst}, 1.0)"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(&format!(
+                "INSERT INTO edge_scan.typed_edges \
+                 (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                 VALUES ({tenant_b}, 00000000-0000-0000-0000-000000000001, \
+                         30000000-0000-0000-0000-000000000001, 'related_to', \
+                         40000000-0000-0000-0000-000000000001, 1.0)"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let stmt = crate::parser::parse(&format!(
+            "SELECT src_id, edge_type, dst_id FROM edge_scan.typed_edges \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, matching_rows as i32,
+            "ALLOW FILTERING on the first component of a composite partition key must scan every matching tenant/session partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_distinct_tenant_id_returns_unique_partition_key_components() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE distinct_scan WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE distinct_scan.typed_edges (
+                    tenant_id uuid,
+                    session_id uuid,
+                    src_id uuid,
+                    edge_type text,
+                    dst_id uuid,
+                    weight double,
+                    PRIMARY KEY ((tenant_id, session_id), src_id, edge_type, dst_id)
+                )",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        for (tenant, session, src, dst) in [
+            (
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "00000000-0000-0000-0000-000000000001",
+                "10000000-0000-0000-0000-000000000001",
+                "20000000-0000-0000-0000-000000000001",
+            ),
+            (
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "00000000-0000-0000-0000-000000000002",
+                "10000000-0000-0000-0000-000000000002",
+                "20000000-0000-0000-0000-000000000002",
+            ),
+            (
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "00000000-0000-0000-0000-000000000003",
+                "10000000-0000-0000-0000-000000000003",
+                "20000000-0000-0000-0000-000000000003",
+            ),
+        ] {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO distinct_scan.typed_edges \
+                     (tenant_id, session_id, src_id, edge_type, dst_id, weight) \
+                     VALUES ({tenant}, {session}, {src}, 'related_to', {dst}, 1.0)"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT DISTINCT tenant_id FROM distinct_scan.typed_edges")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, 2,
+            "SELECT DISTINCT tenant_id must deduplicate repeated tenant partition-key components"
+        );
+    }
+
+    #[tokio::test]
     async fn composite_clustering_text_predicate_matches_exact_pk_lookup() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -13873,6 +14307,74 @@ mod tests {
         assert_eq!(value, 2, "COUNT(*) should aggregate matching rows only");
     }
 
+    #[tokio::test]
+    async fn count_star_key_filtered_matches_equivalent_streamed_key_scan() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cnt_key_filter WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt = crate::parser::parse(
+            "CREATE TABLE cnt_key_filter.entities (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let tenant_a = "00000000-0000-0000-0000-000000000001";
+        let tenant_b = "00000000-0000-0000-0000-000000000002";
+        for i in 0..11 {
+            let tenant = if i < 7 { tenant_a } else { tenant_b };
+            let session = format!("10000000-0000-0000-0000-{i:012}");
+            let entity = format!("20000000-0000-0000-0000-{i:012}");
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO cnt_key_filter.entities \
+                 (tenant_id, session_id, entity_id, body) \
+                 VALUES ({tenant}, {session}, {entity}, 'row-{i}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        let count_stmt = crate::parser::parse(&format!(
+            "SELECT COUNT(*) FROM cnt_key_filter.entities \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let count_result = route(&state, &ctx, count_stmt).await.unwrap();
+        let count_value = match &count_result {
+            RouteResult::Result(b) => extract_first_bigint_value(b),
+            _ => panic!("expected count result"),
+        };
+
+        let scan_stmt = crate::parser::parse(&format!(
+            "SELECT tenant_id, session_id, entity_id FROM cnt_key_filter.entities \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let scan_result = route(&state, &ctx, scan_stmt).await.unwrap();
+        let streamed_rows = match &scan_result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected scan result"),
+        };
+
+        assert_eq!(
+            count_value, streamed_rows as i64,
+            "COUNT(*) over key-filtered broad scans must match the equivalent streamed key-column scan"
+        );
+        assert_eq!(count_value, 7);
+    }
+
     // ── ferrosa_bugs: phonetic match ────────────────────────────────────
 
     /// With a phonetic index on a text column, WHERE col = 'Jon Smyth'
@@ -15508,5 +16010,116 @@ mod tests {
             );
         }
         // Any other outcome (Ok or a different error) is acceptable.
+    }
+
+    #[test]
+    fn broad_select_paths_must_not_materialize_full_range_before_paging() {
+        let source = include_str!("router.rs");
+        let broad_scan = source
+            .split("let scan_bound =")
+            .nth(1)
+            .and_then(|rest| rest.split("let mut all_rows = Vec::new();").next())
+            .expect("broad select scan block must be present");
+
+        assert!(
+            !broad_scan.contains(".range_read(&table_id).await?"),
+            "broad SELECT scans must consume a partition stream directly instead of materializing range_read Vec<Partition>"
+        );
+        assert!(
+            broad_scan.contains("range_read_stream_all"),
+            "broad SELECT scans must use the stream boundary for unbounded scans"
+        );
+        assert!(
+            broad_scan.contains("range_read_stream_all_with")
+                && broad_scan.contains("ctx.consistency")
+                && broad_scan.contains("&table_strategy"),
+            "broad SELECT streams must propagate the request consistency and keyspace replication strategy"
+        );
+    }
+
+    #[test]
+    fn single_partition_limit_pushes_row_cap_into_point_read() {
+        let source = include_str!("router.rs");
+        let pk_lookup = source
+            .split("let decorated_key = bridge::build_decorated_key")
+            .nth(1)
+            .and_then(|rest| rest.split("} else if let Some(in_rows)").next())
+            .expect("single-partition lookup block must be present");
+
+        assert!(
+            pk_lookup.contains("safe_partition_key_filter_row_limit"),
+            "single-partition SELECT must derive a safe row cap from CQL LIMIT before reading storage"
+        );
+        assert!(
+            pk_lookup.contains(".pk_read_limited_rows("),
+            "single-partition SELECT ... LIMIT must push the row cap into the point-read path instead of materializing the whole partition"
+        );
+    }
+
+    #[test]
+    fn full_primary_key_lookup_pushes_clustering_key_into_point_read() {
+        let source = include_str!("router.rs");
+        let pk_lookup = source
+            .split("let decorated_key = bridge::build_decorated_key")
+            .nth(1)
+            .and_then(|rest| rest.split("} else if let Some(in_rows)").next())
+            .expect("single-partition lookup block must be present");
+
+        assert!(
+            pk_lookup.contains("extract_clustering_key_values"),
+            "single-partition SELECT with equality on every clustering column must detect a full primary-key lookup"
+        );
+        assert!(
+            pk_lookup.contains(".pk_read_clustering_row("),
+            "full primary-key SELECT must read the exact clustering row instead of scanning the whole partition"
+        );
+    }
+
+    #[test]
+    fn count_filtering_scans_project_only_predicate_columns() {
+        let source = include_str!("router.rs");
+        let broad_scan = source
+            .split("let projection_wanted =")
+            .nth(1)
+            .and_then(|rest| rest.split("let partitions =").next())
+            .expect("projection decision block must be present");
+        let projected_scan = source
+            .split("let partitions = if let Some(wanted) = projection_wanted")
+            .nth(1)
+            .and_then(|rest| rest.split("if count_only_select {").next())
+            .expect("projected scan block must be present");
+
+        assert!(
+            broad_scan.contains("count_projection_wanted")
+                && broad_scan.contains("projection_storage_ordinals_for_count_predicates"),
+            "COUNT(*) filtered scans must push predicate-only projection into storage"
+        );
+        assert!(
+            source.contains("range_read_projected_stream_all_with"),
+            "COUNT(*) filtered scans must use the projected streaming range path when possible"
+        );
+        assert!(
+            !projected_scan.contains("range_read(&table_id).await?"),
+            "COUNT(*) filtered scans must not materialize full partitions"
+        );
+    }
+
+    #[test]
+    fn planner_fallback_range_reads_must_propagate_replication_strategy() {
+        let source = include_str!("router.rs");
+        let planner_fallback = source
+            .split("match scan_plan {")
+            .nth(1)
+            .and_then(|rest| rest.split("ScanPlan::FullScan =>").next())
+            .expect("planner fallback block must be present");
+
+        assert!(
+            !planner_fallback.contains(".range_read(&table_id).await?"),
+            "planner fallback range reads must not use coordinator bootstrap RF/CL defaults"
+        );
+        assert!(
+            planner_fallback.contains("range_read_with(&table_id, ctx.consistency, &table_strategy)"),
+            "planner fallback range reads must carry request consistency and keyspace replication strategy"
+        );
     }
 }

@@ -40,6 +40,7 @@ use crate::memtable::skiplist::SkipListMemtable;
 use crate::memtable::vector_index::VectorMemtableIndex;
 use crate::memtable::Memtable;
 use crate::merge;
+use crate::range_merger::ColumnOrdinalMapping;
 
 /// Maximum number of row positions collected from secondary index before
 /// returning an error. Prevents OOM from high-cardinality queries.
@@ -209,6 +210,50 @@ fn new_vector_indexes(
         })
         .collect();
     Arc::new(map)
+}
+
+fn sstable_column_mappings<R: ReadAt + Send + Sync + 'static>(
+    schema: &TableSchema,
+    sstables: &[Arc<SSTableReader<R>>],
+) -> Vec<ColumnOrdinalMapping> {
+    sstables
+        .iter()
+        .map(|sstable| ColumnOrdinalMapping::for_header(schema, sstable.header()))
+        .collect()
+}
+
+fn next_remapped_clustered_row<R: ReadAt + Send + Sync + 'static>(
+    iter: &mut ferrosa_sstable::reader::PartitionIter<'_, R>,
+    mapping: &ColumnOrdinalMapping,
+) -> Result<Option<Row>> {
+    let mut row = iter.next_clustered_row()?;
+    if let Some(row) = row.as_mut() {
+        mapping.remap_regular_row(row);
+    }
+    Ok(row)
+}
+
+fn partition_with_matching_clustering(
+    partition: &Partition,
+    clustering: &[u8],
+) -> Option<Partition> {
+    let rows: Vec<Row> = partition
+        .rows
+        .iter()
+        .filter(|row| row.clustering == clustering)
+        .cloned()
+        .collect();
+
+    if rows.is_empty() && partition.deletion.is_live() && partition.static_row.is_none() {
+        return None;
+    }
+
+    Some(Partition {
+        key: partition.key.clone(),
+        deletion: partition.deletion,
+        static_row: partition.static_row.clone(),
+        rows,
+    })
 }
 
 /// Filters sidecar entries to remove references to deleted partitions.
@@ -485,19 +530,43 @@ impl<F: FlushTarget> TableStore<F> {
     /// return data for the same key, `merge_partitions` applies cell-level
     /// last-write-wins semantics.
     pub fn read(&self, key: &DecoratedKey) -> Result<Option<Partition>> {
+        self.read_limited_rows(key, 0)
+    }
+
+    /// Read a partition by merging all sources while retaining at most
+    /// `row_limit` clustered rows from each source when non-zero.
+    ///
+    /// For single-partition CQL `LIMIT` queries this avoids decoding an
+    /// entire wide partition before the router applies the row limit. Each
+    /// immutable source is asked for only the needed prefix; the merged
+    /// result is trimmed again after last-write-wins reconciliation.
+    pub fn read_limited_rows(
+        &self,
+        key: &DecoratedKey,
+        row_limit: usize,
+    ) -> Result<Option<Partition>> {
         let guard = self.view.load();
+        let schema = self.schema.load();
 
         let mut sources: Vec<Partition> = Vec::new();
 
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
-            sources.push((*p).clone());
+            let mut p = (*p).clone();
+            if row_limit > 0 {
+                p.rows.truncate(row_limit);
+            }
+            sources.push(p);
         }
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
             if let Some(p) = flushing.get(key)? {
-                sources.push((*p).clone());
+                let mut p = (*p).clone();
+                if row_limit > 0 {
+                    p.rows.truncate(row_limit);
+                }
+                sources.push(p);
             }
         }
 
@@ -506,8 +575,10 @@ impl<F: FlushTarget> TableStore<F> {
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for (i, sstable) in guard.sstables.iter().enumerate() {
-            match sstable.get_partition(key) {
-                Ok(Some(p)) => {
+            match sstable.get_partition_limited_rows(key, row_limit) {
+                Ok(Some(mut p)) => {
+                    ColumnOrdinalMapping::for_header(&schema, sstable.header())
+                        .remap_partition(&mut p);
                     sources.push(p);
                 }
                 Ok(None) => {}
@@ -537,7 +608,82 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(None);
         }
 
-        Ok(Some(merge::merge_partitions(sources)))
+        let mut merged = merge::merge_partitions(sources);
+        if row_limit > 0 {
+            merge::apply_deletions(&mut merged);
+            merged.rows.truncate(row_limit);
+        }
+        Ok(Some(merged))
+    }
+
+    /// Read exactly one clustered row from a partition by clustering-key
+    /// bytes, merging only matching rows across memtable and SSTable sources.
+    ///
+    /// Full primary-key CQL lookups use this path so equality on every
+    /// clustering column does not decode a wide partition before the router
+    /// applies its predicates. Reads still use an atomic store view
+    /// snapshot and tolerate corrupt SSTables the same way as partition reads.
+    pub fn read_clustering_row(
+        &self,
+        key: &DecoratedKey,
+        clustering: &[u8],
+    ) -> Result<Option<Partition>> {
+        let guard = self.view.load();
+        let schema = self.schema.load();
+        let mut sources: Vec<Partition> = Vec::new();
+
+        if let Some(p) = guard.active.get(key)? {
+            if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
+                sources.push(filtered);
+            }
+        }
+
+        if let Some(ref flushing) = guard.flushing {
+            if let Some(p) = flushing.get(key)? {
+                if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
+                    sources.push(filtered);
+                }
+            }
+        }
+
+        for (i, sstable) in guard.sstables.iter().enumerate() {
+            match sstable.get_clustering_row(key, clustering) {
+                Ok(Some(mut p)) => {
+                    ColumnOrdinalMapping::for_header(&schema, sstable.header())
+                        .remap_partition(&mut p);
+                    sources.push(p);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let id_info = guard
+                        .sstable_ids
+                        .get(i)
+                        .map(|(id, path)| format!("id={id} path={path:?}"))
+                        .unwrap_or_else(|| format!("index={i}"));
+                    tracing::error!(
+                        %e,
+                        %id_info,
+                        key = ?key.key.as_bytes(),
+                        clustering = ?clustering,
+                        "SSTable exact clustering read error: skipping corrupt source — data may be incomplete"
+                    );
+                    self.sstable_read_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        if sources.is_empty() {
+            return Ok(None);
+        }
+
+        let mut merged = merge::merge_partitions(sources);
+        merged.rows.retain(|row| row.clustering == clustering);
+        if merged.rows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(merged))
+        }
     }
 
     /// Visit rows for one partition and timestamp window without returning an
@@ -568,6 +714,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let guard = self.view.load();
+        let schema = self.schema.load();
         let mut partition_delete_at = ferrosa_sstable::types::DeletionTime::LIVE;
         let mut mem_row_iters: Vec<std::vec::IntoIter<Row>> = Vec::new();
 
@@ -592,7 +739,10 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, F::Reader>> = Vec::new();
+        let mut sst_sources: Vec<(
+            ferrosa_sstable::reader::PartitionIter<'_, F::Reader>,
+            ColumnOrdinalMapping,
+        )> = Vec::new();
         for sstable in guard.sstables.iter() {
             let mut iter = match sstable.partitions_iter() {
                 Ok(iter) => iter,
@@ -611,7 +761,10 @@ impl<F: FlushTarget> TableStore<F> {
                     if deletion.marked_for_delete_at > partition_delete_at.marked_for_delete_at {
                         partition_delete_at = deletion;
                     }
-                    sst_iters.push(iter);
+                    sst_sources.push((
+                        iter,
+                        ColumnOrdinalMapping::for_header(&schema, sstable.header()),
+                    ));
                     break;
                 }
                 if peeked.token != key.token || peeked > *key {
@@ -621,15 +774,15 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        if mem_row_iters.is_empty() && sst_iters.is_empty() {
+        if mem_row_iters.is_empty() && sst_sources.is_empty() {
             return Ok(0);
         }
 
         let mut mem_heads: Vec<Option<Row>> =
             mem_row_iters.iter_mut().map(|iter| iter.next()).collect();
-        let mut sst_heads: Vec<Option<Row>> = Vec::with_capacity(sst_iters.len());
-        for iter in sst_iters.iter_mut() {
-            sst_heads.push(iter.next_clustered_row()?);
+        let mut sst_heads: Vec<Option<Row>> = Vec::with_capacity(sst_sources.len());
+        for (iter, mapping) in sst_sources.iter_mut() {
+            sst_heads.push(next_remapped_clustered_row(iter, mapping)?);
         }
 
         let mut visited = 0;
@@ -674,7 +827,8 @@ impl<F: FlushTarget> TableStore<F> {
                         Some(prev) => Some(crate::merge::merge_rows(prev, row)),
                         None => Some(row),
                     };
-                    *head = sst_iters[idx].next_clustered_row()?;
+                    let (iter, mapping) = &mut sst_sources[idx];
+                    *head = next_remapped_clustered_row(iter, mapping)?;
                 }
             }
 
@@ -781,8 +935,12 @@ impl<F: FlushTarget> TableStore<F> {
                 .collect();
             for p in prev_parts {
                 if let Some(&idx) = existing_map.get(&p.key) {
-                    // Same partition key: merge rows from both.
-                    partitions[idx].rows.extend(p.rows);
+                    // Same partition key: merge rows from both sources using
+                    // the normal read-path semantics. A raw append preserves
+                    // data but can leave clustering rows out of order
+                    // (current flush rows followed by previous flushing rows),
+                    // which corrupts wide-row row-index construction.
+                    partitions[idx] = merge::merge_partitions(vec![partitions[idx].clone(), p]);
                 } else {
                     let idx = partitions.len();
                     existing_map.insert(p.key.clone(), idx);
@@ -1169,6 +1327,8 @@ impl<F: FlushTarget> TableStore<F> {
         const STREAM_BUFFER: usize = 4;
 
         let view = self.view.load_full();
+        let schema = self.schema.load_full();
+        let column_mappings = sstable_column_mappings(&schema, &view.sstables);
         let start_owned = start.cloned();
         let end_owned = end.cloned();
         let wanted_owned = wanted;
@@ -1184,10 +1344,11 @@ impl<F: FlushTarget> TableStore<F> {
                 .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
             let sstables_slice = &view.sstables[..];
 
-            let mut merger = match crate::range_merger::merger_for_projected_sources(
+            let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
                 active_iter,
                 flushing_iter,
                 sstables_slice,
+                &column_mappings,
                 &wanted_owned,
                 start_owned,
                 end_owned,
@@ -1249,6 +1410,8 @@ impl<F: FlushTarget> TableStore<F> {
         const STREAM_BUFFER: usize = 4;
 
         let view = self.view.load_full();
+        let schema = self.schema.load_full();
+        let column_mappings = sstable_column_mappings(&schema, &view.sstables);
         let start_owned = start.cloned();
         let end_owned = end.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
@@ -1267,10 +1430,11 @@ impl<F: FlushTarget> TableStore<F> {
                 .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
             let sstables_slice = &view.sstables[..];
 
-            let mut merger = match crate::range_merger::merger_for_sources(
+            let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
                 active_iter,
                 flushing_iter,
                 sstables_slice,
+                &column_mappings,
                 start_owned,
                 end_owned,
             ) {
@@ -1335,6 +1499,7 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(Vec::new());
         }
         let guard = self.view.load();
+        let schema = self.schema.load();
         let in_range = |t: i64| t >= start_token && t < end_token;
         let mut matched: Vec<Partition> = Vec::new();
 
@@ -1375,6 +1540,7 @@ impl<F: FlushTarget> TableStore<F> {
             if matched.len() >= limit {
                 break;
             }
+            let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
             let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
                 Err(e) => {
@@ -1405,12 +1571,13 @@ impl<F: FlushTarget> TableStore<F> {
             }
             while matched.len() < limit {
                 match iter.next_partition() {
-                    Ok(Some(p)) => {
+                    Ok(Some(mut p)) => {
                         let t = p.key.token.0;
                         if t >= end_token {
                             break; // SSTable is token-sorted — done with this source.
                         }
                         if t >= start_token {
+                            mapping.remap_partition(&mut p);
                             matched.push(p);
                         }
                     }
@@ -1509,6 +1676,7 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(());
         }
         let guard = self.view.load();
+        let schema = self.schema.load();
 
         // Memtable bootstrap (same shape as walk_token_range).
         let mut mem_active: Vec<Partition> = guard
@@ -1531,6 +1699,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
             Vec::with_capacity(guard.sstables.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(guard.sstables.len());
         for sstable in guard.sstables.iter() {
             let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
@@ -1547,6 +1716,7 @@ impl<F: FlushTarget> TableStore<F> {
                 break;
             }
             sst_iters.push(iter);
+            sst_mappings.push(ColumnOrdinalMapping::for_header(&schema, sstable.header()));
         }
 
         loop {
@@ -1600,14 +1770,26 @@ impl<F: FlushTarget> TableStore<F> {
                 let header = sst_iters[sst_idx]
                     .next_partition_header_only()?
                     .expect("source had key; header must yield");
-                let (decoded_key, deletion, static_row) = header;
+                let mapping = &sst_mappings[sst_idx];
+                let (decoded_key, deletion, mut static_row) = header;
+                if let Some(static_row) = static_row.as_mut() {
+                    mapping.remap_static_row(static_row);
+                }
                 debug_assert_eq!(decoded_key, key);
                 let iter_ref = &mut sst_iters[sst_idx];
                 let mut emit_rows = |on_row: &mut dyn FnMut(
                     &ferrosa_sstable::types::Row,
                 ) -> Result<()>|
                  -> Result<()> {
-                    iter_ref.stream_clustered_rows(|row| on_row(row))
+                    if mapping.is_identity() {
+                        iter_ref.stream_clustered_rows(|row| on_row(row))
+                    } else {
+                        iter_ref.stream_clustered_rows(|row| {
+                            let mut row = row.clone();
+                            mapping.remap_regular_row(&mut row);
+                            on_row(&row)
+                        })
+                    }
                 };
                 cb(&decoded_key, deletion, static_row.as_ref(), &mut emit_rows)?;
             } else {
@@ -1656,7 +1838,10 @@ impl<F: FlushTarget> TableStore<F> {
                     mem_row_iters.push(rows.into_iter());
                 }
                 for i in &sst_match_indices {
-                    if let Some((k, d, sr)) = sst_iters[*i].next_partition_header_only()? {
+                    if let Some((k, d, mut sr)) = sst_iters[*i].next_partition_header_only()? {
+                        if let Some(static_row) = sr.as_mut() {
+                            sst_mappings[*i].remap_static_row(static_row);
+                        }
                         headers.push((k, d, sr));
                     }
                 }
@@ -1692,11 +1877,14 @@ impl<F: FlushTarget> TableStore<F> {
                     let mut sst_heads: Vec<Option<ferrosa_sstable::types::Row>> =
                         Vec::with_capacity(sst_local_indices.len());
                     for &si in &sst_local_indices {
-                        sst_heads.push(sst_iters[si].next_clustered_row().map_err(|e| {
-                            ferrosa_common::Error::InvalidData(format!(
-                                "sst.next_clustered_row: {e}"
-                            ))
-                        })?);
+                        sst_heads.push(
+                            next_remapped_clustered_row(&mut sst_iters[si], &sst_mappings[si])
+                                .map_err(|e| {
+                                    ferrosa_common::Error::InvalidData(format!(
+                                        "sst.next_clustered_row: {e}"
+                                    ))
+                                })?,
+                        );
                     }
                     loop {
                         // Pick the smallest clustering key
@@ -1743,12 +1931,15 @@ impl<F: FlushTarget> TableStore<F> {
                                     Some(prev) => Some(crate::merge::merge_rows(prev, row)),
                                     None => Some(row),
                                 };
-                                sst_heads[h_idx] =
-                                    sst_iters[si].next_clustered_row().map_err(|e| {
-                                        ferrosa_common::Error::InvalidData(format!(
-                                            "sst.next_clustered_row: {e}"
-                                        ))
-                                    })?;
+                                sst_heads[h_idx] = next_remapped_clustered_row(
+                                    &mut sst_iters[si],
+                                    &sst_mappings[si],
+                                )
+                                .map_err(|e| {
+                                    ferrosa_common::Error::InvalidData(format!(
+                                        "sst.next_clustered_row: {e}"
+                                    ))
+                                })?;
                             }
                         }
                         let row = merged_row.expect("at least one source matched");
@@ -1776,6 +1967,7 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(());
         }
         let guard = self.view.load();
+        let schema = self.schema.load();
 
         // K-way merge across sources (memtables + every SSTable)
         // by key. Each source advertises its current key via a
@@ -1815,6 +2007,7 @@ impl<F: FlushTarget> TableStore<F> {
         // peeked DecoratedKey (small).
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
             Vec::with_capacity(guard.sstables.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(guard.sstables.len());
         for sstable in guard.sstables.iter() {
             let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
@@ -1838,6 +2031,7 @@ impl<F: FlushTarget> TableStore<F> {
                 break;
             }
             sst_iters.push(iter);
+            sst_mappings.push(ColumnOrdinalMapping::for_header(&schema, sstable.header()));
         }
 
         loop {
@@ -1883,13 +2077,16 @@ impl<F: FlushTarget> TableStore<F> {
             if mem_flushing_iter.peek().map(|p| p.key == key) == Some(true) {
                 group.push(mem_flushing_iter.next().expect("peeked"));
             }
-            for iter in sst_iters.iter_mut() {
+            for (idx, iter) in sst_iters.iter_mut().enumerate() {
                 let matches = matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key);
                 if !matches {
                     continue;
                 }
                 match iter.next_partition() {
-                    Ok(Some(p)) => group.push(p),
+                    Ok(Some(mut p)) => {
+                        sst_mappings[idx].remap_partition(&mut p);
+                        group.push(p);
+                    }
                     Ok(None) => {}
                     Err(_) => {}
                 }
@@ -1922,6 +2119,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let guard = self.view.load();
+        let schema = self.schema.load();
 
         // Collect partitions from bounded sources only. This is still a
         // materializing read path, so fail closed once the requested window is
@@ -1962,7 +2160,13 @@ impl<F: FlushTarget> TableStore<F> {
                 break;
             }
             match sstable.read_partitions_limited_rows(remaining, row_limit) {
-                Ok(parts) => all_partitions.extend(parts),
+                Ok(mut parts) => {
+                    let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
+                    for partition in &mut parts {
+                        mapping.remap_partition(partition);
+                    }
+                    all_partitions.extend(parts);
+                }
                 Err(e) => {
                     let id = guard
                         .sstable_ids
@@ -2451,7 +2655,7 @@ impl<F: FlushTarget> TableStore<F> {
             .iter()
             .take(synced_len)
             .enumerate()
-            .map(|(i, sst)| {
+            .filter_map(|(i, sst)| {
                 let header = sst.header();
 
                 // WP-001: compute size from SSTable component buffers
@@ -2472,7 +2676,31 @@ impl<F: FlushTarget> TableStore<F> {
                     path.clone()
                 };
 
-                crate::compaction::metadata::SSTableMetadata {
+                if !path.as_os_str().is_empty()
+                    && !sstable_has_required_compaction_components(&sstable_path, id)
+                {
+                    tracing::warn!(
+                        sstable_id = %id,
+                        table_dir = ?sstable_path,
+                        "compaction planning: skipping SSTable because required on-disk \
+                         component files are missing or empty; live readers remain loaded, \
+                         but this SSTable cannot be used as a compaction input"
+                    );
+                    return None;
+                }
+                if !sstable_data_stream_is_token_monotonic(sst.as_ref()) {
+                    tracing::warn!(
+                        sstable_id = %id,
+                        table_dir = ?sstable_path,
+                        "compaction planning: skipping SSTable because sequential Data.db \
+                         partition order is not token-monotonic; live readers remain loaded, \
+                         but this SSTable requires explicit repair or quarantine before it can \
+                         be compacted"
+                    );
+                    return None;
+                }
+
+                Some(crate::compaction::metadata::SSTableMetadata {
                     id: id.clone(),
                     path: sstable_path,
                     size_bytes,
@@ -2481,9 +2709,51 @@ impl<F: FlushTarget> TableStore<F> {
                     min_timestamp: header.min_timestamp,
                     max_timestamp: header.max_timestamp,
                     partition_count: sst.key_count(),
-                }
+                })
             })
             .collect()
+    }
+}
+
+fn sstable_has_required_compaction_components(table_dir: &std::path::Path, id: &str) -> bool {
+    for suffix in [
+        "Data.db",
+        "Partitions.db",
+        "Rows.db",
+        "Filter.db",
+        "Statistics.db",
+        "TOC.txt",
+    ] {
+        let path = table_dir.join(format!("{id}-{suffix}"));
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return false;
+        };
+        if matches!(suffix, "Data.db" | "Partitions.db" | "Statistics.db") && meta.len() == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn sstable_data_stream_is_token_monotonic<R: ReadAt + Send + Sync + 'static>(
+    sstable: &SSTableReader<R>,
+) -> bool {
+    let mut iter = match sstable.partitions_iter() {
+        Ok(iter) => iter,
+        Err(_) => return false,
+    };
+    let mut previous: Option<DecoratedKey> = None;
+    loop {
+        match iter.next_partition_metadata() {
+            Ok(Some(partition)) => {
+                if previous.as_ref().is_some_and(|prev| partition.key < *prev) {
+                    return false;
+                }
+                previous = Some(partition.key);
+            }
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
     }
 }
 
@@ -2513,7 +2783,7 @@ mod tests {
     use ferrosa_common::cell::CellValue;
     use ferrosa_common::key::PartitionKey;
     use ferrosa_common::schema::ColumnDefinition;
-    use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition};
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -2550,6 +2820,64 @@ mod tests {
         }
     }
 
+    fn make_partition(key: &str, value: &[u8], timestamp: i64) -> Partition {
+        Partition {
+            key: make_key(key),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![make_row(value, timestamp)],
+        }
+    }
+
+    fn data_bytes_for_single_partition(
+        schema: &TableSchema,
+        header_partitions: &[Partition],
+        partition: &Partition,
+    ) -> Vec<u8> {
+        let header = crate::flush::build_serialization_header(schema, header_partitions);
+        let mut writer = ferrosa_sstable::writer::SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            header,
+        );
+        writer.add_partition(partition).unwrap();
+        writer.finish().unwrap().data
+    }
+
+    fn sstable_reader_from_partitions(
+        schema: &TableSchema,
+        partitions: &[Partition],
+        truncate_data_to: Option<usize>,
+    ) -> ferrosa_sstable::reader::SSTableReader<Vec<u8>> {
+        let header = crate::flush::build_serialization_header(schema, partitions);
+        let mut writer = ferrosa_sstable::writer::SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                verify_output: false,
+                ..WriteOptions::default()
+            },
+            header,
+        );
+        for partition in partitions {
+            writer.add_partition(partition).unwrap();
+        }
+        let mut output = writer.finish().unwrap();
+        if let Some(len) = truncate_data_to {
+            output.data.truncate(len);
+        }
+        ferrosa_sstable::reader::SSTableReader::open(ferrosa_sstable::reader::SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })
+        .unwrap()
+    }
+
     fn test_store() -> TableStore<InMemoryFlushTarget> {
         TableStore::new(
             test_schema(),
@@ -2559,6 +2887,282 @@ mod tests {
                 ..WriteOptions::default()
             },
         )
+    }
+
+    fn file_backed_test_store(dir: &std::path::Path) -> TableStore<crate::flush::FileFlushTarget> {
+        TableStore::new(
+            test_schema(),
+            crate::flush::FileFlushTarget::new_starting_at(dir.to_path_buf()).unwrap(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        )
+    }
+
+    fn two_column_schema(first: &str, second: &str) -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "column_order".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: first.to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: second.to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        }
+    }
+
+    fn two_column_time_series_schema(first: &str, second: &str) -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "column_order".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ts".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.LongType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: first.to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: second.to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        }
+    }
+
+    fn make_two_column_row(first_value: &[u8], second_value: &[u8], timestamp: i64) -> Row {
+        Row {
+            clustering: 1i32.to_be_bytes().to_vec(),
+            cells: vec![
+                (0, CellValue::live(first_value.to_vec(), timestamp)),
+                (1, CellValue::live(second_value.to_vec(), timestamp)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+        }
+    }
+
+    fn make_two_column_time_series_row(
+        clustering_ts: i64,
+        first_value: &[u8],
+        second_value: &[u8],
+        timestamp: i64,
+    ) -> Row {
+        Row {
+            clustering: clustering_ts.to_be_bytes().to_vec(),
+            cells: vec![
+                (0, CellValue::live(first_value.to_vec(), timestamp)),
+                (1, CellValue::live(second_value.to_vec(), timestamp)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+        }
+    }
+
+    fn store_with_legacy_order_sstable(
+        legacy_schema: TableSchema,
+        current_schema: TableSchema,
+        key: &DecoratedKey,
+        row: Row,
+    ) -> TableStore<InMemoryFlushTarget> {
+        let legacy = TableStore::new(
+            legacy_schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        legacy.write(key, row).unwrap();
+        legacy.flush().unwrap();
+
+        let legacy_view = legacy.view.load();
+        let initial_sstables = legacy_view.sstables.iter().cloned().collect();
+        let initial_ids = vec![("1".to_string(), std::path::PathBuf::new())];
+
+        TableStore::new_with_sstables(
+            current_schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            initial_sstables,
+            vec![],
+            initial_ids,
+        )
+    }
+
+    #[test]
+    fn read_remaps_legacy_sstable_column_order_to_current_schema() {
+        // Given an SSTable written when storage order was [b, a].
+        let key = make_key("pk-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("b", "a"),
+            two_column_schema("a", "b"),
+            &key,
+            make_two_column_row(b"bee", b"aye", 1000),
+        );
+
+        // When the same table is read with current storage order [a, b].
+        let partition = store.read(&key).unwrap().expect("partition should exist");
+
+        // Then cells are exposed using current ordinals: 0 => a, 1 => b.
+        let row = &partition.rows[0];
+        assert_eq!(row.cells[0].0, 0);
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(b"aye".as_slice()));
+        assert_eq!(row.cells[1].0, 1);
+        assert_eq!(row.cells[1].1.value.as_deref(), Some(b"bee".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn projected_range_translates_current_ordinals_for_legacy_sstable_order() {
+        // Given an SSTable written when storage order was [b, a].
+        let key = make_key("pk-projected-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("b", "a"),
+            two_column_schema("a", "b"),
+            &key,
+            make_two_column_row(b"bee", b"aye", 1000),
+        );
+
+        // When current-schema ordinal 0 (column a) is projected.
+        let mut stream = store.range_iter_projected(vec![0], None, None, None);
+        let partition = futures::StreamExt::next(&mut stream)
+            .await
+            .expect("one partition")
+            .unwrap();
+
+        // Then the reader decodes legacy physical ordinal 1 and exposes it as ordinal 0.
+        let row = &partition.rows[0];
+        assert_eq!(row.cells.len(), 1);
+        assert_eq!(row.cells[0].0, 0);
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(b"aye".as_slice()));
+        assert!(
+            futures::StreamExt::next(&mut stream).await.is_none(),
+            "expected exactly one partition"
+        );
+    }
+
+    #[test]
+    fn token_range_remaps_legacy_sstable_column_order_to_current_schema() {
+        let key = make_key("pk-token-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("b", "a"),
+            two_column_schema("a", "b"),
+            &key,
+            make_two_column_row(b"bee", b"aye", 1000),
+        );
+
+        let partitions = store.read_token_range(i64::MIN, i64::MAX, 10).unwrap();
+
+        assert_eq!(partitions.len(), 1);
+        let row = &partitions[0].rows[0];
+        assert_eq!(row.cells[0].0, 0);
+        assert_eq!(row.cells[0].1.value.as_deref(), Some(b"aye".as_slice()));
+        assert_eq!(row.cells[1].0, 1);
+        assert_eq!(row.cells[1].1.value.as_deref(), Some(b"bee".as_slice()));
+    }
+
+    #[test]
+    fn streaming_token_walk_remaps_legacy_sstable_column_order_to_current_schema() {
+        let key = make_key("pk-walk-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("b", "a"),
+            two_column_schema("a", "b"),
+            &key,
+            make_two_column_row(b"bee", b"aye", 1000),
+        );
+
+        let mut cells = Vec::new();
+        store
+            .walk_token_range(i64::MIN, i64::MAX, |partition| {
+                cells.push(partition.rows[0].cells.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0][0].0, 0);
+        assert_eq!(cells[0][0].1.value.as_deref(), Some(b"aye".as_slice()));
+        assert_eq!(cells[0][1].0, 1);
+        assert_eq!(cells[0][1].1.value.as_deref(), Some(b"bee".as_slice()));
+    }
+
+    #[test]
+    fn digest_stream_remaps_legacy_sstable_column_order_to_current_schema() {
+        let key = make_key("pk-digest-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("b", "a"),
+            two_column_schema("a", "b"),
+            &key,
+            make_two_column_row(b"bee", b"aye", 1000),
+        );
+
+        let mut cells = Vec::new();
+        store
+            .walk_token_range_for_digest(i64::MIN, i64::MAX, |_key, _deletion, _static, emit| {
+                emit(&mut |row| {
+                    cells.push(row.cells.clone());
+                    Ok(())
+                })
+            })
+            .unwrap();
+
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0][0].0, 0);
+        assert_eq!(cells[0][0].1.value.as_deref(), Some(b"aye".as_slice()));
+        assert_eq!(cells[0][1].0, 1);
+        assert_eq!(cells[0][1].1.value.as_deref(), Some(b"bee".as_slice()));
+    }
+
+    #[test]
+    fn time_series_window_cursor_remaps_legacy_sstable_column_order_to_current_schema() {
+        let key = make_key("pk-timeseries-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_time_series_schema("b", "a"),
+            two_column_time_series_schema("a", "b"),
+            &key,
+            make_two_column_time_series_row(123, b"bee", b"aye", 1000),
+        );
+
+        let mut cells = Vec::new();
+        let visited = store
+            .visit_time_series_window_rows(
+                &key,
+                100,
+                200,
+                crate::timeseries::TimeSeriesTimestampUnit::Micros,
+                |row| {
+                    cells.push(row.cells.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(visited, 1);
+        assert_eq!(cells[0][0].0, 0);
+        assert_eq!(cells[0][0].1.value.as_deref(), Some(b"aye".as_slice()));
+        assert_eq!(cells[0][1].0, 1);
+        assert_eq!(cells[0][1].1.value.as_deref(), Some(b"bee".as_slice()));
     }
 
     #[test]
@@ -2572,6 +3176,50 @@ mod tests {
         assert!(
             err.to_string().contains("paged/streaming read path"),
             "error should direct callers away from materializing scans: {err}"
+        );
+    }
+
+    #[test]
+    fn count_range_propagates_truncated_sstable_error() {
+        // Given one readable SSTable and one legacy/truncated SSTable loaded
+        // into the store view, matching a restart over already-corrupt files.
+        let store = test_store();
+        let schema = test_schema();
+        let good = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("good", b"good", 2000)],
+            None,
+        ));
+        let corrupt = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("corrupt", b"bad", 1000)],
+            Some(7),
+        ));
+        let current = store.view.load_full();
+        store.view.store(Arc::new(StoreView {
+            active: new_memtable(),
+            flushing: None,
+            sstables: Arc::new(vec![good, corrupt]),
+            sstable_ids: Arc::new(vec![
+                ("good".to_string(), std::path::PathBuf::new()),
+                ("corrupt".to_string(), std::path::PathBuf::new()),
+            ]),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(vec![Arc::new(HashMap::new()), Arc::new(HashMap::new())]),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        }));
+
+        // When COUNT(*) uses the metadata-only streaming path, the query must
+        // fail closed instead of returning a lower count that looks exact.
+        let err = store
+            .count_range(None, None)
+            .expect_err("corrupt SSTable must make COUNT(*) fail closed");
+
+        assert!(
+            err.to_string().contains("read_exact_at")
+                || err.to_string().contains("unexpected EOF")
+                || err.to_string().contains("UnexpectedEof"),
+            "error should identify the SSTable read failure, got: {err}"
         );
     }
 
@@ -3231,6 +3879,82 @@ mod tests {
         );
     }
 
+    /// Wide-row version of the previous regression: once a partition has
+    /// enough clustered rows to build a Rows.db trie, an append-merge of the
+    /// previous flushing memtable makes `SSTableWriter` reject the second flush
+    /// with "keys must be added in sorted order".
+    #[test]
+    fn consecutive_flushes_with_wide_partition_preserve_row_index_order() {
+        let store = test_store();
+        let key = make_key("wide-pk");
+
+        for ck in 0..100i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("batch1-{ck}").as_bytes(), 1000 + ck as i64),
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        for ck in 100..150i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("batch2-{ck}").as_bytes(), 2000 + ck as i64),
+                )
+                .unwrap();
+        }
+        store
+            .flush()
+            .expect("wide-row second flush must keep clustering rows sorted for row-index build");
+
+        let result = store.read(&key).unwrap().expect("partition must exist");
+        assert_eq!(result.rows.len(), 150);
+        assert!(result
+            .rows
+            .windows(2)
+            .all(|pair| pair[0].clustering < pair[1].clustering));
+    }
+
+    #[test]
+    fn exact_clustering_row_read_returns_only_matching_row_across_sources() {
+        let store = test_store();
+        let key = make_key("wide");
+
+        for ck in 0..100i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("sst-{ck}").as_bytes(), 1000),
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        store
+            .write(&key, make_row_with_ck(42, b"mem-newer", 2000))
+            .unwrap();
+
+        let partition = store
+            .read_clustering_row(&key, &42i32.to_be_bytes())
+            .unwrap()
+            .expect("matching clustering row should be found");
+
+        assert_eq!(
+            partition.rows.len(),
+            1,
+            "exact clustering read must not return or materialize the rest of a wide partition"
+        );
+        assert_eq!(partition.rows[0].clustering, 42i32.to_be_bytes());
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(b"mem-newer".as_slice()),
+            "newer memtable data must merge over the SSTable row for the same clustering key"
+        );
+    }
+
     /// Reproduces the P0 data loss bug: flush stores SSTables with empty
     /// PathBuf, but compaction passes the real path. If swap matches on
     /// (id, path), the inputs are never removed — leaving stale references
@@ -3863,6 +4587,69 @@ mod tests {
             m.max_token,
             tokens[tokens.len() - 1],
             "max_token should match largest token"
+        );
+    }
+
+    #[test]
+    fn sstable_metadata_skips_entries_missing_required_component_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+
+        store
+            .write(
+                &make_key("still-readable-through-open-fd"),
+                make_row(b"v1", 1000),
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        let gen = store.last_flush_generation();
+        let data_path = tmp.path().join(format!("{gen}-Data.db"));
+        std::fs::remove_file(&data_path).unwrap();
+
+        let metadata = store.sstable_metadata(tmp.path());
+
+        assert!(
+            metadata.is_empty(),
+            "compaction planning must not select SSTable {gen} after {:?} is missing",
+            data_path
+        );
+    }
+
+    #[test]
+    fn sstable_metadata_skips_entries_with_out_of_order_data_streams() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        let schema = test_schema();
+
+        let first = make_partition("decision", b"first", 1000);
+        let second = make_partition("org", b"second", 1000);
+        assert!(
+            first.key > second.key,
+            "test keys must be descending by decorated token to simulate a legacy unsorted Data.db"
+        );
+
+        store.write(&first.key, first.rows[0].clone()).unwrap();
+        store.write(&second.key, second.rows[0].clone()).unwrap();
+        store.flush().unwrap();
+
+        let gen = store.last_flush_generation();
+        let data_path = tmp.path().join(format!("{gen}-Data.db"));
+        let header_partitions = vec![second.clone(), first.clone()];
+        let mut unsorted_data =
+            data_bytes_for_single_partition(&schema, &header_partitions, &first);
+        unsorted_data.extend(data_bytes_for_single_partition(
+            &schema,
+            &header_partitions,
+            &second,
+        ));
+        std::fs::write(&data_path, unsorted_data).unwrap();
+
+        let metadata = store.sstable_metadata(tmp.path());
+
+        assert!(
+            metadata.is_empty(),
+            "compaction planning must not select SSTable {gen} when sequential Data.db order is not token-monotonic"
         );
     }
 

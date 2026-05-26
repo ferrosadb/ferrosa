@@ -325,6 +325,10 @@ pub struct ReadRequestPayload {
     /// Opaque page state from a previous response. Empty = start from beginning.
     #[serde(default)]
     pub page_state: Vec<u8>,
+    /// Exact clustering key bytes for full primary-key reads. Empty means
+    /// return partition rows according to page_size/page_state.
+    #[serde(default)]
+    pub clustering: Vec<u8>,
 }
 
 /// Payload for a remote read response.
@@ -635,7 +639,7 @@ impl LazyRaft {
     /// Makes up to 3 attempts with 5-second backoff between retries (total
     /// ~20 seconds worst case). Returns `None` only after all retries are
     /// exhausted.
-    async fn get(&self) -> Option<Arc<super::FerrosRaft>> {
+    pub(crate) async fn get(&self) -> Option<Arc<super::FerrosRaft>> {
         // If already available, return immediately.
         // Scope the borrow so the RwLockReadGuard is dropped before any await.
         let cached = { self.rx.borrow().clone() };
@@ -925,25 +929,24 @@ impl RpcHandler for ReadRequestHandler {
         // MUST use read_local — this handler is the RECEIVING end of a
         // remote ReadRequest. Using read() would route through the coordinator
         // which sends another ReadRequest → infinite recursion → stack overflow.
-        let payload = match self.storage.read(&table_id, &key) {
+        let page_size = req.page_size as usize;
+        let page_offset: usize = if req.page_state.len() >= 8 {
+            u64::from_le_bytes(req.page_state[..8].try_into().unwrap_or([0; 8])) as usize
+        } else {
+            0
+        };
+        let storage_read = if !req.clustering.is_empty() {
+            self.storage
+                .read_clustering_row(&table_id, &key, &req.clustering)
+        } else if page_size > 0 && page_offset == 0 {
+            self.storage.read_limited_rows(&table_id, &key, page_size)
+        } else {
+            self.storage.read(&table_id, &key)
+        };
+
+        let payload = match storage_read {
             Ok(Some(mut partition)) => {
-                let ts = newest_timestamp(&partition);
-                let digest = match compute_partition_digest(&partition) {
-                    Ok(d) => Some(d),
-                    Err(e) => {
-                        tracing::warn!("ReadRequestHandler: digest computation failed: {e}");
-                        None
-                    }
-                };
-
                 // Paging: if page_size > 0, return only a page of rows.
-                let page_size = req.page_size as usize;
-                let page_offset: usize = if req.page_state.len() >= 8 {
-                    u64::from_le_bytes(req.page_state[..8].try_into().unwrap_or([0; 8])) as usize
-                } else {
-                    0
-                };
-
                 let (has_more, next_page_state) = if page_size > 0
                     && !req.digest_only
                     && partition.rows.len() > page_offset + page_size
@@ -959,6 +962,15 @@ impl RpcHandler for ReadRequestHandler {
                     (false, vec![])
                 } else {
                     (false, vec![])
+                };
+
+                let ts = newest_timestamp(&partition);
+                let digest = match compute_partition_digest(&partition) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        tracing::warn!("ReadRequestHandler: digest computation failed: {e}");
+                        None
+                    }
                 };
 
                 let wire_partition = if req.digest_only {
@@ -1138,6 +1150,11 @@ pub struct RangeReadStreamRequestPayload {
     pub request_id: u32,
     pub keyspace: String,
     pub table: String,
+    /// Optional current-schema regular-column ordinals to decode. `None`
+    /// streams full partitions; `Some` uses the projected SSTable reader so
+    /// wide cells not needed by the query are byte-skipped on remote replicas.
+    #[serde(default)]
+    pub projected_regular_ordinals: Option<Vec<u16>>,
 }
 
 /// Handler → coordinator: one batch of partitions belonging to a
@@ -1436,6 +1453,7 @@ mod tests {
             digest_only: false,
             page_size: 0,
             page_state: vec![],
+            clustering: vec![],
         };
         let bytes = bincode::serialize(&req).expect("serialize");
         let decoded: ReadRequestPayload = bincode::deserialize(&bytes).expect("deserialize");
@@ -1646,6 +1664,7 @@ mod tests {
             digest_only: false,
             page_size: 0,
             page_state: vec![],
+            clustering: vec![],
         };
         let req_bytes = bincode::serialize(&req).unwrap();
         let msg = Message::ReadRequest(Bytes::from(req_bytes));
@@ -1678,6 +1697,7 @@ mod tests {
             digest_only: false,
             page_size: 0,
             page_state: vec![],
+            clustering: vec![],
         };
         let req_bytes = bincode::serialize(&req).unwrap();
         let msg = Message::ReadRequest(Bytes::from(req_bytes));
@@ -1721,6 +1741,7 @@ mod tests {
             digest_only: true,
             page_size: 0,
             page_state: vec![],
+            clustering: vec![],
         };
         let req_bytes = bincode::serialize(&req).unwrap();
         let msg = Message::ReadRequest(Bytes::from(req_bytes));
@@ -1859,6 +1880,7 @@ mod tests {
             request_id: 7,
             keyspace: "agent_memory".into(),
             table: "entity_store".into(),
+            projected_regular_ordinals: None,
         };
         let encoded = bincode::serialize(&req).expect("encode request");
         let decoded: RangeReadStreamRequestPayload =

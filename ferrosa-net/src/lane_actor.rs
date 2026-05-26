@@ -26,6 +26,7 @@
 //!                                                   Connected
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,8 +38,8 @@ use crate::config::NetConfig;
 use crate::error::{NetError, Result};
 use crate::message::Message;
 use crate::reconnect::{
-    connect_with_retry, dec_dormant_peer_count, inc_dormant_peer_count, spawn_alive_watcher,
-    LaneState, DORMANT_AFTER_EXHAUSTIONS, DORMANT_PROBE_INTERVAL,
+    connect_with_retry_cancelable, dec_dormant_peer_count, inc_dormant_peer_count,
+    spawn_alive_watcher, LaneState, DORMANT_AFTER_EXHAUSTIONS, DORMANT_PROBE_INTERVAL,
 };
 use crate::rpc::client::RpcClient;
 
@@ -131,6 +132,7 @@ pub enum LaneStatusReport {
 pub struct LaneHandle {
     tx: mpsc::Sender<LaneCommand>,
     lane: Lane,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl LaneHandle {
@@ -138,6 +140,10 @@ impl LaneHandle {
     #[allow(dead_code)] // used in tests; part of actor API
     pub fn lane(&self) -> Lane {
         self.lane
+    }
+
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
     }
 
     /// Send a request/response message through the lane actor.
@@ -223,6 +229,7 @@ impl LaneHandle {
     /// Request a graceful shutdown of the actor loop.
     #[allow(dead_code)] // used in tests; part of actor API
     pub async fn shutdown(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
         let _ = self.tx.send(LaneCommand::Shutdown).await;
     }
 }
@@ -247,6 +254,7 @@ pub struct ActorReconnectContext {
     pub peer_host: String,
     pub tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
     pub handle: LaneHandle,
+    pub cancelled: Arc<AtomicBool>,
 }
 
 impl ActorReconnectContext {
@@ -257,15 +265,22 @@ impl ActorReconnectContext {
     pub(crate) fn spawn_reconnect(&self, exhaustion_count: u32) {
         let ctx = self.clone();
         tokio::spawn(async move {
-            let result = connect_with_retry(
+            if ctx.cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            let result = connect_with_retry_cancelable(
                 Arc::clone(&ctx.config),
                 ctx.local_host_id,
                 &ctx.peer_host,
                 ctx.lane,
                 ctx.tls_connector.clone(),
+                Some(Arc::clone(&ctx.cancelled)),
             )
             .await;
 
+            if ctx.cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             match result {
                 Some(client) => {
                     ctx.handle.try_swap_client(client);
@@ -283,8 +298,12 @@ impl ActorReconnectContext {
     /// then decides whether to fire a connection attempt.
     pub(crate) fn spawn_dormant_probe(&self) {
         let handle = self.handle.clone();
+        let cancelled = Arc::clone(&self.cancelled);
         tokio::spawn(async move {
             tokio::time::sleep(DORMANT_PROBE_INTERVAL).await;
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             handle.trigger_dormant_probe();
         });
     }
@@ -306,7 +325,11 @@ pub fn spawn_lane_actor(
     ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext,
 ) -> LaneHandle {
     let (tx, rx) = mpsc::channel(lane_channel_capacity());
-    let handle = LaneHandle { tx, lane };
+    let handle = LaneHandle {
+        tx,
+        lane,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
     let ctx = ctx_builder(handle.clone());
     tokio::spawn(lane_actor_loop(lane, initial_state, rx, ctx));
     handle
@@ -325,7 +348,11 @@ pub(crate) fn spawn_raft_lane_actor(
     ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext + Send + 'static,
 ) -> LaneHandle {
     let (tx, rx) = mpsc::channel(lane_channel_capacity());
-    let handle = LaneHandle { tx, lane };
+    let handle = LaneHandle {
+        tx,
+        lane,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
     let ctx = ctx_builder(handle.clone());
 
     std::thread::Builder::new()
@@ -476,14 +503,21 @@ async fn lane_actor_loop(
                 tracing::debug!(?lane, peer = %ctx.peer_host, "dormant probe firing");
                 let probe_ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let result = connect_with_retry(
+                    if probe_ctx.cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let result = connect_with_retry_cancelable(
                         Arc::clone(&probe_ctx.config),
                         probe_ctx.local_host_id,
                         &probe_ctx.peer_host,
                         probe_ctx.lane,
                         probe_ctx.tls_connector.clone(),
+                        Some(Arc::clone(&probe_ctx.cancelled)),
                     )
                     .await;
+                    if probe_ctx.cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
                     match result {
                         Some(client) => {
                             probe_ctx.handle.try_swap_client(client);
@@ -614,6 +648,7 @@ mod tests {
                 local_host_id: Uuid::new_v4(),
                 peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
+                cancelled: h.cancel_token(),
                 handle: h,
             },
         );
@@ -654,6 +689,7 @@ mod tests {
                 local_host_id: Uuid::new_v4(),
                 peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
+                cancelled: h.cancel_token(),
                 handle: h,
             },
         );
@@ -693,6 +729,7 @@ mod tests {
                 local_host_id: Uuid::new_v4(),
                 peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
+                cancelled: h.cancel_token(),
                 handle: h,
             },
         );
@@ -730,6 +767,7 @@ mod tests {
                 local_host_id: Uuid::new_v4(),
                 peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
+                cancelled: h.cancel_token(),
                 handle: h,
             },
         );
