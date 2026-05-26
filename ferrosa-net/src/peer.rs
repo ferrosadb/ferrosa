@@ -73,8 +73,16 @@ impl PeerManager {
             last_heartbeat: tokio::time::Instant::now(),
             missed_heartbeats: 0,
         };
-        self.peers.write().await.insert(host_id, state);
+        let old_pool = self
+            .peers
+            .write()
+            .await
+            .insert(host_id, state)
+            .and_then(|old| old.pool);
         self.listener.on_peer_connected(peer_id);
+        if let Some(pool) = old_pool {
+            pool.shutdown().await;
+        }
     }
 
     /// Returns `true` if the PeerManager has an outbound connection to this peer.
@@ -855,14 +863,24 @@ mod tests {
             pm.peer_addr(server_id).await.as_deref(),
             Some(addr1_str.as_str())
         );
-
-        server1.shutdown(Duration::from_millis(50)).await;
+        let old_pool = {
+            let peers = pm.peers.read().await;
+            peers
+                .get(&server_id)
+                .and_then(|state| state.pool.clone())
+                .expect("first ensure_peer should install a pool")
+        };
 
         pm.ensure_peer(server_id, &addr2_str).await.unwrap();
 
         assert_eq!(
             pm.peer_addr(server_id).await.as_deref(),
             Some(addr2_str.as_str())
+        );
+        assert_eq!(
+            old_pool.all_lanes_resolved().await,
+            LaneOutcome::AnyFailed,
+            "replacing a peer address must shut down old lane actors so they stop reconnecting to stale IPs"
         );
         let resp = pm
             .send(
@@ -877,6 +895,7 @@ mod tests {
             .unwrap();
         assert!(matches!(resp, Message::Pong { nonce: 11, .. }));
 
+        server1.shutdown(Duration::from_millis(50)).await;
         server2.shutdown(Duration::from_millis(50)).await;
     }
 

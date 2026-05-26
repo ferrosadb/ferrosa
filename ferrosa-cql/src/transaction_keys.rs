@@ -316,6 +316,7 @@ mod tests {
             keyspace: keyspace.map(String::from),
             table: table.to_string(),
             columns: vec![SelectColumn::Star],
+            distinct: false,
             where_clauses: vec![WhereClause {
                 column: col.to_string(),
                 op: ComparisonOp::Eq,
@@ -534,6 +535,7 @@ mod tests {
             keyspace: None,
             table: "users".to_string(),
             columns: vec![SelectColumn::Star],
+            distinct: false,
             where_clauses: vec![],
             order_by: vec![],
             limit: None,

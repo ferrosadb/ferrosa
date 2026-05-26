@@ -11,6 +11,7 @@ use crate::compression::CompressionInfo;
 use crate::data::DataReader;
 use crate::io::ReadAt;
 use crate::partition_index::{PartitionIndex, PartitionLookup};
+use crate::row_index::{lookup_clustering_in_entry, RowIndex};
 use crate::statistics::{read_statistics, SerializationHeader};
 use crate::types::Partition;
 
@@ -218,6 +219,21 @@ impl<R: ReadAt> SSTableReader<R> {
     /// 2. Looks up the key in the partition index trie.
     /// 3. Reads the partition from Data.db at the resolved position.
     pub fn get_partition(&self, key: &DecoratedKey) -> Result<Option<Partition>> {
+        self.get_partition_limited_rows(key, 0)
+    }
+
+    /// Look up a partition by its decorated key, retaining at most
+    /// `row_limit` clustered rows when the limit is non-zero.
+    ///
+    /// This is the point-read counterpart to
+    /// [`Self::read_partitions_limited_rows`]. CQL single-partition
+    /// `LIMIT` queries use it so a wide partition can return its first
+    /// requested rows without decoding the full row body first.
+    pub fn get_partition_limited_rows(
+        &self,
+        key: &DecoratedKey,
+        row_limit: usize,
+    ) -> Result<Option<Partition>> {
         // Step 1: bloom filter check
         let (h1, h2) = key.filter_hash();
         if !self.bloom_filter.is_present(h1, h2) {
@@ -229,12 +245,8 @@ impl<R: ReadAt> SSTableReader<R> {
 
         let data_position = match lookup {
             PartitionLookup::RowIndex { position } => {
-                // For now, treat RowIndex the same as DataDirect: the position
-                // refers to an offset where we can begin reading the partition.
-                // A full implementation would consult Rows.db to find the
-                // exact data offset, but for simple cases the row index entry
-                // contains the data position in its footer.
-                position
+                let entry = RowIndex::read_entry(&self.rows, position)?;
+                entry.data_position
             }
             PartitionLookup::DataDirect { position } => position,
             PartitionLookup::NotFound => return Ok(None),
@@ -244,11 +256,105 @@ impl<R: ReadAt> SSTableReader<R> {
         if let Some(ref ci) = self.compression_info {
             let decompressed = decompress_data(&self.data, ci)?;
             let mut data_reader = DataReader::new(&decompressed, &self.header, data_position);
-            data_reader.read_partition()
+            if row_limit > 0 {
+                data_reader.read_partition_prefix_rows(row_limit)
+            } else {
+                data_reader.read_partition_limited_rows(0)
+            }
         } else {
             let mut data_reader = DataReader::new(&self.data, &self.header, data_position);
-            data_reader.read_partition()
+            if row_limit > 0 {
+                data_reader.read_partition_prefix_rows(row_limit)
+            } else {
+                data_reader.read_partition_limited_rows(0)
+            }
         }
+    }
+
+    /// Look up a single clustered row by partition key and clustering bytes.
+    ///
+    /// New SSTables may carry a Rows.db entry for wide clustered partitions;
+    /// in that case this jumps directly to the row offset. Legacy SSTables
+    /// without Rows.db fall back to a streaming in-partition scan.
+    pub fn get_clustering_row(
+        &self,
+        key: &DecoratedKey,
+        clustering: &[u8],
+    ) -> Result<Option<Partition>> {
+        if self.compression_info.is_some() {
+            let Some(mut partition) = self.get_partition_limited_rows(key, 0)? else {
+                return Ok(None);
+            };
+            partition.rows.retain(|row| row.clustering == clustering);
+            if partition.rows.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(partition));
+        }
+
+        let (h1, h2) = key.filter_hash();
+        if !self.bloom_filter.is_present(h1, h2) {
+            return Ok(None);
+        }
+
+        let lookup = self.partition_index.lookup(key)?;
+        let (data_position, row_index_position) = match lookup {
+            PartitionLookup::RowIndex { position } => {
+                let entry = RowIndex::read_entry(&self.rows, position)?;
+                let Some(row_offset) = lookup_clustering_in_entry(&self.rows, &entry, clustering)?
+                else {
+                    return Ok(None);
+                };
+                (entry.data_position + row_offset, Some(entry))
+            }
+            PartitionLookup::DataDirect { position } => (position, None),
+            PartitionLookup::NotFound => return Ok(None),
+        };
+
+        if let Some(entry) = row_index_position {
+            let mut header_reader = DataReader::new(&self.data, &self.header, entry.data_position);
+            let Some((partition_key, deletion, static_row)) =
+                header_reader.read_partition_header_only()?
+            else {
+                return Ok(None);
+            };
+
+            let mut row_reader = DataReader::new(&self.data, &self.header, data_position);
+            let Some(row) = row_reader.read_next_clustered_row()? else {
+                return Ok(None);
+            };
+            if row.clustering != clustering {
+                return Ok(None);
+            }
+            return Ok(Some(Partition {
+                key: partition_key,
+                deletion,
+                static_row,
+                rows: vec![row],
+            }));
+        }
+
+        let mut data_reader = DataReader::new(&self.data, &self.header, data_position);
+        let Some((partition_key, deletion, static_row)) =
+            data_reader.read_partition_header_only()?
+        else {
+            return Ok(None);
+        };
+        while let Some(row) = data_reader.read_next_clustered_row()? {
+            match row.clustering.as_slice().cmp(clustering) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(Partition {
+                        key: partition_key,
+                        deletion,
+                        static_row,
+                        rows: vec![row],
+                    }));
+                }
+                std::cmp::Ordering::Greater => return Ok(None),
+            }
+        }
+        Ok(None)
     }
 
     /// Returns the number of partitions in this SSTable.
@@ -833,6 +939,14 @@ mod tests {
         data
     }
 
+    fn build_legacy_header_only_partition(key: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        data.push(DELETION_IS_LIVE);
+        data
+    }
+
     /// Build a Partitions.db file from entries.
     ///
     /// Each entry is `(DecoratedKey, data_position)`. The position is encoded
@@ -1031,6 +1145,270 @@ mod tests {
         assert_eq!(partitions[1].rows.len(), 1);
         assert_eq!(partitions[0].rows[0].clustering, 1_i32.to_be_bytes());
         assert_eq!(partitions[1].rows[0].clustering, 1_i32.to_be_bytes());
+    }
+
+    #[test]
+    fn get_partition_limited_rows_returns_prefix_without_full_partition() {
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"wide".as_slice()));
+
+        let data_bytes = build_data_blob_with_rows(b"wide", 5);
+        let partitions_bytes = build_partition_index(&[(&dk, 0)]);
+        let filter_bytes = build_bloom_filter(&[&dk]);
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+
+        let reader = SSTableReader::open(components).unwrap();
+        let partition = reader
+            .get_partition_limited_rows(&dk, 2)
+            .unwrap()
+            .expect("wide partition should exist");
+
+        assert_eq!(partition.rows.len(), 2);
+        assert_eq!(partition.rows[0].clustering, 1_i32.to_be_bytes());
+        assert_eq!(partition.rows[1].clustering, 2_i32.to_be_bytes());
+    }
+
+    #[derive(Clone)]
+    struct CountingReadAt {
+        data: Vec<u8>,
+        max_read_end: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl CountingReadAt {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                max_read_end: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                bytes_read: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+
+        fn max_read_end(&self) -> u64 {
+            self.max_read_end.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn bytes_read(&self) -> u64 {
+            self.bytes_read.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl crate::io::ReadAt for CountingReadAt {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            let n = self.data.read_at(buf, offset)?;
+            self.bytes_read
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            let end = offset.saturating_add(n as u64);
+            let mut current = self.max_read_end.load(std::sync::atomic::Ordering::Relaxed);
+            while end > current {
+                match self.max_read_end.compare_exchange_weak(
+                    current,
+                    end,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+            Ok(n)
+        }
+
+        fn len(&self) -> Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+    }
+
+    #[test]
+    fn get_partition_limited_rows_does_not_drain_wide_partition_tail() {
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"wide".as_slice()));
+
+        let data_bytes = build_data_blob_with_rows(b"wide", 1_000);
+        let data_len = data_bytes.len() as u64;
+        let data = CountingReadAt::new(data_bytes);
+        let data_probe = data.clone();
+        let partitions = CountingReadAt::new(build_partition_index(&[(&dk, 0)]));
+        let rows = CountingReadAt::new(Vec::new());
+        let filter = build_bloom_filter(&[&dk]);
+        let stats = build_statistics(header);
+
+        let components = SSTableComponents {
+            data,
+            partitions,
+            rows,
+            filter,
+            compression_info: None,
+            statistics: stats,
+        };
+
+        let reader = SSTableReader::open(components).unwrap();
+        let partition = reader
+            .get_partition_limited_rows(&dk, 1)
+            .unwrap()
+            .expect("wide partition should exist");
+
+        assert_eq!(partition.rows.len(), 1);
+        assert!(
+            data_probe.max_read_end() < data_len / 4,
+            "point lookup LIMIT 1 must not walk the unreturned wide-partition tail; read_end={} data_len={}",
+            data_probe.max_read_end(),
+            data_len
+        );
+    }
+
+    #[test]
+    fn get_clustering_row_uses_rows_index_for_wide_partition() {
+        use crate::types::{DeletionTime, LivenessInfo, Row};
+        use crate::writer::{SSTableWriter, WriteOptions};
+        use ferrosa_common::CellValue;
+
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"wide-indexed".as_slice()));
+        let rows = (0_i32..1_000)
+            .map(|idx| {
+                let timestamp = 1_000_000 + i64::from(idx);
+                Row {
+                    clustering: (idx + 1).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("hello-{idx}").into_bytes(), timestamp),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+                }
+            })
+            .collect();
+        let partition = Partition {
+            key: dk.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        };
+
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                bloom_fp_chance: 0.01,
+                chunk_size: 65_536,
+                verify_output: true,
+            },
+            header,
+        );
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+        assert!(
+            !output.rows.is_empty(),
+            "wide clustered partitions must write a Rows.db row index"
+        );
+
+        let data_len = output.data.len() as u64;
+        let data = CountingReadAt::new(output.data);
+        let data_probe = data.clone();
+        let components = SSTableComponents {
+            data,
+            partitions: CountingReadAt::new(output.partitions),
+            rows: CountingReadAt::new(output.rows),
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        };
+
+        let reader = SSTableReader::open(components).unwrap();
+        let target = 900_i32.to_be_bytes();
+        let partition = reader
+            .get_clustering_row(&dk, &target)
+            .unwrap()
+            .expect("target row should exist");
+
+        assert_eq!(partition.rows.len(), 1);
+        assert_eq!(partition.rows[0].clustering, target);
+        assert!(
+            data_probe.max_read_end() > data_len / 2,
+            "test should request a row deep in the partition; read_end={} data_len={}",
+            data_probe.max_read_end(),
+            data_len
+        );
+        assert!(
+            data_probe.bytes_read() < data_len / 8,
+            "row-indexed exact lookup must not scan the wide partition; bytes_read={} data_len={}",
+            data_probe.bytes_read(),
+            data_len
+        );
+    }
+
+    #[test]
+    fn get_partition_limited_rows_uses_data_position_from_rows_index() {
+        use crate::types::{DeletionTime, LivenessInfo, Row};
+        use crate::writer::{SSTableWriter, WriteOptions};
+        use ferrosa_common::CellValue;
+
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"wide-indexed".as_slice()));
+        let rows = (0_i32..64)
+            .map(|idx| {
+                let timestamp = 1_000_000 + i64::from(idx);
+                Row {
+                    clustering: (idx + 1).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("hello-{idx}").into_bytes(), timestamp),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+                }
+            })
+            .collect();
+        let partition = Partition {
+            key: dk.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        };
+
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                bloom_fp_chance: 0.01,
+                chunk_size: 65_536,
+                verify_output: true,
+            },
+            header,
+        );
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+        assert!(
+            !output.rows.is_empty(),
+            "test must exercise a row-indexed partition"
+        );
+
+        let components = SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        };
+
+        let reader = SSTableReader::open(components).unwrap();
+        let partition = reader
+            .get_partition_limited_rows(&dk, 5)
+            .unwrap()
+            .expect("row-indexed partition should be found");
+
+        assert_eq!(partition.rows.len(), 5);
+        assert_eq!(partition.rows[0].clustering, 1_i32.to_be_bytes());
+        assert_eq!(partition.rows[4].clustering, 5_i32.to_be_bytes());
     }
 
     #[test]
@@ -1750,5 +2128,36 @@ mod tests {
                 assert!(r.cells.is_empty(), "empty projection leaves cells empty");
             }
         }
+    }
+
+    #[test]
+    fn next_partition_projected_accepts_legacy_header_only_partition_at_eof() {
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"pk-header-only".as_slice()));
+        let data_bytes = build_legacy_header_only_partition(b"pk-header-only");
+        let partitions_bytes = build_partition_index(&[(&dk, 0)]);
+        let filter_bytes = build_bloom_filter(&[&dk]);
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+        let mut iter = reader.partitions_iter().unwrap();
+
+        let partition = iter
+            .next_partition_projected(&[])
+            .expect("header-only legacy partition should not error")
+            .expect("partition should be returned");
+
+        assert_eq!(partition.key.key.as_bytes(), b"pk-header-only");
+        assert!(partition.rows.is_empty());
+        assert!(partition.static_row.is_none());
+        assert!(iter.next_partition_projected(&[]).unwrap().is_none());
     }
 }

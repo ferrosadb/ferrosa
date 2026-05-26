@@ -901,6 +901,15 @@ impl ModeController {
         self.registry
             .register(MsgType::RaftInstallSnapshot, snapshot_handler);
 
+        let (cluster_forward_tx, cluster_forward_lazy_raft) = LazyRaft::channel();
+        let cluster_forward_handler = Arc::new(
+            crate::raft_forward::LazyClusterMembershipForwardHandler::new(
+                cluster_forward_lazy_raft,
+            ),
+        );
+        self.registry
+            .register(MsgType::ClusterMembershipForward, cluster_forward_handler);
+
         let repair_handler = Arc::new(RepairWriteHandler::new(
             self.storage.clone(),
             repair_metrics_for_handler,
@@ -1326,6 +1335,13 @@ impl ModeController {
                      LazyRaft consumers may be missing; node will not handle Raft RPCs"
                 );
             }
+            if let Err(e) = cluster_forward_tx.send(Some(raft_arc.clone())) {
+                RAFT_PUBLISH_NO_SUBSCRIBERS.fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::error!(
+                    error = %e,
+                    "raft instance published to ClusterMembershipForward watch with no subscribers"
+                );
+            }
 
             // Also publish to the controller's raft_groups map so that
             // controller.raft() returns Some() during the election loop.
@@ -1692,21 +1708,6 @@ impl ModeController {
                         node_map_for_ddl.clone(),
                     ));
                     registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
-
-                    // Register the cluster Raft-forward handler so that when a
-                    // non-leader hits ForwardToLeader on a membership refresh
-                    // (e.g. UpdateNodeInfo from on_peer_connected) it can
-                    // forward the proposal here and the leader proposes it
-                    // locally.  Without this the bug at membership.rs's
-                    // refresh path would silently drop the proposal and the
-                    // joining node's BasicNode addr stays empty forever.
-                    let cluster_raft_forward_handler = Arc::new(
-                        crate::raft_forward::ClusterMembershipForwardHandler::new(raft_arc.clone()),
-                    );
-                    registry.register(
-                        MsgType::ClusterMembershipForward,
-                        cluster_raft_forward_handler,
-                    );
 
                     ddl_path.store(Arc::new(DdlPath::Cluster {
                         raft: raft_arc.clone(),

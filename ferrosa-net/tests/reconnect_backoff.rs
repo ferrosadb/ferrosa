@@ -34,6 +34,7 @@ async fn dead_peer_enters_dormant_after_exhausted_reconnects() {
             local_host_id: Uuid::new_v4(),
             peer_host: "192.0.2.1:9999".to_owned(), // TEST-NET, never reachable
             tls_connector: None,
+            cancelled: h.cancel_token(),
             handle: h,
         },
     );
@@ -92,6 +93,7 @@ async fn dormant_lane_rate_limits_probes() {
             local_host_id: Uuid::new_v4(),
             peer_host: "192.0.2.2:9999".to_owned(),
             tls_connector: None,
+            cancelled: h.cancel_token(),
             handle: h,
         },
     );

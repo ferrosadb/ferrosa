@@ -250,6 +250,71 @@ impl RpcHandler for ClusterMembershipForwardHandler {
     }
 }
 
+/// Startup handler for membership forwards received before this node has
+/// entered cluster mode.
+///
+/// Returning an explicit nack keeps callers from waiting for the RPC timeout
+/// and, more importantly, prevents "no handler registered" drops during rolling
+/// restarts. `transition_to_cluster` replaces this with
+/// [`LazyClusterMembershipForwardHandler`] once the Raft initialization path is
+/// active.
+pub struct ClusterMembershipForwardUnavailableHandler;
+
+#[async_trait]
+impl RpcHandler for ClusterMembershipForwardUnavailableHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let Message::ClusterMembershipForward(_) = msg else {
+            return None;
+        };
+        Some(Message::ClusterMembershipForwardAck(encode_ack(
+            &ForwardAckBody::Err(
+                "ClusterMembershipForward: node has not entered cluster mode".to_string(),
+            ),
+        )))
+    }
+}
+
+/// RPC handler registered before Raft initialization completes.
+///
+/// Reconnect metadata refreshes can be forwarded while a recreated node is
+/// still building its Raft handle. Returning "no handler" in that window makes
+/// peer metadata convergence depend on a later reconnect. This mirrors the
+/// lazy Raft Append/Vote handlers: the message is handled immediately, then the
+/// proposal waits for the Raft handle or returns an explicit ack error.
+pub struct LazyClusterMembershipForwardHandler {
+    raft: crate::raft::handlers::LazyRaft,
+}
+
+impl LazyClusterMembershipForwardHandler {
+    pub fn new(raft: crate::raft::handlers::LazyRaft) -> Self {
+        Self { raft }
+    }
+}
+
+#[async_trait]
+impl RpcHandler for LazyClusterMembershipForwardHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let body = match msg {
+            Message::ClusterMembershipForward(b) => b,
+            _ => return None,
+        };
+        let Some(raft) = self.raft.get().await else {
+            let ack = encode_ack(&ForwardAckBody::Err(
+                "ClusterMembershipForward: raft not initialized".to_string(),
+            ));
+            return Some(Message::ClusterMembershipForwardAck(ack));
+        };
+        let ack_bytes = process_forwarded_command(&body, move |cmd| async move {
+            raft.client_write(cmd)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        Some(Message::ClusterMembershipForwardAck(ack_bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

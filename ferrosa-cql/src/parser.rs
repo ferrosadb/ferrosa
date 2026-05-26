@@ -146,9 +146,7 @@ impl<'input> Parser<'input> {
     fn parse_select(&mut self) -> Result<SelectStatement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Select))?;
 
-        // Optional DISTINCT — consume and treat as a no-op.
-        // Ferrosa returns deduplicated partition-key rows by default.
-        let _distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
+        let distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
 
         // Columns: * or comma-separated identifiers
         let columns = self.parse_select_columns()?;
@@ -206,6 +204,7 @@ impl<'input> Parser<'input> {
             keyspace,
             table,
             columns,
+            distinct,
             where_clauses,
             order_by,
             limit,
@@ -2697,6 +2696,7 @@ mod tests {
         let stmt = parse("SELECT id, name FROM ks.users WHERE id = 42").unwrap();
         match stmt {
             Statement::Select(s) => {
+                assert!(!s.distinct);
                 assert_eq!(
                     s.columns,
                     vec![
@@ -3702,6 +3702,7 @@ mod tests {
         let stmt = parse("SELECT DISTINCT group_id, group_name FROM static_cols").unwrap();
         match stmt {
             Statement::Select(s) => {
+                assert!(s.distinct, "SELECT DISTINCT must be preserved in the AST");
                 assert_eq!(
                     s.columns,
                     vec![

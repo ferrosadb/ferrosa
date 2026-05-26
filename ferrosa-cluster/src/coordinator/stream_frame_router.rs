@@ -30,68 +30,101 @@ use crate::raft::handlers::{RangeReadStreamChunkPayload, RangeReadStreamDonePayl
 
 type StreamSeqKey = (u32, uuid::Uuid, SocketAddr);
 
+struct PendingDone {
+    total_chunks: u32,
+    message: Message,
+}
+
+#[derive(Default)]
+struct StreamSeqState {
+    next_chunk_seq: u32,
+    pending_done: Option<PendingDone>,
+}
+
 /// Inbound dispatch handler for the three streaming range-read
 /// response frame types. Decodes the leading `request_id` from each
 /// frame's bincode payload and pushes the whole `Message` through
 /// the shared [`StreamRouter`].
 pub struct StreamFrameRouter {
     router: Arc<StreamRouter>,
-    next_chunk_seq: Mutex<HashMap<StreamSeqKey, u32>>,
+    seq_state: Mutex<HashMap<StreamSeqKey, StreamSeqState>>,
 }
 
 impl StreamFrameRouter {
     pub fn new(router: Arc<StreamRouter>) -> Self {
         Self {
             router,
-            next_chunk_seq: Mutex::new(HashMap::new()),
+            seq_state: Mutex::new(HashMap::new()),
         }
     }
 
     fn clear_request_state(&self, request_id: u32) {
-        self.next_chunk_seq
+        self.seq_state
             .lock()
             .expect("stream sequence mutex poisoned")
             .retain(|(id, _, _), _| *id != request_id);
     }
 
-    fn validate_chunk_seq(&self, from: PeerId, request_id: u32, bytes: &[u8]) -> bool {
+    fn accept_chunk_seq(
+        &self,
+        from: PeerId,
+        request_id: u32,
+        bytes: &[u8],
+    ) -> Option<Option<Message>> {
         let Ok(payload) = bincode::deserialize::<RangeReadStreamChunkPayload>(bytes) else {
-            return true;
+            return Some(None);
         };
         let key = (request_id, from.0, from.1);
         let mut guard = self
-            .next_chunk_seq
+            .seq_state
             .lock()
             .expect("stream sequence mutex poisoned");
-        let expected = guard.entry(key).or_insert(0);
-        if payload.seq != *expected {
+        let state = guard.entry(key).or_default();
+        if payload.seq != state.next_chunk_seq {
             tracing::warn!(
                 request_id,
                 peer = %from.0,
-                expected_seq = *expected,
+                expected_seq = state.next_chunk_seq,
                 observed_seq = payload.seq,
                 "stream chunk sequence gap/reorder; closing stream route"
             );
             drop(guard);
             self.router.unregister(request_id);
             self.clear_request_state(request_id);
-            return false;
+            return None;
         }
-        *expected = expected.saturating_add(1);
-        true
+        state.next_chunk_seq = state.next_chunk_seq.saturating_add(1);
+
+        let pending_done = state
+            .pending_done
+            .as_ref()
+            .is_some_and(|done| done.total_chunks == state.next_chunk_seq)
+            .then(|| state.pending_done.take().expect("checked Some").message);
+        if pending_done.is_some() {
+            guard.remove(&key);
+        }
+        Some(pending_done)
     }
 
-    fn validate_done_seq(&self, from: PeerId, request_id: u32, bytes: &[u8]) -> bool {
+    fn accept_done_seq(
+        &self,
+        from: PeerId,
+        request_id: u32,
+        bytes: &[u8],
+        msg: Message,
+    ) -> Option<Option<Message>> {
         let Ok(payload) = bincode::deserialize::<RangeReadStreamDonePayload>(bytes) else {
-            return true;
+            return Some(Some(msg));
         };
         let key = (request_id, from.0, from.1);
         let mut guard = self
-            .next_chunk_seq
+            .seq_state
             .lock()
             .expect("stream sequence mutex poisoned");
-        let observed = guard.remove(&key).unwrap_or(0);
-        if payload.total_chunks != observed {
+        let state = guard.entry(key).or_default();
+        let observed = state.next_chunk_seq;
+
+        if payload.total_chunks < observed {
             tracing::warn!(
                 request_id,
                 peer = %from.0,
@@ -102,9 +135,66 @@ impl StreamFrameRouter {
             drop(guard);
             self.router.unregister(request_id);
             self.clear_request_state(request_id);
-            return false;
+            return None;
         }
-        true
+
+        if payload.total_chunks == observed {
+            guard.remove(&key);
+            return Some(Some(msg));
+        }
+
+        if state.pending_done.is_some() {
+            tracing::warn!(
+                request_id,
+                peer = %from.0,
+                observed_chunks = observed,
+                reported_chunks = payload.total_chunks,
+                "duplicate early stream Done; closing stream route"
+            );
+            drop(guard);
+            self.router.unregister(request_id);
+            self.clear_request_state(request_id);
+            return None;
+        }
+
+        state.pending_done = Some(PendingDone {
+            total_chunks: payload.total_chunks,
+            message: msg,
+        });
+        Some(None)
+    }
+
+    fn route_frame(&self, request_id: u32, msg_type: MsgType, msg: Message) {
+        match self.router.route(request_id, msg) {
+            Ok(()) => {}
+            Err(RouteError::NoRoute(id)) => {
+                self.clear_request_state(id);
+                // Stale frame for a request the consumer already
+                // finished or never registered. Common after
+                // cancellation; debug level only.
+                tracing::debug!(
+                    request_id = id,
+                    ?msg_type,
+                    "stream frame for unknown request_id (stale or already done)"
+                );
+            }
+            Err(RouteError::ChannelClosed(id)) => {
+                self.clear_request_state(id);
+                tracing::debug!(
+                    request_id = id,
+                    ?msg_type,
+                    "stream consumer dropped before this frame arrived"
+                );
+            }
+            Err(RouteError::ChannelFull(id)) => {
+                self.clear_request_state(id);
+                tracing::warn!(
+                    request_id = id,
+                    ?msg_type,
+                    "stream consumer buffer full; closing route so consumer fails instead of returning partial data"
+                );
+            }
+        }
     }
 }
 
@@ -147,48 +237,28 @@ impl RpcHandler for StreamFrameRouter {
             return None;
         };
 
-        let sequence_valid = match &msg {
+        let pending_after_chunk = match msg {
             Message::RangeReadStreamChunk(bytes) => {
-                self.validate_chunk_seq(from, request_id, bytes.as_ref())
+                let pending_done = self.accept_chunk_seq(from, request_id, bytes.as_ref())?;
+                self.route_frame(request_id, msg_type, Message::RangeReadStreamChunk(bytes));
+                pending_done
             }
             Message::RangeReadStreamDone(bytes) => {
-                self.validate_done_seq(from, request_id, bytes.as_ref())
+                let msg = Message::RangeReadStreamDone(bytes.clone());
+                let route_done = self.accept_done_seq(from, request_id, bytes.as_ref(), msg)?;
+                if let Some(done) = route_done {
+                    self.route_frame(request_id, msg_type, done);
+                }
+                return None;
             }
-            _ => true,
+            other => {
+                self.route_frame(request_id, msg_type, other);
+                None
+            }
         };
-        if !sequence_valid {
-            return None;
-        }
 
-        match self.router.route(request_id, msg) {
-            Ok(()) => {}
-            Err(RouteError::NoRoute(id)) => {
-                self.clear_request_state(id);
-                // Stale frame for a request the consumer already
-                // finished or never registered. Common after
-                // cancellation; debug level only.
-                tracing::debug!(
-                    request_id = id,
-                    ?msg_type,
-                    "stream frame for unknown request_id (stale or already done)"
-                );
-            }
-            Err(RouteError::ChannelClosed(id)) => {
-                self.clear_request_state(id);
-                tracing::debug!(
-                    request_id = id,
-                    ?msg_type,
-                    "stream consumer dropped before this frame arrived"
-                );
-            }
-            Err(RouteError::ChannelFull(id)) => {
-                self.clear_request_state(id);
-                tracing::warn!(
-                    request_id = id,
-                    ?msg_type,
-                    "stream consumer buffer full; closing route so consumer fails instead of returning partial data"
-                );
-            }
+        if let Some(done) = pending_after_chunk {
+            self.route_frame(request_id, MsgType::RangeReadStreamDone, done);
         }
 
         // Streaming response frames are fire-and-forget — never a
@@ -282,6 +352,40 @@ mod tests {
         assert!(matches!(f1, Message::RangeReadStreamChunk(_)));
         assert!(matches!(f2, Message::RangeReadStreamHeartbeat(_)));
         assert!(matches!(f3, Message::RangeReadStreamDone(_)));
+    }
+
+    /// Net dispatch spawns one task per inbound frame, so a Done frame
+    /// can beat its preceding chunk to this router. The consumer drains
+    /// those stragglers after Done; the router must not close the route
+    /// just because Done.total_chunks is ahead of chunks observed so far.
+    #[tokio::test]
+    async fn done_before_chunk_keeps_route_open_for_consumer_straggler_drain() {
+        let router = Arc::new(StreamRouter::new());
+        let mut rx = router.register(REQ_ID, 8);
+        let handler = StreamFrameRouter::new(router.clone());
+
+        handler.handle(peer(), encoded_done(REQ_ID, 1)).await;
+
+        assert!(
+            !router.is_empty(),
+            "Done racing ahead of chunks is valid; consumer drains stragglers"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "early Done is held until its declared chunks arrive"
+        );
+
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 0)).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::RangeReadStreamChunk(_))
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::RangeReadStreamDone(_))
+        ));
     }
 
     /// Frame for an unregistered request_id is dropped silently

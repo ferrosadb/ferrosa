@@ -42,6 +42,8 @@ pub struct StreamConsumeOutcome {
     /// Total number of chunk frames observed across all replicas.
     pub total_chunks: u32,
     /// `true` if at least one replica's `Done` reported `truncated`.
+    /// Successful outcomes should not set this; truncated replica streams fail
+    /// closed before an outcome is returned.
     pub any_truncated: bool,
 }
 
@@ -75,6 +77,9 @@ pub enum StreamConsumeError {
         delivered_done: usize,
         expected_done: usize,
     },
+    /// A replica ended its stream with `truncated = true`, which indicates a
+    /// storage/decode failure or otherwise incomplete result.
+    TruncatedReplica { request_id: u32 },
 }
 
 /// Consume a streaming range-read response.
@@ -163,7 +168,7 @@ pub async fn consume_range_stream(
                     );
                 }
                 if done.truncated {
-                    outcome.any_truncated = true;
+                    return Err(StreamConsumeError::TruncatedReplica { request_id });
                 }
                 observed_chunks_per_replica = 0;
                 delivered_done += 1;
@@ -448,14 +453,19 @@ mod tests {
         assert_eq!(outcome.total_chunks, 1);
     }
 
-    /// `any_truncated` is true if any replica's Done sets the flag.
+    /// A truncated Done is not a successful partial result; it means the
+    /// replica could not stream a complete view and the coordinator must fail
+    /// the read.
     #[tokio::test]
-    async fn truncation_flag_propagates_from_any_replica() {
+    async fn truncated_done_fails_closed() {
         let (tx, rx) = mpsc::channel(8);
         tx.send(done_msg(0, true)).await.unwrap();
         tx.send(done_msg(0, false)).await.unwrap();
 
-        let outcome = consume_range_stream(rx, IDLE, 2, REQ_ID).await.unwrap();
-        assert!(outcome.any_truncated);
+        let err = consume_range_stream(rx, IDLE, 2, REQ_ID).await.unwrap_err();
+        assert_eq!(
+            err,
+            StreamConsumeError::TruncatedReplica { request_id: REQ_ID }
+        );
     }
 }

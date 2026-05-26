@@ -147,6 +147,7 @@ impl PriorityPool {
                 local_host_id,
                 peer_host: raft_peer_host,
                 tls_connector: raft_tls,
+                cancelled: h.cancel_token(),
                 handle: h,
             },
         );
@@ -157,6 +158,7 @@ impl PriorityPool {
                 local_host_id,
                 peer_host: peer_host.clone(),
                 tls_connector: tls_connector.clone(),
+                cancelled: h.cancel_token(),
                 handle: h,
             }
         });
@@ -167,6 +169,7 @@ impl PriorityPool {
                 local_host_id,
                 peer_host,
                 tls_connector: tls_connector.clone(),
+                cancelled: h.cancel_token(),
                 handle: h,
             }
         });
@@ -266,6 +269,18 @@ impl PriorityPool {
         } else {
             LaneOutcome::AllConnected
         }
+    }
+
+    /// Stop all lane actors owned by this pool.
+    ///
+    /// Peer replacement uses this to retire actors connected to stale peer
+    /// addresses so their alive watchers do not keep reconnecting to dead IPs.
+    pub async fn shutdown(&self) {
+        let ((), (), ()) = tokio::join!(
+            self.raft.shutdown(),
+            self.data.shutdown(),
+            self.bulk.shutdown()
+        );
     }
 }
 
@@ -425,6 +440,7 @@ mod tests {
                 local_host_id: Uuid::new_v4(),
                 peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
+                cancelled: h.cancel_token(),
                 handle: h,
             },
         );

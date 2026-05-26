@@ -8,13 +8,10 @@
 //! `None` immediately — the streaming response goes out through the
 //! [`ChunkSink`] (production: `PeerManager::fire` on `Lane::Bulk`).
 //!
-//! Decode failures and storage errors do not synthesize an error
-//! reply frame today: the coordinator times out via its
-//! [`ferrosa_net::idle_timeout::IdleTimeoutWatchdog`] and surfaces the
-//! partial result. Storage errors emit a `RangeReadStreamDone` with
-//! `truncated = true` so the coordinator sees a clean terminator
-//! and can mark the replica as partial without waiting for the
-//! watchdog.
+//! Decode failures and storage errors emit a `RangeReadStreamDone`
+//! with `truncated = true` and stop the stream. The coordinator treats
+//! that terminator as an error for the overall read, so corrupt SSTable
+//! data cannot be silently converted into a successful partial result.
 //!
 //! [`HandlerRegistry`]: ferrosa_net::rpc::handler::HandlerRegistry
 
@@ -67,13 +64,21 @@ pub trait StreamRangeReader: Send + Sync {
     /// Open a lazy stream of every partition in `table_id`,
     /// in token order. Returns `Err` for synchronous open-time
     /// failures (table not found, etc.); per-partition decode
-    /// failures surface inside the stream so a corrupt SSTable
-    /// page can be skipped without aborting the whole scan.
-    fn range_iter<'a>(&'a self, table_id: &TableId) -> ferrosa_common::Result<PartitionStream<'a>>;
+    /// failures surface inside the stream and fail the overall scan
+    /// through a truncated Done frame.
+    fn range_iter<'a>(
+        &'a self,
+        table_id: &TableId,
+        projected_regular_ordinals: Option<&'a [u16]>,
+    ) -> ferrosa_common::Result<PartitionStream<'a>>;
 }
 
 impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
-    fn range_iter<'a>(&'a self, table_id: &TableId) -> ferrosa_common::Result<PartitionStream<'a>> {
+    fn range_iter<'a>(
+        &'a self,
+        table_id: &TableId,
+        projected_regular_ordinals: Option<&'a [u16]>,
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
         // ADR-020 Phase 2 backing: StorageEngine::range_iter returns
         // a Stream backed by crate::range_merger::RangeMerger — a
         // k-way merge across memtable + flushing memtable + per-SSTable
@@ -81,12 +86,23 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
         // partition at a time. Memory at every layer is bounded by
         // num_sources, not table size; no Vec<Partition> exists for
         // the whole table at any point in the pipeline.
-        Ok(ferrosa_storage::StorageEngine::range_iter(
-            self.as_ref(),
-            table_id,
-            None,
-            None,
-        ))
+        if let Some(wanted) = projected_regular_ordinals {
+            Ok(ferrosa_storage::StorageEngine::range_iter_projected(
+                self.as_ref(),
+                table_id,
+                wanted.to_vec(),
+                None,
+                None,
+                None,
+            ))
+        } else {
+            Ok(ferrosa_storage::StorageEngine::range_iter(
+                self.as_ref(),
+                table_id,
+                None,
+                None,
+            ))
+        }
     }
 }
 
@@ -126,7 +142,7 @@ pub async fn handle_stream_request_with_cancel<R, S>(
 
     // Open the lazy partition stream. Errors here are open-time
     // (table not found, etc.) — emit a truncated Done and bail.
-    let mut stream = match reader.range_iter(&table_id) {
+    let mut stream = match reader.range_iter(&table_id, req.projected_regular_ordinals.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -176,14 +192,12 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                     }
                 }
                 Some(Err(e)) => {
-                    // Per-partition decode failure (e.g. corrupt
-                    // SSTable page). Log and continue — losing one
-                    // partition beats failing the whole scan.
                     tracing::warn!(
                         request_id = req.request_id,
                         "stream request: per-partition decode error: {e}"
                     );
                     any_decode_error = true;
+                    break 'pull;
                 }
                 None => break 'pull, // stream exhausted
             },
@@ -433,6 +447,7 @@ mod tests {
             request_id: id,
             keyspace: "ks".into(),
             table: "tbl".into(),
+            projected_regular_ordinals: None,
         }
     }
 
@@ -445,6 +460,7 @@ mod tests {
         fn range_iter<'a>(
             &'a self,
             _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             let items: Vec<ferrosa_common::Result<Partition>> =
                 self.partitions.iter().cloned().map(Ok).collect();
@@ -459,8 +475,28 @@ mod tests {
         fn range_iter<'a>(
             &'a self,
             _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             Err(ferrosa_common::Error::InvalidData("simulated".into()))
+        }
+    }
+
+    struct ErrorAfterReader;
+    impl StreamRangeReader for ErrorAfterReader {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            let items = vec![
+                Ok(make_partition(1)),
+                Ok(make_partition(2)),
+                Err(ferrosa_common::Error::InvalidData(
+                    "corrupt partition".into(),
+                )),
+                Ok(make_partition(3)),
+            ];
+            Ok(Box::pin(futures::stream::iter(items)))
         }
     }
 
@@ -546,6 +582,31 @@ mod tests {
         let done: RangeReadStreamDonePayload = bincode::deserialize(b).unwrap();
         assert_eq!(done.total_chunks, 0);
         assert!(done.truncated, "truncated=true signals partial replica");
+    }
+
+    #[tokio::test]
+    async fn partition_decode_error_stops_stream_with_truncated_done() {
+        let reader = ErrorAfterReader;
+        let sink = VecSink::new();
+
+        handle_stream_request(req(14), Arc::new(reader), &sink, 2).await;
+
+        let frames = sink.take();
+        assert_eq!(
+            frames.len(),
+            2,
+            "stream must stop at the decode error instead of continuing with later partitions"
+        );
+        assert!(matches!(frames[0], Message::RangeReadStreamChunk(_)));
+        let Message::RangeReadStreamDone(b) = &frames[1] else {
+            panic!("last frame must be Done");
+        };
+        let done: RangeReadStreamDonePayload = bincode::deserialize(b).unwrap();
+        assert_eq!(done.total_chunks, 1);
+        assert!(
+            done.truncated,
+            "decode error must fail closed at coordinator"
+        );
     }
 
     /// request_id propagates onto every emitted frame.
@@ -637,6 +698,7 @@ mod tests {
         fn range_iter<'a>(
             &'a self,
             _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             let ps = self.partitions.lock().unwrap().take().unwrap_or_default();
             let counter = self.partitions_yielded.clone();

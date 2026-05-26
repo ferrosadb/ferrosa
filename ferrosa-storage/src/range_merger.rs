@@ -17,12 +17,123 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
+use ferrosa_common::schema::TableSchema;
 use ferrosa_common::{Error, Result};
 use ferrosa_sstable::reader::{PartitionIter, SSTableReader};
-use ferrosa_sstable::types::Partition;
+use ferrosa_sstable::statistics::SerializationHeader;
+use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_sstable::ReadAt;
 
 use crate::merge;
+
+/// Per-SSTable translation from the physical column ordinals in an
+/// SSTable's SerializationHeader to the current table schema ordinals.
+#[derive(Clone, Debug)]
+pub struct ColumnOrdinalMapping {
+    static_columns: Vec<Option<u16>>,
+    regular_columns: Vec<Option<u16>>,
+    identity: bool,
+}
+
+impl ColumnOrdinalMapping {
+    pub fn for_header(schema: &TableSchema, header: &SerializationHeader) -> Self {
+        fn build_map(
+            source: &[(Vec<u8>, String)],
+            target: &[ferrosa_common::schema::ColumnDefinition],
+        ) -> Vec<Option<u16>> {
+            source
+                .iter()
+                .map(|(source_name, source_type)| {
+                    target
+                        .iter()
+                        .position(|target_col| {
+                            target_col.name.as_bytes() == source_name.as_slice()
+                                && target_col.type_name == *source_type
+                        })
+                        .map(|idx| idx as u16)
+                })
+                .collect()
+        }
+
+        let static_columns = build_map(&header.static_columns, &schema.static_columns);
+        let regular_columns = build_map(&header.regular_columns, &schema.regular_columns);
+        let identity = is_identity(&static_columns) && is_identity(&regular_columns);
+
+        Self {
+            static_columns,
+            regular_columns,
+            identity,
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.identity
+    }
+
+    pub fn remap_partition(&self, partition: &mut Partition) {
+        if self.identity {
+            return;
+        }
+        if let Some(static_row) = partition.static_row.as_mut() {
+            self.remap_static_row(static_row);
+        }
+        for row in &mut partition.rows {
+            self.remap_regular_row(row);
+        }
+    }
+
+    pub fn remap_static_row(&self, row: &mut Row) {
+        if self.identity {
+            return;
+        }
+        remap_cells(&mut row.cells, &self.static_columns);
+    }
+
+    pub fn remap_regular_row(&self, row: &mut Row) {
+        if self.identity {
+            return;
+        }
+        remap_cells(&mut row.cells, &self.regular_columns);
+    }
+
+    pub fn source_regular_ordinals_for_projection(&self, wanted_current: &[u16]) -> Vec<u16> {
+        if self.identity {
+            return wanted_current.to_vec();
+        }
+        self.regular_columns
+            .iter()
+            .enumerate()
+            .filter_map(|(source_idx, target_idx)| {
+                let target_idx = target_idx.as_ref()?;
+                wanted_current
+                    .contains(target_idx)
+                    .then_some(source_idx as u16)
+            })
+            .collect()
+    }
+}
+
+fn is_identity(mapping: &[Option<u16>]) -> bool {
+    mapping
+        .iter()
+        .enumerate()
+        .all(|(idx, target)| *target == Some(idx as u16))
+}
+
+fn remap_cells(cells: &mut Vec<(u16, ferrosa_common::cell::CellValue)>, mapping: &[Option<u16>]) {
+    if cells.is_empty() {
+        return;
+    }
+
+    let mut remapped = Vec::with_capacity(cells.len());
+    for (source_idx, cell) in cells.drain(..) {
+        if let Some(Some(target_idx)) = mapping.get(source_idx as usize) {
+            remapped.push((*target_idx, cell));
+        }
+    }
+    remapped.sort_by_key(|(idx, _)| *idx);
+    *cells = remapped;
+}
 
 /// One source contributing partitions to the merge.
 ///
@@ -56,7 +167,9 @@ pub enum MergeSource<'a, R: ReadAt> {
     SsTable {
         iter: PartitionIter<'a, R>,
         mode: RunMode<'a>,
+        mapping: Option<&'a ColumnOrdinalMapping>,
         peeked_key: Option<DecoratedKey>,
+        failed: bool,
     },
     /// LSM-level-style run of token-disjoint SSTables. The run is
     /// read **sequentially** (concatenated) instead of contributing
@@ -83,10 +196,29 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                 Ok(peeked.as_ref().map(|p| p.key.clone()))
             }
             Self::SsTable {
-                iter, peeked_key, ..
+                iter,
+                mode,
+                peeked_key,
+                failed,
+                ..
             } => {
+                if *failed {
+                    return Ok(None);
+                }
                 if peeked_key.is_none() {
-                    *peeked_key = iter.peek_partition_key()?;
+                    match iter.peek_partition_key() {
+                        Ok(key) => *peeked_key = key,
+                        Err(e) if mode.is_fail_soft() => {
+                            tracing::warn!(
+                                %e,
+                                mode = mode.label(),
+                                "range scan: skipping SSTable whose next key failed to decode"
+                            );
+                            *failed = true;
+                            return Ok(None);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Ok(peeked_key.clone())
             }
@@ -116,14 +248,41 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
             Self::SsTable {
                 iter,
                 mode,
+                mapping,
                 peeked_key,
+                failed,
             } => {
+                if *failed {
+                    return Ok(None);
+                }
                 peeked_key.take();
-                match mode {
+                let result = match mode {
                     RunMode::Full => iter.next_partition(),
                     RunMode::Metadata => iter.next_partition_metadata(),
-                    RunMode::Projected(wanted) => iter.next_partition_projected(wanted),
+                    RunMode::Projected(wanted) => {
+                        let source_wanted = mapping
+                            .map(|m| m.source_regular_ordinals_for_projection(wanted))
+                            .unwrap_or_else(|| wanted.to_vec());
+                        iter.next_partition_projected(&source_wanted)
+                    }
+                };
+                let mut partition = match result {
+                    Ok(partition) => partition,
+                    Err(e) if mode.is_fail_soft() => {
+                        tracing::warn!(
+                            %e,
+                            mode = mode.label(),
+                            "range scan: skipping SSTable whose partition failed to decode"
+                        );
+                        *failed = true;
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let (Some(mapping), Some(partition)) = (mapping, partition.as_mut()) {
+                    mapping.remap_partition(partition);
                 }
+                Ok(partition)
             }
             Self::SsTableRun { run, peeked_key } => {
                 peeked_key.take();
@@ -151,8 +310,14 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                 Ok(())
             }
             Self::SsTable {
-                iter, peeked_key, ..
+                iter,
+                peeked_key,
+                failed,
+                ..
             } => {
+                if *failed {
+                    return Ok(());
+                }
                 peeked_key.take();
                 iter.skip_to_next_partition()
             }
@@ -186,6 +351,20 @@ pub enum RunMode<'a> {
     Full,
     Metadata,
     Projected(&'a [u16]),
+}
+
+impl<'a> RunMode<'a> {
+    fn is_fail_soft(self) -> bool {
+        false
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Metadata => "metadata",
+            Self::Projected(_) => "projected",
+        }
+    }
 }
 
 impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
@@ -249,6 +428,16 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 }
                 match self.sstables[self.cursor].partitions_iter() {
                     Ok(it) => self.current = Some(it),
+                    Err(e) if self.mode.is_fail_soft() => {
+                        tracing::warn!(
+                            %e,
+                            sstable_index = self.cursor,
+                            mode = self.mode.label(),
+                            "range scan: skipping SSTable whose iterator failed to open"
+                        );
+                        self.cursor += 1;
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -256,6 +445,16 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
             match it.peek_partition_key() {
                 Ok(Some(k)) => return Ok(Some(k)),
                 Ok(None) => {
+                    self.current = None;
+                    self.cursor += 1;
+                }
+                Err(e) if self.mode.is_fail_soft() => {
+                    tracing::warn!(
+                        %e,
+                        sstable_index = self.cursor,
+                        mode = self.mode.label(),
+                        "range scan: skipping SSTable whose next key failed to decode"
+                    );
                     self.current = None;
                     self.cursor += 1;
                 }
@@ -272,6 +471,16 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 }
                 match self.sstables[self.cursor].partitions_iter() {
                     Ok(it) => self.current = Some(it),
+                    Err(e) if self.mode.is_fail_soft() => {
+                        tracing::warn!(
+                            %e,
+                            sstable_index = self.cursor,
+                            mode = self.mode.label(),
+                            "range scan: skipping SSTable whose iterator failed to open"
+                        );
+                        self.cursor += 1;
+                        return Ok(None);
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -287,6 +496,17 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                     // Exhausted the current table; advance.
                     self.current = None;
                     self.cursor += 1;
+                }
+                Err(e) if self.mode.is_fail_soft() => {
+                    tracing::warn!(
+                        %e,
+                        sstable_index = self.cursor,
+                        mode = self.mode.label(),
+                        "range scan: skipping SSTable whose partition failed to decode"
+                    );
+                    self.current = None;
+                    self.cursor += 1;
+                    return Ok(None);
                 }
                 Err(e) => return Err(e),
             }
@@ -397,6 +617,30 @@ pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
     )
 }
 
+/// Compatibility variant for tables whose current schema order may differ
+/// from one or more SSTable SerializationHeaders.
+pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    mappings: &'a [ColumnOrdinalMapping],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    if mappings.iter().all(ColumnOrdinalMapping::is_identity) {
+        return merger_for_sources(active_iter, flushing_iter, sstables, start, end);
+    }
+    build_merger_without_runs(
+        active_iter,
+        flushing_iter,
+        sstables,
+        Some(mappings),
+        RunMode::Full,
+        start,
+        end,
+    )
+}
+
 /// Projection variant: SSTables decode only the cells whose
 /// ordinals are in `wanted`; memtable contributions retain their
 /// full cells (already in memory; stripping costs more than it
@@ -416,6 +660,37 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
         active_iter,
         flushing_iter,
         sstables,
+        RunMode::Projected(wanted),
+        start,
+        end,
+    )
+}
+
+/// Compatibility projection variant for mixed current/SSTable column order.
+pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    mappings: &'a [ColumnOrdinalMapping],
+    wanted: &'a [u16],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    if mappings.iter().all(ColumnOrdinalMapping::is_identity) {
+        return merger_for_projected_sources(
+            active_iter,
+            flushing_iter,
+            sstables,
+            wanted,
+            start,
+            end,
+        );
+    }
+    build_merger_without_runs(
+        active_iter,
+        flushing_iter,
+        sstables,
+        Some(mappings),
         RunMode::Projected(wanted),
         start,
         end,
@@ -444,6 +719,54 @@ pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
         start,
         end,
     )
+}
+
+fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
+    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    mappings: Option<&'a [ColumnOrdinalMapping]>,
+    mode: RunMode<'a>,
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+) -> Result<RangeMerger<'a, R>> {
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + sstables.len());
+    sources.push(MergeSource::Memtable {
+        iter: active_iter,
+        peeked: None,
+    });
+    if let Some(it) = flushing_iter {
+        sources.push(MergeSource::Memtable {
+            iter: it,
+            peeked: None,
+        });
+    }
+
+    for (idx, sstable) in sstables.iter().enumerate() {
+        let iter = match sstable.partitions_iter() {
+            Ok(iter) => iter,
+            Err(e) if mode.is_fail_soft() => {
+                tracing::warn!(
+                    %e,
+                    sstable_index = idx,
+                    mode = mode.label(),
+                    "range scan: skipping SSTable whose iterator failed to open"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let mapping = mappings.and_then(|m| m.get(idx));
+        sources.push(MergeSource::SsTable {
+            iter,
+            mode,
+            mapping,
+            peeked_key: None,
+            failed: false,
+        });
+    }
+
+    RangeMerger::new(sources, start, end)
 }
 
 /// Shared back-end for the three `merger_for_*_sources` constructors:
@@ -725,7 +1048,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{group_disjoint_runs, merger_for_sources};
+    use super::{group_disjoint_runs, merger_for_projected_sources, merger_for_sources};
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
     use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
     use ferrosa_sstable::statistics::SerializationHeader;
@@ -943,6 +1266,46 @@ mod tests {
         let err = merger
             .next_merged_partition()
             .expect_err("corrupt SSTable tail must fail the range scan");
+        assert!(
+            err.to_string().contains("read_exact_at")
+                || err.to_string().contains("unexpected EOF")
+                || err.to_string().contains("UnexpectedEof"),
+            "error should identify the SSTable read failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn projected_range_merger_propagates_truncated_sstable_tail_error() {
+        let first = test_partition(b"pk1", 1, b"first");
+        let second = test_partition(b"pk2", 1, b"second");
+        let third = test_partition(b"pk3", 1, b"third");
+        let good_before = reader_from_partitions(std::slice::from_ref(&first));
+        let corrupt_reader = reader_with_truncated_tail(std::slice::from_ref(&second));
+        let good_after = reader_from_partitions(std::slice::from_ref(&third));
+        let sstables = vec![
+            Arc::new(good_before),
+            Arc::new(corrupt_reader),
+            Arc::new(good_after),
+        ];
+        let wanted = [0];
+
+        let mut merger = merger_for_projected_sources(
+            Box::new(std::iter::empty()),
+            None,
+            &sstables,
+            &wanted,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            merger.next_merged_partition().unwrap().is_some(),
+            "first readable partition should still be emitted"
+        );
+        let err = merger
+            .next_merged_partition()
+            .expect_err("projected range scan must fail closed on corrupt SSTable data");
         assert!(
             err.to_string().contains("read_exact_at")
                 || err.to_string().contains("unexpected EOF")

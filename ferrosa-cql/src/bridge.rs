@@ -1310,6 +1310,10 @@ fn encode_clustering(values: &[CqlValue]) -> Vec<u8> {
     buf
 }
 
+pub(crate) fn build_clustering_key(values: &[CqlValue]) -> Vec<u8> {
+    encode_clustering(values)
+}
+
 /// Decode partition key bytes into component byte slices.
 ///
 /// Single PK: the whole byte slice is the single component.

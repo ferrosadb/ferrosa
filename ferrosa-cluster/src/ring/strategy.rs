@@ -69,6 +69,9 @@ impl TryFrom<&ReplicationParams> for ReplicationStrategy {
             "NetworkTopologyStrategy" | "org.apache.cassandra.locator.NetworkTopologyStrategy" => {
                 let mut dc_rf = HashMap::new();
                 for (k, v) in &params.options {
+                    if k == "class" {
+                        continue;
+                    }
                     let rf: usize = v.parse().map_err(|_| {
                         StrategyParseError(format!(
                             "invalid replication factor for DC '{k}': '{v}'"
@@ -162,6 +165,29 @@ mod tests {
             ReplicationStrategy::NetworkTopology { dc_rf } => {
                 assert_eq!(dc_rf.get("dc1"), Some(&3));
                 assert_eq!(dc_rf.get("dc2"), Some(&2));
+            }
+            other => panic!("expected NetworkTopology, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_nts_ignores_cql_class_option() {
+        let params = ReplicationParams {
+            strategy: "NetworkTopologyStrategy".to_string(),
+            options: HashMap::from([
+                (
+                    "class".to_string(),
+                    "org.apache.cassandra.locator.NetworkTopologyStrategy".to_string(),
+                ),
+                ("datacenter1".to_string(), "3".to_string()),
+            ]),
+        };
+        let strategy = ReplicationStrategy::try_from(&params).unwrap();
+        assert_eq!(strategy.replication_factor(), 3);
+        match &strategy {
+            ReplicationStrategy::NetworkTopology { dc_rf } => {
+                assert_eq!(dc_rf.get("datacenter1"), Some(&3));
+                assert!(!dc_rf.contains_key("class"));
             }
             other => panic!("expected NetworkTopology, got {:?}", other),
         }

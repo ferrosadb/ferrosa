@@ -71,9 +71,19 @@ pub struct ClusterCoordinator {
     /// When `true`, `coordinate_range_read_limited_rows` delegates to
     /// the ADR-020 streaming path instead of the legacy single-shot
     /// `RangeReadRequest` RPC. Toggled by
-    /// `FERROSA_BULK_STREAMING_RANGE_READ=1` at process start; off
-    /// by default during rolling upgrade.
+    /// `FERROSA_BULK_STREAMING_RANGE_READ=0` at process start opts
+    /// into the legacy single-shot range RPC for mixed-version
+    /// rolling upgrades. Streaming is the default because the legacy
+    /// path applies a hard partition cap and cannot serve complete
+    /// full-scan semantics.
     pub(crate) streaming_range_reads: bool,
+}
+
+fn streaming_range_reads_enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim),
+        Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF")
+    )
 }
 
 impl ClusterCoordinator {
@@ -85,15 +95,16 @@ impl ClusterCoordinator {
         default_rf: usize,
         default_cl: ConsistencyLevel,
     ) -> Self {
-        let streaming_range_reads = matches!(
-            std::env::var("FERROSA_BULK_STREAMING_RANGE_READ")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("TRUE")
-        );
+        let streaming_env = std::env::var("FERROSA_BULK_STREAMING_RANGE_READ").ok();
+        let streaming_range_reads = streaming_range_reads_enabled(streaming_env.as_deref());
         if streaming_range_reads {
             tracing::info!(
-                "coordinator: ADR-020 streaming range reads ENABLED via FERROSA_BULK_STREAMING_RANGE_READ"
+                configured = streaming_env.as_deref().unwrap_or("default"),
+                "coordinator: ADR-020 streaming range reads enabled"
+            );
+        } else {
+            tracing::warn!(
+                "coordinator: legacy capped range reads enabled via FERROSA_BULK_STREAMING_RANGE_READ=0; uncapped full scans will fail rather than return partial results"
             );
         }
         Self {
@@ -402,6 +413,31 @@ mod tests {
             extensions: Default::default(),
         };
         storage.register_table(schema).unwrap();
+    }
+
+    #[test]
+    fn streaming_range_reads_are_enabled_by_default() {
+        assert!(streaming_range_reads_enabled(None));
+    }
+
+    #[test]
+    fn streaming_range_reads_allow_explicit_legacy_opt_out() {
+        for value in ["0", "false", "FALSE", "off", "OFF"] {
+            assert!(
+                !streaming_range_reads_enabled(Some(value)),
+                "{value} must disable streaming range reads"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_range_reads_accept_explicit_enable_values() {
+        for value in ["1", "true", "TRUE", "on", "anything-else"] {
+            assert!(
+                streaming_range_reads_enabled(Some(value)),
+                "{value} must keep streaming range reads enabled"
+            );
+        }
     }
 
     #[test]

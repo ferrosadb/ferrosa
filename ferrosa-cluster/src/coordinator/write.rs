@@ -26,6 +26,13 @@ enum ReplicaResult {
     },
 }
 
+fn should_refresh_peer_pool(err: &str) -> bool {
+    err.contains("unknown peer")
+        || err.contains("no connection pool")
+        || err.contains("lane is reconnecting")
+        || err.contains("lane permanently failed")
+}
+
 impl ClusterCoordinator {
     async fn send_remote_write_with_reconnect(
         &self,
@@ -39,10 +46,7 @@ impl ClusterCoordinator {
             .await
         {
             Ok(resp) => Ok(resp),
-            Err(e)
-                if e.to_string().contains("unknown peer")
-                    || e.to_string().contains("no connection pool") =>
-            {
+            Err(e) if should_refresh_peer_pool(&e.to_string()) => {
                 self.peer_manager.ensure_peer(host_id, addr).await?;
                 self.peer_manager
                     .send(host_id, message, Lane::Data)
@@ -541,6 +545,18 @@ mod tests {
     use ferrosa_net::rpc::{HandlerRegistry, RpcHandler};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig};
+
+    #[test]
+    fn stale_lane_errors_trigger_peer_refresh_for_writes() {
+        assert!(should_refresh_peer_pool("unknown peer"));
+        assert!(should_refresh_peer_pool("no connection pool"));
+        assert!(should_refresh_peer_pool(
+            "lane is reconnecting; retry later"
+        ));
+        assert!(should_refresh_peer_pool(
+            "lane permanently failed after max reconnection attempts"
+        ));
+    }
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {
