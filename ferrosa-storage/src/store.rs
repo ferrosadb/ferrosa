@@ -2547,13 +2547,18 @@ impl<F: FlushTarget> TableStore<F> {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 match method {
                     VectorIndexMethod::Hnsw => {
-                        if let Some(vec_bytes) = self.flush_target.read_vector_sidecar(gen, index_name) {
+                        if let Some(vec_bytes) =
+                            self.flush_target.read_vector_sidecar(gen, index_name)
+                        {
                             match ferrosa_index::vector::hnsw::search_from_bytes(
                                 &vec_bytes, query, k, ef_search,
                             ) {
                                 Ok(results) => {
                                     for result in results {
-                                        merged.insert(VectorRowRef::sstable(gen, result.position), result);
+                                        merged.insert(
+                                            VectorRowRef::sstable(gen, result.position),
+                                            result,
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -2572,7 +2577,10 @@ impl<F: FlushTarget> TableStore<F> {
                         {
                             Ok(Some(results)) => {
                                 for result in results {
-                                    merged.insert(VectorRowRef::sstable(gen, result.position), result);
+                                    merged.insert(
+                                        VectorRowRef::sstable(gen, result.position),
+                                        result,
+                                    );
                                 }
                             }
                             Ok(None) => {}
