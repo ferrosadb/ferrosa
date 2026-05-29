@@ -3285,6 +3285,52 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writes_and_file_flushes_preserve_acknowledged_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(file_backed_test_store(dir.path()));
+        let key = make_key("concurrent_store_pk");
+        let total = 2_000usize;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let flush_store = Arc::clone(&store);
+        let flush_stop = Arc::clone(&stop);
+        let flush_handle = std::thread::spawn(move || {
+            let mut count = 0u64;
+            while !flush_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                flush_store.flush().unwrap();
+                count += 1;
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            flush_store.flush().unwrap();
+            count
+        });
+
+        for i in 0..total {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(i as i32, format!("r{i}").as_bytes(), i as i64 + 1),
+                )
+                .unwrap();
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let flush_count = flush_handle.join().unwrap();
+        store.flush().unwrap();
+
+        let partition = store
+            .read(&key)
+            .unwrap()
+            .expect("partition must remain readable after concurrent flushes");
+        assert_eq!(
+            partition.rows.len(),
+            total,
+            "DATA LOSS: {total} rows written with {flush_count} concurrent TableStore flushes, got {}",
+            partition.rows.len()
+        );
+    }
+
+    #[test]
     fn late_partition_replay_detects_changes_within_existing_partition() {
         let key = make_key("pk1");
         let flushed = Partition {
