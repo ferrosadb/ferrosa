@@ -265,6 +265,34 @@ pub trait FlushTarget {
     fn read_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Option<Vec<u8>> {
         None
     }
+
+    /// Write a quantized vector artifact (`{gen}-QVEC-{index_name}.qvec`).
+    fn write_quantized_vector_sidecar(
+        &self,
+        _generation: u64,
+        _index_name: &str,
+        _qvec_bytes: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Search a quantized vector artifact without exposing full sidecar bytes
+    /// to the storage read path.
+    fn search_quantized_vector_sidecar(
+        &self,
+        _generation: u64,
+        _index_name: &str,
+        _query: &[f32],
+        _k: usize,
+        _ef_search: usize,
+    ) -> Result<Option<Vec<ferrosa_index::vector::IndexResult>>> {
+        Ok(None)
+    }
+
+    /// Test/metadata probe for quantized artifacts.
+    fn has_quantized_vector_sidecar(&self, _generation: u64, _index_name: &str) -> bool {
+        false
+    }
 }
 
 /// In-memory flush target for testing — wraps output as `SSTableComponents<Vec<u8>>`.
@@ -280,6 +308,8 @@ pub struct InMemoryFlushTarget {
     generation: std::sync::atomic::AtomicU64,
     /// Vector sidecar bytes keyed by `(generation, index_name)`.
     vector_sidecars: std::sync::Mutex<HashMap<(u64, String), Vec<u8>>>,
+    /// Quantized vector sidecar bytes keyed by `(generation, index_name)`.
+    quantized_vector_sidecars: std::sync::Mutex<HashMap<(u64, String), Vec<u8>>>,
 }
 
 impl InMemoryFlushTarget {
@@ -288,6 +318,7 @@ impl InMemoryFlushTarget {
         Self {
             generation: std::sync::atomic::AtomicU64::new(0),
             vector_sidecars: std::sync::Mutex::new(HashMap::new()),
+            quantized_vector_sidecars: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -343,6 +374,46 @@ impl FlushTarget for InMemoryFlushTarget {
             .lock()
             .expect("vector_sidecars poisoned");
         map.get(&(generation, index_name.to_string())).cloned()
+    }
+
+    fn write_quantized_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+        qvec_bytes: &[u8],
+    ) -> Result<()> {
+        let mut map = self
+            .quantized_vector_sidecars
+            .lock()
+            .expect("quantized_vector_sidecars poisoned");
+        map.insert((generation, index_name.to_string()), qvec_bytes.to_vec());
+        Ok(())
+    }
+
+    fn search_quantized_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Option<Vec<ferrosa_index::vector::IndexResult>>> {
+        let map = self
+            .quantized_vector_sidecars
+            .lock()
+            .expect("quantized_vector_sidecars poisoned");
+        let Some(bytes) = map.get(&(generation, index_name.to_string())) else {
+            return Ok(None);
+        };
+        crate::store::search_quantized_vector_artifact(bytes, query, k, ef_search).map(Some)
+    }
+
+    fn has_quantized_vector_sidecar(&self, generation: u64, index_name: &str) -> bool {
+        let map = self
+            .quantized_vector_sidecars
+            .lock()
+            .expect("quantized_vector_sidecars poisoned");
+        map.contains_key(&(generation, index_name.to_string()))
     }
 }
 
@@ -654,6 +725,43 @@ impl FlushTarget for FileFlushTarget {
             .join(format!("{generation}-VEC-{index_name}.db"));
         std::fs::write(&path, vec_bytes)?;
         Ok(())
+    }
+
+    fn write_quantized_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+        qvec_bytes: &[u8],
+    ) -> Result<()> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-QVEC-{index_name}.qvec"));
+        std::fs::write(&path, qvec_bytes)?;
+        Ok(())
+    }
+
+    fn search_quantized_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Option<Vec<ferrosa_index::vector::IndexResult>>> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-QVEC-{index_name}.qvec"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)?;
+        crate::store::search_quantized_vector_artifact(&bytes, query, k, ef_search).map(Some)
+    }
+
+    fn has_quantized_vector_sidecar(&self, generation: u64, index_name: &str) -> bool {
+        self.base_dir
+            .join(format!("{generation}-QVEC-{index_name}.qvec"))
+            .exists()
     }
 }
 
