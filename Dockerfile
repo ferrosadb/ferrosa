@@ -24,12 +24,13 @@ COPY ferrosa-ctl/Cargo.toml ferrosa-ctl/Cargo.toml
 COPY ferrosa-jepsen/Cargo.toml ferrosa-jepsen/Cargo.toml
 COPY ferrosa-loadgen/Cargo.toml ferrosa-loadgen/Cargo.toml
 COPY ferrosa-index-builder/Cargo.toml ferrosa-index-builder/Cargo.toml
+COPY ferrosa-sim/Cargo.toml ferrosa-sim/Cargo.toml
 
 # Create stub lib.rs for each crate so cargo fetch + dep build works
 RUN for d in ferrosa ferrosa-common ferrosa-sstable ferrosa-storage ferrosa-schema \
             ferrosa-cql ferrosa-index ferrosa-net ferrosa-cluster ferrosa-graph \
             ferrosa-udf ferrosa-worker ferrosa-sparql ferrosa-ctl ferrosa-jepsen \
-            ferrosa-loadgen ferrosa-index-builder; do \
+            ferrosa-loadgen ferrosa-index-builder ferrosa-sim; do \
       mkdir -p "$d/src" && echo "" > "$d/src/lib.rs"; \
     done && \
     echo 'fn main() {}' > ferrosa/src/main.rs && \

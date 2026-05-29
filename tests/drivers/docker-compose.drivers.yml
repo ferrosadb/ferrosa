@@ -74,10 +74,10 @@ services:
       rustfs-init:
         condition: service_completed_successfully
     ports:
-      - "9042:9042"   # CQL
-      - "9090:9090"   # Web / observability
-      - "7474:7474"   # Graph HTTP
-      - "7687:7687"   # Bolt (graph wire protocol)
+      - "${FERROSA_CQL_HOST_PORT:-9042}:9042"   # CQL
+      - "${FERROSA_METRICS_HOST_PORT:-9090}:9090"   # Web / observability
+      - "${FERROSA_CYPHER_HTTP_HOST_PORT:-7474}:7474"   # Graph HTTP
+      - "${FERROSA_BOLT_HOST_PORT:-7687}:7687"   # Bolt (graph wire protocol)
     environment:
       FERROSA_HOST_ID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
       FERROSA_DATA_DIR: /var/lib/ferrosa
