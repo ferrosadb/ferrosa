@@ -14,6 +14,7 @@
 
 pub mod hnsw;
 pub mod ivfflat;
+pub mod quantized;
 
 use std::path::Path;
 
