@@ -212,6 +212,20 @@ fn new_vector_indexes(
     Arc::new(map)
 }
 
+fn hex_scope(scope: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(scope.len() * 2);
+    for byte in scope {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn scoped_vector_sidecar_name(index_name: &str, scope: &[u8]) -> String {
+    format!("{index_name}__scope_{}", hex_scope(scope))
+}
+
 fn sstable_column_mappings<R: ReadAt + Send + Sync + 'static>(
     schema: &TableSchema,
     sstables: &[Arc<SSTableReader<R>>],
@@ -503,7 +517,11 @@ impl<F: FlushTarget> TableStore<F> {
                                     .unwrap_or(0),
                             );
                             if let Some(vi) = guard.vector_indexes.get(&cfg.index_name) {
-                                vi.insert(pos, vector);
+                                vi.insert_with_scope(
+                                    pos,
+                                    vector,
+                                    Some(key.key.as_bytes().to_vec()),
+                                );
                             }
                         }
                         // If bytes_to_vec_f32 fails, the cell contains non-vector
@@ -1127,10 +1145,15 @@ impl<F: FlushTarget> TableStore<F> {
         //     to fall back to full scans without the caller knowing.
         for cfg in &self.vector_index_configs {
             if let Some(vi) = old_vector_indexes.get(&cfg.index_name) {
-                let drained = vi.drain();
-                if drained.is_empty() {
+                let drained_with_scopes = vi.drain_with_scopes();
+                if drained_with_scopes.is_empty() {
                     continue;
                 }
+
+                let drained: Vec<_> = drained_with_scopes
+                    .iter()
+                    .map(|(_, pos, vector)| (*pos, vector.clone()))
+                    .collect();
 
                 // Build HNSW graph and serialize via the public API.
                 match ferrosa_index::vector::hnsw::build_and_serialize(
@@ -1158,6 +1181,45 @@ impl<F: FlushTarget> TableStore<F> {
                             "store: vector sidecar serialization failed");
                         #[cfg(debug_assertions)]
                         panic!("vector sidecar serialize failed: {e}");
+                    }
+                }
+
+                let mut by_scope: HashMap<
+                    Vec<u8>,
+                    Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+                > = HashMap::new();
+                for (scope, pos, vector) in drained_with_scopes {
+                    if let Some(scope) = scope {
+                        by_scope.entry(scope).or_default().push((pos, vector));
+                    }
+                }
+
+                for (scope, scoped_entries) in by_scope {
+                    let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
+                    match ferrosa_index::vector::hnsw::build_and_serialize(
+                        cfg.m,
+                        cfg.ef_construction,
+                        cfg.metric,
+                        scoped_entries,
+                    ) {
+                        Ok(vec_bytes) => {
+                            if let Err(e) = self.flush_target.write_vector_sidecar(
+                                gen,
+                                &scoped_index_name,
+                                &vec_bytes,
+                            ) {
+                                tracing::error!(%e, index_name = %scoped_index_name, gen,
+                                    "store: scoped vector sidecar persist failed");
+                                #[cfg(debug_assertions)]
+                                panic!("scoped vector sidecar persist failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(%e, index_name = %scoped_index_name, gen,
+                                "store: scoped vector sidecar serialization failed");
+                            #[cfg(debug_assertions)]
+                            panic!("scoped vector sidecar serialize failed: {e}");
+                        }
                     }
                 }
             }
@@ -2436,6 +2498,75 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // 4. Deduplicate, sort ascending by score, truncate to k.
+        let mut all: Vec<IndexResult> = merged.into_values().collect();
+        all.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all.truncate(k);
+        Ok(all)
+    }
+
+    /// Perform ANN search restricted to one partition/prefix scope.
+    ///
+    /// The scope bytes are the serialized partition key for the v1 routing seam
+    /// (tenant_id + session_id in the blueprint's schema). The active memtable
+    /// filters entries by scope; flushed SSTables use per-scope vector sidecars
+    /// so scoped queries avoid probing unrelated prefixes.
+    pub fn ann_search_in_partition_scope(
+        &self,
+        index_name: &str,
+        partition_scope: &[u8],
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
+        use ferrosa_index::vector::IndexResult;
+        use std::collections::HashMap as StdHashMap;
+
+        let guard = self.view.load();
+        let mut merged: StdHashMap<u64, IndexResult> = StdHashMap::new();
+
+        if let Some(vi) = guard.vector_indexes.get(index_name) {
+            let results = vi
+                .search_with_scope(query, k, ef_search, partition_scope)
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "ann_search scoped memtable failed: {e}"
+                    ))
+                })?;
+            for r in results {
+                merged.insert(r.position.offset, r);
+            }
+        }
+
+        let scoped_index_name = scoped_vector_sidecar_name(index_name, partition_scope);
+        for (gen_str, _dir) in guard.sstable_ids.iter() {
+            if let Ok(gen) = gen_str.parse::<u64>() {
+                if let Some(vec_bytes) = self
+                    .flush_target
+                    .read_vector_sidecar(gen, &scoped_index_name)
+                {
+                    match ferrosa_index::vector::hnsw::search_from_bytes(
+                        &vec_bytes, query, k, ef_search,
+                    ) {
+                        Ok(results) => {
+                            for r in results {
+                                merged.insert(r.position.offset, r);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                %e, index_name = %scoped_index_name, gen,
+                                "ann_search: scoped HNSW sidecar search failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let mut all: Vec<IndexResult> = merged.into_values().collect();
         all.sort_by(|a, b| {
             a.score
@@ -4803,6 +4934,121 @@ mod tests {
             results[0].score < 0.1,
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
+        );
+    }
+
+    #[test]
+    fn partition_scoped_ann_search_excludes_other_prefixes() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        let scope_a = make_key("tenant-a|session-1");
+        let scope_b = make_key("tenant-b|session-1");
+        store
+            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&scope_b, make_vector_row(&[1.0, 0.0, 0.0], 1001))
+            .unwrap();
+
+        let query = [1.0, 0.0, 0.0];
+        let unscoped = store.ann_search("vec_idx", &query, 1, 20).unwrap();
+        assert!(
+            unscoped[0].score < 0.1,
+            "control query should see the cross-prefix exact match"
+        );
+
+        let scoped = store
+            .ann_search_in_partition_scope("vec_idx", scope_a.key.as_bytes(), &query, 1, 20)
+            .expect("partition-scoped ANN search must not fail");
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            scoped[0].score > 1.0,
+            "scoped query must exclude the closer vector in another tenant/session prefix: {:?}",
+            scoped
+        );
+
+        store.flush().unwrap();
+        let flushed_scoped = store
+            .ann_search_in_partition_scope("vec_idx", scope_a.key.as_bytes(), &query, 1, 20)
+            .expect("flushed partition-scoped ANN search must not fail");
+        assert_eq!(flushed_scoped.len(), 1);
+        assert!(
+            flushed_scoped[0].score > 1.0,
+            "flushed scoped query must still exclude vectors from other prefixes: {:?}",
+            flushed_scoped
+        );
+    }
+
+    #[test]
+    fn vector_prefix_scope_reads_smaller_scoped_sidecar_than_unscoped_search() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        let scope_a = make_key("tenant-a|session-1");
+        let scope_b = make_key("tenant-b|session-1");
+        store
+            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .unwrap();
+        for i in 0..16 {
+            let x = 1.0 - (i as f32 * 0.01);
+            store
+                .write(&scope_b, make_vector_row(&[x, 0.0, 0.0], 2000 + i))
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let query = [1.0, 0.0, 0.0];
+        store.flush_target.reset_vector_sidecar_bytes_read();
+        let unscoped = store.ann_search("vec_idx", &query, 1, 20).unwrap();
+        let unscoped_bytes = store.flush_target.vector_sidecar_bytes_read();
+        assert!(
+            unscoped[0].score < 0.1,
+            "control query should see the cross-prefix nearest vector"
+        );
+
+        store.flush_target.reset_vector_sidecar_bytes_read();
+        let scoped = store
+            .ann_search_in_partition_scope("vec_idx", scope_a.key.as_bytes(), &query, 1, 20)
+            .unwrap();
+        let scoped_bytes = store.flush_target.vector_sidecar_bytes_read();
+
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            scoped[0].score > 1.0,
+            "scoped query must exclude closer vectors in other tenant/session prefixes"
+        );
+        assert!(
+            scoped_bytes < unscoped_bytes,
+            "scoped ANN should read a smaller sidecar than unscoped search: scoped={scoped_bytes}, unscoped={unscoped_bytes}"
         );
     }
 

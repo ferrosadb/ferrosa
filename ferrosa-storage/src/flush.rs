@@ -280,6 +280,7 @@ pub struct InMemoryFlushTarget {
     generation: std::sync::atomic::AtomicU64,
     /// Vector sidecar bytes keyed by `(generation, index_name)`.
     vector_sidecars: std::sync::Mutex<HashMap<(u64, String), Vec<u8>>>,
+    vector_sidecar_bytes_read: std::sync::atomic::AtomicU64,
 }
 
 impl InMemoryFlushTarget {
@@ -288,7 +289,18 @@ impl InMemoryFlushTarget {
         Self {
             generation: std::sync::atomic::AtomicU64::new(0),
             vector_sidecars: std::sync::Mutex::new(HashMap::new()),
+            vector_sidecar_bytes_read: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub fn reset_vector_sidecar_bytes_read(&self) {
+        self.vector_sidecar_bytes_read
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn vector_sidecar_bytes_read(&self) -> u64 {
+        self.vector_sidecar_bytes_read
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -342,7 +354,12 @@ impl FlushTarget for InMemoryFlushTarget {
             .vector_sidecars
             .lock()
             .expect("vector_sidecars poisoned");
-        map.get(&(generation, index_name.to_string())).cloned()
+        let bytes = map.get(&(generation, index_name.to_string())).cloned();
+        if let Some(bytes) = bytes.as_ref() {
+            self.vector_sidecar_bytes_read
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        bytes
     }
 }
 

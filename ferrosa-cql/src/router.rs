@@ -217,6 +217,78 @@ fn prepare_order_by_execution(
 /// The caller must additionally confirm WHERE is empty — a predicate
 /// on a non-projected regular column would silently evaluate against
 /// the stripped (NULL) cell and produce wrong results.
+fn vector_bits_from_term(term: &Term, target_type: &CqlType) -> Result<Vec<u32>, CqlError> {
+    match bridge::term_to_cql_value(term, target_type)? {
+        CqlValue::Vector(bits) => Ok(bits),
+        other => Err(CqlError::Invalid(format!(
+            "ANN query value must resolve to vector, got {other:?}"
+        ))),
+    }
+}
+
+fn squared_l2_distance(left: &[u32], right: &[u32]) -> Result<f32, CqlError> {
+    if left.len() != right.len() {
+        return Err(CqlError::Invalid(format!(
+            "vector dimension mismatch: expected {}, got {}",
+            left.len(),
+            right.len()
+        )));
+    }
+
+    Ok(left
+        .iter()
+        .zip(right)
+        .map(|(a, b)| {
+            let diff = f32::from_bits(*a) - f32::from_bits(*b);
+            diff * diff
+        })
+        .sum())
+}
+
+fn apply_ann_of_ordering(
+    rows: &mut [Vec<Option<CqlValue>>],
+    ann_col: &str,
+    ann_query: &Term,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+) -> Result<(), CqlError> {
+    let col_idx = all_col_names
+        .iter()
+        .position(|name| name == ann_col)
+        .ok_or_else(|| CqlError::Invalid(format!("unknown ANN OF column {ann_col}")))?;
+    let target_type = all_col_types.get(col_idx).ok_or_else(|| {
+        CqlError::Invalid(format!("missing type metadata for ANN OF column {ann_col}"))
+    })?;
+    let query_bits = vector_bits_from_term(ann_query, target_type)?;
+
+    let mut keyed_rows = Vec::with_capacity(rows.len());
+    for (ordinal, row) in rows.iter().cloned().enumerate() {
+        let value = row
+            .get(col_idx)
+            .ok_or_else(|| CqlError::Invalid(format!("missing ANN OF column {ann_col} in row")))?;
+        let Some(CqlValue::Vector(row_bits)) = value else {
+            return Err(CqlError::Invalid(format!(
+                "ANN OF column {ann_col} must contain vector values"
+            )));
+        };
+        let distance = squared_l2_distance(row_bits, &query_bits)?;
+        keyed_rows.push((distance, ordinal, row));
+    }
+
+    keyed_rows.sort_by(
+        |(left_distance, left_ordinal, _), (right_distance, right_ordinal, _)| {
+            left_distance
+                .total_cmp(right_distance)
+                .then_with(|| left_ordinal.cmp(right_ordinal))
+        },
+    );
+
+    for (slot, (_, _, row)) in rows.iter_mut().zip(keyed_rows) {
+        *slot = row;
+    }
+    Ok(())
+}
+
 fn projection_storage_ordinals(
     select_columns: &[SelectColumn],
     table_meta: &TableMetadata,
@@ -2893,20 +2965,18 @@ async fn route_select_user_table(
     // on completion or cancellation cleans up the temporary table directory.
     let _order_by_temp_sort = prepare_order_by_execution(state, ks, s, table_meta)?;
 
-    // ANN OF ordering: vector similarity search is deferred — log and fall
-    // through to normal result ordering. The query parses successfully but
-    // ANN execution will be implemented when the vector index query path is
-    // wired up.
-    if s.ann_of.is_some() {
-        tracing::warn!(
-            keyspace = ks,
-            table = %s.table,
-            "ORDER BY ... ANN OF parsed but ANN execution is deferred — returning unordered results"
-        );
-    }
-
     // Apply ORDER BY sorting (FRSA-BUG-004)
-    let rows = if !s.order_by.is_empty() {
+    let rows = if let Some((ann_col, ann_query)) = &s.ann_of {
+        let mut sorted = rows;
+        apply_ann_of_ordering(
+            &mut sorted,
+            ann_col,
+            ann_query,
+            &all_col_names,
+            &all_col_types,
+        )?;
+        sorted
+    } else if !s.order_by.is_empty() {
         let mut sorted = rows;
         // Resolve column indices for ORDER BY columns
         let order_specs: Vec<(usize, bool)> = s
@@ -5229,6 +5299,14 @@ fn resolve_index_type(
     }
 }
 
+fn vector_dimension_from_column_type(column_type: &str) -> Option<usize> {
+    let lower = column_type.trim().to_ascii_lowercase();
+    let inner = lower.strip_prefix("vector<")?.strip_suffix('>')?;
+    inner
+        .rsplit_once(',')
+        .and_then(|(_, dim)| dim.trim().parse::<usize>().ok())
+}
+
 async fn route_create_index(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -5293,7 +5371,7 @@ async fn route_create_index(
     if let Some(target_col) = s.columns.first() {
         let snap = state.schema.snapshot();
         let table_id = TableId::new(ks, &s.table);
-        let col_pos = snap
+        let col_info = snap
             .tables
             .get(&(ks.to_string(), s.table.clone()))
             .and_then(|tbl| {
@@ -5304,11 +5382,29 @@ async fn route_create_index(
                     .filter(|c| c.kind == ColumnKind::Regular)
                     .collect();
                 regulars.sort_by_key(|c| c.position);
-                regulars.iter().position(|c| &c.name == target_col)
+                regulars
+                    .iter()
+                    .position(|c| &c.name == target_col)
+                    .map(|pos| (pos, regulars[pos].column_type.clone()))
             });
 
-        if let Some(pos) = col_pos {
-            if let Err(e) = state.engine.add_index(&table_id, &index_name, pos) {
+        if let Some((pos, column_type)) = col_info {
+            let wire_result = if index_type == IndexType::Vector {
+                let dimension =
+                    vector_dimension_from_column_type(&column_type).ok_or_else(|| {
+                        CqlError::Invalid(format!(
+                            "vector index target column '{}' has non-vector type '{}'",
+                            target_col, column_type
+                        ))
+                    })?;
+                state
+                    .engine
+                    .add_vector_index(&table_id, &index_name, pos, dimension)
+            } else {
+                state.engine.add_index(&table_id, &index_name, pos)
+            };
+
+            if let Err(e) = wire_result {
                 // Log warning but don't fail — index is persisted in schema;
                 // it will be populated once the table is registered (e.g., on restart).
                 tracing::warn!(
@@ -15450,10 +15546,112 @@ mod tests {
     }
 
     #[test]
+    fn ann_of_ordering_sorts_candidate_rows_by_vector_distance() {
+        let all_col_names = vec!["tenant".to_string(), "id".to_string(), "vec".to_string()];
+        let all_col_types = vec![
+            CqlType::Varchar,
+            CqlType::Int,
+            CqlType::Vector(Box::new(CqlType::Float), 3),
+        ];
+        let query = Term::BlobLiteral(ferrosa_index::vec_f32_to_bytes(&[1.0, 0.0, 0.0]));
+        let mut rows = vec![
+            vec![
+                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Int(1)),
+                Some(CqlValue::Vector(vec![
+                    0.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                ])),
+            ],
+            vec![
+                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Int(2)),
+                Some(CqlValue::Vector(vec![
+                    1.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                ])),
+            ],
+        ];
+
+        apply_ann_of_ordering(&mut rows, "vec", &query, &all_col_names, &all_col_types).unwrap();
+
+        assert_eq!(rows[0][1], Some(CqlValue::Int(2)));
+        assert_eq!(rows[1][1], Some(CqlValue::Int(1)));
+    }
+
+    #[test]
     fn resolve_index_type_vector() {
         let result = resolve_index_type(Some("vector"), &["embedding".into()], &HashMap::new());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), IndexType::Vector);
+    }
+
+    #[tokio::test]
+    async fn ann_prefix_create_vector_index_wires_scoped_storage_index() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for cql in [
+            "CREATE KEYSPACE annks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE annks.entities (tenant text, session text, id int, embedding vector<float, 3>, PRIMARY KEY ((tenant, session), id))",
+            "CREATE INDEX entity_embedding_ann ON annks.entities (embedding) USING 'vector'",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let vector_blob = |values: &[f32]| -> String {
+            let bytes = ferrosa_index::vec_f32_to_bytes(values);
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let far = vector_blob(&[0.0, 1.0, 0.0]);
+        let exact = vector_blob(&[1.0, 0.0, 0.0]);
+        for cql in [
+            format!("INSERT INTO annks.entities (tenant, session, id, embedding) VALUES ('tenant-a', 'session-1', 1, 0x{far})"),
+            format!("INSERT INTO annks.entities (tenant, session, id, embedding) VALUES ('tenant-b', 'session-1', 2, 0x{exact})"),
+        ] {
+            route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let table_id = TableId::new("annks", "entities");
+        let pk_types = [CqlType::Varchar, CqlType::Varchar];
+        let scope = bridge::build_decorated_key(
+            &[
+                CqlValue::Text("tenant-a".to_string()),
+                CqlValue::Text("session-1".to_string()),
+            ],
+            &pk_types,
+        )
+        .unwrap();
+        let scoped = state
+            .engine
+            .ann_search_in_partition_scope(
+                &table_id,
+                "entity_embedding_ann",
+                scope.key.as_bytes(),
+                &[1.0, 0.0, 0.0],
+                1,
+                20,
+            )
+            .unwrap();
+
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            scoped[0].score > 1.0,
+            "CQL-created vector index must feed scoped storage ANN and exclude cross-prefix exact matches: {scoped:?}"
+        );
     }
 
     // ── parse_permissions coverage for remaining variants ────────────
