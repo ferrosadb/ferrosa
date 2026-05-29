@@ -1,7 +1,7 @@
 # Hierarchical Vector Quantization for S3-Durable, NVMe-Cached ANN
 
-> Last updated: 2026-05-13
-> Status: Draft / design investigation
+> Last updated: 2026-05-29
+> Status: Draft / design investigation; CockroachDB C-SPANN review incorporated
 
 ## Executive Summary
 
@@ -10,6 +10,55 @@ Ferrosa currently stores flushed vector indexes as per-SSTable JSON sidecars tha
 This spec proposes a hierarchical quantized vector index: store progressively more precise vector representations (`Q1 -> Q2 -> Q4 -> Q8 -> F32` or residual/PQ equivalents) in S3-durable, page-addressable `.qvec` objects, use bounded NVMe cache only for hot manifests/routing/pages, eliminate most candidates with bounded object-range reads, then fetch finer tiers only for survivors. The first implementation should be an additive index method (`quantized_ivf_flat` first, then `quantized_hnsw`) rather than a rewrite of existing HNSW/IVFFlat.
 
 Important invariant: local compute-node disk is not assumed to hold the full vector index. S3-compatible object storage is authoritative and durable; NVMe is a bounded, evictable cache.
+
+## CockroachDB C-SPANN Lessons to Incorporate
+
+The ByteByteGo/CockroachDB article on C-SPANN is useful because it frames vector indexing as a distributed-database integration problem, not merely an ANN library choice. The following lessons are now scope inputs for this proposal:
+
+1. **Index partitions should be storage-native artifacts.** CockroachDB stores C-SPANN partitions as ordinary KV/table data so range split, rebalance, replication, caching, and restart behavior come from the database. Ferrosa should mirror the principle with manifest-published, S3-durable, page-addressable index artifacts whose object keys and liveness follow SSTable/index-artifact rules. Do not create a separate durability/discovery subsystem for vectors.
+2. **Prefer a wide, shallow hierarchical K-means/IVF shape for distributed scale.** HNSW is strong in-memory, but it resists sharding and warm-restart constraints. A C-SPANN-like tree gives explicit partition units that can map to object ranges, cache pages, compaction jobs, and future token/range placement.
+3. **Make prefix-scoped vector indexes first-class.** Real workloads query within tenant/user/session/region scopes. Prefix columns should select a shard-local tree before any vector distance work. This is both a performance feature and a security/isolation boundary.
+4. **Use quantized candidate generation plus exact survivor rerank.** Low-bit vectors should cheaply find a candidate set; exact `f32` or residual pages should be fetched only for survivors when the index is configured for correctness-sensitive results.
+5. **Support incremental maintenance as background/index-builder work.** C-SPANN/SPFresh split, merge, and nearest-partition reassignment are the right long-term quality-maintenance model. Ferrosa v1 can keep immutable per-SSTable artifacts, but the design must not block compaction/index-builder replacement generations that rebalance partitions.
+6. **Avoid central coordinators and hot roots.** The root/routing layer can be cached, but the serving model must not require one leader, one hot partition, or all routing state in RAM. Prefix scope, root partition caching, and page budgets are mandatory design surfaces.
+7. **Benchmark the integration, not just ANN recall.** Required evidence includes bytes read/query, object-range reads/query, p95 latency, cache hit/miss behavior, build memory, and recall@k versus exact search.
+
+## Scope Outlines
+
+### Scope A — Ferrosa-core data model and public contract
+
+- Add vector index metadata for prefix columns: tenant/user/session/region style equality predicates must be available to the ANN search path before vector routing.
+- Keep existing CQL ANN syntax working; map current `ef_search`/limit semantics to an internal budget first, then consider explicit ANN budget options later.
+- Preserve existing HNSW/IVFFlat JSON sidecars as legacy methods. Quantized indexes are additive and require rebuild, not in-place upgrade.
+- Define `VectorRowRef` or equivalent generation-aware identity before global or cross-SSTable merges rely on row offsets.
+
+### Scope B — Quantized format and page-store foundation
+
+- Introduce `.qvec` as a versioned binary container with magic, manifest, page table, checksums, tier metadata, object key/build id/generation identity, and explicit metric/dimension fields.
+- Implement a `QuantizedPageStore` over byte ranges, with file-backed tests first and object-store/NVMe cache integration later.
+- Fail loudly on unknown magic/version, checksum mismatch, stale generation, missing page, short read, dimension mismatch, or codec confusion.
+- Prove range reads are used in tests; whole-sidecar materialization is forbidden for quantized query paths.
+
+### Scope C — Quantized ANN algorithm v1
+
+- Start with IVFFlat / hierarchical K-means rather than HNSW for the first implementation.
+- Build centroids from full vectors, write tiered list/partition pages, and perform staged pruning through Q2/Q4/Q8 plus optional F32/residual rerank.
+- Keep Q1/RaBitQ-style ultra-low-bit routing benchmark-gated. It is in scope as an experiment, not a default before recall evidence.
+- Keep HNSW quantized traversal as a later prototype after IVFFlat evidence is green.
+
+### Scope D — Storage, durability, and compaction integration
+
+- Publish quantized artifacts only after durable object upload and manifest validation.
+- Treat NVMe/local files as cache only; S3-compatible object storage is authoritative outside local test mode.
+- Extend index artifact manifests so engine bootstrap and query paths can discover vector artifacts without scanning local directories or materializing full files.
+- Compaction must publish replacement `.qvec` generations before old-object GC, and cache keys must include generation/build/checksum to avoid stale page reuse.
+
+### Scope E — Benchmark and TDD acceptance spec
+
+- Build a reproducible benchmark/test corpus with clustered synthetic vectors plus a ferrosa-memory embedding corpus when available.
+- Required comparison: current full-vector JSON HNSW/IVFFlat path vs quantized staged reader.
+- Required speed evidence: p50/p95 latency, bytes read/query, sidecar bytes, object-range count, candidates scanned, exact rerank count, and recall@10/@100.
+- Default enablement gate: recall@10 >= 0.95 against exact `f32` brute force on benchmark corpora, with a measurable bytes-read and latency improvement over current sidecar search.
 
 ## Current Codebase Findings
 
@@ -725,13 +774,11 @@ These are the decisions that need owner input before implementation starts:
 1. Compatibility: Can quantized vector indexes require a rebuild, or must existing HNSW/IVFFlat sidecars be upgradable in place?
    - Recommended: rebuild only; no in-place upgrade.
 
-## Recommended Next Step
+## Owner Decisions Locked 2026-05-29
 
-Create a prototype work item for Phase 0 + Phase 1 only:
+The initial implementation swarm should use the defaults above with two overrides:
 
-- `ferrosa-index/src/vector/quantized.rs`
-- `ferrosa-index/src/vector/quantized/container.rs`
-- `ferrosa-index/src/vector/quantized/codec.rs`
-- tests under `ferrosa-index/src/vector/quantized.rs` or `ferrosa-index/tests/quantized_vector.rs`
+1. **Storage integration depth:** implement through full production-oriented scope in this swarm: `ferrosa-index` container/codecs/IVF reader-builder, `ferrosa-storage` dispatch, S3/object-range cache, compaction replacement, and `ferrosa-index-builder` production handoff shape.
+2. **Final output:** produce an integrated branch ready for human testing/review, passing local CI and ready to push. Do not push or open a PR without explicit approval.
 
-Do not wire into `TableStore` until the binary container and codec tests are stable. This keeps churn out of `ferrosa-storage/src/store.rs`, which is the current hotspot.
+The first algorithm remains quantized IVFFlat / hierarchical K-means; HNSW remains a later prototype after IVFFlat evidence is green.
