@@ -78,14 +78,14 @@ fn tier_multi_dc_one_hour_bank_workload() {
 
     // The actual 1-hour bank-workload run is wired into the
     // orchestrator binary `ferrosa-jepsen` (`cargo run -p \
-    // ferrosa-jepsen -- --tier=multi-dc`); this test acts as a
+    // ferrosa-jepsen -- run --tier=multi-dc`); this test acts as a
     // smoke-level check that the test infrastructure (compose
     // file + tier wiring) is reachable end-to-end. The smoke check
     // boots both DCs and exits — full 1h workload is the nightly
     // CI job, not a per-PR signal.
     panic!(
         "FERROSA_TEST_CONTAINERS=1 path: 1-hour multi-DC bank workload is the \
-         nightly CI job. Run `cargo run -p ferrosa-jepsen -- --tier=multi-dc` \
+         nightly CI job. Run `cargo run -p ferrosa-jepsen -- run --tier=multi-dc` \
          directly with the T3 stack already up to execute it."
     );
 }

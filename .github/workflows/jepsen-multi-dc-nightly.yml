@@ -32,6 +32,7 @@ jobs:
 
       - name: Validate tier-multi-dc wiring (config-only)
         run: |
+          set -o pipefail
           cargo test --release -p ferrosa-jepsen \
             --test tier_multi_dc \
             -- tier_multi_dc_resolves_to_t3 \
@@ -53,9 +54,10 @@ jobs:
         env:
           FERROSA_TEST_CONTAINERS: '1'
         run: |
+          set -o pipefail
           cargo run --release -p ferrosa-jepsen -- \
+            run \
             --tier multi-dc \
-            --run-id "multi-dc-$(date -u +%Y%m%d)" \
             --output-dir ./jepsen-out \
             2>&1 | tee tier-multi-dc.log
 
