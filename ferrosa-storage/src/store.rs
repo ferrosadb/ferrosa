@@ -2380,8 +2380,8 @@ impl<F: FlushTarget> TableStore<F> {
     ///
     /// Searches the active (and optionally flushing) memtable via brute-force,
     /// then queries each SSTable's persisted HNSW sidecar via the flush target.
-    /// Results from all sources are merged, deduplicated by `position.offset`,
-    /// sorted ascending by score, and truncated to `k`.
+    /// Results from all sources are merged, deduplicated by generation-aware row
+    /// identity, sorted ascending by score, and truncated to `k`.
     ///
     /// Returns `Ok(Vec::new())` when the index has no data or no sidecar
     /// exists for `index_name`.
@@ -2392,11 +2392,11 @@ impl<F: FlushTarget> TableStore<F> {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
-        use ferrosa_index::vector::IndexResult;
+        use ferrosa_index::vector::{IndexResult, VectorRowRef};
         use std::collections::HashMap as StdHashMap;
 
         let guard = self.view.load();
-        let mut merged: StdHashMap<u64, IndexResult> = StdHashMap::new();
+        let mut merged: StdHashMap<VectorRowRef, IndexResult> = StdHashMap::new();
 
         // 1. Search active memtable.
         if let Some(vi) = guard.vector_indexes.get(index_name) {
@@ -2404,7 +2404,7 @@ impl<F: FlushTarget> TableStore<F> {
                 ferrosa_common::Error::InvalidData(format!("ann_search memtable failed: {e}"))
             })?;
             for r in results {
-                merged.insert(r.position.offset, r);
+                merged.insert(VectorRowRef::memtable(r.position), r);
             }
         }
 
@@ -2421,7 +2421,7 @@ impl<F: FlushTarget> TableStore<F> {
                     ) {
                         Ok(results) => {
                             for r in results {
-                                merged.insert(r.position.offset, r);
+                                merged.insert(VectorRowRef::sstable(gen, r.position), r);
                             }
                         }
                         Err(e) => {
@@ -2436,14 +2436,15 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // 4. Deduplicate, sort ascending by score, truncate to k.
-        let mut all: Vec<IndexResult> = merged.into_values().collect();
+        let mut all: Vec<(VectorRowRef, IndexResult)> = merged.into_iter().collect();
         all.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
+            a.1.score
+                .partial_cmp(&b.1.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
         });
         all.truncate(k);
-        Ok(all)
+        Ok(all.into_iter().map(|(_, result)| result).collect())
     }
 
     /// Returns the generation number of the most recently flushed SSTable.
@@ -4803,6 +4804,49 @@ mod tests {
             results[0].score < 0.1,
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
+        );
+    }
+
+    #[test]
+    fn ann_same_offset_results_from_different_sstable_generations_both_survive_merge() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .unwrap();
+        store.flush().unwrap();
+
+        let results = store
+            .ann_search("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .expect("ann_search must not fail");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "two sidecars may both report row offset 0; merge identity must include SSTable generation: {results:?}"
+        );
+        assert!(
+            results[0].score <= results[1].score,
+            "same-offset cross-generation results must remain deterministically score ordered: {results:?}"
         );
     }
 

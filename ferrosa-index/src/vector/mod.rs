@@ -52,6 +52,41 @@ impl RowPosition {
     }
 }
 
+/// Generation-aware identity for a vector result row during multi-source merges.
+///
+/// Row offsets are only unique within one source. Persisted vector sidecars from
+/// different SSTable generations can legitimately both return offset 0, so ANN
+/// merge/dedup keys must include the generation whenever the row came from an
+/// SSTable. Memtable rows use `generation = None` because they have not been
+/// assigned a persisted SSTable generation yet.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct VectorRowRef {
+    /// SSTable generation for persisted sidecar rows; `None` for active memtable rows.
+    pub generation: Option<u64>,
+    /// Byte offset or in-memory placeholder offset reported by the vector index.
+    pub offset: u64,
+}
+
+impl VectorRowRef {
+    /// Identity for an active memtable result that does not yet have an SSTable generation.
+    pub fn memtable(position: RowPosition) -> Self {
+        Self {
+            generation: None,
+            offset: position.offset,
+        }
+    }
+
+    /// Identity for a persisted SSTable sidecar result.
+    pub fn sstable(generation: u64, position: RowPosition) -> Self {
+        Self {
+            generation: Some(generation),
+            offset: position.offset,
+        }
+    }
+}
+
 /// A single result from a vector index query, pairing a row position with a score.
 ///
 /// For distance-based searches lower scores are better; for point lookups the
