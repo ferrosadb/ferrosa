@@ -29,6 +29,7 @@ pub mod merge;
 pub mod metrics;
 pub mod observer;
 pub mod pin_config;
+pub mod quantized_range_cache;
 pub mod quarantine;
 pub mod range_merger;
 pub mod restore;
