@@ -25,6 +25,7 @@ pub struct VectorMemtableIndex {
 struct VectorMemtableInner {
     vectors: Vec<Vec<f32>>,
     positions: Vec<RowPosition>,
+    scopes: Vec<Option<Vec<u8>>>,
 }
 
 impl VectorMemtableInner {
@@ -32,6 +33,7 @@ impl VectorMemtableInner {
         Self {
             vectors: Vec::new(),
             positions: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 }
@@ -53,9 +55,20 @@ impl VectorMemtableIndex {
 
     /// Insert a vector and its associated row position.
     pub fn insert(&self, position: RowPosition, vector: Vec<f32>) {
+        self.insert_with_scope(position, vector, None);
+    }
+
+    /// Insert a vector and its associated row position plus optional prefix scope.
+    pub fn insert_with_scope(
+        &self,
+        position: RowPosition,
+        vector: Vec<f32>,
+        scope: Option<Vec<u8>>,
+    ) {
         let mut inner = self.inner.write();
         inner.positions.push(position);
         inner.vectors.push(vector);
+        inner.scopes.push(scope);
     }
 
     /// Search for the `k` nearest vectors to `query`.
@@ -94,6 +107,42 @@ impl VectorMemtableIndex {
         Ok(results)
     }
 
+    /// Search for nearest vectors restricted to a specific prefix scope.
+    pub fn search_with_scope(
+        &self,
+        query: &[f32],
+        k: usize,
+        _ef_search: usize,
+        scope: &[u8],
+    ) -> Result<Vec<IndexResult>, ferrosa_index::IndexError> {
+        let inner = self.inner.read();
+
+        if inner.vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut scored: Vec<(f32, RowPosition)> = inner
+            .vectors
+            .iter()
+            .zip(inner.positions.iter())
+            .zip(inner.scopes.iter())
+            .filter_map(|((vec, pos), entry_scope)| {
+                entry_scope
+                    .as_deref()
+                    .filter(|entry_scope| *entry_scope == scope)
+                    .map(|_| (distance(&self.metric, query, vec), *pos))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+
+        Ok(scored
+            .into_iter()
+            .map(|(score, position)| IndexResult { position, score })
+            .collect())
+    }
+
     /// Returns the number of vectors stored in this index.
     pub fn len(&self) -> usize {
         self.inner.read().vectors.len()
@@ -111,7 +160,22 @@ impl VectorMemtableIndex {
         let mut inner = self.inner.write();
         let positions = std::mem::take(&mut inner.positions);
         let vectors = std::mem::take(&mut inner.vectors);
+        let _ = std::mem::take(&mut inner.scopes);
         positions.into_iter().zip(vectors).collect()
+    }
+
+    /// Drain all vectors from the index with their optional prefix scopes.
+    pub fn drain_with_scopes(&self) -> Vec<(Option<Vec<u8>>, RowPosition, Vec<f32>)> {
+        let mut inner = self.inner.write();
+        let positions = std::mem::take(&mut inner.positions);
+        let vectors = std::mem::take(&mut inner.vectors);
+        let scopes = std::mem::take(&mut inner.scopes);
+        scopes
+            .into_iter()
+            .zip(positions)
+            .zip(vectors)
+            .map(|((scope, position), vector)| (scope, position, vector))
+            .collect()
     }
 
     /// HNSW `m` parameter (max connections per node per layer).

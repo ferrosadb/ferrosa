@@ -34,7 +34,7 @@ use crate::compaction::executor::CompactionExecutor;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::FileFlushTarget;
-use crate::store::TableStore;
+use crate::store::{TableStore, VectorIndexConfig};
 use crate::timeseries::aggregator::decode_typed_numeric;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
 use crate::timeseries::consolidation::Accumulator;
@@ -1935,6 +1935,67 @@ impl StorageEngine {
             .store
             .add_fulltext_index(index_name.to_string(), column_position);
         Ok(())
+    }
+
+    /// Register a vector ANN index on a table.
+    ///
+    /// Vector indexes are stored separately from scalar secondary indexes so
+    /// ANN reads can use TableStore's vector sidecars, including partition-
+    /// scoped sidecars for prefix-bounded queries.
+    pub fn add_vector_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        column_position: usize,
+        _dimension: usize,
+    ) -> ferrosa_common::Result<()> {
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.store.add_vector_index(VectorIndexConfig {
+            index_name: index_name.to_string(),
+            column_position,
+            metric: ferrosa_index::DistanceMetric::L2,
+            ef_construction: 64,
+            m: 16,
+        });
+        Ok(())
+    }
+
+    /// Run an ANN search on a registered table vector index.
+    pub fn ann_search(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.store.ann_search(index_name, query, k, ef_search)
+    }
+
+    /// Run an ANN search bounded to partition keys with `partition_scope`.
+    pub fn ann_search_in_partition_scope(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        partition_scope: &[u8],
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state
+            .store
+            .ann_search_in_partition_scope(index_name, partition_scope, query, k, ef_search)
     }
 
     /// Scans a table directory for existing SSTable files and sidecar index files,
