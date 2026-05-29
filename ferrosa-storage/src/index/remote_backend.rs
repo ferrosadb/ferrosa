@@ -275,6 +275,8 @@ impl RemoteBackend {
             "sstable_id": job.sstable_id,
             "index_name": job.index_name,
             "index_type": format!("{:?}", job.index_type).to_lowercase(),
+            "artifact_kind": if job.index_type == ferrosa_index::IndexType::Vector { Some("hvq_qvec") } else { None },
+            "direct_upload": job.index_type == ferrosa_index::IndexType::Vector,
             "s3_endpoint": self.s3_resolver.endpoint,
             "s3_bucket": self.s3_resolver.bucket,
             "s3_prefix": s3_prefix,
@@ -326,12 +328,9 @@ impl RemoteBackend {
                 Ok(resp) => {
                     self.circuit_breakers[endpoint_idx].record_success();
                     if resp.status == "completed" {
-                        return Ok(IndexBuildResult {
-                            sstable_id: job.sstable_id.clone(),
-                            sidecar_entries: std::collections::HashMap::new(),
-                            build_duration: Duration::from_millis(resp.elapsed_ms.unwrap_or(0)),
-                            sidecar_written_to_s3: true,
-                        });
+                        return resp
+                            .into_index_build_result(job)
+                            .map_err(BuildError::Permanent);
                     }
                     // Application-level failure — permanent, don't retry.
                     let msg = resp.error.unwrap_or_else(|| "unknown error".into());
@@ -399,6 +398,29 @@ struct BuildResponse {
     #[allow(dead_code)]
     #[serde(default)]
     entries_built: Option<u64>,
+    #[serde(default)]
+    artifact_manifest_entry: Option<crate::index::ArtifactManifestEntry>,
+}
+
+impl BuildResponse {
+    fn into_index_build_result(self, job: &IndexBuildJob) -> Result<IndexBuildResult, String> {
+        let mut artifact_manifest_entries = Vec::new();
+        if job.index_type == ferrosa_index::IndexType::Vector {
+            let entry = self.artifact_manifest_entry.ok_or_else(|| {
+                "quantized remote build completed without artifact_manifest_entry".to_string()
+            })?;
+            entry.validate_qvec()?;
+            artifact_manifest_entries.push(entry);
+        }
+
+        Ok(IndexBuildResult {
+            sstable_id: job.sstable_id.clone(),
+            sidecar_entries: std::collections::HashMap::new(),
+            build_duration: Duration::from_millis(self.elapsed_ms.unwrap_or(0)),
+            sidecar_written_to_s3: true,
+            artifact_manifest_entries,
+        })
+    }
 }
 
 enum BuildError {
@@ -483,5 +505,56 @@ mod tests {
         assert!(!path.starts_with('/'));
         assert!(path.contains("ks.users"));
         assert!(path.ends_with("gen-42"));
+    }
+
+    fn quantized_job() -> IndexBuildJob {
+        IndexBuildJob {
+            sstable_id: "gen-42".to_string(),
+            index_name: "idx_embedding".to_string(),
+            index_type: ferrosa_index::IndexType::Vector,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: super::super::scheduler::BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+        }
+    }
+
+    #[test]
+    fn quantized_compaction_remote_response_requires_qvec_manifest_metadata() {
+        let response: BuildResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "elapsed_ms": 5
+        }))
+        .unwrap();
+
+        let err = response
+            .into_index_build_result(&quantized_job())
+            .expect_err("vector .qvec responses without manifest metadata must fail closed");
+        assert!(err.contains("artifact_manifest_entry"));
+    }
+
+    #[test]
+    fn quantized_compaction_remote_response_validates_qvec_manifest_metadata() {
+        let response: BuildResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "elapsed_ms": 5,
+            "artifact_manifest_entry": {
+                "artifact_kind": "hvq_qvec",
+                "table_id": "ks.tbl",
+                "index_name": "idx_embedding",
+                "generation": 42,
+                "build_id": 9,
+                "object_key": "prod/42/ks.tbl/gen-42/idx_embedding/q4.qvec",
+                "size_bytes": 4096,
+                "sha256_hex": "abc123",
+                "page_count": 12
+            }
+        }))
+        .unwrap();
+
+        let result = response.into_index_build_result(&quantized_job()).unwrap();
+        assert!(result.sidecar_written_to_s3);
+        assert_eq!(result.artifact_manifest_entries.len(), 1);
+        assert_eq!(result.artifact_manifest_entries[0].build_id, 9);
     }
 }
