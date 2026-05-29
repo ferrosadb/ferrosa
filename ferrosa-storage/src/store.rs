@@ -81,6 +81,38 @@ pub(crate) fn search_quantized_vector_artifact(
     })
 }
 
+pub(crate) fn search_quantized_vector_artifact_reader<R: ReadAt>(
+    reader: &R,
+    query: &[f32],
+    k: usize,
+    ef_search: usize,
+) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
+    let total_len = reader.len()?;
+    let header_len = QVEC_HNSW_MAGIC.len() as u64;
+    if total_len < header_len {
+        return Err(ferrosa_common::Error::InvalidData(
+            "invalid quantized vector artifact header".to_string(),
+        ));
+    }
+
+    let mut header = vec![0; QVEC_HNSW_MAGIC.len()];
+    reader.read_exact_at(&mut header, 0)?;
+    if header != QVEC_HNSW_MAGIC {
+        return Err(ferrosa_common::Error::InvalidData(
+            "invalid quantized vector artifact header".to_string(),
+        ));
+    }
+
+    let payload_len = (total_len - header_len).try_into().map_err(|_| {
+        ferrosa_common::Error::InvalidData("quantized vector artifact too large".to_string())
+    })?;
+    let mut payload = vec![0; payload_len];
+    reader.read_exact_at(&mut payload, header_len)?;
+    ferrosa_index::vector::hnsw::search_from_bytes(&payload, query, k, ef_search).map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!("quantized ANN search failed: {e}"))
+    })
+}
+
 /// Atomic snapshot of the storage engine's current state.
 ///
 /// Held inside an [`ArcSwap`] so any thread can load a consistent view
@@ -4845,6 +4877,61 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
         }
+    }
+
+    struct RecordingReadAt {
+        bytes: Vec<u8>,
+        reads: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl ferrosa_sstable::io::ReadAt for RecordingReadAt {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            let offset = offset as usize;
+            let Some(available) = self.bytes.get(offset..) else {
+                return Ok(0);
+            };
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            self.reads.lock().expect("reads poisoned").push(buf.len());
+            Ok(n)
+        }
+
+        fn len(&self) -> Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    #[test]
+    fn quantized_artifact_reader_does_not_materialize_full_qvec_file() {
+        let artifact = build_quantized_vector_artifact(
+            &VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: DistanceMetric::L2,
+                m: 4,
+                ef_construction: 8,
+            },
+            vec![],
+        )
+        .expect("build empty quantized artifact");
+        let reader = RecordingReadAt {
+            bytes: artifact.clone(),
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let _ = search_quantized_vector_artifact_reader(&reader, &[0.0, 0.0], 1, 4)
+            .expect("empty artifact search should parse through positional reader");
+
+        let reads = reader.reads.lock().expect("reads poisoned");
+        assert!(
+            reads.contains(&QVEC_HNSW_MAGIC.len()),
+            "reader must validate the .qvec header with a bounded positional read, got {reads:?}"
+        );
+        assert!(
+            reads.iter().all(|read_len| *read_len < artifact.len()),
+            "quantized search must not issue a full-.qvec read, got reads {reads:?} for artifact len {}",
+            artifact.len()
+        );
     }
 
     #[test]

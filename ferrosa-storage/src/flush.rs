@@ -754,8 +754,9 @@ impl FlushTarget for FileFlushTarget {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = std::fs::read(&path)?;
-        crate::store::search_quantized_vector_artifact(&bytes, query, k, ef_search).map(Some)
+        let reader = FileReadAt::open(&path)?;
+        crate::store::search_quantized_vector_artifact_reader(&reader, query, k, ef_search)
+            .map(Some)
     }
 
     fn has_quantized_vector_sidecar(&self, generation: u64, index_name: &str) -> bool {
