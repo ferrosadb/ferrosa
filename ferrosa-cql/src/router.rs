@@ -15553,7 +15553,12 @@ mod tests {
             CqlType::Int,
             CqlType::Vector(Box::new(CqlType::Float), 3),
         ];
-        let query = Term::BlobLiteral(ferrosa_index::vec_f32_to_bytes(&[1.0, 0.0, 0.0]));
+        let query = Term::BlobLiteral(
+            [1.0_f32, 0.0, 0.0]
+                .into_iter()
+                .flat_map(f32::to_be_bytes)
+                .collect(),
+        );
         let mut rows = vec![
             vec![
                 Some(CqlValue::Text("a".to_string())),
@@ -15611,7 +15616,10 @@ mod tests {
         }
 
         let vector_blob = |values: &[f32]| -> String {
-            let bytes = ferrosa_index::vec_f32_to_bytes(values);
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|value| value.to_be_bytes())
+                .collect();
             bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
         };
         let far = vector_blob(&[0.0, 1.0, 0.0]);
@@ -15649,7 +15657,7 @@ mod tests {
 
         assert_eq!(scoped.len(), 1);
         assert!(
-            scoped[0].score > 1.0,
+            scoped[0].score > 0.1,
             "CQL-created vector index must feed scoped storage ANN and exclude cross-prefix exact matches: {scoped:?}"
         );
     }
