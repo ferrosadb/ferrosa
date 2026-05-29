@@ -45,10 +45,10 @@ jobs:
           submodules: true
 
       - name: Run all language driver smoke tests
-        # C8 (Full CQL Driver Compatibility) is not yet complete —
-        # allow failures until all 6 drivers pass consistently.
-        continue-on-error: true
-        run: bash tests/drivers/run-all.sh
+        run: |
+          mkdir -p /tmp/driver-logs
+          bash tests/drivers/run-all.sh 2>&1 | tee /tmp/driver-logs/run-all.log
+          exit ${PIPESTATUS[0]}
         timeout-minutes: 20
 
       - name: Collect driver test logs on failure
