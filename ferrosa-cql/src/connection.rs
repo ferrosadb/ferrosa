@@ -1412,6 +1412,10 @@ async fn handle_batch(
         }
         let kind = cursor.get_u8();
 
+        // Parse the statement, then substitute its bound values. BATCH carries
+        // per-statement values (`[short n_values]([int len][bytes])*`) right
+        // after each statement — they must be bound into the bind markers, not
+        // skipped, or route() rejects the leftover markers.
         let stmt = if kind == 0 {
             // Inline query string: [int len][bytes query]
             if cursor.remaining() < 4 {
@@ -1432,11 +1436,31 @@ async fn handle_batch(
             };
             cursor.advance(query_len as usize);
 
-            match parser::parse(&query) {
+            let parsed = match parser::parse(&query) {
                 Ok(s) => s,
                 Err(e) => {
                     return HandleResult::Reply(Opcode::Error, e.encode_body());
                 }
+            };
+
+            // Resolve bind-marker types from the schema (same as the
+            // unprepared QUERY-with-values path) so values decode correctly.
+            let (table_ks, table_name) = extract_keyspace_table(&parsed, current_keyspace);
+            let (bound_columns, _) =
+                analyze_prepared_columns(&parsed, &table_ks, &table_name, state);
+            let temp_plan = PreparedPlan {
+                id: [0u8; 16],
+                query,
+                statement: parsed,
+                keyspace: current_keyspace.clone(),
+                result_columns: Vec::new(),
+                bound_columns,
+                table_keyspace: table_ks,
+                table_name,
+            };
+            match substitute_batch_values(&temp_plan, &mut cursor) {
+                Ok(s) => s,
+                Err(e) => return HandleResult::Reply(Opcode::Error, e.encode_body()),
             }
         } else if kind == 1 {
             // Prepared ID: [short id_len][bytes id]
@@ -1454,7 +1478,10 @@ async fn handle_batch(
             cursor.advance(16);
 
             match state.prepared_cache.get(&id) {
-                Some(p) => p.statement.clone(),
+                Some(p) => match substitute_batch_values(&p, &mut cursor) {
+                    Ok(s) => s,
+                    Err(e) => return HandleResult::Reply(Opcode::Error, e.encode_body()),
+                },
                 None => {
                     let err = CqlError::Unprepared(id);
                     return HandleResult::Reply(Opcode::Error, err.encode_body());
@@ -1464,20 +1491,6 @@ async fn handle_batch(
             let err = CqlError::Protocol(format!("BATCH: invalid statement kind {kind}"));
             return HandleResult::Reply(Opcode::Error, err.encode_body());
         };
-
-        // Skip bound values: [short n_values]([int val_len][bytes val])*
-        if cursor.remaining() >= 2 {
-            let n_values = cursor.get_u16() as usize;
-            for _ in 0..n_values {
-                if cursor.remaining() < 4 {
-                    break;
-                }
-                let val_len = cursor.get_i32();
-                if val_len > 0 && cursor.remaining() >= val_len as usize {
-                    cursor.advance(val_len as usize);
-                }
-            }
-        }
 
         statements.push(stmt);
     }
@@ -2112,6 +2125,52 @@ fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Sta
     ))
 }
 
+/// Substitute bound values for a single statement inside a BATCH.
+///
+/// BATCH per-statement values use a *different* framing than QUERY/EXECUTE:
+/// there is **no leading flags byte** — the section is just
+/// `[short n_values]([int len][bytes value])*` (CQL v4/v5 §4.1.7). The cursor
+/// is advanced past the consumed values so the caller can continue parsing the
+/// next statement (or the trailing consistency level).
+fn substitute_batch_values(plan: &PreparedPlan, cursor: &mut &[u8]) -> Result<Statement, CqlError> {
+    if cursor.remaining() < 2 {
+        return Ok(plan.statement.clone());
+    }
+    let n_values = cursor.get_u16() as usize;
+
+    let mut bound_terms: Vec<Term> = Vec::with_capacity(n_values);
+    for i in 0..n_values {
+        if cursor.remaining() < 4 {
+            return Err(CqlError::Protocol("BATCH: truncated value length".into()));
+        }
+        let val_len = cursor.get_i32();
+        if val_len < 0 {
+            bound_terms.push(Term::Null);
+        } else {
+            let val_len = val_len as usize;
+            if cursor.remaining() < val_len {
+                return Err(CqlError::Protocol("BATCH: truncated value bytes".into()));
+            }
+            let val_bytes = &cursor[..val_len];
+            cursor.advance(val_len);
+
+            let cql_type = if i < plan.bound_columns.len() {
+                &plan.bound_columns[i].1
+            } else {
+                &CqlType::Blob
+            };
+            bound_terms.push(raw_bytes_to_term(cql_type, val_bytes));
+        }
+    }
+
+    let mut substitution_idx = 0usize;
+    Ok(substitute_in_statement(
+        &plan.statement,
+        &bound_terms,
+        &mut substitution_idx,
+    ))
+}
+
 /// Recursively walk a statement and replace `Term::BindMarker` with bound terms.
 fn substitute_in_statement(stmt: &Statement, terms: &[Term], idx: &mut usize) -> Statement {
     match stmt {
@@ -2663,6 +2722,67 @@ mod tests {
             );
         } else {
             panic!("expected Select statement");
+        }
+    }
+
+    #[test]
+    fn substitute_batch_values_replaces_bind_markers() {
+        // BATCH per-statement values have NO flags byte — just
+        // [short n_values]([int len][bytes])*. Regression: handle_batch used to
+        // skip these bytes, leaving BindMarkers that route() then rejected.
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name) VALUES (?, ?)",
+            vec![("id", CqlType::Int), ("name", CqlType::Varchar)],
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_be_bytes()); // n_values
+        payload.extend_from_slice(&4i32.to_be_bytes()); // id len
+        payload.extend_from_slice(&7i32.to_be_bytes()); // id = 7
+        let name = b"alice";
+        payload.extend_from_slice(&(name.len() as i32).to_be_bytes());
+        payload.extend_from_slice(name);
+
+        let mut cursor = &payload[..];
+        let result = substitute_batch_values(&plan, &mut cursor).unwrap();
+
+        if let Statement::Insert(i) = &result {
+            assert!(
+                matches!(&i.values[0], Term::IntegerLiteral(7)),
+                "first value should be 7, got {:?}",
+                i.values[0]
+            );
+            assert!(
+                matches!(&i.values[1], Term::StringLiteral(s) if s == "alice"),
+                "second value should be 'alice', got {:?}",
+                i.values[1]
+            );
+            assert!(cursor.is_empty(), "cursor should be fully consumed");
+        } else {
+            panic!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn substitute_batch_values_handles_null() {
+        // A negative length is a NULL bound value → Term::Null (which
+        // build_row now writes as a tombstone).
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name) VALUES (?, ?)",
+            vec![("id", CqlType::Int), ("name", CqlType::Varchar)],
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_be_bytes());
+        payload.extend_from_slice(&4i32.to_be_bytes());
+        payload.extend_from_slice(&7i32.to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+
+        let mut cursor = &payload[..];
+        let result = substitute_batch_values(&plan, &mut cursor).unwrap();
+        if let Statement::Insert(i) = &result {
+            assert!(matches!(&i.values[1], Term::Null), "got {:?}", i.values[1]);
+        } else {
+            panic!("expected Insert");
         }
     }
 
