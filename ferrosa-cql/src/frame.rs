@@ -383,18 +383,23 @@ impl Decoder for CqlCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> std::result::Result<Option<Self::Item>, Self::Error> {
-        // Reject unsupported request protocol versions.
-        // Valid request versions: 0x03 (v3), 0x04 (v4), 0x05 (v5).
-        // Only explicitly reject 0x06/0x07 (future versions we don't support).
-        // Garbage bytes (healthcheck probes, etc.) fall through to the header
-        // parser which will reject them via unknown opcode.
+        // ferrosa speaks CQL native protocol v3/v4 (legacy 9-byte envelopes).
+        // v5 added a modern framing layer that drivers implement
+        // inconsistently — gocql sends plain legacy envelopes at v5 while the
+        // DataStax Java driver sends CRC-checksummed modern frames — so no
+        // single server framing mode can serve both at v5. We therefore reject
+        // v5+ at negotiation with `supported = 4`, and every driver falls back
+        // to the one well-tested legacy transport.
+        // Valid request versions we accept: 0x03 (v3), 0x04 (v4). Garbage bytes
+        // (healthcheck probes, etc.) with a high version byte also trip this and
+        // get a protocol-version error rather than a confusing opcode error.
         if src.len() >= HEADER_SIZE && !self.v5_framed {
             let version_byte = src[0];
-            if version_byte == 0x06 || version_byte == 0x07 {
+            if (0x05..=0x7F).contains(&version_byte) {
                 src.clear();
                 return Err(CqlError::ProtocolVersionMismatch {
                     requested: version_byte,
-                    supported: 0x05,
+                    supported: 0x04,
                 });
             }
         }
@@ -695,33 +700,35 @@ mod tests {
     }
 
     #[test]
-    fn codec_decodes_v5_use_beta_query_as_legacy_envelope() {
-        // Regression: gocql and the DataStax Java driver negotiate protocol v5
-        // with the USE_BETA frame flag (0x10) but send plain 9-byte envelopes,
-        // NOT CRC24/CRC32 modern frames. The codec must stay unframed and
-        // decode these as legacy envelopes — switching to modern framing here
-        // misreads the version/flags bytes as a frame header (CRC24 mismatch on
-        // every request).
+    fn codec_rejects_v5_use_beta_query() {
+        // gocql and the DataStax Java driver negotiate protocol v5 with the
+        // USE_BETA frame flag (0x10) but disagree on v5 framing (gocql sends
+        // legacy envelopes, DataStax sends CRC modern frames). ferrosa caps at
+        // v4, so any v5 request — USE_BETA or not — is rejected, forcing the
+        // driver to fall back to the single legacy v4 transport.
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         assert!(!codec.is_v5_framed());
         let mut buf = BytesMut::new();
         let header = FrameHeader {
-            version: VERSION_REQUEST, // 0x05
-            flags: 0x10,              // USE_BETA
+            version: 0x05,
+            flags: 0x10, // USE_BETA
             stream_id: 0,
             opcode: Opcode::Query,
             length: 4,
         };
         header.encode(&mut buf);
-        buf.put_slice(&[0x00, 0x00, 0x00, 0x00]); // empty query string (len 0) + flags
+        buf.put_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-        let frame = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(frame.header.opcode, Opcode::Query);
-        assert_eq!(frame.header.version, 0x05);
-        assert_eq!(frame.header.flags, 0x10);
+        let err = codec.decode(&mut buf).unwrap_err();
         assert!(
-            !codec.is_v5_framed(),
-            "USE_BETA must not switch to modern framing"
+            matches!(
+                err,
+                CqlError::ProtocolVersionMismatch {
+                    requested: 5,
+                    supported: 4
+                }
+            ),
+            "v5 request must be rejected, got: {err}"
         );
     }
 
@@ -1071,9 +1078,11 @@ mod tests {
     }
 
     #[test]
-    fn codec_accepts_v5_startup_envelope() {
+    fn codec_rejects_v5_request_to_force_v4_fallback() {
+        // ferrosa caps at v4. A v5 STARTUP must be rejected with a
+        // ProtocolVersionMismatch advertising v4, so the driver downgrades and
+        // every client uses the single legacy transport.
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
-        // v5 STARTUP uses the same 9-byte envelope format as v4 (pre-framing).
         let mut buf = BytesMut::new();
         let header = FrameHeader {
             version: 0x05,
@@ -1083,9 +1092,17 @@ mod tests {
             length: 0,
         };
         header.encode(&mut buf);
-        let result = codec.decode(&mut buf).unwrap();
-        assert!(result.is_some(), "v5 STARTUP should be accepted");
-        assert_eq!(result.unwrap().header.version, 0x05);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CqlError::ProtocolVersionMismatch {
+                    requested: 5,
+                    supported: 4
+                }
+            ),
+            "v5 should be rejected with supported=4, got: {err}"
+        );
     }
 
     #[test]
@@ -1100,7 +1117,7 @@ mod tests {
                 err,
                 CqlError::ProtocolVersionMismatch {
                     requested: 6,
-                    supported: 5
+                    supported: 4
                 }
             ),
             "should be ProtocolVersionMismatch, got: {err}"

@@ -11,9 +11,7 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::error::CqlError;
-use crate::frame::{
-    CqlCodec, CqlFrame, FrameHeader, Opcode, DEFAULT_MAX_FRAME_SIZE, VERSION_REQUEST,
-};
+use crate::frame::{CqlCodec, CqlFrame, FrameHeader, Opcode, DEFAULT_MAX_FRAME_SIZE};
 
 /// A row returned by a query.
 #[derive(Debug, Clone)]
@@ -77,8 +75,8 @@ impl CqlClient {
 
         let frame = CqlFrame {
             header: FrameHeader {
-                version: VERSION_REQUEST,
-                flags: 0x10, // USE_BETA: opt into v5 framing (CRC24/CRC32)
+                version: 0x04, // ferrosa speaks CQL v4 (legacy framing)
+                flags: 0x00,
                 stream_id: 0,
                 opcode: Opcode::Startup,
                 length: body.len() as u32,
@@ -121,7 +119,7 @@ impl CqlClient {
 
             let auth_frame = CqlFrame {
                 header: FrameHeader {
-                    version: VERSION_REQUEST,
+                    version: 0x04, // ferrosa speaks CQL v4 (legacy framing)
                     flags: 0,
                     stream_id: 0,
                     opcode: Opcode::AuthResponse,
@@ -159,11 +157,8 @@ impl CqlClient {
             }
         }
 
-        // We negotiate v5 with USE_BETA but keep the legacy (unframed)
-        // envelope transport — exactly what real drivers do (gocql and the
-        // DataStax Java driver send USE_BETA frames as plain 9-byte envelopes,
-        // not CRC-wrapped modern frames). The server matches by never enabling
-        // modern framing, so both sides speak legacy framing here.
+        // ferrosa speaks CQL v4 (legacy 9-byte envelopes, no modern framing),
+        // so there is nothing to switch on after READY.
         let _ = ready;
 
         Ok(Self {
@@ -202,7 +197,7 @@ impl CqlClient {
 
         let frame = CqlFrame {
             header: FrameHeader {
-                version: VERSION_REQUEST,
+                version: 0x04, // ferrosa speaks CQL v4 (legacy framing)
                 flags: 0,
                 stream_id,
                 opcode: Opcode::Query,
