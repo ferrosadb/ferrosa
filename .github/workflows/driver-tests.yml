@@ -34,6 +34,9 @@ jobs:
   driver-smoke:
     name: Driver Smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +46,26 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: true
+
+      - name: Reuse prebuilt node image from GHCR if available
+        # ci.yml's build-node-image job compiles the release binary once and
+        # pushes it by commit SHA. Reuse it instead of recompiling in Docker.
+        # The two workflows run in parallel, so poll briefly; fall back to a
+        # local build (run-all.sh) if it never appears (e.g. fork PRs).
+        continue-on-error: true
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node:${{ github.sha }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || exit 0
+          for i in $(seq 1 30); do
+            if docker pull "$IMAGE" 2>/dev/null; then
+              docker tag "$IMAGE" ferrosa-test-node:latest
+              echo "Reusing prebuilt image $IMAGE (skipping in-Docker build)."
+              exit 0
+            fi
+            echo "waiting for prebuilt image ($i/30)..."
+            sleep 20
+          done
+          echo "Prebuilt image not available; run-all.sh will build from source."
 
       - name: Run all language driver smoke tests
         run: |

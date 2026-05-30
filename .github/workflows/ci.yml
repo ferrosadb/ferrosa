@@ -110,6 +110,9 @@ jobs:
   build-node-image:
     name: Build node image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
@@ -137,6 +140,16 @@ jobs:
           DEOF
           docker build -t ferrosa-test-node:latest node-bin
           docker save ferrosa-test-node:latest | gzip > ferrosa-node-image.tar.gz
+      - name: Push image to GHCR (cross-workflow reuse)
+        # Lets the separate, path-filtered driver-smoke workflow pull this exact
+        # image by commit SHA instead of recompiling. Best-effort: fork PRs lack
+        # packages:write, so the driver workflow falls back to building.
+        continue-on-error: true
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag ferrosa-test-node:latest "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:${{ github.sha }}"
       - name: Upload node image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
