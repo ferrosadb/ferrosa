@@ -33,9 +33,28 @@ node 1/37, rust/python failing):
    CQL; Ferrosa correctly rejects them ("bind markers not supported in
    non-prepared queries"). Tests should prepare the statements or use literals.
 
-## Plan
+## Update (verified by local reproduction)
 
-Fix the test-side bugs (4, 5) first to cut the failure count, then the Ferrosa
-gaps in impact order: node control connection (1), collections (2), TTL (3).
-Flip `driver-tests.yml`'s driver-smoke step back to fail-loud (and
-`tests/ci/test_driver_smoke_workflow.py`) once green.
+Reproducing each driver against a live node corrected the earlier picture:
+
+- The "node 1/37" CI line was a **transient** (ferrosa not yet ready when node
+  ran). Reproduced, the node driver gets **29 passed, 9 failed** — the *same*
+  shared Ferrosa gaps as the other drivers, **not** a control-connection issue.
+  So the gaps are shared CQL bugs, fixable once for all drivers.
+- **Collections (item 2): FIXED** — bound collection bytes are now decoded via
+  `types::decode_value` in `bridge.rs` instead of being rejected as blobs. Each
+  driver drops ~6 failures (node 29/9 → **35/3**, verified end to end).
+- **LWT (item 4): FIXED** for the rust driver in #72 (re-read the row instead of
+  deserializing the variable-arity not-applied result).
+
+### Remaining (each ~1 test/driver), precise root causes
+
+| Gap | Root cause | Where |
+|-----|-----------|-------|
+| **NULL** | `INSERT ... null` materializes an empty-bytes live cell instead of a tombstone, so SELECT returns `""` not null (`Term::Null` → `CqlValue::Null` → insert path) | `router.rs` `materialize_insert` |
+| **Batch** | bound `?` values are not substituted into batched statements, so a `BindMarker` reaches `term_to_cql_value` (which correctly rejects it); the BATCH protocol message *does* carry per-statement values, so this is a Ferrosa gap, not a test bug | `router.rs` `route_unlogged_batch` / `route_logged_batch` |
+| **TTL** | expired cells are not filtered on read (compaction does not purge them either), so a TTL'd row survives past expiry | SELECT read path (storage) |
+
+Driver smoke stays informational (`continue-on-error` in `driver-tests.yml`,
+asserted by `tests/ci/test_driver_smoke_workflow.py`) until NULL, batch, and TTL
+land. Flip both back to fail-loud once all six drivers pass.
