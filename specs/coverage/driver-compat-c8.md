@@ -55,6 +55,33 @@ Reproducing each driver against a live node corrected the earlier picture:
 | **Batch** | bound `?` values are not substituted into batched statements, so a `BindMarker` reaches `term_to_cql_value` (which correctly rejects it); the BATCH protocol message *does* carry per-statement values, so this is a Ferrosa gap, not a test bug | `router.rs` `route_unlogged_batch` / `route_logged_batch` |
 | **TTL** | expired cells are not filtered on read (compaction does not purge them either), so a TTL'd row survives past expiry | SELECT read path (storage) |
 
+### Strict-driver round (gocql / DataStax Java / scylla-rust / csharp)
+
+The shared NULL/batch/TTL/collections fixes landed (node 38/0). The strictly-typed
+drivers then surfaced a deeper layer:
+
+- **v5 protocol framing (go + java).** Both negotiate CQL v5 with the `USE_BETA`
+  frame flag but **disagree on v5 framing**: gocql sends plain legacy 9-byte
+  envelopes, the DataStax Java driver sends CRC24/CRC32 *modern* frames. No single
+  server framing mode serves both at v5. **Resolution: ferrosa caps negotiation
+  at v4** (`frame.rs` codec rejects v5+ with `supported = 4`), so every driver
+  falls back to the one well-tested legacy transport. ferrosa's own `client.rs`
+  now speaks v4 too.
+- **v5 query/EXECUTE flags width.** v5 widened the query-parameters `<flags>`
+  field from `[byte]` to `[int]`; `substitute_bound_values` now reads the width
+  by protocol version (kept for correctness even though the v4 cap means v4 is
+  used in practice).
+- **PREPARE result metadata typing.** `build_result_columns` typed every function
+  call and unknown system column as `varchar`, so prepared `COUNT(*)` (→ should be
+  `bigint`) and `SELECT ... FROM system.local` (→ 0 columns) broke strict drivers
+  that unmarshal by prepared metadata. Now typed to match `build_column_info` and
+  the system.local/peers handlers.
+- **java test bug:** `.withLocalDatacenter("dc1")` ≠ ferrosa's advertised
+  `datacenter1` → "No node was available". Fixed in the test.
+
+Status: **node 38/0, go PASS** end-to-end. java/csharp/rust re-verification in
+progress.
+
 Driver smoke stays informational (`continue-on-error` in `driver-tests.yml`,
-asserted by `tests/ci/test_driver_smoke_workflow.py`) until NULL, batch, and TTL
-land. Flip both back to fail-loud once all six drivers pass.
+asserted by `tests/ci/test_driver_smoke_workflow.py`) until all six drivers pass.
+Flip both back to fail-loud once they do.
