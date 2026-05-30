@@ -8,7 +8,7 @@ use ferrosa_sstable::types::Partition;
 
 use super::auditor::audit_partition;
 use super::corpus;
-use super::driver::{compact_all, logical_projection};
+use super::driver::{audit_point_reads, compact_all_to, logical_projection, read_sstable};
 use super::oracle::oracle_merge_all;
 use crate::TableId;
 
@@ -37,20 +37,27 @@ pub fn run_iteration(work_dir: &Path, seed: u64) -> Result<usize, String> {
     let dir = work_dir.join(format!("soak_{seed}"));
     std::fs::create_dir_all(&dir).map_err(|e| format!("seed {seed}: mkdir failed: {e}"))?;
 
-    let actual = compact_all(
+    let (out_dir, generation) = compact_all_to(
         &dir,
         &groups,
         &corpus.schema,
         TableId::new("soak", "compaction"),
     );
+    let actual = read_sstable(&out_dir, &generation);
     let expected = oracle_merge_all(&all);
 
-    let outcome = check(seed, &actual, &expected);
+    let outcome = check(seed, &actual, &expected, &out_dir, &generation);
     let _ = std::fs::remove_dir_all(&dir);
     outcome
 }
 
-fn check(seed: u64, actual: &[Partition], expected: &[Partition]) -> Result<usize, String> {
+fn check(
+    seed: u64,
+    actual: &[Partition],
+    expected: &[Partition],
+    out_dir: &std::path::Path,
+    generation: &str,
+) -> Result<usize, String> {
     let projected = logical_projection(actual);
     if projected != logical_projection(expected) {
         return Err(format!(
@@ -62,6 +69,12 @@ fn check(seed: u64, actual: &[Partition], expected: &[Partition]) -> Result<usiz
         if !violations.is_empty() {
             return Err(format!("seed {seed}: format violations: {violations:?}"));
         }
+    }
+    let point_read_violations = audit_point_reads(out_dir, generation);
+    if !point_read_violations.is_empty() {
+        return Err(format!(
+            "seed {seed}: point-read violations: {point_read_violations:?}"
+        ));
     }
     Ok(projected.len())
 }

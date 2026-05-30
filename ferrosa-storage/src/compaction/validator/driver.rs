@@ -5,10 +5,12 @@
 //! serialization round-trips, not just the in-memory merge.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
+use ferrosa_sstable::io::FileReadAt;
+use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
 use ferrosa_sstable::types::Partition;
 
 use crate::compaction::executor::CompactionExecutor;
@@ -83,17 +85,14 @@ pub fn write_sstable(
     }
 }
 
-/// Read every partition from a compaction output SSTable `generation` in `dir`.
-pub fn read_sstable(dir: &Path, generation: &str) -> Vec<Partition> {
-    use ferrosa_sstable::io::FileReadAt;
-    use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
-
+/// Open an SSTable `generation` in `dir` for reading.
+pub fn open_reader(dir: &Path, generation: &str) -> SSTableReader<FileReadAt> {
     let open = |suffix: &str| {
         FileReadAt::open(dir.join(format!("{generation}-{suffix}"))).expect("open component")
     };
     let read = |suffix: &str| std::fs::read(dir.join(format!("{generation}-{suffix}")));
 
-    let reader = SSTableReader::open(SSTableComponents {
+    SSTableReader::open(SSTableComponents {
         data: open("Data.db"),
         partitions: open("Partitions.db"),
         rows: open("Rows.db"),
@@ -101,21 +100,54 @@ pub fn read_sstable(dir: &Path, generation: &str) -> Vec<Partition> {
         compression_info: read("CompressionInfo.db").ok(),
         statistics: read("Statistics.db").expect("read statistics"),
     })
-    .expect("open output reader");
+    .expect("open output reader")
+}
 
-    reader
+/// Read every partition from a compaction output SSTable `generation` in `dir`.
+pub fn read_sstable(dir: &Path, generation: &str) -> Vec<Partition> {
+    open_reader(dir, generation)
         .read_all_partitions()
         .expect("read output partitions")
 }
 
+/// Verify the reader's index-driven point reads agree with a full scan for
+/// every partition — covering the first/last index-block boundaries where
+/// off-by-one seeking bugs hide. Returns the list of mismatches.
+pub fn audit_point_reads(dir: &Path, generation: &str) -> Vec<String> {
+    let reader = open_reader(dir, generation);
+    let scanned = reader.read_all_partitions().expect("scan partitions");
+    let mut violations = Vec::new();
+    for partition in &scanned {
+        match reader.get_partition(&partition.key) {
+            Ok(Some(found)) => {
+                if logical_projection(std::slice::from_ref(&found))
+                    != logical_projection(std::slice::from_ref(partition))
+                {
+                    violations.push(format!(
+                        "point read of {:?} differs from scan",
+                        partition.key
+                    ));
+                }
+            }
+            Ok(None) => violations.push(format!(
+                "point read of {:?} missing (scan has it)",
+                partition.key
+            )),
+            Err(e) => violations.push(format!("point read of {:?} errored: {e}", partition.key)),
+        }
+    }
+    violations
+}
+
 /// Write each group as its own input SSTable under `base_dir`, run a single
-/// all-inputs compaction, and return the merged output partitions.
-pub fn compact_all(
+/// all-inputs compaction, and return the output `(dir, generation)` so the
+/// caller can both read it back and audit its index point reads.
+pub fn compact_all_to(
     base_dir: &Path,
     groups: &[Vec<Partition>],
     schema: &TableSchema,
     table_id: TableId,
-) -> Vec<Partition> {
+) -> (PathBuf, String) {
     let inputs: Vec<SSTableMetadata> = groups
         .iter()
         .enumerate()
@@ -136,7 +168,18 @@ pub fn compact_all(
         table_id,
     };
     let meta = CompactionExecutor::execute_task(&task).expect("compaction must succeed");
-    read_sstable(&output_dir, &meta.id)
+    (output_dir, meta.id)
+}
+
+/// Compact all groups and return the merged output partitions.
+pub fn compact_all(
+    base_dir: &Path,
+    groups: &[Vec<Partition>],
+    schema: &TableSchema,
+    table_id: TableId,
+) -> Vec<Partition> {
+    let (dir, gen) = compact_all_to(base_dir, groups, schema, table_id);
+    read_sstable(&dir, &gen)
 }
 
 #[cfg(test)]
@@ -371,5 +414,46 @@ mod tests {
             logical_projection(&actual).get(&(key, ck.clone(), 0)),
             Some(&(Some(b"new".to_vec()), 3)),
         );
+    }
+
+    /// Index-driven point reads must agree with a full scan for every key,
+    /// including the first and last partitions where final-block off-by-one
+    /// seeking bugs hide. (Ferrosa's reader is forward-only, so the reverse-scan
+    /// errata does not apply.)
+    #[test]
+    fn point_reads_match_scan_at_index_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let ck = b"\x00\x00\x00\x01".to_vec();
+
+        // Enough partitions to span multiple index blocks.
+        let parts: Vec<Partition> = (0..200)
+            .map(|i| {
+                part(
+                    &format!("k{i:05}"),
+                    &ck,
+                    CellValue::live(format!("v{i}").into_bytes(), 1),
+                )
+            })
+            .collect();
+        let dir = tmp.path().join("sst");
+        let meta = write_sstable(&dir, &parts, &schema);
+
+        let violations = audit_point_reads(&dir, &meta.id);
+        assert!(
+            violations.is_empty(),
+            "point reads diverged from scan: {violations:?}"
+        );
+
+        // Explicit first/last boundary point reads.
+        let reader = open_reader(&dir, &meta.id);
+        let scanned = reader.read_all_partitions().unwrap();
+        for boundary in [scanned.first().unwrap(), scanned.last().unwrap()] {
+            assert!(
+                reader.get_partition(&boundary.key).unwrap().is_some(),
+                "boundary partition {:?} not found by point read",
+                boundary.key
+            );
+        }
     }
 }
