@@ -331,6 +331,7 @@ pub(crate) async fn handle_connection<S>(
                         VERSION_RESPONSE
                     };
                     let opcode = maybe_frame.header.opcode;
+                    let proto_version = client_protocol_version;
                     let body = maybe_frame.body.clone();
                     let state_clone = state.clone();
                     let resp_tx = resp_tx.clone();
@@ -353,6 +354,7 @@ pub(crate) async fn handle_connection<S>(
                                         &state_clone,
                                         &body,
                                         peer_addr,
+                                        proto_version,
                                     )
                                     .await
                                 }
@@ -363,6 +365,7 @@ pub(crate) async fn handle_connection<S>(
                                         &state_clone,
                                         &body,
                                         peer_addr,
+                                        proto_version,
                                     )
                                     .await
                                 }
@@ -495,16 +498,16 @@ pub(crate) async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // CQL v5 framing (CRC24/CRC32 envelopes) is only
-                            // enabled when the client sets USE_BETA (0x10) in
-                            // the STARTUP flags, matching Cassandra's behavior.
-                            // Clients that negotiate v5 without USE_BETA (e.g.,
-                            // Python cassandra-driver) use v5 semantics over
-                            // v4 unframed transport.
-                            if client_protocol_version >= 0x05 && client_use_beta {
-                                debug!("enabling v5 framing for {peer} (USE_BETA set)");
-                                framed.codec_mut().enable_v5_framing();
-                            }
+                            // Stay on legacy (unframed) envelope transport for
+                            // all clients. Real drivers that negotiate v5 —
+                            // including ones that set USE_BETA (0x10), like
+                            // gocql and the DataStax Java driver — send plain
+                            // 9-byte envelopes, NOT CRC24/CRC32 modern frames.
+                            // Switching to modern framing on USE_BETA misreads
+                            // their legacy envelopes (a v5 frame-header CRC24
+                            // mismatch on every request). v5 message semantics
+                            // ride over the legacy transport.
+                            let _ = client_use_beta;
                         }
                     }
                     HandleResult::StartSubscription {
@@ -896,11 +899,27 @@ async fn handle_frame(
         },
         ConnectionPhase::Ready => match frame.header.opcode {
             Opcode::Query => {
-                handle_query(auth_context, current_keyspace, state, &frame.body, peer).await
+                handle_query(
+                    auth_context,
+                    current_keyspace,
+                    state,
+                    &frame.body,
+                    peer,
+                    frame.header.version,
+                )
+                .await
             }
             Opcode::Prepare => handle_prepare(auth_context, current_keyspace, state, &frame.body),
             Opcode::Execute => {
-                handle_execute(auth_context, current_keyspace, state, &frame.body, peer).await
+                handle_execute(
+                    auth_context,
+                    current_keyspace,
+                    state,
+                    &frame.body,
+                    peer,
+                    frame.header.version,
+                )
+                .await
             }
             Opcode::Batch => {
                 handle_batch(auth_context, current_keyspace, state, &frame.body, peer).await
@@ -1106,6 +1125,7 @@ async fn handle_query(
     state: &SharedState,
     body: &Bytes,
     peer: SocketAddr,
+    protocol_version: u8,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query][short consistency][byte flags]...
     if body.len() < 4 {
@@ -1164,7 +1184,7 @@ async fn handle_query(
             table_keyspace: table_ks,
             table_name,
         };
-        stmt = match substitute_bound_values(&temp_plan, cursor) {
+        stmt = match substitute_bound_values(&temp_plan, cursor, protocol_version) {
             Ok(s) => s,
             Err(e) => {
                 return HandleResult::Reply(Opcode::Error, e.encode_body());
@@ -1317,6 +1337,7 @@ async fn handle_execute(
     state: &SharedState,
     body: &Bytes,
     peer: SocketAddr,
+    protocol_version: u8,
 ) -> HandleResult {
     // Parse the prepared ID: [short id_len][bytes id]
     if body.len() < 2 {
@@ -1354,7 +1375,7 @@ async fn handle_execute(
     };
 
     // Parse bound values from the EXECUTE frame and substitute into the AST.
-    let stmt = match substitute_bound_values(&plan, cursor) {
+    let stmt = match substitute_bound_values(&plan, cursor, protocol_version) {
         Ok(s) => s,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
@@ -2066,12 +2087,27 @@ fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
 /// The cursor should be positioned after the consistency level bytes.
 /// CQL v5 EXECUTE frame layout after consistency:
 ///   `[int flags][short n_values]([int len][bytes value])*`
-fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Statement, CqlError> {
-    // Parse flags byte (CQL v4: 1 byte). Bit 0x01 = Values present.
-    if cursor.remaining() < 1 {
-        return Ok(plan.statement.clone());
-    }
-    let flags = cursor.get_u8();
+fn substitute_bound_values(
+    plan: &PreparedPlan,
+    mut cursor: &[u8],
+    protocol_version: u8,
+) -> Result<Statement, CqlError> {
+    // Query/EXECUTE parameter flags. CQL native protocol v5 (§4.1.4) widened
+    // this field from a 1-byte `[byte]` to a 4-byte `[int]`. Reading the wrong
+    // width misaligns the values section, so bind markers never get
+    // substituted (driver sends `?` + values, server still sees the marker and
+    // rejects it). Bit 0x01 = Values present.
+    let flags = if protocol_version >= 0x05 {
+        if cursor.remaining() < 4 {
+            return Ok(plan.statement.clone());
+        }
+        cursor.get_u32()
+    } else {
+        if cursor.remaining() < 1 {
+            return Ok(plan.statement.clone());
+        }
+        cursor.get_u8() as u32
+    };
     let has_values = (flags & 0x01) != 0;
 
     if !has_values {
@@ -2705,7 +2741,7 @@ mod tests {
         let uuid1 = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let uuid2 = uuid::Uuid::parse_str("86da7931-7c87-54fe-8a49-eabc21c025aa").unwrap();
         let payload = encode_values(&[uuid1.as_bytes(), uuid2.as_bytes()]);
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         // Then: the WHERE clause values should be UuidLiterals, not BindMarkers
         if let Statement::Select(s) = &result {
@@ -2787,6 +2823,55 @@ mod tests {
     }
 
     #[test]
+    fn substitute_v5_four_byte_flags_replaces_bind_markers() {
+        // CQL v5 (§4.1.4) widened the query-parameters <flags> field from a
+        // 1-byte [byte] to a 4-byte [int]. gocql and the DataStax Java driver
+        // send unprepared queries this way; reading 1 byte misaligns the values
+        // section so the bind marker survives and route() rejects it.
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name) VALUES (?, ?)",
+            vec![("id", CqlType::Int), ("name", CqlType::Varchar)],
+        );
+
+        // v5 params: [int flags=0x01][short n_values=2][int len][bytes]...
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_be_bytes()); // 4-byte flags: VALUES
+        payload.extend_from_slice(&2u16.to_be_bytes()); // n_values
+        payload.extend_from_slice(&4i32.to_be_bytes());
+        payload.extend_from_slice(&7i32.to_be_bytes()); // id = 7
+        let name = b"alice";
+        payload.extend_from_slice(&(name.len() as i32).to_be_bytes());
+        payload.extend_from_slice(name);
+
+        let result = substitute_bound_values(&plan, &payload, 5).unwrap();
+        if let Statement::Insert(i) = &result {
+            assert!(
+                matches!(&i.values[0], Term::IntegerLiteral(7)),
+                "got {:?}",
+                i.values[0]
+            );
+            assert!(
+                matches!(&i.values[1], Term::StringLiteral(s) if s == "alice"),
+                "got {:?}",
+                i.values[1]
+            );
+        } else {
+            panic!("expected Insert");
+        }
+
+        // The SAME payload read as v4 (1-byte flags) must NOT substitute — proof
+        // the width matters and we are not accidentally version-agnostic.
+        let v4 = substitute_bound_values(&plan, &payload, 4).unwrap();
+        if let Statement::Insert(i) = &v4 {
+            assert!(
+                matches!(&i.values[0], Term::BindMarker(_)),
+                "v4 misread should leave the marker, got {:?}",
+                i.values[0]
+            );
+        }
+    }
+
+    #[test]
     fn substitute_no_values_flag_returns_unchanged() {
         // Given: a SELECT with bind markers
         let plan = make_plan(
@@ -2796,7 +2881,7 @@ mod tests {
 
         // When: the frame has no values (flags = 0)
         let payload = vec![0x00u8]; // flags: no values
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         // Then: bind markers remain
         if let Statement::Select(s) = &result {
@@ -2819,7 +2904,7 @@ mod tests {
         payload.extend_from_slice(&1u16.to_be_bytes()); // 1 value
         payload.extend_from_slice(&(-1i32).to_be_bytes()); // null
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
         if let Statement::Select(s) = &result {
             assert!(
                 matches!(&s.where_clauses[0].value, Term::Null),
@@ -2846,7 +2931,7 @@ mod tests {
         let score = 42i32.to_be_bytes();
         let payload = encode_values(&[uuid.as_bytes(), name, &score]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
         if let Statement::Insert(i) = &result {
             assert_eq!(i.values.len(), 3);
             assert!(matches!(&i.values[0], Term::UuidLiteral(_)));
@@ -2864,7 +2949,7 @@ mod tests {
             vec![("pk", CqlType::Int)],
         );
 
-        let result = substitute_bound_values(&plan, &[]).unwrap();
+        let result = substitute_bound_values(&plan, &[], 4).unwrap();
         if let Statement::Select(s) = &result {
             assert!(matches!(&s.where_clauses[0].value, Term::BindMarker(_)));
         } else {
@@ -2884,7 +2969,7 @@ mod tests {
         let v2 = b"unknown";
         let payload = encode_values(&[&v1, v2]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
         if let Statement::Select(s) = &result {
             assert!(
                 matches!(&s.where_clauses[0].value, Term::IntegerLiteral(42)),
@@ -2968,7 +3053,7 @@ mod tests {
         let pk_val = b"partition-key-1";
         let payload = encode_values(&[pk_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Select(s) = &result {
             assert_eq!(s.where_clauses.len(), 1, "expected one WHERE clause");
@@ -2996,7 +3081,7 @@ mod tests {
         let v_val = b"hello";
         let payload = encode_values(&[&pk_val, v_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Insert(i) = &result {
             assert_eq!(i.values.len(), 2, "expected two INSERT values");
@@ -3029,7 +3114,7 @@ mod tests {
         let pk_val = 42i32.to_be_bytes();
         let payload = encode_values(&[v_val, &pk_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Update(u) = &result {
             assert_eq!(u.assignments.len(), 1, "expected one assignment");
@@ -3084,7 +3169,7 @@ mod tests {
             entity_id.as_bytes(),
         ]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Update(u) = &result {
             assert_eq!(u.assignments.len(), 1, "expected one assignment");
@@ -3112,7 +3197,7 @@ mod tests {
         let pk_val = 99i32.to_be_bytes();
         let payload = encode_values(&[&pk_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Delete(d) = &result {
             assert_eq!(d.where_clauses.len(), 1, "expected one WHERE clause");
@@ -3178,7 +3263,7 @@ mod tests {
             &inet_val,
         ]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Insert(i) = &result {
             assert_eq!(i.values.len(), 10, "expected 10 INSERT values");
