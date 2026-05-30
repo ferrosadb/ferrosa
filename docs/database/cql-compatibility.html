@@ -440,6 +440,12 @@
   </ul>
   <p>Set per-query via the standard CQL protocol flags, or configure a default with <code>FERROSA_DEFAULT_CL</code> (default: <code>QUORUM</code>).</p>
 
+  <h3>Conflict resolution</h3>
+  <p>Cells reconcile by last-write-wins on timestamp: the higher write timestamp wins. When two writes to the same cell share the same timestamp, the lexicographically greater value wins, so the result is deterministic regardless of replica or compaction order.</p>
+  <div class="note">
+    <strong>Difference from Cassandra:</strong> when a write and a delete carry the <em>same</em> timestamp, Ferrosa favors the <strong>write</strong> — the data is preserved. Apache Cassandra resolves the same tie in favor of the <strong>delete</strong> (the tombstone wins). If you depend on Cassandra's delete-wins-on-tie behavior, use distinct timestamps for the delete.
+  </div>
+
   <!-- ── Auth ── -->
   <h2 id="auth-roles">Auth &amp; Roles</h2>
 
