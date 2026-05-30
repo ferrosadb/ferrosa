@@ -127,8 +127,8 @@ pub fn merge_rows(a: Row, b: Row) -> Row {
     for (col, cell) in all_cells {
         if let Some(last) = cells.last() {
             if last.0 == col {
-                // Same column — higher timestamp wins
-                if cell.timestamp > last.1.timestamp {
+                // Same column — deterministic last-write-wins.
+                if cell_supersedes(&cell, &last.1) {
                     cells.pop();
                     cells.push((col, cell));
                 }
@@ -144,6 +144,28 @@ pub fn merge_rows(a: Row, b: Row) -> Row {
         deletion,
         primary_key_liveness,
     }
+}
+
+/// Deterministic last-write-wins comparison for a single cell.
+///
+/// Higher timestamp wins. On an **equal** timestamp the outcome must not depend
+/// on merge order, or two compactions that group SSTables differently (STCS vs
+/// UCS) — or two replicas — would diverge. The order-independent tie-break is:
+/// a tombstone beats a live cell, otherwise the lexicographically greater value
+/// wins, and two tombstones are broken by local deletion time.
+fn cell_supersedes(cand: &ferrosa_common::CellValue, cur: &ferrosa_common::CellValue) -> bool {
+    if cand.timestamp != cur.timestamp {
+        return cand.timestamp > cur.timestamp;
+    }
+    (
+        cand.is_tombstone(),
+        cand.value.as_deref().unwrap_or(&[]),
+        cand.local_deletion_time,
+    ) > (
+        cur.is_tombstone(),
+        cur.value.as_deref().unwrap_or(&[]),
+        cur.local_deletion_time,
+    )
 }
 
 /// Apply deletion suppression to a merged partition.
