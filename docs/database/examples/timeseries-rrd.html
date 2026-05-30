@@ -4,41 +4,31 @@
 <meta charset="UTF-8">
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="generator" content="Asciidoctor 2.0.26">
-<title>RRD Cascading Time-Series Aggregation</title>
+<meta name="generator" content="Asciidoctor 2.0.20">
+<title>RRD Time-Series Aggregation</title>
 <link rel="stylesheet" href="./theme/ferrosa.css">
 <link rel="icon" type="image/svg+xml" href="../favicon.svg">
 </head>
 <body class="article toc2 toc-left">
 <div id="header">
-<h1>RRD Cascading Time-Series Aggregation</h1>
+<h1>RRD Time-Series Aggregation</h1>
 <div id="toc" class="toc2">
 <div id="toctitle">Table of Contents</div>
 <ul class="sectlevel1">
-<li><a href="#_the_problem">The Problem</a>
-<ul class="sectlevel2">
-<li><a href="#_high_frequency_sensor_data">High-frequency sensor data</a></li>
-</ul>
-</li>
-<li><a href="#_how_it_works">How It Works</a>
-<ul class="sectlevel2">
-<li><a href="#_the_4_tier_cascade">The 4-tier cascade</a></li>
-<li><a href="#_consolidation_extensions">Consolidation extensions</a></li>
-</ul>
-</li>
+<li><a href="#_the_problem">The Problem</a></li>
+<li><a href="#_the_runnable_rollup">The Runnable Rollup</a></li>
 <li><a href="#_create_the_schema">Create the Schema</a></li>
 <li><a href="#_insert_sample_data">Insert Sample Data</a></li>
-<li><a href="#_query_each_tier">Query Each Tier</a>
+<li><a href="#_query_rollups">Query Rollups</a>
 <ul class="sectlevel2">
-<li><a href="#_raw_data_1_second_resolution">Raw data (1-second resolution)</a></li>
-<li><a href="#_5_minute_aggregates">5-minute aggregates</a></li>
-<li><a href="#_15_minute_aggregates">15-minute aggregates</a></li>
-<li><a href="#_1_hour_aggregates">1-hour aggregates</a></li>
+<li><a href="#_raw_readings">Raw readings</a></li>
+<li><a href="#_5_minute_sensor_envelope">5-minute sensor envelope</a></li>
+<li><a href="#_shift_range_volatility">Shift-range volatility</a></li>
 </ul>
 </li>
+<li><a href="#_wasm_aggregate_status">WASM Aggregate Status</a></li>
 <li><a href="#_built_in_functions">Built-in Functions</a></li>
 <li><a href="#_multi_column_composite">Multi-Column Composite</a></li>
-<li><a href="#_custom_wasm_udf">Custom WASM UDF</a></li>
 <li><a href="#_late_arriving_data">Late-Arriving Data</a></li>
 <li><a href="#_observability">Observability</a></li>
 <li><a href="#_files_in_this_example">Files in This Example</a></li>
@@ -49,8 +39,8 @@
 <div id="preamble">
 <div class="sectionbody">
 <div class="paragraph">
-<p>Automatic multi-tier aggregation for high-frequency time-series data.
-Write raw readings at 1-second resolution and let the database consolidate them into 5-minute, 15-minute, and 1-hour summaries using RRD-style cascading.</p>
+<p>Automatic aggregation for high-frequency sensor data.
+Write raw factory equipment readings at 1-second resolution and let Ferrosa consolidate them into 5-minute summaries.</p>
 </div>
 <div class="admonitionblock note">
 <table>
@@ -69,36 +59,35 @@ Complete the <a href="cluster-setup.html">3-Node Cluster Setup</a> tutorial firs
 <div class="sect1">
 <h2 id="_the_problem">The Problem</h2>
 <div class="sectionbody">
-<div class="sect2">
-<h3 id="_high_frequency_sensor_data">High-frequency sensor data</h3>
 <div class="paragraph">
-<p>Consider a fleet of 10,000 IoT sensors, each reporting once per second.
-That is 10,000 writes per second&#8201;&#8212;&#8201;864 million rows per day.</p>
+<p>A factory monitors vibration and temperature on rotating equipment.
+Raw readings are useful for diagnosis, but dashboards and alerting usually need the operating envelope and trend for each time window:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>min</code> shows the quietest point in the window.</p>
+</li>
+<li>
+<p><code>max</code> catches excursions and short spikes.</p>
+</li>
+<li>
+<p><code>avg</code> shows the baseline trend.</p>
+</li>
+<li>
+<p><code>stddev</code> shows volatility, which is often the earliest sign of bearing wear or imbalance.</p>
+</li>
+</ul>
 </div>
 <div class="paragraph">
-<p>At this scale, dashboards cannot query raw data directly.
-A chart showing 24 hours of data for a single sensor would need to scan 86,400 rows.
-For a fleet view across 100 sensors, that is 8.6 million rows per chart refresh.</p>
-</div>
-<div class="paragraph">
-<p>The standard solution is pre-aggregation: compute min, max, avg, and stddev over fixed time windows and store the results in a separate table at coarser resolution.
-Tools like RRDtool and Graphite have used this pattern for decades.</p>
-</div>
-<div class="paragraph">
-<p>Ferrosa automates this with <strong>cascading consolidation</strong>.
+<p>Ferrosa automates those rollups with built-in streaming consolidation.
 You define the aggregation rules in the table&#8217;s <code>extensions</code> map at <code>CREATE TABLE</code> time, and the storage engine handles the rest.</p>
 </div>
 </div>
 </div>
-</div>
 <div class="sect1">
-<h2 id="_how_it_works">How It Works</h2>
+<h2 id="_the_runnable_rollup">The Runnable Rollup</h2>
 <div class="sectionbody">
-<div class="sect2">
-<h3 id="_the_4_tier_cascade">The 4-tier cascade</h3>
-<div class="paragraph">
-<p>The example creates a cascade with four resolution tiers:</p>
-</div>
 <table class="tableblock frame-all grid-all stretch">
 <colgroup>
 <col style="width: 25%;">
@@ -117,84 +106,22 @@ You define the aggregation rules in the table&#8217;s <code>extensions</code> ma
 <tbody>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock">0</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_1s</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_readings_1s</code></p></td>
 <td class="tableblock halign-left valign-top"><p class="tableblock">1 second (raw)</p></td>
 <td class="tableblock halign-left valign-top"><p class="tableblock">None (source)</p></td>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock">1</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_5m</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_readings_5m</code></p></td>
 <td class="tableblock halign-left valign-top"><p class="tableblock">5 minutes</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">min, max, avg, stddev</p></td>
-</tr>
-<tr>
-<td class="tableblock halign-left valign-top"><p class="tableblock">2</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_15m</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">15 minutes</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">min, max, avg, stddev</p></td>
-</tr>
-<tr>
-<td class="tableblock halign-left valign-top"><p class="tableblock">3</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><code>sensor_1h</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">1 hour</p></td>
 <td class="tableblock halign-left valign-top"><p class="tableblock">min, max, avg, stddev</p></td>
 </tr>
 </tbody>
 </table>
 <div class="paragraph">
-<p>Each tier consolidates data from the tier above it.
-When 5 minutes of raw data accumulates in <code>sensor_1s</code>, the aggregator computes the summary statistics and writes them to <code>sensor_5m</code>.
-When three 5-minute windows accumulate in <code>sensor_5m</code>, they are consolidated into <code>sensor_15m</code>, and so on.</p>
-</div>
-</div>
-<div class="sect2">
-<h3 id="_consolidation_extensions">Consolidation extensions</h3>
-<div class="paragraph">
-<p>Aggregation is configured via <code>extensions</code> on the source table:</p>
-</div>
-<div class="listingblock">
-<div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE sensor_1s (
-    sensor_id uuid,
-    ts timestamp,
-    value double,
-    PRIMARY KEY (sensor_id, ts)
-) WITH CLUSTERING ORDER BY (ts DESC)
-  AND extensions = {
-    'consolidation.interval': '5m',
-    'consolidation.functions': 'min,max,avg,stddev',
-    'consolidation.target': 'sensor_5m',
-    'consolidation.cascade': 'true',
-    'consolidation.late_window': '10m',
-    'consolidation.columns': 'value'
-  };</code></pre>
-</div>
-</div>
-<div class="paragraph">
-<p>The key parameters:</p>
-</div>
-<div class="ulist">
-<ul>
-<li>
-<p><code>consolidation.interval</code>&#8201;&#8212;&#8201;the window size (5 minutes for Tier 0).</p>
-</li>
-<li>
-<p><code>consolidation.functions</code>&#8201;&#8212;&#8201;which aggregates to compute (min, max, avg, stddev).</p>
-</li>
-<li>
-<p><code>consolidation.target</code>&#8201;&#8212;&#8201;the downstream table to write results to.</p>
-</li>
-<li>
-<p><code>consolidation.cascade</code>&#8201;&#8212;&#8201;when <code>true</code>, downstream tables are auto-created with escalating intervals.</p>
-</li>
-<li>
-<p><code>consolidation.late_window</code>&#8201;&#8212;&#8201;how far back to accept late data for re-aggregation.</p>
-</li>
-<li>
-<p><code>consolidation.columns</code>&#8201;&#8212;&#8201;which numeric columns to aggregate.</p>
-</li>
-</ul>
-</div>
+<p>When 5 minutes of raw data accumulates in <code>sensor_readings_1s</code>, the aggregator computes summary statistics and writes them to <code>sensor_readings_5m</code>.
+Multi-tier cascade auto-creation is not enabled in this runnable contract.
+Correct <code>avg</code> and <code>stddev</code> cascades require carrying rollup state such as count, sum, and sum-of-squares between tiers; creating downstream tables without that state would produce misleading results.</p>
 </div>
 </div>
 </div>
@@ -203,42 +130,77 @@ When three 5-minute windows accumulate in <code>sensor_5m</code>, they are conso
 <div class="sectionbody">
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- RRD Cascading Time-Series Aggregation: Schema
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- RRD Time-Series Aggregation: Sensor Schema
 --
--- Creates a 4-tier cascade: 1s -&gt; 5m -&gt; 15m -&gt; 1h.
--- Consolidation is driven by data timestamps, not wall clock.
+-- Creates a runnable single-step rollup for factory sensor readings:
+-- 1s raw readings -&gt; 5m rollups.
+-- Min/max/avg/stddev use the built-in streaming consolidation path.
 
-CREATE KEYSPACE IF NOT EXISTS sensors
+CREATE KEYSPACE IF NOT EXISTS plant
   WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
 
-USE sensors;
+USE plant;
 
--- Tier 0: Raw 1-second sensor readings.
-CREATE TABLE sensor_1s (
+-- Tier 1: materialized 5-minute aggregates.
+CREATE TABLE sensor_readings_5m (
     sensor_id uuid,
     ts timestamp,
-    value double,
+    vibration_mm_s_min double,
+    vibration_mm_s_max double,
+    vibration_mm_s_avg double,
+    vibration_mm_s_stddev double,
+    temperature_c_min double,
+    temperature_c_max double,
+    temperature_c_avg double,
+    temperature_c_stddev double,
+    PRIMARY KEY (sensor_id, ts)
+) WITH CLUSTERING ORDER BY (ts DESC);
+
+-- Tier 0: raw 1-second vibration and temperature readings.
+CREATE TABLE sensor_readings_1s (
+    sensor_id uuid,
+    ts timestamp,
+    vibration_mm_s double,
+    temperature_c double,
     PRIMARY KEY (sensor_id, ts)
 ) WITH CLUSTERING ORDER BY (ts DESC)
   AND extensions = {
     'consolidation.interval': '5m',
     'consolidation.functions': 'min,max,avg,stddev',
-    'consolidation.target': 'sensor_5m',
-    'consolidation.cascade': 'true',
-    'consolidation.late_window': '10m',
-    'consolidation.columns': 'value'
+    'consolidation.target': 'sensor_readings_5m',
+    'consolidation.late_window': '15m',
+    'consolidation.columns': 'vibration_mm_s,temperature_c'
   };
 
--- Tiers 1-3 are auto-created by cascade. Shown here for reference:
---
--- sensor_5m:  5-minute aggregates  (consolidation.interval: '15m', target: 'sensor_15m')
--- sensor_15m: 15-minute aggregates (consolidation.interval: '1h', target: 'sensor_1h')
--- sensor_1h:  1-hour aggregates    (terminal, no consolidation config)</code></pre>
+-- Multi-tier cascade auto-creation is intentionally not used in this runnable
+-- contract. It is tracked separately because correct avg/stddev cascades need
+-- additional rollup state such as count, sum, and sum-of-squares.</code></pre>
 </div>
 </div>
 <div class="paragraph">
-<p>Tiers 1-3 (<code>sensor_5m</code>, <code>sensor_15m</code>, <code>sensor_1h</code>) are auto-created by the cascade engine.
-Each downstream table&#8217;s consolidation interval is derived from the cascade multipliers (default: 3x then 4x).</p>
+<p>The source table stores <code>vibration_mm_s</code> and <code>temperature_c</code>.
+Both columns are rolled up with built-in streaming min/max/avg/stddev:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">'consolidation.functions': 'min,max,avg,stddev',
+'consolidation.columns': 'vibration_mm_s,temperature_c'</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The 5-minute rollup exposes one row per sensor per window with columns such as:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-text" data-lang="text">vibration_mm_s_min
+vibration_mm_s_max
+vibration_mm_s_avg
+vibration_mm_s_stddev
+temperature_c_min
+temperature_c_max
+temperature_c_avg
+temperature_c_stddev</code></pre>
+</div>
 </div>
 </div>
 </div>
@@ -247,135 +209,187 @@ Each downstream table&#8217;s consolidation interval is derived from the cascade
 <div class="sectionbody">
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- RRD Cascading Time-Series Aggregation: Sample Data
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- RRD Time-Series Aggregation: Sensor Data
 --
--- Insert 1-second sensor readings. Consolidation triggers automatically
+-- Insert factory equipment readings. Consolidation triggers automatically
 -- when data timestamps cross 5-minute boundaries.
 
-USE sensors;
+USE plant;
 
--- Sensor 1: temperature readings every second for 10 minutes.
--- (In production, these would come from the application layer.)
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:01', 22.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:02', 22.3);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:03', 22.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:00:30', 22.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:00', 23.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:30', 23.4);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:02:00', 22.8);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:02:30', 22.6);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:03:00', 22.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:03:30', 22.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:04:00', 21.8);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:04:30', 21.5);
+-- Pump A: rising vibration during the first 5-minute window, then recovery.
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:00:01', 4.2, 68.1);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:00:30', 4.4, 68.3);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:01:00', 4.1, 68.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:01:30', 4.7, 68.6);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:02:00', 5.0, 69.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:02:30', 5.4, 69.5);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:03:00', 5.9, 70.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:03:30', 6.2, 70.4);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:04:00', 5.8, 70.1);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:04:30', 5.1, 69.4);
 
--- After 300 rows (5 minutes), the first consolidation triggers automatically:
--- sensor_1s observer detects timestamp crossing the 5m boundary,
--- runs min/max/avg/stddev over the window, writes result to sensor_5m.
+-- Expected first 5-minute rollup for Pump A:
+--   vibration_mm_s_min    = 4.1
+--   vibration_mm_s_max    = 6.2
+--   vibration_mm_s_avg    = 5.08
+--   vibration_mm_s_stddev = computed by the built-in streaming stddev
+--   temperature_c_min     = 68.0
+--   temperature_c_max     = 70.4
+--   temperature_c_avg     = 69.14
+--   temperature_c_stddev  = computed by the built-in streaming stddev
 
--- Second 5-minute window: 00:05:00 - 00:09:59
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:05:00', 23.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:05:30', 23.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:06:00', 23.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:06:30', 24.0);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:07:00', 24.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:07:30', 23.8);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:08:00', 23.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:08:30', 23.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:09:00', 22.9);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:09:30', 22.7);
+-- Second 5-minute window: the same pump settles after inspection.
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:05:00', 4.8, 69.0);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:06:00', 4.6, 68.7);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:07:00', 4.5, 68.6);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:08:00', 4.3, 68.4);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:09:00', 4.2, 68.2);
 
--- Sensor 2: pressure readings (different sensor, same cascade).
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:01', 1013.2);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:02', 1013.3);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:00:03', 1013.1);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:05:00', 1013.5);
-INSERT INTO sensor_1s (sensor_id, ts, value)
-  VALUES (550e8400-e29b-41d4-a716-446655440002, '2026-03-20 00:05:30', 1013.7);</code></pre>
+-- Pump B: baseline readings for cross-sensor comparisons.
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:00:01', 2.1, 64.2);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:01:00', 2.3, 64.4);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:02:00', 2.2, 64.3);
+INSERT INTO sensor_readings_1s (sensor_id, ts, vibration_mm_s, temperature_c)
+  VALUES (7c07fa8d-f630-4a32-a0d8-df48235ed6f2, '2026-05-20 12:05:00', 2.4, 64.5);</code></pre>
 </div>
 </div>
 <div class="paragraph">
-<p>As data timestamps cross 5-minute boundaries, the consolidation observer fires automatically.
-No cron jobs, no external ETL&#8201;&#8212;&#8201;the aggregation runs inline with the write path.</p>
+<p>As data timestamps cross 5-minute boundaries, the consolidation observer enqueues
+rollup work and the background materialization worker writes target rows.
+No cron jobs, no external ETL.</p>
 </div>
 </div>
 </div>
 <div class="sect1">
-<h2 id="_query_each_tier">Query Each Tier</h2>
+<h2 id="_query_rollups">Query Rollups</h2>
 <div class="sectionbody">
 <div class="sect2">
-<h3 id="_raw_data_1_second_resolution">Raw data (1-second resolution)</h3>
+<h3 id="_raw_readings">Raw readings</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- Raw 1-second data (most recent 10 readings).
-SELECT sensor_id, ts, value
-  FROM sensor_1s
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Raw 1-second data for one pump.
+SELECT sensor_id, ts, vibration_mm_s, temperature_c
+  FROM sensor_readings_1s
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
   LIMIT 10;</code></pre>
 </div>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_5_minute_aggregates">5-minute aggregates</h3>
+<h3 id="_5_minute_sensor_envelope">5-minute sensor envelope</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- 5-minute aggregates.
-SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
-  FROM sensor_5m
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- 5-minute aggregates show excursions, trend, and volatility.
+SELECT sensor_id, ts,
+       vibration_mm_s_min,
+       vibration_mm_s_max,
+       vibration_mm_s_avg,
+       vibration_mm_s_stddev,
+       temperature_c_min,
+       temperature_c_max,
+       temperature_c_avg,
+       temperature_c_stddev
+  FROM sensor_readings_5m
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
   LIMIT 10;</code></pre>
 </div>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_15_minute_aggregates">15-minute aggregates</h3>
+<h3 id="_shift_range_volatility">Shift-range volatility</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- 15-minute aggregates.
-SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
-  FROM sensor_15m
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
-  LIMIT 10;</code></pre>
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Time-range query across a shift at 5-minute resolution.
+SELECT sensor_id, ts, vibration_mm_s_min, vibration_mm_s_max,
+       vibration_mm_s_avg, vibration_mm_s_stddev
+  FROM sensor_readings_5m
+  WHERE sensor_id = 2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34
+    AND ts &gt;= '2026-05-20 12:00:00'
+    AND ts &lt;  '2026-05-20 20:00:00';</code></pre>
 </div>
 </div>
 </div>
-<div class="sect2">
-<h3 id="_1_hour_aggregates">1-hour aggregates</h3>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_wasm_aggregate_status">WASM Aggregate Status</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The runnable sensor demo uses the built-in streaming <code>stddev</code>.
+Ferrosa supports three WASM loading forms for function metadata, and the WASM executor now has a streaming aggregate ABI with <code>init</code>, <code>update(value)</code>, and <code>finalize</code>.
+WASM aggregate execution for live RRD materialization uses that ABI for each row in the rollup window.
+The <code>AS FILE</code> and <code>AS URL &#8230;&#8203; WITH SHA256</code> forms are admin-only artifact loading paths.</p>
+</div>
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">-- 1-hour aggregates.
-SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
-  FROM sensor_1h
-  WHERE sensor_id = 550e8400-e29b-41d4-a716-446655440001
-  LIMIT 10;</code></pre>
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- streaming stddev function so it runs without an external WASM artifact.
+-- Rust-authored examples live under wasm-rust/stddev and wasm-rust/rms.
+
+USE plant;
+
+-- Inline hex loading form. Replace these tiny placeholder bytes with a
+-- compiled Component Model module that carries the
+-- ferrosa:streaming-aggregate:v1 marker and exports init/update/finalize.
+CREATE OR REPLACE FUNCTION plant.stddev(value double)
+  CALLED ON NULL INPUT
+  RETURNS double
+  LANGUAGE wasm
+  AS '0x0061736d0d000100';
+
+-- Admin-only file loading form for pre-approved local artifacts.
+CREATE OR REPLACE FUNCTION plant.stddev(value double)
+  CALLED ON NULL INPUT
+  RETURNS double
+  LANGUAGE wasm
+  AS FILE '/secure/udf/stddev.wasm';
+
+-- Admin-only URL loading form. Ferrosa verifies the fetched bytes against the
+-- required SHA-256 digest before storing the function metadata.</code></pre>
 </div>
 </div>
+<div class="paragraph">
+<p>The accepted future table syntax references the function with <code>wasm:keyspace.function_name</code>:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">  CALLED ON NULL INPUT
+  RETURNS double
+  LANGUAGE wasm
+  AS URL 'https://artifacts.example/ferrosa/stddev.wasm'
+  WITH SHA256 = '3dbe4f6fb3f44dfb11ad93f6c07f81a4b34d217f8dcf7dd06d80670d88e6b7c1';
+
+-- RRD table syntax references the UDF through the wasm:keyspace.function_name
+-- consolidation function syntax. The RRD worker streams window rows through
+-- init/update/finalize.
+CREATE TABLE vibration_with_wasm_stddev (
+    sensor_id uuid,
+    ts timestamp,
+    vibration_mm_s double,
+    PRIMARY KEY (sensor_id, ts)</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Use <code>wasm:</code> functions only for components that declare the <code>ferrosa:streaming-aggregate:v1</code> marker and export <code>init</code>, <code>update</code>, and <code>finalize</code>.
+Scalar WASM UDFs are rejected for aggregate execution rather than being called with a materialized list.
+The URL form requires a SHA-256 digest so artifact bytes cannot change between review and DDL apply.</p>
 </div>
 </div>
 </div>
@@ -383,7 +397,7 @@ SELECT sensor_id, ts, value_min, value_max, value_avg, value_stddev
 <h2 id="_built_in_functions">Built-in Functions</h2>
 <div class="sectionbody">
 <div class="paragraph">
-<p>Ferrosa provides seven built-in consolidation functions.
+<p>Ferrosa provides built-in consolidation functions for common rollups.
 See <code>built-in-functions.cql</code> for a complete example of each.</p>
 </div>
 <table class="tableblock frame-all grid-all stretch">
@@ -412,7 +426,7 @@ See <code>built-in-functions.cql</code> for a complete example of each.</p>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><code>stddev</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">Population standard deviation (Welford&#8217;s online algorithm)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Population standard deviation using the built-in implementation</p></td>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><code>count</code></p></td>
@@ -429,8 +443,7 @@ See <code>built-in-functions.cql</code> for a complete example of each.</p>
 </tbody>
 </table>
 <div class="paragraph">
-<p>All functions except <code>median</code> are computed in a single pass using Welford&#8217;s online algorithm.
-Median requires a sorted copy of the window values and is computed separately.</p>
+<p>WASM aggregate execution is documented separately because it is not part of the runnable materialization path yet.</p>
 </div>
 </div>
 </div>
@@ -438,55 +451,9 @@ Median requires a sorted copy of the window values and is computed separately.</
 <h2 id="_multi_column_composite">Multi-Column Composite</h2>
 <div class="sectionbody">
 <div class="paragraph">
-<p>When a table has multiple numeric columns, all functions are applied to each column independently:</p>
-</div>
-<div class="listingblock">
-<div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">    device_id uuid,
-    ts timestamp,
-    temperature double,
-    humidity double,
-    pressure double,
-    PRIMARY KEY (device_id, ts)
-) WITH CLUSTERING ORDER BY (ts DESC)
-  AND extensions = {
-    'consolidation.interval': '5m',
-    'consolidation.functions': 'min,max,avg',
-    'consolidation.target': 'multi_sensor_5m',
-    'consolidation.columns': 'temperature,humidity,pressure'
-  };</code></pre>
-</div>
-</div>
-<div class="paragraph">
-<p>This produces nine output columns (3 columns x 3 functions): <code>temperature_min</code>, <code>temperature_max</code>, <code>temperature_avg</code>, <code>humidity_min</code>, etc.</p>
-</div>
-</div>
-</div>
-<div class="sect1">
-<h2 id="_custom_wasm_udf">Custom WASM UDF</h2>
-<div class="sectionbody">
-<div class="paragraph">
-<p>For domain-specific aggregation logic, use a WASM UDF:</p>
-</div>
-<div class="listingblock">
-<div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">    latency_ms double,
-    PRIMARY KEY (endpoint, ts)
-) WITH CLUSTERING ORDER BY (ts DESC)
-  AND extensions = {
-    'consolidation.interval': '5m',
-    'consolidation.functions': 'avg,median,wasm:sensors.percentile_95',
-    'consolidation.target': 'api_latency_5m',
-    'consolidation.columns': 'latency_ms'
-  };
-
--- Output table api_latency_5m will have columns:
---   latency_ms_avg              double   (built-in avg)
---   latency_ms_median           double   (built-in median)</code></pre>
-</div>
-</div>
-<div class="paragraph">
-<p>The <code>wasm:keyspace.function_name</code> syntax routes the window values to the WASM executor after the built-in accumulator pass completes.</p>
+<p>When a table has multiple numeric columns, all configured functions are applied to each column independently.
+The sensor schema applies the same min/max/avg/stddev set to vibration and temperature.
+See <code>composite.cql</code> for an additional weather-station style example.</p>
 </div>
 </div>
 </div>
@@ -499,7 +466,7 @@ Ferrosa handles late-arriving data with automatic re-aggregation:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">  VALUES (550e8400-e29b-41d4-a716-446655440001, '2026-03-20 00:01:30', 23.5);</code></pre>
+<pre class="highlight"><code class="language-sql" data-lang="sql">  VALUES (2f4d6a9e-6a9a-4f75-a6c4-cd8d210e7e34, '2026-05-20 12:01:30', 4.9, 68.8);</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -514,19 +481,19 @@ Ferrosa handles late-arriving data with automatic re-aggregation:</p>
 <p>A <code>LateData</code> task is sent to the async worker.</p>
 </li>
 <li>
-<p>The worker reads the full window from disk and re-runs consolidation.</p>
+<p>The worker streams the affected source window from storage.</p>
 </li>
 <li>
 <p>The corrected aggregate is upserted into the downstream table.</p>
 </li>
 <li>
-<p>The cascade continues: the upsert triggers the next tier&#8217;s observer.</p>
+<p>The corrected aggregate is visible in the target table.</p>
 </li>
 </ol>
 </div>
 <div class="paragraph">
-<p>Late data is only accepted within the <code>late_window</code> (default: 2x the consolidation interval).
-Multiple late arrivals for the same window are debounced to avoid redundant re-aggregation.</p>
+<p>Late data is only accepted within the <code>late_window</code>.
+The disk-backed keyed cursor streams source rows by partition and window for recomputation when a window has fallen out of the in-memory ring.</p>
 </div>
 </div>
 </div>
@@ -534,28 +501,33 @@ Multiple late arrivals for the same window are debounced to avoid redundant re-a
 <h2 id="_observability">Observability</h2>
 <div class="sectionbody">
 <div class="paragraph">
-<p>Monitor consolidation health via the virtual table:</p>
+<p>Monitor consolidation health, delayed materialization, and runtime ring-memory controls:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM system_observability.consolidation_status;</code></pre>
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM system_observability.consolidation_status;
+SELECT keyspace_name, table_name, queue_depth, oldest_task_age_ms, alerting
+  FROM system_observability.materialization_queues
+  WHERE alerting = true;
+SELECT setting_name, setting_value, source
+  FROM system_observability.rrd_runtime_settings;
+
+-- Admin-only runtime tuning. The default ring memory budget is derived from
+-- detected memory and can be overridden at process start with
+-- FERROSA_RRD_RING_MEMORY_BUDGET_BYTES.
+UPDATE system_observability.rrd_runtime_settings
+  SET setting_value = 134217728
+  WHERE setting_name = 'ring_memory_budget_bytes';
+UPDATE system_observability.rrd_runtime_settings
+  SET setting_value = 50
+  WHERE setting_name = 'ring_thrash_warn_evictions';</code></pre>
 </div>
 </div>
 <div class="paragraph">
-<p>This shows per-table metrics:</p>
-</div>
-<div class="ulist">
-<ul>
-<li>
-<p><code>windows_consolidated</code>&#8201;&#8212;&#8201;total windows processed.</p>
-</li>
-<li>
-<p><code>late_arrivals</code>&#8201;&#8212;&#8201;late data points detected.</p>
-</li>
-<li>
-<p><code>consolidation_drops</code>&#8201;&#8212;&#8201;tasks dropped due to backpressure (channel full).</p>
-</li>
-</ul>
+<p><code>consolidation_status</code> shows per-table rollup counters.
+<code>materialization_queues</code> highlights tables where async rollup work is falling behind.
+<code>rrd_runtime_settings</code> lets an administrator inspect and tune ring memory pressure without restarting the node.
+The default ring memory budget is derived from the host or container memory limit and can be overridden at startup with <code>FERROSA_RRD_RING_MEMORY_BUDGET_BYTES</code>.</p>
 </div>
 </div>
 </div>
@@ -576,15 +548,27 @@ Multiple late arrivals for the same window are debounced to avoid redundant re-a
 <tbody>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><code>schema.cql</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">Keyspace and raw table with consolidation extensions</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Keyspace, target rollup table, and raw sensor table with built-in streaming consolidation extensions</p></td>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><code>data.cql</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">Sample sensor data for two sensors across two 5-minute windows</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sample vibration and temperature data for two pumps across two 5-minute windows</p></td>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><code>queries.cql</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">Queries against each tier plus observability</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Queries against raw data, rollup tiers, and operational observability</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>custom-wasm-udf.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">WASM stddev loading forms and streaming aggregate registration</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>wasm-rust/stddev</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Rust-authored Welford stddev aggregate with bounded streaming state</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>wasm-rust/rms</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Rust-authored RMS aggregate for vibration energy rollups</p></td>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><code>built-in-functions.cql</code></p></td>
@@ -599,12 +583,12 @@ Multiple late arrivals for the same window are debounced to avoid redundant re-a
 <td class="tableblock halign-left valign-top"><p class="tableblock">Median-specific example with latency monitoring</p></td>
 </tr>
 <tr>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><code>custom-wasm-udf.cql</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">Custom WASM UDF for 95th percentile</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>late-data.cql</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Late-arriving data and re-aggregation</p></td>
 </tr>
 <tr>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><code>late-data.cql</code></p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">Late-arriving data and re-aggregation cascade</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>smoke-test.sh</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Static contract test for the sensor example and WASM loading snippets</p></td>
 </tr>
 </tbody>
 </table>
@@ -613,7 +597,7 @@ Multiple late arrivals for the same window are debounced to avoid redundant re-a
 </div>
 <div id="footer">
 <div id="footer-text">
-Last updated 2026-05-08 19:58:04 -0700
+Last updated 2026-05-23 15:44:41 -0700
 </div>
 </div>
 </body>

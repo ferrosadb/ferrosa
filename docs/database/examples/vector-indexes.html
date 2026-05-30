@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.20">
+<title>Vector Indexes: HNSW and HVQ</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>Vector Indexes: HNSW and HVQ</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_the_three_index_strategies">The three index strategies</a></li>
+<li><a href="#_create_the_schema">Create the schema</a></li>
+<li><a href="#_load_sample_data">Load sample data</a></li>
+<li><a href="#_query_each_index">Query each index</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Run semantic similarity search over embeddings, and choose the index strategy
+that fits your storage and latency budget.
+This tutorial creates a secondary BTree index, a full-precision HNSW vector
+index, and a quantized HVQ vector index&#8201;&#8212;&#8201;then runs the same nearest-neighbour
+query against each.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+This tutorial assumes you have a running Ferrosa node.
+If you haven&#8217;t set one up yet, follow the <a href="cluster-setup.html">3-Node Cluster Setup</a> guide first&#8201;&#8212;&#8201;it only takes about 5 minutes.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_the_three_index_strategies">The three index strategies</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Ferrosa gives you three index strategies through plain CQL:</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Strategy</th>
+<th class="tableblock halign-left valign-top">When to use it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>BTree secondary index</strong></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Exact-match lookups on a scalar column (<code>WHERE category = 'science'</code>).</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>HNSW vector index</strong></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Full-precision approximate nearest-neighbour search. Highest recall; stores
+  every vector in a navigable graph sidecar.</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>HVQ vector index</strong></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Hybrid vector quantization (Q8/Q4 codes plus a staged exact-rerank tier).
+  Near-HNSW recall while reading far fewer bytes per query&#8201;&#8212;&#8201;the right default
+  when the index is larger than memory or lives in object storage.</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>HVQ is selected with a single option on an otherwise ordinary vector index:
+<code>USING 'vector' WITH OPTIONS = {'method': 'hvq'}</code>. Omit the option (or pass
+<code>'method': 'hnsw'</code>) and you get the full-precision HNSW path.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_create_the_schema">Create the schema</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>We model a small article catalogue with a 4-dimensional embedding and a scalar
+<code>category</code> column. To compare HNSW and HVQ on identical data we create two
+tables of the same shape&#8201;&#8212;&#8201;one indexed each way&#8201;&#8212;&#8201;and add a BTree index on the
+scalar column.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql">-- Vector index strategies: BTree + HNSW + HVQ on the same data.
+--
+-- Ferrosa exposes three index strategies a user can reach from CQL:
+--   1. A secondary BTree index for exact-match lookups on a scalar column.
+--   2. A full-precision HNSW vector index (the default for USING 'vector').
+--   3. A quantized HVQ vector index (USING 'vector' WITH OPTIONS={'method':'hvq'}),
+--      which stores Q8/Q4 codes plus a staged exact-rerank tier for far less
+--      storage and bytes-read per query at a small recall cost.
+--
+-- HNSW and HVQ are demonstrated on two identically-shaped tables so the same
+-- ANN query can run against each.
+
+CREATE KEYSPACE IF NOT EXISTS semantic
+  WITH replication = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 1
+  };
+
+USE semantic;
+
+-- Full-precision HNSW table.
+CREATE TABLE articles_hnsw (
+    id        int PRIMARY KEY,
+    category  text,
+    title     text,
+    embedding vector&lt;float, 4&gt;
+);
+
+-- Identically-shaped table whose vector index uses the quantized HVQ method.
+CREATE TABLE articles_hvq (
+    id        int PRIMARY KEY,
+    category  text,
+    title     text,
+    embedding vector&lt;float, 4&gt;
+);
+
+-- 1) Secondary BTree index on a scalar column for exact-match lookups.
+CREATE INDEX articles_category_idx ON articles_hnsw (category);
+
+-- 2) Default vector index: full-precision HNSW navigable graph.
+CREATE INDEX articles_hnsw_ann ON articles_hnsw (embedding) USING 'vector';
+
+-- 3) Quantized vector index: hybrid vector quantization (Q8/Q4 + staged rerank).
+CREATE INDEX articles_hvq_ann ON articles_hvq (embedding) USING 'vector'
+    WITH OPTIONS = {'method': 'hvq'};</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_load_sample_data">Load sample data</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The six articles fall into two clear clusters of the embedding space: a
+<strong>science</strong> cluster near <code>[0.9, 0.1, 0, 0]</code> and a <strong>history</strong> cluster near
+<code>[0, 0, 0.9, 0.1]</code>. Vectors are written as ordinary CQL list literals.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql">USE semantic;
+
+-- Six articles in two clear clusters of the 4-dimensional embedding space:
+-- a "science" cluster near [0.9, 0.1, 0, 0] and a "history" cluster near
+-- [0, 0, 0.9, 0.1]. Vectors are written as CQL list literals.
+
+-- Science cluster.
+INSERT INTO articles_hnsw (id, category, title, embedding) VALUES (1, 'science', 'Quantum Foundations', [0.90, 0.10, 0.00, 0.00]);
+INSERT INTO articles_hnsw (id, category, title, embedding) VALUES (2, 'science', 'Relativity in Practice', [0.80, 0.20, 0.10, 0.00]);
+INSERT INTO articles_hnsw (id, category, title, embedding) VALUES (5, 'science', 'Statistical Mechanics', [0.85, 0.15, 0.05, 0.00]);
+-- History cluster.
+INSERT INTO articles_hnsw (id, category, title, embedding) VALUES (3, 'history', 'The Bronze Age', [0.00, 0.00, 0.90, 0.10]);
+INSERT INTO articles_hnsw (id, category, title, embedding) VALUES (4, 'history', 'Maritime Empires', [0.10, 0.00, 0.80, 0.20]);
+INSERT INTO articles_hnsw (id, category, title, embedding) VALUES (6, 'history', 'Industrial Revolution', [0.05, 0.05, 0.85, 0.15]);
+
+-- The same six rows in the HVQ-indexed table.
+INSERT INTO articles_hvq (id, category, title, embedding) VALUES (1, 'science', 'Quantum Foundations', [0.90, 0.10, 0.00, 0.00]);
+INSERT INTO articles_hvq (id, category, title, embedding) VALUES (2, 'science', 'Relativity in Practice', [0.80, 0.20, 0.10, 0.00]);
+INSERT INTO articles_hvq (id, category, title, embedding) VALUES (5, 'science', 'Statistical Mechanics', [0.85, 0.15, 0.05, 0.00]);
+INSERT INTO articles_hvq (id, category, title, embedding) VALUES (3, 'history', 'The Bronze Age', [0.00, 0.00, 0.90, 0.10]);
+INSERT INTO articles_hvq (id, category, title, embedding) VALUES (4, 'history', 'Maritime Empires', [0.10, 0.00, 0.80, 0.20]);
+INSERT INTO articles_hvq (id, category, title, embedding) VALUES (6, 'history', 'Industrial Revolution', [0.05, 0.05, 0.85, 0.15]);</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_query_each_index">Query each index</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The BTree index answers an exact-match lookup. The two vector indexes answer the
+same <code>ORDER BY … ANN OF … LIMIT</code> nearest-neighbour query&#8201;&#8212;&#8201;the science-cluster
+query vector returns the three science articles, and HVQ returns the same
+ranking as HNSW.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql">USE semantic;
+
+-- 1) BTree secondary index: exact-match lookup on the scalar `category` column.
+SELECT id, title FROM articles_hnsw WHERE category = 'science';
+
+-- 2) HNSW vector index: approximate nearest-neighbour search.
+--    The query vector sits in the science cluster, so the three science
+--    articles (1, 5, 2) rank highest.
+SELECT id, title FROM articles_hnsw
+  ORDER BY embedding ANN OF [0.90, 0.10, 0.00, 0.00] LIMIT 3;
+
+-- 3) HVQ vector index: the identical ANN query against the quantized index.
+--    Results match the HNSW ranking while the index reads far fewer bytes.
+SELECT id, title FROM articles_hvq
+  ORDER BY embedding ANN OF [0.90, 0.10, 0.00, 0.00] LIMIT 3;
+
+-- 4) A history-cluster query, to confirm both clusters are separable.
+SELECT id, title FROM articles_hvq
+  ORDER BY embedding ANN OF [0.00, 0.00, 0.90, 0.10] LIMIT 3;</code></pre>
+</div>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+The quantized index trades a small amount of recall for a large reduction
+in bytes read per query. For a head-to-head measurement of recall, bytes read,
+and latency across HNSW, IVFFlat, and HVQ, see the
+<a href="../vector-indexes.html">Vector Indexes reference and evaluation</a>.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+</div>
+<div id="footer">
+<div id="footer-text">
+Last updated 2026-05-30 07:44:08 -0700
+</div>
+</div>
+</body>
+</html>

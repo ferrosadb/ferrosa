@@ -1,0 +1,79 @@
+= Vector Indexes: HNSW and HVQ
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+:source-highlighter: rouge
+
+Run semantic similarity search over embeddings, and choose the index strategy
+that fits your storage and latency budget.
+This tutorial creates a secondary BTree index, a full-precision HNSW vector
+index, and a quantized HVQ vector index -- then runs the same nearest-neighbour
+query against each.
+
+NOTE: This tutorial assumes you have a running Ferrosa node.
+If you haven't set one up yet, follow the link:cluster-setup.html[3-Node Cluster Setup] guide first -- it only takes about 5 minutes.
+
+== The three index strategies
+
+Ferrosa gives you three index strategies through plain CQL:
+
+[cols="1,3"]
+|===
+| Strategy | When to use it
+
+| *BTree secondary index*
+| Exact-match lookups on a scalar column (`WHERE category = 'science'`).
+
+| *HNSW vector index*
+| Full-precision approximate nearest-neighbour search. Highest recall; stores
+  every vector in a navigable graph sidecar.
+
+| *HVQ vector index*
+| Hybrid vector quantization (Q8/Q4 codes plus a staged exact-rerank tier).
+  Near-HNSW recall while reading far fewer bytes per query -- the right default
+  when the index is larger than memory or lives in object storage.
+|===
+
+HVQ is selected with a single option on an otherwise ordinary vector index:
+`USING 'vector' WITH OPTIONS = {'method': 'hvq'}`. Omit the option (or pass
+`'method': 'hnsw'`) and you get the full-precision HNSW path.
+
+== Create the schema
+
+We model a small article catalogue with a 4-dimensional embedding and a scalar
+`category` column. To compare HNSW and HVQ on identical data we create two
+tables of the same shape -- one indexed each way -- and add a BTree index on the
+scalar column.
+
+[source,sql]
+----
+include::schema.cql[]
+----
+
+== Load sample data
+
+The six articles fall into two clear clusters of the embedding space: a
+*science* cluster near `[0.9, 0.1, 0, 0]` and a *history* cluster near
+`[0, 0, 0.9, 0.1]`. Vectors are written as ordinary CQL list literals.
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+== Query each index
+
+The BTree index answers an exact-match lookup. The two vector indexes answer the
+same `ORDER BY … ANN OF … LIMIT` nearest-neighbour query -- the science-cluster
+query vector returns the three science articles, and HVQ returns the same
+ranking as HNSW.
+
+[source,sql]
+----
+include::queries.cql[]
+----
+
+TIP: The quantized index trades a small amount of recall for a large reduction
+in bytes read per query. For a head-to-head measurement of recall, bytes read,
+and latency across HNSW, IVFFlat, and HVQ, see the
+link:../vector-indexes.html[Vector Indexes reference and evaluation].
