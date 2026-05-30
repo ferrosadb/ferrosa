@@ -23,6 +23,10 @@ pub struct BuildRequest {
     pub sstable_id: String,
     pub index_name: String,
     pub index_type: String,
+    #[serde(default)]
+    pub artifact_kind: Option<String>,
+    #[serde(default)]
+    pub direct_upload: bool,
     pub s3_endpoint: String,
     pub s3_bucket: String,
     pub s3_prefix: String,
@@ -43,6 +47,35 @@ pub struct BuildResponse {
     pub entries_built: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_manifest_entry: Option<ferrosa_storage::index::ArtifactManifestEntry>,
+}
+
+impl BuildResponse {
+    pub fn completed_quantized(
+        entry: ferrosa_storage::index::ArtifactManifestEntry,
+        elapsed_ms: u64,
+    ) -> Self {
+        Self {
+            status: "completed".into(),
+            error: None,
+            sidecar_s3_path: None,
+            entries_built: None,
+            elapsed_ms: Some(elapsed_ms),
+            artifact_manifest_entry: Some(entry),
+        }
+    }
+
+    fn failed(error: impl Into<String>, elapsed_ms: Option<u64>) -> Self {
+        Self {
+            status: "failed".into(),
+            error: Some(error.into()),
+            sidecar_s3_path: None,
+            entries_built: None,
+            elapsed_ms,
+            artifact_manifest_entry: None,
+        }
+    }
 }
 
 /// Bounded worker pool that processes index build jobs.
@@ -100,17 +133,18 @@ impl WorkerPool {
         let _permit = match self.semaphore.acquire().await {
             Ok(p) => p,
             Err(_) => {
-                return BuildResponse {
-                    status: "failed".into(),
-                    error: Some("worker pool shut down".into()),
-                    sidecar_s3_path: None,
-                    entries_built: None,
-                    elapsed_ms: None,
-                };
+                return BuildResponse::failed("worker pool shut down", None);
             }
         };
 
         let start = Instant::now();
+
+        if req.is_quantized_direct_upload() {
+            return BuildResponse::failed(
+                "quantized .qvec direct-upload is not implemented: builder must stream/upload final .qvec, validate object size and sha256, and return artifact_manifest_entry before engine can publish it",
+                Some(start.elapsed().as_millis() as u64),
+            );
+        }
 
         match self.do_build(&req).await {
             Ok((s3_path, entries)) => {
@@ -121,6 +155,7 @@ impl WorkerPool {
                     sidecar_s3_path: Some(s3_path),
                     entries_built: Some(entries),
                     elapsed_ms: Some(start.elapsed().as_millis() as u64),
+                    artifact_manifest_entry: None,
                 }
             }
             Err(e) => {
@@ -131,13 +166,7 @@ impl WorkerPool {
                     error = %e,
                     "index build failed"
                 );
-                BuildResponse {
-                    status: "failed".into(),
-                    error: Some(e),
-                    sidecar_s3_path: None,
-                    entries_built: None,
-                    elapsed_ms: Some(start.elapsed().as_millis() as u64),
-                }
+                BuildResponse::failed(e, Some(start.elapsed().as_millis() as u64))
             }
         }
     }
@@ -261,12 +290,23 @@ impl WorkerPool {
     }
 }
 
+impl BuildRequest {
+    fn is_quantized_direct_upload(&self) -> bool {
+        self.direct_upload
+            && self
+                .artifact_kind
+                .as_deref()
+                .is_some_and(|kind| kind == "hvq_qvec")
+    }
+}
+
 fn parse_index_type(s: &str) -> Result<IndexType, String> {
     match s.to_lowercase().as_str() {
         "btree" => Ok(IndexType::BTree),
         "hash" => Ok(IndexType::Hash),
         "composite" => Ok(IndexType::Composite),
         "phonetic" => Ok(IndexType::Phonetic),
+        "vector" => Ok(IndexType::Vector),
         "fulltext" => Ok(IndexType::FullText),
         other => Err(format!("unknown index type: {other}")),
     }
@@ -301,5 +341,55 @@ mod tests {
         assert!(matches!(parse_priority("normal"), BuildPriority::Normal));
         assert!(matches!(parse_priority("initial"), BuildPriority::Initial));
         assert!(matches!(parse_priority("whatever"), BuildPriority::Normal));
+    }
+
+    #[tokio::test]
+    async fn quantized_remote_builder_fails_closed_without_direct_upload_support() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let pool = WorkerPool::new(1, store, 1024 * 1024);
+        let response = pool
+            .execute(BuildRequest {
+                sstable_id: "gen-42".into(),
+                index_name: "idx_embedding".into(),
+                index_type: "vector".into(),
+                artifact_kind: Some("hvq_qvec".into()),
+                direct_upload: true,
+                s3_endpoint: "memory://".into(),
+                s3_bucket: "bucket".into(),
+                s3_prefix: "prod/42/ks.tbl/gen-42".into(),
+                table: ("ks".into(), "tbl".into()),
+                column_position: 0,
+                priority: "normal".into(),
+            })
+            .await;
+
+        assert_eq!(response.status, "failed");
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("quantized .qvec direct-upload is not implemented"));
+        assert!(response.artifact_manifest_entry.is_none());
+    }
+
+    #[test]
+    fn quantized_remote_builder_response_carries_validated_qvec_manifest() {
+        let entry = ferrosa_storage::index::ArtifactManifestEntry {
+            artifact_kind: "hvq_qvec".into(),
+            table_id: "ks.tbl".into(),
+            index_name: "idx_embedding".into(),
+            generation: 42,
+            build_id: 9,
+            object_key: "prod/42/ks.tbl/gen-42/idx_embedding/q4.qvec".into(),
+            size_bytes: 4096,
+            sha256_hex: "abc123".into(),
+            page_count: 12,
+        };
+
+        let response = BuildResponse::completed_quantized(entry.clone(), 37);
+        assert_eq!(response.status, "completed");
+        assert_eq!(response.artifact_manifest_entry, Some(entry));
+        assert_eq!(response.sidecar_s3_path, None);
+        assert_eq!(response.elapsed_ms, Some(37));
     }
 }

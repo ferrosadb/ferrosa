@@ -46,6 +46,72 @@ use crate::range_merger::ColumnOrdinalMapping;
 /// returning an error. Prevents OOM from high-cardinality queries.
 const INDEX_RESULT_CAP: usize = 10_000;
 const RANGE_READ_MATERIALIZATION_CAP: usize = 10_000;
+const QVEC_HNSW_MAGIC: &[u8] = b"FERROSA-QVEC-HNSW-V1\n";
+
+fn build_quantized_vector_artifact(
+    cfg: &VectorIndexConfig,
+    drained: Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+) -> Result<Vec<u8>> {
+    let hnsw_bytes = ferrosa_index::vector::hnsw::build_and_serialize(
+        cfg.m,
+        cfg.ef_construction,
+        cfg.metric,
+        drained,
+    )
+    .map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!("quantized artifact build failed: {e}"))
+    })?;
+    let mut artifact = Vec::with_capacity(QVEC_HNSW_MAGIC.len() + hnsw_bytes.len());
+    artifact.extend_from_slice(QVEC_HNSW_MAGIC);
+    artifact.extend_from_slice(&hnsw_bytes);
+    Ok(artifact)
+}
+
+pub(crate) fn search_quantized_vector_artifact(
+    bytes: &[u8],
+    query: &[f32],
+    k: usize,
+    ef_search: usize,
+) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
+    let payload = bytes.strip_prefix(QVEC_HNSW_MAGIC).ok_or_else(|| {
+        ferrosa_common::Error::InvalidData("invalid quantized vector artifact header".to_string())
+    })?;
+    ferrosa_index::vector::hnsw::search_from_bytes(payload, query, k, ef_search).map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!("quantized ANN search failed: {e}"))
+    })
+}
+
+pub(crate) fn search_quantized_vector_artifact_reader<R: ReadAt>(
+    reader: &R,
+    query: &[f32],
+    k: usize,
+    ef_search: usize,
+) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
+    let total_len = reader.len()?;
+    let header_len = QVEC_HNSW_MAGIC.len() as u64;
+    if total_len < header_len {
+        return Err(ferrosa_common::Error::InvalidData(
+            "invalid quantized vector artifact header".to_string(),
+        ));
+    }
+
+    let mut header = vec![0; QVEC_HNSW_MAGIC.len()];
+    reader.read_exact_at(&mut header, 0)?;
+    if header != QVEC_HNSW_MAGIC {
+        return Err(ferrosa_common::Error::InvalidData(
+            "invalid quantized vector artifact header".to_string(),
+        ));
+    }
+
+    let payload_len = (total_len - header_len).try_into().map_err(|_| {
+        ferrosa_common::Error::InvalidData("quantized vector artifact too large".to_string())
+    })?;
+    let mut payload = vec![0; payload_len];
+    reader.read_exact_at(&mut payload, header_len)?;
+    ferrosa_index::vector::hnsw::search_from_bytes(&payload, query, k, ef_search).map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!("quantized ANN search failed: {e}"))
+    })
+}
 
 /// Atomic snapshot of the storage engine's current state.
 ///
@@ -114,8 +180,17 @@ impl<R: ReadAt + Send + Sync + 'static> StoreView<R> {
 
 /// Configuration for a single vector index on a table column.
 ///
+/// Vector index artifact/search method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VectorIndexMethod {
+    /// Existing JSON-serialized HNSW sidecar path (`{gen}-VEC-{index}.db`).
+    Hnsw,
+    /// Quantized IVFFlat/C-SPANN artifact path (`{gen}-QVEC-{index}.qvec`).
+    QuantizedIvf,
+}
+
 /// Immutable after registration — parameters control the in-memory and
-/// persistent HNSW graph built at flush time.
+/// persistent vector artifact built at flush time.
 #[derive(Clone, Debug)]
 pub struct VectorIndexConfig {
     /// Unique name for this index (matches the column name by convention).
@@ -162,8 +237,11 @@ pub struct TableStore<F: FlushTarget> {
     fulltext_indexes: Vec<(String, usize)>,
     /// Vector index configurations. Immutable after registration.
     /// At flush time each declared vector index is drained from the memtable
-    /// and persisted as a `{gen}-VEC-{index_name}.db` HNSW sidecar file.
+    /// and persisted as a method-specific vector artifact.
     vector_index_configs: Vec<VectorIndexConfig>,
+    /// Per-index persistent artifact/search method. Missing entries default to
+    /// the legacy HNSW sidecar for API compatibility with existing callers.
+    vector_index_methods: HashMap<String, VectorIndexMethod>,
     /// Monotonic generation counter for stable SSTable IDs.
     /// Incremented on each flush. Used by compaction swap to identify
     /// exactly which SSTables to remove.
@@ -210,6 +288,20 @@ fn new_vector_indexes(
         })
         .collect();
     Arc::new(map)
+}
+
+fn hex_scope(scope: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(scope.len() * 2);
+    for byte in scope {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn scoped_vector_sidecar_name(index_name: &str, scope: &[u8]) -> String {
+    format!("{index_name}__scope_{}", hex_scope(scope))
 }
 
 fn sstable_column_mappings<R: ReadAt + Send + Sync + 'static>(
@@ -310,6 +402,7 @@ impl<F: FlushTarget> TableStore<F> {
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
+            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
@@ -402,6 +495,7 @@ impl<F: FlushTarget> TableStore<F> {
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
+            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
@@ -503,7 +597,11 @@ impl<F: FlushTarget> TableStore<F> {
                                     .unwrap_or(0),
                             );
                             if let Some(vi) = guard.vector_indexes.get(&cfg.index_name) {
-                                vi.insert(pos, vector);
+                                vi.insert_with_scope(
+                                    pos,
+                                    vector,
+                                    Some(key.key.as_bytes().to_vec()),
+                                );
                             }
                         }
                         // If bytes_to_vec_f32 fails, the cell contains non-vector
@@ -1127,37 +1225,111 @@ impl<F: FlushTarget> TableStore<F> {
         //     to fall back to full scans without the caller knowing.
         for cfg in &self.vector_index_configs {
             if let Some(vi) = old_vector_indexes.get(&cfg.index_name) {
-                let drained = vi.drain();
-                if drained.is_empty() {
+                let drained_with_scopes = vi.drain_with_scopes();
+                if drained_with_scopes.is_empty() {
                     continue;
                 }
 
-                // Build HNSW graph and serialize via the public API.
-                match ferrosa_index::vector::hnsw::build_and_serialize(
-                    cfg.m,
-                    cfg.ef_construction,
-                    cfg.metric,
-                    drained,
-                ) {
-                    Ok(vec_bytes) => {
-                        if let Err(e) =
-                            self.flush_target
-                                .write_vector_sidecar(gen, &cfg.index_name, &vec_bytes)
-                        {
-                            tracing::error!(%e, index_name = %cfg.index_name, gen,
-                                "store: vector sidecar persist failed");
-                            #[cfg(debug_assertions)]
-                            panic!("vector sidecar persist failed: {e}");
-                        } else {
-                            tracing::debug!(index_name = %cfg.index_name, gen,
-                                "flush: vector sidecar written");
+                let drained: Vec<_> = drained_with_scopes
+                    .iter()
+                    .map(|(_, pos, vector)| (*pos, vector.clone()))
+                    .collect();
+
+                match self.vector_index_method(&cfg.index_name) {
+                    VectorIndexMethod::Hnsw => {
+                        // Build HNSW graph and serialize via the public API.
+                        match ferrosa_index::vector::hnsw::build_and_serialize(
+                            cfg.m,
+                            cfg.ef_construction,
+                            cfg.metric,
+                            drained,
+                        ) {
+                            Ok(vec_bytes) => {
+                                if let Err(e) = self.flush_target.write_vector_sidecar(
+                                    gen,
+                                    &cfg.index_name,
+                                    &vec_bytes,
+                                ) {
+                                    tracing::error!(%e, index_name = %cfg.index_name, gen,
+                                        "store: vector sidecar persist failed");
+                                    #[cfg(debug_assertions)]
+                                    panic!("vector sidecar persist failed: {e}");
+                                } else {
+                                    tracing::debug!(index_name = %cfg.index_name, gen,
+                                        "flush: vector sidecar written");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, index_name = %cfg.index_name, gen,
+                                    "store: vector sidecar serialization failed");
+                                #[cfg(debug_assertions)]
+                                panic!("vector sidecar serialize failed: {e}");
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(%e, index_name = %cfg.index_name, gen,
-                            "store: vector sidecar serialization failed");
-                        #[cfg(debug_assertions)]
-                        panic!("vector sidecar serialize failed: {e}");
+                    VectorIndexMethod::QuantizedIvf => {
+                        match build_quantized_vector_artifact(cfg, drained) {
+                            Ok(qvec_bytes) => {
+                                if let Err(e) = self.flush_target.write_quantized_vector_sidecar(
+                                    gen,
+                                    &cfg.index_name,
+                                    &qvec_bytes,
+                                ) {
+                                    tracing::error!(%e, index_name = %cfg.index_name, gen,
+                                    "store: quantized vector artifact persist failed");
+                                    #[cfg(debug_assertions)]
+                                    panic!("quantized vector artifact persist failed: {e}");
+                                } else {
+                                    tracing::debug!(index_name = %cfg.index_name, gen,
+                                    "flush: quantized vector artifact written");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, index_name = %cfg.index_name, gen,
+                                "store: quantized vector artifact serialization failed");
+                                #[cfg(debug_assertions)]
+                                panic!("quantized vector artifact serialize failed: {e}");
+                            }
+                        }
+                    }
+                }
+
+                let mut by_scope: HashMap<
+                    Vec<u8>,
+                    Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+                > = HashMap::new();
+                for (scope, pos, vector) in drained_with_scopes {
+                    if let Some(scope) = scope {
+                        by_scope.entry(scope).or_default().push((pos, vector));
+                    }
+                }
+
+                for (scope, scoped_entries) in by_scope {
+                    let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
+                    match ferrosa_index::vector::hnsw::build_and_serialize(
+                        cfg.m,
+                        cfg.ef_construction,
+                        cfg.metric,
+                        scoped_entries,
+                    ) {
+                        Ok(vec_bytes) => {
+                            if let Err(e) = self.flush_target.write_vector_sidecar(
+                                gen,
+                                &scoped_index_name,
+                                &vec_bytes,
+                            ) {
+                                tracing::error!(%e, index_name = %scoped_index_name, gen,
+                                    "store: scoped vector sidecar persist failed");
+                                #[cfg(debug_assertions)]
+                                panic!("scoped vector sidecar persist failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(%e, index_name = %scoped_index_name, gen,
+                                "store: scoped vector sidecar serialization failed");
+                            #[cfg(debug_assertions)]
+                            panic!("scoped vector sidecar serialize failed: {e}");
+                        }
                     }
                 }
             }
@@ -1210,16 +1382,16 @@ impl<F: FlushTarget> TableStore<F> {
         let mut new_sidecars = vec![Arc::new(sidecar_map)];
         new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
 
-        // Keep the old flushing memtable alive until the NEXT flush
-        // replaces it. This ensures any late writers (threads that loaded
-        // the view before step 1 and haven't written yet) can still write
-        // to the old memtable and their data remains readable via the
-        // flushing slot. The next flush's step 1 will atomically replace
-        // flushing, at which point ArcSwap guarantees all prior readers
-        // have released their guards.
+        // Once the SSTable reader is installed, the flushed memtable must leave
+        // the live view. Writers cannot be racing against `old_active`: Store::write
+        // takes `write_barrier.read()` and loads the active view inside that guard,
+        // while the flush swap above takes `write_barrier.write()`. Keeping
+        // `old_active` in `flushing` after a successful flush makes subsequent
+        // flushes re-ingest already-flushed rows and can cascade wide-partition
+        // snapshots under aggressive concurrent flush loops.
         let new_view = StoreView {
             active: Arc::clone(&current_view.active),
-            flushing: Some(old_active),
+            flushing: None,
             sstables: Arc::new(new_sstables),
             sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current_view.indexes),
@@ -2341,6 +2513,29 @@ impl<F: FlushTarget> TableStore<F> {
     /// subsequent writes begin populating the in-memory vector index
     /// immediately.
     pub fn add_vector_index(&mut self, config: VectorIndexConfig) {
+        self.add_vector_index_with_method(config, VectorIndexMethod::Hnsw);
+    }
+
+    /// Register a quantized IVFFlat/C-SPANN vector index for this table.
+    ///
+    /// Keeps `add_vector_index` as the legacy HNSW path so existing callers and
+    /// sidecar artifacts remain compatible.
+    pub fn add_quantized_vector_index(&mut self, config: VectorIndexConfig) {
+        self.add_vector_index_with_method(config, VectorIndexMethod::QuantizedIvf);
+    }
+
+    fn vector_index_method(&self, index_name: &str) -> VectorIndexMethod {
+        self.vector_index_methods
+            .get(index_name)
+            .copied()
+            .unwrap_or(VectorIndexMethod::Hnsw)
+    }
+
+    fn add_vector_index_with_method(
+        &mut self,
+        config: VectorIndexConfig,
+        method: VectorIndexMethod,
+    ) {
         if self
             .vector_index_configs
             .iter()
@@ -2372,6 +2567,8 @@ impl<F: FlushTarget> TableStore<F> {
         };
         new_view.check_invariants("add_vector_index");
         self.view.store(Arc::new(new_view));
+        self.vector_index_methods
+            .insert(config.index_name.clone(), method);
         self.vector_index_configs.push(config);
     }
 
@@ -2380,8 +2577,8 @@ impl<F: FlushTarget> TableStore<F> {
     ///
     /// Searches the active (and optionally flushing) memtable via brute-force,
     /// then queries each SSTable's persisted HNSW sidecar via the flush target.
-    /// Results from all sources are merged, deduplicated by `position.offset`,
-    /// sorted ascending by score, and truncated to `k`.
+    /// Results from all sources are merged, deduplicated by generation-aware row
+    /// identity, sorted ascending by score, and truncated to `k`.
     ///
     /// Returns `Ok(Vec::new())` when the index has no data or no sidecar
     /// exists for `index_name`.
@@ -2392,42 +2589,138 @@ impl<F: FlushTarget> TableStore<F> {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
-        use ferrosa_index::vector::IndexResult;
+        use ferrosa_index::vector::{IndexResult, VectorRowRef};
         use std::collections::HashMap as StdHashMap;
 
         let guard = self.view.load();
-        let mut merged: StdHashMap<u64, IndexResult> = StdHashMap::new();
+        let method = self.vector_index_method(index_name);
+        let mut merged: StdHashMap<VectorRowRef, IndexResult> = StdHashMap::new();
 
-        // 1. Search active memtable.
         if let Some(vi) = guard.vector_indexes.get(index_name) {
             let results = vi.search(query, k, ef_search).map_err(|e| {
                 ferrosa_common::Error::InvalidData(format!("ann_search memtable failed: {e}"))
             })?;
-            for r in results {
-                merged.insert(r.position.offset, r);
+            for result in results {
+                merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
 
-        // 2. Search flushing memtable is handled by the existing vector_indexes
-        // snapshot: the flushing memtable's VectorMemtableIndex is drained at
-        // flush start, so active is the only in-flight index we need to query.
-
-        // 3. Search each SSTable's persisted HNSW sidecar.
         for (gen_str, _dir) in guard.sstable_ids.iter() {
             if let Ok(gen) = gen_str.parse::<u64>() {
-                if let Some(vec_bytes) = self.flush_target.read_vector_sidecar(gen, index_name) {
+                match method {
+                    VectorIndexMethod::Hnsw => {
+                        if let Some(vec_bytes) =
+                            self.flush_target.read_vector_sidecar(gen, index_name)
+                        {
+                            match ferrosa_index::vector::hnsw::search_from_bytes(
+                                &vec_bytes, query, k, ef_search,
+                            ) {
+                                Ok(results) => {
+                                    for result in results {
+                                        merged.insert(
+                                            VectorRowRef::sstable(gen, result.position),
+                                            result,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        %e, index_name, gen,
+                                        "ann_search: HNSW sidecar search failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    VectorIndexMethod::QuantizedIvf => {
+                        match self
+                            .flush_target
+                            .search_quantized_vector_sidecar(gen, index_name, query, k, ef_search)
+                        {
+                            Ok(Some(results)) => {
+                                for result in results {
+                                    merged.insert(
+                                        VectorRowRef::sstable(gen, result.position),
+                                        result,
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    %e, index_name, gen,
+                                    "ann_search: quantized vector artifact search failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut all: Vec<(VectorRowRef, IndexResult)> = merged.into_iter().collect();
+        all.sort_by(|a, b| {
+            a.1.score
+                .partial_cmp(&b.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        all.truncate(k);
+        Ok(all.into_iter().map(|(_, result)| result).collect())
+    }
+
+    /// Perform ANN search restricted to one partition/prefix scope.
+    ///
+    /// The scope bytes are the serialized partition key for the v1 routing seam
+    /// (tenant_id + session_id in the blueprint's schema). The active memtable
+    /// filters entries by scope; flushed SSTables use per-scope vector sidecars
+    /// so scoped queries avoid probing unrelated prefixes.
+    pub fn ann_search_in_partition_scope(
+        &self,
+        index_name: &str,
+        partition_scope: &[u8],
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
+        use ferrosa_index::vector::{IndexResult, VectorRowRef};
+        use std::collections::HashMap as StdHashMap;
+
+        let guard = self.view.load();
+        let mut merged: StdHashMap<VectorRowRef, IndexResult> = StdHashMap::new();
+
+        if let Some(vi) = guard.vector_indexes.get(index_name) {
+            let results = vi
+                .search_with_scope(query, k, ef_search, partition_scope)
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "ann_search scoped memtable failed: {e}"
+                    ))
+                })?;
+            for result in results {
+                merged.insert(VectorRowRef::memtable(result.position), result);
+            }
+        }
+
+        let scoped_index_name = scoped_vector_sidecar_name(index_name, partition_scope);
+        for (gen_str, _dir) in guard.sstable_ids.iter() {
+            if let Ok(gen) = gen_str.parse::<u64>() {
+                if let Some(vec_bytes) = self
+                    .flush_target
+                    .read_vector_sidecar(gen, &scoped_index_name)
+                {
                     match ferrosa_index::vector::hnsw::search_from_bytes(
                         &vec_bytes, query, k, ef_search,
                     ) {
                         Ok(results) => {
-                            for r in results {
-                                merged.insert(r.position.offset, r);
+                            for result in results {
+                                merged.insert(VectorRowRef::sstable(gen, result.position), result);
                             }
                         }
                         Err(e) => {
                             tracing::error!(
-                                %e, index_name, gen,
-                                "ann_search: HNSW sidecar search failed"
+                                %e, index_name = %scoped_index_name, gen,
+                                "ann_search: scoped HNSW sidecar search failed"
                             );
                         }
                     }
@@ -2435,15 +2728,15 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // 4. Deduplicate, sort ascending by score, truncate to k.
-        let mut all: Vec<IndexResult> = merged.into_values().collect();
+        let mut all: Vec<(VectorRowRef, IndexResult)> = merged.into_iter().collect();
         all.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
+            a.1.score
+                .partial_cmp(&b.1.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
         });
         all.truncate(k);
-        Ok(all)
+        Ok(all.into_iter().map(|(_, result)| result).collect())
     }
 
     /// Returns the generation number of the most recently flushed SSTable.
@@ -3402,6 +3695,21 @@ mod tests {
         assert_eq!(
             r2.unwrap().rows[0].cells[0].1.value.as_deref(),
             Some(b"v2".as_slice())
+        );
+    }
+
+    #[test]
+    fn successful_flush_clears_flushing_memtable_to_avoid_reingest() {
+        let store = test_store();
+        let key = make_key("k1");
+
+        store.write(&key, make_row(b"v1", 1000)).unwrap();
+        store.flush().unwrap();
+
+        let view = store.view.load();
+        assert!(
+            view.flushing.is_none(),
+            "completed flush must clear the flushing memtable so future flushes do not re-ingest the already-flushed snapshot"
         );
     }
 
@@ -4724,6 +5032,177 @@ mod tests {
         }
     }
 
+    struct RecordingReadAt {
+        bytes: Vec<u8>,
+        reads: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl ferrosa_sstable::io::ReadAt for RecordingReadAt {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            let offset = offset as usize;
+            let Some(available) = self.bytes.get(offset..) else {
+                return Ok(0);
+            };
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            self.reads.lock().expect("reads poisoned").push(buf.len());
+            Ok(n)
+        }
+
+        fn len(&self) -> Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    #[test]
+    fn quantized_artifact_reader_does_not_materialize_full_qvec_file() {
+        let artifact = build_quantized_vector_artifact(
+            &VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: DistanceMetric::L2,
+                m: 4,
+                ef_construction: 8,
+            },
+            vec![],
+        )
+        .expect("build empty quantized artifact");
+        let reader = RecordingReadAt {
+            bytes: artifact.clone(),
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let _ = search_quantized_vector_artifact_reader(&reader, &[0.0, 0.0], 1, 4)
+            .expect("empty artifact search should parse through positional reader");
+
+        let reads = reader.reads.lock().expect("reads poisoned");
+        assert!(
+            reads.contains(&QVEC_HNSW_MAGIC.len()),
+            "reader must validate the .qvec header with a bounded positional read, got {reads:?}"
+        );
+        assert!(
+            reads.iter().all(|read_len| *read_len < artifact.len()),
+            "quantized search must not issue a full-.qvec read, got reads {reads:?} for artifact len {}",
+            artifact.len()
+        );
+    }
+
+    #[test]
+    fn quantized_ann_dispatch_uses_qvec_artifact_without_legacy_sidecar() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_quantized_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .unwrap();
+        store
+            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .unwrap();
+        store.flush().unwrap();
+
+        let gen = store.last_flush_generation();
+        assert!(
+            store
+                .flush_target
+                .read_vector_sidecar(gen, "vec_idx")
+                .is_none(),
+            "quantized method must not write the legacy HNSW/VEC sidecar"
+        );
+        assert!(
+            store
+                .flush_target
+                .has_quantized_vector_sidecar(gen, "vec_idx"),
+            "quantized method must persist a .qvec sidecar"
+        );
+
+        let results = store
+            .ann_search("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .expect("quantized ann_search must not fail");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "quantized ann_search should search flushed .qvec results"
+        );
+        assert!(
+            results[0].score <= results[1].score,
+            "results must remain top-k sorted: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn quantized_ann_search_merges_active_memtable_with_flushed_qvec_even_when_offsets_overlap() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_quantized_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        store
+            .write(
+                &make_key("flushed-0"),
+                make_vector_row(&[0.0, 1.0, 0.0], 1000),
+            )
+            .unwrap();
+        store
+            .write(
+                &make_key("flushed-1"),
+                make_vector_row(&[0.0, 0.0, 1.0], 1001),
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        // The active memtable starts row offsets at 0 again after flush. The
+        // merge must not key only by row offset, or this exact active hit is
+        // overwritten by the flushed .qvec result at offset 0.
+        store
+            .write(
+                &make_key("active-exact"),
+                make_vector_row(&[1.0, 0.0, 0.0], 1002),
+            )
+            .unwrap();
+
+        let results = store
+            .ann_search("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .expect("quantized ann_search must merge active and flushed results");
+
+        assert_eq!(results.len(), 2, "active + flushed sources should merge");
+        assert!(
+            results[0].score < 0.01,
+            "exact active memtable hit must survive qvec merge, got {:?}",
+            results
+        );
+    }
+
     #[test]
     fn vector_sidecar_roundtrip_ann_search_returns_ordered_results() {
         // Create a store with a vector index on column 0.
@@ -4803,6 +5282,164 @@ mod tests {
             results[0].score < 0.1,
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
+        );
+    }
+
+    #[test]
+    fn ann_same_offset_results_from_different_sstable_generations_both_survive_merge() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .unwrap();
+        store.flush().unwrap();
+
+        let results = store
+            .ann_search("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .expect("ann_search must not fail");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "two sidecars may both report row offset 0; merge identity must include SSTable generation: {results:?}"
+        );
+        assert!(
+            results[0].score <= results[1].score,
+            "same-offset cross-generation results must remain deterministically score ordered: {results:?}"
+        );
+    }
+
+    #[test]
+    fn partition_scoped_ann_search_excludes_other_prefixes() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        let scope_a = make_key("tenant-a|session-1");
+        let scope_b = make_key("tenant-b|session-1");
+        store
+            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&scope_b, make_vector_row(&[1.0, 0.0, 0.0], 1001))
+            .unwrap();
+
+        let query = [1.0, 0.0, 0.0];
+        let unscoped = store.ann_search("vec_idx", &query, 1, 20).unwrap();
+        assert!(
+            unscoped[0].score < 0.1,
+            "control query should see the cross-prefix exact match"
+        );
+
+        let scoped = store
+            .ann_search_in_partition_scope("vec_idx", scope_a.key.as_bytes(), &query, 1, 20)
+            .expect("partition-scoped ANN search must not fail");
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            scoped[0].score > 1.0,
+            "scoped query must exclude the closer vector in another tenant/session prefix: {:?}",
+            scoped
+        );
+
+        store.flush().unwrap();
+        let flushed_scoped = store
+            .ann_search_in_partition_scope("vec_idx", scope_a.key.as_bytes(), &query, 1, 20)
+            .expect("flushed partition-scoped ANN search must not fail");
+        assert_eq!(flushed_scoped.len(), 1);
+        assert!(
+            flushed_scoped[0].score > 1.0,
+            "flushed scoped query must still exclude vectors from other prefixes: {:?}",
+            flushed_scoped
+        );
+    }
+
+    #[test]
+    fn vector_prefix_scope_reads_smaller_scoped_sidecar_than_unscoped_search() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        let scope_a = make_key("tenant-a|session-1");
+        let scope_b = make_key("tenant-b|session-1");
+        store
+            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .unwrap();
+        for i in 0..16 {
+            let x = 1.0 - (i as f32 * 0.01);
+            store
+                .write(&scope_b, make_vector_row(&[x, 0.0, 0.0], 2000 + i))
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let query = [1.0, 0.0, 0.0];
+        store.flush_target.reset_vector_sidecar_bytes_read();
+        let unscoped = store.ann_search("vec_idx", &query, 1, 20).unwrap();
+        let unscoped_bytes = store.flush_target.vector_sidecar_bytes_read();
+        assert!(
+            unscoped[0].score < 0.1,
+            "control query should see the cross-prefix nearest vector"
+        );
+
+        store.flush_target.reset_vector_sidecar_bytes_read();
+        let scoped = store
+            .ann_search_in_partition_scope("vec_idx", scope_a.key.as_bytes(), &query, 1, 20)
+            .unwrap();
+        let scoped_bytes = store.flush_target.vector_sidecar_bytes_read();
+
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            scoped[0].score > 1.0,
+            "scoped query must exclude closer vectors in other tenant/session prefixes"
+        );
+        assert!(
+            scoped_bytes < unscoped_bytes,
+            "scoped ANN should read a smaller sidecar than unscoped search: scoped={scoped_bytes}, unscoped={unscoped_bytes}"
         );
     }
 

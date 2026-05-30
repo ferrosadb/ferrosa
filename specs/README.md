@@ -60,7 +60,9 @@ Keep unsupported engineering topics in `proposed/`, `todo/`, or
 | [Full-Text Indexing](fulltext-index-architecture.md) | Inverted index sidecars, analyzer pipeline, BM25, `fts_match()` | Implemented evidence |
 | [Anti-Entropy Repair](anti-entropy-repair-architecture.md) | Merkle-then-stream repair with bounded-memory streaming digest | Implemented evidence (v0.11.0, operator-initiated) |
 | [Remote Index Build Backend](remote-index-build-backend.md) | Standalone `ferrosa-index-builder` binary and backend modes | Design / open work tracked in `todo/` |
-| [Hierarchical Vector Quantization](proposed/hierarchical-vector-quantization.md) | Quantized NVMe-resident ANN design | Proposed; current HNSW/IVFFlat sidecars are JSON |
+| [Hierarchical Vector Quantization](proposed/hierarchical-vector-quantization.md) | Quantized NVMe-resident ANN design with CockroachDB C-SPANN lessons and scope outlines | Proposed; current HNSW/IVFFlat sidecars are JSON |
+| [HVQ / C-SPANN Implementation Blueprint](in-process/hvq-cspann-implementation-blueprint.md) | Multi-agent implementation blueprint and TDD acceptance spec for quantized prefix-scoped ANN | In-process blueprint pending owner decisions |
+| [HVQ C-SPANN Implementation Plan](plans/hvq-cspann-implementation-plan.md) | Work-packet DAG for Kanban/worktree implementation | Plan pending owner decisions |
 | [UCS Compaction](ucs-compaction-architecture.md) | Unified Compaction Strategy | Active design/implementation |
 | [Cluster Formation](cluster-formation-architecture.md) | Cluster formation state machine and protocol | Active hardening |
 | [Observability](observability-architecture.md) | Metrics, tracing, telemetry pipeline | Active; not complete public claim |

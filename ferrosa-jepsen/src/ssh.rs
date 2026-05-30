@@ -232,6 +232,7 @@ mod tests {
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
     /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
+    #[cfg(feature = "live-infra-tests")]
     #[tokio::test]
     async fn ssh_execute_command() {
         if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
@@ -243,7 +244,16 @@ mod tests {
             );
         }
 
-        let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
+        let key = vm_key();
+        if !key.exists() {
+            panic!(
+                "SSH key {} not found — run scripts/lima-fc-setup.sh first, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1",
+                key.display()
+            );
+        }
+
+        let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &key)
             .await
             .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");
 
@@ -254,6 +264,7 @@ mod tests {
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
     /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
+    #[cfg(feature = "live-infra-tests")]
     #[tokio::test]
     async fn ssh_upload_file() {
         if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
@@ -265,7 +276,16 @@ mod tests {
             );
         }
 
-        let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
+        let key = vm_key();
+        if !key.exists() {
+            panic!(
+                "SSH key {} not found — run scripts/lima-fc-setup.sh first, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1",
+                key.display()
+            );
+        }
+
+        let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &key)
             .await
             .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");
 

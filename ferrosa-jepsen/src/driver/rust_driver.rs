@@ -175,6 +175,7 @@ mod tests {
     /// Connect to a real ferrosa cluster and run a system query.
     ///
     /// Requires FERROSA_TEST_CONTAINERS=1 and a cluster on port 49042.
+    #[cfg(feature = "live-infra-tests")]
     #[tokio::test]
     async fn rust_driver_connects_to_cluster() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {

@@ -7,6 +7,14 @@ edition = "2021"
 name = "ferrosa_jepsen"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Live infrastructure tests are intentionally absent from the default test
+# target. Opt in with `--features live-infra-tests` plus the documented
+# FERROSA_TEST_* environment prerequisites so missing infra cannot be reported
+# as a passing test body.
+live-infra-tests = []
+
 [[bin]]
 name = "ferrosa-jepsen"
 path = "src/main.rs"
