@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 
+use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::CellValue;
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
@@ -57,6 +58,23 @@ pub fn oracle_merge(sources: &[Partition]) -> Partition {
     };
     suppress_deleted(&mut partition);
     partition
+}
+
+/// Merge a flat set of partitions from multiple SSTables into the canonical
+/// per-key result — the reference for what a full compaction must produce.
+/// Partitions are grouped by key and each group merged with [`oracle_merge`].
+pub fn oracle_merge_all(partitions: &[Partition]) -> Vec<Partition> {
+    let mut by_key: BTreeMap<DecoratedKey, Vec<Partition>> = BTreeMap::new();
+    for partition in partitions {
+        by_key
+            .entry(partition.key.clone())
+            .or_default()
+            .push(partition.clone());
+    }
+    by_key
+        .into_values()
+        .map(|group| oracle_merge(&group))
+        .collect()
 }
 
 /// Merge two versions of the same row (same clustering key).

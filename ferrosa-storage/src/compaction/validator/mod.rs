@@ -8,6 +8,7 @@
 //! oracle/auditor for soak testing.
 
 pub mod auditor;
+pub mod driver;
 pub mod oracle;
 
 #[cfg(test)]

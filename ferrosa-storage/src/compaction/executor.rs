@@ -130,7 +130,11 @@ impl CompactionExecutor {
     /// independent of the total dataset size. The output's serialization
     /// header is built from the inputs' headers (bounded compute) rather
     /// than from a full data scan.
-    fn execute_task(task: &CompactionTask) -> std::result::Result<SSTableMetadata, String> {
+    // `pub(crate)` so the compaction validator can drive a real compaction
+    // synchronously and diff the output against its oracle.
+    pub(crate) fn execute_task(
+        task: &CompactionTask,
+    ) -> std::result::Result<SSTableMetadata, String> {
         Self::execute_task_inner(task, |_| {})
     }
 
