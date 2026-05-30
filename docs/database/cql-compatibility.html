@@ -514,6 +514,7 @@
       <tr><td>Filtered</td><td>Any + <code>WHERE</code></td><td>Partial index over a subset of rows</td></tr>
       <tr><td>Vector (HNSW)</td><td><code>'vector'</code></td><td>Approximate nearest neighbor — graph-based, best query performance</td></tr>
       <tr><td>Vector (IVFFlat)</td><td><code>'vector'</code></td><td>Approximate nearest neighbor — k-means clustering, faster builds</td></tr>
+      <tr><td>Vector (HVQ)</td><td><code>'vector' WITH OPTIONS = {'method':'hvq'}</code></td><td>Quantized approximate nearest neighbor — reads far fewer bytes per query (<a href="vector-indexes.html">evaluation</a>)</td></tr>
     </tbody>
   </table>
 

@@ -13,4 +13,5 @@ Public developer-preview documentation for Ferrosa Database and Ferrosa Memory. 
 - [Getting Started](database/getting-started.html) — installation and first cluster
 - [Migration](database/migration.html) — migrating from Apache Cassandra
 - [CQL Compatibility](database/cql-compatibility.html) — supported CQL features and driver compatibility
+- [Vector Indexes](database/vector-indexes.html) — HNSW and quantized HVQ vector search. In the in-tree evaluation, HVQ reads **3.2× fewer bytes per query** and answers **~3.5× faster** at equal recall@10 vs the full HNSW sidecar.
 - [Examples](database/examples/) — generated database examples
