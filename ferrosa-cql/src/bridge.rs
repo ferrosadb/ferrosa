@@ -271,11 +271,11 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .collect();
                 Ok(CqlValue::Vector(floats))
             }
-            _ => Err(CqlError::Invalid(format!(
-                "type mismatch: expected {}, got blob literal ({} bytes)",
-                cql_type_name(target),
-                b.len()
-            ))),
+            // Bound (`?`) values for collections, tuples, UDTs, and the
+            // remaining scalar types arrive as raw CQL-serialized bytes. Decode
+            // them against the target type rather than rejecting them as an
+            // opaque blob — this is what lets drivers bind list/set/map values.
+            _ => crate::types::decode_value(target, b),
         },
 
         Term::ListLiteral(items) => match target {
@@ -2806,6 +2806,27 @@ mod tests {
         let val =
             term_to_cql_value(&Term::BlobLiteral(b"hello".to_vec()), &CqlType::Varchar).unwrap();
         assert_eq!(val, CqlValue::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn term_blob_to_list_decodes_collection_wire_format() {
+        // A bound (`?`) list<int> [1, 2, 3] arrives as CQL-serialized bytes:
+        // an i32 count followed by length-prefixed elements.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        for v in [1i32, 2, 3] {
+            bytes.extend_from_slice(&4i32.to_be_bytes());
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        let val = term_to_cql_value(
+            &Term::BlobLiteral(bytes),
+            &CqlType::List(Box::new(CqlType::Int)),
+        )
+        .unwrap();
+        assert_eq!(
+            val,
+            CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)])
+        );
     }
 
     #[test]
