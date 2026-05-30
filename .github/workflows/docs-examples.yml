@@ -40,7 +40,33 @@ jobs:
             exit 1
           fi
 
-      - name: Commit generated HTML (main only)
+      # Drift gate: a PR that changes an example must also commit its
+      # regenerated HTML. This is the source of truth for keeping generated
+      # docs in sync — the post-merge auto-commit below has historically failed
+      # to push to a protected main, letting HTML silently drift from source
+      # (e.g. timeseries-rrd.html lagged its .adoc by several feature commits).
+      # The asciidoctor version stamp and "Last updated" timestamp vary by
+      # toolchain, so they are ignored; only content drift fails the check.
+      - name: Check generated HTML is in sync with sources
+        if: github.event_name == 'pull_request'
+        run: |
+          drift=$(git diff -- docs/database/examples/ \
+            | grep -E '^[+-]' \
+            | grep -vE '^[+-][+-]' \
+            | grep -vE 'name="generator"|Last updated' \
+            | grep -c . || true)
+          if [ "$drift" -gt 0 ]; then
+            echo "::error::Generated example HTML is out of date. Run 'make -C examples html' and commit docs/database/examples/."
+            git diff -- docs/database/examples/ \
+              | grep -vE 'name="generator"|Last updated' | head -80
+            exit 1
+          fi
+          echo "Generated HTML is in sync with AsciiDoc sources."
+
+      # Best-effort convenience commit on main. If branch protection blocks the
+      # push it only warns — the PR drift gate above already guarantees sync, so
+      # a blocked push here must never fail CI.
+      - name: Commit generated HTML (main only, best-effort)
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
@@ -50,5 +76,5 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "docs: regenerate example HTML from AsciiDoc sources"
-            git push
+            git push || echo "::warning::Could not push regenerated docs (expected if main is protected); the PR drift gate keeps HTML in sync."
           fi
