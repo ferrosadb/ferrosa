@@ -1,8 +1,15 @@
 # C8 — Full CQL Driver Compatibility
 
-Driver smoke (`tests/drivers/run-all.sh`, six languages) is **informational**
-(continue-on-error) until all drivers pass consistently. This file tracks the
-gaps surfaced when the harness was made fail-loud.
+**Status: COMPLETE.** All six language CQL drivers pass, the multi-protocol
+python suite (CQL + graph/Cypher + Bolt + SPARQL + examples) is green, and an
+auth-enabled node covers auth enforcement. Driver smoke (`run-all.sh`) is back to
+**fail-loud**.
+
+Final results (fresh nodes): node 38/0, go pass, java 38/0, rust 44/0, csharp
+42/0, python 123 passed / 5 skipped (auth tests run on the auth node;
+cassandra-example corpus optional), python-auth 4/4.
+
+This file tracks the gaps surfaced and fixed along the way.
 
 Diagnosis from the 2026-05-30 run (per-driver: csharp 39/3, go 29/9, java 35/9,
 node 1/37, rust/python failing):
