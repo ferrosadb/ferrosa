@@ -1118,10 +1118,17 @@
         <p>
           Eleven index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
           composite for multi-column queries, phonetic for fuzzy string matching (Soundex,
-          Metaphone, Double Metaphone, Caverphone), two vector methods for approximate nearest
+          Metaphone, Double Metaphone, Caverphone), three vector methods for approximate nearest
           neighbor search, filtered indexes with predicates, and <strong>full-text search</strong> with
           BM25 ranked retrieval. Native <code>vector&lt;float, N&gt;</code> CQL type
           for embedding storage — store and query high-dimensional vectors directly.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          For vector search, choose full-precision <strong>HNSW</strong> or the quantized
+          <strong>HVQ</strong> method (<code>WITH OPTIONS = {'method':'hvq'}</code>). In the in-tree
+          evaluation, HVQ reads <strong>3.2&times; fewer bytes per query</strong> and answers
+          <strong>~3.5&times; faster</strong> at equal recall@10 vs the full HNSW sidecar.
+          See the <a href="vector-indexes.html">Vector Indexes reference &amp; evaluation</a>.
         </p>
         <p style="margin-top: 0.75rem;">
           Indexes are storage-attached — built asynchronously after SSTable flush to keep
@@ -1131,7 +1138,7 @@
           via <code>system_views.secondary_indexes</code> let you monitor build progress
           and lag in real time. CQL-compatible DDL with standard <code>CREATE INDEX ... USING 'type'</code> syntax.
         </p>
-        <span class="metric">B-tree · Hash · Composite · Phonetic · Filtered · Vector (HNSW) · Vector (IVFFlat) · Full-Text</span>
+        <span class="metric">B-tree · Hash · Composite · Phonetic · Filtered · Vector (HNSW) · Vector (IVFFlat) · Vector (HVQ) · Full-Text</span>
       </div>
       <div class="code-demo" style="margin: 0; border: none;">
         <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- B-tree index for range queries</span>

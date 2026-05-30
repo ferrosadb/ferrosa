@@ -55,6 +55,11 @@ Call detail records and real-time billing.
 link:gaming-leaderboards.html[*Gaming Leaderboards*]::
 Player stats, rankings, and match history.
 
+== Vector Search & AI
+
+link:vector-indexes.html[*Vector Indexes: HNSW and HVQ*] _New!_::
+Semantic similarity search over embeddings, comparing the full-precision HNSW index with the quantized HVQ index -- plus a BTree secondary index -- all from plain CQL.
+
 == Ferrosa-Exclusive: Graph + CQL
 
 link:graph-joins.html[*Graph Joins & Traversals*]::

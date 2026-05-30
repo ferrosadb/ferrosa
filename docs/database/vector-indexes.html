@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Vector Indexes</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --border: #1e1e2a;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 4rem 2rem 6rem;
+    }
+
+    .back-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-bottom: 2rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 3rem;
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1.5rem;
+      margin-top: 4rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      margin-top: 2rem;
+    }
+
+    p, li {
+      color: var(--text-secondary);
+      margin-bottom: 1rem;
+      max-width: 720px;
+      line-height: 1.7;
+    }
+
+    ul, ol { padding-left: 1.5rem; margin-bottom: 1.5rem; }
+    li { margin-bottom: 0.5rem; }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.875em;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--accent-cool);
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin-bottom: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.8;
+      color: var(--text-secondary);
+    }
+
+    pre .cm { color: #546e7a; }
+    pre .kw { color: #c792ea; }
+    pre .str { color: #c3e88d; }
+    pre .var { color: #f78c6c; }
+    pre .type { color: #ffcb6b; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    td { color: var(--text-secondary); }
+    td:first-child { color: var(--text-primary); font-weight: 600; font-family: var(--font-mono); font-size: 0.875rem; }
+
+    .check { color: var(--accent-green); }
+    .cross { color: var(--text-muted); }
+    .partial { color: var(--accent-warm); }
+    .win { color: var(--accent-green); font-weight: 600; }
+
+    .note {
+      background: rgba(226, 114, 91, 0.08);
+      border: 1px solid rgba(226, 114, 91, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .note strong { color: var(--accent); }
+
+    .extension {
+      background: rgba(107, 201, 160, 0.08);
+      border: 1px solid rgba(107, 201, 160, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .extension strong { color: var(--accent-green); }
+
+    .toc {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem 2rem;
+      margin-bottom: 2rem;
+    }
+
+    .toc h4 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+    }
+
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin-bottom: 0.375rem; }
+    .toc a { font-size: 0.9375rem; font-weight: 500; }
+
+    @media (max-width: 640px) {
+      table { font-size: 0.8125rem; }
+      th, td { padding: 0.5rem 0.625rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="/" class="back-link">&larr; Ferrosa Suite home</a> · <a href="/database/" class="back-link">Database home</a>
+
+  <h1>Vector <span>Indexes</span></h1>
+  <p class="subtitle">Ferrosa runs approximate nearest-neighbour search over embeddings directly in the database. Choose the full-precision HNSW index for maximum recall, or the quantized HVQ index to read far fewer bytes per query when the index outgrows memory.</p>
+
+  <div class="note">
+    <strong>Beta:</strong> Vector indexing is under active development. HVQ (hybrid vector quantization) is a developer-preview path; the numbers below are reproducible from the in-tree evaluation harness.
+  </div>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ul>
+      <li><a href="#strategies">Index strategies</a></li>
+      <li><a href="#quantization">Quantization &amp; staged rerank</a></li>
+      <li><a href="#cql">CQL reference</a></li>
+      <li><a href="#evaluation">Evaluation: HNSW vs HVQ</a></li>
+      <li><a href="#example">Runnable example</a></li>
+    </ul>
+  </div>
+
+  <!-- ── Strategies ── -->
+  <h2 id="strategies">Index strategies</h2>
+
+  <p>A vector index answers "find the rows whose embedding is closest to this query vector". Ferrosa offers three strategies, all created through ordinary CQL DDL.</p>
+
+  <table>
+    <thead><tr><th>Strategy</th><th>CQL</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td>HNSW</td><td><code>USING 'vector'</code> (default)</td><td>Highest recall. A navigable small-world graph; stores every vector in a sidecar.</td></tr>
+      <tr><td>IVFFlat</td><td>engine internal</td><td>k-means clustered lists; faster builds than HNSW.</td></tr>
+      <tr><td>HVQ</td><td><code>USING 'vector' WITH OPTIONS = {'method':'hvq'}</code></td><td>Near-HNSW recall while reading far fewer bytes per query — when the index is larger than memory or lives in object storage.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="extension">
+    <strong>Beyond Cassandra:</strong> HVQ stores vectors as page-addressable quantized artifacts. A query routes to a few centroid lists and reads only the pages it needs, instead of materializing the whole index — the foundation for serving indexes that live in S3.
+  </div>
+
+  <!-- ── Quantization ── -->
+  <h2 id="quantization">Quantization &amp; staged rerank</h2>
+
+  <p>HVQ compresses each vector with scalar quantization, trading a little precision for a large reduction in size and bytes moved. Multiple code widths are available:</p>
+
+  <table>
+    <thead><tr><th>Codec</th><th>Bits / dim</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>Q8</td><td>8</td><td>Refinement tier — 1 byte per dimension.</td></tr>
+      <tr><td>Q4</td><td>4</td><td>Candidate tier — 2 dimensions per byte.</td></tr>
+      <tr><td>Q2</td><td>2</td><td>Coarse routing (behind a benchmark gate).</td></tr>
+      <tr><td>Q1</td><td>1</td><td>Experimental ultra-low-bit.</td></tr>
+      <tr><td>F32</td><td>32</td><td>Optional exact-rerank tier for survivors.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Search is <strong>staged</strong>: cheap quantized codes narrow the candidate set, then an exact rerank over the survivors restores ranking quality. Because the reader only fetches the pages for the probed lists, the bytes it moves scale with the query, not the index.</p>
+
+  <!-- ── CQL ── -->
+  <h2 id="cql">CQL reference</h2>
+
+  <h3>Vector columns</h3>
+  <pre><span class="cm">-- A fixed-dimension float vector column</span>
+<span class="kw">CREATE TABLE</span> <span class="type">documents</span> (
+  id <span class="type">int</span> <span class="kw">PRIMARY KEY</span>,
+  embedding <span class="type">vector</span>&lt;<span class="type">float</span>, <span class="var">4</span>&gt;
+);</pre>
+
+  <h3>Creating a vector index</h3>
+  <pre><span class="cm">-- Default: full-precision HNSW</span>
+<span class="kw">CREATE INDEX</span> docs_ann <span class="kw">ON</span> <span class="type">documents</span> (embedding) <span class="kw">USING</span> <span class="str">'vector'</span>;
+
+<span class="cm">-- Quantized HVQ — select the method explicitly</span>
+<span class="kw">CREATE INDEX</span> docs_ann <span class="kw">ON</span> <span class="type">documents</span> (embedding)
+  <span class="kw">USING</span> <span class="str">'vector'</span> <span class="kw">WITH OPTIONS</span> = {<span class="str">'method'</span>: <span class="str">'hvq'</span>};</pre>
+
+  <div class="note">
+    <strong>Note:</strong> <code>method</code> accepts <code>'hnsw'</code> (the default) or <code>'hvq'</code>. Any other value is rejected at DDL time — there is no silent fallback.
+  </div>
+
+  <h3>Nearest-neighbour query</h3>
+  <pre><span class="cm">-- Return the 3 rows closest to the query vector</span>
+<span class="kw">SELECT</span> id, title <span class="kw">FROM</span> <span class="type">documents</span>
+  <span class="kw">ORDER BY</span> embedding <span class="kw">ANN OF</span> [<span class="var">0.90</span>, <span class="var">0.10</span>, <span class="var">0.00</span>, <span class="var">0.00</span>] <span class="kw">LIMIT</span> <span class="var">3</span>;</pre>
+
+  <!-- ── Evaluation ── -->
+  <h2 id="evaluation">Evaluation: HNSW vs HVQ</h2>
+
+  <p>Measured by the in-tree harness <code>ferrosa-index/tests/eval_comparison.rs</code> on a shared clustered corpus of 192 vectors (16 dimensions, 18 queries, 4 of 12 lists probed), against exact brute-force truth. Reproduce with:</p>
+
+  <pre><span class="kw">cargo</span> test -p ferrosa-index --test eval_comparison -- --nocapture</pre>
+
+  <table>
+    <thead><tr><th>Index</th><th>Size (bytes)</th><th>Bytes read / query</th><th>p50</th><th>p95</th><th>recall@10</th></tr></thead>
+    <tbody>
+      <tr><td>HNSW (full sidecar)</td><td>48,515</td><td>48,515</td><td>2102&nbsp;µs</td><td>2166&nbsp;µs</td><td>1.000</td></tr>
+      <tr><td>HVQ (staged quantized IVF)</td><td>45,089</td><td class="win">15,068</td><td class="win">609&nbsp;µs</td><td class="win">614&nbsp;µs</td><td>1.000</td></tr>
+    </tbody>
+  </table>
+
+  <p>On this corpus HVQ reads <span class="win">3.2&times; fewer bytes per query</span> and answers about <span class="win">3.5&times; faster</span> at p50/p95, with <strong>identical recall</strong>. The win comes from staged reads: HVQ fetches only the probed pages, while the HNSW path decodes the whole sidecar per query.</p>
+
+  <div class="note">
+    <strong>Honest caveats:</strong> this is a small single-artifact microbenchmark. The bytes-read advantage grows with corpus size and with multi-sidecar reads — the design target is &ge;5&times; on larger corpora. The on-disk <em>size</em> is near parity here because the developer-preview staged format still retains full-precision vectors for exact rerank; the larger storage win comes from the production binary <code>.qvec</code> container with quantized-only tiers.
+  </div>
+
+  <!-- ── Example ── -->
+  <h2 id="example">Runnable example</h2>
+
+  <p>The <a href="examples/vector-indexes.html">Vector Indexes example</a> is a complete, CI-executed walkthrough: it creates a BTree secondary index, an HNSW vector index, and an HVQ vector index, loads clustered embeddings, and runs the same ANN query against each — all from plain CQL.</p>
+
+</div>
+</body>
+</html>
