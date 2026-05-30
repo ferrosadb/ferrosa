@@ -695,6 +695,37 @@ mod tests {
     }
 
     #[test]
+    fn codec_decodes_v5_use_beta_query_as_legacy_envelope() {
+        // Regression: gocql and the DataStax Java driver negotiate protocol v5
+        // with the USE_BETA frame flag (0x10) but send plain 9-byte envelopes,
+        // NOT CRC24/CRC32 modern frames. The codec must stay unframed and
+        // decode these as legacy envelopes — switching to modern framing here
+        // misreads the version/flags bytes as a frame header (CRC24 mismatch on
+        // every request).
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        assert!(!codec.is_v5_framed());
+        let mut buf = BytesMut::new();
+        let header = FrameHeader {
+            version: VERSION_REQUEST, // 0x05
+            flags: 0x10,              // USE_BETA
+            stream_id: 0,
+            opcode: Opcode::Query,
+            length: 4,
+        };
+        header.encode(&mut buf);
+        buf.put_slice(&[0x00, 0x00, 0x00, 0x00]); // empty query string (len 0) + flags
+
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.header.opcode, Opcode::Query);
+        assert_eq!(frame.header.version, 0x05);
+        assert_eq!(frame.header.flags, 0x10);
+        assert!(
+            !codec.is_v5_framed(),
+            "USE_BETA must not switch to modern framing"
+        );
+    }
+
+    #[test]
     fn codec_decode_incomplete_header() {
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         let mut buf = BytesMut::from(&[0x04, 0x00, 0x00][..]);

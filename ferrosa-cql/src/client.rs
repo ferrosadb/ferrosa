@@ -159,13 +159,12 @@ impl CqlClient {
             }
         }
 
-        // The server enables v5 framing after READY/AUTH_SUCCESS when the
-        // client sends VERSION_REQUEST (0x05). The client must also switch
-        // to v5 framed mode so subsequent messages are wrapped in
-        // CRC-protected frames.
-        if ready {
-            framed.codec_mut().enable_v5_framing();
-        }
+        // We negotiate v5 with USE_BETA but keep the legacy (unframed)
+        // envelope transport — exactly what real drivers do (gocql and the
+        // DataStax Java driver send USE_BETA frames as plain 9-byte envelopes,
+        // not CRC-wrapped modern frames). The server matches by never enabling
+        // modern framing, so both sides speak legacy framing here.
+        let _ = ready;
 
         Ok(Self {
             framed,
