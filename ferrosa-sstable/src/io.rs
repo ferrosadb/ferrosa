@@ -83,9 +83,13 @@ pub trait WriteAt {
 /// `pread` is offsetful (no shared seek state), so sharing one `File` via
 /// `Arc` across threads is safe — see `std::os::unix::fs::FileExt::read_at`.
 ///
-/// Capacity is a tunable (`FERROSA_FD_CACHE_SIZE`, default 512) chosen to
-/// leave headroom under common 1024-fd test/container limits while still
-/// amortising opens across queries.
+/// Capacity is a tunable (`FERROSA_FD_CACHE_SIZE`, default 1024 before
+/// runtime headroom is applied) chosen so a node with hundreds of active
+/// SSTables fits comfortably under typical `RLIMIT_NOFILE` values while still
+/// amortising opens across queries. On Linux the effective default is capped to
+/// one quarter of the process soft open-file limit so test/CI runs with
+/// `ulimit -n 1024` keep enough descriptor headroom for writers, tempdirs,
+/// commit logs, and other crates.
 pub struct FdCache {
     inner: std::sync::Mutex<lru::LruCache<std::path::PathBuf, std::sync::Arc<std::fs::File>>>,
     opens: std::sync::atomic::AtomicU64,
@@ -171,19 +175,55 @@ impl FdCache {
     }
 }
 
-const DEFAULT_FD_CACHE_CAPACITY: usize = 512;
+const DEFAULT_FD_CACHE_CAPACITY: usize = 1024;
+const MIN_FD_CACHE_CAPACITY: usize = 64;
+
+fn linux_soft_nofile_limit() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+        for line in limits.lines() {
+            if let Some(rest) = line.strip_prefix("Max open files") {
+                let soft = rest.split_whitespace().next()?;
+                if soft == "unlimited" {
+                    return None;
+                }
+                return soft.parse::<usize>().ok();
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn fd_cache_capacity(
+    env_value: Option<&str>,
+    soft_nofile_limit: Option<usize>,
+) -> std::num::NonZeroUsize {
+    let requested = env_value
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_FD_CACHE_CAPACITY);
+    let capped = soft_nofile_limit
+        .map(|limit| {
+            let headroom_cap = (limit / 4).max(MIN_FD_CACHE_CAPACITY);
+            requested.min(headroom_cap)
+        })
+        .unwrap_or(requested)
+        .max(1);
+    std::num::NonZeroUsize::new(capped).expect("fd cache capacity is non-zero")
+}
 
 fn global_fd_cache() -> &'static std::sync::Arc<FdCache> {
     static CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
-        let cap = std::env::var("FERROSA_FD_CACHE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .and_then(std::num::NonZeroUsize::new)
-            .unwrap_or_else(|| {
-                std::num::NonZeroUsize::new(DEFAULT_FD_CACHE_CAPACITY)
-                    .expect("DEFAULT_FD_CACHE_CAPACITY is non-zero")
-            });
+        let cap = fd_cache_capacity(
+            std::env::var("FERROSA_FD_CACHE_SIZE").ok().as_deref(),
+            linux_soft_nofile_limit(),
+        );
         std::sync::Arc::new(FdCache::with_capacity(cap))
     })
 }
@@ -515,6 +555,17 @@ mod tests {
             cache.opens_observed() - opens_before,
             1,
             "underlying open() must be called exactly once across all readers"
+        );
+    }
+
+    #[test]
+    fn default_fd_cache_capacity_leaves_headroom_under_low_ulimit() {
+        let cap = super::fd_cache_capacity(None, Some(1024));
+
+        assert!(
+            cap.get() <= 256,
+            "default fd cache cap must leave process headroom under ulimit 1024, got {}",
+            cap
         );
     }
 

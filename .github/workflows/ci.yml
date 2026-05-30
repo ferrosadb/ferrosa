@@ -100,6 +100,63 @@ jobs:
             target/x86_64-unknown-linux-musl/release/ferrosa-ctl
           retention-days: 14
 
+  # ── Build the runtime node image ONCE (12-factor build/release/run) ──
+  # Compile the glibc release binary exactly once (cached via rust-cache; glibc
+  # for allocator performance — musl's allocator is slow, so the static musl
+  # binary above is only for distribution, not for the test node). Package it
+  # into an immutable `ferrosa-test-node:latest` image saved as an artifact. The
+  # cluster-integration and driver-smoke jobs RUN that artifact instead of
+  # recompiling the release binary inside Docker (previously done twice/run).
+  build-node-image:
+    name: Build node image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: node-image
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Build glibc release binary (once)
+        run: cargo build --release -p ferrosa -p ferrosa-ctl
+      - name: Package into a thin runtime image
+        run: |
+          mkdir -p node-bin
+          cp target/release/ferrosa target/release/ferrosa-ctl node-bin/
+          cat > node-bin/Dockerfile <<'DEOF'
+          FROM debian:trixie-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                  ca-certificates gdb procps \
+              && rm -rf /var/lib/apt/lists/*
+          COPY ferrosa /usr/local/bin/ferrosa
+          COPY ferrosa-ctl /usr/local/bin/ferrosa-ctl
+          EXPOSE 9042 7000 9090 7474 7687
+          ENV FERROSA_DATA_DIR=/var/lib/ferrosa
+          CMD ["ferrosa"]
+          DEOF
+          docker build -t ferrosa-test-node:latest node-bin
+          docker save ferrosa-test-node:latest | gzip > ferrosa-node-image.tar.gz
+      - name: Push image to GHCR (cross-workflow reuse)
+        # Lets the separate, path-filtered driver-smoke workflow pull this exact
+        # image by commit SHA instead of recompiling. Best-effort: fork PRs lack
+        # packages:write, so the driver workflow falls back to building.
+        continue-on-error: true
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag ferrosa-test-node:latest "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:${{ github.sha }}"
+      - name: Upload node image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-node-image
+          path: ferrosa-node-image.tar.gz
+          retention-days: 14
+
   # ── Stage 2.5: Jepsen smoke tier (Sprint 2 W2.13) ──────────────────
   # Lifts the `--exclude ferrosa-jepsen` from this dedicated job so the
   # structural-invariant + topology nemesis suite runs on every PR.
@@ -317,6 +374,7 @@ jobs:
   integration:
     name: Cluster integration tests
     runs-on: ubuntu-latest
+    needs: build-node-image
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     timeout-minutes: 45
     steps:
@@ -324,6 +382,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Download prebuilt node image
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-node-image
+          path: .
+      - name: Load node image into Docker
+        run: docker load < ferrosa-node-image.tar.gz
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: false

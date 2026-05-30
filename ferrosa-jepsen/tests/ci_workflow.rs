@@ -7,11 +7,29 @@
 
 use std::path::PathBuf;
 
-fn ci_yaml_path() -> PathBuf {
+fn repo_root() -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .expect("CARGO_MANIFEST_DIR must be set under cargo test");
-    manifest_dir.join("../.github/workflows/ci.yml")
+    manifest_dir.join("..")
+}
+
+fn ci_yaml_path() -> PathBuf {
+    repo_root().join(".github/workflows/ci.yml")
+}
+
+fn multi_dc_nightly_yaml_path() -> PathBuf {
+    repo_root().join(".github/workflows/jepsen-multi-dc-nightly.yml")
+}
+
+fn step_body<'a>(yaml: &'a str, step_name: &str) -> &'a str {
+    let marker = format!("- name: {step_name}");
+    let start = yaml
+        .find(&marker)
+        .unwrap_or_else(|| panic!("workflow step `{step_name}` not found"));
+    let rest = &yaml[start..];
+    let end = rest.find("\n      - name:").unwrap_or(rest.len());
+    &rest[..end]
 }
 
 #[test]
@@ -50,5 +68,45 @@ fn legacy_test_job_still_excludes_ferrosa_jepsen() {
         yaml.contains("--exclude ferrosa-jepsen"),
         "the general-purpose `test` job must keep `--exclude ferrosa-jepsen` so it \
          doesn't try to spin Docker. The new jepsen-smoke job runs the suite separately."
+    );
+}
+
+#[test]
+fn multi_dc_nightly_workload_invokes_current_run_subcommand() {
+    let path = multi_dc_nightly_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let step = step_body(&yaml, "Run tier-multi-dc 1h bank workload");
+
+    assert!(
+        step.contains("cargo run --release -p ferrosa-jepsen -- \\\n            run \\\n            --tier multi-dc"),
+        "nightly multi-DC workload must call the current ferrosa-jepsen CLI via \
+         the `run` subcommand; step was:\n{step}"
+    );
+    assert!(
+        !step.contains("cargo run --release -p ferrosa-jepsen -- \\\n            --tier multi-dc"),
+        "nightly multi-DC workload must not use the obsolete top-level --tier form"
+    );
+    assert!(
+        !step.contains("--run-id"),
+        "ferrosa-jepsen no longer accepts --run-id on the run command"
+    );
+}
+
+#[test]
+fn multi_dc_nightly_workload_pipeline_fails_loudly_with_tee() {
+    let path = multi_dc_nightly_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let step = step_body(&yaml, "Run tier-multi-dc 1h bank workload");
+
+    assert!(
+        step.contains("set -o pipefail"),
+        "workload step pipes cargo output through tee and must set pipefail so \
+         cargo failures are not hidden; step was:\n{step}"
+    );
+    assert!(
+        step.contains("2>&1 | tee tier-multi-dc.log"),
+        "workload step must preserve tier-multi-dc.log artifact capture"
     );
 }

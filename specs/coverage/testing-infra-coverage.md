@@ -90,7 +90,7 @@
 | `ci.yml` | Every PR + push to main | fmt, clippy, `--workspace --exclude ferrosa-jepsen --exclude ferrosa-loadgen` (with additional `--skip` for 11 named infra-gated tests), musl static build, example CQL scripts against Docker single-node + RustFS, rustdoc |
 | `nightly-fuzz.yml` | Daily 03:00 UTC + manual | 45-min proptest session (`--workspace --exclude ferrosa-jepsen`), `PROPTEST_CASES=50000`, Docker pair-mode smoke test; auto-PRs regression files |
 | `cluster-data-loss.yml` | Push to main (storage/cluster/cql/sstable paths) + manual | 3-node Docker cluster, `tests/cluster/test_data_loss_reproduction.py` (cassandra-driver + pytest) |
-| `driver-tests.yml` | Daily 03:30 UTC + manual | All 6 language driver smoke tests via `tests/drivers/run-all.sh`; `continue-on-error: true` (C8 not yet complete) |
+| `driver-tests.yml` | Daily 03:30 UTC + manual | All 6 language driver smoke tests via `tests/drivers/run-all.sh`; harness failures fail the workflow and upload driver logs |
 | `release.yml` | Tag push `v*` | `cargo test --workspace` (note: no `--exclude`, runs all including jepsen/loadgen), clippy, glibc + musl + macOS ARM64 builds, Debian package, GitHub release |
 | `docs-examples.yml` | Push/PR to main if `examples/**` changed | AsciiDoc → HTML generation only, no Rust tests |
 | `docs.yml` | Every PR + push to main | `cargo doc --no-deps --workspace` |
