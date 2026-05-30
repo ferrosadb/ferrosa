@@ -1,0 +1,33 @@
+<script>
+// Add a "Copy" button to every code listing.
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('.listingblock .content').forEach(function (content) {
+    var pre = content.querySelector('pre');
+    if (!pre) { return; }
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'copy-btn';
+    button.textContent = 'Copy';
+    button.setAttribute('aria-label', 'Copy code to clipboard');
+    button.addEventListener('click', function () {
+      var text = pre.innerText;
+      var done = function () {
+        button.textContent = 'Copied';
+        setTimeout(function () { button.textContent = 'Copy'; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var area = document.createElement('textarea');
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+        document.body.removeChild(area);
+        done();
+      }
+    });
+    content.appendChild(button);
+  });
+});
+</script>

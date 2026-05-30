@@ -19,10 +19,12 @@ html: $(ADOC) $(THEME) index.adoc
 	@asciidoctor -a reproducible -a 'source-highlighter!' -a stylesheet=$(THEME) -a linkcss -a stylesdir=. \
 		-a docinfo=shared -a docinfodir=$$PWD \
 		-D $(OUTDIR) -o index.html index.adoc
+	@mkdir -p $(OUTDIR)/theme
+	@cp $(THEME) $(OUTDIR)/theme/ferrosa.css
 	@cp $(THEME) $(OUTDIR)/ferrosa.css
 
 clean:
-	rm -f $(OUTDIR)/*.html $(OUTDIR)/ferrosa.css
+	rm -f $(OUTDIR)/*.html $(OUTDIR)/ferrosa.css $(OUTDIR)/theme/ferrosa.css
 
 test:
 	./test-examples.sh

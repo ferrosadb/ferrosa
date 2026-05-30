@@ -65,6 +65,14 @@
 <dd>
 <p>Aggregate financial market data for dashboards.</p>
 </dd>
+<dt class="hdlist1"><a href="timeseries-rrd.html"><strong>RRD Time-Series Aggregation</strong></a> <em>New!</em></dt>
+<dd>
+<p>Roll up high-frequency sensor readings into time-window summaries (min/max/avg) automatically&#8201;&#8212;&#8201;RRD-style consolidation with streaming built-ins and optional WebAssembly aggregates.</p>
+</dd>
+<dt class="hdlist1"><a href="advanced-aggregation.html"><strong>Advanced Aggregation</strong></a></dt>
+<dd>
+<p>Group-by aggregates with built-in functions and WebAssembly user-defined aggregates.</p>
+</dd>
 <dt class="hdlist1"><a href="ecommerce.html"><strong>E-Commerce</strong></a></dt>
 <dd>
 <p>Product catalog, shopping cart, and order processing.</p>
@@ -163,5 +171,38 @@
 </div>
 </div>
 </div>
+<script>
+// Add a "Copy" button to every code listing.
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('.listingblock .content').forEach(function (content) {
+    var pre = content.querySelector('pre');
+    if (!pre) { return; }
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'copy-btn';
+    button.textContent = 'Copy';
+    button.setAttribute('aria-label', 'Copy code to clipboard');
+    button.addEventListener('click', function () {
+      var text = pre.innerText;
+      var done = function () {
+        button.textContent = 'Copied';
+        setTimeout(function () { button.textContent = 'Copy'; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var area = document.createElement('textarea');
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+        document.body.removeChild(area);
+        done();
+      }
+    });
+    content.appendChild(button);
+  });
+});
+</script>
 </body>
 </html>

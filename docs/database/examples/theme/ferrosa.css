@@ -191,6 +191,34 @@ code, .literal {
   color: inherit;
 }
 
+/* Copy-to-clipboard button (added by docinfo-footer.html). */
+.listingblock .content .copy-btn {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.25rem 0.6rem;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.listingblock:hover .content .copy-btn,
+.listingblock .content .copy-btn:focus {
+  opacity: 1;
+}
+
+.listingblock .content .copy-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* ── Literal blocks ── */
 .literalblock pre {
   background: var(--code-bg);
@@ -262,6 +290,9 @@ table.tableblock {
   border-collapse: collapse;
   margin: 1.5rem 0;
   font-size: 0.9375rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
 }
 
 table.tableblock th,
@@ -269,6 +300,17 @@ table.tableblock td {
   text-align: left;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+
+/* No double border on the table's right edge or bottom row. */
+table.tableblock th:last-child,
+table.tableblock td:last-child {
+  border-right: none;
+}
+
+table.tableblock tbody tr:last-child td {
+  border-bottom: none;
 }
 
 table.tableblock thead th {
@@ -277,6 +319,7 @@ table.tableblock thead th {
   letter-spacing: 0.08em;
   color: var(--text-muted);
   font-weight: 600;
+  background: var(--bg-secondary);
 }
 
 table.tableblock td {
