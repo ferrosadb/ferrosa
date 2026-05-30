@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use ferrosa_common::CellValue;
-use ferrosa_sstable::types::{DeletionTime, Partition, Row};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
 /// Merge every source version of one partition into the canonical result.
 ///
@@ -66,12 +66,11 @@ fn oracle_merge_row(a: &Row, b: &Row) -> Row {
     } else {
         a.deletion
     };
-    let primary_key_liveness =
-        if b.primary_key_liveness.timestamp > a.primary_key_liveness.timestamp {
-            b.primary_key_liveness
-        } else {
-            a.primary_key_liveness
-        };
+    let primary_key_liveness = if liveness_wins(b.primary_key_liveness, a.primary_key_liveness) {
+        b.primary_key_liveness
+    } else {
+        a.primary_key_liveness
+    };
 
     let mut cells: BTreeMap<u16, CellValue> = BTreeMap::new();
     for (col, cell) in a.cells.iter().chain(b.cells.iter()) {
@@ -96,6 +95,13 @@ fn oracle_merge_row(a: &Row, b: &Row) -> Row {
 fn deletion_wins(x: DeletionTime, y: DeletionTime) -> bool {
     (x.marked_for_delete_at, x.local_deletion_time)
         > (y.marked_for_delete_at, y.local_deletion_time)
+}
+
+/// True when primary-key liveness `x` supersedes `y`. Newer timestamp wins;
+/// equal timestamps are broken deterministically so the merge is order
+/// independent.
+fn liveness_wins(x: LivenessInfo, y: LivenessInfo) -> bool {
+    (x.timestamp, x.ttl, x.local_deletion_time) > (y.timestamp, y.ttl, y.local_deletion_time)
 }
 
 /// True when cell `cand` supersedes `cur` under deterministic last-write-wins.

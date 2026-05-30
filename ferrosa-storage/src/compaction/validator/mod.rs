@@ -49,3 +49,87 @@ mod tests {
         assert_eq!(ab, oracle, "merge_partitions must match the oracle");
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::oracle::oracle_merge;
+    use crate::merge::merge_partitions;
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    // A live cell or a tombstone, at a small timestamp to force conflicts.
+    fn arb_cell() -> impl Strategy<Value = CellValue> {
+        prop_oneof![
+            (0u8..3, 1i64..4).prop_map(|(v, ts)| CellValue::live(vec![v], ts)),
+            (1i64..4, 50i32..150).prop_map(|(ts, ldt)| CellValue::tombstone(ts, ldt)),
+        ]
+    }
+
+    // A row keyed by a small clustering, with a pk timestamp, an optional row
+    // deletion, and cells deduplicated by column (a row holds one cell/column).
+    fn arb_row() -> impl Strategy<Value = Row> {
+        (
+            0u8..2,
+            1i64..4,
+            prop::option::of(1i64..4),
+            prop::collection::vec((0u16..3, arb_cell()), 0..3),
+        )
+            .prop_map(|(clustering, pk_ts, row_del, cells)| {
+                let mut by_col: BTreeMap<u16, CellValue> = BTreeMap::new();
+                for (col, cell) in cells {
+                    by_col.insert(col, cell);
+                }
+                Row {
+                    clustering: vec![b'c', clustering],
+                    cells: by_col.into_iter().collect(),
+                    deletion: row_del
+                        .map_or(DeletionTime::LIVE, |t| DeletionTime::new(t, t as u32)),
+                    primary_key_liveness: LivenessInfo::with_timestamp(pk_ts),
+                }
+            })
+    }
+
+    // One source version of the shared partition (rows deduped by clustering).
+    fn arb_partition() -> impl Strategy<Value = Partition> {
+        (
+            prop::option::of(1i64..4),
+            prop::collection::vec(arb_row(), 0..3),
+        )
+            .prop_map(|(part_del, rows)| {
+                let mut by_clustering: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
+                for row in rows {
+                    by_clustering.insert(row.clustering.clone(), row);
+                }
+                Partition {
+                    key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
+                    deletion: part_del
+                        .map_or(DeletionTime::LIVE, |t| DeletionTime::new(t, t as u32)),
+                    static_row: None,
+                    rows: by_clustering.into_values().collect(),
+                }
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Across many random multi-SSTable partition sets, the read-path merge
+        /// must be order-independent and agree with the independent oracle.
+        #[test]
+        fn merge_is_order_independent_and_matches_oracle(
+            sources in prop::collection::vec(arb_partition(), 1..4)
+        ) {
+            let oracle = oracle_merge(&sources);
+            let forward = merge_partitions(sources.clone());
+            let mut reversed = sources.clone();
+            reversed.reverse();
+            let backward = merge_partitions(reversed);
+
+            prop_assert_eq!(&forward, &backward, "merge must be order-independent");
+            prop_assert_eq!(&forward, &oracle, "merge must match the oracle");
+        }
+    }
+}
