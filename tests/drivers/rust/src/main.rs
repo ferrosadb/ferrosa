@@ -329,7 +329,7 @@ async fn main() {
     .await;
 
     run_test("insert_if_not_exists", || async {
-        // First insert should be applied.
+        // First insert should be applied — applied results are a single `[applied]` column.
         let q = format!(
             "INSERT INTO {} (id, name) VALUES (900, 'LwtUser') IF NOT EXISTS",
             fq("users")
@@ -339,17 +339,24 @@ async fn main() {
         let (applied,): (bool,) = rows1.first_row()?;
         assert!(applied, "first INSERT IF NOT EXISTS should be applied");
 
-        // Second insert with same PK should NOT be applied.
+        // Second insert with same PK is NOT applied. When an LWT is not applied,
+        // Cassandra returns `[applied=false]` plus the conflicting row, so the
+        // result's column count varies and must not be deserialized as a fixed
+        // `(bool,)`. Verify non-application by re-reading the row instead.
         let q2 = format!(
-            "INSERT INTO {} (id, name) VALUES (900, 'LwtUser') IF NOT EXISTS",
+            "INSERT INTO {} (id, name) VALUES (900, 'Different') IF NOT EXISTS",
             fq("users")
         );
-        let res2 = session.query_unpaged(q2, &[]).await?;
-        let rows2 = res2.into_rows_result()?;
-        let (applied2,): (bool,) = rows2.first_row()?;
-        assert!(
-            !applied2,
-            "second INSERT IF NOT EXISTS should NOT be applied"
+        session.query_unpaged(q2, &[]).await?;
+        let select = format!("SELECT name FROM {} WHERE id = 900", fq("users"));
+        let (name,): (String,) = session
+            .query_unpaged(select, &[])
+            .await?
+            .into_rows_result()?
+            .first_row()?;
+        assert_eq!(
+            name, "LwtUser",
+            "second INSERT IF NOT EXISTS must not overwrite the existing row"
         );
         Ok(())
     })
