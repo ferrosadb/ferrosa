@@ -77,6 +77,19 @@ struct Args {
     /// List available profiles and exit.
     #[arg(long)]
     list_profiles: bool,
+
+    /// Run the compaction soak instead of a load test: generate deterministic
+    /// corpora, compact them for real, and diff each against the oracle.
+    #[arg(long)]
+    compaction_soak: bool,
+
+    /// Starting seed for the compaction soak (corpora are reproducible per seed).
+    #[arg(long, default_value_t = 1)]
+    soak_seed: u64,
+
+    /// Number of compaction-soak iterations to run.
+    #[arg(long, default_value_t = 1000)]
+    soak_iterations: usize,
 }
 
 fn main() {
@@ -91,6 +104,34 @@ fn main() {
             "  delete_update_heavy  10% read / 70% update / 20% delete — max tombstone pressure"
         );
         println!("  compaction_stress    Long-running compaction stress with W=2");
+        return;
+    }
+
+    if args.compaction_soak {
+        let work_dir = args.data_dir.join("compaction-soak");
+        std::fs::create_dir_all(&work_dir).expect("create soak work dir");
+        println!(
+            "Compaction soak: {} iterations from seed {}",
+            args.soak_iterations, args.soak_seed
+        );
+        let result = ferrosa_storage::compaction::validator::soak::run(
+            &work_dir,
+            args.soak_seed,
+            args.soak_iterations,
+        );
+        let _ = std::fs::remove_dir_all(&work_dir);
+        match result {
+            Ok(report) => {
+                println!(
+                    "Soak PASSED: {} iterations, {} logical cells checked",
+                    report.iterations, report.cells_checked
+                );
+            }
+            Err(err) => {
+                eprintln!("Soak FAILED: {err}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 

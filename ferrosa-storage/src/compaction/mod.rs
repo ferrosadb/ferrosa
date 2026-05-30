@@ -11,6 +11,11 @@ pub mod metadata;
 pub mod strategy;
 pub mod strategy_ucs;
 
+/// Compaction correctness validator (oracle + differential checks). Compiled
+/// only for tests or when the `compaction-validator` feature is enabled.
+#[cfg(any(test, feature = "compaction-validator"))]
+pub mod validator;
+
 pub use executor::{CompactionExecutor, CompactionResult};
 pub use metadata::{CompactionTask, SSTableMetadata};
 pub use strategy::{CompactionConfig, CompactionStrategy, SizeTieredStrategy};

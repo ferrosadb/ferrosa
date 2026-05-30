@@ -38,6 +38,10 @@ skiplist-memtable = ["crossbeam-skiplist"]
 # FERROSA_TEST_* environment prerequisites so missing infra cannot be reported
 # as a passing test body.
 live-infra-tests = []
+# Exposes the compaction validator (oracle + differential checks) so other
+# crates (ferrosa-loadgen soak) can reuse it. The validator is always available
+# to this crate's own tests regardless of this feature.
+compaction-validator = []
 
 [dev-dependencies]
 async-trait = "0.1"

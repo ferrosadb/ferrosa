@@ -11,7 +11,7 @@ ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-cql = { path = "../ferrosa-cql" }
-ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-storage = { path = "../ferrosa-storage", features = ["compaction-validator"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
