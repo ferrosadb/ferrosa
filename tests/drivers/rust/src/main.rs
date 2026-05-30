@@ -385,7 +385,7 @@ async fn main() {
         session.query_unpaged(q_del, &[]).await?;
 
         // Verify it is gone.
-        let q_sel = format!("SELECT * FROM {} WHERE id = 999", fq("users"));
+        let q_sel = format!("SELECT id FROM {} WHERE id = 999", fq("users"));
         let res = session.query_unpaged(q_sel, &[]).await?;
         let rows_result = res.into_rows_result()?;
         let row: Option<(i32,)> = rows_result.maybe_first_row()?;
@@ -516,7 +516,7 @@ async fn main() {
     .await;
 
     run_test("select_limit", || async {
-        let q = format!("SELECT * FROM {} LIMIT 2", fq("users"));
+        let q = format!("SELECT id FROM {} LIMIT 2", fq("users"));
         let res = session.query_unpaged(q, &[]).await?;
         let rows_result = res.into_rows_result()?;
         let mut count = 0_u32;
@@ -577,7 +577,7 @@ async fn main() {
     .await;
 
     run_test("select_after_delete", || async {
-        let q = format!("SELECT * FROM {} WHERE id = 999", fq("users"));
+        let q = format!("SELECT id FROM {} WHERE id = 999", fq("users"));
         let res = session.query_unpaged(q, &[]).await?;
         let rows_result = res.into_rows_result()?;
         let row: Option<(i32,)> = rows_result.maybe_first_row()?;
@@ -646,7 +646,7 @@ async fn main() {
         session.execute_unpaged(&prepared, (200_i32,)).await?;
 
         // Verify deletion
-        let q = format!("SELECT * FROM {} WHERE id = 200", fq("users"));
+        let q = format!("SELECT id FROM {} WHERE id = 200", fq("users"));
         let res = session.query_unpaged(q, &[]).await?;
         let rows_result = res.into_rows_result()?;
         let row: Option<(i32,)> = rows_result.maybe_first_row()?;
@@ -699,7 +699,7 @@ async fn main() {
         // Wait for TTL to expire.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        let q_sel = format!("SELECT * FROM {} WHERE id = 800", fq("users"));
+        let q_sel = format!("SELECT id FROM {} WHERE id = 800", fq("users"));
         let res = session.query_unpaged(q_sel, &[]).await?;
         let rows_result = res.into_rows_result()?;
         let row: Option<(i32,)> = rows_result.maybe_first_row()?;
