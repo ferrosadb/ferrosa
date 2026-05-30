@@ -158,11 +158,18 @@ class TestCassandraCqlExamples:
         if not examples_dir.exists():
             pytest.skip(
                 f"Cassandra CQL examples not found at {examples_dir}. "
-                "Ensure the cassandra submodule is checked out."
+                "Ensure the cassandra example corpus is present."
             )
 
         cql_files = collect_cql_files(examples_dir)
-        assert len(cql_files) > 0, "No .cql files found"
+        if not cql_files:
+            # The directory exists (e.g. an empty bind mount) but the example
+            # corpus isn't present. Skip rather than fail — the corpus is an
+            # optional external dependency, not a ferrosa defect.
+            pytest.skip(
+                f"No .cql example files under {examples_dir}; "
+                "Cassandra example corpus not populated."
+            )
 
         total = 0
         passed = 0
