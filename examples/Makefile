@@ -11,12 +11,12 @@ html: $(ADOC) $(THEME) index.adoc
 		name=$$(basename $$f .adoc); \
 		dir=$$(dirname $$f); \
 		echo "Converting $$f -> $(OUTDIR)/$$name.html"; \
-		asciidoctor -a reproducible -a stylesheet=$(THEME) -a linkcss -a stylesdir=. \
+		asciidoctor -a reproducible -a 'source-highlighter!' -a stylesheet=$(THEME) -a linkcss -a stylesdir=. \
 			-a docinfo=shared -a docinfodir=$$PWD \
 			-D $(OUTDIR) -o $$name.html $$f; \
 	done
 	@echo "Converting index.adoc -> $(OUTDIR)/index.html"
-	@asciidoctor -a reproducible -a stylesheet=$(THEME) -a linkcss -a stylesdir=. \
+	@asciidoctor -a reproducible -a 'source-highlighter!' -a stylesheet=$(THEME) -a linkcss -a stylesdir=. \
 		-a docinfo=shared -a docinfodir=$$PWD \
 		-D $(OUTDIR) -o index.html index.adoc
 	@cp $(THEME) $(OUTDIR)/ferrosa.css

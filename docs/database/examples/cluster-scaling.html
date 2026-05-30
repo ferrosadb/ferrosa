@@ -88,7 +88,7 @@ It starts fast, uses minimal resources, and gives you a fully functional CQL end
 <h3 id="_start_node1">Start node1</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose up -d</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -97,7 +97,7 @@ Wait for node1 to report healthy:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose ps</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose ps</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -111,12 +111,12 @@ Wait for node1 to report healthy:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9042</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">cqlsh localhost 9042</code></pre>
 </div>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Act 1: Development / Standalone Mode
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Act 1: Development / Standalone Mode
 -- Create the application keyspace and core table.
 -- RF=1 is appropriate for single-node development.
 
@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS app.events (
 <h3 id="_insert_seed_data">Insert seed data</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Act 1: Standalone — seed initial event data
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Act 1: Standalone — seed initial event data
 -- 5 events for acme, 5 for globex (10 total)
 
 USE app;
@@ -207,7 +207,7 @@ Think of it like PostgreSQL streaming replication, but it also replicates DDL&#8
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml up -d</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -231,7 +231,7 @@ Writes continue uninterrupted during this transition. Node1 accepts CQL commands
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose logs -f node1 node2</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose logs -f node1 node2</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -247,7 +247,7 @@ These writes replicate to node2 in real time:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Act 2: Pair mode — writes replicated to second node
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Act 2: Pair mode — writes replicated to second node
 -- 3 more for acme (total 8), 2 more for globex (total 7)
 
 USE app;
@@ -282,7 +282,7 @@ Add a new column and a secondary index&#8201;&#8212;&#8201;the schema change pro
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Phase 2: Pair mode — DDL replication test
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Phase 2: Pair mode — DDL replication test
 -- Create a counter table and populate it with daily summaries
 
 USE app;
@@ -325,7 +325,7 @@ SELECT * FROM daily_summary WHERE tenant_id = 'globex' AND event_date = '2026-03
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9043 -e "DESCRIBE TABLE app.events;"</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">cqlsh localhost 9043 -e "DESCRIBE TABLE app.events;"</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -373,7 +373,7 @@ Three nodes give you:</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml up -d</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -382,7 +382,7 @@ Node3 joins, a Raft leader election completes, and the cluster stabilizes.</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose logs -f node1 node2 node3</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose logs -f node1 node2 node3</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -410,7 +410,7 @@ Insert more events&#8201;&#8212;&#8201;these are acknowledged after a quorum (2 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Act 3: Raft cluster — writes across a 3-node cluster
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Act 3: Raft cluster — writes across a 3-node cluster
 -- 2 more for acme (total 10), 3 for new tenant initech (total 3)
 
 USE app;
@@ -446,7 +446,7 @@ SELECT COUNT(*) FROM events WHERE tenant_id = 'initech' AND event_date = '2026-0
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Phase 3: Raft cluster — DDL through consensus
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Phase 3: Raft cluster — DDL through consensus
 -- Create a tenants table and register all known tenants
 
 USE app;
@@ -493,7 +493,7 @@ In cluster mode, DDL statements are intended to be linearizable. A <code>CREATE 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Final verification: confirm all data across the scaled cluster
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Final verification: confirm all data across the scaled cluster
 
 USE app;
 
@@ -535,7 +535,7 @@ SELECT peer, data_center FROM system.peers;</code></pre>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">curl -s http://localhost:9090/api/cluster/status | python3 -m json.tool</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">curl -s http://localhost:9090/api/cluster/status | python3 -m json.tool</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -551,7 +551,7 @@ SELECT peer, data_center FROM system.peers;</code></pre>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">bash run-demo.sh</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">bash run-demo.sh</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -567,7 +567,7 @@ SELECT peer, data_center FROM system.peers;</code></pre>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml down -v</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml down -v</code></pre>
 </div>
 </div>
 <div class="paragraph">

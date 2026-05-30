@@ -100,7 +100,7 @@ scalar column.</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Vector index strategies: BTree + HNSW + HVQ on the same data.
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Vector index strategies: BTree + HNSW + HVQ on the same data.
 --
 -- Ferrosa exposes three index strategies a user can reach from CQL:
 --   1. A secondary BTree index for exact-match lookups on a scalar column.
@@ -159,7 +159,7 @@ CREATE INDEX articles_hvq_ann ON articles_hvq (embedding) USING 'vector'
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">USE semantic;
+<pre class="highlight"><code class="language-sql" data-lang="sql">USE semantic;
 
 -- Six articles in two clear clusters of the 4-dimensional embedding space:
 -- a "science" cluster near [0.9, 0.1, 0, 0] and a "history" cluster near
@@ -196,7 +196,7 @@ ranking as HNSW.</p>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">USE semantic;
+<pre class="highlight"><code class="language-sql" data-lang="sql">USE semantic;
 
 -- 1) BTree secondary index: exact-match lookup on the scalar `category` column.
 SELECT id, title FROM articles_hnsw WHERE category = 'science';
