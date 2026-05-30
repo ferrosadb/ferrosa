@@ -950,6 +950,17 @@ pub fn build_row(
     let mut cells: Vec<(u16, CellValue)> = column_values
         .iter()
         .map(|(idx, val)| {
+            // An explicit NULL deletes the column (Cassandra semantics): emit
+            // a cell tombstone, not a live empty-bytes cell, so reads return
+            // null rather than "" / 0.
+            if matches!(val, CqlValue::Null) {
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let local_deletion_time = i32::try_from(now_secs).unwrap_or(i32::MAX);
+                return (*idx, CellValue::tombstone(timestamp, local_deletion_time));
+            }
             let encoded = encode_value(val);
             let cell = match ttl {
                 Some(ttl_secs) => {
@@ -2056,6 +2067,21 @@ mod tests {
         assert_eq!(row.cells.len(), 1);
         assert!(row.cells[0].1.is_live());
         assert!(row.clustering.is_empty());
+    }
+
+    #[test]
+    fn build_row_null_value_is_a_tombstone_not_an_empty_live_cell() {
+        // An explicit NULL in INSERT/UPDATE deletes the column (Cassandra
+        // semantics). It must become a cell tombstone so reads return null —
+        // not a live empty-bytes cell, which reads back as "" for text.
+        let row = build_row(&[(0, CqlValue::Null)], &[], 1000, None);
+        assert_eq!(row.cells.len(), 1);
+        assert!(
+            row.cells[0].1.is_tombstone(),
+            "null insert should produce a tombstone cell"
+        );
+        assert!(!row.cells[0].1.is_live());
+        assert_eq!(row.cells[0].1.timestamp, 1000);
     }
 
     #[test]
