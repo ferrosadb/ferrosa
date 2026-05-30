@@ -34,7 +34,7 @@ use crate::compaction::executor::CompactionExecutor;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::FileFlushTarget;
-use crate::store::{TableStore, VectorIndexConfig};
+use crate::store::{TableStore, VectorIndexConfig, VectorIndexMethod};
 use crate::timeseries::aggregator::decode_typed_numeric;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
 use crate::timeseries::consolidation::Accumulator;
@@ -1947,20 +1947,60 @@ impl StorageEngine {
         table_id: &TableId,
         index_name: &str,
         column_position: usize,
+        dimension: usize,
+    ) -> ferrosa_common::Result<()> {
+        self.add_vector_index_with_method(
+            table_id,
+            index_name,
+            column_position,
+            dimension,
+            VectorIndexMethod::Hnsw,
+        )
+    }
+
+    /// Register a vector index selecting the artifact/search `method`.
+    ///
+    /// `add_vector_index` delegates here with [`VectorIndexMethod::Hnsw`] so the
+    /// legacy callers keep the full-precision sidecar path; the CQL DDL router
+    /// passes [`VectorIndexMethod::QuantizedIvf`] when the user requests the
+    /// `hvq` method via `WITH OPTIONS`.
+    pub fn add_vector_index_with_method(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        column_position: usize,
         _dimension: usize,
+        method: VectorIndexMethod,
     ) -> ferrosa_common::Result<()> {
         let mut tables = self.tables.write();
         let state = tables.get_mut(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
-        state.store.add_vector_index(VectorIndexConfig {
+        let config = VectorIndexConfig {
             index_name: index_name.to_string(),
             column_position,
             metric: ferrosa_index::DistanceMetric::L2,
             ef_construction: 64,
             m: 16,
-        });
+        };
+        match method {
+            VectorIndexMethod::Hnsw => state.store.add_vector_index(config),
+            VectorIndexMethod::QuantizedIvf => state.store.add_quantized_vector_index(config),
+        }
         Ok(())
+    }
+
+    /// Report the artifact/search method registered for a table's vector index.
+    pub fn vector_index_method(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> ferrosa_common::Result<VectorIndexMethod> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        Ok(state.store.vector_index_method(index_name))
     }
 
     /// Run an ANN search on a registered table vector index.

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="generator" content="Asciidoctor 2.0.26">
+<meta name="generator" content="Asciidoctor 2.0.20">
 <title>3-Node Cluster Setup</title>
 <link rel="stylesheet" href="./theme/ferrosa.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
@@ -148,7 +148,7 @@ Need one cluster to serve both host clients and in-network container clients? Se
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker --version
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker --version
 # Docker version 27.x.x, build xxxxxxx
 
 docker compose version
@@ -183,7 +183,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">mkdir ferrosa-cluster &amp;&amp; cd ferrosa-cluster</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">mkdir ferrosa-cluster &amp;&amp; cd ferrosa-cluster</code></pre>
 </div>
 </div>
 </div>
@@ -194,7 +194,7 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="yaml"># docker-compose.yml — 3-node Ferrosa cluster with S3-compatible storage
+<pre class="highlight"><code class="language-yaml" data-lang="yaml"># docker-compose.yml — 3-node Ferrosa cluster with S3-compatible storage
 # Run with: docker compose up -d
 
 services:
@@ -414,7 +414,7 @@ volumes:
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose up -d</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose up -d</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -428,7 +428,7 @@ volumes:
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose logs -f node1 node2 node3</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose logs -f node1 node2 node3</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -481,7 +481,7 @@ volumes:
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">curl http://localhost:9090/api/cluster/status | python3 -m json.tool</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">curl http://localhost:9090/api/cluster/status | python3 -m json.tool</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -495,7 +495,7 @@ volumes:
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">docker compose ps</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">docker compose ps</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -589,7 +589,7 @@ volumes:
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">pip install cqlsh</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">pip install cqlsh</code></pre>
 </div>
 </div>
 </div>
@@ -600,7 +600,7 @@ volumes:
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9042</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">cqlsh localhost 9042</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -614,7 +614,7 @@ volumes:
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">-- Verify cluster is responsive
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Verify cluster is responsive
 SELECT cluster_name, data_center FROM system.local;
 SELECT * FROM system.peers;
 
@@ -630,7 +630,7 @@ SELECT * FROM setup_test.hello;</code></pre>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code> id | message
+<pre class="highlight"><code> id | message
 ----+---------------------
   1 | Hello from Ferrosa!
 
@@ -645,7 +645,7 @@ SELECT * FROM setup_test.hello;</code></pre>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9043</code></pre>
+<pre class="highlight"><code class="language-bash" data-lang="bash">cqlsh localhost 9043</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -653,7 +653,7 @@ SELECT * FROM setup_test.hello;</code></pre>
 </div>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="sql">SELECT * FROM setup_test.hello;</code></pre>
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM setup_test.hello;</code></pre>
 </div>
 </div>
 <div class="paragraph">
@@ -718,7 +718,7 @@ Leave this cluster running as you work through the tutorials. Each tutorial crea
 <h3 id="_useful_commands_for_managing_your_cluster">Useful commands for managing your cluster</h3>
 <div class="listingblock">
 <div class="content">
-<pre class="rouge highlight"><code data-lang="bash"># Stop the cluster (preserves data)
+<pre class="highlight"><code class="language-bash" data-lang="bash"># Stop the cluster (preserves data)
 docker compose stop
 
 # Start it again
@@ -740,7 +740,6 @@ docker compose restart node3</code></pre>
 </div>
 <div id="footer">
 <div id="footer-text">
-Last updated 2026-05-08 19:58:04 -0700
 </div>
 </div>
 </body>

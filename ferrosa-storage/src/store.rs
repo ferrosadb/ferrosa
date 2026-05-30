@@ -2524,7 +2524,11 @@ impl<F: FlushTarget> TableStore<F> {
         self.add_vector_index_with_method(config, VectorIndexMethod::QuantizedIvf);
     }
 
-    fn vector_index_method(&self, index_name: &str) -> VectorIndexMethod {
+    /// Report the artifact/search method registered for `index_name`.
+    ///
+    /// Defaults to [`VectorIndexMethod::Hnsw`] when the index is unknown or was
+    /// registered through the legacy path, matching `add_vector_index`.
+    pub fn vector_index_method(&self, index_name: &str) -> VectorIndexMethod {
         self.vector_index_methods
             .get(index_name)
             .copied()

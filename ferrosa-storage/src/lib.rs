@@ -63,7 +63,7 @@ pub use memtable::skiplist::SkipListMemtable;
 pub use memtable::Memtable;
 pub use merge::merge_partitions;
 pub use observer::{ObserverConfig, ObserverMode, WriteObserver};
-pub use store::TableStore;
+pub use store::{TableStore, VectorIndexMethod};
 pub use subscription_observer::{
     SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,
 };
