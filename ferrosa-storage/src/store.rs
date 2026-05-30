@@ -1382,16 +1382,16 @@ impl<F: FlushTarget> TableStore<F> {
         let mut new_sidecars = vec![Arc::new(sidecar_map)];
         new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
 
-        // Keep the old flushing memtable alive until the NEXT flush
-        // replaces it. This ensures any late writers (threads that loaded
-        // the view before step 1 and haven't written yet) can still write
-        // to the old memtable and their data remains readable via the
-        // flushing slot. The next flush's step 1 will atomically replace
-        // flushing, at which point ArcSwap guarantees all prior readers
-        // have released their guards.
+        // Once the SSTable reader is installed, the flushed memtable must leave
+        // the live view. Writers cannot be racing against `old_active`: Store::write
+        // takes `write_barrier.read()` and loads the active view inside that guard,
+        // while the flush swap above takes `write_barrier.write()`. Keeping
+        // `old_active` in `flushing` after a successful flush makes subsequent
+        // flushes re-ingest already-flushed rows and can cascade wide-partition
+        // snapshots under aggressive concurrent flush loops.
         let new_view = StoreView {
             active: Arc::clone(&current_view.active),
-            flushing: Some(old_active),
+            flushing: None,
             sstables: Arc::new(new_sstables),
             sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current_view.indexes),
@@ -3695,6 +3695,21 @@ mod tests {
         assert_eq!(
             r2.unwrap().rows[0].cells[0].1.value.as_deref(),
             Some(b"v2".as_slice())
+        );
+    }
+
+    #[test]
+    fn successful_flush_clears_flushing_memtable_to_avoid_reingest() {
+        let store = test_store();
+        let key = make_key("k1");
+
+        store.write(&key, make_row(b"v1", 1000)).unwrap();
+        store.flush().unwrap();
+
+        let view = store.view.load();
+        assert!(
+            view.flushing.is_none(),
+            "completed flush must clear the flushing memtable so future flushes do not re-ingest the already-flushed snapshot"
         );
     }
 

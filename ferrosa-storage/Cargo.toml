@@ -33,6 +33,11 @@ ureq = { version = "3", features = ["json"] }
 [features]
 default = []
 skiplist-memtable = ["crossbeam-skiplist"]
+# Live infrastructure tests are intentionally absent from the default test
+# target. Opt in with `--features live-infra-tests` plus the documented
+# FERROSA_TEST_* environment prerequisites so missing infra cannot be reported
+# as a passing test body.
+live-infra-tests = []
 
 [dev-dependencies]
 async-trait = "0.1"

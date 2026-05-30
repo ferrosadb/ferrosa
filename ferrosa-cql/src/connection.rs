@@ -57,9 +57,24 @@ pub(crate) async fn authenticate_off_runtime(
     username: String,
     password: String,
 ) -> ferrosa_schema::Result<ferrosa_schema::AuthContext> {
-    tokio::task::spawn_blocking(move || schema.authenticate(&username, &password))
-        .await
-        .unwrap_or(Err(ferrosa_schema::SchemaError::AuthenticationFailed))
+    authenticate_off_runtime_observed(schema, username, password, || {}).await
+}
+
+async fn authenticate_off_runtime_observed<F>(
+    schema: Arc<ferrosa_schema::Schema>,
+    username: String,
+    password: String,
+    on_blocking_start: F,
+) -> ferrosa_schema::Result<ferrosa_schema::AuthContext>
+where
+    F: FnOnce() + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        on_blocking_start();
+        schema.authenticate(&username, &password)
+    })
+    .await
+    .unwrap_or(Err(ferrosa_schema::SchemaError::AuthenticationFailed))
 }
 
 /// Connection phase state machine (M7).
@@ -2372,19 +2387,33 @@ mod tests {
     #[tokio::test]
     async fn authenticate_off_runtime_does_not_serialize_on_async_thread() {
         // Pre-fix: `authenticate` ran synchronously on the async worker. On a
-        // single-threaded runtime (which `#[tokio::test]` uses), 10 concurrent
-        // cost-4 bcrypts serialise through the one worker thread (~50-100 ms
-        // total). Post-fix: `spawn_blocking` offloads each to the blocking
-        // pool; the 10 run in parallel (~5-15 ms total).
+        // single-threaded runtime (which `#[tokio::test]` uses), concurrent
+        // cost-4 bcrypts serialised through the one worker thread. The old
+        // regression assertion used elapsed wall-clock time, which became
+        // brittle when the full workspace test runner competed for CPU.
+        //
+        // The invariant we actually need is deterministic: bcrypt must run on
+        // Tokio's blocking pool, not on the async worker thread.
         let schema = build_minimal_schema_for_test();
-        let start = std::time::Instant::now();
+        let async_worker_thread = std::thread::current().id();
+        let (thread_tx, thread_rx) = std::sync::mpsc::channel();
+
         let mut handles = Vec::new();
         for _ in 0..10 {
             let s = schema.clone();
+            let tx = thread_tx.clone();
             handles.push(tokio::spawn(async move {
-                authenticate_off_runtime(s, "cassandra".into(), "cassandra".into()).await
+                authenticate_off_runtime_observed(
+                    s,
+                    "cassandra".into(),
+                    "cassandra".into(),
+                    move || tx.send(std::thread::current().id()).unwrap(),
+                )
+                .await
             }));
         }
+        drop(thread_tx);
+
         for h in handles {
             let res = h.await.unwrap();
             assert!(
@@ -2392,10 +2421,18 @@ mod tests {
                 "auth should succeed against the default cassandra user: {res:?}"
             );
         }
-        let elapsed = start.elapsed();
+
+        let blocking_threads: Vec<_> = thread_rx.into_iter().collect();
+        assert_eq!(
+            blocking_threads.len(),
+            10,
+            "every auth attempt should enter the blocking closure"
+        );
         assert!(
-            elapsed < std::time::Duration::from_millis(40),
-            "10 concurrent cost-4 auths took {elapsed:?} — auth is not offloaded to the blocking pool"
+            blocking_threads
+                .into_iter()
+                .all(|thread_id| thread_id != async_worker_thread),
+            "bcrypt auth ran on the async worker thread instead of Tokio's blocking pool"
         );
     }
 

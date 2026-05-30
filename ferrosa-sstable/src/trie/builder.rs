@@ -315,6 +315,10 @@ fn encode_sparse_node(
         .map(|&(_, child_pos)| current_pos - child_pos)
         .collect();
 
+    if cc > u8::MAX as usize {
+        return encode_dense_node(children, &distances, pb, payload_bytes);
+    }
+
     let max_distance = *distances.iter().max().unwrap_or(&0);
 
     // Choose the smallest sparse type that fits.
@@ -347,6 +351,64 @@ fn encode_sparse_node(
         write_12bit_pointers(&mut out, &distances);
     } else {
         for &d in &distances {
+            write_be_unsigned(&mut out, d, bytes_per_ptr);
+        }
+    }
+
+    out.extend_from_slice(payload_bytes);
+    Ok(out)
+}
+
+/// Encode a dense node for a transition span. Dense nodes can represent all
+/// 256 byte values because they store `span_len - 1` in a single byte; sparse
+/// nodes cannot represent 256 children because their child count is one byte.
+fn encode_dense_node(
+    children: &[(u8, u64)],
+    distances: &[u64],
+    pb: u8,
+    payload_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let (&min_transition, &max_transition) = match (
+        children.iter().map(|(transition, _)| transition).min(),
+        children.iter().map(|(transition, _)| transition).max(),
+    ) {
+        (Some(min), Some(max)) => (min, max),
+        _ => {
+            return Err(Error::InvalidData(
+                "cannot encode dense trie node with no children".to_string(),
+            ))
+        }
+    };
+    let span = (max_transition as usize) - (min_transition as usize) + 1;
+    debug_assert!(span <= 256);
+
+    let mut dense_distances = vec![0u64; span];
+    for ((transition, _), distance) in children.iter().zip(distances.iter().copied()) {
+        dense_distances[(*transition as usize) - (min_transition as usize)] = distance;
+    }
+
+    let max_distance = *dense_distances.iter().max().unwrap_or(&0);
+    let (node_type, bytes_per_ptr) = if max_distance <= 0xFFF {
+        (NodeType::Dense12, 0)
+    } else if max_distance <= 0xFFFF {
+        (NodeType::Dense16, 2)
+    } else if max_distance <= 0xFF_FFFF {
+        (NodeType::Dense24, 3)
+    } else if max_distance <= 0xFFFF_FFFF {
+        (NodeType::Dense32, 4)
+    } else if max_distance <= 0xFF_FFFF_FFFF {
+        (NodeType::Dense40, 5)
+    } else {
+        (NodeType::LongDense, 8)
+    };
+
+    let type_byte = (node_type as u8) << 4 | (pb & 0x0F);
+    let mut out = vec![type_byte, min_transition, (span - 1) as u8];
+
+    if node_type == NodeType::Dense12 {
+        write_12bit_pointers(&mut out, &dense_distances);
+    } else {
+        for &d in &dense_distances {
             write_be_unsigned(&mut out, d, bytes_per_ptr);
         }
     }

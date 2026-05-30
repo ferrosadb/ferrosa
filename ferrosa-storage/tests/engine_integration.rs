@@ -319,7 +319,7 @@ fn flush_2000_keys_all_readable() {
 
     engine.flush(&tid).unwrap();
 
-    let mut missing = 0u64;
+    let mut missing = 0;
     for i in 0..2000u64 {
         let key = make_key(&format!("k{i:06}"));
         if engine.read(&tid, &key).unwrap().is_none() {

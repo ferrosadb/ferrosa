@@ -1500,6 +1500,54 @@ mod tests {
     }
 
     #[test]
+    fn write_many_partitions_point_lookup_roundtrip() {
+        use crate::reader::{SSTableComponents, SSTableReader};
+
+        let header = test_header();
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+            verify_output: true,
+        };
+
+        let mut partitions: Vec<Partition> = (0..2000u64)
+            .map(|i| {
+                make_partition(
+                    format!("k{i:06}").as_bytes(),
+                    &[0x00, 0x00, ((i >> 8) & 0xFF) as u8, (i & 0xFF) as u8],
+                    format!("v{i}").as_bytes(),
+                    i as i64,
+                )
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let mut writer = SSTableWriter::new(options, header);
+        for partition in &partitions {
+            writer.add_partition(partition).unwrap();
+        }
+        let output = writer.finish().unwrap();
+        let reader = SSTableReader::open(SSTableComponents {
+            data: output.data.as_slice(),
+            partitions: output.partitions.as_slice(),
+            rows: output.rows.as_slice(),
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })
+        .unwrap();
+
+        for i in 0..2000u64 {
+            let key = DecoratedKey::new(PartitionKey::new(format!("k{i:06}").into_bytes()));
+            assert!(
+                reader.get_partition(&key).unwrap().is_some(),
+                "point lookup missed k{i:06}"
+            );
+        }
+    }
+
+    #[test]
     fn round_trip_write_read_all_components() {
         let header = test_header();
         let options = WriteOptions {

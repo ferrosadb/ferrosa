@@ -460,7 +460,13 @@ impl<R: ReadAt> SSTableReader<R> {
             let decompressed = decompress_data(&self.data, ci)?;
             let mut reader = crate::data::DataReader::new(&decompressed, &self.header, 0);
             while partitions.len() < limit {
-                let Some(partition) = reader.read_partition_limited_rows(row_limit)? else {
+                let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
+                let partition = if is_final_requested_partition {
+                    reader.read_partition_prefix_rows(row_limit)?
+                } else {
+                    reader.read_partition_limited_rows(row_limit)?
+                };
+                let Some(partition) = partition else {
                     break;
                 };
                 partitions.push(partition);
@@ -468,7 +474,13 @@ impl<R: ReadAt> SSTableReader<R> {
         } else {
             let mut reader = crate::data::DataReader::new(&self.data, &self.header, 0);
             while partitions.len() < limit {
-                let Some(partition) = reader.read_partition_limited_rows(row_limit)? else {
+                let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
+                let partition = if is_final_requested_partition {
+                    reader.read_partition_prefix_rows(row_limit)?
+                } else {
+                    reader.read_partition_limited_rows(row_limit)?
+                };
+                let Some(partition) = partition else {
                     break;
                 };
                 partitions.push(partition);

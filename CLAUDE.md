@@ -97,10 +97,12 @@ Non-negotiable rules for all agents:
 
 - **No `#[ignore]`** — Zero legitimately ignored tests in this codebase.
 - **No silent returns** — Never `if condition { return; }` in a test body.
-- **Panic on missing infrastructure** — Tests requiring Firecracker/Docker/cluster must `panic!` with setup instructions.
+- **Live-infra opt-in target** — Tests requiring Firecracker/Docker/cluster must be behind the crate feature `live-infra-tests`, so default verifier commands do not report missing-infra test bodies as passed.
+- **Panic on missing infrastructure** — Once `live-infra-tests` is enabled, tests requiring Firecracker/Docker/cluster must `panic!` with setup instructions when the matching environment prerequisite is absent.
 - **Infrastructure env vars**:
   - `FERROSA_TEST_FIRECRACKER=1` — Firecracker VMs
   - `FERROSA_TEST_CLUSTER_NODES=<addr>` — pre-provisioned cluster
   - `FERROSA_TEST_CONTAINERS=1` — Docker/Podman compose (MinIO + Cassandra compat)
 - **Container runtime** — Use `container_runtime()` helper, not hardcoded `"docker"`.
 - **Goal**: `cargo test` with full infrastructure = zero failures, zero ignored.
+- **Local live-infra form**: enable the feature and the matching env var together, e.g. `FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-storage --features live-infra-tests compaction_end_to_end_pipeline -- --nocapture`.
