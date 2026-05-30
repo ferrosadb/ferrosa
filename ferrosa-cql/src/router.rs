@@ -3704,10 +3704,13 @@ fn route_update_virtual_table(
 
 /// Encode a lightweight-transaction `[applied]` result.
 ///
-/// CQL protocol returns a RESULT Rows frame with `[applied]` boolean plus
-/// all table columns.  When `applied=true`, the extra columns are NULL.
-/// When `applied=false`, `existing_row` contains the current row values.
-/// When `applied=true`, all table columns are NULL.
+/// Cassandra semantics:
+/// - **Applied** (`applied=true`): the result is the single `[applied]=true`
+///   column. No table columns are appended — strictly-typed drivers
+///   deserialize an applied conditional as `(bool,)`.
+/// - **Not applied** (`applied=false`): `[applied]=false` plus the current
+///   values of the conflicting row (`existing_row`), so the caller can see why
+///   the condition failed.
 fn encode_lwt_applied(
     applied: bool,
     keyspace: &str,
@@ -3716,15 +3719,24 @@ fn encode_lwt_applied(
     schema: &Schema,
     existing_row: Option<&[Option<CqlValue>]>,
 ) -> BytesMut {
+    if applied {
+        return result::encode_rows(
+            &["[applied]".to_string()],
+            &[CqlType::Boolean],
+            keyspace,
+            table,
+            &[vec![Some(CqlValue::Boolean(true))]],
+        );
+    }
+
     let mut col_names = vec!["[applied]".to_string()];
     let mut col_types = vec![CqlType::Boolean];
-    let mut row: Vec<Option<CqlValue>> = vec![Some(CqlValue::Boolean(applied))];
+    let mut row: Vec<Option<CqlValue>> = vec![Some(CqlValue::Boolean(false))];
 
     for (i, (name, cm)) in table_meta.columns.iter().enumerate() {
         col_names.push(name.clone());
         let cql_type = resolve_col_type(&cm.column_type, keyspace, schema).unwrap_or(CqlType::Blob);
         col_types.push(cql_type);
-        // Use existing row values when not applied, NULL when applied
         let val = existing_row.and_then(|r| r.get(i)).and_then(|v| v.clone());
         row.push(val);
     }
@@ -11709,6 +11721,87 @@ mod tests {
             result.is_ok(),
             "second INSERT IF NOT EXISTS should succeed (return applied=false): {:?}",
             result.err()
+        );
+    }
+
+    /// Cassandra LWT result shape: an *applied* conditional returns ONLY the
+    /// `[applied]=true` column; a *not-applied* one returns `[applied]=false`
+    /// plus the conflicting row's columns. Returning the full column set on
+    /// apply breaks strictly-typed drivers (scylla-rust) that deserialize the
+    /// applied result as `(bool,)`.
+    #[tokio::test]
+    async fn lwt_applied_returns_only_applied_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        route(
+            &state,
+            &ctx_ks,
+            crate::parser::parse("CREATE TABLE ks.t (id int PRIMARY KEY, name text, email text)")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Applied → exactly one column: [applied].
+        let applied = route(
+            &state,
+            &ctx_ks,
+            crate::parser::parse("INSERT INTO ks.t (id, name) VALUES (1, 'a') IF NOT EXISTS")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let buf = match applied {
+            RouteResult::Result(b) => b,
+            other => panic!("expected Result, got {:?}", std::mem::discriminant(&other)),
+        };
+        assert_eq!(
+            extract_column_count(&buf),
+            1,
+            "applied LWT must return only the [applied] column"
+        );
+
+        // Not applied → [applied] plus the conflicting row's columns (> 1).
+        let not_applied = route(
+            &state,
+            &ctx_ks,
+            crate::parser::parse("INSERT INTO ks.t (id, name) VALUES (1, 'b') IF NOT EXISTS")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let buf2 = match not_applied {
+            RouteResult::Result(b) => b,
+            other => panic!("expected Result, got {:?}", std::mem::discriminant(&other)),
+        };
+        assert!(
+            extract_column_count(&buf2) > 1,
+            "not-applied LWT must return the conflicting row columns"
         );
     }
 
