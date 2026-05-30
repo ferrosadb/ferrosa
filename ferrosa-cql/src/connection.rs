@@ -1758,13 +1758,73 @@ fn system_schema_column_type(table_ks: &str, table_name: &str, col_name: &str) -
 }
 
 fn system_schema_column_specs(table_ks: &str, table_name: &str) -> Vec<(String, CqlType)> {
-    if table_ks != "system_schema" {
-        return Vec::new();
-    }
-
     let text = || CqlType::Varchar;
     let text_map = || CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar));
     let text_list = || CqlType::List(Box::new(CqlType::Varchar));
+    let text_set = || CqlType::Set(Box::new(CqlType::Varchar));
+
+    // `system` keyspace topology tables. These must mirror the column shape
+    // emitted by the system.local / system.peers handlers in router.rs so that
+    // a prepared `SELECT col, ... FROM system.local` advertises non-empty,
+    // correctly-typed result metadata. Strict drivers (gocql, DataStax Java)
+    // unmarshal EXECUTE rows using this prepared metadata — an empty column
+    // list makes them fail with "not enough columns to scan into".
+    if table_ks == "system" {
+        let specs: Vec<(&str, CqlType)> = match table_name {
+            "local" => vec![
+                ("key", text()),
+                ("cluster_name", text()),
+                ("data_center", text()),
+                ("rack", text()),
+                ("host_id", CqlType::Uuid),
+                ("partitioner", text()),
+                ("native_protocol_version", text()),
+                ("cql_version", text()),
+                ("release_version", text()),
+                ("schema_version", CqlType::Uuid),
+                ("rpc_port", CqlType::Int),
+                ("listen_address", CqlType::Inet),
+                ("broadcast_address", CqlType::Inet),
+                ("rpc_address", CqlType::Inet),
+                ("bootstrapped", text()),
+                ("tokens", text_set()),
+            ],
+            "peers" => vec![
+                ("peer", CqlType::Inet),
+                ("peer_port", CqlType::Int),
+                ("data_center", text()),
+                ("rack", text()),
+                ("host_id", CqlType::Uuid),
+                ("native_address", CqlType::Inet),
+                ("native_port", CqlType::Int),
+                ("rpc_address", CqlType::Inet),
+                ("schema_version", CqlType::Uuid),
+                ("release_version", text()),
+                ("tokens", text_set()),
+            ],
+            "peers_v2" => vec![
+                ("peer", CqlType::Inet),
+                ("peer_port", CqlType::Int),
+                ("data_center", text()),
+                ("rack", text()),
+                ("host_id", CqlType::Uuid),
+                ("native_address", CqlType::Inet),
+                ("native_port", CqlType::Int),
+                ("schema_version", CqlType::Uuid),
+                ("release_version", text()),
+                ("tokens", text_set()),
+            ],
+            _ => Vec::new(),
+        };
+        return specs
+            .into_iter()
+            .map(|(name, ty)| (name.to_string(), ty))
+            .collect();
+    }
+
+    if table_ks != "system_schema" {
+        return Vec::new();
+    }
 
     let specs: Vec<(&str, CqlType)> = match table_name {
         "keyspaces" => vec![
@@ -1985,11 +2045,36 @@ fn build_result_columns(
                     result.push((name.clone(), cql_type));
                 }
             }
-            SelectColumn::FunctionCall { alias, name, .. } => {
-                // For function calls, use the alias or function name;
-                // type is unknown without deeper analysis, default to Varchar.
-                let col_name = alias.as_ref().unwrap_or(name).clone();
-                result.push((col_name, CqlType::Varchar));
+            SelectColumn::FunctionCall {
+                alias, name, args, ..
+            } => {
+                // Type built-in functions so prepared-statement result metadata
+                // matches what EXECUTE returns. Strict drivers (gocql, DataStax
+                // Java) unmarshal using the PREPARE metadata, so a wrong type
+                // (e.g. COUNT(*) as varchar) fails with "can not unmarshal
+                // varchar into *int". Mirror build_column_info()'s typing.
+                let fn_lower = name.to_lowercase();
+                let display = alias.clone().unwrap_or_else(|| {
+                    if fn_lower == "count" {
+                        "count".to_string()
+                    } else {
+                        fn_lower.clone()
+                    }
+                });
+                let cql_type = match fn_lower.as_str() {
+                    "count" | "writetime" | "token" => CqlType::Bigint,
+                    "ttl" => CqlType::Int,
+                    "now" | "totimestamp" | "todate" | "currenttimestamp" => CqlType::Timestamp,
+                    "uuid" | "timeuuid" => CqlType::Uuid,
+                    "avg" => CqlType::Double,
+                    "min" | "max" | "sum" => args
+                        .first()
+                        .and_then(|a| crate::router::extract_column_name(a).ok())
+                        .and_then(|c| resolve(&c))
+                        .unwrap_or(CqlType::Varchar),
+                    _ => CqlType::Varchar,
+                };
+                result.push((display, cql_type));
             }
         }
     }
@@ -2869,6 +2954,27 @@ mod tests {
                 i.values[0]
             );
         }
+    }
+
+    #[test]
+    fn system_table_column_specs_are_typed_for_prepare() {
+        // A prepared `SELECT cluster_name, data_center FROM system.local` must
+        // advertise non-empty, correctly-typed result metadata, or strict
+        // drivers (gocql, DataStax Java) fail with "not enough columns to scan
+        // into: have N want 0".
+        let local = system_schema_column_specs("system", "local");
+        assert!(!local.is_empty(), "system.local must expose column specs");
+        let by_name: std::collections::HashMap<String, CqlType> = local.into_iter().collect();
+        assert_eq!(by_name.get("cluster_name"), Some(&CqlType::Varchar));
+        assert_eq!(by_name.get("data_center"), Some(&CqlType::Varchar));
+        assert_eq!(by_name.get("host_id"), Some(&CqlType::Uuid));
+        assert_eq!(by_name.get("rpc_port"), Some(&CqlType::Int));
+
+        assert!(!system_schema_column_specs("system", "peers").is_empty());
+        assert!(!system_schema_column_specs("system", "peers_v2").is_empty());
+        // Unrelated keyspaces still resolve to nothing.
+        assert!(system_schema_column_specs("system", "bogus").is_empty());
+        assert!(system_schema_column_specs("myks", "local").is_empty());
     }
 
     #[test]

@@ -6787,7 +6787,7 @@ fn apply_system_select(
 ///
 /// In the `parse_term` codepath, bare identifiers in function arguments are
 /// parsed as `Term::FunctionCall { name, args: [] }` (zero-arg function call).
-fn extract_column_name(term: &Term) -> Result<String, CqlError> {
+pub(crate) fn extract_column_name(term: &Term) -> Result<String, CqlError> {
     match term {
         Term::FunctionCall { name, args, .. } if args.is_empty() => Ok(name.to_lowercase()),
         Term::StringLiteral(s) => Ok(s.clone()),
