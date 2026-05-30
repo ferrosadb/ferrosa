@@ -24,7 +24,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install asciidoctor
-        run: sudo gem install asciidoctor --no-document
+        # Pin the version so generated HTML is byte-reproducible across CI and
+        # local runs (different asciidoctor versions render structurally
+        # different HTML, which would defeat the drift check below).
+        run: sudo gem install asciidoctor -v 2.0.20 --no-document
 
       - name: Generate HTML
         run: make -C examples html
