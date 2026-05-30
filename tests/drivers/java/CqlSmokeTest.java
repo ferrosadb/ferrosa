@@ -80,7 +80,11 @@ public class CqlSmokeTest {
         try {
             session = CqlSession.builder()
                     .addContactPoint(new InetSocketAddress(ferrosaHost(), ferrosaPort()))
-                    .withLocalDatacenter("dc1")
+                    // Must match the DC ferrosa advertises in system.local
+                    // ("datacenter1", the Cassandra default). The DataStax
+                    // driver ignores nodes outside the configured local DC, so a
+                    // mismatch yields "No node was available to execute the query".
+                    .withLocalDatacenter("datacenter1")
                     .build();
             System.out.println("  PASS  connect");
             passed++;
