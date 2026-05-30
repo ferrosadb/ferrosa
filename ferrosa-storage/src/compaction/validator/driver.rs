@@ -4,14 +4,36 @@
 //! k-way merge, and SSTable read-back — so the differential check covers
 //! serialization round-trips, not just the in-memory merge.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
 use ferrosa_sstable::types::Partition;
 
 use crate::compaction::executor::CompactionExecutor;
 use crate::compaction::metadata::{CompactionTask, SSTableMetadata};
 use crate::TableId;
+
+/// Logical projection of a partition set: the winning `(value, timestamp)` per
+/// `(key, clustering, column)`. Robust to serialization-level field
+/// normalization, so it compares merge *results* rather than encodings.
+pub fn logical_projection(
+    partitions: &[Partition],
+) -> BTreeMap<(DecoratedKey, Vec<u8>, u16), (Option<Vec<u8>>, i64)> {
+    let mut map = BTreeMap::new();
+    for p in partitions {
+        for row in &p.rows {
+            for (col, cell) in &row.cells {
+                map.insert(
+                    (p.key.clone(), row.clustering.clone(), *col),
+                    (cell.value.clone(), cell.timestamp),
+                );
+            }
+        }
+    }
+    map
+}
 
 /// Write one SSTable from `partitions` into `dir`, returning its metadata.
 pub fn write_sstable(
@@ -123,7 +145,6 @@ mod tests {
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     use ferrosa_common::CellValue;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
-    use std::collections::BTreeMap;
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -157,25 +178,6 @@ mod tests {
         }
     }
 
-    /// Logical projection: the winning (value, timestamp) per (key, clustering,
-    /// column). Robust to serialization-level field normalization.
-    fn project(
-        partitions: &[Partition],
-    ) -> BTreeMap<(DecoratedKey, Vec<u8>, u16), (Option<Vec<u8>>, i64)> {
-        let mut map = BTreeMap::new();
-        for p in partitions {
-            for row in &p.rows {
-                for (col, cell) in &row.cells {
-                    map.insert(
-                        (p.key.clone(), row.clustering.clone(), *col),
-                        (cell.value.clone(), cell.timestamp),
-                    );
-                }
-            }
-        }
-        map
-    }
-
     #[test]
     fn real_compaction_matches_oracle() {
         let tmp = tempfile::tempdir().unwrap();
@@ -203,14 +205,14 @@ mod tests {
         );
 
         assert_eq!(
-            project(&actual),
-            project(&expected),
+            logical_projection(&actual),
+            logical_projection(&expected),
             "real compaction output must match the oracle merge"
         );
         // The newest write wins the cell.
         let key = DecoratedKey::new(PartitionKey::new(b"k0001".to_vec()));
         assert_eq!(
-            project(&actual).get(&(key, ck.clone(), 0)),
+            logical_projection(&actual).get(&(key, ck.clone(), 0)),
             Some(&(Some(b"new".to_vec()), 3)),
         );
     }
