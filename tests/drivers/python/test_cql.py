@@ -480,7 +480,10 @@ class TestErrorHandling:
             session.execute("SELECT * FROM nonexistent_table_xyz")
 
     def test_invalid_syntax(self, session):
-        from cassandra import InvalidRequest, SyntaxException
+        # SyntaxException lives in cassandra.protocol (not the top-level package)
+        # in the cassandra-driver 3.x line.
+        from cassandra import InvalidRequest
+        from cassandra.protocol import SyntaxException
 
         with pytest.raises((SyntaxException, InvalidRequest)):
             session.execute("SELEC BROKEN QUERY")
