@@ -15771,6 +15771,60 @@ mod tests {
         );
     }
 
+    /// Drive the full `examples/vector-indexes` flow through `route()`: create
+    /// an HVQ-method vector index, insert vectors as CQL list literals, and run
+    /// an `ANN OF` query — the exact path the CI examples job exercises via
+    /// cqlsh. Every statement must execute without error.
+    #[tokio::test]
+    async fn example_hvq_vector_index_flow_executes_end_to_end() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let run = |cql: String| {
+            let state = &state;
+            let ctx = &ctx;
+            async move {
+                route(state, ctx, crate::parser::parse(&cql).unwrap())
+                    .await
+                    .unwrap_or_else(|e| panic!("statement failed: {cql}: {e:?}"))
+            }
+        };
+
+        run("CREATE KEYSPACE semantic WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}".into()).await;
+        run("CREATE TABLE semantic.articles (id int PRIMARY KEY, category text, embedding vector<float, 4>)".into()).await;
+        run("CREATE INDEX articles_hvq_ann ON semantic.articles (embedding) USING 'vector' WITH OPTIONS = {'method': 'hvq'}".into()).await;
+
+        // Storage registered the quantized method for this CQL-created index.
+        assert_eq!(
+            state
+                .engine
+                .vector_index_method(&TableId::new("semantic", "articles"), "articles_hvq_ann")
+                .unwrap(),
+            ferrosa_storage::VectorIndexMethod::QuantizedIvf,
+        );
+
+        for (id, cat, vec) in [
+            (1, "science", "[0.90, 0.10, 0.00, 0.00]"),
+            (2, "science", "[0.80, 0.20, 0.10, 0.00]"),
+            (3, "history", "[0.00, 0.00, 0.90, 0.10]"),
+            (4, "history", "[0.10, 0.00, 0.80, 0.20]"),
+        ] {
+            run(format!(
+                "INSERT INTO semantic.articles (id, category, embedding) VALUES ({id}, '{cat}', {vec})"
+            ))
+            .await;
+        }
+
+        // ANN query against the HVQ index must execute and return a result set.
+        run("SELECT id FROM semantic.articles ORDER BY embedding ANN OF [0.90, 0.10, 0.00, 0.00] LIMIT 2".into()).await;
+    }
+
     // ── parse_permissions coverage for remaining variants ────────────
 
     #[test]
