@@ -7,6 +7,7 @@
 //! the production library; the feature lets `ferrosa-loadgen` reuse the same
 //! oracle/auditor for soak testing.
 
+pub mod auditor;
 pub mod oracle;
 
 #[cfg(test)]
@@ -71,6 +72,7 @@ mod tests {
 
 #[cfg(test)]
 mod prop_tests {
+    use super::auditor::audit_partition;
     use super::oracle::oracle_merge;
     use crate::merge::merge_partitions;
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -149,6 +151,18 @@ mod prop_tests {
 
             prop_assert_eq!(&forward, &backward, "merge must be order-independent");
             prop_assert_eq!(&forward, &oracle, "merge must match the oracle");
+
+            // The merged output (and the oracle) must satisfy format invariants.
+            prop_assert!(
+                audit_partition(&forward).is_empty(),
+                "merge output violated format invariants: {:?}",
+                audit_partition(&forward)
+            );
+            prop_assert!(
+                audit_partition(&oracle).is_empty(),
+                "oracle output violated format invariants: {:?}",
+                audit_partition(&oracle)
+            );
         }
     }
 }
