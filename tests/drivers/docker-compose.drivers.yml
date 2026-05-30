@@ -67,6 +67,9 @@ services:
   # Single Ferrosa node (auth disabled, graph enabled)
   # -------------------------------------------------------------------------
   ferrosa:
+    # Tagged so a pre-built image (e.g. one loaded from the build-once artifact
+    # or a prior local build) is reused by `compose up`/`run` without rebuilding.
+    image: ferrosa-test-node:latest
     build:
       context: ../..
       dockerfile: Dockerfile

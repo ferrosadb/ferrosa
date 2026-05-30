@@ -32,11 +32,19 @@ COMPOSE_BASE="${REPO_ROOT}/tests/docker-compose.cluster.yml"
 # target (typically node2) reports `failed to compute cache key:
 # "/Cargo.lock": not found`. Pre-building the image with a single
 # `docker build` invocation is the canonical way around this — see p1-32 spec.
-echo "Building ferrosa-test-node:latest (single docker build, avoids BuildKit race)..." >&2
-docker build \
-    -t ferrosa-test-node:latest \
-    -f "${REPO_ROOT}/Dockerfile" \
-    "${REPO_ROOT}"
+# Reuse a pre-built image when one is already loaded (CI loads the
+# `ferrosa-node-image` artifact built once by the `build-node-image` job),
+# otherwise build it locally. Build/release/run: don't recompile if the
+# immutable artifact already exists.
+if docker image inspect ferrosa-test-node:latest >/dev/null 2>&1; then
+    echo "Using preloaded ferrosa-test-node:latest image (skipping build)." >&2
+else
+    echo "Building ferrosa-test-node:latest (single docker build, avoids BuildKit race)..." >&2
+    docker build \
+        -t ferrosa-test-node:latest \
+        -f "${REPO_ROOT}/Dockerfile" \
+        "${REPO_ROOT}"
+fi
 
 # ── Bring up cluster (no --build; uses the pre-built image via image: tag) ──
 echo "Starting Ferrosa CI test cluster (profile: ${PROFILE}, project: ${PROJECT_NAME})..." >&2

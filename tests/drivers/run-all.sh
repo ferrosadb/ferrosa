@@ -37,10 +37,17 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# 1. Build Ferrosa Docker image
+# 1. Build Ferrosa Docker image (skip if one is already present)
 # ---------------------------------------------------------------------------
-echo "=== Building Ferrosa image (runtime: $RUNTIME) ==="
-"$RUNTIME" compose -f "$COMPOSE_FILE" build ferrosa
+# Build/release/run: reuse an existing ferrosa-test-node:latest image (loaded
+# from the build-once CI artifact, or built by a prior local run) instead of
+# recompiling the release binary inside Docker every time.
+if "$RUNTIME" image inspect ferrosa-test-node:latest >/dev/null 2>&1; then
+    echo "=== Reusing existing ferrosa-test-node:latest image (skipping build) ==="
+else
+    echo "=== Building Ferrosa image (runtime: $RUNTIME) ==="
+    "$RUNTIME" compose -f "$COMPOSE_FILE" build ferrosa
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Start Ferrosa + RustFS
