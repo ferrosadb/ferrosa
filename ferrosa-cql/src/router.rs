@@ -5299,6 +5299,25 @@ fn resolve_index_type(
     }
 }
 
+/// Resolve the `method` index option to a storage [`VectorIndexMethod`].
+///
+/// Absent or `'hnsw'` selects the full-precision HNSW sidecar (the default);
+/// `'hvq'` selects the hybrid vector quantization (quantized IVF / C-SPANN)
+/// artifact path. Any other value fails loudly rather than silently falling
+/// back to HNSW.
+fn resolve_vector_index_method(
+    options: &HashMap<String, String>,
+) -> Result<ferrosa_storage::VectorIndexMethod, CqlError> {
+    use ferrosa_storage::VectorIndexMethod;
+    match options.get("method").map(String::as_str) {
+        None | Some("hnsw") => Ok(VectorIndexMethod::Hnsw),
+        Some("hvq") => Ok(VectorIndexMethod::QuantizedIvf),
+        Some(other) => Err(CqlError::Invalid(format!(
+            "unknown vector index method '{other}' (expected 'hnsw' or 'hvq')"
+        ))),
+    }
+}
+
 fn vector_dimension_from_column_type(column_type: &str) -> Option<usize> {
     let lower = column_type.trim().to_ascii_lowercase();
     let inner = lower.strip_prefix("vector<")?.strip_suffix('>')?;
@@ -5326,6 +5345,14 @@ async fn route_create_index(
 
     // Resolve index type
     let index_type = resolve_index_type(s.using.as_deref(), &s.columns, &options_map)?;
+
+    // For vector indexes, resolve the artifact/search method up front so an
+    // unknown `method` option rejects the whole statement before any DDL runs.
+    let vector_method = if index_type == IndexType::Vector {
+        Some(resolve_vector_index_method(&options_map)?)
+    } else {
+        None
+    };
 
     // Generate index name if not provided
     let index_name = s
@@ -5397,9 +5424,14 @@ async fn route_create_index(
                             target_col, column_type
                         ))
                     })?;
-                state
-                    .engine
-                    .add_vector_index(&table_id, &index_name, pos, dimension)
+                let method = vector_method.expect("vector index resolves a method above");
+                state.engine.add_vector_index_with_method(
+                    &table_id,
+                    &index_name,
+                    pos,
+                    dimension,
+                    method,
+                )
             } else {
                 state.engine.add_index(&table_id, &index_name, pos)
             };
@@ -15659,6 +15691,83 @@ mod tests {
         assert!(
             scoped[0].score > 0.1,
             "CQL-created vector index must feed scoped storage ANN and exclude cross-prefix exact matches: {scoped:?}"
+        );
+    }
+
+    // ── CREATE INDEX … USING 'vector' WITH OPTIONS={'method': …} ──────
+
+    /// Set up a keyspace + table with a `vector<float, 3>` column, then run the
+    /// supplied `CREATE INDEX` statement. Returns the shared state so the caller
+    /// can inspect the storage engine. The temp dir is leaked into the tuple to
+    /// keep it alive for the duration of the test.
+    async fn create_vector_index(
+        create_index_cql: &str,
+    ) -> (SharedState, TempDir, Result<RouteResult, CqlError>) {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE vidx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE vidx.docs (id int PRIMARY KEY, embedding vector<float, 3>)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse(create_index_cql).unwrap(),
+        )
+        .await;
+        (state, dir, result)
+    }
+
+    #[tokio::test]
+    async fn create_vector_index_default_method_is_hnsw() {
+        let (state, _dir, result) =
+            create_vector_index("CREATE INDEX idx ON vidx.docs (embedding) USING 'vector'").await;
+        result.expect("default vector index create must succeed");
+        let method = state
+            .engine
+            .vector_index_method(&TableId::new("vidx", "docs"), "idx")
+            .unwrap();
+        assert_eq!(method, ferrosa_storage::VectorIndexMethod::Hnsw);
+    }
+
+    #[tokio::test]
+    async fn create_vector_index_hvq_method_selects_quantized_storage() {
+        let (state, _dir, result) = create_vector_index(
+            "CREATE INDEX idx ON vidx.docs (embedding) USING 'vector' WITH OPTIONS = {'method': 'hvq'}",
+        )
+        .await;
+        result.expect("hvq vector index create must succeed");
+        let method = state
+            .engine
+            .vector_index_method(&TableId::new("vidx", "docs"), "idx")
+            .unwrap();
+        assert_eq!(
+            method,
+            ferrosa_storage::VectorIndexMethod::QuantizedIvf,
+            "WITH OPTIONS={{'method':'hvq'}} must register the quantized IVF storage method"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_vector_index_unknown_method_is_rejected() {
+        let (_state, _dir, result) = create_vector_index(
+            "CREATE INDEX idx ON vidx.docs (embedding) USING 'vector' WITH OPTIONS = {'method': 'bogus'}",
+        )
+        .await;
+        assert!(
+            matches!(result.err(), Some(CqlError::Invalid(_))),
+            "an unknown vector index method must fail loudly"
         );
     }
 
