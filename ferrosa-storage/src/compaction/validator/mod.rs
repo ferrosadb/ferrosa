@@ -48,6 +48,25 @@ mod tests {
         assert_eq!(ab, ba, "merge_partitions must be order-independent");
         assert_eq!(ab, oracle, "merge_partitions must match the oracle");
     }
+
+    /// When a write and a delete carry the same timestamp, the write is favored
+    /// and the data is preserved (Ferrosa's chosen equal-timestamp reconciliation).
+    #[test]
+    fn write_wins_over_tombstone_on_equal_timestamp() {
+        let write = partition(vec![(0, CellValue::live(b"v".to_vec(), 7))], 7);
+        let del = partition(vec![(0, CellValue::tombstone(7, 100))], 7);
+
+        let oracle = oracle_merge(&[write.clone(), del.clone()]);
+        let ab = merge_partitions(vec![write.clone(), del.clone()]);
+        let ba = merge_partitions(vec![del, write]);
+
+        assert_eq!(ab, ba, "merge must be order-independent");
+        assert_eq!(ab, oracle, "merge must match the oracle");
+        assert!(
+            ab.rows[0].cells[0].1.value.is_some(),
+            "the write must survive the equal-timestamp tie, got a tombstone"
+        );
+    }
 }
 
 #[cfg(test)]

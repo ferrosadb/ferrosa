@@ -107,8 +107,9 @@ fn liveness_wins(x: LivenessInfo, y: LivenessInfo) -> bool {
 /// True when cell `cand` supersedes `cur` under deterministic last-write-wins.
 ///
 /// Higher timestamp wins. On an equal timestamp the result must not depend on
-/// merge order: a tombstone beats a live cell, otherwise the lexicographically
-/// greater value wins, and two tombstones are broken by local deletion time.
+/// merge order: a write (a cell with a value) beats a tombstone so equal-
+/// timestamp data is preserved; among writes the lexicographically greater value
+/// wins; two tombstones are broken by local deletion time.
 fn cell_wins(cand: &CellValue, cur: &CellValue) -> bool {
     if cand.timestamp != cur.timestamp {
         return cand.timestamp > cur.timestamp;
@@ -118,7 +119,7 @@ fn cell_wins(cand: &CellValue, cur: &CellValue) -> bool {
 
 fn tie_rank(c: &CellValue) -> (bool, &[u8], i32) {
     (
-        c.is_tombstone(),
+        c.value.is_some(),
         c.value.as_deref().unwrap_or(&[]),
         c.local_deletion_time,
     )
