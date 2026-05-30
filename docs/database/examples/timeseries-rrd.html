@@ -26,7 +26,12 @@
 <li><a href="#_shift_range_volatility">Shift-range volatility</a></li>
 </ul>
 </li>
-<li><a href="#_wasm_aggregate_status">WASM Aggregate Status</a></li>
+<li><a href="#_wasm_aggregate_status">WASM Aggregate Status</a>
+<ul class="sectlevel2">
+<li><a href="#_author_the_aggregate_in_rust">Author the aggregate in Rust</a></li>
+<li><a href="#_load_the_compiled_artifact">Load the compiled artifact</a></li>
+</ul>
+</li>
 <li><a href="#_built_in_functions">Built-in Functions</a></li>
 <li><a href="#_multi_column_composite">Multi-Column Composite</a></li>
 <li><a href="#_late_arriving_data">Late-Arriving Data</a></li>
@@ -335,8 +340,98 @@ SELECT sensor_id, ts, vibration_mm_s_min, vibration_mm_s_max,
 <div class="paragraph">
 <p>The runnable sensor demo uses the built-in streaming <code>stddev</code>.
 Ferrosa supports three WASM loading forms for function metadata, and the WASM executor now has a streaming aggregate ABI with <code>init</code>, <code>update(value)</code>, and <code>finalize</code>.
-WASM aggregate execution for live RRD materialization uses that ABI for each row in the rollup window.
-The <code>AS FILE</code> and <code>AS URL &#8230;&#8203; WITH SHA256</code> forms are admin-only artifact loading paths.</p>
+WASM aggregate execution for live RRD materialization uses that ABI for each row in the rollup window.</p>
+</div>
+<div class="sect2">
+<h3 id="_author_the_aggregate_in_rust">Author the aggregate in Rust</h3>
+<div class="paragraph">
+<p>A streaming aggregate keeps bounded state, consumes one value per <code>update</code>, and returns one <code>f64</code> from <code>finalize</code>.
+It declares the <code>ferrosa:streaming-aggregate:v1</code> marker so the executor recognizes the aggregate ABI rather than treating it as a scalar UDF.
+Here is a complete Welford standard-deviation aggregate&#8201;&#8212;&#8201;<code>no_std</code>, allocation-free, and under 60 lines.
+The full crates (this <code>stddev</code> and an <code>rms</code> variant for vibration energy) live at <a href="https://github.com/ferrosadb/ferrosa/tree/main/examples/timeseries-rrd/wasm-rust">examples/timeseries-rrd/wasm-rust</a>.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-rust" data-lang="rust">#![no_std]
+
+use core::panic::PanicInfo;
+
+#[used]
+#[link_section = "ferrosa:streaming-aggregate:v1"]
+static FERROSA_STREAMING_AGGREGATE_ABI: [u8; 57] =
+    *b"ferrosa streaming aggregate abi: init/update/finalize f64";
+
+static mut COUNT: f64 = 0.0;
+static mut MEAN: f64 = 0.0;
+static mut M2: f64 = 0.0;
+
+#[no_mangle]
+pub extern "C" fn init() {
+    unsafe {
+        COUNT = 0.0;
+        MEAN = 0.0;
+        M2 = 0.0;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn update(value: f64) {
+    unsafe {
+        COUNT += 1.0;
+        let delta = value - MEAN;
+        MEAN += delta / COUNT;
+        let delta2 = value - MEAN;
+        M2 += delta * delta2;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn finalize() -&gt; f64 {
+    unsafe {
+        if COUNT &lt;= 0.0 {
+            0.0
+        } else {
+            sqrt(M2 / COUNT)
+        }
+    }
+}
+
+fn sqrt(value: f64) -&gt; f64 {
+    if value &lt;= 0.0 {
+        return 0.0;
+    }
+
+    let mut estimate = if value &gt;= 1.0 { value } else { 1.0 };
+    for _ in 0..16 {
+        estimate = 0.5 * (estimate + value / estimate);
+    }
+    estimate
+}
+
+#[panic_handler]
+fn panic(_info: &amp;PanicInfo) -&gt; ! {
+    loop {}
+}</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Build it for <code>wasm32-unknown-unknown</code> and package the core module as a Component Model artifact:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown \
+  --manifest-path wasm-rust/stddev/Cargo.toml
+wasm-tools component new \
+  wasm-rust/stddev/target/wasm32-unknown-unknown/release/ferrosa_rrd_stddev.wasm \
+  -o stddev.wasm</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_load_the_compiled_artifact">Load the compiled artifact</h3>
+<div class="paragraph">
+<p>The <code>AS FILE</code> and <code>AS URL &#8230;&#8203; WITH SHA256</code> forms are admin-only artifact loading paths.</p>
 </div>
 <div class="listingblock">
 <div class="content">
@@ -390,6 +485,7 @@ CREATE TABLE vibration_with_wasm_stddev (
 <p>Use <code>wasm:</code> functions only for components that declare the <code>ferrosa:streaming-aggregate:v1</code> marker and export <code>init</code>, <code>update</code>, and <code>finalize</code>.
 Scalar WASM UDFs are rejected for aggregate execution rather than being called with a materialized list.
 The URL form requires a SHA-256 digest so artifact bytes cannot change between review and DDL apply.</p>
+</div>
 </div>
 </div>
 </div>

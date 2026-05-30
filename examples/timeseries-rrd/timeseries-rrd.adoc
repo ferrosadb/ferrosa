@@ -104,6 +104,33 @@ include::queries.cql[lines=27..34]
 The runnable sensor demo uses the built-in streaming `stddev`.
 Ferrosa supports three WASM loading forms for function metadata, and the WASM executor now has a streaming aggregate ABI with `init`, `update(value)`, and `finalize`.
 WASM aggregate execution for live RRD materialization uses that ABI for each row in the rollup window.
+
+=== Author the aggregate in Rust
+
+A streaming aggregate keeps bounded state, consumes one value per `update`, and returns one `f64` from `finalize`.
+It declares the `ferrosa:streaming-aggregate:v1` marker so the executor recognizes the aggregate ABI rather than treating it as a scalar UDF.
+Here is a complete Welford standard-deviation aggregate -- `no_std`, allocation-free, and under 60 lines.
+The full crates (this `stddev` and an `rms` variant for vibration energy) live at link:https://github.com/ferrosadb/ferrosa/tree/main/examples/timeseries-rrd/wasm-rust[examples/timeseries-rrd/wasm-rust].
+
+[source,rust]
+----
+include::wasm-rust/stddev/src/lib.rs[]
+----
+
+Build it for `wasm32-unknown-unknown` and package the core module as a Component Model artifact:
+
+[source,bash]
+----
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown \
+  --manifest-path wasm-rust/stddev/Cargo.toml
+wasm-tools component new \
+  wasm-rust/stddev/target/wasm32-unknown-unknown/release/ferrosa_rrd_stddev.wasm \
+  -o stddev.wasm
+----
+
+=== Load the compiled artifact
+
 The `AS FILE` and `AS URL ... WITH SHA256` forms are admin-only artifact loading paths.
 
 [source,sql]
