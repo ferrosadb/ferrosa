@@ -34,6 +34,9 @@ jobs:
   driver-smoke:
     name: Driver Smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -44,11 +47,39 @@ jobs:
         with:
           submodules: true
 
-      - name: Run all language driver smoke tests
-        # C8 (Full CQL Driver Compatibility) is not yet complete —
-        # allow failures until all 6 drivers pass consistently.
+      - name: Reuse prebuilt node image from GHCR if available
+        # ci.yml's build-node-image job compiles the release binary once and
+        # pushes it by commit SHA. Reuse it instead of recompiling in Docker.
+        # The two workflows run in parallel, so poll briefly; fall back to a
+        # local build (run-all.sh) if it never appears (e.g. fork PRs).
         continue-on-error: true
-        run: bash tests/drivers/run-all.sh
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node:${{ github.sha }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || exit 0
+          for i in $(seq 1 30); do
+            if docker pull "$IMAGE" 2>/dev/null; then
+              docker tag "$IMAGE" ferrosa-test-node:latest
+              echo "Reusing prebuilt image $IMAGE (skipping in-Docker build)."
+              exit 0
+            fi
+            echo "waiting for prebuilt image ($i/30)..."
+            sleep 20
+          done
+          echo "Prebuilt image not available; run-all.sh will build from source."
+
+      - name: Run all language driver smoke tests
+        # Informational until C8 (Full CQL Driver Compatibility) is complete:
+        # several drivers still fail collection/TTL cases, the node driver's
+        # control connection, and a few test-side LWT/batch expectations
+        # (diagnosed in specs/coverage/driver-compat-c8.md). continue-on-error
+        # surfaces the failures — logs are teed and the real exit code is
+        # propagated for visibility — without blocking PRs. Remove this once all
+        # six drivers pass consistently.
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/driver-logs
+          bash tests/drivers/run-all.sh 2>&1 | tee /tmp/driver-logs/run-all.log
+          exit ${PIPESTATUS[0]}
         timeout-minutes: 20
 
       - name: Collect driver test logs on failure

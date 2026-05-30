@@ -106,7 +106,6 @@ class CqlSmokeTest
             cluster = Cluster.Builder()
                 .AddContactPoint(host)
                 .WithPort(port)
-                .WithLoadBalancingPolicy(new Cassandra.Policies.RoundRobinPolicy())
                 // Let the driver auto-negotiate protocol version
                 .Build();
             session = cluster.Connect();

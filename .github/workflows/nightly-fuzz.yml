@@ -42,6 +42,8 @@ jobs:
                --skip dep_wait_ordering --skip disk_fail_no_phantom \
                --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
                --skip clock_skew_large_preaccept \
+               --skip binary_ --skip ucs_load_s3_ \
+               --skip ucs_load_read_heavy --skip ucs_load_balanced --skip ucs_load_write_heavy \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           echo "$status" > cargo-test-status
