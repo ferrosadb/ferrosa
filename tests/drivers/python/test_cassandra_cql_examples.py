@@ -225,7 +225,17 @@ class TestCassandraCqlExamples:
 
         print(f"\n{'=' * 60}")
 
-        # This test is informational — reports coverage without failing.
-        # The parser doc test (cassandra_cql_examples.rs) enforces parse coverage.
-        # Uncomment to make it enforcing:
-        # assert failed == 0, f"{failed} CQL statements failed to execute"
+        # Regression floor. A clean pass of the whole corpus is not expected:
+        # the examples are documentation *fragments* (an INSERT whose CREATE
+        # lives in another file, hard-coded keyspaces) and exercise features
+        # ferrosa intentionally does not support (materialized views, triggers,
+        # CREATE ROLE ... WITH HASHED PASSWORD, CUSTOM indexes, data masking).
+        # Instead of requiring zero failures, assert that wire-level execution
+        # coverage does not regress. On a fresh node ferrosa executes ~246 of
+        # the ~847 example statements; the floor is set conservatively below
+        # that. Raise MIN_EXECUTED as ferrosa's CQL coverage grows.
+        MIN_EXECUTED = 200
+        assert passed >= MIN_EXECUTED, (
+            f"CQL example execution regressed: only {passed} statements ran OK "
+            f"(floor {MIN_EXECUTED}). See the failures above."
+        )
