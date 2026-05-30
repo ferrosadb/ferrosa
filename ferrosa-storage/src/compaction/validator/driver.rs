@@ -15,12 +15,14 @@ use crate::compaction::executor::CompactionExecutor;
 use crate::compaction::metadata::{CompactionTask, SSTableMetadata};
 use crate::TableId;
 
+/// A logical projection keyed by `(partition key, clustering, column)` mapping
+/// to the winning `(value, timestamp)`.
+pub type LogicalProjection = BTreeMap<(DecoratedKey, Vec<u8>, u16), (Option<Vec<u8>>, i64)>;
+
 /// Logical projection of a partition set: the winning `(value, timestamp)` per
 /// `(key, clustering, column)`. Robust to serialization-level field
 /// normalization, so it compares merge *results* rather than encodings.
-pub fn logical_projection(
-    partitions: &[Partition],
-) -> BTreeMap<(DecoratedKey, Vec<u8>, u16), (Option<Vec<u8>>, i64)> {
+pub fn logical_projection(partitions: &[Partition]) -> LogicalProjection {
     let mut map = BTreeMap::new();
     for p in partitions {
         for row in &p.rows {
