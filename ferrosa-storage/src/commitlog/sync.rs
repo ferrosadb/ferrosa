@@ -483,14 +483,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (segment, _offset) = write_mutation(dir.path());
 
+        let flush_observed = Arc::new((Mutex::new(false), Condvar::new()));
+        let flush_observed_clone = Arc::clone(&flush_observed);
         let seg_clone = Arc::clone(&segment);
-        let flush_cb: FlushCallback = Arc::new(move || seg_clone.flush_to_disk());
+        let flush_cb: FlushCallback = Arc::new(move || {
+            let result = seg_clone.flush_to_disk();
+            if result.is_ok() {
+                let (lock, cvar) = &*flush_observed_clone;
+                *lock.lock() = true;
+                cvar.notify_all();
+            }
+            result
+        });
         let sync = PeriodicSync::new(Duration::from_millis(50), flush_cb);
         sync.start();
 
-        // File should not exist yet (no on_write, but the timer hasn't fired).
-        // Wait for the periodic flush to fire.
-        thread::sleep(Duration::from_millis(200));
+        // The old test used a fixed 200ms sleep and then checked the file path.
+        // Under full-package parallel test load, OS scheduling can delay the
+        // background sync thread past that wall-clock window even though the
+        // timer behavior is correct. Wait for the flush callback itself so the
+        // assertion is synchronized to the event being tested, not scheduler
+        // timing.
+        let (lock, cvar) = &*flush_observed;
+        let mut flushed = lock.lock();
+        let result = cvar.wait_for(&mut flushed, Duration::from_secs(5));
+        assert!(
+            *flushed && !result.timed_out(),
+            "periodic flush callback did not run within 5s"
+        );
+        drop(flushed);
 
         let path = segment.path();
         assert!(

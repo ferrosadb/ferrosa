@@ -81,6 +81,8 @@ pub async fn run(
                             sstable_id: entry.sstable_id.clone(),
                             index_name: index_name.clone(),
                             index_type: "btree".into(), // pull mode uses default
+                            artifact_kind: None,
+                            direct_upload: false,
                             s3_endpoint: String::new(), // uses pre-configured store
                             s3_bucket: String::new(),
                             s3_prefix: sstable_prefix,

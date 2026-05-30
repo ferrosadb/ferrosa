@@ -472,6 +472,7 @@ services:
 
     /// Provision a 3-node Docker cluster and verify all CQL ports are reachable.
     /// Requires: FERROSA_TEST_CONTAINERS=1
+    #[cfg(feature = "live-infra-tests")]
     #[tokio::test]
     async fn orchestrator_docker_cluster_provision() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
@@ -498,6 +499,7 @@ services:
 
     /// Provision, then tear down, and verify containers are removed.
     /// Requires: FERROSA_TEST_CONTAINERS=1
+    #[cfg(feature = "live-infra-tests")]
     #[tokio::test]
     async fn orchestrator_cluster_teardown() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {

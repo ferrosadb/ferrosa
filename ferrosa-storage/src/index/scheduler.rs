@@ -85,6 +85,9 @@ pub struct IndexBuildResult {
     /// (e.g. `RemoteBackend`). The scheduler should skip local
     /// `SidecarWriter::write()`.
     pub sidecar_written_to_s3: bool,
+    /// Object-backed artifacts already uploaded by the backend and validated
+    /// for manifest publication.
+    pub artifact_manifest_entries: Vec<crate::index::ArtifactManifestEntry>,
 }
 
 /// Default backend that builds indexes in-process from local SSTable files.
@@ -175,6 +178,7 @@ impl IndexBuildBackend for LocalBackend {
             sidecar_entries,
             build_duration: start.elapsed(),
             sidecar_written_to_s3: false,
+            artifact_manifest_entries: Vec::new(),
         })
     }
 }
@@ -213,6 +217,7 @@ impl IndexBuildScheduler {
                     sidecar_entries: HashMap::new(),
                     build_duration: std::time::Duration::from_millis(0),
                     sidecar_written_to_s3: false,
+                    artifact_manifest_entries: Vec::new(),
                 })
             }
         }
@@ -613,6 +618,7 @@ mod tests {
             sidecar_entries,
             build_duration: Duration::from_millis(42),
             sidecar_written_to_s3: false,
+            artifact_manifest_entries: Vec::new(),
         };
 
         assert_eq!(result.sstable_id, "sst-001");
@@ -632,6 +638,7 @@ mod tests {
                     sidecar_entries: std::collections::HashMap::new(),
                     build_duration: Duration::from_millis(0),
                     sidecar_written_to_s3: false,
+                    artifact_manifest_entries: Vec::new(),
                 })
             }
         }
@@ -820,6 +827,7 @@ mod tests {
                     sidecar_entries: std::collections::HashMap::new(),
                     build_duration: Duration::from_millis(1),
                     sidecar_written_to_s3: false,
+                    artifact_manifest_entries: Vec::new(),
                 })
             }
         }
@@ -910,6 +918,7 @@ mod tests {
                     sidecar_entries: HashMap::new(),
                     build_duration: Duration::from_millis(200),
                     sidecar_written_to_s3: false,
+                    artifact_manifest_entries: Vec::new(),
                 })
             }
         }
@@ -954,6 +963,7 @@ mod tests {
                     sidecar_entries: HashMap::new(),
                     build_duration: Duration::from_secs(30),
                     sidecar_written_to_s3: false,
+                    artifact_manifest_entries: Vec::new(),
                 })
             }
         }
@@ -1012,6 +1022,7 @@ mod tests {
                     sidecar_entries,
                     build_duration: Duration::from_millis(1),
                     sidecar_written_to_s3: false,
+                    artifact_manifest_entries: Vec::new(),
                 })
             }
         }

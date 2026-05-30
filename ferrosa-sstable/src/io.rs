@@ -83,9 +83,9 @@ pub trait WriteAt {
 /// `pread` is offsetful (no shared seek state), so sharing one `File` via
 /// `Arc` across threads is safe — see `std::os::unix::fs::FileExt::read_at`.
 ///
-/// Capacity is a tunable (`FERROSA_FD_CACHE_SIZE`, default 1024) chosen so a
-/// node with hundreds of active SSTables fits comfortably under typical
-/// `RLIMIT_NOFILE` values while still amortising opens across queries.
+/// Capacity is a tunable (`FERROSA_FD_CACHE_SIZE`, default 512) chosen to
+/// leave headroom under common 1024-fd test/container limits while still
+/// amortising opens across queries.
 pub struct FdCache {
     inner: std::sync::Mutex<lru::LruCache<std::path::PathBuf, std::sync::Arc<std::fs::File>>>,
     opens: std::sync::atomic::AtomicU64,
@@ -152,6 +152,12 @@ impl FdCache {
             if let Some(f) = guard.get(path) {
                 return Ok(std::sync::Arc::clone(f));
             }
+            if guard.len() >= guard.cap().get() {
+                // Make room before opening the next descriptor. `LruCache::put`
+                // would evict after insertion, but on low RLIMIT_NOFILE systems
+                // opening first can fail with EMFILE before the eviction happens.
+                guard.pop_lru();
+            }
         }
         let file = std::sync::Arc::new(std::fs::File::open(path)?);
         self.opens
@@ -165,7 +171,7 @@ impl FdCache {
     }
 }
 
-const DEFAULT_FD_CACHE_CAPACITY: usize = 1024;
+const DEFAULT_FD_CACHE_CAPACITY: usize = 512;
 
 fn global_fd_cache() -> &'static std::sync::Arc<FdCache> {
     static CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();

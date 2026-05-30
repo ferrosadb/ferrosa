@@ -217,6 +217,7 @@ mod tests {
         assert_eq!(node.cql_address(), "172.16.0.2:9042");
     }
 
+    #[cfg(feature = "live-infra-tests")]
     #[tokio::test]
     async fn provision_t1_cluster() {
         if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()

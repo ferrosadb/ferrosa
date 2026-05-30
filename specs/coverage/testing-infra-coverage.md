@@ -79,7 +79,7 @@
 - `TuiDashboard` — live terminal dashboard (crossterm).
 - `orchestrator::run_load_test` / `run_load_test_with_tui` — entry points for embedding in test or binary.
 
-**Gating:** All non-unit tests require `FERROSA_TEST_CONTAINERS=1` (S3 integration via MinIO) or `FERROSA_TEST_LOADGEN=1` (binary smoke). Unit tests (profile ratios, generator correctness, stats, integrity logic) run without infrastructure.
+**Gating:** All non-unit tests require `FERROSA_TEST_CONTAINERS=1` (S3 integration via MinIO) or `FERROSA_TEST_LOADGEN=1` (binary smoke). Unit tests (profile ratios, generator correctness, stats, integrity logic) run without infrastructure. Rust tests that directly require live Docker/Firecracker/cluster infrastructure must also be compiled with the crate feature `live-infra-tests`; default verifier commands do not compile those test bodies, and opt-in runs still panic loudly if the matching `FERROSA_TEST_*` prerequisite is absent.
 
 ---
 

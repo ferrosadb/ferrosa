@@ -152,6 +152,10 @@ async fn read_local_range_stream_limited_rows(
     limit: usize,
     row_limit: usize,
 ) -> ferrosa_common::Result<Vec<Partition>> {
+    if row_limit > 0 {
+        return storage.read_range_limited_rows(table_id, None, None, limit, row_limit);
+    }
+
     let mut stream = storage.range_iter(table_id, None, None);
     let mut partitions = Vec::with_capacity(limit);
 
