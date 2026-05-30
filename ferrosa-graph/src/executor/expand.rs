@@ -173,6 +173,7 @@ pub async fn execute(
             anchor,
             hops,
             optional_hops,
+            post_filters,
             with_pipeline,
             return_clause,
         } => {
@@ -182,6 +183,7 @@ pub async fn execute(
                 &anchor,
                 &hops,
                 &optional_hops,
+                &post_filters,
                 with_pipeline.as_ref(),
                 &return_clause,
                 config,
@@ -673,6 +675,7 @@ async fn execute_expand(
     anchor: &Anchor,
     hops: &[Hop],
     optional_hops: &[Hop],
+    post_filters: &[Expr],
     with_pipeline: Option<&crate::parser::WithPipeline>,
     return_clause: &ReturnClause,
     config: &GraphEngineConfig,
@@ -965,6 +968,38 @@ async fn execute_expand(
 
         stats.vertices_read += next_states.len();
         current_states = next_states;
+    }
+
+    // Apply WHERE predicates that reference hop-bound variables. The required
+    // pattern is now fully matched, so every variable (anchor + each hop's
+    // target) is bound in each state — these predicates would wrongly filter
+    // everything out if evaluated earlier at the anchor scan.
+    if !post_filters.is_empty() {
+        let anchor_var = anchor.var.as_deref().unwrap_or("");
+        let mut kept = Vec::with_capacity(current_states.len());
+        for state in current_states {
+            let mut passes = true;
+            for filter in post_filters {
+                if !graph_filter_passes(
+                    filter,
+                    write_path,
+                    keyspace,
+                    schema,
+                    &state.bindings,
+                    anchor_var,
+                    &state.current_key,
+                )
+                .await?
+                {
+                    passes = false;
+                    break;
+                }
+            }
+            if passes {
+                kept.push(state);
+            }
+        }
+        current_states = kept;
     }
 
     if !optional_hops.is_empty() {
@@ -4584,6 +4619,7 @@ mod tests {
             },
             hops: vec![],
             optional_hops: vec![],
+            post_filters: vec![],
             with_pipeline: None,
             return_clause: ReturnClause {
                 distinct: false,
@@ -6084,6 +6120,7 @@ mod tests {
             },
             hops: vec![],
             optional_hops: vec![],
+            post_filters: vec![],
             with_pipeline: None,
             return_clause: inner_return_clause,
         };
