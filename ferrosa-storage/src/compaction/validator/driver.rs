@@ -180,6 +180,160 @@ mod tests {
         }
     }
 
+    use crate::compaction::{
+        CompactionConfig, CompactionStrategy, SizeTieredStrategy, UcsConfig,
+        UnifiedCompactionStrategy,
+    };
+    use crate::flush::{build_serialization_header, FileFlushTarget, FlushTarget};
+    use ferrosa_sstable::writer::SSTableWriter;
+    use ferrosa_sstable::WriteOptions;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    /// Write each group as its own SSTable into one shared `dir` (so generations
+    /// are unique across inputs), returning their metadata.
+    fn write_inputs(
+        dir: &Path,
+        groups: &[Vec<Partition>],
+        schema: &TableSchema,
+    ) -> Vec<SSTableMetadata> {
+        std::fs::create_dir_all(dir).unwrap();
+        let flush_target = FileFlushTarget::new(dir.to_path_buf()).unwrap();
+        let mut metas = Vec::new();
+        for group in groups {
+            let mut sorted = group.clone();
+            sorted.sort_by(|a, b| a.key.cmp(&b.key));
+            let header = build_serialization_header(schema, &sorted);
+            let mut writer = SSTableWriter::new(
+                WriteOptions {
+                    compression: None,
+                    ..WriteOptions::default()
+                },
+                header,
+            );
+            for p in &sorted {
+                writer.add_partition(p).unwrap();
+            }
+            flush_target.flush(writer.finish().unwrap()).unwrap();
+            let gen = flush_target.generation();
+            let size_bytes: u64 = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("{gen}-"))
+                })
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum();
+            metas.push(SSTableMetadata {
+                id: gen.to_string(),
+                path: dir.to_path_buf(),
+                size_bytes,
+                min_token: sorted.first().map(|p| p.key.token.0).unwrap_or(0),
+                max_token: sorted.last().map(|p| p.key.token.0).unwrap_or(0),
+                min_timestamp: 1,
+                max_timestamp: 1_000_000,
+                partition_count: sorted.len() as u64,
+            });
+        }
+        metas
+    }
+
+    /// Execute whatever `strategy` selects (one round), then read every surviving
+    /// SSTable and return the oracle-merged canonical view. Robust to partial
+    /// selection: it tests that the strategy's compaction preserves the data.
+    fn strategy_view(
+        strategy: &dyn CompactionStrategy,
+        metas: &[SSTableMetadata],
+        schema: &TableSchema,
+        table_id: &TableId,
+        out_base: &Path,
+    ) -> super::LogicalProjection {
+        let mut surviving: Vec<(PathBuf, String)> = metas
+            .iter()
+            .map(|m| (m.path.clone(), m.id.clone()))
+            .collect();
+        for (i, task) in strategy
+            .select(metas, schema, table_id)
+            .into_iter()
+            .enumerate()
+        {
+            let out = out_base.join(format!("o{i}"));
+            std::fs::create_dir_all(&out).unwrap();
+            let consumed: HashSet<String> = task.inputs.iter().map(|m| m.id.clone()).collect();
+            let result = CompactionExecutor::execute_task(&CompactionTask {
+                inputs: task.inputs.clone(),
+                output_dir: out.clone(),
+                schema: schema.clone(),
+                table_id: table_id.clone(),
+            })
+            .expect("compaction must succeed");
+            surviving.retain(|(_, id)| !consumed.contains(id));
+            surviving.push((out, result.id));
+        }
+        let mut partitions = Vec::new();
+        for (dir, id) in &surviving {
+            partitions.extend(read_sstable(dir, id));
+        }
+        logical_projection(&oracle_merge_all(&partitions))
+    }
+
+    /// A/B differential: SizeTiered and Unified compaction differ only in which
+    /// SSTables they group — never in the merge result — so each must preserve
+    /// the same data, equal to the oracle.
+    #[test]
+    fn stcs_and_ucs_preserve_identical_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let ck = b"\x00\x00\x00\x01".to_vec();
+        let table_id = crate::TableId::new("ab", "t");
+
+        // Four SSTables over the same keys with ascending timestamps.
+        let groups: Vec<Vec<Partition>> = (0..4u32)
+            .map(|g| {
+                (0..4)
+                    .map(|k| {
+                        part(
+                            &format!("k{k:02}"),
+                            &ck,
+                            CellValue::live(format!("v{g}").into_bytes(), (g + 1) as i64),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let all: Vec<Partition> = groups.iter().flatten().cloned().collect();
+        let metas = write_inputs(&tmp.path().join("inputs"), &groups, &schema);
+
+        let oracle = logical_projection(&oracle_merge_all(&all));
+        let placeholder = PathBuf::from(tmp.path());
+        let stcs = SizeTieredStrategy::new(CompactionConfig {
+            min_threshold: 2,
+            max_threshold: 32,
+            max_compaction_bytes: 1 << 30,
+            bucket_low: 0.5,
+            bucket_high: 1.5,
+            output_dir: placeholder.clone(),
+        });
+        let ucs = UnifiedCompactionStrategy::new(UcsConfig {
+            fan_factor: 2,
+            min_sstable_size: 1,
+            max_levels: 32,
+            output_dir: placeholder,
+        });
+
+        let stcs_view = strategy_view(&stcs, &metas, &schema, &table_id, &tmp.path().join("stcs"));
+        let ucs_view = strategy_view(&ucs, &metas, &schema, &table_id, &tmp.path().join("ucs"));
+
+        assert_eq!(stcs_view, oracle, "STCS must preserve the oracle's data");
+        assert_eq!(ucs_view, oracle, "UCS must preserve the oracle's data");
+        assert_eq!(
+            stcs_view, ucs_view,
+            "STCS and UCS must preserve identical data"
+        );
+    }
+
     #[test]
     fn real_compaction_matches_oracle() {
         let tmp = tempfile::tempdir().unwrap();
