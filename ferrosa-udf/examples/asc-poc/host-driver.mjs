@@ -2,7 +2,7 @@ import asc from "assemblyscript/asc";
 // Exposed to the Rust host: compile AS source string -> Uint8Array (wasm) or throw.
 globalThis.__ascCompile = async function (src) {
   let out = null;
-  const r = await asc.main(["i.ts","--outFile","o.wasm","-O3","--runtime","stub"], {
+  const r = await asc.main(["i.ts","--outFile","o.wasm","-O1","--runtime","stub","--enable","mutable-globals"], {
     readFile: (n) => n === "i.ts" ? src : null,
     writeFile: (n, c) => { if (n === "o.wasm") out = c; },
     listFiles: () => [],

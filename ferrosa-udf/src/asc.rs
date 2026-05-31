@@ -154,6 +154,9 @@ fn compiler_main(bundle: String, jobs: Receiver<Job>, init: Sender<Result<(), St
         // bundle (binaryen ctors run here), and confirm __ascCompile is defined.
         let init_result: Result<(), String> = async_with!(ctx => |ctx| {
             let log = Function::new(ctx.clone(), |msg: String| {
+                if std::env::var_os("ASC_TRACE").is_some() {
+                    eprintln!("[asc-js] {msg}");
+                }
                 tracing::trace!(target: "ferrosa_udf::asc", "{msg}");
             })
             .map_err(|e| format!("install __log: {e}"))?;
@@ -368,7 +371,11 @@ fn js_to_val(ty: &ValType, v: &Value<'_>) -> rquickjs::Result<Val> {
 }
 
 fn coerce_i32(v: &Value<'_>) -> i32 {
-    if let Some(i) = v.as_int() {
+    // Booleans must coerce too: binaryen passes flag args (e.g. the `mutable`
+    // bool of BinaryenAddGlobal) as JS booleans for i32 wasm params.
+    if let Some(b) = v.as_bool() {
+        b as i32
+    } else if let Some(i) = v.as_int() {
         i
     } else if let Some(f) = v.as_float() {
         f as i64 as i32
@@ -378,7 +385,9 @@ fn coerce_i32(v: &Value<'_>) -> i32 {
 }
 
 fn coerce_i64(v: &Value<'_>) -> i64 {
-    if let Some(bi) = v.as_big_int() {
+    if let Some(b) = v.as_bool() {
+        b as i64
+    } else if let Some(bi) = v.as_big_int() {
         bi.clone().to_i64().unwrap_or(0)
     } else if let Some(i) = v.as_int() {
         i as i64
