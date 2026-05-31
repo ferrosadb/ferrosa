@@ -288,7 +288,7 @@ ferrosa</pre>
       <tr><th>Service</th><th>Port</th><th>Protocol</th></tr>
     </thead>
     <tbody>
-      <tr><td>CQL Server</td><td><code>9042</code></td><td>CQL native protocol v5</td></tr>
+      <tr><td>CQL Server</td><td><code>9042</code></td><td>CQL native protocol (v4)</td></tr>
       <tr><td>Web Console</td><td><code>9090</code></td><td>HTTP (REST API + static UI + WebSocket)</td></tr>
       <tr><td>Graph HTTP</td><td><code>7474</code></td><td>HTTP/JSON (Cypher queries)</td></tr>
       <tr><td>Prometheus Metrics</td><td><code>9090/metrics</code></td><td>HTTP (text exposition)</td></tr>
@@ -299,7 +299,7 @@ ferrosa</pre>
   <!-- ── Connect ── -->
   <h2 id="connect">Connect a CQL Driver</h2>
 
-  <p>Ferrosa speaks CQL protocol v5 — the same wire protocol as Apache Cassandra. Any standard CQL driver works unchanged.</p>
+  <p>Ferrosa speaks the CQL native protocol (negotiated at v4) — the same wire protocol as Apache Cassandra. Any standard CQL driver works unchanged.</p>
 
   <h3>Python</h3>
   <pre><span class="kw">from</span> cassandra.cluster <span class="kw">import</span> Cluster
