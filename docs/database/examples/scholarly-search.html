@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.20">
+<title>Multi-Model Scholarly Search</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>Multi-Model Scholarly Search</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_the_idea_one_corpus_five_lenses">The idea: one corpus, five lenses</a></li>
+<li><a href="#_set_up">Set up</a></li>
+<li><a href="#_lens_1keyword_substring_match">Lens 1&#8201;&#8212;&#8201;Keyword (substring match)</a></li>
+<li><a href="#_lens_2meaning_vector_ann_over_real_embeddings">Lens 2&#8201;&#8212;&#8201;Meaning (vector ANN over real embeddings)</a></li>
+<li><a href="#_lens_3fuzzy_author_name_phonetic">Lens 3&#8201;&#8212;&#8201;Fuzzy author name (phonetic)</a></li>
+<li><a href="#_lens_4trending_rrd_consolidation">Lens 4&#8201;&#8212;&#8201;Trending (RRD consolidation)</a></li>
+<li><a href="#_lens_5influence_property_graph_cypher">Lens 5&#8201;&#8212;&#8201;Influence (property graph, Cypher)</a></li>
+<li><a href="#fusion">The payoff: fuse the lenses (reciprocal rank fusion)</a></li>
+<li><a href="#_why_this_matters">Why this matters</a></li>
+<li><a href="#embeddings">Regenerating the embeddings</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>A paper-search engine where <strong>one corpus of papers</strong> is queried five different
+ways&#8201;&#8212;&#8201;keyword, meaning, fuzzy author name, trending, and influence&#8201;&#8212;&#8201;and the
+results are fused into a single ranked list. In Cassandra you would run five
+systems (a search engine, a vector DB, a fuzzy matcher, a time-series store, and
+a graph DB) and ETL between them. In Ferrosa it is one keyspace.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-note" title="Note"></i>
+</td>
+<td class="content">
+This tutorial uses the same 3-node Docker cluster as the others. If you
+haven&#8217;t set one up, start with the <a href="cluster-setup.html">3-Node Cluster Setup</a>
+guide.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_the_idea_one_corpus_five_lenses">The idea: one corpus, five lenses</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The same <code>paper</code> and <code>author</code> rows carry several indexes at once, and the same
+tables are also a property graph. Each "lens" answers a question the others
+can&#8217;t:</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 20%;">
+<col style="width: 40%;">
+<col style="width: 40%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Lens</th>
+<th class="tableblock halign-left valign-top">Answers</th>
+<th class="tableblock halign-left valign-top">How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Keyword</strong> (LIKE)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"papers that literally contain <em>nearest neighbor</em>"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>WHERE abstract LIKE '%&#8230;&#8203;%'</code></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Meaning</strong> (vector ANN)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"papers <em>about</em> efficient similarity search, even with no shared words"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>vector&lt;float, 768&gt;</code> + <code>ORDER BY &#8230;&#8203; ANN OF</code></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Fuzzy name</strong> (phonetic)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"the author I remember as <em>Jon Smyth</em>"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">phonetic index + <code>SOUNDS LIKE</code></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Trending</strong> (RRD)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"what&#8217;s being cited a lot <em>lately</em>"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>consolidation.*</code> rollups</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Influence</strong> (graph)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"the most-cited, central papers"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>graph.*</code> edges + Cypher</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>The payoff at the end fuses the three retrieval lenses and re-ranks with the two
+signal lenses.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_set_up">Set up</h2>
+<div class="sectionbody">
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-shell" data-lang="shell"># from this directory, against your running cluster:
+cqlsh -f schema.cql
+cqlsh -f data.cql
+cqlsh -f queries.cql
+./cypher-queries.sh        # graph lens, over HTTP :7474</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The corpus is twelve papers in three topic clusters (distributed consensus,
+vector search, storage), eight authors, a citation graph, and daily citation
+counts. The <code>embedding</code> column holds <strong>real</strong> 768-dimensional vectors&#8201;&#8212;&#8201;see
+<a href="#embeddings">Regenerating the embeddings</a>&#8201;&#8212;&#8201;so semantic search genuinely works.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_lens_1keyword_substring_match">Lens 1&#8201;&#8212;&#8201;Keyword (substring match)</h2>
+<div class="sectionbody">
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT paper_id, title FROM paper
+  WHERE abstract LIKE '%nearest neighbor%' ALLOW FILTERING;</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>A <code>LIKE</code> substring match is precise when you know the exact words&#8201;&#8212;&#8201;and blind to
+synonyms or paraphrases. That&#8217;s what the next lens fixes.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_lens_2meaning_vector_ann_over_real_embeddings">Lens 2&#8201;&#8212;&#8201;Meaning (vector ANN over real embeddings)</h2>
+<div class="sectionbody">
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE INDEX paper_ann ON paper (embedding) USING 'vector'
+    WITH OPTIONS = {'method': 'hvq'};
+
+-- nearest papers to the embedding of
+-- "memory-efficient approximate nearest neighbor search over embeddings":
+SELECT paper_id, title, year FROM paper
+  ORDER BY embedding ANN OF [0.0288, ...] LIMIT 5;</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The query vector is the <strong>embedding of the query sentence</strong>, produced by the same
+model as the documents. Approximate-nearest-neighbor search returns the papers
+whose meaning is closest&#8201;&#8212;&#8201;HNSW (default) or, here, <strong>HVQ</strong> quantization
+(<code>method: 'hvq'</code>), which shrinks the index to 8-/4-bit codes and reranks a small
+candidate set at full precision. The query for "efficient nearest-neighbor
+search" surfaces the entire vector-search cluster (HNSW, dense retrieval, scalar
+quantization, product quantization)&#8201;&#8212;&#8201;none of which a keyword search for those
+exact words would fully catch. Try the contrasting query at the bottom of
+<code>queries.cql</code> ("agreement among replicas despite failures"): it returns the
+<strong>consensus</strong> papers, by meaning, not words.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_lens_3fuzzy_author_name_phonetic">Lens 3&#8201;&#8212;&#8201;Fuzzy author name (phonetic)</h2>
+<div class="sectionbody">
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE INDEX author_phonetic ON author (name) USING 'phonetic';
+
+SELECT author_id, name, affiliation FROM author
+  WHERE name SOUNDS LIKE 'Jon Smyth' ALLOW FILTERING;</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p><code>SOUNDS LIKE</code> matches on a Double-Metaphone code, so the misspelled <code>Jon Smyth</code>
+finds the stored <code>John Smith</code>. Useful when a name is half-remembered or
+transliterated. Cassandra has no phonetic matching at all.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_lens_4trending_rrd_consolidation">Lens 4&#8201;&#8212;&#8201;Trending (RRD consolidation)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Daily citation counts feed an automatic rollup:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE paper_citations_daily ( ... )
+  WITH extensions = {
+    'consolidation.interval': '7d',
+    'consolidation.functions': 'sum,max,avg',
+    'consolidation.target': 'paper_citations_weekly',
+    'consolidation.columns': 'citations'
+  };</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Ferrosa materializes <code>paper_citations_weekly</code> in the background (it appears
+within the window). For reranking we read the always-populated daily source and
+look at recent velocity&#8201;&#8212;&#8201;papers 3 (Accord) and 8 (Scalar Quantization) are
+accelerating, paper 1 (Paxos) is flat. That recency signal is the kind of thing
+a pure relevance search misses.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_lens_5influence_property_graph_cypher">Lens 5&#8201;&#8212;&#8201;Influence (property graph, Cypher)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The <code>paper</code>, <code>author</code>, <code>authored</code>, and <code>cites</code> tables were created with
+<code>graph.<strong></code> extensions, so the *same data</strong> is a property graph. Centrality&#8201;&#8212;&#8201;"how many papers cite this one"&#8201;&#8212;&#8201;needs a reverse-edge count that CQL can&#8217;t do
+without a full scan, but Cypher does it directly (<code>./cypher-queries.sh</code>):</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-cypher" data-lang="cypher">MATCH (p:Paper)-[:CITES]-&gt;(t:Paper)
+RETURN t.title, COUNT(p) AS cited_by ORDER BY cited_by DESC</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>HNSW, Paxos, and LSM come out as the influential, foundational papers.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="fusion">The payoff: fuse the lenses (reciprocal rank fusion)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>No single lens is "the answer." A great search <em>composes</em> them. Because the
+keyword, vector, and phonetic lenses each return a <strong>ranked list</strong>, we fuse them with
+<strong>Reciprocal Rank Fusion</strong> (RRF)&#8201;&#8212;&#8201;which needs only ranks, not scores&#8201;&#8212;&#8201;then
+boost by the trend and influence signals:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-text" data-lang="text"># client-side, after running the three retrieval queries:
+for each paper p:
+    rrf(p)   = sum over lenses L of  1 / (k + rank_L(p))        # k ~ 60
+    trend(p) = recent_citation_velocity(p)      # from paper_citations_daily
+    infl(p)  = cited_by(p)                       # from the Cypher centrality query
+    score(p) = rrf(p) * (1 + a*norm(trend) + b*norm(infl))
+rank papers by score(p)</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>A query for <em>"efficient similarity search"</em> by an author you recall as
+<em>"Jon Smyth"</em> now returns papers that (a) match the words <strong>or</strong> the meaning,
+(b) are co-authored by the phonetically-matched John Smith, (c) are <strong>trending</strong>
+in citations, and (d) are <strong>influential</strong> in the citation graph&#8201;&#8212;&#8201;a result no
+one index could produce. Ferrosa has no server-side fusion query; the
+composition is a few lines of client code over five lenses that all live in one
+database.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_why_this_matters">Why this matters</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The same twelve rows answered keyword, semantic, fuzzy-name, time-series, and
+graph questions&#8201;&#8212;&#8201;with no copies, no ETL pipelines, and no five-system
+operational burden. That is the multi-model story: pick the right lens per
+question, and compose them when one isn&#8217;t enough.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="embeddings">Regenerating the embeddings</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The vectors in <code>data.cql</code> and <code>queries.cql</code> are real embeddings from
+<strong><code>nomic-embed-text-v2-moe</code></strong> (768-dim), generated once and committed so the
+example is self-contained and deterministic&#8201;&#8212;&#8201;no API key or network service is
+needed to run it. To change the corpus, edit <code>embeddings/corpus.json</code> and
+regenerate:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-shell" data-lang="shell">ollama pull nomic-embed-text-v2-moe
+cd embeddings &amp;&amp; python3 gen_embeddings.py    # rewrites ../data.cql and ../queries.cql</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The generator embeds each paper abstract and each query string, then writes the
+runnable CQL with the vectors inlined.</p>
+</div>
+</div>
+</div>
+</div>
+<script>
+// Add a "Copy" button to every code listing.
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('.listingblock .content').forEach(function (content) {
+    var pre = content.querySelector('pre');
+    if (!pre) { return; }
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'copy-btn';
+    button.textContent = 'Copy';
+    button.setAttribute('aria-label', 'Copy code to clipboard');
+    button.addEventListener('click', function () {
+      var text = pre.innerText;
+      var done = function () {
+        button.textContent = 'Copied';
+        setTimeout(function () { button.textContent = 'Copy'; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var area = document.createElement('textarea');
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+        document.body.removeChild(area);
+        done();
+      }
+    });
+    content.appendChild(button);
+  });
+});
+</script>
+</body>
+</html>

@@ -66,6 +66,16 @@ Player stats, rankings, and match history.
 link:vector-indexes.html[*Vector Indexes: HNSW and HVQ*] _New!_::
 Semantic similarity search over embeddings, comparing the full-precision HNSW index with the quantized HVQ index -- plus a BTree secondary index -- all from plain CQL.
 
+== Multi-Model Search
+
+The lens that makes Ferrosa _not just Cassandra_: one dataset queried five ways -- keyword (LIKE), meaning (vector ANN), fuzzy name (phonetic), trending (RRD), and influence (graph) -- and the results fused into one ranked list. No five-system stack, no ETL.
+
+link:scholarly-search.html[*Multi-Model Scholarly Search*] _New!_::
+A paper search engine over one corpus: keyword (LIKE) + vector ANN over real `nomic-embed-text-v2-moe` embeddings, phonetic author lookup, RRD citation-trend rollups, and a Cypher citation graph -- composed with reciprocal-rank fusion.
+
+link:threat-hunting.html[*Multi-Model Threat Hunting*] _New!_::
+A threat-intel workbench over one indicator corpus: keyword over IOC notes, vector ANN over real behaviour embeddings, phonetic actor-name lookup, RRD activity-spike rollups, and a Cypher attack-infrastructure graph -- fused into a single triage order.
+
 == Ferrosa-Exclusive: Graph + CQL
 
 link:graph-joins.html[*Graph Joins & Traversals*]::

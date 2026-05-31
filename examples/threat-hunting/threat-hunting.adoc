@@ -1,0 +1,167 @@
+= Multi-Model Threat Hunting
+:stylesheet: theme/ferrosa.css
+:linkcss:
+:icons: font
+:source-highlighter: rouge
+:docinfo: shared
+:nofooter:
+:toc: left
+:toclevels: 2
+
+A threat-intel workbench where *one corpus of indicators* is hunted five ways --
+keyword, behaviour, fuzzy actor name, activity spikes, and shared infrastructure
+-- then fused into one prioritized list. In a typical SOC stack that's a search
+cluster, a vector store, a fuzzy matcher, a SIEM/time-series DB, and a graph DB,
+wired together with pipelines. In Ferrosa it's one keyspace.
+
+NOTE: Uses the same 3-node Docker cluster as the other tutorials. Start with the
+link:cluster-setup.html[3-Node Cluster Setup] guide if you need one.
+
+== The idea: one corpus, five lenses
+
+The same `indicator` and `actor` rows carry several indexes at once, and the same
+tables are also a property graph:
+
+[cols="1,2,2",options="header"]
+|===
+| Lens | Answers | How
+| *Keyword* (LIKE) | "IOCs whose notes literally contain _credential_" | `WHERE description LIKE '%...%'`
+| *Behaviour* (vector ANN) | "IOCs that _behave like_ a fake bank login, whatever the words" | `vector<float, 768>` + `ORDER BY ... ANN OF`
+| *Fuzzy actor* (phonetic) | "the actor I typed as _Lazerus_" | phonetic index + `SOUNDS LIKE`
+| *Spiking* (RRD) | "indicators whose activity is _surging now_" | `consolidation.*` rollups
+| *Infrastructure* (graph) | "shared C2, reused infra, cross-actor links" | `graph.*` edges + Cypher
+|===
+
+== Set up
+
+[source,shell]
+----
+cqlsh -f schema.cql
+cqlsh -f data.cql
+cqlsh -f queries.cql
+./cypher-queries.sh        # graph lens, over HTTP :7474
+----
+
+Ten indicators across three behaviour clusters (phishing, ransomware C2,
+exfiltration), four actors, an infrastructure graph, and per-minute activity
+counts. The `embedding` column holds *real* 768-d vectors (see <<embeddings>>),
+so "behaves like" search genuinely works.
+
+== Lens 1 -- Keyword (substring match)
+
+[source,sql]
+----
+SELECT indicator_id, value, kind FROM indicator
+  WHERE description LIKE '%credential%' ALLOW FILTERING;
+----
+
+A `LIKE` substring match is precise when you know the tradecraft vocabulary,
+blind to paraphrase.
+
+== Lens 2 -- Behaviour (vector ANN over real embeddings)
+
+[source,sql]
+----
+-- nearest IOCs to the behaviour "fake bank login page that steals
+-- usernames and passwords":
+SELECT indicator_id, value, kind FROM indicator
+  ORDER BY embedding ANN OF [0.0..., ...] LIMIT 5;
+----
+
+The query vector is the embedding of the *behaviour you describe*. ANN returns
+the indicators that behave most similarly -- the whole credential-theft cluster
+-- even ones whose notes never use your words. The contrasting query at the end
+of `queries.cql` ("command and control beacon for ransomware encryption
+tasking") returns the C2 cluster instead. `method: 'hvq'` keeps the index small
+with quantization and reranks the top candidates at full precision.
+
+== Lens 3 -- Fuzzy actor name (phonetic)
+
+[source,sql]
+----
+SELECT actor_id, name, origin FROM actor
+  WHERE name SOUNDS LIKE 'Lazerus' ALLOW FILTERING;
+----
+
+A misremembered `Lazerus` matches the stored `Lazarus` via Double Metaphone --
+handy when actor and malware-family names are spelled a dozen ways across reports.
+
+== Lens 4 -- Spiking activity (RRD consolidation)
+
+Per-minute hit counts feed an automatic rollup:
+
+[source,sql]
+----
+CREATE TABLE indicator_activity ( ... )
+  WITH extensions = {
+    'consolidation.interval': '1h',
+    'consolidation.functions': 'sum,max',
+    'consolidation.target': 'indicator_activity_hourly',
+    'consolidation.columns': 'hits'
+  };
+----
+
+The hunt reads the always-populated source for recent velocity: indicators 4
+(C2 beacon) and 8 (infostealer) are *surging* (12 -> 28 -> 61 -> 140 hits/5min),
+while the phishing page is flat. A spike is exactly what turns a dormant IOC into
+an active incident.
+
+== Lens 5 -- Shared infrastructure (property graph, Cypher)
+
+The `indicator`, `actor`, `attributed_to`, and `communicates_with` tables were
+created with `graph.*` extensions, so the *same data* is an attack graph.
+Pivoting -- "what else uses this C2", "which actors share infrastructure" --
+needs traversals CQL can't do (`./cypher-queries.sh`):
+
+[source,cypher]
+----
+MATCH (i:Indicator)-[:COMMUNICATES_WITH]->(t:Indicator)
+RETURN t.value, COUNT(i) AS used_by ORDER BY used_by DESC
+----
+
+The most-reused infrastructure nodes are the highest-value pivots.
+
+[#fusion]
+== The payoff: fuse the lenses (reciprocal rank fusion)
+
+A real hunt composes the lenses. The keyword, vector, and phonetic lenses each
+return a ranked list, so we fuse them with **Reciprocal Rank Fusion** (ranks,
+not scores), then
+boost by the spike and infrastructure-centrality signals:
+
+[source,text]
+----
+# client-side, after running the three retrieval queries:
+for each indicator x:
+    rrf(x)   = sum over lenses L of  1 / (k + rank_L(x))        # k ~ 60
+    spike(x) = recent_activity_velocity(x)     # from indicator_activity
+    pivot(x) = reuse_centrality(x)             # from the Cypher centrality query
+    score(x) = rrf(x) * (1 + a*norm(spike) + b*norm(pivot))
+rank indicators by score(x)
+----
+
+A hunt for IOCs that _behave like credential theft_, attributed to an actor you
+recall as _Lazerus_, now ranks first the indicators that (a) match the words
+**or** the behaviour, (b) tie to the phonetically-matched Lazarus, (c) are
+**spiking** in activity, and (d) sit on **reused** infrastructure -- a triage
+order no single index could produce, from one database.
+
+== Why this matters
+
+The same ten rows answered keyword, behavioural, fuzzy-name, time-series, and
+graph questions -- no copies between five systems, no brittle pipelines. Pick the
+right lens per question; compose them when one isn't enough.
+
+[#embeddings]
+== Regenerating the embeddings
+
+The vectors in `data.cql`/`queries.cql` are real embeddings from
+**`nomic-embed-text-v2-moe`** (768-dim), generated once and committed so the
+example is self-contained -- no API key or network is needed to run it. To change
+the corpus, edit `embeddings/corpus.json` and regenerate:
+
+[source,shell]
+----
+ollama pull nomic-embed-text-v2-moe
+cd embeddings && python3 gen_embeddings.py    # rewrites ../data.cql and ../queries.cql
+----

@@ -1,0 +1,46 @@
+{
+  "_comment": "Editable source for the threat-hunting demo. Run gen_embeddings.py to (re)generate ../data.cql and ../queries.cql with real nomic-embed-text-v2-moe embeddings. Three behaviour clusters (phishing, ransomware/C2, exfiltration) make ANN meaningful; actor names have phonetic variants; infrastructure edges form a graph; activity_counts make indicators 4 and 8 spike.",
+  "model": "nomic-embed-text-v2-moe",
+  "actors": [
+    {"id": 1, "name": "Lazarus", "origin": "DPRK"},
+    {"id": 2, "name": "Emotet", "origin": "eCrime"},
+    {"id": 3, "name": "Cobalt Strike", "origin": "Tooling"},
+    {"id": 4, "name": "Sandworm", "origin": "Russia"}
+  ],
+  "indicators": [
+    {"id": 1, "value": "login-microsoft-verify.com", "kind": "domain", "description": "Phishing page mimicking the Microsoft 365 sign-in to harvest corporate credentials from employees."},
+    {"id": 2, "value": "secure-paypal-account-update.com", "kind": "domain", "description": "Credential harvesting site spoofing a PayPal account verification flow to steal logins and card data."},
+    {"id": 3, "value": "203.0.113.45", "kind": "ip", "description": "Server hosting cloned online banking login portals used for credential theft and session hijacking."},
+    {"id": 4, "value": "cdn-update-sync.net", "kind": "domain", "description": "Command and control beacon domain for a ransomware affiliate, polling for encryption tasking over HTTPS."},
+    {"id": 5, "value": "198.51.100.7", "kind": "ip", "description": "Command and control server issuing file-encryption commands to ransomware implants on victim hosts."},
+    {"id": 6, "value": "9f86d081884c7d659a2feaa0c55ad015", "kind": "hash", "description": "Ransomware loader that encrypts user files and drops a ransom note demanding cryptocurrency payment."},
+    {"id": 7, "value": "data-backup-cloud.io", "kind": "domain", "description": "Exfiltration endpoint receiving stolen documents and databases from compromised networks over TLS."},
+    {"id": 8, "value": "f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4", "kind": "hash", "description": "Infostealer that collects saved browser passwords and cookies and uploads them to a remote drop server."},
+    {"id": 9, "value": "update-flash-player.net", "kind": "domain", "description": "Fake software update page delivering a credential stealer disguised as a browser plugin installer."},
+    {"id": 10, "value": "192.0.2.200", "kind": "ip", "description": "Staging server aggregating exfiltrated archives before transfer to actor-controlled storage."}
+  ],
+  "attributed": [
+    [1, 1], [2, 2], [3, 1], [4, 2], [5, 4], [6, 2], [7, 4], [8, 2], [9, 1], [10, 4]
+  ],
+  "communicates": [
+    [1, 3], [2, 3], [4, 5], [6, 4], [7, 10], [8, 7], [9, 3]
+  ],
+  "activity_counts": [
+    {"indicator_id": 4, "minute": "2026-05-30 14:00:00", "hits": 12},
+    {"indicator_id": 4, "minute": "2026-05-30 14:05:00", "hits": 28},
+    {"indicator_id": 4, "minute": "2026-05-30 14:10:00", "hits": 61},
+    {"indicator_id": 4, "minute": "2026-05-30 14:15:00", "hits": 140},
+    {"indicator_id": 8, "minute": "2026-05-30 14:00:00", "hits": 9},
+    {"indicator_id": 8, "minute": "2026-05-30 14:05:00", "hits": 24},
+    {"indicator_id": 8, "minute": "2026-05-30 14:10:00", "hits": 55},
+    {"indicator_id": 8, "minute": "2026-05-30 14:15:00", "hits": 130},
+    {"indicator_id": 1, "minute": "2026-05-30 14:00:00", "hits": 18},
+    {"indicator_id": 1, "minute": "2026-05-30 14:05:00", "hits": 16},
+    {"indicator_id": 1, "minute": "2026-05-30 14:10:00", "hits": 15},
+    {"indicator_id": 1, "minute": "2026-05-30 14:15:00", "hits": 14}
+  ],
+  "queries": [
+    {"name": "ann_phishing", "text": "fake bank login page that steals usernames and passwords"},
+    {"name": "ann_c2", "text": "command and control beacon for ransomware encryption tasking"}
+  ]
+}

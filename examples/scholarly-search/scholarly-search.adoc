@@ -1,0 +1,191 @@
+= Multi-Model Scholarly Search
+:stylesheet: theme/ferrosa.css
+:linkcss:
+:icons: font
+:source-highlighter: rouge
+:docinfo: shared
+:nofooter:
+:toc: left
+:toclevels: 2
+
+A paper-search engine where *one corpus of papers* is queried five different
+ways -- keyword, meaning, fuzzy author name, trending, and influence -- and the
+results are fused into a single ranked list. In Cassandra you would run five
+systems (a search engine, a vector DB, a fuzzy matcher, a time-series store, and
+a graph DB) and ETL between them. In Ferrosa it is one keyspace.
+
+NOTE: This tutorial uses the same 3-node Docker cluster as the others. If you
+haven't set one up, start with the link:cluster-setup.html[3-Node Cluster Setup]
+guide.
+
+== The idea: one corpus, five lenses
+
+The same `paper` and `author` rows carry several indexes at once, and the same
+tables are also a property graph. Each "lens" answers a question the others
+can't:
+
+[cols="1,2,2",options="header"]
+|===
+| Lens | Answers | How
+| *Keyword* (LIKE) | "papers that literally contain _nearest neighbor_" | `WHERE abstract LIKE '%...%'`
+| *Meaning* (vector ANN) | "papers _about_ efficient similarity search, even with no shared words" | `vector<float, 768>` + `ORDER BY ... ANN OF`
+| *Fuzzy name* (phonetic) | "the author I remember as _Jon Smyth_" | phonetic index + `SOUNDS LIKE`
+| *Trending* (RRD) | "what's being cited a lot _lately_" | `consolidation.*` rollups
+| *Influence* (graph) | "the most-cited, central papers" | `graph.*` edges + Cypher
+|===
+
+The payoff at the end fuses the three retrieval lenses and re-ranks with the two
+signal lenses.
+
+== Set up
+
+[source,shell]
+----
+# from this directory, against your running cluster:
+cqlsh -f schema.cql
+cqlsh -f data.cql
+cqlsh -f queries.cql
+./cypher-queries.sh        # graph lens, over HTTP :7474
+----
+
+The corpus is twelve papers in three topic clusters (distributed consensus,
+vector search, storage), eight authors, a citation graph, and daily citation
+counts. The `embedding` column holds *real* 768-dimensional vectors -- see
+<<embeddings>> -- so semantic search genuinely works.
+
+== Lens 1 -- Keyword (substring match)
+
+[source,sql]
+----
+SELECT paper_id, title FROM paper
+  WHERE abstract LIKE '%nearest neighbor%' ALLOW FILTERING;
+----
+
+A `LIKE` substring match is precise when you know the exact words -- and blind to
+synonyms or paraphrases. That's what the next lens fixes.
+
+== Lens 2 -- Meaning (vector ANN over real embeddings)
+
+[source,sql]
+----
+CREATE INDEX paper_ann ON paper (embedding) USING 'vector'
+    WITH OPTIONS = {'method': 'hvq'};
+
+-- nearest papers to the embedding of
+-- "memory-efficient approximate nearest neighbor search over embeddings":
+SELECT paper_id, title, year FROM paper
+  ORDER BY embedding ANN OF [0.0288, ...] LIMIT 5;
+----
+
+The query vector is the *embedding of the query sentence*, produced by the same
+model as the documents. Approximate-nearest-neighbor search returns the papers
+whose meaning is closest -- HNSW (default) or, here, *HVQ* quantization
+(`method: 'hvq'`), which shrinks the index to 8-/4-bit codes and reranks a small
+candidate set at full precision. The query for "efficient nearest-neighbor
+search" surfaces the entire vector-search cluster (HNSW, dense retrieval, scalar
+quantization, product quantization) -- none of which a keyword search for those
+exact words would fully catch. Try the contrasting query at the bottom of
+`queries.cql` ("agreement among replicas despite failures"): it returns the
+*consensus* papers, by meaning, not words.
+
+== Lens 3 -- Fuzzy author name (phonetic)
+
+[source,sql]
+----
+CREATE INDEX author_phonetic ON author (name) USING 'phonetic';
+
+SELECT author_id, name, affiliation FROM author
+  WHERE name SOUNDS LIKE 'Jon Smyth' ALLOW FILTERING;
+----
+
+`SOUNDS LIKE` matches on a Double-Metaphone code, so the misspelled `Jon Smyth`
+finds the stored `John Smith`. Useful when a name is half-remembered or
+transliterated. Cassandra has no phonetic matching at all.
+
+== Lens 4 -- Trending (RRD consolidation)
+
+Daily citation counts feed an automatic rollup:
+
+[source,sql]
+----
+CREATE TABLE paper_citations_daily ( ... )
+  WITH extensions = {
+    'consolidation.interval': '7d',
+    'consolidation.functions': 'sum,max,avg',
+    'consolidation.target': 'paper_citations_weekly',
+    'consolidation.columns': 'citations'
+  };
+----
+
+Ferrosa materializes `paper_citations_weekly` in the background (it appears
+within the window). For reranking we read the always-populated daily source and
+look at recent velocity -- papers 3 (Accord) and 8 (Scalar Quantization) are
+accelerating, paper 1 (Paxos) is flat. That recency signal is the kind of thing
+a pure relevance search misses.
+
+== Lens 5 -- Influence (property graph, Cypher)
+
+The `paper`, `author`, `authored`, and `cites` tables were created with
+`graph.*` extensions, so the *same data* is a property graph. Centrality --
+"how many papers cite this one" -- needs a reverse-edge count that CQL can't do
+without a full scan, but Cypher does it directly (`./cypher-queries.sh`):
+
+[source,cypher]
+----
+MATCH (p:Paper)-[:CITES]->(t:Paper)
+RETURN t.title, COUNT(p) AS cited_by ORDER BY cited_by DESC
+----
+
+HNSW, Paxos, and LSM come out as the influential, foundational papers.
+
+[#fusion]
+== The payoff: fuse the lenses (reciprocal rank fusion)
+
+No single lens is "the answer." A great search _composes_ them. Because the
+keyword, vector, and phonetic lenses each return a *ranked list*, we fuse them with
+**Reciprocal Rank Fusion** (RRF) -- which needs only ranks, not scores -- then
+boost by the trend and influence signals:
+
+[source,text]
+----
+# client-side, after running the three retrieval queries:
+for each paper p:
+    rrf(p)   = sum over lenses L of  1 / (k + rank_L(p))        # k ~ 60
+    trend(p) = recent_citation_velocity(p)      # from paper_citations_daily
+    infl(p)  = cited_by(p)                       # from the Cypher centrality query
+    score(p) = rrf(p) * (1 + a*norm(trend) + b*norm(infl))
+rank papers by score(p)
+----
+
+A query for _"efficient similarity search"_ by an author you recall as
+_"Jon Smyth"_ now returns papers that (a) match the words **or** the meaning,
+(b) are co-authored by the phonetically-matched John Smith, (c) are **trending**
+in citations, and (d) are **influential** in the citation graph -- a result no
+one index could produce. Ferrosa has no server-side fusion query; the
+composition is a few lines of client code over five lenses that all live in one
+database.
+
+== Why this matters
+
+The same twelve rows answered keyword, semantic, fuzzy-name, time-series, and
+graph questions -- with no copies, no ETL pipelines, and no five-system
+operational burden. That is the multi-model story: pick the right lens per
+question, and compose them when one isn't enough.
+
+[#embeddings]
+== Regenerating the embeddings
+
+The vectors in `data.cql` and `queries.cql` are real embeddings from
+**`nomic-embed-text-v2-moe`** (768-dim), generated once and committed so the
+example is self-contained and deterministic -- no API key or network service is
+needed to run it. To change the corpus, edit `embeddings/corpus.json` and
+regenerate:
+
+[source,shell]
+----
+ollama pull nomic-embed-text-v2-moe
+cd embeddings && python3 gen_embeddings.py    # rewrites ../data.cql and ../queries.cql
+----
+
+The generator embeds each paper abstract and each query string, then writes the
+runnable CQL with the vectors inlined.
