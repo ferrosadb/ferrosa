@@ -39,17 +39,44 @@ WASM. Therefore:
 - Host-side Boa (pure Rust) / `rquickjs` is the fallback (simpler wiring, but the
   compile is not auto-sandboxed by Wasmtime — needs separate limits).
 
-### Next validation (implementation spike)
+### Bundling spike (2026-05-31, continued)
 
-1. Pick the WASM-guest JS engine that cleanly runs `asc.js` + 13 MB
-   `binaryen.js` (needs ESM, async, TypedArrays, BigInt for the `long` dep):
-   evaluate Javy/`quickjs-wasi` (QuickJS — good compat, small) vs StarlingMonkey
-   (SpiderMonkey — heavier, very compatible).
-2. Bundle the ~15 MB JS + a thin driver into the guest; pass source via
-   stdin/WASI or a component interface, return wasm bytes.
-3. Run it under the **wasmtime 44 component runtime** ferrosa already has
-   (`ferrosa-udf`); measure compile latency (pure-JS binaryen is slower than
-   WASM binaryen — acceptable for occasional DDL) and bound guest memory.
+Tested bundling the in-memory driver + `asc` + `binaryen` for a bare engine
+(esbuild, node 25):
+
+- `asc.js` uses **top-level await** → must bundle as **ESM**, not IIFE/CJS.
+- `asc.js` has **no static** node imports, but `binaryen` (Emscripten) does
+  `require("fs"|"path"|"url"|...)` and conditional `import("node:...")` for its
+  default backend. With the callback I/O these paths are **dead code**, so
+  externalizing all node builtins (`--external:fs --external:path … --external:node:*`)
+  bundles cleanly → a single **~15 MB ESM**.
+- Running that bundle in **bare QuickJS** (`quickjs-emscripten`, the engine a
+  Javy / `quickjs-wasi` Wasmtime guest uses) then hits the standard
+  *Emscripten-output-on-a-minimal-engine* shimming wall: module init throws
+  unless the dynamic-import stubs and Emscripten environment globals are shimmed
+  correctly. This is **plumbing, not a feasibility wall** — QuickJS supports
+  everything asc/binaryen use (ES2023, modules, async, BigInt, TypedArrays).
+
+### Conclusion → don't hand-roll the shims; use a maintained QuickJS-WASI toolchain
+
+The Emscripten/node shimming is exactly what **Javy** and **jco/ComponentizeJS
+(StarlingMonkey)** automate. Recommended build path:
+
+1. **First try Javy** (Bytecode Alliance): bundle the driver + asc + binaryen to
+   a single JS, `javy build` → a QuickJS-WASI `.wasm`; pass source on stdin,
+   return wasm on stdout. Smallest guest. Risks to confirm: async `asc.main`
+   under Javy's run model, and the 15 MB working set.
+2. **Fallback: jco + StarlingMonkey** (SpiderMonkey-as-WASM component). Heavier,
+   but far more node/Emscripten-compatible, so it most likely runs the toolchain
+   with minimal shims; it's a Wasmtime **component**, matching `ferrosa-udf`'s
+   component runtime directly.
+3. Run the produced module under the **wasmtime 44 component runtime** ferrosa
+   already has; bound guest memory + epoch/fuel; measure compile latency
+   (pure-JS binaryen is slower than WASM binaryen — fine for occasional DDL).
+
+The fundamental questions are now answered (pure JS, no WASM, in-memory,
+single-bundle). The open item is purely **which guest toolchain runs the bundle
+with least friction** — a build/integration task, not a research risk.
 
 ## Goal
 
