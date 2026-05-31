@@ -921,9 +921,31 @@ impl<'input> Parser<'input> {
     /// Parsed `WITH option (AND option)*` set for CREATE/ALTER ROLE.
     fn parse_role_option_set(&mut self) -> Result<RoleOptionSet, CqlError> {
         let mut o = RoleOptionSet::default();
-        if !self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
-            return Ok(o);
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            self.parse_with_role_options(&mut o)?;
         }
+        // Legacy USER syntax allows a trailing bare SUPERUSER / NOSUPERUSER flag
+        // (no `WITH`, no `=`), e.g. `ALTER USER bob SUPERUSER` or
+        // `CREATE USER ops WITH PASSWORD 'p' NOSUPERUSER`. Setting the flag is
+        // still authorized downstream exactly as `SUPERUSER = <bool>` is.
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Superuser) => {
+                self.lexer.next_token()?;
+                o.superuser = Some(true);
+            }
+            TokenKind::Keyword(Keyword::Nosuperuser) => {
+                self.lexer.next_token()?;
+                o.superuser = Some(false);
+            }
+            _ => {}
+        }
+        Ok(o)
+    }
+
+    /// Parse the `WITH <option> [AND <option> ...]` role-option list (the caller
+    /// has already consumed `WITH`).
+    fn parse_with_role_options(&mut self, o: &mut RoleOptionSet) -> Result<(), CqlError> {
         loop {
             let tok = self.lexer.peek()?;
             match &tok.kind {
@@ -974,7 +996,7 @@ impl<'input> Parser<'input> {
                 break;
             }
         }
-        Ok(o)
+        Ok(())
     }
 
     /// Parse one `ACCESS TO/FROM …` clause (the `ACCESS` token is already consumed).
@@ -3776,6 +3798,33 @@ mod tests {
                 );
             }
             other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_user_bare_superuser() {
+        // Legacy USER syntax: no WITH, trailing bare SUPERUSER flag.
+        let stmt = parse("ALTER USER bob SUPERUSER").unwrap();
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "bob");
+                assert_eq!(s.superuser, Some(true));
+                assert_eq!(s.password, None);
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_user_trailing_nosuperuser() {
+        let stmt = parse("CREATE USER ops WITH PASSWORD 'p' NOSUPERUSER").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.name, "ops");
+                assert_eq!(s.password, Some("p".into()));
+                assert_eq!(s.superuser, Some(false));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
         }
     }
 
