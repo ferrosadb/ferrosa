@@ -25,7 +25,7 @@ tables are also a property graph:
 [cols="1,2,2",options="header"]
 |===
 | Lens | Answers | How
-| *Keyword* (BM25) | "IOCs whose notes literally say _credential_ + _harvest_" | full-text index + `fts_match()`
+| *Keyword* (LIKE) | "IOCs whose notes literally contain _credential_" | `WHERE description LIKE '%...%'`
 | *Behaviour* (vector ANN) | "IOCs that _behave like_ a fake bank login, whatever the words" | `vector<float, 768>` + `ORDER BY ... ANN OF`
 | *Fuzzy actor* (phonetic) | "the actor I typed as _Lazerus_" | phonetic index + `SOUNDS LIKE`
 | *Spiking* (RRD) | "indicators whose activity is _surging now_" | `consolidation.*` rollups
@@ -47,15 +47,16 @@ exfiltration), four actors, an infrastructure graph, and per-minute activity
 counts. The `embedding` column holds *real* 768-d vectors (see <<embeddings>>),
 so "behaves like" search genuinely works.
 
-== Lens 1 -- Keyword (BM25 full text)
+== Lens 1 -- Keyword (substring match)
 
 [source,sql]
 ----
 SELECT indicator_id, value, kind FROM indicator
-  WHERE description = fts_match('credential AND harvest');
+  WHERE description LIKE '%credential%' ALLOW FILTERING;
 ----
 
-Precise when you know the tradecraft vocabulary, blind to paraphrase.
+A `LIKE` substring match is precise when you know the tradecraft vocabulary,
+blind to paraphrase.
 
 == Lens 2 -- Behaviour (vector ANN over real embeddings)
 
@@ -123,8 +124,9 @@ The most-reused infrastructure nodes are the highest-value pivots.
 [#fusion]
 == The payoff: fuse the lenses (reciprocal rank fusion)
 
-A real hunt composes the lenses. BM25, vector, and phonetic each return a ranked
-list, so we fuse them with **Reciprocal Rank Fusion** (ranks, not scores), then
+A real hunt composes the lenses. The keyword, vector, and phonetic lenses each
+return a ranked list, so we fuse them with **Reciprocal Rank Fusion** (ranks,
+not scores), then
 boost by the spike and infrastructure-centrality signals:
 
 [source,text]

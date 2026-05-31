@@ -3,9 +3,10 @@
 -- query strings in corpus.json. Five lenses over the SAME paper corpus.
 USE scholar;
 
--- 1) BM25 full-text (lexical recall): abstracts matching keywords.
+-- 1) Keyword (lexical substring recall): abstracts containing a phrase. Precise
+--    when you know the words, blind to synonyms -- which is what lens 2 fixes.
 SELECT paper_id, title FROM paper
-  WHERE abstract = fts_match('nearest neighbor AND memory');
+  WHERE abstract LIKE '%nearest neighbor%' ALLOW FILTERING;
 
 -- 2) Vector ANN over HVQ-quantized embeddings (semantic recall): nearest papers
 --    to the embedding of "memory-efficient approximate nearest neighbor search
@@ -21,7 +22,7 @@ SELECT author_id, name, affiliation FROM author
 --    paper_citations_weekly materializes asynchronously from the consolidation
 --    config; the rerank reads the always-populated daily source directly.
 SELECT paper_id, day, citations FROM paper_citations_daily WHERE paper_id = 8;
-SELECT paper_id, day, citations_sum, citations_max, citations_avg
+SELECT paper_id, week, citations_sum, citations_max, citations_avg
   FROM paper_citations_weekly WHERE paper_id = 8;
 
 -- 5) Graph lens as plain CQL: papers that paper 8 cites (outgoing edges by

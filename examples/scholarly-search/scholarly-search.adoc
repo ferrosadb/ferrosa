@@ -27,7 +27,7 @@ can't:
 [cols="1,2,2",options="header"]
 |===
 | Lens | Answers | How
-| *Keyword* (BM25) | "papers that literally say _nearest neighbor_ and _memory_" | full-text index + `fts_match()`
+| *Keyword* (LIKE) | "papers that literally contain _nearest neighbor_" | `WHERE abstract LIKE '%...%'`
 | *Meaning* (vector ANN) | "papers _about_ efficient similarity search, even with no shared words" | `vector<float, 768>` + `ORDER BY ... ANN OF`
 | *Fuzzy name* (phonetic) | "the author I remember as _Jon Smyth_" | phonetic index + `SOUNDS LIKE`
 | *Trending* (RRD) | "what's being cited a lot _lately_" | `consolidation.*` rollups
@@ -53,19 +53,16 @@ vector search, storage), eight authors, a citation graph, and daily citation
 counts. The `embedding` column holds *real* 768-dimensional vectors -- see
 <<embeddings>> -- so semantic search genuinely works.
 
-== Lens 1 -- Keyword (BM25 full text)
+== Lens 1 -- Keyword (substring match)
 
 [source,sql]
 ----
-CREATE INDEX paper_fts ON paper (abstract) USING 'fulltext';
-
 SELECT paper_id, title FROM paper
-  WHERE abstract = fts_match('nearest neighbor AND memory');
+  WHERE abstract LIKE '%nearest neighbor%' ALLOW FILTERING;
 ----
 
-`fts_match()` runs a BM25-scored boolean query over the inverted index. It is
-precise when you know the words -- and blind to synonyms or paraphrases. That's
-what the next lens fixes.
+A `LIKE` substring match is precise when you know the exact words -- and blind to
+synonyms or paraphrases. That's what the next lens fixes.
 
 == Lens 2 -- Meaning (vector ANN over real embeddings)
 
@@ -144,8 +141,8 @@ HNSW, Paxos, and LSM come out as the influential, foundational papers.
 [#fusion]
 == The payoff: fuse the lenses (reciprocal rank fusion)
 
-No single lens is "the answer." A great search _composes_ them. Because BM25,
-vector, and phonetic each return a *ranked list*, we fuse them with
+No single lens is "the answer." A great search _composes_ them. Because the
+keyword, vector, and phonetic lenses each return a *ranked list*, we fuse them with
 **Reciprocal Rank Fusion** (RRF) -- which needs only ranks, not scores -- then
 boost by the trend and influence signals:
 

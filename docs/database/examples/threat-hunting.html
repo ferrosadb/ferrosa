@@ -18,7 +18,7 @@
 <ul class="sectlevel1">
 <li><a href="#_the_idea_one_corpus_five_lenses">The idea: one corpus, five lenses</a></li>
 <li><a href="#_set_up">Set up</a></li>
-<li><a href="#_lens_1keyword_bm25_full_text">Lens 1&#8201;&#8212;&#8201;Keyword (BM25 full text)</a></li>
+<li><a href="#_lens_1keyword_substring_match">Lens 1&#8201;&#8212;&#8201;Keyword (substring match)</a></li>
 <li><a href="#_lens_2behaviour_vector_ann_over_real_embeddings">Lens 2&#8201;&#8212;&#8201;Behaviour (vector ANN over real embeddings)</a></li>
 <li><a href="#_lens_3fuzzy_actor_name_phonetic">Lens 3&#8201;&#8212;&#8201;Fuzzy actor name (phonetic)</a></li>
 <li><a href="#_lens_4spiking_activity_rrd_consolidation">Lens 4&#8201;&#8212;&#8201;Spiking activity (RRD consolidation)</a></li>
@@ -74,9 +74,9 @@ tables are also a property graph:</p>
 </thead>
 <tbody>
 <tr>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Keyword</strong> (BM25)</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">"IOCs whose notes literally say <em>credential</em> + <em>harvest</em>"</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">full-text index + <code>fts_match()</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Keyword</strong> (LIKE)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"IOCs whose notes literally contain <em>credential</em>"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>WHERE description LIKE '%&#8230;&#8203;%'</code></p></td>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Behaviour</strong> (vector ANN)</p></td>
@@ -122,16 +122,17 @@ so "behaves like" search genuinely works.</p>
 </div>
 </div>
 <div class="sect1">
-<h2 id="_lens_1keyword_bm25_full_text">Lens 1&#8201;&#8212;&#8201;Keyword (BM25 full text)</h2>
+<h2 id="_lens_1keyword_substring_match">Lens 1&#8201;&#8212;&#8201;Keyword (substring match)</h2>
 <div class="sectionbody">
 <div class="listingblock">
 <div class="content">
 <pre class="highlight"><code class="language-sql" data-lang="sql">SELECT indicator_id, value, kind FROM indicator
-  WHERE description = fts_match('credential AND harvest');</code></pre>
+  WHERE description LIKE '%credential%' ALLOW FILTERING;</code></pre>
 </div>
 </div>
 <div class="paragraph">
-<p>Precise when you know the tradecraft vocabulary, blind to paraphrase.</p>
+<p>A <code>LIKE</code> substring match is precise when you know the tradecraft vocabulary,
+blind to paraphrase.</p>
 </div>
 </div>
 </div>
@@ -217,8 +218,9 @@ RETURN t.value, COUNT(i) AS used_by ORDER BY used_by DESC</code></pre>
 <h2 id="fusion">The payoff: fuse the lenses (reciprocal rank fusion)</h2>
 <div class="sectionbody">
 <div class="paragraph">
-<p>A real hunt composes the lenses. BM25, vector, and phonetic each return a ranked
-list, so we fuse them with <strong>Reciprocal Rank Fusion</strong> (ranks, not scores), then
+<p>A real hunt composes the lenses. The keyword, vector, and phonetic lenses each
+return a ranked list, so we fuse them with <strong>Reciprocal Rank Fusion</strong> (ranks,
+not scores), then
 boost by the spike and infrastructure-centrality signals:</p>
 </div>
 <div class="listingblock">

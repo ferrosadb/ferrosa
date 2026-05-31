@@ -1,5 +1,5 @@
 -- Threat hunting, multi-model: one corpus of indicators (IOCs), queried five ways.
---   * full-text (BM25)    on description    -> USING 'fulltext'  + fts_match()
+--   * keyword (LIKE)      on description    -> WHERE description LIKE '%...%'
 --   * vector ANN (HVQ)    on embedding       -> USING 'vector'    + ORDER BY ... ANN OF
 --   * phonetic (Metaphone) on actor name      -> USING 'phonetic'  + SOUNDS LIKE
 --   * RRD consolidation   on activity counts  -> consolidation.*    (spike signal)
@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS indicator (
     embedding    vector<float, 768>
 ) WITH extensions = { 'graph.type': 'vertex', 'graph.label': 'Indicator' };
 
-CREATE INDEX IF NOT EXISTS indicator_fts ON indicator (description) USING 'fulltext';
 CREATE INDEX IF NOT EXISTS indicator_ann ON indicator (embedding) USING 'vector'
     WITH OPTIONS = {'method': 'hvq'};
 

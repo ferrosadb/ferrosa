@@ -3,9 +3,10 @@
 -- strings in corpus.json. Five lenses over the SAME indicator corpus.
 USE threat;
 
--- 1) BM25 full-text (lexical recall): IOC descriptions matching keywords.
+-- 1) Keyword (lexical substring recall): IOC descriptions containing a phrase.
+--    Precise when you know the tradecraft words, blind to paraphrase -- lens 2 fixes that.
 SELECT indicator_id, value, kind FROM indicator
-  WHERE description = fts_match('credential AND harvest');
+  WHERE description LIKE '%credential%' ALLOW FILTERING;
 
 -- 2) Vector ANN over HVQ-quantized embeddings (semantic recall): indicators
 --    whose BEHAVIOUR is closest to "fake bank login page that steals usernames

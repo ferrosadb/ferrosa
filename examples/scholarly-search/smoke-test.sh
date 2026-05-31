@@ -14,9 +14,8 @@ require_regex() {
   grep -Eq "$2" "$1" || { echo "FAIL: $1 does not match: $2" >&2; exit 1; }
 }
 
-# Lens 1 -- full-text (BM25).
-require_text schema.cql "USING 'fulltext'"
-require_text queries.cql "fts_match("
+# Lens 1 -- keyword (substring LIKE).
+require_text queries.cql "LIKE '%"
 
 # Lens 2 -- vector ANN over HVQ-quantized real embeddings.
 require_regex schema.cql "USING 'vector'"
@@ -29,7 +28,7 @@ require_text schema.cql "USING 'phonetic'"
 require_text queries.cql "SOUNDS LIKE"
 
 # Lens 4 -- RRD consolidation (trend signal).
-require_text schema.cql "'consolidation.interval': '7d'"
+require_text schema.cql "'consolidation.interval': '168h'"
 require_text schema.cql "'consolidation.target': 'paper_citations_weekly'"
 
 # Lens 5 -- property graph over the same tables.

@@ -1,5 +1,5 @@
 -- Scholarly multi-model search: one corpus of papers, queried five ways.
---   * full-text (BM25)   on abstract        -> USING 'fulltext'  + fts_match()
+--   * keyword (LIKE)     on abstract        -> WHERE abstract LIKE '%...%'
 --   * vector ANN (HVQ)   on embedding        -> USING 'vector'    + ORDER BY ... ANN OF
 --   * phonetic (Metaphone) on author name     -> USING 'phonetic'  + SOUNDS LIKE
 --   * RRD consolidation  on citation counts   -> consolidation.*    (trend signal)
@@ -22,7 +22,6 @@ CREATE TABLE IF NOT EXISTS paper (
     embedding vector<float, 768>
 ) WITH extensions = { 'graph.type': 'vertex', 'graph.label': 'Paper' };
 
-CREATE INDEX IF NOT EXISTS paper_fts ON paper (abstract) USING 'fulltext';
 CREATE INDEX IF NOT EXISTS paper_ann ON paper (embedding) USING 'vector'
     WITH OPTIONS = {'method': 'hvq'};
 
@@ -77,7 +76,7 @@ CREATE TABLE IF NOT EXISTS paper_citations_daily (
     PRIMARY KEY (paper_id, day)
 ) WITH CLUSTERING ORDER BY (day DESC)
   AND extensions = {
-    'consolidation.interval': '7d',
+    'consolidation.interval': '168h',
     'consolidation.functions': 'sum,max,avg',
     'consolidation.target': 'paper_citations_weekly',
     'consolidation.columns': 'citations'

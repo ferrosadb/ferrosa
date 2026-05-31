@@ -14,9 +14,8 @@ require_regex() {
   grep -Eq "$2" "$1" || { echo "FAIL: $1 does not match: $2" >&2; exit 1; }
 }
 
-# Lens 1 -- full-text (BM25).
-require_text schema.cql "USING 'fulltext'"
-require_text queries.cql "fts_match("
+# Lens 1 -- keyword (substring LIKE).
+require_text queries.cql "LIKE '%"
 # Lens 2 -- vector ANN over HVQ-quantized real embeddings.
 require_regex schema.cql "USING 'vector'"
 require_text schema.cql "WITH OPTIONS = {'method': 'hvq'}"

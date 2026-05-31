@@ -18,7 +18,7 @@
 <ul class="sectlevel1">
 <li><a href="#_the_idea_one_corpus_five_lenses">The idea: one corpus, five lenses</a></li>
 <li><a href="#_set_up">Set up</a></li>
-<li><a href="#_lens_1keyword_bm25_full_text">Lens 1&#8201;&#8212;&#8201;Keyword (BM25 full text)</a></li>
+<li><a href="#_lens_1keyword_substring_match">Lens 1&#8201;&#8212;&#8201;Keyword (substring match)</a></li>
 <li><a href="#_lens_2meaning_vector_ann_over_real_embeddings">Lens 2&#8201;&#8212;&#8201;Meaning (vector ANN over real embeddings)</a></li>
 <li><a href="#_lens_3fuzzy_author_name_phonetic">Lens 3&#8201;&#8212;&#8201;Fuzzy author name (phonetic)</a></li>
 <li><a href="#_lens_4trending_rrd_consolidation">Lens 4&#8201;&#8212;&#8201;Trending (RRD consolidation)</a></li>
@@ -78,9 +78,9 @@ can&#8217;t:</p>
 </thead>
 <tbody>
 <tr>
-<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Keyword</strong> (BM25)</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">"papers that literally say <em>nearest neighbor</em> and <em>memory</em>"</p></td>
-<td class="tableblock halign-left valign-top"><p class="tableblock">full-text index + <code>fts_match()</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Keyword</strong> (LIKE)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"papers that literally contain <em>nearest neighbor</em>"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>WHERE abstract LIKE '%&#8230;&#8203;%'</code></p></td>
 </tr>
 <tr>
 <td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Meaning</strong> (vector ANN)</p></td>
@@ -131,20 +131,17 @@ counts. The <code>embedding</code> column holds <strong>real</strong> 768-dimens
 </div>
 </div>
 <div class="sect1">
-<h2 id="_lens_1keyword_bm25_full_text">Lens 1&#8201;&#8212;&#8201;Keyword (BM25 full text)</h2>
+<h2 id="_lens_1keyword_substring_match">Lens 1&#8201;&#8212;&#8201;Keyword (substring match)</h2>
 <div class="sectionbody">
 <div class="listingblock">
 <div class="content">
-<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE INDEX paper_fts ON paper (abstract) USING 'fulltext';
-
-SELECT paper_id, title FROM paper
-  WHERE abstract = fts_match('nearest neighbor AND memory');</code></pre>
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT paper_id, title FROM paper
+  WHERE abstract LIKE '%nearest neighbor%' ALLOW FILTERING;</code></pre>
 </div>
 </div>
 <div class="paragraph">
-<p><code>fts_match()</code> runs a BM25-scored boolean query over the inverted index. It is
-precise when you know the words&#8201;&#8212;&#8201;and blind to synonyms or paraphrases. That&#8217;s
-what the next lens fixes.</p>
+<p>A <code>LIKE</code> substring match is precise when you know the exact words&#8201;&#8212;&#8201;and blind to
+synonyms or paraphrases. That&#8217;s what the next lens fixes.</p>
 </div>
 </div>
 </div>
@@ -243,8 +240,8 @@ RETURN t.title, COUNT(p) AS cited_by ORDER BY cited_by DESC</code></pre>
 <h2 id="fusion">The payoff: fuse the lenses (reciprocal rank fusion)</h2>
 <div class="sectionbody">
 <div class="paragraph">
-<p>No single lens is "the answer." A great search <em>composes</em> them. Because BM25,
-vector, and phonetic each return a <strong>ranked list</strong>, we fuse them with
+<p>No single lens is "the answer." A great search <em>composes</em> them. Because the
+keyword, vector, and phonetic lenses each return a <strong>ranked list</strong>, we fuse them with
 <strong>Reciprocal Rank Fusion</strong> (RRF)&#8201;&#8212;&#8201;which needs only ranks, not scores&#8201;&#8212;&#8201;then
 boost by the trend and influence signals:</p>
 </div>
