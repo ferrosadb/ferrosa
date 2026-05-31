@@ -35,6 +35,7 @@ globalThis.WebAssembly = {
     const blen = (b && (b.byteLength ?? b.length)) ?? (b && b.__bytes && (b.__bytes.byteLength ?? b.__bytes.length));
     __log("WA.instantiate bytes=" + blen + " importNS=" + Object.keys(imports || {}).join(","));
     for (const ns of Object.keys(imports || {})) __log("  ns[" + ns + "]=" + Object.keys(imports[ns]).slice(0, 80).join(","));
+    try { __dumpWasm(b instanceof Uint8Array ? b : new Uint8Array(b.__bytes ?? b)); } catch (e) { __log("dump failed: " + e); }
     throw new Error("WA.instantiate stub (logging only)");
   },
   compile(b) { __log("WA.compile len=" + (b.byteLength ?? b.length)); throw new Error("WA.compile stub"); },
@@ -61,6 +62,13 @@ async fn main() {
     async_with!(ctx => |ctx| {
         let log = Function::new(ctx.clone(), |msg: String| eprintln!("[js] {msg}")).unwrap();
         ctx.globals().set("__log", log).unwrap();
+        let dump = Function::new(ctx.clone(), |bytes: rquickjs::TypedArray<'_, u8>| {
+            let data: &[u8] = bytes.as_bytes().unwrap_or(&[]);
+            std::fs::write("/tmp/binaryen.wasm", data).ok();
+            eprintln!("[poc] dumped {} wasm bytes -> /tmp/binaryen.wasm", data.len());
+        })
+        .unwrap();
+        ctx.globals().set("__dumpWasm", dump).unwrap();
         ctx.eval::<(), _>(PRELUDE).catch(&ctx).expect("prelude");
 
         // Evaluate the bundle module and AWAIT its top-level await (binaryen init).

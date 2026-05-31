@@ -95,6 +95,44 @@ with `ferrosa-udf/examples/asc-poc/build-bundle.sh`). Empirically established:
   - binaryen's wasm **exports its memory**; Emscripten's JS reads/writes that
     linear memory directly via the `Memory.buffer` ArrayBuffer.
 
+### Binaryen wasm analyzed in wasmtime (`examples/wasm_imports.rs`)
+
+Dumped binaryen's wasm (`examples/asc_compile_poc.rs` writes it via `__dumpWasm`)
+and loaded it in wasmtime 44 — **wasmtime accepts it**. Surface:
+
+- **82 function imports, all in namespace `a`**, and **all params/results are
+  numeric** (`i32`/`i64`/`f32`/`f64`) — no `externref`/`funcref`. Signatures
+  range from `() -> ()` to 16×`i32 -> ()`. A handful use `i64`
+  (`a::p,a::D,a::ga,a::Q,a::M,a::aa,a::W`) → marshal as JS **BigInt**; a few use
+  `f32`/`f64`.
+- binaryen's wasm **exports its `memory`**.
+
+So the bridge is *only* number marshalling + a shared-memory view — no reference
+types. The implementation mechanism (re-entrancy + memory) is the work:
+
+- **Re-entrancy (rquickjs ↔ wasmtime).** The wasm runs inside the JS call to
+  `WebAssembly.instantiate`, so a `Ctx<'js>` is on the stack, but a wasmtime host
+  closure must be `'static`. Bridge it by storing the raw QuickJS context
+  (`Ctx::as_raw()` → `NonNull<JSContext>`) plus the imports as
+  `Persistent<Function>` in the wasmtime `Store` data; inside each host func,
+  `unsafe { Ctx::from_raw(raw) }` and call the persisted JS import. Valid because
+  the QuickJS context outlives the instantiate call. (Mind the earlier
+  double-borrow rule: never run pending jobs while a host func holds the ctx.)
+- **Memory aliasing.** Expose `instance.exports.memory` as a `WebAssembly.Memory`
+  whose `.buffer` is an **external ArrayBuffer over the wasmtime linear memory**
+  (QuickJS `JS_NewArrayBuffer` with no-op free over `Memory::data_ptr`/`len`).
+  On `memory.grow` (Emscripten's `emscripten_resize_heap` import) the pointer can
+  move, so re-derive a fresh ArrayBuffer and let Emscripten's `updateMemoryViews`
+  re-read `.buffer` — matching its own model.
+
+### Reproduce
+
+```
+./ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
+cargo run -p ferrosa-udf --example asc_compile_poc -- /tmp/asc-host/asc-bundle.mjs   # runs toolchain, dumps /tmp/binaryen.wasm
+cargo run -p ferrosa-udf --example wasm_imports -- /tmp/binaryen.wasm                # dumps the 82-import surface
+```
+
 ### Remaining shim to build (well-defined)
 
 Implement a `WebAssembly` global in rquickjs backed by ferrosa's wasmtime:
