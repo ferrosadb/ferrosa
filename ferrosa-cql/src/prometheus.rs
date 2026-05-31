@@ -85,6 +85,9 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
         &[],
         emfile_total() as f64,
     ));
+    output.push_str(&ferrosa_net::metrics::render_prometheus());
+    output.push_str(&ferrosa_cluster::coordinator::metrics::render_prometheus());
+    output.push_str(&ferrosa_storage::commitlog::render_prometheus());
 
     // Process memory metrics — critical for diagnosing memory leaks.
     // On Linux (containers), read from /proc/self/status.

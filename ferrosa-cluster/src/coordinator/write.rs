@@ -12,6 +12,7 @@ use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
 
+use super::metrics;
 use super::ClusterCoordinator;
 
 type ReplicaWriteTarget = (u64, Option<(uuid::Uuid, String)>, String);
@@ -180,11 +181,16 @@ impl ClusterCoordinator {
 
                 async move {
                     let is_local = replica_id == local_node_id;
+                    metrics::inc_replica_write_attempt(is_local);
                     if is_local {
                         match storage.write(&table_id, &key, row, timestamp) {
-                            Ok(()) => ReplicaResult::Ack,
+                            Ok(()) => {
+                                metrics::inc_replica_write_ack(true);
+                                ReplicaResult::Ack
+                            }
                             Err(e) => {
                                 tracing::warn!(%e, "local write failed");
+                                metrics::inc_replica_write_failure(true);
                                 ReplicaResult::Failure { host_id: None }
                             }
                         }
@@ -219,13 +225,18 @@ impl ClusterCoordinator {
                                     )
                                     .await
                                 {
-                                    Ok(Message::MutationAck(_)) => ReplicaResult::Ack,
+                                    Ok(Message::MutationAck(_)) => {
+                                        metrics::inc_replica_write_ack(false);
+                                        ReplicaResult::Ack
+                                    }
                                     Ok(other) => {
                                         tracing::warn!(?other, "unexpected response from replica");
+                                        metrics::inc_replica_write_failure(false);
                                         ReplicaResult::Failure { host_id: Some(hid) }
                                     }
                                     Err(e) => {
                                         tracing::warn!(%e, %hid, "MutationForward failed");
+                                        metrics::inc_replica_write_failure(false);
                                         ReplicaResult::Failure { host_id: Some(hid) }
                                     }
                                 }

@@ -281,6 +281,8 @@ pub struct FerrosStateMachine {
     /// Optional live token ring — updated after topology commands
     /// (`JoinNode`, `LeaveNode`, `AssignTokens`).
     ring: Option<Arc<ArcSwap<TokenRing>>>,
+    /// Optional observer used by HTTP/CLI surfaces that expose a ring snapshot.
+    ring_observer: Option<Arc<ArcSwap<Option<Arc<TokenRing>>>>>,
     /// Optional system table writer for persisting DDL/auth mutations.
     system_writer: Option<SystemTableWriter>,
     /// Optional on-disk snapshot file for restart recovery.
@@ -340,6 +342,7 @@ impl FerrosStateMachine {
             schema: None,
             engine: None,
             ring: None,
+            ring_observer: None,
             system_writer: None,
             snapshot_path: None,
         }
@@ -493,6 +496,7 @@ impl FerrosStateMachine {
             schema: Some(schema),
             engine: Some(engine),
             ring: None,
+            ring_observer: None,
             system_writer,
             snapshot_path: None,
         }
@@ -522,6 +526,17 @@ impl FerrosStateMachine {
     /// will rebuild the ring from `RaftState` and store it via `ArcSwap`.
     pub fn set_ring(&mut self, ring: Arc<ArcSwap<TokenRing>>) {
         self.ring = Some(ring);
+    }
+
+    /// Wire an observer holder for the current ring snapshot.
+    ///
+    /// The coordinator consumes the non-optional `ring` above. Web/CLI
+    /// surfaces use an optional holder because standalone and pair modes have
+    /// no cluster ring. Keep the observer updated from the same `sync_ring()`
+    /// path so `/api/cluster/ring` reflects committed `AssignTokens` entries
+    /// instead of the bootstrap snapshot.
+    pub fn set_ring_observer(&mut self, ring: Arc<ArcSwap<Option<Arc<TokenRing>>>>) {
+        self.ring_observer = Some(ring);
     }
 
     /// Seed the state machine with initial cluster topology.
@@ -681,7 +696,7 @@ impl FerrosStateMachine {
     /// Called after every topology-changing command so that the
     /// `ArcSwap<TokenRing>` always reflects the committed Raft state.
     fn sync_ring(&self) {
-        if let Some(ring_swap) = &self.ring {
+        if self.ring.is_some() || self.ring_observer.is_some() {
             let mut ring = TokenRing::new();
 
             // Populate nodes.
@@ -694,7 +709,13 @@ impl FerrosStateMachine {
                 ring.assign_tokens(node_id, &[token]);
             }
 
-            ring_swap.store(Arc::new(ring));
+            let ring = Arc::new(ring);
+            if let Some(ring_swap) = &self.ring {
+                ring_swap.store(Arc::clone(&ring));
+            }
+            if let Some(observer) = &self.ring_observer {
+                observer.store(Arc::new(Some(ring)));
+            }
         }
     }
 
@@ -1570,6 +1591,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             schema: None, // snapshot builder doesn't need side effects
             engine: None,
             ring: None,          // snapshot builder doesn't need live ring
+            ring_observer: None, // snapshot builder doesn't need observability ring
             system_writer: None, // snapshot builder doesn't need system writer
             snapshot_path: self.snapshot_path.clone(),
         }
@@ -3218,6 +3240,78 @@ mod tests {
             3,
             "live ring must have 3 tokens after AssignTokens"
         );
+    }
+
+    #[tokio::test]
+    async fn topology_changes_update_ring_observer() {
+        use crate::ring::TokenRing;
+        use arc_swap::ArcSwap;
+
+        let coordinator_ring = Arc::new(ArcSwap::from_pointee(TokenRing::new()));
+        let observer = Arc::new(ArcSwap::from_pointee(None));
+        let mut sm = FerrosStateMachine::new();
+        sm.set_ring(coordinator_ring);
+        sm.set_ring_observer(observer.clone());
+
+        let host_a = Uuid::new_v4();
+        let host_b = Uuid::new_v4();
+        let node_a = super::super::uuid_to_node_id(host_a);
+        let node_b = super::super::uuid_to_node_id(host_b);
+        let info_a = NodeInfo {
+            host_id: host_a,
+            addr: "10.0.0.1:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+        let info_b = NodeInfo {
+            host_id: host_b,
+            addr: "10.0.0.2:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                0,
+                RaftOp::UpdateConfig(ClusterConfig {
+                    num_tokens: 0,
+                    ..ClusterConfig::default()
+                }),
+            ),
+            make_entry(1, 1, RaftOp::JoinNode(info_a)),
+            make_entry(1, 2, RaftOp::JoinNode(info_b)),
+            make_entry(
+                1,
+                3,
+                RaftOp::AssignTokens {
+                    node_id: node_a,
+                    tokens: vec![10, 20],
+                },
+            ),
+            make_entry(
+                1,
+                4,
+                RaftOp::AssignTokens {
+                    node_id: node_b,
+                    tokens: vec![30, 40],
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let observed_snapshot = observer.load_full();
+        let observed = observed_snapshot
+            .as_ref()
+            .clone()
+            .expect("ring observer must be populated");
+        assert_eq!(observed.tokens_for_node(node_a).len(), 2);
+        assert_eq!(observed.tokens_for_node(node_b).len(), 2);
     }
 
     #[tokio::test]

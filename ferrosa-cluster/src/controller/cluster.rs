@@ -719,6 +719,7 @@ impl ModeController {
                 "recovered raft topology from persisted state machine snapshot"
             );
             state_machine.set_ring(ring_arc.clone());
+            state_machine.set_ring_observer(self.ring.clone());
             state_machine.sync_live_ring_from_state();
         } else {
             let mut ring = TokenRing::new();
@@ -778,6 +779,7 @@ impl ModeController {
             }
             state_machine.seed_topology(members, token_map);
             state_machine.set_ring(ring_arc.clone());
+            state_machine.set_ring_observer(self.ring.clone());
         }
 
         // Expose the live ring snapshot for observability (web API, CLI).
@@ -1188,6 +1190,28 @@ impl ModeController {
             // extensions exposed by the patched openraft (`correctness/prevote-checkquorum`
             // branch) and inert against upstream openraft (defaults are
             // upstream-compatible: pre_vote=false, ratio=0.0).
+            let raft_max_payload_entries = match std::env::var("FERROSA_RAFT_MAX_PAYLOAD_ENTRIES")
+                .ok()
+                .and_then(|raw| match raw.parse::<u64>() {
+                    Ok(n) if n > 0 => Some(n),
+                    Ok(_) => {
+                        tracing::warn!(
+                            "FERROSA_RAFT_MAX_PAYLOAD_ENTRIES must be greater than zero, using default"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %e,
+                            "FERROSA_RAFT_MAX_PAYLOAD_ENTRIES parse error, using default"
+                        );
+                        None
+                    }
+                }) {
+                Some(n) => n,
+                None => openraft::Config::default().max_payload_entries,
+            };
+
             let raft_config = match (openraft::Config {
                 cluster_name,
                 heartbeat_interval: raft_heartbeat_ms,
@@ -1196,7 +1220,7 @@ impl ModeController {
                 replication_lag_timeout: raft_heartbeat_ms * 10,
                 election_timeout_min: raft_election_min_ms,
                 election_timeout_max: raft_election_max_ms,
-                max_payload_entries: 5,
+                max_payload_entries: raft_max_payload_entries,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
                 enable_pre_vote: raft_enable_pre_vote,
                 check_quorum_ratio: raft_check_quorum_ratio,

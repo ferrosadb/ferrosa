@@ -849,7 +849,9 @@ impl<F: FlushTarget> TableStore<F> {
                     continue;
                 }
             };
-            iter.seek_to_token(key.token.0)?;
+            // Walk partition metadata until the exact key instead of using
+            // `seek_to_token`; this cursor only needs one partition and must
+            // not depend on the SSTable token-offset cache hot path.
             while let Some(peeked) = iter.peek_partition_key()? {
                 if peeked == *key {
                     let Some((_, deletion, _static_row)) = iter.next_partition_header_only()?
@@ -865,10 +867,10 @@ impl<F: FlushTarget> TableStore<F> {
                     ));
                     break;
                 }
-                if peeked.token != key.token || peeked > *key {
+                if peeked.token > key.token || (peeked.token == key.token && peeked > *key) {
                     break;
                 }
-                iter.skip_to_next_partition()?;
+                let _ = iter.next_partition_metadata()?;
             }
         }
 
