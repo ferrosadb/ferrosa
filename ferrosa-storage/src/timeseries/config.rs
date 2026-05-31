@@ -365,6 +365,13 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
             .map_err(|_| format!("invalid duration: '{s}'"))?;
         return Ok(Duration::from_millis(n));
     }
+    if let Some(num) = s.strip_suffix('d') {
+        let n: u64 = num
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid duration: '{s}'"))?;
+        return Ok(Duration::from_secs(n * 86_400));
+    }
     if let Some(num) = s.strip_suffix('h') {
         let n: u64 = num
             .trim()
@@ -585,6 +592,12 @@ mod tests {
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("100ms").unwrap(), Duration::from_millis(100));
         assert_eq!(parse_duration("60").unwrap(), Duration::from_secs(60));
+        // Day units: a weekly rollup is '7d', a daily one '1d'.
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(
+            parse_duration("7d").unwrap(),
+            Duration::from_secs(7 * 86_400)
+        );
     }
 
     #[test]
