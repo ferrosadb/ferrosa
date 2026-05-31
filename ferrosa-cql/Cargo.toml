@@ -40,6 +40,12 @@ snap = "1"
 socket2 = "0.6"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+# Inline AssemblyScript UDF compilation (CREATE FUNCTION ... LANGUAGE assemblyscript).
+asc-udf = ["ferrosa-udf/asc-udf"]
+# Opt-in tests needing external infrastructure (e.g. the asc toolchain bundle).
+live-infra-tests = []
+
 [dev-dependencies]
 proptest = "1"
 rcgen = "0.14"

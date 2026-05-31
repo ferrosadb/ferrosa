@@ -71,3 +71,22 @@ AS '$$to_celsius$$';
 -- Use it
 SELECT to_celsius(temperature) FROM sensor_readings;
 ```
+
+## Alternative: inline AssemblyScript
+
+For simple scalar functions you can skip the Rust build and hex-encoding entirely
+and write the source inline. The server compiles it at definition time
+(`LANGUAGE assemblyscript`, requires the `asc-udf` feature):
+
+```cql
+CREATE FUNCTION mykeyspace.to_celsius(temp double)
+CALLED ON NULL INPUT
+RETURNS double
+LANGUAGE assemblyscript
+AS 'export function to_celsius(temp: f64): f64 { return (temp - 32.0) * 5.0 / 9.0; }';
+```
+
+The exported function name must match the UDF name. Supported argument/return
+types: numeric (`int`, `bigint`, `float`, `double`, `smallint`, `tinyint`),
+`text`/`ascii` (AS `string`), and `blob` (AS `Uint8Array`). Collection and
+temporal types still require the precompiled `LANGUAGE wasm` form above.

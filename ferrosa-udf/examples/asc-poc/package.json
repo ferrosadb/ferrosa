@@ -1,0 +1,10 @@
+{
+  "name": "ferrosa-asc-bundle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned toolchain for building the inline-AssemblyScript UDF compiler bundle (ferrosa-udf, asc-udf feature). Installed with `npm ci` for integrity-verified, reproducible builds.",
+  "dependencies": {
+    "assemblyscript": "0.28.17",
+    "esbuild": "0.25.10"
+  }
+}

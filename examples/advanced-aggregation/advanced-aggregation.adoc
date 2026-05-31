@@ -147,6 +147,28 @@ CREATE OR REPLACE FUNCTION sensor_analytics.to_celsius(f double)
 `CALLED ON NULL INPUT` means the function runs even when `f` is null.
 The implementation returns null when given null, preserving the null semantics your application expects.
 
+==== Alternative: inline AssemblyScript
+
+Instead of building and hex-encoding a precompiled binary, you can write a scalar
+function as inline AssemblyScript (TypeScript-like) source and let the server
+compile it at definition time with `LANGUAGE assemblyscript`:
+
+[source,sql]
+----
+CREATE OR REPLACE FUNCTION sensor_analytics.to_celsius(f double)
+    CALLED ON NULL INPUT
+    RETURNS double
+    LANGUAGE assemblyscript
+    AS 'export function to_celsius(f: f64): f64 { return (f - 32.0) * 5.0 / 9.0; }';
+----
+
+The exported function name must match the UDF name. Inline AssemblyScript
+supports numeric (`int`, `bigint`, `float`, `double`, `smallint`, `tinyint`),
+`text`/`ascii` (AS `string`), and `blob` (AS `Uint8Array`) argument and return
+types. It requires the server to be built with the `asc-udf` feature and the asc
+toolchain bundle to be available (see `examples/asc-poc/build-bundle.sh`);
+collection and temporal types still require the precompiled `LANGUAGE wasm` form.
+
 ==== Register `coalesce`
 
 [source,sql]
