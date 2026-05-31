@@ -8,75 +8,73 @@ context: "CQL UDF gap-fill — ferrosa runs WASM UDFs, not Java. Explore compili
 
 # Design: inline language → WASM for `CREATE FUNCTION`
 
-## Spike findings (2026-05-31) — asc runs with no WASM dependency
+## Spike findings (2026-05-31) — binaryen REQUIRES the WebAssembly API
 
-Empirically tested (`npm i assemblyscript binaryen`, node 25):
+Empirically tested (`npm i assemblyscript binaryen`, node 25; Javy 8.1.1;
+wasmtime 45 CLI):
 
-1. **The whole toolchain is pure JavaScript.** `asc` (dist `asc.js` 0.9 MB +
-   `assemblyscript.js` 0.8 MB) and the `binaryen` npm package (`index.js` 13 MB)
-   are pure JS. Compilation **succeeds with `globalThis.WebAssembly` deleted**
-   (verified on non-trivial code with loops) — binaryen's npm build is the
-   Emscripten **JS fallback**, not WASM. The `WebAssembly.compile/instantiate`
-   references are an *optional* fast path, not required.
-2. **It drives fully in-memory.** `asc.main(args, { readFile, writeFile,
+1. **Correction to an earlier result.** A first test appeared to show the
+   toolchain compiling with `globalThis.WebAssembly` deleted — that was a **false
+   positive from ES-module import hoisting**: the static `import` ran (loading
+   binaryen *with* `WebAssembly` present) *before* the `delete` statement
+   executed. Denying `WebAssembly` *before* binaryen loads (dynamic import, or in
+   a JS engine that simply lacks it) makes binaryen **fail at its
+   `WebAssembly.instantiate`** (`_r` in `binaryen/index.js`). So:
+   **binaryen (the npm Emscripten build) requires the `WebAssembly` API** to run
+   its codegen. It contains `wasm2js` symbols, but that pure-JS fallback is **not
+   auto-selected** when `WebAssembly` is merely absent.
+2. **It does drive fully in-memory.** `asc.main(args, { readFile, writeFile,
    listFiles })` with callbacks compiles a source **string** to wasm **bytes**
-   with no `fs`/WASI and no CLI (`process.argv/exit` are only the CLI wrapper).
+   with no `fs`/WASI and no CLI. (Still true and useful.)
 3. **Vendored footprint ≈ 15 MB of JS** (`asc.js` + `assemblyscript.js` +
-   `binaryen/index.js`); the 79 MB native `binaryen/bin/` is **not** needed.
+   `binaryen/index.js`); the native `binaryen/bin/` is not needed.
 
-### Consequence — the "into our Wasmtime" question is answered: YES, cleanly
+### The Javy-guest-in-Wasmtime PoC ran, then hit exactly this
 
-The earlier blocker (running `asc` in Wasmtime would need nested WASM, because
-binaryen-as-WASM needs `WebAssembly.instantiate` → no WASM-guest JS engine
-provides that) **does not apply**: binaryen is pure JS, so there is no inner
-WASM. Therefore:
+`esbuild` bundles the in-memory driver + asc + binaryen to a ~15 MB ESM (node
+builtins externalized as dead code). `javy build -J event-loop=y` produced a
+41 MB `compiler.wasm`. Running it under `wasmtime` (stdin = AS source) **executed
+QuickJS and asc all the way to binaryen codegen**, then aborted with
+`WebAssembly is not defined` → with a `validate` stub, `WA.instantiate
+unsupported`. QuickJS (and thus a Javy/`quickjs-wasi` guest) has **no
+WebAssembly**, and nesting a real WASM engine inside the guest is the unsolved
+part. So the pure-guest path is **blocked** by binaryen's WebAssembly need.
 
-- **Recommended: run a JS engine *as a WASM/WASI guest inside ferrosa's existing
-  Wasmtime*** (a Javy / `quickjs-wasi`-style QuickJS, or StarlingMonkey),
-  executing `asc.js` + `binaryen.js`, source-in → wasm-out. The guest engine
-  needs **no** WebAssembly support. The compile inherits Wasmtime's
-  sandbox + fuel/memory/epoch limits — the STRIDE-DoS bound for free.
-- Host-side Boa (pure Rust) / `rquickjs` is the fallback (simpler wiring, but the
-  compile is not auto-sandboxed by Wasmtime — needs separate limits).
+### Revised recommendation
 
-### Bundling spike (2026-05-31, continued)
+Two viable paths; pick one:
 
-Tested bundling the in-memory driver + `asc` + `binaryen` for a bare engine
-(esbuild, node 25):
+- **(A) Host-side JS engine + Wasmtime-backed `WebAssembly` shim** (recommended).
+  Embed Boa (pure Rust, permissive) or `rquickjs` (QuickJS, MIT) in the ferrosa
+  process to run `asc.js` + `binaryen.js`. Provide a global `WebAssembly` whose
+  `compile`/`instantiate`/`Module`/`Instance`/`Memory` are **backed by ferrosa's
+  existing wasmtime** — so binaryen's real (fast) WASM executes *in our
+  wasmtime*, sandboxed, while the JS engine just orchestrates on the host. The
+  fiddly part is the `Memory` ↔ ArrayBuffer bridge and exported-function
+  marshalling. This still satisfies "use the wasmtime we have" for the heavy work.
+- **(B) Produce a `WASM=0` binaryen** (Emscripten pure-JS, zero WebAssembly
+  references) so the whole toolchain runs in a Javy/QuickJS guest *inside*
+  wasmtime with no shim. Requires building binaryen with `-s WASM=0` (an
+  Emscripten toolchain build) or forcing its `wasm2js` path — an artifact-
+  production effort, but then the runtime story is the cleanest (all-in-wasmtime,
+  no host JS engine).
 
-- `asc.js` uses **top-level await** → must bundle as **ESM**, not IIFE/CJS.
-- `asc.js` has **no static** node imports, but `binaryen` (Emscripten) does
-  `require("fs"|"path"|"url"|...)` and conditional `import("node:...")` for its
-  default backend. With the callback I/O these paths are **dead code**, so
-  externalizing all node builtins (`--external:fs --external:path … --external:node:*`)
-  bundles cleanly → a single **~15 MB ESM**.
-- Running that bundle in **bare QuickJS** (`quickjs-emscripten`, the engine a
-  Javy / `quickjs-wasi` Wasmtime guest uses) then hits the standard
-  *Emscripten-output-on-a-minimal-engine* shimming wall: module init throws
-  unless the dynamic-import stubs and Emscripten environment globals are shimmed
-  correctly. This is **plumbing, not a feasibility wall** — QuickJS supports
-  everything asc/binaryen use (ES2023, modules, async, BigInt, TypedArrays).
+The remaining `asc.js`/Emscripten environment shims (TLA→ESM, externalised node
+builtins, event loop) are solved; the open fork is **(A) host-engine + WASM shim**
+vs **(B) WASM=0 binaryen**.
 
-### Conclusion → don't hand-roll the shims; use a maintained QuickJS-WASI toolchain
+### Bundling details (still valid)
 
-The Emscripten/node shimming is exactly what **Javy** and **jco/ComponentizeJS
-(StarlingMonkey)** automate. Recommended build path:
-
-1. **First try Javy** (Bytecode Alliance): bundle the driver + asc + binaryen to
-   a single JS, `javy build` → a QuickJS-WASI `.wasm`; pass source on stdin,
-   return wasm on stdout. Smallest guest. Risks to confirm: async `asc.main`
-   under Javy's run model, and the 15 MB working set.
-2. **Fallback: jco + StarlingMonkey** (SpiderMonkey-as-WASM component). Heavier,
-   but far more node/Emscripten-compatible, so it most likely runs the toolchain
-   with minimal shims; it's a Wasmtime **component**, matching `ferrosa-udf`'s
-   component runtime directly.
-3. Run the produced module under the **wasmtime 44 component runtime** ferrosa
-   already has; bound guest memory + epoch/fuel; measure compile latency
-   (pure-JS binaryen is slower than WASM binaryen — fine for occasional DDL).
-
-The fundamental questions are now answered (pure JS, no WASM, in-memory,
-single-bundle). The open item is purely **which guest toolchain runs the bundle
-with least friction** — a build/integration task, not a research risk.
+- `asc.js` uses **top-level await** → bundle as **ESM** (not IIFE/CJS).
+- `asc.js` has no static node imports; `binaryen` (Emscripten) does
+  `require("fs"|"path"|"url"|...)` and conditional `import("node:...")`, all dead
+  code under the callback I/O → externalize all node builtins → single ~15 MB
+  ESM. `javy build -J event-loop=y -J text-encoding=y -J javy-stream-io=y`
+  produced a 41 MB `compiler.wasm`.
+- The remaining engine work is **not** the node/Emscripten shims (solved) — it is
+  binaryen's `WebAssembly` requirement (see the corrected findings above). That
+  decides the fork: **(A) host JS engine + Wasmtime-backed WebAssembly shim** vs
+  **(B) WASM=0 binaryen for an all-in-Wasmtime guest**.
 
 ## Goal
 
