@@ -6,6 +6,9 @@
 //! `call()` method.
 
 pub mod arena;
+/// Inline AssemblyScript -> WASM compilation (feature `asc-udf`).
+#[cfg(feature = "asc-udf")]
+pub mod asc;
 pub mod convert;
 pub mod error;
 pub mod executor;
