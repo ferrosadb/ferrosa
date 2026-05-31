@@ -1,30 +1,20 @@
+-- User-defined aggregate built from WASM state/final functions. Ferrosa runs
+-- UDF/UDA bodies as WebAssembly components (inline hex placeholder below).
 CREATE OR REPLACE FUNCTION test.averageState(state tuple<int,bigint>, val int)
     CALLED ON NULL INPUT
-    RETURNS tuple
-    LANGUAGE java
-    AS $$
-        if (val != null) {
-            state.setInt(0, state.getInt(0)+1);
-            state.setLong(1, state.getLong(1)+val.intValue());
-        }
-        return state;
-    $$;
+    RETURNS tuple<int,bigint>
+    LANGUAGE wasm
+    AS '0x0061736d0d000100';
 
 CREATE OR REPLACE FUNCTION test.averageFinal (state tuple<int,bigint>)
     CALLED ON NULL INPUT
     RETURNS double
-    LANGUAGE java
-    AS $$
-        double r = 0;
-        if (state.getInt(0) == 0) return null;
-        r = state.getLong(1);
-        r /= state.getInt(0);
-        return Double.valueOf(r);
-    $$;
+    LANGUAGE wasm
+    AS '0x0061736d0d000100';
 
 CREATE OR REPLACE AGGREGATE test.average(int)
     SFUNC averageState
-    STYPE tuple
+    STYPE tuple<int,bigint>
     FINALFUNC averageFinal
     INITCOND (0, 0);
 
