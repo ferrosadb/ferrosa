@@ -30,6 +30,11 @@ pub struct StorageStats {
     pub sstable_size_bytes: i64,
     pub s3_object_count: i32,
     pub s3_bytes: i64,
+    pub local_sstable_component_count: i32,
+    pub compressed_sstable_count: i32,
+    pub uncompressed_sstable_count: i32,
+    pub local_cache_max_bytes: i64,
+    pub local_sstable_cache_bytes: i64,
     pub pending_compactions: i32,
 }
 
@@ -96,6 +101,26 @@ impl StorageStatsTable {
                 data_type: DataType::BigInt,
             },
             VirtualColumnDef {
+                name: "local_sstable_component_count".into(),
+                data_type: DataType::Int,
+            },
+            VirtualColumnDef {
+                name: "compressed_sstable_count".into(),
+                data_type: DataType::Int,
+            },
+            VirtualColumnDef {
+                name: "uncompressed_sstable_count".into(),
+                data_type: DataType::Int,
+            },
+            VirtualColumnDef {
+                name: "local_cache_max_bytes".into(),
+                data_type: DataType::BigInt,
+            },
+            VirtualColumnDef {
+                name: "local_sstable_cache_bytes".into(),
+                data_type: DataType::BigInt,
+            },
+            VirtualColumnDef {
                 name: "pending_compactions".into(),
                 data_type: DataType::Int,
             },
@@ -136,6 +161,11 @@ impl VirtualTable for StorageStatsTable {
                     CellValue::live(s.sstable_size_bytes.to_be_bytes().to_vec(), 0),
                     CellValue::live(s.s3_object_count.to_be_bytes().to_vec(), 0),
                     CellValue::live(s.s3_bytes.to_be_bytes().to_vec(), 0),
+                    CellValue::live(s.local_sstable_component_count.to_be_bytes().to_vec(), 0),
+                    CellValue::live(s.compressed_sstable_count.to_be_bytes().to_vec(), 0),
+                    CellValue::live(s.uncompressed_sstable_count.to_be_bytes().to_vec(), 0),
+                    CellValue::live(s.local_cache_max_bytes.to_be_bytes().to_vec(), 0),
+                    CellValue::live(s.local_sstable_cache_bytes.to_be_bytes().to_vec(), 0),
                     CellValue::live(s.pending_compactions.to_be_bytes().to_vec(), 0),
                 ];
                 VirtualRow { cells }
@@ -418,6 +448,11 @@ mod tests {
             sstable_size_bytes: 65536,
             s3_object_count: 3,
             s3_bytes: 131072,
+            local_sstable_component_count: 15,
+            compressed_sstable_count: 4,
+            uncompressed_sstable_count: 1,
+            local_cache_max_bytes: 1_048_576,
+            local_sstable_cache_bytes: 32768,
             pending_compactions: 1,
         }
     }
@@ -432,7 +467,7 @@ mod tests {
 
         assert_eq!(table.name(), "storage_stats");
         assert_eq!(table.keyspace(), "system_observability");
-        assert_eq!(table.columns().len(), 9);
+        assert_eq!(table.columns().len(), 14);
 
         let names: Vec<&str> = table.columns().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -446,6 +481,11 @@ mod tests {
                 "sstable_size_bytes",
                 "s3_object_count",
                 "s3_bytes",
+                "local_sstable_component_count",
+                "compressed_sstable_count",
+                "uncompressed_sstable_count",
+                "local_cache_max_bytes",
+                "local_sstable_cache_bytes",
                 "pending_compactions",
             ]
         );
@@ -462,9 +502,9 @@ mod tests {
         let rows = table.read(None);
         assert_eq!(rows.len(), 2);
 
-        // Each row has exactly 9 cells.
+        // Each row has exactly one cell per column.
         for row in &rows {
-            assert_eq!(row.cells.len(), 9);
+            assert_eq!(row.cells.len(), 14);
         }
 
         // Spot-check first row: keyspace bytes

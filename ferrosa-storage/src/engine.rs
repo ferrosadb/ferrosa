@@ -45,6 +45,66 @@ use crate::timeseries::{
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
+pub(crate) fn write_options_for_schema(
+    schema: &TableSchema,
+    verify_output: bool,
+) -> ferrosa_common::Result<ferrosa_sstable::WriteOptions> {
+    let compression = compression_from_schema(schema)?;
+    let chunk_size = schema
+        .extensions
+        .get("compression.chunk_length_kb")
+        .or_else(|| schema.extensions.get("compression.chunk_length_in_kb"))
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|kb| kb.saturating_mul(1024))
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(ferrosa_sstable::Compression::DEFAULT_CHUNK_SIZE);
+
+    Ok(ferrosa_sstable::WriteOptions {
+        compression,
+        chunk_size,
+        verify_output,
+        ..ferrosa_sstable::WriteOptions::default()
+    })
+}
+
+fn compression_from_schema(
+    schema: &TableSchema,
+) -> ferrosa_common::Result<Option<ferrosa_sstable::Compression>> {
+    let Some(class) = schema
+        .extensions
+        .get("compression.class")
+        .or_else(|| schema.extensions.get("compression.sstable_compression"))
+    else {
+        return Ok(Some(ferrosa_sstable::Compression::Lz4));
+    };
+
+    let class = class.trim();
+    if class.is_empty()
+        || class.eq_ignore_ascii_case("none")
+        || class.eq_ignore_ascii_case("null")
+        || class.eq_ignore_ascii_case("false")
+    {
+        return Ok(None);
+    }
+
+    let short_name = class.rsplit('.').next().unwrap_or(class);
+    match short_name {
+        "LZ4Compressor" | "LZ4" | "lz4" => Ok(Some(ferrosa_sstable::Compression::Lz4)),
+        "ZstdCompressor" | "Zstd" | "zstd" | "ZSTD" => {
+            let level = schema
+                .extensions
+                .get("compression.compression_level")
+                .or_else(|| schema.extensions.get("compression.level"))
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(3);
+            Ok(Some(ferrosa_sstable::Compression::Zstd { level }))
+        }
+        other => Err(ferrosa_common::Error::UnsupportedCompression(
+            other.to_string(),
+        )),
+    }
+}
+
 /// Bounded live queue snapshot for one time-series materialization target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeSeriesMaterializationQueueSnapshot {
@@ -548,6 +608,9 @@ pub struct StorageEngine {
     /// Set by `probe_s3_cas()` at startup.  When `false`, manifest saves
     /// fall back to unconditional PUT (last-writer-wins).
     pub(crate) s3_cas_supported: std::sync::atomic::AtomicBool,
+    /// Last observed live manifest object/byte totals per table. Updated by
+    /// S3 sync/restore paths and used by sync-only metrics surfaces.
+    s3_manifest_stats: RwLock<HashMap<String, (i32, i64)>>,
     /// Injected object store used in tests to bypass `ObjectStoreConfig::build_object_store()`.
     /// When `Some`, `resolve_store_and_prefix()` returns this store instead of building one.
     #[cfg(test)]
@@ -834,6 +897,7 @@ impl StorageEngine {
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_manifest_stats: RwLock::new(HashMap::new()),
             #[cfg(test)]
             upload_store_override: None,
         };
@@ -980,6 +1044,7 @@ impl StorageEngine {
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_manifest_stats: RwLock::new(HashMap::new()),
             #[cfg(test)]
             upload_store_override: None,
         })
@@ -1107,6 +1172,7 @@ impl StorageEngine {
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_manifest_stats: RwLock::new(HashMap::new()),
             #[cfg(test)]
             upload_store_override: None,
         };
@@ -1667,13 +1733,9 @@ impl StorageEngine {
             Self::load_existing_sstables_and_sidecars(&table_dir);
 
         let flush_target = FileFlushTarget::new_starting_at(table_dir)?;
-        // Thread the engine-level write_verify flag into the writer so
-        // FERROSA_WRITE_VERIFY=false actually disables Gate B at finish()
-        // time. Default is Gate-B-on (see SSTableWriter::finish).
-        let write_options = ferrosa_sstable::WriteOptions {
-            verify_output: config.write_verify,
-            ..ferrosa_sstable::WriteOptions::default()
-        };
+        // Thread schema compression options and the engine-level write_verify
+        // flag into the writer.
+        let write_options = write_options_for_schema(&schema, config.write_verify)?;
         let store = if existing_sstables.is_empty() && indexed_columns.is_empty() {
             TableStore::new(schema.clone(), flush_target, write_options)
         } else if existing_sstables.is_empty() {
@@ -4681,6 +4743,7 @@ impl StorageEngine {
                         "Filter.db",
                         "Statistics.db",
                         "TOC.txt",
+                        "CompressionInfo.db",
                     ];
                     result
                         .task
@@ -5195,6 +5258,100 @@ impl StorageEngine {
         self.commit_log.discard_completed_segments()
     }
 
+    fn collect_uploaded_local_sstables(
+        &self,
+        manifest: &crate::manifest::Manifest,
+    ) -> Vec<(
+        String,
+        String,
+        std::path::PathBuf,
+        u64,
+        std::time::SystemTime,
+    )> {
+        let mut entries = Vec::new();
+        for (table_id, manifest_entries) in &manifest.sstables {
+            let table_dir = self.config.data_dir.join("sstables").join(table_id);
+            for entry in manifest_entries {
+                let Ok(gen) = entry.id.parse::<u64>() else {
+                    continue;
+                };
+                let component_paths = Self::generation_component_paths(&table_dir, gen);
+                if component_paths.is_empty() {
+                    continue;
+                }
+
+                let mut size = 0u64;
+                let mut last_modified = std::time::UNIX_EPOCH;
+                for path in component_paths {
+                    let Ok(metadata) = std::fs::metadata(&path) else {
+                        continue;
+                    };
+                    size = size.saturating_add(metadata.len());
+                    if let Ok(modified) = metadata.modified() {
+                        last_modified = last_modified.max(modified);
+                    }
+                }
+
+                if size > 0 {
+                    entries.push((
+                        table_id.clone(),
+                        entry.id.clone(),
+                        table_dir.clone(),
+                        size,
+                        last_modified,
+                    ));
+                }
+            }
+        }
+
+        entries.sort_by_key(|(_, _, _, _, last_modified)| *last_modified);
+        entries
+    }
+
+    fn enforce_uploaded_sstable_cache_limit(
+        &self,
+        manifest: &crate::manifest::Manifest,
+    ) -> ferrosa_common::Result<usize> {
+        let max_bytes = self.config.local_cache_max_bytes;
+        let candidates = self.collect_uploaded_local_sstables(manifest);
+        let mut total_bytes = candidates
+            .iter()
+            .fold(0u64, |acc, (_, _, _, size, _)| acc.saturating_add(*size));
+        let mut evicted = 0usize;
+
+        for (table_id, sstable_id, table_dir, size, _) in candidates {
+            if total_bytes <= max_bytes {
+                break;
+            }
+
+            Self::delete_sstable_files(&table_dir, &sstable_id);
+            total_bytes = total_bytes.saturating_sub(size);
+            evicted += 1;
+            tracing::info!(
+                table = table_id,
+                sstable = sstable_id,
+                size_bytes = size,
+                remaining_uploaded_cache_bytes = total_bytes,
+                max_uploaded_cache_bytes = max_bytes,
+                "s3-sync: evicted uploaded local SSTable from cache"
+            );
+        }
+
+        Ok(evicted)
+    }
+
+    fn update_s3_manifest_stats(&self, manifest: &crate::manifest::Manifest) {
+        let mut stats = HashMap::new();
+        for (table_id, entries) in &manifest.sstables {
+            let object_count = entries.iter().fold(0i32, |acc, _| acc.saturating_add(7));
+            let bytes = entries
+                .iter()
+                .fold(0i64, |acc, entry| acc.saturating_add(entry.size as i64));
+            stats.insert(table_id.clone(), (object_count, bytes));
+        }
+        *self.s3_manifest_stats.write() = stats;
+    }
+
     /// Sync all local SSTables to S3 and update the manifest.
     ///
     /// Scans each registered table's SSTable directory, collects component
@@ -5210,6 +5367,7 @@ impl StorageEngine {
         // Load current manifest to check which SSTables are already uploaded.
         let (mut manifest, _version) =
             crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        self.update_s3_manifest_stats(&manifest);
 
         let mut uploaded = 0usize;
 
@@ -5320,7 +5478,12 @@ impl StorageEngine {
             } else {
                 manifest.save_without_cas(store.as_ref(), &prefix).await?;
             }
-            tracing::info!(uploaded, "s3-sync: SSTables uploaded, manifest saved");
+            self.update_s3_manifest_stats(&manifest);
+        }
+
+        let evicted = self.enforce_uploaded_sstable_cache_limit(&manifest)?;
+        if uploaded > 0 || evicted > 0 {
+            tracing::info!(uploaded, evicted, "s3-sync: SSTables synchronized");
         }
 
         Ok(uploaded)
@@ -5347,6 +5510,7 @@ impl StorageEngine {
             Some(e) => e,
             None => return Ok(0),
         };
+        self.update_s3_manifest_stats(manifest);
 
         let table_dir = self
             .config
@@ -5369,6 +5533,7 @@ impl StorageEngine {
             "Filter.db",
             "Statistics.db",
             "TOC.txt",
+            "CompressionInfo.db",
         ];
 
         'entry_loop: for entry in entries {
@@ -5833,6 +5998,7 @@ impl StorageEngine {
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_manifest_stats: RwLock::new(HashMap::new()),
             upload_store_override: Some((store, prefix)),
         })
     }
@@ -5915,6 +6081,7 @@ impl StorageEngine {
                     "Filter.db",
                     "Statistics.db",
                     "TOC.txt",
+                    "CompressionInfo.db",
                 ];
                 for component in &components {
                     let local_path = table_dir.join(format!("{gen}-{component}"));
@@ -5965,25 +6132,59 @@ impl crate::virtual_tables::StorageStatsProvider for StorageEngine {
             .map(|(table_id, state)| {
                 let sstable_count = state.store.sstable_count() as i32;
 
-                // Sum on-disk SSTable file sizes for this table.
                 let table_dir = self
                     .config
                     .data_dir
                     .join("sstables")
                     .join(table_id.to_string());
-                let sstable_size_bytes: i64 = std::fs::read_dir(&table_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| e.metadata().ok().map(|m| m.len() as i64))
-                    .sum();
+                let generations = Self::scan_generations(&table_dir);
+                let mut sstable_size_bytes = 0i64;
+                let mut local_sstable_component_count = 0i32;
+                let mut compressed_sstable_count = 0i32;
+                let mut uncompressed_sstable_count = 0i32;
 
-                // Approximate S3 stats: each SSTable has ~5 component files
-                // (Data.db, Index.db, Filter.db, Statistics.db, CompressionInfo.db).
-                // S3 bytes approximates sstable_size_bytes since flushed SSTables
-                // are uploaded to S3.
-                let s3_object_count = sstable_count.saturating_mul(5);
-                let s3_bytes = sstable_size_bytes;
+                for gen in generations {
+                    let component_paths = Self::generation_component_paths(&table_dir, gen);
+                    if component_paths.is_empty() {
+                        continue;
+                    }
+                    local_sstable_component_count =
+                        local_sstable_component_count.saturating_add(component_paths.len() as i32);
+                    for path in component_paths {
+                        sstable_size_bytes = sstable_size_bytes.saturating_add(
+                            std::fs::metadata(&path)
+                                .map(|m| m.len() as i64)
+                                .unwrap_or(0),
+                        );
+                    }
+                    if Self::generation_component_path(
+                        &table_dir,
+                        &gen.to_string(),
+                        "CompressionInfo.db",
+                    )
+                    .is_some()
+                    {
+                        compressed_sstable_count = compressed_sstable_count.saturating_add(1);
+                    } else {
+                        uncompressed_sstable_count = uncompressed_sstable_count.saturating_add(1);
+                    }
+                }
+
+                let local_sstable_cache_bytes = if self.has_s3() {
+                    // Local component footprint for this table. After S3 sync
+                    // it should stay under `local_cache_max_bytes`, while
+                    // remote bytes come from the last observed manifest below.
+                    sstable_size_bytes
+                } else {
+                    0
+                };
+
+                let (s3_object_count, s3_bytes) = self
+                    .s3_manifest_stats
+                    .read()
+                    .get(&table_id.to_string())
+                    .copied()
+                    .unwrap_or((0, 0));
 
                 crate::virtual_tables::StorageStats {
                     keyspace: table_id.keyspace().to_string(),
@@ -5994,6 +6195,11 @@ impl crate::virtual_tables::StorageStatsProvider for StorageEngine {
                     sstable_size_bytes,
                     s3_object_count,
                     s3_bytes,
+                    local_sstable_component_count,
+                    compressed_sstable_count,
+                    uncompressed_sstable_count,
+                    local_cache_max_bytes: self.config.local_cache_max_bytes as i64,
+                    local_sstable_cache_bytes,
                     pending_compactions: 0, // Per-table pending count not yet exposed
                 }
             })
@@ -6416,6 +6622,84 @@ mod tests {
 
     fn table_id() -> TableId {
         TableId::new("test_ks", "test_table")
+    }
+
+    #[test]
+    fn write_options_default_to_lz4() {
+        let options = write_options_for_schema(&test_schema(), true).unwrap();
+        assert!(matches!(
+            options.compression,
+            Some(ferrosa_sstable::Compression::Lz4)
+        ));
+        assert!(options.verify_output);
+    }
+
+    #[test]
+    fn write_options_parse_zstd_schema_extensions() {
+        let mut schema = test_schema();
+        schema.extensions.insert(
+            "compression.class".to_string(),
+            "org.apache.cassandra.io.compress.ZstdCompressor".to_string(),
+        );
+        schema
+            .extensions
+            .insert("compression.compression_level".to_string(), "7".to_string());
+        schema
+            .extensions
+            .insert("compression.chunk_length_kb".to_string(), "32".to_string());
+
+        let options = write_options_for_schema(&schema, false).unwrap();
+        assert_eq!(
+            options.compression,
+            Some(ferrosa_sstable::Compression::Zstd { level: 7 })
+        );
+        assert_eq!(options.chunk_size, 32 * 1024);
+        assert!(!options.verify_output);
+    }
+
+    #[test]
+    fn uploaded_sstable_cache_eviction_deletes_only_manifest_confirmed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_cache_max_bytes = 100;
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let table_id = table_id().to_string();
+        let table_dir = dir.path().join("sstables").join(&table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("1-Data.db"), vec![1u8; 80]).unwrap();
+        std::fs::write(table_dir.join("2-Data.db"), vec![2u8; 80]).unwrap();
+        std::fs::write(table_dir.join("3-Data.db"), vec![3u8; 80]).unwrap();
+
+        let mut manifest = crate::manifest::Manifest::new();
+        for id in ["1", "2"] {
+            manifest.add_sstable(
+                &table_id,
+                crate::manifest::ManifestEntry {
+                    id: id.to_string(),
+                    size: 80,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+        }
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert_eq!(evicted, 1);
+        let uploaded_remaining = ["1", "2"]
+            .into_iter()
+            .filter(|id| table_dir.join(format!("{id}-Data.db")).exists())
+            .count();
+        assert_eq!(uploaded_remaining, 1);
+        assert!(
+            table_dir.join("3-Data.db").exists(),
+            "unmanifested local SSTables must not be evicted"
+        );
     }
 
     #[test]

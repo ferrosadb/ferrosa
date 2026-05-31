@@ -1079,10 +1079,7 @@ impl<F: FlushTarget> TableStore<F> {
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
 
         // Step 5: Build the SSTable.
-        // Force compression off — there is a known CRC mismatch between
-        // SSTableWriter and SSTableReader for compressed data.
-        let mut options = self.options.clone();
-        options.compression = None;
+        let options = self.options.clone();
 
         let schema = self.schema.load();
 
