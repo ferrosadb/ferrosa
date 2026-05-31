@@ -1223,10 +1223,12 @@ impl<'input> Parser<'input> {
                     durable_writes = match t.kind {
                         TokenKind::Keyword(Keyword::True) => Some(true),
                         TokenKind::Keyword(Keyword::False) => Some(false),
-                        _ => return Err(CqlError::SyntaxError(format!(
+                        _ => {
+                            return Err(CqlError::SyntaxError(format!(
                             "expected true or false for DURABLE_WRITES, got {:?} at position {}",
                             t.kind, t.pos
-                        ))),
+                        )))
+                        }
                     };
                 }
                 _ => {
@@ -1263,6 +1265,8 @@ impl<'input> Parser<'input> {
 
         let mut add_columns = vec![];
         let mut drop_columns = vec![];
+        let mut rename_columns: Vec<(String, String)> = vec![];
+        let mut alter_column_types = vec![];
         let mut extensions = None;
         let mut table_options = vec![];
 
@@ -1278,6 +1282,27 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 let col_name = self.parse_ident()?;
                 drop_columns.push(col_name);
+            }
+            TokenKind::Keyword(Keyword::Rename) => {
+                // RENAME <from> TO <to> [AND <from> TO <to> ...]
+                self.lexer.next_token()?;
+                loop {
+                    let from = self.parse_ident()?;
+                    self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
+                    let to = self.parse_ident()?;
+                    rename_columns.push((from, to));
+                    if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                        break;
+                    }
+                }
+            }
+            TokenKind::Keyword(Keyword::Alter) => {
+                // ALTER <column> TYPE <new_type>
+                self.lexer.next_token()?;
+                let col_name = self.parse_ident()?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+                let new_type = self.parse_cql_type_name()?;
+                alter_column_types.push((col_name, new_type));
             }
             TokenKind::Keyword(Keyword::With) => {
                 self.lexer.next_token()?;
@@ -1299,7 +1324,8 @@ impl<'input> Parser<'input> {
                 let kind = tok.kind.clone();
                 let pos = tok.pos;
                 return Err(CqlError::SyntaxError(format!(
-                    "expected ADD, DROP, or WITH after ALTER TABLE, got {:?} at position {}",
+                    "expected ADD, DROP, ALTER, RENAME, or WITH after ALTER TABLE, \
+                     got {:?} at position {}",
                     kind, pos
                 )));
             }
@@ -1310,6 +1336,8 @@ impl<'input> Parser<'input> {
             table,
             add_columns,
             drop_columns,
+            rename_columns,
+            alter_column_types,
             extensions,
             table_options,
         })
@@ -3240,6 +3268,49 @@ mod tests {
                     vec![("email".into(), CqlTypeName::Simple("text".into()))]
                 );
                 assert!(s.drop_columns.is_empty());
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_rename() {
+        let stmt = parse("ALTER TABLE cycling.cyclist_name RENAME id TO cyclist_id").unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(s.table, "cyclist_name");
+                assert_eq!(s.rename_columns, vec![("id".into(), "cyclist_id".into())]);
+                assert!(s.alter_column_types.is_empty());
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_rename_multiple() {
+        let stmt = parse("ALTER TABLE t RENAME a TO b AND c TO d").unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(
+                    s.rename_columns,
+                    vec![("a".into(), "b".into()), ("c".into(), "d".into())]
+                );
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_alter_type() {
+        let stmt =
+            parse("ALTER TABLE cycling.cyclist_alt_stats ALTER favorite_color TYPE text").unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(
+                    s.alter_column_types,
+                    vec![("favorite_color".into(), CqlTypeName::Simple("text".into()))]
+                );
+                assert!(s.rename_columns.is_empty());
             }
             other => panic!("expected AlterTable, got {:?}", other),
         }

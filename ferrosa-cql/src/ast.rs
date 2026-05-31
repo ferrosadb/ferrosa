@@ -418,6 +418,11 @@ pub struct AlterTableStatement {
     pub table: String,
     pub add_columns: Vec<(String, CqlTypeName)>,
     pub drop_columns: Vec<String>,
+    /// `RENAME <from> TO <to> [AND ...]` — Cassandra restricts this to primary
+    /// key columns.
+    pub rename_columns: Vec<(String, String)>,
+    /// `ALTER <column> TYPE <new_type>`.
+    pub alter_column_types: Vec<(String, CqlTypeName)>,
     /// Table extensions (e.g. graph metadata: `WITH extensions = {'vertex_label': 'Person'}`).
     pub extensions: Option<Vec<(String, String)>>,
     /// Generic table options (compaction, compression, comment, etc.).

@@ -5150,6 +5150,20 @@ async fn route_alter_table(
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
 
+    // RENAME and ALTER ... TYPE parse, but applying them to live data is not yet
+    // implemented. Reject loudly rather than silently building empty updates and
+    // reporting success — a no-op "success" would be worse than a clear error.
+    if !s.rename_columns.is_empty() {
+        return Err(CqlError::Invalid(
+            "ALTER TABLE ... RENAME is not yet supported".to_string(),
+        ));
+    }
+    if !s.alter_column_types.is_empty() {
+        return Err(CqlError::Invalid(
+            "ALTER TABLE ... ALTER <column> TYPE is not yet supported".to_string(),
+        ));
+    }
+
     let add_columns: Vec<ColumnMetadata> = s
         .add_columns
         .iter()
@@ -15807,6 +15821,8 @@ mod tests {
             table: "t".into(),
             add_columns: vec![],
             drop_columns: vec![],
+            rename_columns: vec![],
+            alter_column_types: vec![],
             extensions: Some(vec![("vertex_label".into(), "Person".into())]),
             table_options: vec![],
         });
@@ -15816,6 +15832,39 @@ mod tests {
             "ALTER TABLE with extensions should succeed: {:?}",
             result.err()
         );
+    }
+
+    /// ALTER TABLE RENAME / ALTER TYPE parse but are not yet executable; they
+    /// must be rejected loudly rather than silently succeeding as a no-op.
+    #[tokio::test]
+    async fn alter_table_rename_and_alter_type_rejected() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE atrk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt = crate::parser::parse("CREATE TABLE atrk.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let rename = crate::parser::parse("ALTER TABLE atrk.t RENAME k TO k2").unwrap();
+        match route(&state, &ctx, rename).await {
+            Ok(_) => panic!("RENAME must be rejected, not silently succeed"),
+            Err(e) => assert!(format!("{e}").contains("RENAME")),
+        }
+
+        let alter = crate::parser::parse("ALTER TABLE atrk.t ALTER v TYPE blob").unwrap();
+        match route(&state, &ctx, alter).await {
+            Ok(_) => panic!("ALTER TYPE must be rejected, not silently succeed"),
+            Err(e) => assert!(format!("{e}").contains("TYPE")),
+        }
     }
 
     // ── CREATE INDEX with auto-generated name ────────────────────────
