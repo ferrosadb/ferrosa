@@ -929,7 +929,9 @@ impl<'input> Parser<'input> {
             match &tok.kind {
                 TokenKind::Keyword(Keyword::Password) => {
                     self.lexer.next_token()?;
-                    self.lexer.expect(&TokenKind::Eq)?;
+                    // `=` is optional: ROLE syntax uses `PASSWORD = 'x'`, the
+                    // legacy USER syntax uses `PASSWORD 'x'`.
+                    self.lexer.eat(&TokenKind::Eq)?;
                     o.password = Some(self.expect_string_literal()?);
                 }
                 TokenKind::Keyword(Keyword::Superuser) => {
@@ -953,7 +955,8 @@ impl<'input> Parser<'input> {
                 TokenKind::Ident(s) if s.eq_ignore_ascii_case("hashed") => {
                     self.lexer.next_token()?;
                     self.lexer.expect(&TokenKind::Keyword(Keyword::Password))?;
-                    self.lexer.expect(&TokenKind::Eq)?;
+                    // `=` is optional (see PASSWORD above).
+                    self.lexer.eat(&TokenKind::Eq)?;
                     o.hashed_password = Some(self.expect_string_literal()?);
                 }
                 TokenKind::Ident(s) if s.eq_ignore_ascii_case("access") => {
@@ -1863,14 +1866,17 @@ impl<'input> Parser<'input> {
     }
 
     fn parse_permissions(&mut self) -> Result<Vec<String>, CqlError> {
-        // ALL [PERMISSIONS] or single permission (SELECT, INSERT, UPDATE, DELETE, etc.)
+        // ALL [PERMISSIONS] or a comma-separated permission list
+        // (SELECT, MODIFY, UNMASK, SELECT_MASKED, ...).
         if self.lexer.eat(&TokenKind::Keyword(Keyword::All))? {
             self.lexer.eat(&TokenKind::Keyword(Keyword::Permissions))?;
             Ok(vec!["ALL".to_string()])
         } else {
-            // Single permission keyword
-            let perm = self.parse_ident()?;
-            Ok(vec![perm.to_uppercase()])
+            let mut perms = vec![self.parse_ident()?.to_uppercase()];
+            while self.lexer.eat(&TokenKind::Comma)? {
+                perms.push(self.parse_ident()?.to_uppercase());
+            }
+            Ok(perms)
         }
     }
 
@@ -1917,6 +1923,14 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 let ks = self.parse_ident()?;
                 Ok(GrantResource::Keyspace(ks))
+            }
+            TokenKind::Keyword(Keyword::Table) => {
+                // Explicit `TABLE [ks.]table` resource form. Resolves to the
+                // same Table resource as the bare `[ks.]table` form below —
+                // the keyword does not widen the grant's scope.
+                self.lexer.next_token()?;
+                let (ks, table) = self.parse_table_ref()?;
+                Ok(GrantResource::Table(ks, table))
             }
             TokenKind::Keyword(Keyword::Role) => {
                 self.lexer.next_token()?;
@@ -3737,6 +3751,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_alter_user_with_password_no_equals() {
+        // Legacy USER syntax omits the '=' after PASSWORD.
+        let stmt = parse("ALTER USER alice WITH PASSWORD 'PASSWORD_A'").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "alice");
+                assert_eq!(s.password, Some("PASSWORD_A".into()));
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_user_with_hashed_password_no_equals() {
+        let stmt =
+            parse("ALTER USER alice WITH HASHED PASSWORD '$2a$10$abcdefghijklmnopqrstuv'").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "alice");
+                assert_eq!(
+                    s.hashed_password,
+                    Some("$2a$10$abcdefghijklmnopqrstuv".into())
+                );
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_alter_role_with_login() {
         let stmt = parse("ALTER ROLE admin WITH LOGIN = false").unwrap();
         match stmt {
@@ -3779,6 +3822,49 @@ mod tests {
                 assert_eq!(s.role, "reader");
             }
             other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_grant_on_table_keyword() {
+        // Cassandra accepts the explicit `ON TABLE <name>` resource form.
+        let stmt = parse("GRANT SELECT ON TABLE patients TO privileged").unwrap();
+        match stmt {
+            Statement::Grant(s) => {
+                assert_eq!(s.permissions, vec!["SELECT".to_string()]);
+                assert_eq!(s.resource, GrantResource::Table(None, "patients".into()));
+                assert_eq!(s.role, "privileged");
+            }
+            other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_grant_multiple_permissions() {
+        let stmt = parse("GRANT SELECT, MODIFY ON TABLE patients TO trusted_user").unwrap();
+        match stmt {
+            Statement::Grant(s) => {
+                assert_eq!(
+                    s.permissions,
+                    vec!["SELECT".to_string(), "MODIFY".to_string()]
+                );
+                assert_eq!(s.resource, GrantResource::Table(None, "patients".into()));
+                assert_eq!(s.role, "trusted_user");
+            }
+            other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_revoke_on_table_keyword() {
+        let stmt = parse("REVOKE UNMASK ON TABLE patients FROM privileged").unwrap();
+        match stmt {
+            Statement::Revoke(s) => {
+                assert_eq!(s.permissions, vec!["UNMASK".to_string()]);
+                assert_eq!(s.resource, GrantResource::Table(None, "patients".into()));
+                assert_eq!(s.role, "privileged");
+            }
+            other => panic!("expected Revoke, got {:?}", other),
         }
     }
 
