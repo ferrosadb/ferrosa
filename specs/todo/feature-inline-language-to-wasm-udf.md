@@ -8,6 +8,49 @@ context: "CQL UDF gap-fill — ferrosa runs WASM UDFs, not Java. Explore compili
 
 # Design: inline language → WASM for `CREATE FUNCTION`
 
+## Spike findings (2026-05-31) — asc runs with no WASM dependency
+
+Empirically tested (`npm i assemblyscript binaryen`, node 25):
+
+1. **The whole toolchain is pure JavaScript.** `asc` (dist `asc.js` 0.9 MB +
+   `assemblyscript.js` 0.8 MB) and the `binaryen` npm package (`index.js` 13 MB)
+   are pure JS. Compilation **succeeds with `globalThis.WebAssembly` deleted**
+   (verified on non-trivial code with loops) — binaryen's npm build is the
+   Emscripten **JS fallback**, not WASM. The `WebAssembly.compile/instantiate`
+   references are an *optional* fast path, not required.
+2. **It drives fully in-memory.** `asc.main(args, { readFile, writeFile,
+   listFiles })` with callbacks compiles a source **string** to wasm **bytes**
+   with no `fs`/WASI and no CLI (`process.argv/exit` are only the CLI wrapper).
+3. **Vendored footprint ≈ 15 MB of JS** (`asc.js` + `assemblyscript.js` +
+   `binaryen/index.js`); the 79 MB native `binaryen/bin/` is **not** needed.
+
+### Consequence — the "into our Wasmtime" question is answered: YES, cleanly
+
+The earlier blocker (running `asc` in Wasmtime would need nested WASM, because
+binaryen-as-WASM needs `WebAssembly.instantiate` → no WASM-guest JS engine
+provides that) **does not apply**: binaryen is pure JS, so there is no inner
+WASM. Therefore:
+
+- **Recommended: run a JS engine *as a WASM/WASI guest inside ferrosa's existing
+  Wasmtime*** (a Javy / `quickjs-wasi`-style QuickJS, or StarlingMonkey),
+  executing `asc.js` + `binaryen.js`, source-in → wasm-out. The guest engine
+  needs **no** WebAssembly support. The compile inherits Wasmtime's
+  sandbox + fuel/memory/epoch limits — the STRIDE-DoS bound for free.
+- Host-side Boa (pure Rust) / `rquickjs` is the fallback (simpler wiring, but the
+  compile is not auto-sandboxed by Wasmtime — needs separate limits).
+
+### Next validation (implementation spike)
+
+1. Pick the WASM-guest JS engine that cleanly runs `asc.js` + 13 MB
+   `binaryen.js` (needs ESM, async, TypedArrays, BigInt for the `long` dep):
+   evaluate Javy/`quickjs-wasi` (QuickJS — good compat, small) vs StarlingMonkey
+   (SpiderMonkey — heavier, very compatible).
+2. Bundle the ~15 MB JS + a thin driver into the guest; pass source via
+   stdin/WASI or a component interface, return wasm bytes.
+3. Run it under the **wasmtime 44 component runtime** ferrosa already has
+   (`ferrosa-udf`); measure compile latency (pure-JS binaryen is slower than
+   WASM binaryen — acceptable for occasional DDL) and bound guest memory.
+
 ## Goal
 
 Let users write UDF/UDA bodies in a high-level language inside
