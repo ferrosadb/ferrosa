@@ -63,12 +63,12 @@ CREATE TABLE IF NOT EXISTS cites (
 -- used for reranking is read straight from this (always-populated) source table.
 CREATE TABLE IF NOT EXISTS paper_citations_weekly (
     paper_id       int,
-    week           timestamp,
+    day            timestamp,
     citations_sum  int,
     citations_max  int,
     citations_avg  double,
-    PRIMARY KEY (paper_id, week)
-) WITH CLUSTERING ORDER BY (week DESC);
+    PRIMARY KEY (paper_id, day)
+) WITH CLUSTERING ORDER BY (day DESC);
 
 CREATE TABLE IF NOT EXISTS paper_citations_daily (
     paper_id  int,

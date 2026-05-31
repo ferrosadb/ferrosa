@@ -21,7 +21,7 @@ SELECT author_id, name, affiliation FROM author
 --    paper_citations_weekly materializes asynchronously from the consolidation
 --    config; the rerank reads the always-populated daily source directly.
 SELECT paper_id, day, citations FROM paper_citations_daily WHERE paper_id = 8;
-SELECT paper_id, week, citations_sum, citations_max, citations_avg
+SELECT paper_id, day, citations_sum, citations_max, citations_avg
   FROM paper_citations_weekly WHERE paper_id = 8;
 
 -- 5) Graph lens as plain CQL: papers that paper 8 cites (outgoing edges by

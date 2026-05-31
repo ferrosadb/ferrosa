@@ -73,6 +73,9 @@ The lens that makes Ferrosa _not just Cassandra_: one dataset queried five ways 
 link:scholarly-search.html[*Multi-Model Scholarly Search*] _New!_::
 A paper search engine over one corpus: BM25 full-text, vector ANN over real `nomic-embed-text-v2-moe` embeddings, phonetic author lookup, RRD citation-trend rollups, and a Cypher citation graph -- composed with reciprocal-rank fusion.
 
+link:threat-hunting.html[*Multi-Model Threat Hunting*] _New!_::
+A threat-intel workbench over one indicator corpus: BM25 over IOC notes, vector ANN over real behaviour embeddings, phonetic actor-name lookup, RRD activity-spike rollups, and a Cypher attack-infrastructure graph -- fused into a single triage order.
+
 == Ferrosa-Exclusive: Graph + CQL
 
 link:graph-joins.html[*Graph Joins & Traversals*]::
