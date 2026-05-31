@@ -2153,6 +2153,8 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wat",
+ "wit-component",
+ "wit-parser 0.244.0",
 ]
 
 [[package]]

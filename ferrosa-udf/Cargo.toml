@@ -21,10 +21,14 @@ rquickjs = { version = "0.9", features = [
     "futures",
 ], optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
+# Wrap the asc core module into a component matching the `udf` WIT world.
+wit-component = { version = "0.244", optional = true }
+wit-parser = { version = "0.244", optional = true }
 
 [features]
-# Inline AssemblyScript UDF compilation (pulls QuickJS via rquickjs).
-asc-udf = ["dep:rquickjs", "dep:tokio"]
+# Inline AssemblyScript UDF compilation (pulls QuickJS via rquickjs) and
+# componentization to the `udf` WIT ABI.
+asc-udf = ["dep:rquickjs", "dep:tokio", "dep:wit-component", "dep:wit-parser"]
 # Opt-in target for tests that need external infrastructure (e.g. the 15 MB
 # asc+binaryen bundle). Default `cargo test` does not build these.
 live-infra-tests = []
