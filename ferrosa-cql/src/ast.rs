@@ -195,6 +195,9 @@ pub enum ComparisonOp {
     Contains,
     ContainsKey,
     SoundsLike,
+    /// `LIKE` pattern match (`%` wildcard). Requires ALLOW FILTERING or a
+    /// matching index, evaluated as a post-scan predicate.
+    Like,
 }
 
 #[derive(Debug, Clone, PartialEq)]

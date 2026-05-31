@@ -6635,6 +6635,10 @@ fn evaluate_where_predicates(
                 (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
                 _ => false,
             },
+            ComparisonOp::Like => match (actual, &expected) {
+                (CqlValue::Text(a), CqlValue::Text(b)) => like_match(a, b),
+                _ => false,
+            },
             ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
                 unreachable!("CONTAINS/CONTAINS KEY handled above")
@@ -6645,6 +6649,65 @@ fn evaluate_where_predicates(
         }
     }
     Ok(true)
+}
+
+/// Cassandra `LIKE` pattern matching. `%` matches any (possibly empty) sequence
+/// of characters; every other character — including `_` — matches literally,
+/// which is Cassandra's SAI `LIKE` semantics. Matching is case-sensitive, the
+/// default for an un-analyzed column.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let segments: Vec<&str> = pattern.split('%').collect();
+    // No wildcard: exact match.
+    if segments.len() == 1 {
+        return text == pattern;
+    }
+    let last = segments.len() - 1;
+    let mut idx = 0usize;
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Leading literal must be a prefix.
+            if !text[idx..].starts_with(seg) {
+                return false;
+            }
+            idx += seg.len();
+        } else if i == last {
+            // Trailing literal must be a suffix of what remains.
+            if !text[idx..].ends_with(seg) {
+                return false;
+            }
+        } else {
+            // Interior literal must occur, in order, at or after the cursor.
+            match text[idx..].find(seg) {
+                Some(pos) => idx += pos + seg.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod like_match_tests {
+    use super::like_match;
+
+    #[test]
+    fn prefix_suffix_contains_and_exact() {
+        assert!(like_match("mark", "m%"));
+        assert!(like_match("mark", "%k"));
+        assert!(like_match("mark", "%ar%"));
+        assert!(like_match("mark", "m%k"));
+        assert!(like_match("mark", "mark"));
+        assert!(like_match("anything", "%"));
+
+        assert!(!like_match("mark", "M%")); // case-sensitive
+        assert!(!like_match("mark", "%z"));
+        assert!(!like_match("mark", "z%"));
+        assert!(!like_match("mark", "mark2"));
+        assert!(!like_match("ma", "m%k")); // suffix missing
+    }
 }
 
 /// Apply column selection (with `toJson()` support) to system table query results.

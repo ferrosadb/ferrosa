@@ -2053,6 +2053,7 @@ impl<'input> Parser<'input> {
                 self.lexer.expect(&TokenKind::Keyword(Keyword::Like))?;
                 Ok(ComparisonOp::SoundsLike)
             }
+            TokenKind::Keyword(Keyword::Like) => Ok(ComparisonOp::Like),
             _ => Err(CqlError::SyntaxError(format!(
                 "expected comparison operator, got {:?} at position {}",
                 tok.kind, tok.pos
@@ -2786,6 +2787,23 @@ mod tests {
                 assert_eq!(s.where_clauses[0].column, "id");
                 assert_eq!(s.where_clauses[0].op, ComparisonOp::Eq);
                 assert_eq!(s.where_clauses[0].value, Term::IntegerLiteral(42));
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_select_where_like() {
+        let stmt =
+            parse("SELECT * FROM cycling.cyclist_name WHERE firstname LIKE 'm%' ALLOW FILTERING")
+                .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.where_clauses.len(), 1);
+                assert_eq!(s.where_clauses[0].column, "firstname");
+                assert_eq!(s.where_clauses[0].op, ComparisonOp::Like);
+                assert_eq!(s.where_clauses[0].value, Term::StringLiteral("m%".into()));
+                assert!(s.allow_filtering);
             }
             other => panic!("expected Select, got {:?}", other),
         }
