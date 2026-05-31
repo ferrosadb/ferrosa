@@ -47,6 +47,9 @@ pub struct RoleUpdates {
     pub can_login: Option<bool>,
     /// New password (plaintext — will be hashed before storage).
     pub password: Option<String>,
+    /// New pre-computed password hash (`HASHED PASSWORD` — stored verbatim
+    /// after format validation). Mutually exclusive with `password`.
+    pub hashed_password: Option<String>,
     /// New set of parent roles, if changing.
     pub member_of: Option<HashSet<String>>,
 }

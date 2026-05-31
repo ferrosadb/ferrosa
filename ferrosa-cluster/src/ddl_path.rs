@@ -87,7 +87,9 @@ impl DdlPath {
                 node_map,
             } => {
                 match execute_via_raft(raft, op.clone()).await {
-                    Ok(()) => Ok(()),
+                    // Leader applied the DDL (client_write awaits leader apply),
+                    // so read-your-writes already holds on this node.
+                    Ok(_committed_index) => Ok(()),
                     Err(ClusterError::NotLeader {
                         leader_id: Some(leader_node_id),
                     }) => {
@@ -99,7 +101,12 @@ impl DdlPath {
                             .copied();
 
                         match leader_uuid {
-                            Some(uuid) => forward_ddl_to_leader(peer_manager, uuid, op).await,
+                            // Forward to the leader; `forward_ddl_to_leader` waits
+                            // for THIS node to apply before returning, so the
+                            // client sees its own write on this follower.
+                            Some(uuid) => forward_ddl_to_leader(Some(raft), peer_manager, uuid, op)
+                                .await
+                                .map(|_committed| ()),
                             None => {
                                 // Leader UUID unknown — cannot forward.
                                 Err(ClusterError::Internal(format!(
@@ -256,6 +263,40 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
                 )
                 .map_err(ClusterError::Storage)?;
         }
+        DdlOperation::GrantRole {
+            member,
+            granted_role,
+        } => {
+            schema
+                .grant_role_internal(member, granted_role)
+                .map_err(|e| ClusterError::Internal(format!("grant_role: {e}")))?;
+            if let Some(role) = schema.snapshot().roles.get(member) {
+                SystemTableWriter::new(Arc::clone(engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                            role.clone(),
+                        ),
+                    )
+                    .map_err(ClusterError::Storage)?;
+            }
+        }
+        DdlOperation::RevokeRole {
+            member,
+            granted_role,
+        } => {
+            schema
+                .revoke_role_internal(member, granted_role)
+                .map_err(|e| ClusterError::Internal(format!("revoke_role: {e}")))?;
+            if let Some(role) = schema.snapshot().roles.get(member) {
+                SystemTableWriter::new(Arc::clone(engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                            role.clone(),
+                        ),
+                    )
+                    .map_err(ClusterError::Storage)?;
+            }
+        }
         DdlOperation::CreateIndex(idx) => {
             schema
                 .create_index_internal(idx.clone())
@@ -334,11 +375,19 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
 /// [`Message::PairDdlAck`].  The leader runs a
 /// [`ClusterDdlForwardHandler`] that calls `execute_via_raft` locally —
 /// since the leader is the Raft leader, the proposal succeeds immediately.
+/// Returns the committed Raft log index of the applied DDL (or `0` if the leader
+/// returned a legacy empty ack), so chained forwards can relay it.
+///
+/// Pass `local_raft = Some(..)` on the **client DDL path** so this node waits for
+/// its own state machine to apply the DDL before returning (same-node
+/// read-your-writes). Membership/bootstrap forwards (JoinNode, schema hand-off)
+/// pass `None` — they have no waiting client and may lack a usable local raft.
 pub(crate) async fn forward_ddl_to_leader(
+    local_raft: Option<&FerrosRaft>,
     peer_manager: &PeerManager,
     leader_uuid: Uuid,
     op: DdlOperation,
-) -> Result<()> {
+) -> Result<u64> {
     let body = op.to_bytes()?;
     let resp = match peer_manager
         .send(
@@ -371,7 +420,26 @@ pub(crate) async fn forward_ddl_to_leader(
     };
 
     match resp {
-        Message::PairDdlAck(_) => Ok(()),
+        Message::PairDdlAck(bytes) => {
+            // The leader returns the committed Raft log index of the DDL (8-byte
+            // big-endian). Before acking the client, wait for THIS node's state
+            // machine to apply up to that index, so a following DML on the same
+            // connection observes the schema change (same-node read-your-writes).
+            // Older acks carry an empty payload — skip the wait for those.
+            let committed = if bytes.len() >= 8 {
+                u64::from_be_bytes(
+                    bytes[..8]
+                        .try_into()
+                        .expect("slice of length 8 converts to [u8; 8]"),
+                )
+            } else {
+                0
+            };
+            if let (Some(raft), true) = (local_raft, committed > 0) {
+                wait_for_local_apply(raft, committed, DDL_AGREEMENT_TIMEOUT).await;
+            }
+            Ok(committed)
+        }
         other => Err(ClusterError::Internal(format!(
             "unexpected response from leader during DDL forward: {:?}",
             other.msg_type()
@@ -415,6 +483,20 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
             role,
             resource,
             permission,
+        },
+        DdlOperation::GrantRole {
+            member,
+            granted_role,
+        } => RaftOp::GrantRole {
+            member,
+            granted_role,
+        },
+        DdlOperation::RevokeRole {
+            member,
+            granted_role,
+        } => RaftOp::RevokeRole {
+            member,
+            granted_role,
         },
         DdlOperation::CreateIndex(idx) => RaftOp::CreateIndex(idx),
         DdlOperation::DropIndex {
@@ -477,16 +559,12 @@ const DDL_AGREEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Polling interval inside [`wait_for_replication_to_catch_up`].
 const DDL_AGREEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Final settle wait after every follower has *replicated* (appended) the
-/// committed entry. Replication lands a few ms before the follower's state
-/// machine actually `apply`s it, so we sleep a hair to drain the apply queue.
-const DDL_AGREEMENT_APPLY_DRAIN: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Wait until every voter in the current membership has replicated up to
-/// `committed_index`, then sleep [`DDL_AGREEMENT_APPLY_DRAIN`] to cover the
-/// apply-after-append window. Returns `Ok` either when everyone catches up
-/// or when [`DDL_AGREEMENT_TIMEOUT`] expires (caller logs the partial
-/// agreement and proceeds — the eventual-consistency guarantee still holds).
+/// Wait until every voter in the current membership has replicated (appended)
+/// up to `committed_index`. Returns either when everyone catches up or when
+/// [`DDL_AGREEMENT_TIMEOUT`] expires (caller logs the partial agreement and
+/// proceeds — the eventual-consistency guarantee still holds). Deterministic
+/// same-node read-your-writes is handled separately by [`wait_for_local_apply`]
+/// on a forwarding follower; this barrier only drives cross-node replication.
 async fn wait_for_replication_to_catch_up(raft: &FerrosRaft, committed_index: u64) {
     let deadline = tokio::time::Instant::now() + DDL_AGREEMENT_TIMEOUT;
     loop {
@@ -542,7 +620,47 @@ async fn wait_for_replication_to_catch_up(raft: &FerrosRaft, committed_index: u6
         }
         tokio::time::sleep(DDL_AGREEMENT_POLL_INTERVAL).await;
     }
-    tokio::time::sleep(DDL_AGREEMENT_APPLY_DRAIN).await;
+}
+
+/// Wait until THIS node's state machine has applied up to `target_index`.
+///
+/// A node cannot observe a follower's apply progress from the leader (openraft
+/// metrics expose only the replicated/`matched` index), but it can always
+/// observe its OWN `last_applied`. A node that forwards a DDL to the leader uses
+/// this — after the leader confirms the committed index — to guarantee
+/// **same-node read-your-writes**: it returns success to the CQL client only
+/// once its local schema reflects the committed DDL, so a following DML on the
+/// same connection cannot see stale schema. Replaces the previous fixed
+/// `DDL_AGREEMENT_APPLY_DRAIN` sleep, which was a race rather than a guarantee.
+///
+/// Returns `true` if the node caught up before `timeout`.
+pub async fn wait_for_local_apply(
+    raft: &FerrosRaft,
+    target_index: u64,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let applied = raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|lid| lid.index)
+            .unwrap_or(0);
+        if applied >= target_index {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target_index,
+                applied,
+                "ddl_read_your_writes: timed out waiting for local apply; a read \
+                 on this node may briefly observe stale schema"
+            );
+            return false;
+        }
+        tokio::time::sleep(DDL_AGREEMENT_POLL_INTERVAL).await;
+    }
 }
 
 /// Propose a DDL operation through Raft consensus.
@@ -554,19 +672,20 @@ async fn wait_for_replication_to_catch_up(raft: &FerrosRaft, committed_index: u6
 /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
 /// and transparently forwards the request to the leader instead of propagating
 /// the error to the CQL client.
-pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
+pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64> {
     let cmd = ddl_op_to_raft_command(op);
 
     match raft.client_write(cmd).await {
         Ok(resp) => {
-            // Schema-agreement barrier: openraft's `client_write` returns once
-            // the leader applies, not when followers do. Without this wait, a
-            // CQL client that runs DDL → DML in quick succession will route
-            // the DML to a follower that has not yet applied the ALTER and
-            // get a memtable-validator rejection (see ferrosa-memory cluster-
-            // int "co_occurs_with column first_seen index 3" symptom).
+            // openraft's `client_write` returns once the LEADER applies, so on
+            // the leader read-your-writes already holds. Drive followers'
+            // *log replication* forward (condition-based on the matched index)
+            // so a subsequent request load-balanced to another node has the
+            // entry to apply. Deterministic same-node read-your-writes for a
+            // forwarding follower is handled by `wait_for_local_apply` once the
+            // forward path returns the committed index (below).
             wait_for_replication_to_catch_up(raft, resp.log_id.index).await;
-            Ok(())
+            Ok(resp.log_id.index)
         }
         Err(raft_err) => {
             // Extract a ForwardToLeader hint if present.
@@ -646,7 +765,7 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
         };
 
         match execute_via_raft(&self.raft, op.clone()).await {
-            Ok(()) => {
+            Ok(committed_index) => {
                 // P0-21: after a successful JoinNode commit, promote the new
                 // node to openraft voter via change_membership so the leader
                 // will replicate / send InstallSnapshot to it.
@@ -754,7 +873,11 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
                         }
                     });
                 }
-                Some(Message::PairDdlAck(Bytes::new()))
+                // Ack carries the committed log index so the forwarding
+                // follower can wait for its own apply (read-your-writes).
+                Some(Message::PairDdlAck(Bytes::copy_from_slice(
+                    &committed_index.to_be_bytes(),
+                )))
             }
             Err(ClusterError::NotLeader {
                 leader_id: Some(leader_node_id),
@@ -767,17 +890,25 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
                     .copied();
 
                 match leader_uuid {
-                    Some(uuid) => match forward_ddl_to_leader(&self.peer_manager, uuid, op).await {
-                        Ok(()) => Some(Message::PairDdlAck(Bytes::new())),
-                        Err(e) => {
-                            tracing::error!(
-                                leader_node_id,
-                                leader_uuid = %uuid,
-                                "ClusterDdlForwardHandler: forward to leader failed: {e}"
-                            );
-                            None
+                    Some(uuid) => {
+                        match forward_ddl_to_leader(Some(&self.raft), &self.peer_manager, uuid, op)
+                            .await
+                        {
+                            // Relay the leader's committed index back to the
+                            // original forwarder so it can wait for its own apply.
+                            Ok(committed) => Some(Message::PairDdlAck(Bytes::copy_from_slice(
+                                &committed.to_be_bytes(),
+                            ))),
+                            Err(e) => {
+                                tracing::error!(
+                                    leader_node_id,
+                                    leader_uuid = %uuid,
+                                    "ClusterDdlForwardHandler: forward to leader failed: {e}"
+                                );
+                                None
+                            }
                         }
-                    },
+                    }
                     None => {
                         tracing::error!(
                             leader_node_id,
@@ -1245,6 +1376,7 @@ mod tests {
         peer_manager.add_peer_entry((leader_uuid, addr)).await;
 
         forward_ddl_to_leader(
+            None,
             &peer_manager,
             leader_uuid,
             DdlOperation::CreateKeyspace(simple_keyspace("fwd_ks")),
@@ -1545,6 +1677,7 @@ mod tests {
             is_superuser: None,
             can_login: Some(true),
             password: None,
+            hashed_password: None,
             member_of: None,
         };
         ddl.execute(DdlOperation::AlterRole {
@@ -1682,6 +1815,7 @@ mod tests {
             is_superuser: Some(true),
             can_login: None,
             password: None,
+            hashed_password: None,
             member_of: None,
         };
         let op = DdlOperation::AlterRole {

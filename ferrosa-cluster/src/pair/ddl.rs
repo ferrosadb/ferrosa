@@ -71,6 +71,18 @@ pub enum DdlOperation {
         resource: Resource,
         permission: Permission,
     },
+    /// Grant role membership: add `granted_role` to `member`'s `member_of`.
+    /// Additive (one edge) so concurrent role grants replicate without
+    /// clobbering each other.
+    GrantRole {
+        member: String,
+        granted_role: String,
+    },
+    /// Revoke role membership: remove `granted_role` from `member`'s `member_of`.
+    RevokeRole {
+        member: String,
+        granted_role: String,
+    },
     CreateIndex(IndexMetadata),
     DropIndex {
         keyspace: String,
@@ -299,6 +311,22 @@ impl DdlCoordinator {
                 self.schema
                     .revoke_internal(role, resource, permission)
                     .map_err(|e| ClusterError::Internal(format!("revoke: {e}")))?;
+            }
+            DdlOperation::GrantRole {
+                member,
+                granted_role,
+            } => {
+                self.schema
+                    .grant_role_internal(member, granted_role)
+                    .map_err(|e| ClusterError::Internal(format!("grant_role: {e}")))?;
+            }
+            DdlOperation::RevokeRole {
+                member,
+                granted_role,
+            } => {
+                self.schema
+                    .revoke_role_internal(member, granted_role)
+                    .map_err(|e| ClusterError::Internal(format!("revoke_role: {e}")))?;
             }
             DdlOperation::CreateIndex(ref idx) => {
                 self.schema

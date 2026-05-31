@@ -85,6 +85,26 @@ impl PasswordHasher {
         }
     }
 
+    /// Validate that `hash` is a supported password-hash string (bcrypt or
+    /// argon2id PHC). A `HASHED PASSWORD` is stored verbatim, so rejecting an
+    /// unsupported format here prevents a role from ever holding a credential
+    /// that `verify_password_any` cannot interpret (which would otherwise make
+    /// the role permanently unauthenticatable). Fail loud, not silent.
+    pub fn validate_password_hash(hash: &str) -> crate::Result<()> {
+        let supported = hash.starts_with("$2a$")
+            || hash.starts_with("$2b$")
+            || hash.starts_with("$2y$")
+            || hash.starts_with("$argon2id$");
+        if supported {
+            Ok(())
+        } else {
+            Err(SchemaError::InvalidSchema(
+                "unsupported password hash format (expected bcrypt $2a/$2b/$2y or $argon2id)"
+                    .to_string(),
+            ))
+        }
+    }
+
     /// Returns true if the hash algorithm differs from the configured one.
     pub fn needs_rehash(&self, hash: &str) -> bool {
         match self {

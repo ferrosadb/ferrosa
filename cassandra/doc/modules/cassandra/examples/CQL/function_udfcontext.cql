@@ -1,11 +1,10 @@
 CREATE TYPE custom_type (txt text, i int);
-CREATE FUNCTION fct\_using\_udt ( somearg int )
+
+-- A WASM UDF that returns a UDT value. Ferrosa runs UDFs as WebAssembly
+-- components (inline hex placeholder body below); the WASM module builds and
+-- returns the custom_type value.
+CREATE FUNCTION fct_using_udt ( somearg int )
     RETURNS NULL ON NULL INPUT
     RETURNS custom_type
-    LANGUAGE java
-    AS $$
-        UDTValue udt = udfContext.newReturnUDTValue();
-        udt.setString("txt", "some string");
-        udt.setInt("i", 42);
-        return udt;
-    $$;
+    LANGUAGE wasm
+    AS '0x0061736d0d000100';

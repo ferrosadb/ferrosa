@@ -1002,8 +1002,22 @@ pub async fn route(
         } => route_list_roles(state, ctx, of, no_recursive, users_alias)
             .await
             .map(RouteResult::Result),
+        Statement::ListPermissions {
+            permission,
+            resource,
+            of,
+            no_recursive,
+        } => route_list_permissions(state, ctx, permission, resource, of, no_recursive)
+            .await
+            .map(RouteResult::Result),
         Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
         Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
+        Statement::GrantRole { role, member } => route_grant_role(state, ctx, role, member, true)
+            .await
+            .map(RouteResult::Result),
+        Statement::RevokeRole { role, member } => route_grant_role(state, ctx, role, member, false)
+            .await
+            .map(RouteResult::Result),
         Statement::Use(u) => {
             validate_keyspace_exists(&state.schema, &u.keyspace)?;
             let body = result::encode_set_keyspace(&u.keyspace);
@@ -5150,6 +5164,20 @@ async fn route_alter_table(
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
 
+    // RENAME and ALTER ... TYPE parse, but applying them to live data is not yet
+    // implemented. Reject loudly rather than silently building empty updates and
+    // reporting success — a no-op "success" would be worse than a clear error.
+    if !s.rename_columns.is_empty() {
+        return Err(CqlError::Invalid(
+            "ALTER TABLE ... RENAME is not yet supported".to_string(),
+        ));
+    }
+    if !s.alter_column_types.is_empty() {
+        return Err(CqlError::Invalid(
+            "ALTER TABLE ... ALTER <column> TYPE is not yet supported".to_string(),
+        ));
+    }
+
     let add_columns: Vec<ColumnMetadata> = s
         .add_columns
         .iter()
@@ -5568,6 +5596,15 @@ async fn route_create_role(
         .schema
         .check_permission(ctx.auth, Permission::Create, &Resource::AllRoles)?;
 
+    // Security (threat-model T9): ferrosa has no network authorizer, so reject
+    // ACCESS TO/FROM clauses rather than silently accept an unenforced access
+    // restriction (which would give a false sense of security). Fail loud.
+    if !s.access.is_empty() {
+        return Err(CqlError::Invalid(
+            "ACCESS (network authorization) is not supported".into(),
+        ));
+    }
+
     let base_role = RoleMetadata {
         name: s.name.clone(),
         is_superuser: s.superuser.unwrap_or(false),
@@ -5580,12 +5617,16 @@ async fn route_create_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Direct path: pass the cleartext through; `Schema::create_role`
-            // validates the policy, hashes it under the schema's
-            // write-lock, and emits the audit event.
-            state
-                .schema
-                .create_role(base_role, s.password.as_deref(), ctx.auth)?;
+            // Direct path: `Schema::create_role` hashes the cleartext under the
+            // write-lock; `create_role_hashed` validates and stores a supplied
+            // HASHED PASSWORD verbatim. Both emit the audit event.
+            if let Some(ref h) = s.hashed_password {
+                state.schema.create_role_hashed(base_role, h, ctx.auth)?;
+            } else {
+                state
+                    .schema
+                    .create_role(base_role, s.password.as_deref(), ctx.auth)?;
+            }
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: serialise `DdlOperation::CreateRole(role)`
@@ -5599,7 +5640,11 @@ async fn route_create_role(
             // Hashing on the coordinator also keeps the cleartext
             // password off the wire and out of the Raft log.
             let mut role = base_role;
-            if let Some(ref pw) = s.password {
+            if let Some(ref h) = s.hashed_password {
+                // HASHED PASSWORD: validate on the coordinator, ship verbatim.
+                state.schema.validate_password_hash(h)?;
+                role.salted_hash = Some(h.clone());
+            } else if let Some(ref pw) = s.password {
                 state.schema.password_policy().validate(pw, &s.name)?;
                 role.salted_hash = Some(state.schema.password_hasher().hash_password(pw)?);
             }
@@ -5637,16 +5682,24 @@ async fn route_alter_role(
         .schema
         .check_permission(ctx.auth, Permission::Alter, &Resource::Role(s.name.clone()))?;
 
+    // Security (threat-model T9): reject unenforced ACCESS clauses. Fail loud.
+    if !s.access.is_empty() {
+        return Err(CqlError::Invalid(
+            "ACCESS (network authorization) is not supported".into(),
+        ));
+    }
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Direct path: pass the cleartext through; `Schema::alter_role`
-            // hashes inside the lock and emits the audit event.
+            // Direct path: `Schema::alter_role` hashes plaintext under the lock,
+            // or validates+stores a HASHED PASSWORD verbatim; emits the audit event.
             let updates = RoleUpdates {
                 is_superuser: s.superuser,
                 can_login: s.login,
                 password: s.password.clone(),
+                hashed_password: s.hashed_password.clone(),
                 member_of: None,
             };
             state.schema.alter_role(&s.name, updates, ctx.auth)?;
@@ -5666,10 +5719,15 @@ async fn route_alter_role(
             } else {
                 None
             };
+            // HASHED PASSWORD: validate on the coordinator before replicating.
+            if let Some(ref h) = s.hashed_password {
+                state.schema.validate_password_hash(h)?;
+            }
             let updates = RoleUpdates {
                 is_superuser: s.superuser,
                 can_login: s.login,
                 password: hashed_password,
+                hashed_password: s.hashed_password.clone(),
                 member_of: None,
             };
             match ddl {
@@ -5819,6 +5877,102 @@ async fn route_list_roles(
     ))
 }
 
+/// Handle `LIST [ALL | <perm>] PERMISSIONS [ON <resource>] [OF <role>]
+/// [NORECURSIVE]`. Mirrors Cassandra's `system_auth.role_permissions` view —
+/// one row per (role, resource, permission). Gated on DESCRIBE over all roles
+/// (the same check as LIST ROLES) so a caller cannot enumerate grants it has no
+/// authority to see.
+async fn route_list_permissions(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    permission: Option<String>,
+    resource: Option<GrantResource>,
+    of: Option<String>,
+    no_recursive: bool,
+) -> Result<BytesMut, CqlError> {
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Describe, &Resource::AllRoles)?;
+
+    let snap = state.schema.snapshot();
+
+    // `OF <role>` restricts to that role and — unless NORECURSIVE — the roles it
+    // is a member of, since a role inherits their permissions.
+    let role_filter: Option<HashSet<String>> = of.as_ref().map(|start| {
+        let mut set = HashSet::new();
+        let mut stack = vec![start.clone()];
+        while let Some(name) = stack.pop() {
+            if !set.insert(name.clone()) {
+                continue;
+            }
+            if !no_recursive {
+                if let Some(role) = snap.roles.get(&name) {
+                    for parent in &role.member_of {
+                        stack.push(parent.clone());
+                    }
+                }
+            }
+        }
+        set
+    });
+
+    // `ON <resource>` compares against the stored resource string form.
+    let resource_filter: Option<String> = match resource {
+        Some(r) => Some(ast_resource_to_schema(&r, ctx.current_keyspace)?.to_string()),
+        None => None,
+    };
+
+    let mut perm_rows = ferrosa_schema::query_role_permissions(&snap);
+    perm_rows.sort_by(|a, b| {
+        a.role
+            .cmp(&b.role)
+            .then_with(|| a.resource.cmp(&b.resource))
+    });
+
+    let column_names = vec![
+        "role".to_string(),
+        "resource".to_string(),
+        "permission".to_string(),
+    ];
+    let column_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Varchar];
+
+    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
+    for row in perm_rows {
+        if let Some(ref roles) = role_filter {
+            if !roles.contains(&row.role) {
+                continue;
+            }
+        }
+        if let Some(ref res) = resource_filter {
+            if &row.resource != res {
+                continue;
+            }
+        }
+        let mut perms: Vec<String> = row.permissions.into_iter().collect();
+        perms.sort();
+        for perm in perms {
+            if let Some(ref want) = permission {
+                if &perm != want {
+                    continue;
+                }
+            }
+            rows.push(vec![
+                Some(CqlValue::Text(row.role.clone())),
+                Some(CqlValue::Text(row.resource.clone())),
+                Some(CqlValue::Text(perm)),
+            ]);
+        }
+    }
+
+    Ok(result::encode_rows(
+        &column_names,
+        &column_types,
+        "system_auth",
+        "role_permissions",
+        &rows,
+    ))
+}
+
 // ── GRANT / REVOKE ───────────────────────────────────────────────────────
 
 async fn route_grant(
@@ -5911,6 +6065,75 @@ async fn route_revoke(
                 };
                 ddl.execute(op).await.map_err(CqlError::from)?;
             }
+        }
+        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_void())
+}
+
+/// `GRANT/REVOKE <role> TO/FROM <member>` — role membership (the member
+/// inherits the role's permissions). Replicates via the additive
+/// `DdlOperation::GrantRole` / `RevokeRole`, which mutate a single `member_of`
+/// edge, so concurrent role grants never clobber one another and cross-grant
+/// cycles are caught at apply.
+async fn route_grant_role(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    role: String,
+    member: String,
+    grant: bool,
+) -> Result<BytesMut, CqlError> {
+    // Authorization: (re)granting a role requires AUTHORIZE on that role.
+    // Superusers pass implicitly through check_permission.
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Authorize,
+        &Resource::Role(role.clone()),
+    )?;
+
+    // Both roles must exist — fail loud to the client rather than no-op at apply.
+    {
+        let snap = state.schema.snapshot();
+        if !snap.roles.contains_key(&role) {
+            return Err(CqlError::Invalid(format!("role not found: {role}")));
+        }
+        if !snap.roles.contains_key(&member) {
+            return Err(CqlError::Invalid(format!("role not found: {member}")));
+        }
+    }
+
+    let op = if grant {
+        DdlOperation::GrantRole {
+            member: member.clone(),
+            granted_role: role.clone(),
+        }
+    } else {
+        DdlOperation::RevokeRole {
+            member: member.clone(),
+            granted_role: role.clone(),
+        }
+    };
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            if grant {
+                state.schema.grant_role_internal(&member, &role)?;
+            } else {
+                state.schema.revoke_role_internal(&member, &role)?;
+            }
+        }
+        DdlPath::Pair(coordinator) => {
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster { .. } => {
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -6605,6 +6828,10 @@ fn evaluate_where_predicates(
                 (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
                 _ => false,
             },
+            ComparisonOp::Like => match (actual, &expected) {
+                (CqlValue::Text(a), CqlValue::Text(b)) => like_match(a, b),
+                _ => false,
+            },
             ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
                 unreachable!("CONTAINS/CONTAINS KEY handled above")
@@ -6615,6 +6842,65 @@ fn evaluate_where_predicates(
         }
     }
     Ok(true)
+}
+
+/// Cassandra `LIKE` pattern matching. `%` matches any (possibly empty) sequence
+/// of characters; every other character — including `_` — matches literally,
+/// which is Cassandra's SAI `LIKE` semantics. Matching is case-sensitive, the
+/// default for an un-analyzed column.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let segments: Vec<&str> = pattern.split('%').collect();
+    // No wildcard: exact match.
+    if segments.len() == 1 {
+        return text == pattern;
+    }
+    let last = segments.len() - 1;
+    let mut idx = 0usize;
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Leading literal must be a prefix.
+            if !text[idx..].starts_with(seg) {
+                return false;
+            }
+            idx += seg.len();
+        } else if i == last {
+            // Trailing literal must be a suffix of what remains.
+            if !text[idx..].ends_with(seg) {
+                return false;
+            }
+        } else {
+            // Interior literal must occur, in order, at or after the cursor.
+            match text[idx..].find(seg) {
+                Some(pos) => idx += pos + seg.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod like_match_tests {
+    use super::like_match;
+
+    #[test]
+    fn prefix_suffix_contains_and_exact() {
+        assert!(like_match("mark", "m%"));
+        assert!(like_match("mark", "%k"));
+        assert!(like_match("mark", "%ar%"));
+        assert!(like_match("mark", "m%k"));
+        assert!(like_match("mark", "mark"));
+        assert!(like_match("anything", "%"));
+
+        assert!(!like_match("mark", "M%")); // case-sensitive
+        assert!(!like_match("mark", "%z"));
+        assert!(!like_match("mark", "z%"));
+        assert!(!like_match("mark", "mark2"));
+        assert!(!like_match("ma", "m%k")); // suffix missing
+    }
 }
 
 /// Apply column selection (with `toJson()` support) to system table query results.
@@ -15344,6 +15630,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_role_with_access_clause_is_rejected() {
+        // Threat T9: ferrosa has no network authorizer, so an ACCESS restriction
+        // must be rejected (fail loud), never silently accepted-and-ignored.
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE ROLE netrole WITH PASSWORD = 'p' AND ACCESS TO DATACENTERS {'DC1'}", // pragma: allowlist secret
+        )
+        .unwrap();
+        assert!(
+            route(&state, &ctx, stmt).await.is_err(),
+            "CREATE ROLE with ACCESS must be rejected, not silently accepted"
+        );
+        assert!(!state.schema.snapshot().roles.contains_key("netrole"));
+    }
+
+    #[tokio::test]
+    async fn create_role_with_hashed_password_stores_hash_verbatim() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        // A valid bcrypt hash string (HASHED PASSWORD input).
+        let hash = "$2a$10$JSJEMFm6GeaW9XxT5JIheuEtPvat6i7uKbnTcxX3c1wshIIsGyUtG";
+        let cql = format!("CREATE ROLE hrole WITH HASHED PASSWORD = '{hash}' AND LOGIN = true");
+        route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .schema
+                .snapshot()
+                .roles
+                .get("hrole")
+                .unwrap()
+                .salted_hash
+                .as_deref(),
+            Some(hash),
+            "HASHED PASSWORD must be stored verbatim"
+        );
+    }
+
+    #[tokio::test]
     async fn alter_role_updates_login() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -15365,8 +15706,11 @@ mod tests {
         let stmt = Statement::AlterRole(AlterRoleStatement {
             name: "ar_role".into(),
             password: None,
+            hashed_password: None,
             superuser: None,
             login: Some(true),
+            options: Vec::new(),
+            access: Vec::new(),
         });
         let result = route(&state, &ctx, stmt).await;
         assert!(
@@ -15627,6 +15971,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn grant_and_revoke_role_membership() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for r in ["reporter", "alice"] {
+            let stmt = crate::parser::parse(&format!(
+                "CREATE ROLE {r} WITH PASSWORD = 'pw' AND LOGIN = true"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // GRANT reporter TO alice — alice becomes a member of reporter.
+        let stmt = crate::parser::parse("GRANT reporter TO alice").unwrap();
+        route(&state, &ctx, stmt).await.expect("grant role");
+        assert!(state
+            .schema
+            .snapshot()
+            .roles
+            .get("alice")
+            .unwrap()
+            .member_of
+            .contains("reporter"));
+
+        // Granting a role to a nonexistent member fails loud.
+        let stmt = crate::parser::parse("GRANT reporter TO ghost").unwrap();
+        match route(&state, &ctx, stmt).await {
+            Ok(_) => panic!("granting to a nonexistent role must fail"),
+            Err(e) => assert!(format!("{e}").contains("ghost")),
+        }
+
+        // REVOKE removes the single edge.
+        let stmt = crate::parser::parse("REVOKE reporter FROM alice").unwrap();
+        route(&state, &ctx, stmt).await.expect("revoke role");
+        assert!(!state
+            .schema
+            .snapshot()
+            .roles
+            .get("alice")
+            .unwrap()
+            .member_of
+            .contains("reporter"));
+    }
+
+    #[tokio::test]
+    async fn list_permissions_reflects_grants() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for q in [
+            "CREATE KEYSPACE lpks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE lpks.t (k int PRIMARY KEY)",
+            "CREATE ROLE reader WITH PASSWORD = 'pw' AND LOGIN = true",
+            "GRANT SELECT ON lpks.t TO reader",
+        ] {
+            let stmt = crate::parser::parse(q).unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // LIST ALL PERMISSIONS returns a Rows result (kind 0x0002).
+        let stmt = crate::parser::parse("LIST ALL PERMISSIONS OF reader").unwrap();
+        let result = route(&state, &ctx, stmt).await.expect("list permissions");
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes(), "expected Rows result");
+            }
+            _ => panic!("expected a Rows Result from LIST PERMISSIONS"),
+        }
+    }
+
     // ── ALTER TABLE with extensions ──────────────────────────────────
 
     #[tokio::test]
@@ -15656,6 +16083,8 @@ mod tests {
             table: "t".into(),
             add_columns: vec![],
             drop_columns: vec![],
+            rename_columns: vec![],
+            alter_column_types: vec![],
             extensions: Some(vec![("vertex_label".into(), "Person".into())]),
             table_options: vec![],
         });
@@ -15665,6 +16094,39 @@ mod tests {
             "ALTER TABLE with extensions should succeed: {:?}",
             result.err()
         );
+    }
+
+    /// ALTER TABLE RENAME / ALTER TYPE parse but are not yet executable; they
+    /// must be rejected loudly rather than silently succeeding as a no-op.
+    #[tokio::test]
+    async fn alter_table_rename_and_alter_type_rejected() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE atrk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt = crate::parser::parse("CREATE TABLE atrk.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let rename = crate::parser::parse("ALTER TABLE atrk.t RENAME k TO k2").unwrap();
+        match route(&state, &ctx, rename).await {
+            Ok(_) => panic!("RENAME must be rejected, not silently succeed"),
+            Err(e) => assert!(format!("{e}").contains("RENAME")),
+        }
+
+        let alter = crate::parser::parse("ALTER TABLE atrk.t ALTER v TYPE blob").unwrap();
+        match route(&state, &ctx, alter).await {
+            Ok(_) => panic!("ALTER TYPE must be rejected, not silently succeed"),
+            Err(e) => assert!(format!("{e}").contains("TYPE")),
+        }
     }
 
     // ── CREATE INDEX with auto-generated name ────────────────────────

@@ -277,7 +277,7 @@
   </ol>
 
   <div class="success">
-    <strong>Zero driver changes:</strong> Ferrosa speaks CQL protocol v5 with SASL authentication,
+    <strong>Zero driver changes:</strong> Ferrosa speaks the CQL native protocol (negotiated at v4) with SASL authentication,
     LZ4/Snappy compression, and prepared statement support. Your Python, Java, Go, and Node.js
     drivers connect without modification.
   </div>
@@ -288,7 +288,7 @@
   <table>
     <thead><tr><th>Feature</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>CQL protocol v5</td><td><span class="check">Compatible</span></td><td>All 16 opcodes</td></tr>
+      <tr><td>CQL protocol v4</td><td><span class="check">Compatible</span></td><td>All 16 opcodes; negotiation capped at v4 (v5 STARTUP falls back to v4)</td></tr>
       <tr><td>SASL authentication</td><td><span class="check">Compatible</span></td><td>PasswordAuthenticator flow</td></tr>
       <tr><td>Frame compression</td><td><span class="check">Compatible</span></td><td>LZ4, Snappy</td></tr>
       <tr><td>Prepared statements</td><td><span class="check">Compatible</span></td><td>W-TinyLFU cache</td></tr>
