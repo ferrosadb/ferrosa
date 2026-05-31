@@ -8,16 +8,20 @@ context: "CQL UDF gap-fill — ferrosa runs WASM UDFs, not Java. Explore compili
 
 # Design: inline language → WASM for `CREATE FUNCTION`
 
-> **Status (2026-05-31): IMPLEMENTED for numeric UDFs** on branch
-> `feature-inline-udf-compile` (commits `271bb62`→`3c376b4`). `CREATE FUNCTION …
-> LANGUAGE assemblyscript AS '<src>'` compiles inline AS → core wasm
-> (`ferrosa_udf::asc`) → udf-world component (`ferrosa_udf::component`) → executor,
-> for `int/bigint/float/double/smallint/tinyint`. Behind the `asc-udf` feature
+> **Status (2026-05-31): IMPLEMENTED** on branch `feature-inline-udf-compile`
+> (commits `271bb62`→`a2aac2c`). `CREATE FUNCTION … LANGUAGE assemblyscript AS
+> '<src>'` compiles inline AS → core wasm (`ferrosa_udf::asc`) → udf-world
+> component (`ferrosa_udf::component`) → executor, for **numeric**
+> (int/bigint/float/double/smallint/tinyint), **text/ascii** (AS `string`), and
+> **blob** (AS `Uint8Array`) arg+return types. Behind the `asc-udf` feature
 > (ferrosa-udf + ferrosa-cql); the 15 MB asc bundle is a runtime artifact via
-> `FERROSA_ASC_BUNDLE`. **Remaining:** text/blob/collection arg+return types (need
-> linear-memory marshalling / a `collection-val` msgpack bridge); caching/perf;
-> resource bounds + STRIDE on the source-as-input surface. See the "Path to
-> production" and Componentization findings below.
+> `FERROSA_ASC_BUNDLE` (built `-O0 --runtime stub --enable mutable-globals --use
+> abort=`). **Remaining:** collection/temporal/decimal types (need a
+> `collection-val` msgpack bridge); `-O` optimization (blocked on Emscripten C++
+> exception support in the shim — binaryen's optimizer aborts without it, so UDFs
+> compile unoptimized); compile caching/perf; resource bounds + STRIDE on the
+> source-as-input surface. See "Path to production" and Componentization findings
+> below.
 
 ## Spike findings (2026-05-31) — binaryen REQUIRES the WebAssembly API
 
