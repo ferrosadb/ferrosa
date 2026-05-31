@@ -21,6 +21,7 @@ pub mod auth;
 pub mod bridge;
 pub mod client;
 pub mod connection;
+pub mod duration;
 pub mod error;
 pub mod event;
 pub mod frame;

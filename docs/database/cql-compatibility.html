@@ -407,8 +407,20 @@
       <tr><td>uuid()</td><td><span class="check">Supported</span></td><td>Generate random UUID</td></tr>
       <tr><td>now()</td><td><span class="check">Supported</span></td><td>Current timeuuid</td></tr>
       <tr><td>toTimestamp()</td><td><span class="check">Supported</span></td><td>Convert timeuuid to timestamp</td></tr>
+      <tr><td>currentDate()</td><td><span class="check">Supported</span></td><td>Today's date (for temporal arithmetic in WHERE)</td></tr>
     </tbody>
   </table>
+
+  <h3>Durations &amp; temporal arithmetic</h3>
+  <p>The <code>duration</code> type accepts both literal forms — compact
+  (<code>2d</code>, <code>1mo3d</code>, <code>89h4m48s</code>) and ISO-8601
+  (<code>P1Y2M3D</code>, <code>PT4H5M6S</code>). A WHERE predicate may add or
+  subtract a duration from a <code>date</code> or <code>timestamp</code>; months
+  and days are applied calendar-aware (e.g. Jan&nbsp;31&nbsp;+&nbsp;1mo clamps to
+  the last day of February).</p>
+  <pre><span class="cm">-- rows from the last two days</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> <span class="type">events</span>
+  <span class="kw">WHERE</span> day &gt;= <span class="fn">currentDate</span>() <span class="kw">-</span> <span class="str">2d</span> <span class="kw">ALLOW FILTERING</span>;</pre>
 
   <h3>Prepared statements</h3>
   <p>Full PREPARE/EXECUTE support with positional bind values. PREPARE responses include <code>pk_count</code> metadata for driver routing. The prepared statement cache uses moka with W-TinyLFU eviction (64 MB default). Bind markers (<code>?</code>) and named bind markers (<code>:name</code>) are both supported.</p>

@@ -2232,7 +2232,7 @@ impl<'input> Parser<'input> {
                 self.lexer.expect(&TokenKind::RParen)?;
                 Term::InList(terms)
             } else {
-                self.parse_term()?
+                self.parse_where_value()?
             };
             clauses.push(WhereClause {
                 column: actual_column,
@@ -2283,6 +2283,56 @@ impl<'input> Parser<'input> {
     // ---------------------------------------------------------------
 
     fn parse_term(&mut self) -> Result<Term, CqlError> {
+        self.parse_primary_term()
+    }
+
+    /// Parse a value in WHERE-predicate position, allowing trailing temporal
+    /// arithmetic `base ± <duration>` (the only place CQL permits `±` after a
+    /// value — elsewhere `+`/`-` are UPDATE SET collection/counter operators).
+    fn parse_where_value(&mut self) -> Result<Term, CqlError> {
+        let base = self.parse_term()?;
+        if matches!(self.lexer.peek()?.kind, TokenKind::Plus | TokenKind::Minus) {
+            let subtract = matches!(self.lexer.next_token()?.kind, TokenKind::Minus);
+            let offset = self.parse_duration_term()?;
+            return Ok(Term::TemporalArithmetic {
+                base: Box::new(base),
+                subtract,
+                offset: Box::new(offset),
+            });
+        }
+        Ok(base)
+    }
+
+    /// Parse a duration literal: ISO-8601 (`P1Y2M3D`) or compact (`2d`,
+    /// `1mo3d`). The lexer emits both forms as a single identifier token.
+    fn parse_duration_term(&mut self) -> Result<Term, CqlError> {
+        let tok = self.lexer.peek()?;
+        if let TokenKind::Ident(s) = &tok.kind {
+            let components = if crate::duration::is_iso_duration(s) {
+                crate::duration::parse_iso_duration(s)
+            } else if crate::duration::is_compact_duration(s) {
+                crate::duration::parse_compact_duration(s)
+            } else {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected a duration, got {:?} at position {}",
+                    tok.kind, tok.pos
+                )));
+            }
+            .map_err(CqlError::SyntaxError)?;
+            self.lexer.next_token()?;
+            return Ok(Term::Duration {
+                months: components.months,
+                days: components.days,
+                nanos: components.nanos,
+            });
+        }
+        Err(CqlError::SyntaxError(format!(
+            "expected a duration, got {:?} at position {}",
+            tok.kind, tok.pos
+        )))
+    }
+
+    fn parse_primary_term(&mut self) -> Result<Term, CqlError> {
         let tok = self.lexer.next_token()?;
         match tok.kind {
             TokenKind::StringLiteral(s) => Ok(Term::StringLiteral(s)),
@@ -2336,6 +2386,26 @@ impl<'input> Parser<'input> {
             // Identifiers and function calls
             TokenKind::Ident(name) => {
                 let name = name.to_string();
+                // A standalone duration literal in value position — ISO-8601
+                // (`P1Y2M3D`) or compact (`2d`, `1mo3d`) — both lex as a single
+                // identifier. Not when followed by `(` (which makes it a call).
+                if self.lexer.peek()?.kind != TokenKind::LParen {
+                    let dur = if crate::duration::is_iso_duration(&name) {
+                        Some(crate::duration::parse_iso_duration(&name))
+                    } else if crate::duration::is_compact_duration(&name) {
+                        Some(crate::duration::parse_compact_duration(&name))
+                    } else {
+                        None
+                    };
+                    if let Some(d) = dur {
+                        let d = d.map_err(CqlError::SyntaxError)?;
+                        return Ok(Term::Duration {
+                            months: d.months,
+                            days: d.days,
+                            nanos: d.nanos,
+                        });
+                    }
+                }
                 if self.lexer.eat(&TokenKind::LParen)? {
                     // Function call: name(args...)
                     self.enter_nesting()?;
@@ -3024,6 +3094,77 @@ mod tests {
             }
             other => panic!("expected Select, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_where_temporal_arithmetic() {
+        let stmt =
+            parse("SELECT * FROM mytable WHERE d >= current_date() - 2d ALLOW FILTERING").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.where_clauses.len(), 1);
+                match &s.where_clauses[0].value {
+                    Term::TemporalArithmetic {
+                        base,
+                        subtract,
+                        offset,
+                    } => {
+                        assert!(*subtract);
+                        assert!(
+                            matches!(base.as_ref(), Term::FunctionCall { name, .. } if name == "current_date")
+                        );
+                        assert_eq!(
+                            offset.as_ref(),
+                            &Term::Duration {
+                                months: 0,
+                                days: 2,
+                                nanos: 0
+                            }
+                        );
+                    }
+                    other => panic!("expected TemporalArithmetic, got {:?}", other),
+                }
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_duration_literals() {
+        // Compact form as a standalone value.
+        let stmt = parse("SELECT * FROM t WHERE x = 1mo3d ALLOW FILTERING").unwrap();
+        match stmt {
+            Statement::Select(s) => assert_eq!(
+                s.where_clauses[0].value,
+                Term::Duration {
+                    months: 1,
+                    days: 3,
+                    nanos: 0
+                }
+            ),
+            other => panic!("expected Select, got {:?}", other),
+        }
+        // ISO-8601 form, and the subtraction operator still untouched for non-WHERE.
+        let stmt = parse("SELECT * FROM t WHERE x = P1Y2M3D ALLOW FILTERING").unwrap();
+        match stmt {
+            Statement::Select(s) => assert_eq!(
+                s.where_clauses[0].value,
+                Term::Duration {
+                    months: 14,
+                    days: 3,
+                    nanos: 0
+                }
+            ),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn counter_and_collection_update_not_treated_as_duration() {
+        // Regression: `+`/`-` in UPDATE SET must stay collection/counter ops.
+        assert!(parse("UPDATE t SET n = n + 1 WHERE k = 1").is_ok());
+        assert!(parse("UPDATE t SET tags = tags + {'a'} WHERE k = 1").is_ok());
+        assert!(parse("UPDATE t SET items = items - [1] WHERE k = 1").is_ok());
     }
 
     #[test]

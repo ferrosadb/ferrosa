@@ -200,6 +200,19 @@ pub enum Term {
         name: String,
         args: Vec<Term>,
     },
+    /// A CQL `duration` literal (months, days, nanoseconds).
+    Duration {
+        months: i32,
+        days: i32,
+        nanos: i64,
+    },
+    /// Temporal arithmetic: `base ± offset`, where `offset` is a duration and
+    /// `base` resolves to a `date` or `timestamp`.
+    TemporalArithmetic {
+        base: Box<Term>,
+        subtract: bool,
+        offset: Box<Term>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
