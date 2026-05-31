@@ -36,6 +36,7 @@
 <li><a href="#_build_the_guest_crate">Build the guest crate</a></li>
 <li><a href="#_hex_encode_the_binary">Hex-encode the binary</a></li>
 <li><a href="#_register_to_celsius">Register <code>to_celsius</code></a></li>
+<li><a href="#_alternative_inline_assemblyscript">Alternative: inline AssemblyScript</a></li>
 <li><a href="#_register_coalesce">Register <code>coalesce</code></a></li>
 <li><a href="#_register_weighted_avg">Register <code>weighted_avg</code></a></li>
 <li><a href="#_register_histogram">Register <code>histogram</code></a></li>
@@ -315,6 +316,31 @@ The schema file contains the full <code>CREATE FUNCTION</code> statements with a
 <div class="paragraph">
 <p><code>CALLED ON NULL INPUT</code> means the function runs even when <code>f</code> is null.
 The implementation returns null when given null, preserving the null semantics your application expects.</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_alternative_inline_assemblyscript">Alternative: inline AssemblyScript</h4>
+<div class="paragraph">
+<p>Instead of building and hex-encoding a precompiled binary, you can write a scalar
+function as inline AssemblyScript (TypeScript-like) source and let the server
+compile it at definition time with <code>LANGUAGE assemblyscript</code>:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE OR REPLACE FUNCTION sensor_analytics.to_celsius(f double)
+    CALLED ON NULL INPUT
+    RETURNS double
+    LANGUAGE assemblyscript
+    AS 'export function to_celsius(f: f64): f64 { return (f - 32.0) * 5.0 / 9.0; }';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The exported function name must match the UDF name. Inline AssemblyScript
+supports numeric (<code>int</code>, <code>bigint</code>, <code>float</code>, <code>double</code>, <code>smallint</code>, <code>tinyint</code>),
+<code>text</code>/<code>ascii</code> (AS <code>string</code>), and <code>blob</code> (AS <code>Uint8Array</code>) argument and return
+types. It requires the server to be built with the <code>asc-udf</code> feature and the asc
+toolchain bundle to be available (see <code>examples/asc-poc/build-bundle.sh</code>);
+collection and temporal types still require the precompiled <code>LANGUAGE wasm</code> form.</p>
 </div>
 </div>
 <div class="sect3">
