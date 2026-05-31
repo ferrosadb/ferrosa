@@ -65,10 +65,10 @@ def supply_chain_schema(cql_session):
         "  country TEXT,"
         "  tier INT,"
         "  iso_certified INT"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'vertex',"
         "  'graph.label': 'Supplier'"
-        "}}"
+        "}"
     )
 
     # Products (graph vertex)
@@ -77,10 +77,10 @@ def supply_chain_schema(cql_session):
         "  id TEXT PRIMARY KEY,"
         "  name TEXT,"
         "  category TEXT"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'vertex',"
         "  'graph.label': 'Product'"
-        "}}"
+        "}"
     )
 
     # Supplies relationship (graph edge)
@@ -91,12 +91,14 @@ def supply_chain_schema(cql_session):
         "  component TEXT,"
         "  lead_time_days INT,"
         "  PRIMARY KEY (src_id, tgt_id)"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'SUPPLIES',"
         "  'graph.source': 'src_id',"
-        "  'graph.target': 'tgt_id'"
-        "}}"
+        "  'graph.target': 'tgt_id',"
+        "  'graph.source_label': 'Supplier',"
+        "  'graph.target_label': 'Supplier'"
+        "}"
     )
 
     # Shipments (time-series — operational CQL)

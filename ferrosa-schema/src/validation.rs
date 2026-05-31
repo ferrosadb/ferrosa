@@ -69,21 +69,47 @@ pub fn validate_keyspace(ks: &KeyspaceMetadata) -> crate::Result<()> {
         )));
     }
 
-    if let Some(rf_str) = ks.replication.options.get("replication_factor") {
-        match rf_str.parse::<i32>() {
-            Ok(rf) if rf < 1 => {
-                return Err(SchemaError::InvalidSchema(format!(
-                    "replication_factor must be >= 1, got {}",
-                    rf
-                )));
+    // Validate every replication factor: the cluster-wide `replication_factor`
+    // and each per-datacenter factor (NetworkTopologyStrategy). `class` is the
+    // strategy name, not a factor.
+    for (key, value) in &ks.replication.options {
+        if key == "class" {
+            continue;
+        }
+
+        // Transient replication (`'<full>/<transient>'`, e.g. `'3/1'`) is a
+        // disabled-by-default Cassandra feature ferrosa does not implement.
+        // Accepting it would persist an option string strict CQL drivers
+        // (scylla, DataStax) cannot parse during schema agreement, breaking
+        // every subsequent metadata fetch against the node. Reject it loudly at
+        // creation, exactly as Cassandra does when transient replication is off.
+        if value.contains('/') {
+            return Err(SchemaError::InvalidSchema(format!(
+                "transient replication is not supported: replication option \
+                 '{key}' = '{value}'; use a plain integer replication factor"
+            )));
+        }
+
+        match value.parse::<i32>() {
+            Ok(rf) => {
+                // The cluster-wide replication_factor must be >= 1. A per-DC
+                // factor of 0 is valid — it excludes that datacenter.
+                if key == "replication_factor" && rf < 1 {
+                    return Err(SchemaError::InvalidSchema(format!(
+                        "replication_factor must be >= 1, got {rf}"
+                    )));
+                }
+                if rf < 0 {
+                    return Err(SchemaError::InvalidSchema(format!(
+                        "replication factor for '{key}' must be >= 0, got {rf}"
+                    )));
+                }
             }
             Err(_) => {
                 return Err(SchemaError::InvalidSchema(format!(
-                    "replication_factor '{}' is not a valid integer",
-                    rf_str
+                    "replication factor for '{key}' is not a valid integer: '{value}'"
                 )));
             }
-            _ => {}
         }
     }
 
@@ -241,6 +267,77 @@ mod tests {
             err.to_string().contains("replication_factor"),
             "expected RF error, got: {}",
             err
+        );
+    }
+
+    /// Transient replication (`'<full>/<transient>'`, e.g. `'3/1'`) is a
+    /// disabled-by-default Cassandra feature ferrosa does not implement.
+    /// Accepting it would persist an option string strict CQL drivers cannot
+    /// parse during schema agreement, corrupting every metadata fetch. It must
+    /// be rejected at creation, as Cassandra does by default.
+    #[test]
+    fn reject_transient_replication_per_dc() {
+        let mut ks = valid_keyspace();
+        ks.replication.strategy = "NetworkTopologyStrategy".to_string();
+        ks.replication.options.clear();
+        ks.replication
+            .options
+            .insert("DC1".to_string(), "3/1".to_string());
+        let err = validate_keyspace(&ks).unwrap_err();
+        assert!(
+            err.to_string().contains("transient replication"),
+            "expected transient-replication rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn reject_transient_replication_factor() {
+        let mut ks = valid_keyspace();
+        ks.replication
+            .options
+            .insert("replication_factor".to_string(), "3/1".to_string());
+        let err = validate_keyspace(&ks).unwrap_err();
+        assert!(
+            err.to_string().contains("transient replication"),
+            "expected transient-replication rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn reject_non_integer_dc_factor() {
+        let mut ks = valid_keyspace();
+        ks.replication.strategy = "NetworkTopologyStrategy".to_string();
+        ks.replication.options.clear();
+        ks.replication
+            .options
+            .insert("DC1".to_string(), "three".to_string());
+        let err = validate_keyspace(&ks).unwrap_err();
+        assert!(
+            err.to_string().contains("DC1"),
+            "expected invalid-factor error naming the DC, got: {}",
+            err
+        );
+    }
+
+    /// A per-DC factor of 0 is valid in NetworkTopologyStrategy — it excludes
+    /// that datacenter (see `autoexpand_exclude_dc.cql`). Only the cluster-wide
+    /// `replication_factor` must be >= 1.
+    #[test]
+    fn accept_per_dc_zero_replication_factor() {
+        let mut ks = valid_keyspace();
+        ks.replication.strategy = "NetworkTopologyStrategy".to_string();
+        ks.replication.options.clear();
+        ks.replication
+            .options
+            .insert("replication_factor".to_string(), "3".to_string());
+        ks.replication
+            .options
+            .insert("DC2".to_string(), "0".to_string());
+        assert!(
+            validate_keyspace(&ks).is_ok(),
+            "per-DC RF of 0 (exclude DC) must be accepted"
         );
     }
 

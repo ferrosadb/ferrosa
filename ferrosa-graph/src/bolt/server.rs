@@ -195,7 +195,14 @@ async fn handle_connection(
             if find_string_field(&extra, "principal").is_some()
                 || find_string_field(&extra, "credentials").is_some()
             {
-                authenticate_bolt_fields(&extra, &schema, config.auth_disabled, &mut state).await?;
+                if let Err(e) =
+                    authenticate_bolt_fields(&extra, &schema, config.auth_disabled, &mut state)
+                        .await
+                {
+                    tracing::debug!(%e, "Bolt HELLO authentication failed");
+                    send_message(&mut stream, &auth_failure_message()).await?;
+                    return Ok(());
+                }
             }
 
             let success = BoltMessage::Success {
@@ -222,7 +229,13 @@ async fn handle_connection(
 
     match logon_msg {
         BoltMessage::Logon { auth } => {
-            authenticate_bolt_fields(&auth, &schema, config.auth_disabled, &mut state).await?;
+            if let Err(e) =
+                authenticate_bolt_fields(&auth, &schema, config.auth_disabled, &mut state).await
+            {
+                tracing::debug!(%e, "Bolt LOGON authentication failed");
+                send_message(&mut stream, &auth_failure_message()).await?;
+                return Ok(());
+            }
             let success = BoltMessage::Success { metadata: vec![] };
             send_message(&mut stream, &success).await?;
         }
@@ -447,6 +460,28 @@ async fn process_message(
                 ),
             ],
         }]),
+    }
+}
+
+/// A Bolt `FAILURE` for an authentication error. Sending this (rather than just
+/// dropping the connection) is what makes a Bolt driver raise an auth error
+/// instead of a generic `SessionExpired` / `ServiceUnavailable`.
+fn auth_failure_message() -> BoltMessage {
+    BoltMessage::Failure {
+        metadata: vec![
+            (
+                "code".into(),
+                PackValue::String("Neo.ClientError.Security.Unauthorized".into()),
+            ),
+            (
+                "neo4j_code".into(),
+                PackValue::String("Neo.ClientError.Security.Unauthorized".into()),
+            ),
+            (
+                "message".into(),
+                PackValue::String("authentication failed".into()),
+            ),
+        ],
     }
 }
 

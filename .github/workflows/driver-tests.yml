@@ -68,19 +68,16 @@ jobs:
           echo "Prebuilt image not available; run-all.sh will build from source."
 
       - name: Run all language driver smoke tests
-        # Informational until C8 (Full CQL Driver Compatibility) is complete:
-        # several drivers still fail collection/TTL cases, the node driver's
-        # control connection, and a few test-side LWT/batch expectations
-        # (diagnosed in specs/coverage/driver-compat-c8.md). continue-on-error
-        # surfaces the failures — logs are teed and the real exit code is
-        # propagated for visibility — without blocking PRs. Remove this once all
-        # six drivers pass consistently.
-        continue-on-error: true
+        # Fail-loud: C8 (Full CQL Driver Compatibility) is complete — all six
+        # language CQL drivers, the multi-protocol python suite (CQL + Cypher +
+        # Bolt + SPARQL + examples), and the auth-enabled enforcement job pass.
+        # A driver regression now fails the build. (History in
+        # specs/coverage/driver-compat-c8.md.)
         run: |
           mkdir -p /tmp/driver-logs
           bash tests/drivers/run-all.sh 2>&1 | tee /tmp/driver-logs/run-all.log
           exit ${PIPESTATUS[0]}
-        timeout-minutes: 20
+        timeout-minutes: 25
 
       - name: Collect driver test logs on failure
         if: failure()

@@ -20,7 +20,7 @@ COMPOSE_FILE="$SCRIPT_DIR/docker-compose.drivers.yml"
 # Allow overriding to podman for environments without Docker
 RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
-DRIVERS=("python-tests" "go-tests" "node-tests" "java-tests" "rust-tests" "csharp-tests")
+DRIVERS=("python-tests" "go-tests" "node-tests" "java-tests" "rust-tests" "csharp-tests" "python-auth-tests")
 
 pass=0
 fail=0
@@ -54,7 +54,9 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Starting Ferrosa + RustFS ==="
-"$RUNTIME" compose -f "$COMPOSE_FILE" up -d ferrosa
+# ferrosa: auth-disabled functional node (CQL/graph/bolt/sparql smoke).
+# ferrosa-auth: auth-enabled node for the auth-enforcement tests.
+"$RUNTIME" compose -f "$COMPOSE_FILE" up -d ferrosa ferrosa-auth
 
 # ---------------------------------------------------------------------------
 # 3. Wait for Ferrosa CQL port

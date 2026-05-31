@@ -7,10 +7,16 @@ endpoints reject requests without credentials when auth would be required.
 
 import os
 
+import pytest
 import requests
 
 FERROSA_HOST = os.environ.get("FERROSA_HOST", "127.0.0.1")
 FERROSA_GRAPH_PORT = int(os.environ.get("FERROSA_GRAPH_PORT", "7474"))
+FERROSA_AUTH_DISABLED = os.environ.get("FERROSA_AUTH_DISABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 BASE_URL = f"http://{FERROSA_HOST}:{FERROSA_GRAPH_PORT}"
 
@@ -39,6 +45,11 @@ class TestHealth:
 # ---- Auth enforcement ----------------------------------------------------
 
 
+@pytest.mark.skipif(
+    FERROSA_AUTH_DISABLED,
+    reason="auth-disabled smoke node never returns 401; auth enforcement is "
+    "covered separately with auth enabled",
+)
 class TestAuth:
     def test_query_without_auth_returns_401(self):
         """POST /graph/query without credentials returns 401."""

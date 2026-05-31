@@ -1187,6 +1187,7 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             anchor,
             hops,
             optional_hops,
+            post_filters: _,
             with_pipeline,
             return_clause,
         } => {
@@ -1681,6 +1682,7 @@ mod tests {
             },
             hops: vec![],
             optional_hops: vec![],
+            post_filters: vec![],
             with_pipeline: None,
             return_clause: ReturnClause {
                 distinct: false,

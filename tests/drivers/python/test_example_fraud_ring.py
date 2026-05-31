@@ -63,10 +63,10 @@ def fraud_graph(cql_session):
         "  account_type TEXT,"
         "  risk_score INT,"
         "  country TEXT"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'vertex',"
         "  'graph.label': 'Account'"
-        "}}"
+        "}"
     )
 
     # Transactions (edges)
@@ -78,12 +78,14 @@ def fraud_graph(cql_session):
         "  currency TEXT,"
         "  timestamp TIMESTAMP,"
         "  PRIMARY KEY (src_id, tgt_id)"
-        ") WITH extensions = {{"
+        ") WITH extensions = {"
         "  'graph.type': 'edge',"
         "  'graph.label': 'TRANSFER',"
         "  'graph.source': 'src_id',"
-        "  'graph.target': 'tgt_id'"
-        "}}"
+        "  'graph.target': 'tgt_id',"
+        "  'graph.source_label': 'Account',"
+        "  'graph.target_label': 'Account'"
+        "}"
     )
 
     # Seed accounts: 3 legitimate, 4 in a fraud ring, 2 shell companies

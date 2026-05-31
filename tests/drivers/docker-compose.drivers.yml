@@ -60,7 +60,8 @@ services:
     entrypoint: >
       sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
              mc mb local/ferrosa-drivers --ignore-existing &&
-             echo 'bucket ferrosa-drivers ready'"
+             mc mb local/ferrosa-drivers-auth --ignore-existing &&
+             echo 'buckets ready'"
     restart: "no"
 
   # -------------------------------------------------------------------------
@@ -104,6 +105,62 @@ services:
       start_period: 15s
 
   # -------------------------------------------------------------------------
+  # Second Ferrosa node with auth ENABLED — exercises the auth-enforcement
+  # path (graph 401 / Bolt invalid-credentials) that the auth-disabled node
+  # cannot. No host ports: reached only over the compose network.
+  # -------------------------------------------------------------------------
+  ferrosa-auth:
+    image: ferrosa-test-node:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      FERROSA_HOST_ID: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_ENABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-driver-test-auth"
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-drivers-auth"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - ferrosa-data-auth:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/9042'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # Auth-enforcement tests: run the graph/Bolt auth tests against the
+  # auth-enabled node. FERROSA_AUTH_DISABLED is left false so the auth tests
+  # run (rather than skip) and assert 401 / AuthError.
+  python-auth-tests:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    depends_on:
+      ferrosa-auth:
+        condition: service_healthy
+    environment:
+      FERROSA_HOST: ferrosa-auth
+      FERROSA_CQL_PORT: "9042"
+      FERROSA_GRAPH_PORT: "7474"
+      FERROSA_BOLT_PORT: "7687"
+    command:
+      - pytest
+      - -v
+      - test_graph.py::TestAuth
+      - test_bolt_compat.py::TestBoltWireProtocol::test_bolt_auth_invalid_credentials
+
+  # -------------------------------------------------------------------------
   # Python driver tests (CQL + Graph HTTP)
   # -------------------------------------------------------------------------
   python-tests:
@@ -118,6 +175,10 @@ services:
       FERROSA_CQL_PORT: "9042"
       FERROSA_GRAPH_PORT: "7474"
       FERROSA_BOLT_PORT: "7687"
+      # The smoke node runs with auth disabled (so CQL drivers connect without
+      # credentials). Tell the auth-enforcement tests so they skip rather than
+      # assert a 401/AuthError the node will never produce.
+      FERROSA_AUTH_DISABLED: "true"
     volumes:
       - ../../cassandra/doc/modules/cassandra/examples/CQL:/cassandra-examples:ro
 
@@ -194,3 +255,4 @@ services:
 volumes:
   rustfs-data:
   ferrosa-data:
+  ferrosa-data-auth:
