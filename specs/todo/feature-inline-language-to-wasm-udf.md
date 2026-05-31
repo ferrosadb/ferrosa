@@ -133,6 +133,25 @@ cargo run -p ferrosa-udf --example asc_compile_poc -- /tmp/asc-host/asc-bundle.m
 cargo run -p ferrosa-udf --example wasm_imports -- /tmp/binaryen.wasm                # dumps the 82-import surface
 ```
 
+### Feasibility of the mechanism — CONFIRMED (rquickjs 0.9)
+
+Both load-bearing primitives exist:
+
+- **Re-entrancy:** `Ctx::as_raw() -> NonNull<JSContext>` and
+  `unsafe Ctx::from_raw(NonNull<JSContext>)` (`rquickjs-core/src/context/ctx.rs`).
+  Store the raw ctx in the wasmtime `Store` data; rebuild a `Ctx` inside each
+  host func to call the persisted JS import.
+- **Zero-copy memory:** the safe `ArrayBuffer::{new,new_copy}` only **copy**
+  (unusable — Emscripten writes into memory and expects the wasm to see it). But
+  **`JS_NewArrayBuffer`** is exported in `rquickjs-sys` → create an **external**
+  ArrayBuffer over `wasmtime::Memory`'s data pointer (no-op free fn), re-derived
+  on grow. This is the one place we drop to the raw QuickJS FFI.
+- **Imports:** wire all 82 generically with `wasmtime::Func::new(&FuncType, …)`
+  (dynamic `&[Val]` → JS, JS → `&mut [Val]`); `i64` ↔ JS `BigInt`.
+
+So Path A is buildable end to end; the remaining work is the implementation
+(below), not a feasibility question.
+
 ### Remaining shim to build (well-defined)
 
 Implement a `WebAssembly` global in rquickjs backed by ferrosa's wasmtime:
