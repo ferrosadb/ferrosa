@@ -302,15 +302,20 @@ fn projection_storage_ordinals(
         })
         .collect::<Option<Vec<_>>>()?;
 
-    // Build the regular column list in `position` order — exactly
-    // what `ferrosa_schema::convert` emits into the SSTable's
-    // SerializationHeader.regular_columns.
+    // Build the regular column list in Cassandra **name-sorted** order —
+    // exactly what `ferrosa_schema::convert::to_storage_schema` emits into the
+    // SSTable's `SerializationHeader.regular_columns` (and what
+    // `storage_column_index` indexes against). Sorting by declared `position`
+    // here is WRONG: for a table whose declared column order differs from
+    // name order, the projected SSTable read would then decode the wrong
+    // column and the requested column would come back NULL once the memtable
+    // flushed (the scholarly-search embedding → ANN regression).
     let mut regulars: Vec<&ColumnMetadata> = table_meta
         .columns
         .values()
         .filter(|c| c.kind == ColumnKind::Regular)
         .collect();
-    regulars.sort_by_key(|c| c.position);
+    regulars.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
 
     let mut wanted: Vec<u16> = Vec::new();
     for name in &names {
@@ -16596,6 +16601,201 @@ mod tests {
 
         // ANN query against the HVQ index must execute and return a result set.
         run("SELECT id FROM semantic.articles ORDER BY embedding ANN OF [0.90, 0.10, 0.00, 0.00] LIMIT 2".into()).await;
+    }
+
+    /// Reproduction for the scholarly-search example failure: a 768-d
+    /// `vector<float, 768>` column on a graph-vertex table, with enough rows
+    /// (and a small flush threshold in `setup()`) that the memtable flushes to
+    /// a local SSTable mid-insert. A subsequent full-scan `ANN OF` query must
+    /// still see every row's embedding as a vector — i.e. the large vector cell
+    /// must round-trip through the SSTable read path. Before the fix this failed
+    /// with "ANN OF column embedding must contain vector values" because a
+    /// flushed row read back without its vector cell.
+    #[tokio::test]
+    async fn ann_over_768d_vectors_survives_flush_end_to_end() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let run = |cql: String| {
+            let state = &state;
+            let ctx = &ctx;
+            async move {
+                route(state, ctx, crate::parser::parse(&cql).unwrap())
+                    .await
+                    .unwrap_or_else(|e| panic!("statement failed: {cql}: {e:?}"))
+            }
+        };
+
+        // Build a distinct, well-formed 768-d unit-ish vector literal per row.
+        let vec_literal = |seed: usize| -> String {
+            let mut parts = Vec::with_capacity(768);
+            for i in 0..768 {
+                // Deterministic small floats in [-0.1, 0.1], distinct per seed.
+                let v = (((seed * 31 + i * 7) % 200) as f32 - 100.0) / 1000.0;
+                parts.push(format!("{v:.6}"));
+            }
+            format!("[{}]", parts.join(", "))
+        };
+
+        run("CREATE KEYSPACE scholar WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}".into()).await;
+        run("CREATE TABLE scholar.paper (paper_id int PRIMARY KEY, title text, abstract text, year int, venue text, embedding vector<float, 768>) WITH extensions = { 'graph.type': 'vertex', 'graph.label': 'Paper' }".into()).await;
+        run("CREATE INDEX paper_ann ON scholar.paper (embedding) USING 'vector' WITH OPTIONS = {'method': 'hvq'}".into()).await;
+
+        // 12 papers, each with a 3072-byte vector cell: total well over the
+        // 4096-byte flush threshold, forcing flushes during the insert run.
+        for id in 1..=12usize {
+            run(format!(
+                "INSERT INTO scholar.paper (paper_id, title, abstract, year, venue, embedding) \
+                 VALUES ({id}, 'Paper {id}', 'abstract {id}', 2024, 'Venue', {})",
+                vec_literal(id)
+            ))
+            .await;
+        }
+
+        // Full-scan ANN ordering must read every flushed row's vector back.
+        let result = run(format!(
+            "SELECT paper_id, title FROM scholar.paper ORDER BY embedding ANN OF {} LIMIT 5",
+            vec_literal(3)
+        ))
+        .await;
+        let RouteResult::Result(body) = result else {
+            panic!("ANN OF query must return a RESULT frame");
+        };
+        let row_count = extract_row_count(&body);
+        assert_eq!(
+            row_count, 5,
+            "ANN OF full scan must rank all flushed 768-d rows, got {row_count}"
+        );
+    }
+
+    /// Reproduction for the scholarly-search example failure on the shared CI
+    /// node: two graph-vertex tables in *different* keyspaces declare the same
+    /// `graph.label`, but only one has a vector column. An `ANN OF` query
+    /// against the vector table must stay scoped to its own keyspace.table and
+    /// rank its own rows -- it must not resolve columns/rows through the shared
+    /// vertex label and trip over the other table's (embedding-less) schema.
+    /// Before the fix this failed with "ANN OF column embedding must contain
+    /// vector values" once the second same-label table existed.
+    #[tokio::test]
+    async fn ann_of_is_isolated_from_same_graph_label_in_other_keyspace() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let run = |cql: String| {
+            let state = &state;
+            let ctx = &ctx;
+            async move {
+                route(state, ctx, crate::parser::parse(&cql).unwrap())
+                    .await
+                    .unwrap_or_else(|e| panic!("statement failed: {cql}: {e:?}"))
+            }
+        };
+
+        // Keyspace `scholar`: a Paper vertex WITH a vector embedding.
+        run("CREATE KEYSPACE scholar WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}".into()).await;
+        run("CREATE TABLE scholar.paper (paper_id int PRIMARY KEY, title text, embedding vector<float, 4>) WITH extensions = { 'graph.type': 'vertex', 'graph.label': 'Paper' }".into()).await;
+        run("CREATE INDEX paper_ann ON scholar.paper (embedding) USING 'vector' WITH OPTIONS = {'method': 'hvq'}".into()).await;
+        for (id, vec) in [
+            (1, "[0.90, 0.10, 0.00, 0.00]"),
+            (2, "[0.80, 0.20, 0.10, 0.00]"),
+            (3, "[0.00, 0.00, 0.90, 0.10]"),
+        ] {
+            run(format!(
+                "INSERT INTO scholar.paper (paper_id, title, embedding) VALUES ({id}, 'P{id}', {vec})"
+            ))
+            .await;
+        }
+
+        // Keyspace `knowledge`: a different Paper vertex with NO vector column,
+        // sharing the same graph.label. Creating it must not corrupt the
+        // schema/column resolution that scholar.paper's ANN query relies on.
+        run("CREATE KEYSPACE knowledge WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}".into()).await;
+        run("CREATE TABLE knowledge.paper (paper_id uuid PRIMARY KEY, title text) WITH extensions = { 'graph.type': 'vertex', 'graph.label': 'Paper' }".into()).await;
+
+        // ANN query against scholar.paper must still rank its own 3 rows.
+        let result = run(
+            "SELECT paper_id, title FROM scholar.paper ORDER BY embedding ANN OF [0.90, 0.10, 0.00, 0.00] LIMIT 5".into(),
+        )
+        .await;
+        let RouteResult::Result(body) = result else {
+            panic!("ANN OF query must return a RESULT frame");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            3,
+            "ANN OF must stay scoped to scholar.paper despite the same graph.label in another keyspace"
+        );
+    }
+
+    /// Regression for the scholarly-search ANN failure root cause: the
+    /// projection fast path (`SELECT a, b FROM t` with no WHERE) must request
+    /// the **SSTable storage ordinal** of each column — i.e. regular columns in
+    /// Cassandra **name-sorted** order, exactly as `ferrosa_schema::convert::
+    /// to_storage_schema` writes them into the SerializationHeader — NOT the
+    /// table-definition `position` order. For a table whose declared order
+    /// differs from name order, requesting the position index made the flushed
+    /// SSTable projected read decode the wrong column, so the projected column
+    /// came back NULL once the memtable flushed (e.g. a 768-d embedding → the
+    /// ANN query then failed "must contain vector values").
+    #[test]
+    fn projection_storage_ordinals_use_name_sorted_storage_order_not_table_position() {
+        let mk = |name: &str, kind: ColumnKind, position: i32, ty: &str| ColumnMetadata {
+            name: name.to_string(),
+            kind,
+            position,
+            column_type: ty.to_string(),
+            clustering_order: SchemaClusteringOrder::None,
+            mask: None,
+        };
+        // Declared order: id(pk), title(1), abstract(2), embedding(3).
+        // Name-sorted regular storage order is abstract(0), embedding(1),
+        // title(2) — so embedding's storage ordinal is 1, NOT its table
+        // position index of 2.
+        let mut columns: indexmap::IndexMap<String, ColumnMetadata> = indexmap::IndexMap::new();
+        columns.insert("id".into(), mk("id", ColumnKind::PartitionKey, 0, "int"));
+        columns.insert("title".into(), mk("title", ColumnKind::Regular, 1, "text"));
+        columns.insert(
+            "abstract".into(),
+            mk("abstract", ColumnKind::Regular, 2, "text"),
+        );
+        columns.insert(
+            "embedding".into(),
+            mk("embedding", ColumnKind::Regular, 3, "vector<float, 4>"),
+        );
+
+        let table_meta = TableMetadata {
+            keyspace: "ks".into(),
+            name: "t".into(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["id".into()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+
+        let wanted =
+            projection_storage_ordinals(&[SelectColumn::Column("embedding".into())], &table_meta);
+        assert_eq!(
+            wanted,
+            Some(vec![1]),
+            "projection must use the SSTable name-sorted storage ordinal (embedding=1), \
+             not the table-definition position (embedding=2)"
+        );
     }
 
     // ── parse_permissions coverage for remaining variants ────────────
