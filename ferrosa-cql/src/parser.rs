@@ -1163,6 +1163,9 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Table) => {
                 self.parse_alter_table().map(Statement::AlterTable)
             }
+            TokenKind::Keyword(Keyword::Keyspace) => {
+                self.parse_alter_keyspace().map(Statement::AlterKeyspace)
+            }
             TokenKind::Keyword(Keyword::Type) => self.parse_alter_type(),
             // ALTER ROLE / ALTER USER share the same options as CREATE.
             // Both forms accepted — `USER` is the deprecated alias.
@@ -1195,6 +1198,62 @@ impl<'input> Parser<'input> {
             login: opts.login,
             options: opts.options,
             access: opts.access,
+        })
+    }
+
+    fn parse_alter_keyspace(&mut self) -> Result<AlterKeyspaceStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Keyspace))?;
+        let name = self.parse_ident()?;
+        self.lexer.expect(&TokenKind::Keyword(Keyword::With))?;
+
+        let mut replication = None;
+        let mut durable_writes = None;
+        loop {
+            let tok = self.lexer.peek()?;
+            match &tok.kind {
+                TokenKind::Keyword(Keyword::Replication) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    replication = Some(self.parse_string_map()?);
+                }
+                TokenKind::Keyword(Keyword::DurableWrites) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    let t = self.lexer.next_token()?;
+                    durable_writes = match t.kind {
+                        TokenKind::Keyword(Keyword::True) => Some(true),
+                        TokenKind::Keyword(Keyword::False) => Some(false),
+                        _ => return Err(CqlError::SyntaxError(format!(
+                            "expected true or false for DURABLE_WRITES, got {:?} at position {}",
+                            t.kind, t.pos
+                        ))),
+                    };
+                }
+                _ => {
+                    let kind = tok.kind.clone();
+                    let pos = tok.pos;
+                    return Err(CqlError::SyntaxError(format!(
+                        "expected REPLICATION or DURABLE_WRITES after ALTER KEYSPACE ... WITH, \
+                         got {:?} at position {}",
+                        kind, pos
+                    )));
+                }
+            }
+            if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                break;
+            }
+        }
+
+        if replication.is_none() && durable_writes.is_none() {
+            return Err(CqlError::SyntaxError(
+                "ALTER KEYSPACE requires REPLICATION or DURABLE_WRITES".to_string(),
+            ));
+        }
+
+        Ok(AlterKeyspaceStatement {
+            name,
+            replication,
+            durable_writes,
         })
     }
 
@@ -3077,6 +3136,42 @@ mod tests {
     // ---------------------------------------------------------------
     // DDL tests
     // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_alter_keyspace_replication() {
+        let stmt = parse(
+            "ALTER KEYSPACE excelsior WITH replication = \
+             {'class': 'SimpleStrategy', 'replication_factor' : '4'}",
+        )
+        .unwrap();
+        match stmt {
+            Statement::AlterKeyspace(s) => {
+                assert_eq!(s.name, "excelsior");
+                assert_eq!(
+                    s.replication,
+                    Some(vec![
+                        ("class".into(), "SimpleStrategy".into()),
+                        ("replication_factor".into(), "4".into()),
+                    ])
+                );
+                assert_eq!(s.durable_writes, None);
+            }
+            other => panic!("expected AlterKeyspace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_keyspace_durable_writes_only() {
+        let stmt = parse("ALTER KEYSPACE ks WITH DURABLE_WRITES = false").unwrap();
+        match stmt {
+            Statement::AlterKeyspace(s) => {
+                assert_eq!(s.name, "ks");
+                assert_eq!(s.replication, None);
+                assert_eq!(s.durable_writes, Some(false));
+            }
+            other => panic!("expected AlterKeyspace, got {:?}", other),
+        }
+    }
 
     #[test]
     fn parse_create_keyspace() {
