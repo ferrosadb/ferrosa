@@ -7720,6 +7720,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode_bytes(&Sha256::digest(bytes))
 }
 
+/// Compile an inline AssemblyScript function body to a UDF component, returning
+/// (component bytes, hex for replication). The compile runs on a blocking thread
+/// (it drives the QuickJS/wasmtime toolchain synchronously).
+#[cfg(feature = "asc-udf")]
+async fn compile_assemblyscript_body(
+    name: &str,
+    body: &FunctionBodySource,
+    arg_types: &[ferrosa_common::CqlType],
+    return_type: &ferrosa_common::CqlType,
+) -> Result<(Vec<u8>, String), CqlError> {
+    let source = match body {
+        FunctionBodySource::InlineHex(s) => s.clone(),
+        _ => {
+            return Err(CqlError::Invalid(
+                "AssemblyScript UDFs require inline source: AS '<source>'".into(),
+            ))
+        }
+    };
+    let nm = name.to_string();
+    let at = arg_types.to_vec();
+    let rt = return_type.clone();
+    let component = tokio::task::spawn_blocking(move || {
+        ferrosa_udf::component::compile_to_component(&nm, &source, &at, &rt)
+    })
+    .await
+    .map_err(|e| CqlError::Invalid(format!("AssemblyScript compile task panicked: {e}")))?
+    .map_err(|e| CqlError::Invalid(format!("{e}")))?;
+    let stored = hex_encode_bytes(&component);
+    Ok((component, stored))
+}
+
+#[cfg(not(feature = "asc-udf"))]
+async fn compile_assemblyscript_body(
+    _name: &str,
+    _body: &FunctionBodySource,
+    _arg_types: &[ferrosa_common::CqlType],
+    _return_type: &ferrosa_common::CqlType,
+) -> Result<(Vec<u8>, String), CqlError> {
+    Err(CqlError::Invalid(
+        "AssemblyScript UDF support was not compiled in (rebuild ferrosa with the \
+         asc-udf feature)"
+            .into(),
+    ))
+}
+
 async fn load_function_body(body: &FunctionBodySource) -> Result<(Vec<u8>, String), CqlError> {
     match body {
         FunctionBodySource::InlineHex(hex) => Ok((hex_decode(hex)?, hex.clone())),
@@ -7779,16 +7824,17 @@ async fn route_create_function(
         .or_else(|| ctx.current_keyspace.clone())
         .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
 
-    // Only WASM language is supported
-    if !language.eq_ignore_ascii_case("wasm") {
+    // WASM (precompiled) and AssemblyScript (compiled inline) are supported.
+    let is_assemblyscript = language.eq_ignore_ascii_case("assemblyscript");
+    if !language.eq_ignore_ascii_case("wasm") && !is_assemblyscript {
         return Err(CqlError::Invalid(format!(
-            "unsupported UDF language '{}': only 'wasm' is supported",
+            "unsupported UDF language '{}': only 'wasm' and 'assemblyscript' are supported",
             language
         )));
     }
     if !ctx.auth.is_superuser {
         return Err(CqlError::Invalid(
-            "CREATE FUNCTION LANGUAGE wasm requires a superuser role".into(),
+            "CREATE FUNCTION requires a superuser role".into(),
         ));
     }
 
@@ -7845,8 +7891,14 @@ async fn route_create_function(
         .map(bridge::cql_type_display_name)
         .collect();
 
-    // Load WASM bytes and compile only after existence semantics are settled.
-    let (wasm_bytes, stored_body) = load_function_body(&body).await?;
+    // Load WASM bytes (precompiled) or compile AssemblyScript source inline, only
+    // after existence semantics are settled. Either way `wasm_bytes` is a
+    // component the executor compiles; `stored_body` is its hex for replication.
+    let (wasm_bytes, stored_body) = if is_assemblyscript {
+        compile_assemblyscript_body(&name, &body, &arg_types, &common_return).await?
+    } else {
+        load_function_body(&body).await?
+    };
     if ferrosa_udf::UdfExecutor::wasm_declares_streaming_aggregate_abi(&wasm_bytes) {
         state
             .udf_executor
@@ -13510,6 +13562,63 @@ mod tests {
         assert_eq!(func.return_type, CqlType::Int);
         assert!(func.called_on_null);
         assert_eq!(func.language, "wasm");
+    }
+
+    /// CREATE FUNCTION ... LANGUAGE assemblyscript compiles the inline source to a
+    /// component, registers it, and the executor invokes it. Requires the asc
+    /// bundle (FERROSA_ASC_BUNDLE) and the asc-udf feature.
+    #[cfg(all(feature = "asc-udf", feature = "live-infra-tests"))]
+    #[tokio::test]
+    async fn route_create_function_assemblyscript_compiles_and_runs() {
+        use ferrosa_common::CqlValue;
+        if std::env::var_os("FERROSA_ASC_BUNDLE").is_none() {
+            panic!(
+                "FERROSA_ASC_BUNDLE is not set. Build the asc bundle and run:\n  \
+                 ./ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs\n  \
+                 FERROSA_ASC_BUNDLE=/tmp/asc-host/asc-bundle.mjs cargo test -p ferrosa-cql \
+                 --features 'asc-udf live-infra-tests' route_create_function_assemblyscript"
+            );
+        }
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE udf_as WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let cql = "CREATE FUNCTION udf_as.addi(a int, b int) CALLED ON NULL INPUT \
+                   RETURNS int LANGUAGE assemblyscript \
+                   AS 'export function addi(a: i32, b: i32): i32 { return a + b; }'";
+        let stmt = crate::parser::parse(cql).unwrap();
+        route(&state, &ctx, stmt)
+            .await
+            .expect("CREATE FUNCTION LANGUAGE assemblyscript should succeed");
+
+        let func = state
+            .schema
+            .get_function("udf_as", "addi", &[CqlType::Int, CqlType::Int])
+            .expect("asc function registered in schema");
+        assert_eq!(func.language, "assemblyscript");
+
+        let out = state
+            .udf_executor
+            .call(
+                "udf_as",
+                "addi",
+                vec![CqlValue::Int(2), CqlValue::Int(3)],
+                &[CqlType::Int, CqlType::Int],
+                &CqlType::Int,
+            )
+            .expect("invoke compiled asc UDF");
+        assert_eq!(out, CqlValue::Int(5));
     }
 
     #[tokio::test]
