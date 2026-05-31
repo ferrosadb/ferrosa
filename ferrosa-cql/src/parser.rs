@@ -26,6 +26,18 @@ type OrderByResult = (Vec<(String, OrderDirection)>, Option<(String, Term)>);
 /// Security mitigation M6.
 const MAX_COLLECTION_ELEMENTS: usize = 65_536;
 
+/// Options parsed from a CREATE/ALTER ROLE `WITH …` clause. Shared by the
+/// CREATE and ALTER role parsers (identical grammar).
+#[derive(Default)]
+struct RoleOptionSet {
+    password: Option<String>,
+    hashed_password: Option<String>,
+    superuser: Option<bool>,
+    login: Option<bool>,
+    options: Vec<(String, String)>,
+    access: Vec<RoleAccess>,
+}
+
 /// Parse a CQL statement from the given input string.
 pub fn parse(input: &str) -> Result<Statement, CqlError> {
     let span = tracing::info_span!("cql.parse", cql.statement_type = tracing::field::Empty,);
@@ -125,8 +137,8 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback(),
             TokenKind::Keyword(Keyword::Truncate) => self.parse_truncate().map(Statement::Truncate),
             TokenKind::Keyword(Keyword::Compact) => self.parse_compact().map(Statement::Compact),
-            TokenKind::Keyword(Keyword::Grant) => self.parse_grant().map(Statement::Grant),
-            TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
+            TokenKind::Keyword(Keyword::Grant) => self.parse_grant(),
+            TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke(),
             TokenKind::Keyword(Keyword::Subscribe) => self.parse_subscribe(),
             TokenKind::Keyword(Keyword::Unsubscribe) => self.parse_unsubscribe(),
             TokenKind::Keyword(Keyword::List) => self.parse_list(),
@@ -220,10 +232,16 @@ impl<'input> Parser<'input> {
 
         let mut cols = vec![];
         loop {
-            // Check if this is a function call: ident(...)
-            let name = self.parse_ident()?;
+            // Check if this is a function call: ident(...) or a keyspace-
+            // qualified function: keyspace.function(...) (e.g. a UDF/UDA).
+            let first = self.parse_ident()?;
+            let (keyspace, name) = if self.lexer.eat(&TokenKind::Dot)? {
+                (Some(first), self.parse_ident()?)
+            } else {
+                (None, first)
+            };
             if self.lexer.eat(&TokenKind::LParen)? {
-                // Function call: COUNT(*), WRITETIME(col), TTL(col), etc.
+                // Function call: COUNT(*), WRITETIME(col), TTL(col), ks.udf(col).
                 let mut args = vec![];
                 if self.lexer.eat(&TokenKind::Star)? {
                     // COUNT(*) — represent * as a special term
@@ -244,11 +262,18 @@ impl<'input> Parser<'input> {
                 };
 
                 cols.push(SelectColumn::FunctionCall {
-                    keyspace: None,
+                    keyspace,
                     name,
                     args,
                     alias,
                 });
+            } else if keyspace.is_some() {
+                // `keyspace.name` without `(` — a qualified column is not valid
+                // in a SELECT list (only qualified function calls are).
+                return Err(CqlError::SyntaxError(format!(
+                    "expected a function call after '{}.{name}' in the SELECT list",
+                    keyspace.unwrap()
+                )));
             } else if self.lexer.eat(&TokenKind::Keyword(Keyword::As))? {
                 // Column with alias: col AS alias
                 let alias = self.parse_ident()?;
@@ -906,6 +931,148 @@ impl<'input> Parser<'input> {
     /// Cassandra's grammar is permissive about ordering; we accept a
     /// trailing `SUPERUSER`/`NOSUPERUSER` keyword as a shorthand for
     /// `WITH SUPERUSER = true/false`.
+    /// Parsed `WITH option (AND option)*` set for CREATE/ALTER ROLE.
+    fn parse_role_option_set(&mut self) -> Result<RoleOptionSet, CqlError> {
+        let mut o = RoleOptionSet::default();
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            self.parse_with_role_options(&mut o)?;
+        }
+        // Legacy USER syntax allows a trailing bare SUPERUSER / NOSUPERUSER flag
+        // (no `WITH`, no `=`), e.g. `ALTER USER bob SUPERUSER` or
+        // `CREATE USER ops WITH PASSWORD 'p' NOSUPERUSER`. Setting the flag is
+        // still authorized downstream exactly as `SUPERUSER = <bool>` is.
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Superuser) => {
+                self.lexer.next_token()?;
+                o.superuser = Some(true);
+            }
+            TokenKind::Keyword(Keyword::Nosuperuser) => {
+                self.lexer.next_token()?;
+                o.superuser = Some(false);
+            }
+            _ => {}
+        }
+        Ok(o)
+    }
+
+    /// Parse the `WITH <option> [AND <option> ...]` role-option list (the caller
+    /// has already consumed `WITH`).
+    fn parse_with_role_options(&mut self, o: &mut RoleOptionSet) -> Result<(), CqlError> {
+        loop {
+            let tok = self.lexer.peek()?;
+            match &tok.kind {
+                TokenKind::Keyword(Keyword::Password) => {
+                    self.lexer.next_token()?;
+                    // `=` is optional: ROLE syntax uses `PASSWORD = 'x'`, the
+                    // legacy USER syntax uses `PASSWORD 'x'`.
+                    self.lexer.eat(&TokenKind::Eq)?;
+                    o.password = Some(self.expect_string_literal()?);
+                }
+                TokenKind::Keyword(Keyword::Superuser) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    o.superuser = Some(self.parse_bool()?);
+                }
+                TokenKind::Keyword(Keyword::Login) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    o.login = Some(self.parse_bool()?);
+                }
+                TokenKind::Keyword(Keyword::Options) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    // parse_string_map enforces MAX_COLLECTION_ELEMENTS (T8/DoS).
+                    o.options = self.parse_string_map()?;
+                }
+                // `HASHED` and `ACCESS` are not reserved keywords — they lex as
+                // identifiers. Match case-insensitively.
+                TokenKind::Ident(s) if s.eq_ignore_ascii_case("hashed") => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Keyword(Keyword::Password))?;
+                    // `=` is optional (see PASSWORD above).
+                    self.lexer.eat(&TokenKind::Eq)?;
+                    o.hashed_password = Some(self.expect_string_literal()?);
+                }
+                TokenKind::Ident(s) if s.eq_ignore_ascii_case("access") => {
+                    self.lexer.next_token()?;
+                    o.access.push(self.parse_role_access()?);
+                }
+                _ => {
+                    return Err(CqlError::SyntaxError(format!(
+                        "unexpected token {:?} in role options at position {}",
+                        tok.kind, tok.pos
+                    )))
+                }
+            }
+            if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse one `ACCESS TO/FROM …` clause (the `ACCESS` token is already consumed).
+    fn parse_role_access(&mut self) -> Result<RoleAccess, CqlError> {
+        let tok = self.lexer.next_token()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::To) => {
+                if self.lexer.eat(&TokenKind::Keyword(Keyword::All))? {
+                    self.expect_ident_ci("DATACENTERS")?;
+                    Ok(RoleAccess::ToAllDatacenters)
+                } else {
+                    self.expect_ident_ci("DATACENTERS")?;
+                    Ok(RoleAccess::ToDatacenters(self.parse_string_set()?))
+                }
+            }
+            TokenKind::Keyword(Keyword::From) => {
+                if self.lexer.eat(&TokenKind::Keyword(Keyword::All))? {
+                    self.expect_ident_ci("CIDRS")?;
+                    Ok(RoleAccess::FromAllCidrs)
+                } else {
+                    self.expect_ident_ci("CIDRS")?;
+                    Ok(RoleAccess::FromCidrs(self.parse_string_set()?))
+                }
+            }
+            other => Err(CqlError::SyntaxError(format!(
+                "expected TO or FROM after ACCESS, got {:?} at position {}",
+                other, tok.pos
+            ))),
+        }
+    }
+
+    /// Expect a (non-keyword) identifier matching `name`, case-insensitively.
+    fn expect_ident_ci(&mut self, name: &str) -> Result<(), CqlError> {
+        let tok = self.lexer.next_token()?;
+        match &tok.kind {
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case(name) => Ok(()),
+            other => Err(CqlError::SyntaxError(format!(
+                "expected {name}, got {:?} at position {}",
+                other, tok.pos
+            ))),
+        }
+    }
+
+    /// Parse `{ 'a', 'b', ... }` — a set of string literals (bounded).
+    fn parse_string_set(&mut self) -> Result<Vec<String>, CqlError> {
+        self.lexer.expect(&TokenKind::LBrace)?;
+        let mut items = Vec::new();
+        if self.lexer.eat(&TokenKind::RBrace)? {
+            return Ok(items);
+        }
+        loop {
+            items.push(self.expect_string_literal()?);
+            if items.len() > MAX_COLLECTION_ELEMENTS {
+                return Err(CqlError::SyntaxError("collection too large".to_string()));
+            }
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+        self.lexer.expect(&TokenKind::RBrace)?;
+        Ok(items)
+    }
+
     fn parse_create_user_as_role(&mut self) -> Result<CreateRoleStatement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::User))?;
 
@@ -913,13 +1080,21 @@ impl<'input> Parser<'input> {
         let name = self.parse_ident()?;
 
         let mut password = None;
+        let mut hashed_password = None;
         let mut superuser = None;
 
         if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            // Legacy USER grammar: `WITH [HASHED] PASSWORD '...'` (no `=`; we
+            // also tolerate `=` for forgiving compatibility).
             let tok = self.lexer.peek()?;
-            if matches!(&tok.kind, TokenKind::Keyword(Keyword::Password)) {
+            if matches!(&tok.kind, TokenKind::Ident(s) if s.eq_ignore_ascii_case("hashed")) {
                 self.lexer.next_token()?;
-                self.lexer.expect(&TokenKind::Eq)?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Password))?;
+                let _ = self.lexer.eat(&TokenKind::Eq)?;
+                hashed_password = Some(self.expect_string_literal()?);
+            } else if matches!(&tok.kind, TokenKind::Keyword(Keyword::Password)) {
+                self.lexer.next_token()?;
+                let _ = self.lexer.eat(&TokenKind::Eq)?;
                 password = Some(self.expect_string_literal()?);
             }
         }
@@ -942,9 +1117,12 @@ impl<'input> Parser<'input> {
             name,
             if_not_exists,
             password,
+            hashed_password,
             superuser,
             // CREATE USER is the alias that defaults LOGIN = true.
             login: Some(true),
+            options: Vec::new(),
+            access: Vec::new(),
         })
     }
 
@@ -953,49 +1131,17 @@ impl<'input> Parser<'input> {
 
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_ident()?;
-
-        let mut password = None;
-        let mut superuser = None;
-        let mut login = None;
-
-        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
-            loop {
-                let tok = self.lexer.peek()?;
-                match &tok.kind {
-                    TokenKind::Keyword(Keyword::Password) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        password = Some(self.expect_string_literal()?);
-                    }
-                    TokenKind::Keyword(Keyword::Superuser) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        superuser = Some(self.parse_bool()?);
-                    }
-                    TokenKind::Keyword(Keyword::Login) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        login = Some(self.parse_bool()?);
-                    }
-                    _ => {
-                        return Err(CqlError::SyntaxError(format!(
-                            "unexpected token {:?} in CREATE ROLE options at position {}",
-                            tok.kind, tok.pos
-                        )))
-                    }
-                }
-                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
-                    break;
-                }
-            }
-        }
+        let opts = self.parse_role_option_set()?;
 
         Ok(CreateRoleStatement {
             name,
             if_not_exists,
-            password,
-            superuser,
-            login,
+            password: opts.password,
+            hashed_password: opts.hashed_password,
+            superuser: opts.superuser,
+            login: opts.login,
+            options: opts.options,
+            access: opts.access,
         })
     }
 
@@ -1009,42 +1155,84 @@ impl<'input> Parser<'input> {
     /// the permissions reporting pipeline catches up.
     fn parse_list(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::List))?;
-        let tok = self.lexer.next_token()?;
-        // ROLES / USERS are matched as case-insensitive identifiers
-        // rather than reserved keywords so user tables named `users`
-        // continue to lex as `Ident("users")` in non-LIST contexts.
-        let users_alias = match &tok.kind {
-            TokenKind::Ident(name) if name.eq_ignore_ascii_case("roles") => false,
-            TokenKind::Ident(name) if name.eq_ignore_ascii_case("users") => true,
-            _ => {
-                return Err(CqlError::SyntaxError(format!(
-                    "expected ROLES or USERS after LIST, got {:?} at position {}",
-                    tok.kind, tok.pos
-                )))
-            }
-        };
+        let tok = self.lexer.peek()?;
 
-        let mut of = None;
-        if self.lexer.eat(&TokenKind::Keyword(Keyword::Of))? {
-            of = Some(self.parse_ident()?);
+        // LIST ALL PERMISSIONS ...
+        if matches!(tok.kind, TokenKind::Keyword(Keyword::All)) {
+            self.lexer.next_token()?;
+            self.expect_permissions_keyword()?;
+            return self.parse_list_permissions_tail(None);
         }
 
-        // Cassandra spells the recursion suppressor as `NORECURSIVE`
-        // — a single token. We accept the bare ident form so existing
-        // tooling that parses LIST output can interoperate.
-        let mut no_recursive = false;
+        // LIST ROLES / USERS — matched as case-insensitive identifiers rather
+        // than reserved keywords so user tables named `users` keep lexing as
+        // `Ident("users")` elsewhere.
+        if let TokenKind::Ident(name) = &tok.kind {
+            if name.eq_ignore_ascii_case("roles") || name.eq_ignore_ascii_case("users") {
+                let users_alias = name.eq_ignore_ascii_case("users");
+                self.lexer.next_token()?;
+                let of = if self.lexer.eat(&TokenKind::Keyword(Keyword::Of))? {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                let no_recursive = self.eat_norecursive()?;
+                return Ok(Statement::ListRoles {
+                    of,
+                    no_recursive,
+                    users_alias,
+                });
+            }
+        }
+
+        // Otherwise: LIST <permission> PERMISSIONS ... (e.g. LIST SELECT PERMISSIONS).
+        let permission = self.parse_ident()?.to_uppercase();
+        self.expect_permissions_keyword()?;
+        self.parse_list_permissions_tail(Some(permission))
+    }
+
+    /// Expect the `PERMISSIONS` keyword.
+    fn expect_permissions_keyword(&mut self) -> Result<(), CqlError> {
+        self.lexer
+            .expect(&TokenKind::Keyword(Keyword::Permissions))?;
+        Ok(())
+    }
+
+    /// Cassandra spells the recursion suppressor `NORECURSIVE` as one token; we
+    /// accept the bare ident form.
+    fn eat_norecursive(&mut self) -> Result<bool, CqlError> {
         let tok = self.lexer.peek()?;
         if let TokenKind::Ident(name) = &tok.kind {
             if name.eq_ignore_ascii_case("norecursive") {
                 self.lexer.next_token()?;
-                no_recursive = true;
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
 
-        Ok(Statement::ListRoles {
+    /// Parse the tail of a `LIST … PERMISSIONS` statement: optional
+    /// `ON <resource>`, `OF <role>`, and `NORECURSIVE`.
+    fn parse_list_permissions_tail(
+        &mut self,
+        permission: Option<String>,
+    ) -> Result<Statement, CqlError> {
+        let resource = if self.lexer.eat(&TokenKind::Keyword(Keyword::On))? {
+            Some(self.parse_resource()?)
+        } else {
+            None
+        };
+        let of = if self.lexer.eat(&TokenKind::Keyword(Keyword::Of))? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        let no_recursive = self.eat_norecursive()?;
+        Ok(Statement::ListPermissions {
+            permission,
+            resource,
             of,
             no_recursive,
-            users_alias,
         })
     }
 
@@ -1054,6 +1242,9 @@ impl<'input> Parser<'input> {
         match &tok.kind {
             TokenKind::Keyword(Keyword::Table) => {
                 self.parse_alter_table().map(Statement::AlterTable)
+            }
+            TokenKind::Keyword(Keyword::Keyspace) => {
+                self.parse_alter_keyspace().map(Statement::AlterKeyspace)
             }
             TokenKind::Keyword(Keyword::Type) => self.parse_alter_type(),
             // ALTER ROLE / ALTER USER share the same options as CREATE.
@@ -1077,48 +1268,74 @@ impl<'input> Parser<'input> {
         ));
 
         let name = self.parse_ident()?;
-
-        let mut password = None;
-        let mut superuser = None;
-        let mut login = None;
-
-        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
-            loop {
-                let tok = self.lexer.peek()?;
-                match &tok.kind {
-                    TokenKind::Keyword(Keyword::Password) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        password = Some(self.expect_string_literal()?);
-                    }
-                    TokenKind::Keyword(Keyword::Superuser) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        superuser = Some(self.parse_bool()?);
-                    }
-                    TokenKind::Keyword(Keyword::Login) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        login = Some(self.parse_bool()?);
-                    }
-                    _ => {
-                        return Err(CqlError::SyntaxError(format!(
-                            "unexpected token {:?} in ALTER ROLE options at position {}",
-                            tok.kind, tok.pos
-                        )))
-                    }
-                }
-                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
-                    break;
-                }
-            }
-        }
+        let opts = self.parse_role_option_set()?;
 
         Ok(AlterRoleStatement {
             name,
-            password,
-            superuser,
-            login,
+            password: opts.password,
+            hashed_password: opts.hashed_password,
+            superuser: opts.superuser,
+            login: opts.login,
+            options: opts.options,
+            access: opts.access,
+        })
+    }
+
+    fn parse_alter_keyspace(&mut self) -> Result<AlterKeyspaceStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Keyspace))?;
+        let name = self.parse_ident()?;
+        self.lexer.expect(&TokenKind::Keyword(Keyword::With))?;
+
+        let mut replication = None;
+        let mut durable_writes = None;
+        loop {
+            let tok = self.lexer.peek()?;
+            match &tok.kind {
+                TokenKind::Keyword(Keyword::Replication) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    replication = Some(self.parse_string_map()?);
+                }
+                TokenKind::Keyword(Keyword::DurableWrites) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    let t = self.lexer.next_token()?;
+                    durable_writes = match t.kind {
+                        TokenKind::Keyword(Keyword::True) => Some(true),
+                        TokenKind::Keyword(Keyword::False) => Some(false),
+                        _ => {
+                            return Err(CqlError::SyntaxError(format!(
+                            "expected true or false for DURABLE_WRITES, got {:?} at position {}",
+                            t.kind, t.pos
+                        )))
+                        }
+                    };
+                }
+                _ => {
+                    let kind = tok.kind.clone();
+                    let pos = tok.pos;
+                    return Err(CqlError::SyntaxError(format!(
+                        "expected REPLICATION or DURABLE_WRITES after ALTER KEYSPACE ... WITH, \
+                         got {:?} at position {}",
+                        kind, pos
+                    )));
+                }
+            }
+            if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                break;
+            }
+        }
+
+        if replication.is_none() && durable_writes.is_none() {
+            return Err(CqlError::SyntaxError(
+                "ALTER KEYSPACE requires REPLICATION or DURABLE_WRITES".to_string(),
+            ));
+        }
+
+        Ok(AlterKeyspaceStatement {
+            name,
+            replication,
+            durable_writes,
         })
     }
 
@@ -1128,6 +1345,8 @@ impl<'input> Parser<'input> {
 
         let mut add_columns = vec![];
         let mut drop_columns = vec![];
+        let mut rename_columns: Vec<(String, String)> = vec![];
+        let mut alter_column_types = vec![];
         let mut extensions = None;
         let mut table_options = vec![];
 
@@ -1143,6 +1362,27 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 let col_name = self.parse_ident()?;
                 drop_columns.push(col_name);
+            }
+            TokenKind::Keyword(Keyword::Rename) => {
+                // RENAME <from> TO <to> [AND <from> TO <to> ...]
+                self.lexer.next_token()?;
+                loop {
+                    let from = self.parse_ident()?;
+                    self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
+                    let to = self.parse_ident()?;
+                    rename_columns.push((from, to));
+                    if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                        break;
+                    }
+                }
+            }
+            TokenKind::Keyword(Keyword::Alter) => {
+                // ALTER <column> TYPE <new_type>
+                self.lexer.next_token()?;
+                let col_name = self.parse_ident()?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+                let new_type = self.parse_cql_type_name()?;
+                alter_column_types.push((col_name, new_type));
             }
             TokenKind::Keyword(Keyword::With) => {
                 self.lexer.next_token()?;
@@ -1164,7 +1404,8 @@ impl<'input> Parser<'input> {
                 let kind = tok.kind.clone();
                 let pos = tok.pos;
                 return Err(CqlError::SyntaxError(format!(
-                    "expected ADD, DROP, or WITH after ALTER TABLE, got {:?} at position {}",
+                    "expected ADD, DROP, ALTER, RENAME, or WITH after ALTER TABLE, \
+                     got {:?} at position {}",
                     kind, pos
                 )));
             }
@@ -1175,6 +1416,8 @@ impl<'input> Parser<'input> {
             table,
             add_columns,
             drop_columns,
+            rename_columns,
+            alter_column_types,
             extensions,
             table_options,
         })
@@ -1669,45 +1912,100 @@ impl<'input> Parser<'input> {
     // GRANT / REVOKE
     // ---------------------------------------------------------------
 
-    fn parse_grant(&mut self) -> Result<GrantStatement, CqlError> {
+    fn parse_grant(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Grant))?;
-        let permissions = self.parse_permissions()?;
+        // `GRANT ALL ...` is always a permission grant.
+        if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::All)) {
+            let permissions = self.parse_permissions()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
+            let resource = self.parse_resource()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
+            let role = self.parse_ident()?;
+            return Ok(Statement::Grant(GrantStatement {
+                permissions,
+                resource,
+                role,
+            }));
+        }
+
+        let first = self.parse_ident()?;
+        // `GRANT <role> TO <member>` — role membership (no ON / resource).
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::To))? {
+            let member = self.parse_ident()?;
+            return Ok(Statement::GrantRole {
+                role: first,
+                member,
+            });
+        }
+
+        // Otherwise `first` is the first permission of a permission grant.
+        let mut permissions = vec![first.to_uppercase()];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            permissions.push(self.parse_ident()?.to_uppercase());
+        }
         self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
         let resource = self.parse_resource()?;
         self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
         let role = self.parse_ident()?;
-
-        Ok(GrantStatement {
+        Ok(Statement::Grant(GrantStatement {
             permissions,
             resource,
             role,
-        })
+        }))
     }
 
-    fn parse_revoke(&mut self) -> Result<RevokeStatement, CqlError> {
+    fn parse_revoke(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Revoke))?;
-        let permissions = self.parse_permissions()?;
+        if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::All)) {
+            let permissions = self.parse_permissions()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
+            let resource = self.parse_resource()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::From))?;
+            let role = self.parse_ident()?;
+            return Ok(Statement::Revoke(RevokeStatement {
+                permissions,
+                resource,
+                role,
+            }));
+        }
+
+        let first = self.parse_ident()?;
+        // `REVOKE <role> FROM <member>` — role membership.
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::From))? {
+            let member = self.parse_ident()?;
+            return Ok(Statement::RevokeRole {
+                role: first,
+                member,
+            });
+        }
+
+        let mut permissions = vec![first.to_uppercase()];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            permissions.push(self.parse_ident()?.to_uppercase());
+        }
         self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
         let resource = self.parse_resource()?;
         self.lexer.expect(&TokenKind::Keyword(Keyword::From))?;
         let role = self.parse_ident()?;
-
-        Ok(RevokeStatement {
+        Ok(Statement::Revoke(RevokeStatement {
             permissions,
             resource,
             role,
-        })
+        }))
     }
 
     fn parse_permissions(&mut self) -> Result<Vec<String>, CqlError> {
-        // ALL [PERMISSIONS] or single permission (SELECT, INSERT, UPDATE, DELETE, etc.)
+        // ALL [PERMISSIONS] or a comma-separated permission list
+        // (SELECT, MODIFY, UNMASK, SELECT_MASKED, ...).
         if self.lexer.eat(&TokenKind::Keyword(Keyword::All))? {
             self.lexer.eat(&TokenKind::Keyword(Keyword::Permissions))?;
             Ok(vec!["ALL".to_string()])
         } else {
-            // Single permission keyword
-            let perm = self.parse_ident()?;
-            Ok(vec![perm.to_uppercase()])
+            let mut perms = vec![self.parse_ident()?.to_uppercase()];
+            while self.lexer.eat(&TokenKind::Comma)? {
+                perms.push(self.parse_ident()?.to_uppercase());
+            }
+            Ok(perms)
         }
     }
 
@@ -1754,6 +2052,14 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 let ks = self.parse_ident()?;
                 Ok(GrantResource::Keyspace(ks))
+            }
+            TokenKind::Keyword(Keyword::Table) => {
+                // Explicit `TABLE [ks.]table` resource form. Resolves to the
+                // same Table resource as the bare `[ks.]table` form below —
+                // the keyword does not widen the grant's scope.
+                self.lexer.next_token()?;
+                let (ks, table) = self.parse_table_ref()?;
+                Ok(GrantResource::Table(ks, table))
             }
             TokenKind::Keyword(Keyword::Role) => {
                 self.lexer.next_token()?;
@@ -1939,7 +2245,7 @@ impl<'input> Parser<'input> {
                 self.lexer.expect(&TokenKind::RParen)?;
                 Term::InList(terms)
             } else {
-                self.parse_term()?
+                self.parse_where_value()?
             };
             clauses.push(WhereClause {
                 column: actual_column,
@@ -1977,6 +2283,7 @@ impl<'input> Parser<'input> {
                 self.lexer.expect(&TokenKind::Keyword(Keyword::Like))?;
                 Ok(ComparisonOp::SoundsLike)
             }
+            TokenKind::Keyword(Keyword::Like) => Ok(ComparisonOp::Like),
             _ => Err(CqlError::SyntaxError(format!(
                 "expected comparison operator, got {:?} at position {}",
                 tok.kind, tok.pos
@@ -1989,6 +2296,56 @@ impl<'input> Parser<'input> {
     // ---------------------------------------------------------------
 
     fn parse_term(&mut self) -> Result<Term, CqlError> {
+        self.parse_primary_term()
+    }
+
+    /// Parse a value in WHERE-predicate position, allowing trailing temporal
+    /// arithmetic `base ± <duration>` (the only place CQL permits `±` after a
+    /// value — elsewhere `+`/`-` are UPDATE SET collection/counter operators).
+    fn parse_where_value(&mut self) -> Result<Term, CqlError> {
+        let base = self.parse_term()?;
+        if matches!(self.lexer.peek()?.kind, TokenKind::Plus | TokenKind::Minus) {
+            let subtract = matches!(self.lexer.next_token()?.kind, TokenKind::Minus);
+            let offset = self.parse_duration_term()?;
+            return Ok(Term::TemporalArithmetic {
+                base: Box::new(base),
+                subtract,
+                offset: Box::new(offset),
+            });
+        }
+        Ok(base)
+    }
+
+    /// Parse a duration literal: ISO-8601 (`P1Y2M3D`) or compact (`2d`,
+    /// `1mo3d`). The lexer emits both forms as a single identifier token.
+    fn parse_duration_term(&mut self) -> Result<Term, CqlError> {
+        let tok = self.lexer.peek()?;
+        if let TokenKind::Ident(s) = &tok.kind {
+            let components = if crate::duration::is_iso_duration(s) {
+                crate::duration::parse_iso_duration(s)
+            } else if crate::duration::is_compact_duration(s) {
+                crate::duration::parse_compact_duration(s)
+            } else {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected a duration, got {:?} at position {}",
+                    tok.kind, tok.pos
+                )));
+            }
+            .map_err(CqlError::SyntaxError)?;
+            self.lexer.next_token()?;
+            return Ok(Term::Duration {
+                months: components.months,
+                days: components.days,
+                nanos: components.nanos,
+            });
+        }
+        Err(CqlError::SyntaxError(format!(
+            "expected a duration, got {:?} at position {}",
+            tok.kind, tok.pos
+        )))
+    }
+
+    fn parse_primary_term(&mut self) -> Result<Term, CqlError> {
         let tok = self.lexer.next_token()?;
         match tok.kind {
             TokenKind::StringLiteral(s) => Ok(Term::StringLiteral(s)),
@@ -2042,6 +2399,26 @@ impl<'input> Parser<'input> {
             // Identifiers and function calls
             TokenKind::Ident(name) => {
                 let name = name.to_string();
+                // A standalone duration literal in value position — ISO-8601
+                // (`P1Y2M3D`) or compact (`2d`, `1mo3d`) — both lex as a single
+                // identifier. Not when followed by `(` (which makes it a call).
+                if self.lexer.peek()?.kind != TokenKind::LParen {
+                    let dur = if crate::duration::is_iso_duration(&name) {
+                        Some(crate::duration::parse_iso_duration(&name))
+                    } else if crate::duration::is_compact_duration(&name) {
+                        Some(crate::duration::parse_compact_duration(&name))
+                    } else {
+                        None
+                    };
+                    if let Some(d) = dur {
+                        let d = d.map_err(CqlError::SyntaxError)?;
+                        return Ok(Term::Duration {
+                            months: d.months,
+                            days: d.days,
+                            nanos: d.nanos,
+                        });
+                    }
+                }
                 if self.lexer.eat(&TokenKind::LParen)? {
                     // Function call: name(args...)
                     self.enter_nesting()?;
@@ -2716,6 +3093,115 @@ mod tests {
     }
 
     #[test]
+    fn parse_select_where_like() {
+        let stmt =
+            parse("SELECT * FROM cycling.cyclist_name WHERE firstname LIKE 'm%' ALLOW FILTERING")
+                .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.where_clauses.len(), 1);
+                assert_eq!(s.where_clauses[0].column, "firstname");
+                assert_eq!(s.where_clauses[0].op, ComparisonOp::Like);
+                assert_eq!(s.where_clauses[0].value, Term::StringLiteral("m%".into()));
+                assert!(s.allow_filtering);
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_select_keyspace_qualified_function() {
+        let stmt = parse("SELECT test.average(val) FROM atable").unwrap();
+        match stmt {
+            Statement::Select(s) => match &s.columns[0] {
+                SelectColumn::FunctionCall {
+                    keyspace,
+                    name,
+                    args,
+                    ..
+                } => {
+                    assert_eq!(keyspace.as_deref(), Some("test"));
+                    assert_eq!(name, "average");
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected qualified FunctionCall, got {:?}", other),
+            },
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_where_temporal_arithmetic() {
+        let stmt =
+            parse("SELECT * FROM mytable WHERE d >= current_date() - 2d ALLOW FILTERING").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.where_clauses.len(), 1);
+                match &s.where_clauses[0].value {
+                    Term::TemporalArithmetic {
+                        base,
+                        subtract,
+                        offset,
+                    } => {
+                        assert!(*subtract);
+                        assert!(
+                            matches!(base.as_ref(), Term::FunctionCall { name, .. } if name == "current_date")
+                        );
+                        assert_eq!(
+                            offset.as_ref(),
+                            &Term::Duration {
+                                months: 0,
+                                days: 2,
+                                nanos: 0
+                            }
+                        );
+                    }
+                    other => panic!("expected TemporalArithmetic, got {:?}", other),
+                }
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_duration_literals() {
+        // Compact form as a standalone value.
+        let stmt = parse("SELECT * FROM t WHERE x = 1mo3d ALLOW FILTERING").unwrap();
+        match stmt {
+            Statement::Select(s) => assert_eq!(
+                s.where_clauses[0].value,
+                Term::Duration {
+                    months: 1,
+                    days: 3,
+                    nanos: 0
+                }
+            ),
+            other => panic!("expected Select, got {:?}", other),
+        }
+        // ISO-8601 form, and the subtraction operator still untouched for non-WHERE.
+        let stmt = parse("SELECT * FROM t WHERE x = P1Y2M3D ALLOW FILTERING").unwrap();
+        match stmt {
+            Statement::Select(s) => assert_eq!(
+                s.where_clauses[0].value,
+                Term::Duration {
+                    months: 14,
+                    days: 3,
+                    nanos: 0
+                }
+            ),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn counter_and_collection_update_not_treated_as_duration() {
+        // Regression: `+`/`-` in UPDATE SET must stay collection/counter ops.
+        assert!(parse("UPDATE t SET n = n + 1 WHERE k = 1").is_ok());
+        assert!(parse("UPDATE t SET tags = tags + {'a'} WHERE k = 1").is_ok());
+        assert!(parse("UPDATE t SET items = items - [1] WHERE k = 1").is_ok());
+    }
+
+    #[test]
     fn parse_select_with_order_limit() {
         let stmt = parse("SELECT * FROM events WHERE pk = 1 ORDER BY ts DESC LIMIT 10").unwrap();
         match stmt {
@@ -2985,6 +3471,42 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
+    fn parse_alter_keyspace_replication() {
+        let stmt = parse(
+            "ALTER KEYSPACE excelsior WITH replication = \
+             {'class': 'SimpleStrategy', 'replication_factor' : '4'}",
+        )
+        .unwrap();
+        match stmt {
+            Statement::AlterKeyspace(s) => {
+                assert_eq!(s.name, "excelsior");
+                assert_eq!(
+                    s.replication,
+                    Some(vec![
+                        ("class".into(), "SimpleStrategy".into()),
+                        ("replication_factor".into(), "4".into()),
+                    ])
+                );
+                assert_eq!(s.durable_writes, None);
+            }
+            other => panic!("expected AlterKeyspace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_keyspace_durable_writes_only() {
+        let stmt = parse("ALTER KEYSPACE ks WITH DURABLE_WRITES = false").unwrap();
+        match stmt {
+            Statement::AlterKeyspace(s) => {
+                assert_eq!(s.name, "ks");
+                assert_eq!(s.replication, None);
+                assert_eq!(s.durable_writes, Some(false));
+            }
+            other => panic!("expected AlterKeyspace, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_create_keyspace() {
         let stmt = parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -3051,6 +3573,49 @@ mod tests {
                     vec![("email".into(), CqlTypeName::Simple("text".into()))]
                 );
                 assert!(s.drop_columns.is_empty());
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_rename() {
+        let stmt = parse("ALTER TABLE cycling.cyclist_name RENAME id TO cyclist_id").unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(s.table, "cyclist_name");
+                assert_eq!(s.rename_columns, vec![("id".into(), "cyclist_id".into())]);
+                assert!(s.alter_column_types.is_empty());
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_rename_multiple() {
+        let stmt = parse("ALTER TABLE t RENAME a TO b AND c TO d").unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(
+                    s.rename_columns,
+                    vec![("a".into(), "b".into()), ("c".into(), "d".into())]
+                );
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_alter_type() {
+        let stmt =
+            parse("ALTER TABLE cycling.cyclist_alt_stats ALTER favorite_color TYPE text").unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(
+                    s.alter_column_types,
+                    vec![("favorite_color".into(), CqlTypeName::Simple("text".into()))]
+                );
+                assert!(s.rename_columns.is_empty());
             }
             other => panic!("expected AlterTable, got {:?}", other),
         }
@@ -3244,6 +3809,99 @@ mod tests {
     }
 
     #[test]
+    fn parse_create_role_with_hashed_password() {
+        // HASHED PASSWORD stores a pre-computed hash; password stays None.
+        let stmt = parse(
+            "CREATE ROLE alice WITH HASHED PASSWORD = '$2a$10$abcdefghijklmnopqrstuv' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.name, "alice");
+                assert_eq!(s.password, None);
+                assert_eq!(
+                    s.hashed_password.as_deref(),
+                    Some("$2a$10$abcdefghijklmnopqrstuv")
+                );
+                assert_eq!(s.login, Some(true));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_role_with_options_and_access() {
+        let stmt = parse(
+            "CREATE ROLE carlos WITH OPTIONS = { 'opt1' : 'v1', 'opt2' : 99 } \
+             AND ACCESS TO DATACENTERS {'DC1', 'DC3'}",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.options.len(), 2);
+                assert_eq!(s.options[0], ("opt1".into(), "v1".into()));
+                assert_eq!(s.options[1], ("opt2".into(), "99".into()));
+                assert_eq!(
+                    s.access,
+                    vec![RoleAccess::ToDatacenters(vec!["DC1".into(), "DC3".into()])]
+                );
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_role_with_access_from_all_cidrs() {
+        let stmt = parse(
+            "CREATE ROLE hob WITH LOGIN = true AND PASSWORD = 'p' AND ACCESS FROM ALL CIDRS", // pragma: allowlist secret
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.access, vec![RoleAccess::FromAllCidrs]);
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_role_with_hashed_password() {
+        let stmt = parse(
+            "ALTER ROLE bob WITH HASHED PASSWORD = '$argon2id$v=19$m=1' AND SUPERUSER = false",
+        ) // pragma: allowlist secret
+        .unwrap();
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.hashed_password.as_deref(), Some("$argon2id$v=19$m=1"));
+                assert_eq!(s.password, None);
+                assert_eq!(s.superuser, Some(false));
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_user_with_hashed_password() {
+        // Legacy USER grammar: no `=`, trailing NOSUPERUSER.
+        let stmt = parse(
+            "CREATE USER bob WITH HASHED PASSWORD '$2a$10$abcdefghijklmnopqrstuv' NOSUPERUSER",
+        ) // pragma: allowlist secret
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(
+                    s.hashed_password.as_deref(),
+                    Some("$2a$10$abcdefghijklmnopqrstuv")
+                );
+                assert_eq!(s.password, None);
+                assert_eq!(s.superuser, Some(false));
+                assert_eq!(s.login, Some(true));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_create_role() {
         let stmt = parse(
             "CREATE ROLE admin WITH PASSWORD = 'secret' AND SUPERUSER = true AND LOGIN = true", // pragma: allowlist secret
@@ -3321,6 +3979,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_list_all_permissions() {
+        let stmt = parse("LIST ALL PERMISSIONS").unwrap();
+        match stmt {
+            Statement::ListPermissions {
+                permission,
+                resource,
+                of,
+                ..
+            } => {
+                assert_eq!(permission, None);
+                assert!(resource.is_none());
+                assert_eq!(of, None);
+            }
+            other => panic!("expected ListPermissions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_specific_permission_of_role() {
+        let stmt = parse("LIST SELECT PERMISSIONS OF carlos").unwrap();
+        match stmt {
+            Statement::ListPermissions { permission, of, .. } => {
+                assert_eq!(permission.as_deref(), Some("SELECT"));
+                assert_eq!(of.as_deref(), Some("carlos"));
+            }
+            other => panic!("expected ListPermissions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_all_permissions_on_resource_of_role() {
+        let stmt = parse("LIST ALL PERMISSIONS ON keyspace1.table1 OF bob").unwrap();
+        match stmt {
+            Statement::ListPermissions {
+                permission,
+                resource,
+                of,
+                ..
+            } => {
+                assert_eq!(permission, None);
+                assert_eq!(
+                    resource,
+                    Some(GrantResource::Table(
+                        Some("keyspace1".into()),
+                        "table1".into()
+                    ))
+                );
+                assert_eq!(of.as_deref(), Some("bob"));
+            }
+            other => panic!("expected ListPermissions, got {:?}", other),
+        }
+    }
+
     /// `CREATE USER` is a deprecated alias for
     /// `CREATE ROLE WITH LOGIN = true`. Reported as failing alongside
     /// CREATE ROLE in the auth-defects bug list.
@@ -3384,6 +4096,62 @@ mod tests {
     }
 
     #[test]
+    fn parse_alter_user_with_password_no_equals() {
+        // Legacy USER syntax omits the '=' after PASSWORD.
+        let stmt = parse("ALTER USER alice WITH PASSWORD 'PASSWORD_A'").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "alice");
+                assert_eq!(s.password, Some("PASSWORD_A".into()));
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_user_with_hashed_password_no_equals() {
+        let stmt =
+            parse("ALTER USER alice WITH HASHED PASSWORD '$2a$10$abcdefghijklmnopqrstuv'").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "alice");
+                assert_eq!(
+                    s.hashed_password,
+                    Some("$2a$10$abcdefghijklmnopqrstuv".into())
+                );
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_user_bare_superuser() {
+        // Legacy USER syntax: no WITH, trailing bare SUPERUSER flag.
+        let stmt = parse("ALTER USER bob SUPERUSER").unwrap();
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.name, "bob");
+                assert_eq!(s.superuser, Some(true));
+                assert_eq!(s.password, None);
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_user_trailing_nosuperuser() {
+        let stmt = parse("CREATE USER ops WITH PASSWORD 'p' NOSUPERUSER").unwrap(); // pragma: allowlist secret
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.name, "ops");
+                assert_eq!(s.password, Some("p".into()));
+                assert_eq!(s.superuser, Some(false));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_alter_role_with_login() {
         let stmt = parse("ALTER ROLE admin WITH LOGIN = false").unwrap();
         match stmt {
@@ -3426,6 +4194,73 @@ mod tests {
                 assert_eq!(s.role, "reader");
             }
             other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_grant_on_table_keyword() {
+        // Cassandra accepts the explicit `ON TABLE <name>` resource form.
+        let stmt = parse("GRANT SELECT ON TABLE patients TO privileged").unwrap();
+        match stmt {
+            Statement::Grant(s) => {
+                assert_eq!(s.permissions, vec!["SELECT".to_string()]);
+                assert_eq!(s.resource, GrantResource::Table(None, "patients".into()));
+                assert_eq!(s.role, "privileged");
+            }
+            other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_grant_multiple_permissions() {
+        let stmt = parse("GRANT SELECT, MODIFY ON TABLE patients TO trusted_user").unwrap();
+        match stmt {
+            Statement::Grant(s) => {
+                assert_eq!(
+                    s.permissions,
+                    vec!["SELECT".to_string(), "MODIFY".to_string()]
+                );
+                assert_eq!(s.resource, GrantResource::Table(None, "patients".into()));
+                assert_eq!(s.role, "trusted_user");
+            }
+            other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_grant_role_to_member() {
+        let stmt = parse("GRANT report_writer TO alice").unwrap();
+        match stmt {
+            Statement::GrantRole { role, member } => {
+                assert_eq!(role, "report_writer");
+                assert_eq!(member, "alice");
+            }
+            other => panic!("expected GrantRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_revoke_role_from_member() {
+        let stmt = parse("REVOKE role_a FROM role_b").unwrap();
+        match stmt {
+            Statement::RevokeRole { role, member } => {
+                assert_eq!(role, "role_a");
+                assert_eq!(member, "role_b");
+            }
+            other => panic!("expected RevokeRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_revoke_on_table_keyword() {
+        let stmt = parse("REVOKE UNMASK ON TABLE patients FROM privileged").unwrap();
+        match stmt {
+            Statement::Revoke(s) => {
+                assert_eq!(s.permissions, vec!["UNMASK".to_string()]);
+                assert_eq!(s.resource, GrantResource::Table(None, "patients".into()));
+                assert_eq!(s.role, "privileged");
+            }
+            other => panic!("expected Revoke, got {:?}", other),
         }
     }
 

@@ -456,13 +456,80 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     let inner = term_to_cql_value(&args[0], &CqlType::Date)?;
                     Ok(inner)
                 }
+                "currentdate" | "current_date" if args.is_empty() => match target {
+                    CqlType::Date => Ok(CqlValue::Date(today_cql_date())),
+                    _ => Err(CqlError::Invalid(format!(
+                        "type mismatch: currentDate() returns date, but column expects {}",
+                        cql_type_name(target)
+                    ))),
+                },
                 _ => Err(CqlError::Invalid(format!(
                     "unknown function: {name}. If this is a UDF used in WHERE, \
                      the query requires ALLOW FILTERING"
                 ))),
             }
         }
+
+        Term::Duration {
+            months,
+            days,
+            nanos,
+        } => match target {
+            CqlType::Duration => Ok(CqlValue::Duration {
+                months: *months,
+                days: *days,
+                nanos: *nanos,
+            }),
+            _ => Err(CqlError::Invalid(format!(
+                "type mismatch: expected {}, got a duration literal",
+                cql_type_name(target)
+            ))),
+        },
+
+        Term::TemporalArithmetic {
+            base,
+            subtract,
+            offset,
+        } => {
+            // The base resolves to the column's temporal type; the offset is a
+            // duration regardless of the column type.
+            let base_val = term_to_cql_value(base, target)?;
+            let dur = match term_to_cql_value(offset, &CqlType::Duration)? {
+                CqlValue::Duration {
+                    months,
+                    days,
+                    nanos,
+                } => crate::duration::DurationComponents {
+                    months,
+                    days,
+                    nanos,
+                },
+                _ => return Err(CqlError::Invalid("expected a duration offset".into())),
+            };
+            match base_val {
+                CqlValue::Timestamp(ms) => {
+                    crate::duration::apply_to_timestamp_millis(ms, dur, *subtract)
+                        .map(CqlValue::Timestamp)
+                        .ok_or_else(|| CqlError::Invalid("timestamp arithmetic overflow".into()))
+                }
+                CqlValue::Date(d) => crate::duration::apply_to_date_days(d, dur, *subtract)
+                    .map(CqlValue::Date)
+                    .ok_or_else(|| CqlError::Invalid("date arithmetic overflow".into())),
+                _ => Err(CqlError::Invalid(
+                    "temporal arithmetic requires a date or timestamp base".into(),
+                )),
+            }
+        }
     }
+}
+
+/// Today's date as a Cassandra `date` value (days from the Unix epoch, offset by
+/// `2^31`).
+fn today_cql_date() -> u32 {
+    let today = chrono::Utc::now().date_naive();
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
+    let days = today.signed_duration_since(epoch).num_days();
+    (days + (1i64 << 31)) as u32
 }
 
 /// Human-readable name for a CqlType (for error messages).
@@ -1798,6 +1865,54 @@ mod tests {
             }
             other => panic!("expected CqlValue::Timeuuid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duration_literal_and_temporal_arithmetic_eval() {
+        // A duration literal resolves to CqlValue::Duration.
+        let d = Term::Duration {
+            months: 1,
+            days: 2,
+            nanos: 3,
+        };
+        assert_eq!(
+            term_to_cql_value(&d, &CqlType::Duration).unwrap(),
+            CqlValue::Duration {
+                months: 1,
+                days: 2,
+                nanos: 3
+            }
+        );
+
+        // timestamp − 2 days: 2017-01-03 → 2017-01-01.
+        let base_ms = 1_483_401_600_000i64; // 2017-01-03T00:00:00Z
+        let arith = Term::TemporalArithmetic {
+            base: Box::new(Term::IntegerLiteral(base_ms)),
+            subtract: true,
+            offset: Box::new(Term::Duration {
+                months: 0,
+                days: 2,
+                nanos: 0,
+            }),
+        };
+        match term_to_cql_value(&arith, &CqlType::Timestamp).unwrap() {
+            CqlValue::Timestamp(ms) => assert_eq!(ms, base_ms - 2 * 86_400_000),
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+
+        // date − 2 days: '2017-01-03' → '2017-01-01'.
+        let arith = Term::TemporalArithmetic {
+            base: Box::new(Term::StringLiteral("2017-01-03".into())),
+            subtract: true,
+            offset: Box::new(Term::Duration {
+                months: 0,
+                days: 2,
+                nanos: 0,
+            }),
+        };
+        let expected =
+            term_to_cql_value(&Term::StringLiteral("2017-01-01".into()), &CqlType::Date).unwrap();
+        assert_eq!(term_to_cql_value(&arith, &CqlType::Date).unwrap(), expected);
     }
 
     /// `now()` encodes to exactly 16 bytes when bound into a TimeUUID

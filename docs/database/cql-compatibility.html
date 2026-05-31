@@ -211,7 +211,7 @@
   <a href="/" class="back-link">&larr; Ferrosa Suite home</a> · <a href="/database/" class="back-link">Database home</a>
 
   <h1>CQL <span>Reference</span></h1>
-  <p class="subtitle">Ferrosa implements CQL native protocol v4 and v5 compatibility work, including tested driver paths such as cdrs-tokio. This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
+  <p class="subtitle">Ferrosa implements the CQL native protocol with negotiation capped at v4, including tested driver paths such as cdrs-tokio. This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
 
   <div class="note">
     <strong>Beta:</strong> Ferrosa is currently in beta. CQL compatibility is under active development.
@@ -238,7 +238,7 @@
   <h2 id="protocol">Protocol</h2>
 
   <h3>Wire protocol</h3>
-  <p>Ferrosa implements CQL native protocol versions 4 and 5 with the standard 9-byte frame header. Protocol v4 compatibility enables broad CQL driver support including cdrs-tokio. All 16 opcodes are handled:</p>
+  <p>Ferrosa speaks the CQL native protocol with the standard 9-byte frame header and <strong>caps negotiation at protocol v4</strong>. v5 added a modern framing layer that drivers implement inconsistently — some send plain legacy envelopes at v5, others send CRC-checksummed modern frames — so no single server mode serves both. A v5 <code>STARTUP</code> is therefore rejected with a protocol-version error advertising v4 as the maximum, and every compliant driver (gocql, DataStax Java/C#, scylla-rust, cassandra-driver) transparently falls back to the one well-tested v4 transport, including cdrs-tokio. All 16 opcodes are handled:</p>
 
   <table>
     <thead><tr><th>Opcode</th><th>Name</th><th>Direction</th></tr></thead>
@@ -330,7 +330,7 @@
   <table>
     <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>CREATE KEYSPACE</td><td><span class="check">Supported</span></td><td>WITH replication, IF NOT EXISTS, DURABLE_WRITES</td></tr>
+      <tr><td>CREATE KEYSPACE</td><td><span class="check">Supported</span></td><td>WITH replication (SimpleStrategy / NetworkTopologyStrategy), IF NOT EXISTS, DURABLE_WRITES. Transient replication (<code>'DC1': '3/1'</code>) is rejected — Ferrosa does not implement it, and accepting it would corrupt driver schema metadata.</td></tr>
       <tr><td>ALTER KEYSPACE</td><td><span class="check">Supported</span></td><td>Change replication, durable_writes</td></tr>
       <tr><td>DROP KEYSPACE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
       <tr><td>CREATE TABLE</td><td><span class="check">Supported</span></td><td>Partition key, clustering key with order, IF NOT EXISTS, table options (compaction, compression, comment, TTL, gc_grace)</td></tr>
@@ -341,7 +341,7 @@
       <tr><td>DROP (without TABLE keyword)</td><td><span class="check">Supported</span></td><td>DROP keyspace_name.table_name shorthand</td></tr>
       <tr><td>CREATE MATERIALIZED VIEW</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
       <tr><td>CREATE TYPE (UDT)</td><td><span class="check">Supported</span></td><td>CREATE TYPE, ALTER TYPE, DROP TYPE — full UDT DDL lifecycle</td></tr>
-      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="check">Supported</span></td><td>CREATE/DROP FUNCTION (WASM), CREATE/DROP AGGREGATE — full DDL lifecycle with cluster replication</td></tr>
+      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="check">Supported</span></td><td>CREATE/DROP FUNCTION, CREATE/DROP AGGREGATE — full DDL lifecycle with cluster replication. UDFs are <strong>WebAssembly</strong> components (<code>LANGUAGE wasm AS '&lt;hex&gt;' | AS FILE '…' | AS URL '…' WITH SHA256 = '…'</code>); Java UDFs are not supported. Keyspace-qualified calls (<code>ks.fn(args)</code>) work in SELECT.</td></tr>
     </tbody>
   </table>
 
@@ -387,7 +387,7 @@
   <table>
     <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, DISTINCT, bind markers (?), named bind markers (:name), IN clause, ALLOW FILTERING, token(), CONTAINS / CONTAINS KEY, SOUNDS LIKE, fts_match()</td></tr>
+      <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, DISTINCT, bind markers (?), named bind markers (:name), IN clause, ALLOW FILTERING, token(), CONTAINS / CONTAINS KEY, LIKE, SOUNDS LIKE, fts_match()</td></tr>
       <tr><td>INSERT</td><td><span class="check">Supported</span></td><td>IF NOT EXISTS (LWT), USING TTL, USING TIMESTAMP</td></tr>
       <tr><td>UPDATE</td><td><span class="check">Supported</span></td><td>SET, WHERE, IF conditions (LWT), collection +/- operators, counter increment/decrement</td></tr>
       <tr><td>DELETE</td><td><span class="check">Supported</span></td><td>WHERE, IF EXISTS / IF conditions (LWT), column-level delete, map element delete syntax</td></tr>
@@ -407,8 +407,20 @@
       <tr><td>uuid()</td><td><span class="check">Supported</span></td><td>Generate random UUID</td></tr>
       <tr><td>now()</td><td><span class="check">Supported</span></td><td>Current timeuuid</td></tr>
       <tr><td>toTimestamp()</td><td><span class="check">Supported</span></td><td>Convert timeuuid to timestamp</td></tr>
+      <tr><td>currentDate()</td><td><span class="check">Supported</span></td><td>Today's date (for temporal arithmetic in WHERE)</td></tr>
     </tbody>
   </table>
+
+  <h3>Durations &amp; temporal arithmetic</h3>
+  <p>The <code>duration</code> type accepts both literal forms — compact
+  (<code>2d</code>, <code>1mo3d</code>, <code>89h4m48s</code>) and ISO-8601
+  (<code>P1Y2M3D</code>, <code>PT4H5M6S</code>). A WHERE predicate may add or
+  subtract a duration from a <code>date</code> or <code>timestamp</code>; months
+  and days are applied calendar-aware (e.g. Jan&nbsp;31&nbsp;+&nbsp;1mo clamps to
+  the last day of February).</p>
+  <pre><span class="cm">-- rows from the last two days</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> <span class="type">events</span>
+  <span class="kw">WHERE</span> day &gt;= <span class="fn">currentDate</span>() <span class="kw">-</span> <span class="str">2d</span> <span class="kw">ALLOW FILTERING</span>;</pre>
 
   <h3>Prepared statements</h3>
   <p>Full PREPARE/EXECUTE support with positional bind values. PREPARE responses include <code>pk_count</code> metadata for driver routing. The prepared statement cache uses moka with W-TinyLFU eviction (64 MB default). Bind markers (<code>?</code>) and named bind markers (<code>:name</code>) are both supported.</p>
@@ -422,7 +434,11 @@
 <span class="kw">EXECUTE</span> stmt <span class="kw">USING</span> <span class="var">550e8400-e29b-41d4-a716-446655440000</span>;</pre>
 
   <h3>Comparison operators</h3>
-  <p>WHERE clauses support: <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>!=</code>, <code>IN</code>, <code>CONTAINS</code>, <code>CONTAINS KEY</code></p>
+  <p>WHERE clauses support: <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>!=</code>, <code>IN</code>, <code>CONTAINS</code>, <code>CONTAINS KEY</code>, <code>LIKE</code></p>
+  <p><code>LIKE</code> matches text patterns with the <code>%</code> wildcard (any sequence of characters) — <code>'pre%'</code> (prefix), <code>'%suf'</code> (suffix), <code>'%mid%'</code> (contains), or an exact literal. Matching is case-sensitive. As a non-key predicate it is evaluated as a post-scan filter and requires <code>ALLOW FILTERING</code>.</p>
+  <pre><span class="cm">-- names beginning with 'M'</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> <span class="type">cycling.cyclist_name</span>
+  <span class="kw">WHERE</span> firstname <span class="kw">LIKE</span> <span class="str">'M%'</span> <span class="kw">ALLOW FILTERING</span>;</pre>
 
   <h3>Consistency levels</h3>
   <p>Ferrosa supports the following consistency levels for reads and writes:</p>
@@ -452,13 +468,40 @@
   <table>
     <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>CREATE ROLE</td><td><span class="check">Supported</span></td><td>WITH PASSWORD, SUPERUSER, LOGIN, IF NOT EXISTS</td></tr>
-      <tr><td>ALTER ROLE</td><td><span class="check">Supported</span></td><td>Change password, superuser, login</td></tr>
+      <tr><td>CREATE ROLE</td><td><span class="check">Supported</span></td><td>WITH PASSWORD, HASHED PASSWORD, SUPERUSER, LOGIN, OPTIONS, IF NOT EXISTS</td></tr>
+      <tr><td>ALTER ROLE</td><td><span class="check">Supported</span></td><td>Change PASSWORD / HASHED PASSWORD, SUPERUSER, LOGIN</td></tr>
+      <tr><td>CREATE USER / ALTER USER</td><td><span class="check">Supported</span></td><td>Legacy alias; WITH [HASHED] PASSWORD, SUPERUSER / NOSUPERUSER</td></tr>
       <tr><td>DROP ROLE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
-      <tr><td>GRANT</td><td><span class="check">Supported</span></td><td>GRANT permission ON resource TO role</td></tr>
-      <tr><td>REVOKE</td><td><span class="check">Supported</span></td><td>REVOKE permission ON resource FROM role</td></tr>
+      <tr><td>GRANT</td><td><span class="check">Supported</span></td><td>GRANT perm[, perm…] ON resource TO role. Resource: <code>ON TABLE ks.t</code> / <code>ks.t</code>, <code>ON KEYSPACE</code>, <code>ON ALL KEYSPACES</code>, <code>ON ALL ROLES</code>, <code>ON FUNCTION</code>. Unknown permissions are rejected (no silent partial grant).</td></tr>
+      <tr><td>REVOKE</td><td><span class="check">Supported</span></td><td>REVOKE perm[, perm…] ON resource FROM role (same resource forms as GRANT)</td></tr>
+      <tr><td>GRANT / REVOKE role</td><td><span class="check">Supported</span></td><td><code>GRANT &lt;role&gt; TO &lt;member&gt;</code> / <code>REVOKE &lt;role&gt; FROM &lt;member&gt;</code> — role hierarchy (the member inherits the role's permissions). Replicated additively (one membership edge per op) and cycle-checked at apply, so concurrent grants never clobber and a revoke is never lost to a racing grant.</td></tr>
+      <tr><td>LIST ROLES</td><td><span class="check">Supported</span></td><td><code>LIST ROLES [OF &lt;role&gt;] [NORECURSIVE]</code>; <code>LIST USERS</code> alias</td></tr>
+      <tr><td>LIST PERMISSIONS</td><td><span class="check">Supported</span></td><td><code>LIST [ALL | &lt;permission&gt;] PERMISSIONS [ON &lt;resource&gt;] [OF &lt;role&gt;] [NORECURSIVE]</code> — gated on DESCRIBE over all roles</td></tr>
+      <tr><td>ACCESS TO/FROM (network auth)</td><td><span class="cross">Rejected</span></td><td>ACCESS TO DATACENTERS / FROM CIDRS is parsed but rejected — ferrosa has no network authorizer, so an unenforced access restriction fails loud rather than being silently accepted</td></tr>
     </tbody>
   </table>
+
+  <p><strong>HASHED PASSWORD.</strong> <code>CREATE ROLE … WITH HASHED PASSWORD = '&lt;hash&gt;'</code> (and the legacy <code>CREATE USER … WITH HASHED PASSWORD '&lt;hash&gt;'</code>) stores a pre-computed bcrypt or argon2id hash verbatim — it is not re-hashed, which lets you migrate existing credentials. The hash format is validated on the coordinator and rejected if unsupported, so a role can never hold a credential the authenticator cannot verify. Password and hash literals are redacted from any log line or error message.</p>
+
+  <pre><span class="cm">-- Plaintext password — hashed server-side with bcrypt / argon2id</span>
+<span class="kw">CREATE ROLE</span> app_writer <span class="kw">WITH PASSWORD</span> = <span class="str">'S3cret-Pass!'</span> <span class="kw">AND LOGIN</span> = <span class="kw">true</span>;
+
+<span class="cm">-- Migrate an existing credential: a pre-computed hash, stored verbatim</span>
+<span class="kw">CREATE ROLE</span> legacy_user
+  <span class="kw">WITH HASHED PASSWORD</span> = <span class="str">'$2a$10$JSJEMFm6GeaW9XxT5JIheuEtPvat6i7uKbnTcxX3c1wshIIsGyUtG'</span>
+  <span class="kw">AND LOGIN</span> = <span class="kw">true</span>;
+
+<span class="cm">-- Custom authenticator OPTIONS (accepted; not interpreted by the default authenticator)</span>
+<span class="kw">CREATE ROLE</span> svc <span class="kw">WITH PASSWORD</span> = <span class="str">'p'</span> <span class="kw">AND OPTIONS</span> = { <span class="str">'ttl'</span> : <span class="str">'3600'</span> };
+
+<span class="cm">-- Rotate to a new hashed credential, or toggle superuser/login</span>
+<span class="kw">ALTER ROLE</span> app_writer <span class="kw">WITH HASHED PASSWORD</span> = <span class="str">'$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaA'</span>;
+
+<span class="cm">-- Legacy USER alias: no '=', trailing SUPERUSER / NOSUPERUSER</span>
+<span class="kw">CREATE USER</span> ops <span class="kw">WITH HASHED PASSWORD</span> <span class="str">'$2a$10$JSJEMFm6GeaW9XxT5JIheuEtPvat6i7uKbnTcxX3c1wshIIsGyUtG'</span> <span class="kw">NOSUPERUSER</span>;
+
+<span class="cm">-- Network authorization is parsed but REJECTED (no network authorizer):</span>
+<span class="cm">--   CREATE ROLE r WITH PASSWORD = 'p' AND ACCESS TO DATACENTERS {'DC1'};  -- error</span></pre>
 
   <p>Ferrosa supports column-level permissions, rate limiting per role, and audit logging to configurable sinks (log file, audit table).</p>
 

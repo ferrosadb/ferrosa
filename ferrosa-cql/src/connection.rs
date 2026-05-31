@@ -1117,6 +1117,69 @@ fn increment_auth_attempts_and_reply(phase: &mut ConnectionPhase, err: CqlError)
     HandleResult::Reply(Opcode::Error, err.encode_body())
 }
 
+/// Redact password literals from a CQL string before it is placed in a log
+/// line or error message (threat-model T5: keep `PASSWORD`/`HASHED PASSWORD`
+/// secrets out of logs). Replaces the single-quoted string literal that follows
+/// a `PASSWORD` keyword — covering `PASSWORD = '…'`, `PASSWORD '…'`, and
+/// `HASHED PASSWORD …` — with `'<redacted>'`. Handles `''`-escaped quotes and
+/// is a no-op for queries without a password.
+fn redact_cql_secrets(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    let mut rest = query;
+    while !rest.is_empty() {
+        let at_word_boundary = out
+            .chars()
+            .last()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        let is_password_kw = rest.len() >= 8
+            && rest[..8].eq_ignore_ascii_case("password")
+            && rest[8..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        if at_word_boundary && is_password_kw {
+            out.push_str(&rest[..8]);
+            rest = &rest[8..];
+            // Copy surrounding whitespace and an optional '='.
+            while let Some(c) = rest.chars().next().filter(|c| c.is_whitespace()) {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+            if let Some(stripped) = rest.strip_prefix('=') {
+                out.push('=');
+                rest = stripped;
+                while let Some(c) = rest.chars().next().filter(|c| c.is_whitespace()) {
+                    out.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+            // Redact a following single-quoted literal (handle '' escapes).
+            if rest.starts_with('\'') {
+                let b = rest.as_bytes();
+                let mut j = 1;
+                while j < b.len() {
+                    if b[j] == b'\'' {
+                        if j + 1 < b.len() && b[j + 1] == b'\'' {
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                out.push_str("'<redacted>'");
+                rest = &rest[j..];
+            }
+        } else {
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
 // ── QUERY ────────────────────────────────────────────────────────────────
 
 async fn handle_query(
@@ -1286,8 +1349,9 @@ pub(crate) fn handle_prepare(
     // retriable.  Real Cassandra returns 0x2200 (Invalid) when the table is
     // not found during PREPARE.
     if bound_columns.len() != expected_bind_count {
+        let redacted_query = redact_cql_secrets(query);
         let err = CqlError::Invalid(format!(
-            "PREPARE failed for '{query}': \
+            "PREPARE failed for '{redacted_query}': \
              expected {expected_bind_count} bind-marker column spec(s) \
              but resolved only {}. \
              Table '{table_ks}.{table_name}' may not yet be visible on this node \
@@ -2428,6 +2492,36 @@ fn extract_keyspace_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_cql_secrets_removes_password_literals() {
+        // PASSWORD = '...'  (ROLE form)
+        let r = redact_cql_secrets("CREATE ROLE x WITH PASSWORD = 'sup3rSecret' AND LOGIN = true");
+        assert!(!r.contains("sup3rSecret"), "secret leaked: {r}");
+        assert!(r.contains("'<redacted>'"));
+        assert!(r.contains("LOGIN = true"));
+
+        // PASSWORD '...'  (legacy USER form, no '=') + trailing keyword.
+        let r2 = redact_cql_secrets("CREATE USER y WITH PASSWORD 'pw1' SUPERUSER");
+        assert!(!r2.contains("pw1"), "secret leaked: {r2}");
+        assert!(r2.ends_with("SUPERUSER"));
+
+        // HASHED PASSWORD hash.
+        let r3 = redact_cql_secrets("ALTER ROLE z WITH HASHED PASSWORD = '$2a$10$abcXYZ'");
+        assert!(!r3.contains("$2a$10$abcXYZ"), "hash leaked: {r3}");
+
+        // Embedded '' escape inside the literal.
+        let r4 = redact_cql_secrets("CREATE ROLE q WITH PASSWORD = 'a''b' AND LOGIN = true");
+        assert!(!r4.contains("a''b"), "escaped-quote secret leaked: {r4}");
+        assert!(r4.contains("LOGIN = true"));
+
+        // No password — unchanged.
+        let q = "SELECT * FROM t WHERE id = 1";
+        assert_eq!(redact_cql_secrets(q), q);
+        // 'password' as a substring of an identifier must not trigger redaction.
+        let q2 = "SELECT password_changed FROM t";
+        assert_eq!(redact_cql_secrets(q2), q2);
+    }
 
     fn build_minimal_schema_for_test() -> Arc<ferrosa_schema::Schema> {
         use ferrosa_schema::audit::TestAuditSink;

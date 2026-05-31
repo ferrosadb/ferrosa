@@ -175,6 +175,26 @@ fn serialize_term_into(term: &Term, buf: &mut Vec<u8>) {
                 serialize_term_into(a, buf);
             }
         }
+        Term::Duration {
+            months,
+            days,
+            nanos,
+        } => {
+            buf.push(0x0F);
+            buf.extend_from_slice(&months.to_be_bytes());
+            buf.extend_from_slice(&days.to_be_bytes());
+            buf.extend_from_slice(&nanos.to_be_bytes());
+        }
+        Term::TemporalArithmetic {
+            base,
+            subtract,
+            offset,
+        } => {
+            buf.push(0x10);
+            buf.push(u8::from(*subtract));
+            serialize_term_into(base, buf);
+            serialize_term_into(offset, buf);
+        }
     }
 }
 

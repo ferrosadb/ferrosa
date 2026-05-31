@@ -32,8 +32,27 @@ pub enum Statement {
         no_recursive: bool,
         users_alias: bool,
     },
+    /// `LIST [ALL | <permission>] PERMISSIONS [ON <resource>] [OF <role>]
+    /// [NORECURSIVE]`. `permission = None` means ALL permissions.
+    ListPermissions {
+        permission: Option<String>,
+        resource: Option<GrantResource>,
+        of: Option<String>,
+        no_recursive: bool,
+    },
     Grant(GrantStatement),
     Revoke(RevokeStatement),
+    /// `GRANT <role> TO <member>` — role membership (the member inherits the
+    /// granted role's permissions).
+    GrantRole {
+        role: String,
+        member: String,
+    },
+    /// `REVOKE <role> FROM <member>`.
+    RevokeRole {
+        role: String,
+        member: String,
+    },
     Use(UseStatement),
     Truncate(TruncateStatement),
     Compact(CompactStatement),
@@ -181,6 +200,19 @@ pub enum Term {
         name: String,
         args: Vec<Term>,
     },
+    /// A CQL `duration` literal (months, days, nanoseconds).
+    Duration {
+        months: i32,
+        days: i32,
+        nanos: i64,
+    },
+    /// Temporal arithmetic: `base ± offset`, where `offset` is a duration and
+    /// `base` resolves to a `date` or `timestamp`.
+    TemporalArithmetic {
+        base: Box<Term>,
+        subtract: bool,
+        offset: Box<Term>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +227,9 @@ pub enum ComparisonOp {
     Contains,
     ContainsKey,
     SoundsLike,
+    /// `LIKE` pattern match (`%` wildcard). Requires ALLOW FILTERING or a
+    /// matching index, evaluated as a post-scan predicate.
+    Like,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -415,6 +450,11 @@ pub struct AlterTableStatement {
     pub table: String,
     pub add_columns: Vec<(String, CqlTypeName)>,
     pub drop_columns: Vec<String>,
+    /// `RENAME <from> TO <to> [AND ...]` — Cassandra restricts this to primary
+    /// key columns.
+    pub rename_columns: Vec<(String, String)>,
+    /// `ALTER <column> TYPE <new_type>`.
+    pub alter_column_types: Vec<(String, CqlTypeName)>,
     /// Table extensions (e.g. graph metadata: `WITH extensions = {'vertex_label': 'Person'}`).
     pub extensions: Option<Vec<(String, String)>>,
     /// Generic table options (compaction, compression, comment, etc.).
@@ -502,21 +542,45 @@ pub struct CompactStatement {
     pub table: String,
 }
 
+/// A role's network-authorization `ACCESS` clause (Cassandra's CassandraNetworkAuthorizer
+/// grammar). ferrosa parses these for CQL compatibility; enforcement is a separate concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleAccess {
+    /// `ACCESS TO DATACENTERS { 'dc1', 'dc2' }`
+    ToDatacenters(Vec<String>),
+    /// `ACCESS TO ALL DATACENTERS`
+    ToAllDatacenters,
+    /// `ACCESS FROM CIDRS { 'region1' }`
+    FromCidrs(Vec<String>),
+    /// `ACCESS FROM ALL CIDRS`
+    FromAllCidrs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateRoleStatement {
     pub name: String,
     pub if_not_exists: bool,
+    /// Plaintext `PASSWORD = '...'` — hashed before storage.
     pub password: Option<String>,
+    /// Pre-hashed `HASHED PASSWORD = '...'` — stored verbatim.
+    pub hashed_password: Option<String>,
     pub superuser: Option<bool>,
     pub login: Option<bool>,
+    /// Custom `OPTIONS = { 'k': v }` (passed to the authenticator).
+    pub options: Vec<(String, String)>,
+    /// `ACCESS TO/FROM ...` network-auth clauses.
+    pub access: Vec<RoleAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterRoleStatement {
     pub name: String,
     pub password: Option<String>,
+    pub hashed_password: Option<String>,
     pub superuser: Option<bool>,
     pub login: Option<bool>,
+    pub options: Vec<(String, String)>,
+    pub access: Vec<RoleAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

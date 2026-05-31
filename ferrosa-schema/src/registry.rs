@@ -491,8 +491,10 @@ impl Schema {
             role.can_login = can_login;
         }
         // password field carries the already-hashed value during replication;
-        // store it directly without re-hashing.
-        if let Some(hash) = updates.password {
+        // store it directly without re-hashing. hashed_password (HASHED
+        // PASSWORD) is likewise an already-hashed value, validated on the
+        // coordinator before replication.
+        if let Some(hash) = updates.password.or(updates.hashed_password) {
             role.salted_hash = Some(hash);
         }
         if let Some(member_of) = updates.member_of {
@@ -527,6 +529,48 @@ impl Schema {
                 .extend(entry.permissions.iter().copied());
         } else {
             grants.push(entry);
+        }
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Grant role membership without auth checks: add `granted_role` to
+    /// `member`'s `member_of` set. Additive — it touches exactly one membership
+    /// edge, so concurrently-replicated grants of different edges never clobber
+    /// one another (unlike replacing the whole `member_of` set).
+    ///
+    /// The cycle check runs against the CURRENT state. Because Raft applies
+    /// entries serially, a cycle formed by two independently-committed grants
+    /// (e.g. `GRANT a TO b` and `GRANT b TO a`) is caught when the second entry
+    /// applies — the first edge is already present — so it is rejected rather
+    /// than corrupting the hierarchy. Idempotent if `member` no longer exists.
+    pub fn grant_role_internal(&self, member: &str, granted_role: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        if !snap.roles.contains_key(member) {
+            return Ok(());
+        }
+        if would_create_cycle(&snap, granted_role, member) {
+            return Err(SchemaError::RoleCycleDetected(member.to_string()));
+        }
+        // unwrap: existence checked above, under the write lock.
+        snap.roles
+            .get_mut(member)
+            .unwrap()
+            .member_of
+            .insert(granted_role.to_string());
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Revoke role membership without auth checks: remove `granted_role` from
+    /// `member`'s `member_of` set. Subtractive and idempotent — touches one
+    /// edge, so it never clobbers other concurrently-replicated memberships.
+    pub fn revoke_role_internal(&self, member: &str, granted_role: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        if let Some(role) = snap.roles.get_mut(member) {
+            role.member_of.remove(granted_role);
         }
         self.inner.store(Arc::new(snap));
         Ok(())
@@ -1189,6 +1233,53 @@ impl Schema {
         Ok(())
     }
 
+    /// Validate a `HASHED PASSWORD` value is a supported hash format. Used by
+    /// the coordinator to fail loud before replicating an unusable credential.
+    pub fn validate_password_hash(&self, hash: &str) -> crate::Result<()> {
+        PasswordHasher::validate_password_hash(hash)
+    }
+
+    /// Create a role from a pre-computed password hash (`HASHED PASSWORD`).
+    ///
+    /// The hash is validated for a supported format and stored **verbatim** —
+    /// it is NOT re-hashed and the password-strength policy is NOT applied
+    /// (there is no plaintext to evaluate). The supplied hash never appears in
+    /// the audit payload.
+    pub fn create_role_hashed(
+        &self,
+        role: RoleMetadata,
+        hashed_password: &str,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Create, &Resource::AllRoles)?;
+        PasswordHasher::validate_password_hash(hashed_password)?;
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if snap.roles.contains_key(&role.name) {
+            return Err(SchemaError::RoleExists(role.name));
+        }
+        for parent in &role.member_of {
+            if would_create_cycle(&snap, parent, &role.name) {
+                return Err(SchemaError::RoleCycleDetected(role.name));
+            }
+        }
+        let name = role.name.clone();
+        let is_su = role.is_superuser;
+        let mut role = role;
+        role.salted_hash = Some(hashed_password.to_string());
+        snap.roles.insert(role.name.clone(), role);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::RoleCreated {
+                role: name,
+                is_superuser: is_su,
+            },
+            auth,
+        );
+        Ok(())
+    }
+
     /// Alter an existing role.
     ///
     /// Requires `Alter` permission on `AllRoles`. Applies non-`None` fields
@@ -1203,11 +1294,23 @@ impl Schema {
     ) -> crate::Result<()> {
         self.check_permission(auth, Permission::Alter, &Resource::AllRoles)?;
         // Validate and hash password outside the write lock (expensive)
-        let new_hash = if let Some(ref pw) = updates.password {
-            self.password_policy.validate(pw, name)?;
-            Some(self.hasher_config.hash_password(pw)?)
-        } else {
-            None
+        // PASSWORD is hashed under policy; HASHED PASSWORD is stored verbatim
+        // after format validation. They are mutually exclusive.
+        let new_hash = match (&updates.password, &updates.hashed_password) {
+            (Some(pw), None) => {
+                self.password_policy.validate(pw, name)?;
+                Some(self.hasher_config.hash_password(pw)?)
+            }
+            (None, Some(h)) => {
+                PasswordHasher::validate_password_hash(h)?;
+                Some(h.clone())
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(SchemaError::InvalidSchema(
+                    "cannot specify both PASSWORD and HASHED PASSWORD".to_string(),
+                ))
+            }
         };
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
@@ -2514,6 +2617,61 @@ mod tests {
     }
 
     #[test]
+    fn create_role_hashed_stores_verbatim_and_authenticates() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        // A real bcrypt hash of a known password (HASHED PASSWORD input).
+        let hash = bcrypt::hash("KnownPass1", 4).unwrap();
+        schema
+            .create_role_hashed(test_role("hrole"), &hash, &auth)
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let r = snap.roles.get("hrole").expect("role exists");
+        // Stored VERBATIM — not re-hashed under the policy.
+        assert_eq!(r.salted_hash.as_deref(), Some(hash.as_str()));
+        // The known password authenticates; a wrong one does not (fail-closed).
+        assert!(PasswordHasher::verify_password_any("KnownPass1", &hash).unwrap());
+        assert!(!PasswordHasher::verify_password_any("wrong", &hash).unwrap());
+    }
+
+    #[test]
+    fn create_role_hashed_rejects_unsupported_format() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        // Not bcrypt/argon2 — must be rejected so a role never holds a
+        // credential that verify_password_any cannot interpret (threat T3).
+        let err = schema.create_role_hashed(test_role("badrole"), "not-a-real-hash", &auth);
+        assert!(err.is_err(), "unsupported hash format must be rejected");
+        assert!(!schema.snapshot().roles.contains_key("badrole"));
+    }
+
+    #[test]
+    fn alter_role_hashed_stores_verbatim() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_role(test_role("auser"), Some("InitPass1"), &auth)
+            .unwrap();
+        let hash = bcrypt::hash("NewPass2", 4).unwrap();
+        let updates = RoleUpdates {
+            hashed_password: Some(hash.clone()),
+            ..Default::default()
+        };
+        schema.alter_role("auser", updates, &auth).unwrap();
+        assert_eq!(
+            schema
+                .snapshot()
+                .roles
+                .get("auser")
+                .unwrap()
+                .salted_hash
+                .as_deref(),
+            Some(hash.as_str())
+        );
+    }
+
+    #[test]
     fn create_role_weak_password_rejected_by_policy() {
         let sink = Arc::new(TestAuditSink::new());
         let schema = test_schema_with_iso27001_sink(sink);
@@ -3103,6 +3261,48 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn grant_and_revoke_role_internal_additive() {
+        let schema = test_schema();
+        schema.create_role_internal(test_role("parent_a")).unwrap();
+        schema.create_role_internal(test_role("parent_b")).unwrap();
+        schema.create_role_internal(test_role("child")).unwrap();
+
+        // Two independent grants — each touches one edge, neither clobbers.
+        schema.grant_role_internal("child", "parent_a").unwrap();
+        schema.grant_role_internal("child", "parent_b").unwrap();
+        let snap = schema.snapshot();
+        let member_of = &snap.roles.get("child").unwrap().member_of;
+        assert!(member_of.contains("parent_a"));
+        assert!(member_of.contains("parent_b"));
+
+        // Revoke is subtractive and leaves the other edge intact.
+        schema.revoke_role_internal("child", "parent_a").unwrap();
+        let snap = schema.snapshot();
+        let member_of = &snap.roles.get("child").unwrap().member_of;
+        assert!(!member_of.contains("parent_a"));
+        assert!(member_of.contains("parent_b"));
+
+        // Idempotent: grant twice, revoke a missing edge.
+        schema.grant_role_internal("child", "parent_b").unwrap();
+        schema.revoke_role_internal("child", "nonexistent").unwrap();
+        // Missing member is a no-op, not an error.
+        schema.grant_role_internal("ghost", "parent_a").unwrap();
+    }
+
+    #[test]
+    fn grant_role_internal_rejects_cycle() {
+        let schema = test_schema();
+        schema.create_role_internal(test_role("a")).unwrap();
+        schema.create_role_internal(test_role("b")).unwrap();
+        // a is a member of b.
+        schema.grant_role_internal("a", "b").unwrap();
+        // Granting b membership in a would close the loop — must be rejected,
+        // even though each grant is individually fine.
+        let err = schema.grant_role_internal("b", "a").unwrap_err();
+        assert!(matches!(err, SchemaError::RoleCycleDetected(_)));
     }
 
     #[test]
