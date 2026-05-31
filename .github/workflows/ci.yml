@@ -51,7 +51,14 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           df -h /
+      - name: Build AssemblyScript UDF toolchain bundle
+        # `--all-features` enables `asc-udf` + `live-infra-tests`, which run the
+        # inline-AssemblyScript UDF tests for real against this bundle. Build it
+        # (pinned asc version) so those tests run and pass rather than being skipped.
+        run: bash ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
       - name: Run tests
+        env:
+          FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
         run: |
           cargo test --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
