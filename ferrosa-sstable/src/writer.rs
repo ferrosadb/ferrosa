@@ -775,10 +775,13 @@ impl SSTableWriter {
                 for chunk in data_buf.chunks(chunk_size) {
                     chunk_offsets.push(compressed_data.len() as u64);
                     let compressed_chunk = compression.compress(chunk)?;
-                    if compressed_chunk.len() > max_compressed_size {
-                        max_compressed_size = compressed_chunk.len();
+                    let crc = crc32fast::hash(&compressed_chunk);
+                    let stored_chunk_size = compressed_chunk.len() + std::mem::size_of::<u32>();
+                    if stored_chunk_size > max_compressed_size {
+                        max_compressed_size = stored_chunk_size;
                     }
                     compressed_data.extend_from_slice(&compressed_chunk);
+                    compressed_data.extend_from_slice(&crc.to_be_bytes());
                 }
 
                 let info = CompressionInfo {
@@ -1657,12 +1660,7 @@ mod tests {
             compression: Some(Compression::Lz4),
             bloom_fp_chance: 0.01,
             chunk_size: 64, // Small chunks to test chunking
-            // Disabled because of the pre-existing CRC32 mismatch between
-            // SSTableWriter (emits no per-chunk trailer) and the reader's
-            // `decompress_data` (expects a 4-byte trailer). Same reason
-            // `store::flush` forces compression=None — see
-            // ferrosa-storage/src/store.rs:637-640.
-            verify_output: false,
+            verify_output: true,
         };
 
         // Create enough data to span multiple chunks
@@ -1705,7 +1703,16 @@ mod tests {
                 output.data.len()
             };
             let chunk = &output.data[start..end];
-            let decompressed = compression.decompress(chunk, ci.chunk_length).unwrap();
+            let payload_len = chunk.len() - std::mem::size_of::<u32>();
+            let payload = &chunk[..payload_len];
+            let stored_crc = u32::from_be_bytes([
+                chunk[payload_len],
+                chunk[payload_len + 1],
+                chunk[payload_len + 2],
+                chunk[payload_len + 3],
+            ]);
+            assert_eq!(crc32fast::hash(payload), stored_crc);
+            let decompressed = compression.decompress(payload, ci.chunk_length).unwrap();
             uncompressed_data.extend_from_slice(&decompressed);
         }
 
@@ -1716,6 +1723,39 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 20);
+    }
+
+    #[test]
+    fn write_with_zstd_compression() {
+        let header = test_header();
+        let options = WriteOptions {
+            compression: Some(Compression::Zstd { level: 3 }),
+            bloom_fp_chance: 0.01,
+            chunk_size: 64,
+            verify_output: true,
+        };
+
+        let mut partitions: Vec<Partition> = (0..20)
+            .map(|i| {
+                make_partition(
+                    format!("zkey{:04}", i).as_bytes(),
+                    &[0x00, 0x00, 0x00, i as u8],
+                    format!("zstd_value_{:04}", i).as_bytes(),
+                    1_000_000 + i as i64,
+                )
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let ci = CompressionInfo::read(output.compression_info.as_ref().unwrap()).unwrap();
+        assert!(matches!(ci.compression, Compression::Zstd { .. }));
+        assert!(ci.chunk_offsets.len() > 1, "should have multiple chunks");
     }
 
     #[test]

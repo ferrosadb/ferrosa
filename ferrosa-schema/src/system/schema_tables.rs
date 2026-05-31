@@ -513,6 +513,11 @@ fn system_column_rows() -> Vec<ColumnRow> {
         ("sstable_size_bytes", "regular", "bigint", -1),
         ("s3_object_count", "regular", "int", -1),
         ("s3_bytes", "regular", "bigint", -1),
+        ("local_sstable_component_count", "regular", "int", -1),
+        ("compressed_sstable_count", "regular", "int", -1),
+        ("uncompressed_sstable_count", "regular", "int", -1),
+        ("local_cache_max_bytes", "regular", "bigint", -1),
+        ("local_sstable_cache_bytes", "regular", "bigint", -1),
         ("pending_compactions", "regular", "int", -1),
     ];
     for (name, kind, cql_type, pos) in storage_stats_cols {

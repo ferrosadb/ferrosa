@@ -174,6 +174,9 @@ impl ClusterConfig {
         if let Ok(addr) = std::env::var("FERROSA_CQL_BROADCAST") {
             config.cql_broadcast = Some(addr);
         }
+        if let Ok(dir) = std::env::var("FERROSA_RAFT_DATA_DIR") {
+            config.raft_data_dir = Some(PathBuf::from(dir));
+        }
         if let Ok(val) = std::env::var("FERROSA_RAFT_HEARTBEAT_MS") {
             if let Ok(n) = val.parse() {
                 config.raft_heartbeat_ms = n;

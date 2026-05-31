@@ -10,7 +10,8 @@ use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::error::Result;
 use crate::lane_actor::{
-    spawn_lane_actor, spawn_raft_lane_actor, ActorReconnectContext, LaneHandle, LaneStatusReport,
+    spawn_lane_actor_with_timeout, spawn_raft_lane_actor_with_timeout, ActorReconnectContext,
+    LaneHandle, LaneStatusReport,
 };
 use crate::message::Message;
 use crate::reconnect::LaneState;
@@ -137,9 +138,10 @@ impl PriorityPool {
         let raft_config = Arc::clone(&config);
         let raft_peer_host = peer_host.clone();
         let raft_tls = tls_connector.clone();
-        let raft = spawn_raft_lane_actor(
+        let raft = spawn_raft_lane_actor_with_timeout(
             Lane::Raft,
             LaneState::Connected(raft_client),
+            config.lane_timeout(Lane::Raft),
             peer_label,
             move |h| ActorReconnectContext {
                 lane: Lane::Raft,
@@ -151,8 +153,11 @@ impl PriorityPool {
                 handle: h,
             },
         );
-        let data = spawn_lane_actor(Lane::Data, LaneState::Connected(data_client), |h| {
-            ActorReconnectContext {
+        let data = spawn_lane_actor_with_timeout(
+            Lane::Data,
+            LaneState::Connected(data_client),
+            config.lane_timeout(Lane::Data),
+            |h| ActorReconnectContext {
                 lane: Lane::Data,
                 config: Arc::clone(&config),
                 local_host_id,
@@ -160,10 +165,13 @@ impl PriorityPool {
                 tls_connector: tls_connector.clone(),
                 cancelled: h.cancel_token(),
                 handle: h,
-            }
-        });
-        let bulk = spawn_lane_actor(Lane::Bulk, LaneState::Connected(bulk_client), |h| {
-            ActorReconnectContext {
+            },
+        );
+        let bulk = spawn_lane_actor_with_timeout(
+            Lane::Bulk,
+            LaneState::Connected(bulk_client),
+            config.lane_timeout(Lane::Bulk),
+            |h| ActorReconnectContext {
                 lane: Lane::Bulk,
                 config: Arc::clone(&config),
                 local_host_id,
@@ -171,8 +179,8 @@ impl PriorityPool {
                 tls_connector: tls_connector.clone(),
                 cancelled: h.cancel_token(),
                 handle: h,
-            }
-        });
+            },
+        );
 
         Ok(Self {
             peer_host_id,

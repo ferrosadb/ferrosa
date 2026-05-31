@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serial_test::serial;
 use uuid::Uuid;
 
 use ferrosa_cluster::config::ClusterConfig;
@@ -171,6 +172,7 @@ async fn setup_pair() -> (PairNode, PairNode, Arc<StorageEngine>, Arc<StorageEng
 /// write latencies spike, and on a 3-node cluster the Raft heartbeat is
 /// starved — causing an election storm.
 #[tokio::test]
+#[serial]
 async fn sequential_bulk_writes_complete_without_timeout() {
     let (node1, _node2, _storage1, storage2) = setup_pair().await;
 
@@ -243,6 +245,7 @@ async fn sequential_bulk_writes_complete_without_timeout() {
 /// how throughput and latency degrade as concurrency increases past the
 /// lane capacity.
 #[tokio::test]
+#[serial]
 async fn concurrent_burst_writes_measure_lane_saturation() {
     let (node1, _node2, _storage1, _storage2) = setup_pair().await;
 
@@ -330,6 +333,7 @@ async fn concurrent_burst_writes_measure_lane_saturation() {
 /// writes, the probe latency will spike — mirroring how Raft election
 /// timeouts get missed in production.
 #[tokio::test]
+#[serial]
 async fn bulk_writes_do_not_starve_probe_latency() {
     let (node1, _node2, _storage1, _storage2) = setup_pair().await;
 

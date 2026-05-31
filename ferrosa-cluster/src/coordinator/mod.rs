@@ -182,12 +182,14 @@ impl RpcHandler for MutationForwardHandler {
             _ => return None,
         };
         let mutation = decode_mutation(&body).ok()?;
+        metrics::inc_inbound_mutation_forward(mutation.rows.len());
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         for row in &mutation.rows {
             if let Err(e) =
                 self.storage
                     .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
             {
+                metrics::inc_inbound_mutation_failure();
                 // CRITICAL: Do NOT return MutationAck when the write fails.
                 // Returning ACK here would make the coordinator count this as a
                 // successful replica write, but the data is NOT stored. This is

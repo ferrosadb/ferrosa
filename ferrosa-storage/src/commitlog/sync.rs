@@ -114,6 +114,9 @@ pub struct PeriodicSync {
 
     /// Condvar used to wake the background thread early on stop.
     wake: Arc<(Mutex<bool>, Condvar)>,
+
+    /// Number of writes waiting for the next timed flush.
+    pending: Arc<AtomicU64>,
 }
 
 impl PeriodicSync {
@@ -124,6 +127,7 @@ impl PeriodicSync {
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
             wake: Arc::new((Mutex::new(false), Condvar::new())),
+            pending: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -151,7 +155,9 @@ impl PeriodicSync {
 
 impl SyncStrategy for PeriodicSync {
     fn on_write(&self, _segment: &Segment, _position: u64) {
-        // No-op: periodic sync does not block writers.
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let (_lock, cvar) = &*self.wake;
+        cvar.notify_one();
     }
 
     fn start(&self) {
@@ -159,25 +165,42 @@ impl SyncStrategy for PeriodicSync {
         let flush_callback = Arc::clone(&self.flush_callback);
         let interval = self.sync_interval;
         let wake = Arc::clone(&self.wake);
+        let pending = Arc::clone(&self.pending);
 
         let thread = thread::Builder::new()
             .name("commitlog-periodic-sync".to_string())
             .spawn(move || {
                 while !stop_flag.load(Ordering::Acquire) {
-                    // Wait for sync_interval or until woken by stop().
+                    // Wait for the first write in a batch, then hold the
+                    // batch open for one interval to collect nearby writes.
                     let (lock, cvar) = &*wake;
                     let mut stopped = lock.lock();
-                    let result = cvar.wait_for(&mut stopped, interval);
-                    if *stopped || result.timed_out() {
-                        // Either we timed out (normal periodic wake) or
-                        // we were signaled to stop.
+                    if pending.load(Ordering::Acquire) == 0 {
+                        let result = cvar.wait_for(&mut stopped, interval);
+                        if result.timed_out() && pending.load(Ordering::Acquire) == 0 {
+                            PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     }
 
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
 
+                    let _ = cvar.wait_for(&mut stopped, interval);
+
+                    if stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let pending_writes = pending.swap(0, Ordering::AcqRel);
+                    if pending_writes == 0 {
+                        PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
                     if let Err(e) = flush_callback() {
+                        pending.fetch_add(pending_writes, Ordering::AcqRel);
                         tracing::error!(%e, "commitlog: periodic flush_callback failed — data may not be durable");
                     }
                 }
@@ -196,6 +219,12 @@ impl Drop for PeriodicSync {
     fn drop(&mut self) {
         self.stop_inner(false);
     }
+}
+
+static PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn periodic_idle_flush_skipped_total() -> u64 {
+    PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +510,7 @@ mod tests {
     #[test]
     fn periodic_sync_flushes_on_timer() {
         let dir = tempfile::tempdir().unwrap();
-        let (segment, _offset) = write_mutation(dir.path());
+        let (segment, offset) = write_mutation(dir.path());
 
         let flush_observed = Arc::new((Mutex::new(false), Condvar::new()));
         let flush_observed_clone = Arc::clone(&flush_observed);
@@ -497,6 +526,7 @@ mod tests {
         });
         let sync = PeriodicSync::new(Duration::from_millis(50), flush_cb);
         sync.start();
+        sync.on_write(&segment, offset);
 
         // The old test used a fixed 200ms sleep and then checked the file path.
         // Under full-package parallel test load, OS scheduling can delay the

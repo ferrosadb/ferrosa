@@ -1,0 +1,94 @@
+description: |
+  NoSQLBench IoT CQL workload variant for incremental benchmark ramps.
+  This keeps the stock cql_iot schema and operations, but omits truncate from
+  the main scenario so each stage can append data before measuring.
+
+scenarios:
+  default:
+    schema: run driver=cql tags==block:schema threads==1 cycles==UNDEF
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,10000000) threads=auto
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,10000000) threads=auto
+  init:
+    schema: run driver=cql tags==block:schema threads==1 cycles==UNDEF
+  basic_check:
+    schema: run driver=cql tags==block:schema threads==1 cycles==UNDEF
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,10) threads=auto
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,10) threads=auto
+
+params:
+  instrument: TEMPLATE(instrument,false)
+
+bindings:
+  machine_id: Mod(TEMPLATE(sources,10000)); ToHashedUUID() -> java.util.UUID
+  sensor_name: HashedLineToString('data/variable_words.txt')
+  time: Mul(TEMPLATE(timespeed,100)L); Div(TEMPLATE(sources,10000)L); ToJavaInstant();
+  cell_timestamp: Mul(TEMPLATE(timespeed,100)L); Div(TEMPLATE(sources,10000)L); Mul(1000L)
+  sensor_value: Normal(0.0,5.0); Add(100.0) -> double
+  station_id: Div(TEMPLATE(sources,10000));Mod(TEMPLATE(stations,100)); ToHashedUUID() -> java.util.UUID
+  data: HashedFileExtractToString('data/lorem_ipsum_full.txt',800,1200)
+
+blocks:
+  schema:
+    params:
+      prepared: false
+      timeout: TEMPLATE(request_timeout_seconds,30.0)
+    ops:
+      create_keyspace: |
+        create keyspace if not exists TEMPLATE(keyspace,baselines)
+        WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 'TEMPLATE(rf,1)'}
+        AND durable_writes = true;
+      create_table: |
+        create table if not exists TEMPLATE(keyspace,baselines).TEMPLATE(table,iot) (
+        machine_id UUID,
+        sensor_name text,
+        time timestamp,
+        sensor_value double,
+        station_id UUID,
+        data text,
+        PRIMARY KEY ((machine_id, sensor_name), time)
+        ) WITH CLUSTERING ORDER BY (time DESC)
+         AND compression = {
+         'class' : 'TEMPLATE(table_compression,LZ4Compressor)',
+         'compression_level' : 'TEMPLATE(table_compression_level,3)'
+        }
+         AND compaction = {
+         'class': 'TimeWindowCompactionStrategy',
+         'compaction_window_size': TEMPLATE(expiry_minutes,60),
+         'compaction_window_unit': 'MINUTES'
+        };
+  rampup:
+    params:
+      cl: TEMPLATE(write_cl,LOCAL_QUORUM)
+      instrument: TEMPLATE(instrument-writes,TEMPLATE(instrument,false))
+      idempotent: true
+      timeout: TEMPLATE(request_timeout_seconds,30.0)
+    ops:
+      insert_rampup: |
+        insert into  TEMPLATE(keyspace,baselines).TEMPLATE(table,iot)
+        (machine_id, sensor_name, time, sensor_value, station_id, data)
+        values ({machine_id}, {sensor_name}, {time}, {sensor_value}, {station_id}, {data})
+        using timestamp {cell_timestamp}
+  main_read:
+    params:
+      ratio: TEMPLATE(read_ratio,1)
+      cl: TEMPLATE(read_cl,LOCAL_QUORUM)
+      instrument: TEMPLATE(instrument-reads,TEMPLATE(instrument,false))
+      timeout: TEMPLATE(request_timeout_seconds,30.0)
+    ops:
+      select_read: |
+        select * from TEMPLATE(keyspace,baselines).TEMPLATE(table,iot)
+        where machine_id={machine_id} and sensor_name={sensor_name}
+        limit TEMPLATE(limit,10)
+  main_write:
+    params:
+      ratio: TEMPLATE(write_ratio,9)
+      cl: TEMPLATE(write_cl,LOCAL_QUORUM)
+      idempotent: true
+      instrument: TEMPLATE(instrument-writes,TEMPLATE(instrument,false))
+      timeout: TEMPLATE(request_timeout_seconds,30.0)
+    ops:
+      insert_main: |
+        insert into TEMPLATE(keyspace,baselines).TEMPLATE(table,iot)
+        (machine_id, sensor_name, time, sensor_value, station_id, data)
+        values ({machine_id}, {sensor_name}, {time}, {sensor_value}, {station_id}, {data})
+        using timestamp {cell_timestamp}

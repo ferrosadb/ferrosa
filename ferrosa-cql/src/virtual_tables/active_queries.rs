@@ -4,13 +4,14 @@
 //! [`ActiveQueriesTable`] exposes that map as a [`VirtualTable`] readable
 //! via CQL `SELECT` from `system_observability.active_queries`.
 
+use arc_swap::ArcSwap;
 use ferrosa_common::{CellValue, DataType};
 use ferrosa_schema::virtual_table::{
     RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -18,6 +19,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 // ---------------------------------------------------------------------------
 
 /// Metadata about a single in-flight query.
+#[derive(Clone)]
 pub struct QueryInfo {
     pub query_id: u64,
     pub client_address: String,
@@ -37,11 +39,10 @@ pub struct QueryInfo {
 
 /// Tracks currently executing queries.
 ///
-/// Designed for concurrent use: `begin` and `complete` are called from
-/// arbitrary async tasks. All mutation goes through an inner [`RwLock`];
-/// reads via `active_count` and `scan` take a short-lived read guard.
+/// Designed for concurrent use without blocking runtime workers. Active query
+/// state is clone-on-write via `ArcSwap`, so reads take a lock-free snapshot.
 pub struct QueryTracker {
-    active: RwLock<HashMap<u64, QueryInfo>>,
+    active: ArcSwap<HashMap<u64, QueryInfo>>,
     next_id: AtomicU64,
     total_executed: AtomicU64,
 }
@@ -50,7 +51,7 @@ impl QueryTracker {
     /// Create an empty tracker.
     pub fn new() -> Self {
         Self {
-            active: RwLock::new(HashMap::new()),
+            active: ArcSwap::new(Arc::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             total_executed: AtomicU64::new(0),
         }
@@ -77,10 +78,11 @@ impl QueryTracker {
             start_epoch_ms: now_ms,
             state: "executing".to_string(),
         };
-        self.active
-            .write()
-            .expect("QueryTracker lock poisoned")
-            .insert(id, info);
+        self.active.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(id, info.clone());
+            Arc::new(next)
+        });
         id
     }
 
@@ -102,22 +104,20 @@ impl QueryTracker {
 
     /// Mark a query as complete. If `id` is not found this is a no-op.
     pub fn complete(&self, id: u64) {
-        let removed = self
-            .active
-            .write()
-            .expect("QueryTracker lock poisoned")
-            .remove(&id);
-        if removed.is_some() {
+        let removed = AtomicBool::new(false);
+        self.active.rcu(|current| {
+            let mut next = (**current).clone();
+            removed.store(next.remove(&id).is_some(), Ordering::Relaxed);
+            Arc::new(next)
+        });
+        if removed.load(Ordering::Relaxed) {
             self.total_executed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Number of queries currently in flight.
     pub fn active_count(&self) -> usize {
-        self.active
-            .read()
-            .expect("QueryTracker lock poisoned")
-            .len()
+        self.active.load().len()
     }
 
     /// Total number of queries that have completed since this tracker was
@@ -128,9 +128,9 @@ impl QueryTracker {
 
     /// Snapshot of all active query infos, for use by [`ActiveQueriesTable`].
     fn snapshot(&self) -> Vec<ActiveQuerySnapshot> {
-        let guard = self.active.read().expect("QueryTracker lock poisoned");
+        let snapshot = self.active.load();
         let now = Instant::now();
-        guard
+        snapshot
             .values()
             .map(|info| ActiveQuerySnapshot {
                 query_id: info.query_id,

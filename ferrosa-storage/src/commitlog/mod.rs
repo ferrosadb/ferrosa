@@ -47,6 +47,9 @@ use reader::SegmentReader;
 use segment::Segment;
 use sync::{BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
 
+static COMMITLOG_APPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Process-wide counter of zero-byte commit-log segment files skipped during
 /// crash recovery. A non-zero value means the writer rolled to a new segment
 /// and was killed before any bytes (not even the header) were durably synced
@@ -58,6 +61,64 @@ pub static EMPTY_SEGMENT_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Reads the `EMPTY_SEGMENT_SKIPPED_TOTAL` counter.
 pub fn empty_segment_skipped_total() -> u64 {
     EMPTY_SEGMENT_SKIPPED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Renders commit-log counters in Prometheus exposition format.
+pub fn render_prometheus() -> String {
+    let flush = segment::flush_metrics();
+    let mut out = String::new();
+    out.push_str("# HELP ferrosa_commitlog_appends_total Total commit-log appends.\n");
+    out.push_str("# TYPE ferrosa_commitlog_appends_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_appends_total {}\n",
+        COMMITLOG_APPENDS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_bytes_total Total bytes reserved for commit-log entries.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_bytes_total {}\n",
+        COMMITLOG_APPEND_BYTES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_commitlog_flushes_total Incremental commit-log flushes.\n");
+    out.push_str("# TYPE ferrosa_commitlog_flushes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_flushes_total {}\n",
+        flush.incremental_flushes
+    ));
+    out.push_str("# HELP ferrosa_commitlog_flush_bytes_total Bytes written by incremental commit-log flushes.\n");
+    out.push_str("# TYPE ferrosa_commitlog_flush_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_flush_bytes_total {}\n",
+        flush.incremental_bytes
+    ));
+    out.push_str("# HELP ferrosa_commitlog_full_flushes_total Full segment rewrite flushes.\n");
+    out.push_str("# TYPE ferrosa_commitlog_full_flushes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_full_flushes_total {}\n",
+        flush.full_flushes
+    ));
+    out.push_str("# HELP ferrosa_commitlog_full_flush_bytes_total Bytes written by full segment rewrite flushes.\n");
+    out.push_str("# TYPE ferrosa_commitlog_full_flush_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_full_flush_bytes_total {}\n",
+        flush.full_bytes
+    ));
+    out.push_str("# HELP ferrosa_commitlog_syncs_total Successful commit-log fsync calls.\n");
+    out.push_str("# TYPE ferrosa_commitlog_syncs_total counter\n");
+    out.push_str(&format!("ferrosa_commitlog_syncs_total {}\n", flush.syncs));
+    out.push_str("# HELP ferrosa_commitlog_periodic_idle_flushes_skipped_total Periodic commit-log timer ticks skipped because no writes were pending.\n");
+    out.push_str("# TYPE ferrosa_commitlog_periodic_idle_flushes_skipped_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_periodic_idle_flushes_skipped_total {}\n",
+        sync::periodic_idle_flush_skipped_total()
+    ));
+    out.push_str("# HELP ferrosa_commitlog_empty_segments_skipped_total Empty or torn commit-log segments skipped during replay.\n");
+    out.push_str("# TYPE ferrosa_commitlog_empty_segments_skipped_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_empty_segments_skipped_total {}\n",
+        empty_segment_skipped_total()
+    ));
+    out
 }
 
 fn is_zeroed_segment_header(path: &std::path::Path) -> ferrosa_common::Result<bool> {
@@ -336,6 +397,8 @@ impl CommitLog {
 
         let position = segment.write_entry(offset, mutation);
         segment.writer_done();
+        COMMITLOG_APPENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        COMMITLOG_APPEND_BYTES_TOTAL.fetch_add(total_size as u64, Ordering::Relaxed);
 
         // Track dirty table in this segment. `dirty_tables` on the segment
         // is a `DashMap<TableId, AtomicU64>` so this is lock-free in steady
@@ -689,13 +752,7 @@ impl CommitLog {
                 let active_ref = Arc::clone(&active);
                 let flush_callback: FlushCallback = Arc::new(move || {
                     let seg = active_ref.load();
-                    if let Some(offset) = seg.allocate(segment::SYNC_MARKER_SIZE) {
-                        seg.write_sync_marker_at(offset, 0);
-                    }
-                    // Persist both the new EOF marker and the patched previous
-                    // marker. Incremental append cannot durably capture the
-                    // earlier pointer rewrite.
-                    seg.force_full_flush()
+                    seg.flush_to_disk()
                 });
                 Box::new(PeriodicSync::new(*sync_interval, flush_callback))
             }
@@ -703,10 +760,7 @@ impl CommitLog {
                 let active_ref = Arc::clone(&active);
                 let flush_callback: FlushCallback = Arc::new(move || {
                     let seg = active_ref.load();
-                    if let Some(offset) = seg.allocate(segment::SYNC_MARKER_SIZE) {
-                        seg.write_sync_marker_at(offset, 0);
-                    }
-                    seg.force_full_flush()
+                    seg.flush_to_disk()
                 });
                 Box::new(GroupSync::new(*max_wait, flush_callback))
             }
@@ -1297,8 +1351,25 @@ mod tests {
             timestamp: 222_222,
             ..simple_mutation()
         };
-        cl.append(&second).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        let second_pos = cl.append(&second).unwrap();
+        let target_len = second_pos.offset + Segment::entry_total_size(&second) as u64;
+        let segment_path = dir.path().join("commitlog-1.log");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if std::fs::metadata(&segment_path)
+                .map(|meta| meta.len() >= target_len)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            std::fs::metadata(&segment_path)
+                .map(|meta| meta.len() >= target_len)
+                .unwrap_or(false),
+            "periodic sync did not flush the second mutation within 5s"
+        );
 
         drop(cl);
 

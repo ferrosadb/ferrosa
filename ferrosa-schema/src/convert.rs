@@ -235,10 +235,14 @@ impl TableMetadata {
             })
             .collect();
 
-        // Merge table extensions with compaction params (prefixed with "compaction.")
+        // Merge table options into extensions so the storage layer can
+        // configure components without depending on schema metadata types.
         let mut extensions = self.extensions.clone();
         for (k, v) in &self.params.compaction {
             extensions.insert(format!("compaction.{k}"), v.clone());
+        }
+        for (k, v) in &self.params.compression {
+            extensions.insert(format!("compression.{k}"), v.clone());
         }
 
         TableSchema {
@@ -413,6 +417,61 @@ mod tests {
         );
         assert!(schema.clustering_columns.is_empty());
         assert!(schema.static_columns.is_empty());
+    }
+
+    #[test]
+    fn to_storage_schema_copies_compression_params() {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnMetadata {
+                name: "id".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+
+        let mut params = TableParams::default();
+        params.compression.insert(
+            "class".to_string(),
+            "org.apache.cassandra.io.compress.ZstdCompressor".to_string(),
+        );
+        params
+            .compression
+            .insert("compression_level".to_string(), "5".to_string());
+        params
+            .compression
+            .insert("chunk_length_kb".to_string(), "32".to_string());
+
+        let table = TableMetadata {
+            keyspace: "ks1".to_string(),
+            name: "compressed".to_string(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["id".to_string()],
+            clustering_key: vec![],
+            params,
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+
+        let schema = table.to_storage_schema();
+        assert_eq!(
+            schema.extensions.get("compression.class"),
+            Some(&"org.apache.cassandra.io.compress.ZstdCompressor".to_string())
+        );
+        assert_eq!(
+            schema.extensions.get("compression.compression_level"),
+            Some(&"5".to_string())
+        );
+        assert_eq!(
+            schema.extensions.get("compression.chunk_length_kb"),
+            Some(&"32".to_string())
+        );
     }
 
     #[test]
