@@ -210,6 +210,16 @@ pub enum RaftOp {
         resource: Resource,
         permission: Permission,
     },
+    /// Grant role membership (additive, one `member_of` edge).
+    GrantRole {
+        member: String,
+        granted_role: String,
+    },
+    /// Revoke role membership (subtractive, one `member_of` edge).
+    RevokeRole {
+        member: String,
+        granted_role: String,
+    },
     CreateIndex(IndexMetadata),
     DropIndex {
         keyspace: String,

@@ -1004,6 +1004,12 @@ pub async fn route(
             .map(RouteResult::Result),
         Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
         Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
+        Statement::GrantRole { role, member } => route_grant_role(state, ctx, role, member, true)
+            .await
+            .map(RouteResult::Result),
+        Statement::RevokeRole { role, member } => route_grant_role(state, ctx, role, member, false)
+            .await
+            .map(RouteResult::Result),
         Statement::Use(u) => {
             validate_keyspace_exists(&state.schema, &u.keyspace)?;
             let body = result::encode_set_keyspace(&u.keyspace);
@@ -5955,6 +5961,75 @@ async fn route_revoke(
                 };
                 ddl.execute(op).await.map_err(CqlError::from)?;
             }
+        }
+        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_void())
+}
+
+/// `GRANT/REVOKE <role> TO/FROM <member>` — role membership (the member
+/// inherits the role's permissions). Replicates via the additive
+/// `DdlOperation::GrantRole` / `RevokeRole`, which mutate a single `member_of`
+/// edge, so concurrent role grants never clobber one another and cross-grant
+/// cycles are caught at apply.
+async fn route_grant_role(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    role: String,
+    member: String,
+    grant: bool,
+) -> Result<BytesMut, CqlError> {
+    // Authorization: (re)granting a role requires AUTHORIZE on that role.
+    // Superusers pass implicitly through check_permission.
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Authorize,
+        &Resource::Role(role.clone()),
+    )?;
+
+    // Both roles must exist — fail loud to the client rather than no-op at apply.
+    {
+        let snap = state.schema.snapshot();
+        if !snap.roles.contains_key(&role) {
+            return Err(CqlError::Invalid(format!("role not found: {role}")));
+        }
+        if !snap.roles.contains_key(&member) {
+            return Err(CqlError::Invalid(format!("role not found: {member}")));
+        }
+    }
+
+    let op = if grant {
+        DdlOperation::GrantRole {
+            member: member.clone(),
+            granted_role: role.clone(),
+        }
+    } else {
+        DdlOperation::RevokeRole {
+            member: member.clone(),
+            granted_role: role.clone(),
+        }
+    };
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            if grant {
+                state.schema.grant_role_internal(&member, &role)?;
+            } else {
+                state.schema.revoke_role_internal(&member, &role)?;
+            }
+        }
+        DdlPath::Pair(coordinator) => {
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster { .. } => {
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -15790,6 +15865,57 @@ mod tests {
             "GRANT ALL ON KEYSPACE should succeed: {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn grant_and_revoke_role_membership() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for r in ["reporter", "alice"] {
+            let stmt = crate::parser::parse(&format!(
+                "CREATE ROLE {r} WITH PASSWORD = 'pw' AND LOGIN = true"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // GRANT reporter TO alice — alice becomes a member of reporter.
+        let stmt = crate::parser::parse("GRANT reporter TO alice").unwrap();
+        route(&state, &ctx, stmt).await.expect("grant role");
+        assert!(state
+            .schema
+            .snapshot()
+            .roles
+            .get("alice")
+            .unwrap()
+            .member_of
+            .contains("reporter"));
+
+        // Granting a role to a nonexistent member fails loud.
+        let stmt = crate::parser::parse("GRANT reporter TO ghost").unwrap();
+        match route(&state, &ctx, stmt).await {
+            Ok(_) => panic!("granting to a nonexistent role must fail"),
+            Err(e) => assert!(format!("{e}").contains("ghost")),
+        }
+
+        // REVOKE removes the single edge.
+        let stmt = crate::parser::parse("REVOKE reporter FROM alice").unwrap();
+        route(&state, &ctx, stmt).await.expect("revoke role");
+        assert!(!state
+            .schema
+            .snapshot()
+            .roles
+            .get("alice")
+            .unwrap()
+            .member_of
+            .contains("reporter"));
     }
 
     // ── ALTER TABLE with extensions ──────────────────────────────────

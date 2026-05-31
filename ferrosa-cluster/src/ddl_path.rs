@@ -263,6 +263,40 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
                 )
                 .map_err(ClusterError::Storage)?;
         }
+        DdlOperation::GrantRole {
+            member,
+            granted_role,
+        } => {
+            schema
+                .grant_role_internal(member, granted_role)
+                .map_err(|e| ClusterError::Internal(format!("grant_role: {e}")))?;
+            if let Some(role) = schema.snapshot().roles.get(member) {
+                SystemTableWriter::new(Arc::clone(engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                            role.clone(),
+                        ),
+                    )
+                    .map_err(ClusterError::Storage)?;
+            }
+        }
+        DdlOperation::RevokeRole {
+            member,
+            granted_role,
+        } => {
+            schema
+                .revoke_role_internal(member, granted_role)
+                .map_err(|e| ClusterError::Internal(format!("revoke_role: {e}")))?;
+            if let Some(role) = schema.snapshot().roles.get(member) {
+                SystemTableWriter::new(Arc::clone(engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                            role.clone(),
+                        ),
+                    )
+                    .map_err(ClusterError::Storage)?;
+            }
+        }
         DdlOperation::CreateIndex(idx) => {
             schema
                 .create_index_internal(idx.clone())
@@ -449,6 +483,20 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
             role,
             resource,
             permission,
+        },
+        DdlOperation::GrantRole {
+            member,
+            granted_role,
+        } => RaftOp::GrantRole {
+            member,
+            granted_role,
+        },
+        DdlOperation::RevokeRole {
+            member,
+            granted_role,
+        } => RaftOp::RevokeRole {
+            member,
+            granted_role,
         },
         DdlOperation::CreateIndex(idx) => RaftOp::CreateIndex(idx),
         DdlOperation::DropIndex {

@@ -534,6 +534,48 @@ impl Schema {
         Ok(())
     }
 
+    /// Grant role membership without auth checks: add `granted_role` to
+    /// `member`'s `member_of` set. Additive — it touches exactly one membership
+    /// edge, so concurrently-replicated grants of different edges never clobber
+    /// one another (unlike replacing the whole `member_of` set).
+    ///
+    /// The cycle check runs against the CURRENT state. Because Raft applies
+    /// entries serially, a cycle formed by two independently-committed grants
+    /// (e.g. `GRANT a TO b` and `GRANT b TO a`) is caught when the second entry
+    /// applies — the first edge is already present — so it is rejected rather
+    /// than corrupting the hierarchy. Idempotent if `member` no longer exists.
+    pub fn grant_role_internal(&self, member: &str, granted_role: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        if !snap.roles.contains_key(member) {
+            return Ok(());
+        }
+        if would_create_cycle(&snap, granted_role, member) {
+            return Err(SchemaError::RoleCycleDetected(member.to_string()));
+        }
+        // unwrap: existence checked above, under the write lock.
+        snap.roles
+            .get_mut(member)
+            .unwrap()
+            .member_of
+            .insert(granted_role.to_string());
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Revoke role membership without auth checks: remove `granted_role` from
+    /// `member`'s `member_of` set. Subtractive and idempotent — touches one
+    /// edge, so it never clobbers other concurrently-replicated memberships.
+    pub fn revoke_role_internal(&self, member: &str, granted_role: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        if let Some(role) = snap.roles.get_mut(member) {
+            role.member_of.remove(granted_role);
+        }
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
     /// Remove a specific permission for a role on a resource without auth checks.
     /// Removes the grant entry entirely if no permissions remain.
     /// Used for pair mode DDL replication.
@@ -2601,7 +2643,7 @@ mod tests {
         // credential that verify_password_any cannot interpret (threat T3).
         let err = schema.create_role_hashed(test_role("badrole"), "not-a-real-hash", &auth);
         assert!(err.is_err(), "unsupported hash format must be rejected");
-        assert!(schema.snapshot().roles.get("badrole").is_none());
+        assert!(!schema.snapshot().roles.contains_key("badrole"));
     }
 
     #[test]
@@ -3219,6 +3261,48 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn grant_and_revoke_role_internal_additive() {
+        let schema = test_schema();
+        schema.create_role_internal(test_role("parent_a")).unwrap();
+        schema.create_role_internal(test_role("parent_b")).unwrap();
+        schema.create_role_internal(test_role("child")).unwrap();
+
+        // Two independent grants — each touches one edge, neither clobbers.
+        schema.grant_role_internal("child", "parent_a").unwrap();
+        schema.grant_role_internal("child", "parent_b").unwrap();
+        let snap = schema.snapshot();
+        let member_of = &snap.roles.get("child").unwrap().member_of;
+        assert!(member_of.contains("parent_a"));
+        assert!(member_of.contains("parent_b"));
+
+        // Revoke is subtractive and leaves the other edge intact.
+        schema.revoke_role_internal("child", "parent_a").unwrap();
+        let snap = schema.snapshot();
+        let member_of = &snap.roles.get("child").unwrap().member_of;
+        assert!(!member_of.contains("parent_a"));
+        assert!(member_of.contains("parent_b"));
+
+        // Idempotent: grant twice, revoke a missing edge.
+        schema.grant_role_internal("child", "parent_b").unwrap();
+        schema.revoke_role_internal("child", "nonexistent").unwrap();
+        // Missing member is a no-op, not an error.
+        schema.grant_role_internal("ghost", "parent_a").unwrap();
+    }
+
+    #[test]
+    fn grant_role_internal_rejects_cycle() {
+        let schema = test_schema();
+        schema.create_role_internal(test_role("a")).unwrap();
+        schema.create_role_internal(test_role("b")).unwrap();
+        // a is a member of b.
+        schema.grant_role_internal("a", "b").unwrap();
+        // Granting b membership in a would close the loop — must be rejected,
+        // even though each grant is individually fine.
+        let err = schema.grant_role_internal("b", "a").unwrap_err();
+        assert!(matches!(err, SchemaError::RoleCycleDetected(_)));
     }
 
     #[test]

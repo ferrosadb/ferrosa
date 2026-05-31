@@ -34,6 +34,17 @@ pub enum Statement {
     },
     Grant(GrantStatement),
     Revoke(RevokeStatement),
+    /// `GRANT <role> TO <member>` — role membership (the member inherits the
+    /// granted role's permissions).
+    GrantRole {
+        role: String,
+        member: String,
+    },
+    /// `REVOKE <role> FROM <member>`.
+    RevokeRole {
+        role: String,
+        member: String,
+    },
     Use(UseStatement),
     Truncate(TruncateStatement),
     Compact(CompactStatement),

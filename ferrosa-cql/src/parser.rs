@@ -137,8 +137,8 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback(),
             TokenKind::Keyword(Keyword::Truncate) => self.parse_truncate().map(Statement::Truncate),
             TokenKind::Keyword(Keyword::Compact) => self.parse_compact().map(Statement::Compact),
-            TokenKind::Keyword(Keyword::Grant) => self.parse_grant().map(Statement::Grant),
-            TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
+            TokenKind::Keyword(Keyword::Grant) => self.parse_grant(),
+            TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke(),
             TokenKind::Keyword(Keyword::Subscribe) => self.parse_subscribe(),
             TokenKind::Keyword(Keyword::Unsubscribe) => self.parse_unsubscribe(),
             TokenKind::Keyword(Keyword::List) => self.parse_list(),
@@ -1857,34 +1857,86 @@ impl<'input> Parser<'input> {
     // GRANT / REVOKE
     // ---------------------------------------------------------------
 
-    fn parse_grant(&mut self) -> Result<GrantStatement, CqlError> {
+    fn parse_grant(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Grant))?;
-        let permissions = self.parse_permissions()?;
+        // `GRANT ALL ...` is always a permission grant.
+        if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::All)) {
+            let permissions = self.parse_permissions()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
+            let resource = self.parse_resource()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
+            let role = self.parse_ident()?;
+            return Ok(Statement::Grant(GrantStatement {
+                permissions,
+                resource,
+                role,
+            }));
+        }
+
+        let first = self.parse_ident()?;
+        // `GRANT <role> TO <member>` — role membership (no ON / resource).
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::To))? {
+            let member = self.parse_ident()?;
+            return Ok(Statement::GrantRole {
+                role: first,
+                member,
+            });
+        }
+
+        // Otherwise `first` is the first permission of a permission grant.
+        let mut permissions = vec![first.to_uppercase()];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            permissions.push(self.parse_ident()?.to_uppercase());
+        }
         self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
         let resource = self.parse_resource()?;
         self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
         let role = self.parse_ident()?;
-
-        Ok(GrantStatement {
+        Ok(Statement::Grant(GrantStatement {
             permissions,
             resource,
             role,
-        })
+        }))
     }
 
-    fn parse_revoke(&mut self) -> Result<RevokeStatement, CqlError> {
+    fn parse_revoke(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Revoke))?;
-        let permissions = self.parse_permissions()?;
+        if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::All)) {
+            let permissions = self.parse_permissions()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
+            let resource = self.parse_resource()?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::From))?;
+            let role = self.parse_ident()?;
+            return Ok(Statement::Revoke(RevokeStatement {
+                permissions,
+                resource,
+                role,
+            }));
+        }
+
+        let first = self.parse_ident()?;
+        // `REVOKE <role> FROM <member>` — role membership.
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::From))? {
+            let member = self.parse_ident()?;
+            return Ok(Statement::RevokeRole {
+                role: first,
+                member,
+            });
+        }
+
+        let mut permissions = vec![first.to_uppercase()];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            permissions.push(self.parse_ident()?.to_uppercase());
+        }
         self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
         let resource = self.parse_resource()?;
         self.lexer.expect(&TokenKind::Keyword(Keyword::From))?;
         let role = self.parse_ident()?;
-
-        Ok(RevokeStatement {
+        Ok(Statement::Revoke(RevokeStatement {
             permissions,
             resource,
             role,
-        })
+        }))
     }
 
     fn parse_permissions(&mut self) -> Result<Vec<String>, CqlError> {
@@ -3901,6 +3953,30 @@ mod tests {
                 assert_eq!(s.role, "trusted_user");
             }
             other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_grant_role_to_member() {
+        let stmt = parse("GRANT report_writer TO alice").unwrap();
+        match stmt {
+            Statement::GrantRole { role, member } => {
+                assert_eq!(role, "report_writer");
+                assert_eq!(member, "alice");
+            }
+            other => panic!("expected GrantRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_revoke_role_from_member() {
+        let stmt = parse("REVOKE role_a FROM role_b").unwrap();
+        match stmt {
+            Statement::RevokeRole { role, member } => {
+                assert_eq!(role, "role_a");
+                assert_eq!(member, "role_b");
+            }
+            other => panic!("expected RevokeRole, got {:?}", other),
         }
     }
 

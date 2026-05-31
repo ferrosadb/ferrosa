@@ -1260,6 +1260,63 @@ impl FerrosStateMachine {
                 }
             }
 
+            RaftOp::GrantRole {
+                member,
+                granted_role,
+            } => {
+                // Cycle check against the replicated state, which Raft applies
+                // serially — this catches a cycle formed by two independently
+                // committed grants (GRANT a TO b, GRANT b TO a). If it would
+                // cycle, neither the replicated state nor the schema is mutated,
+                // so they stay consistent.
+                if roles_form_cycle(&self.state.roles, &granted_role, &member) {
+                    tracing::warn!(
+                        member,
+                        granted_role,
+                        "Raft apply: grant_role would create a role cycle; skipped"
+                    );
+                } else {
+                    if let Some(role) = self.state.roles.get_mut(&member) {
+                        role.member_of.insert(granted_role.clone());
+                    }
+                    if let Some(writer) = &self.system_writer {
+                        if let Some(role) = self.state.roles.get(&member) {
+                            if let Err(e) =
+                                writer.apply(SystemTableMutation::RoleCreated(role.clone()))
+                            {
+                                tracing::error!(%e, "Raft apply: system table write failed for GrantRole");
+                            }
+                        }
+                    }
+                    if let Some(schema) = &self.schema {
+                        if let Err(e) = schema.grant_role_internal(&member, &granted_role) {
+                            tracing::error!(%e, "Raft apply: schema.grant_role_internal failed");
+                        }
+                    }
+                }
+            }
+            RaftOp::RevokeRole {
+                member,
+                granted_role,
+            } => {
+                if let Some(role) = self.state.roles.get_mut(&member) {
+                    role.member_of.remove(&granted_role);
+                }
+                if let Some(writer) = &self.system_writer {
+                    if let Some(role) = self.state.roles.get(&member) {
+                        if let Err(e) = writer.apply(SystemTableMutation::RoleCreated(role.clone()))
+                        {
+                            tracing::error!(%e, "Raft apply: system table write failed for RevokeRole");
+                        }
+                    }
+                }
+                if let Some(schema) = &self.schema {
+                    if let Err(e) = schema.revoke_role_internal(&member, &granted_role) {
+                        tracing::error!(%e, "Raft apply: schema.revoke_role_internal failed");
+                    }
+                }
+            }
+
             // ---- Topology ----------------------------------------------
             RaftOp::JoinNode(node_info) => {
                 schema_changed = false;
@@ -1564,6 +1621,29 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
 /// Convert an error into an `AnyError` for openraft storage errors.
 fn to_any_error(e: impl std::error::Error + Send + Sync + 'static) -> openraft::AnyError {
     openraft::AnyError::new(&e)
+}
+
+/// True if granting `child` membership in `parent` (adding `parent` to
+/// `child.member_of`) would close a cycle in the role hierarchy — i.e. `child`
+/// is already an ancestor of `parent`. Walks upward from `parent`.
+fn roles_form_cycle(roles: &BTreeMap<String, RoleMetadata>, parent: &str, child: &str) -> bool {
+    let mut visited: Vec<String> = Vec::new();
+    let mut stack = vec![parent.to_string()];
+    while let Some(cur) = stack.pop() {
+        if cur == child {
+            return true;
+        }
+        if visited.contains(&cur) {
+            continue;
+        }
+        visited.push(cur.clone());
+        if let Some(r) = roles.get(&cur) {
+            for grandparent in &r.member_of {
+                stack.push(grandparent.clone());
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2754,6 +2834,65 @@ mod tests {
         sm.apply(entries).await.unwrap();
 
         assert!(!sm.state().roles.contains_key("analyst"));
+    }
+
+    #[tokio::test]
+    async fn apply_grant_role_is_additive_and_cycle_safe() {
+        let mut sm = FerrosStateMachine::new();
+        let mk = |name: &str| {
+            RaftOp::CreateRole(RoleMetadata {
+                name: name.to_string(),
+                is_superuser: false,
+                can_login: true,
+                salted_hash: None,
+                member_of: HashSet::new(),
+            })
+        };
+        let grant = |member: &str, role: &str| RaftOp::GrantRole {
+            member: member.to_string(),
+            granted_role: role.to_string(),
+        };
+
+        sm.apply(vec![
+            make_entry(1, 1, mk("a")),
+            make_entry(1, 2, mk("b")),
+            make_entry(1, 3, mk("c")),
+            // Two independent grants to the same member — additive, neither clobbers.
+            make_entry(1, 4, grant("c", "a")),
+            make_entry(1, 5, grant("c", "b")),
+            // a becomes a member of b.
+            make_entry(1, 6, grant("a", "b")),
+            // b -> a would close a cycle (a is already a member of b): must be skipped.
+            make_entry(1, 7, grant("b", "a")),
+        ])
+        .await
+        .unwrap();
+
+        let roles = &sm.state().roles;
+        let c = &roles.get("c").unwrap().member_of;
+        assert!(
+            c.contains("a") && c.contains("b"),
+            "additive grants preserved"
+        );
+        assert!(roles.get("a").unwrap().member_of.contains("b"));
+        assert!(
+            !roles.get("b").unwrap().member_of.contains("a"),
+            "cycle-forming grant must be skipped at apply"
+        );
+
+        // Revoke removes exactly one edge.
+        sm.apply(vec![make_entry(
+            1,
+            8,
+            RaftOp::RevokeRole {
+                member: "c".to_string(),
+                granted_role: "a".to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+        let c = &sm.state().roles.get("c").unwrap().member_of;
+        assert!(!c.contains("a") && c.contains("b"), "revoke is subtractive");
     }
 
     /// Cluster (Raft) replication test: a `RaftOp::CreateRole(role)`
