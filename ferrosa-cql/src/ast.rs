@@ -32,6 +32,14 @@ pub enum Statement {
         no_recursive: bool,
         users_alias: bool,
     },
+    /// `LIST [ALL | <permission>] PERMISSIONS [ON <resource>] [OF <role>]
+    /// [NORECURSIVE]`. `permission = None` means ALL permissions.
+    ListPermissions {
+        permission: Option<String>,
+        resource: Option<GrantResource>,
+        of: Option<String>,
+        no_recursive: bool,
+    },
     Grant(GrantStatement),
     Revoke(RevokeStatement),
     /// `GRANT <role> TO <member>` — role membership (the member inherits the

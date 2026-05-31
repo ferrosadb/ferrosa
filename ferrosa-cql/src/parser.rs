@@ -1142,42 +1142,84 @@ impl<'input> Parser<'input> {
     /// the permissions reporting pipeline catches up.
     fn parse_list(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::List))?;
-        let tok = self.lexer.next_token()?;
-        // ROLES / USERS are matched as case-insensitive identifiers
-        // rather than reserved keywords so user tables named `users`
-        // continue to lex as `Ident("users")` in non-LIST contexts.
-        let users_alias = match &tok.kind {
-            TokenKind::Ident(name) if name.eq_ignore_ascii_case("roles") => false,
-            TokenKind::Ident(name) if name.eq_ignore_ascii_case("users") => true,
-            _ => {
-                return Err(CqlError::SyntaxError(format!(
-                    "expected ROLES or USERS after LIST, got {:?} at position {}",
-                    tok.kind, tok.pos
-                )))
-            }
-        };
+        let tok = self.lexer.peek()?;
 
-        let mut of = None;
-        if self.lexer.eat(&TokenKind::Keyword(Keyword::Of))? {
-            of = Some(self.parse_ident()?);
+        // LIST ALL PERMISSIONS ...
+        if matches!(tok.kind, TokenKind::Keyword(Keyword::All)) {
+            self.lexer.next_token()?;
+            self.expect_permissions_keyword()?;
+            return self.parse_list_permissions_tail(None);
         }
 
-        // Cassandra spells the recursion suppressor as `NORECURSIVE`
-        // — a single token. We accept the bare ident form so existing
-        // tooling that parses LIST output can interoperate.
-        let mut no_recursive = false;
+        // LIST ROLES / USERS — matched as case-insensitive identifiers rather
+        // than reserved keywords so user tables named `users` keep lexing as
+        // `Ident("users")` elsewhere.
+        if let TokenKind::Ident(name) = &tok.kind {
+            if name.eq_ignore_ascii_case("roles") || name.eq_ignore_ascii_case("users") {
+                let users_alias = name.eq_ignore_ascii_case("users");
+                self.lexer.next_token()?;
+                let of = if self.lexer.eat(&TokenKind::Keyword(Keyword::Of))? {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                let no_recursive = self.eat_norecursive()?;
+                return Ok(Statement::ListRoles {
+                    of,
+                    no_recursive,
+                    users_alias,
+                });
+            }
+        }
+
+        // Otherwise: LIST <permission> PERMISSIONS ... (e.g. LIST SELECT PERMISSIONS).
+        let permission = self.parse_ident()?.to_uppercase();
+        self.expect_permissions_keyword()?;
+        self.parse_list_permissions_tail(Some(permission))
+    }
+
+    /// Expect the `PERMISSIONS` keyword.
+    fn expect_permissions_keyword(&mut self) -> Result<(), CqlError> {
+        self.lexer
+            .expect(&TokenKind::Keyword(Keyword::Permissions))?;
+        Ok(())
+    }
+
+    /// Cassandra spells the recursion suppressor `NORECURSIVE` as one token; we
+    /// accept the bare ident form.
+    fn eat_norecursive(&mut self) -> Result<bool, CqlError> {
         let tok = self.lexer.peek()?;
         if let TokenKind::Ident(name) = &tok.kind {
             if name.eq_ignore_ascii_case("norecursive") {
                 self.lexer.next_token()?;
-                no_recursive = true;
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
 
-        Ok(Statement::ListRoles {
+    /// Parse the tail of a `LIST … PERMISSIONS` statement: optional
+    /// `ON <resource>`, `OF <role>`, and `NORECURSIVE`.
+    fn parse_list_permissions_tail(
+        &mut self,
+        permission: Option<String>,
+    ) -> Result<Statement, CqlError> {
+        let resource = if self.lexer.eat(&TokenKind::Keyword(Keyword::On))? {
+            Some(self.parse_resource()?)
+        } else {
+            None
+        };
+        let of = if self.lexer.eat(&TokenKind::Keyword(Keyword::Of))? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        let no_recursive = self.eat_norecursive()?;
+        Ok(Statement::ListPermissions {
+            permission,
+            resource,
             of,
             no_recursive,
-            users_alias,
         })
     }
 
@@ -3759,6 +3801,60 @@ mod tests {
                 assert!(users_alias, "USERS variant must be flagged for the alias");
             }
             other => panic!("expected ListRoles, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_all_permissions() {
+        let stmt = parse("LIST ALL PERMISSIONS").unwrap();
+        match stmt {
+            Statement::ListPermissions {
+                permission,
+                resource,
+                of,
+                ..
+            } => {
+                assert_eq!(permission, None);
+                assert!(resource.is_none());
+                assert_eq!(of, None);
+            }
+            other => panic!("expected ListPermissions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_specific_permission_of_role() {
+        let stmt = parse("LIST SELECT PERMISSIONS OF carlos").unwrap();
+        match stmt {
+            Statement::ListPermissions { permission, of, .. } => {
+                assert_eq!(permission.as_deref(), Some("SELECT"));
+                assert_eq!(of.as_deref(), Some("carlos"));
+            }
+            other => panic!("expected ListPermissions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_all_permissions_on_resource_of_role() {
+        let stmt = parse("LIST ALL PERMISSIONS ON keyspace1.table1 OF bob").unwrap();
+        match stmt {
+            Statement::ListPermissions {
+                permission,
+                resource,
+                of,
+                ..
+            } => {
+                assert_eq!(permission, None);
+                assert_eq!(
+                    resource,
+                    Some(GrantResource::Table(
+                        Some("keyspace1".into()),
+                        "table1".into()
+                    ))
+                );
+                assert_eq!(of.as_deref(), Some("bob"));
+            }
+            other => panic!("expected ListPermissions, got {:?}", other),
         }
     }
 

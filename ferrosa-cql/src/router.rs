@@ -1002,6 +1002,14 @@ pub async fn route(
         } => route_list_roles(state, ctx, of, no_recursive, users_alias)
             .await
             .map(RouteResult::Result),
+        Statement::ListPermissions {
+            permission,
+            resource,
+            of,
+            no_recursive,
+        } => route_list_permissions(state, ctx, permission, resource, of, no_recursive)
+            .await
+            .map(RouteResult::Result),
         Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
         Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
         Statement::GrantRole { role, member } => route_grant_role(state, ctx, role, member, true)
@@ -5865,6 +5873,102 @@ async fn route_list_roles(
         &column_types,
         "system_auth",
         "roles",
+        &rows,
+    ))
+}
+
+/// Handle `LIST [ALL | <perm>] PERMISSIONS [ON <resource>] [OF <role>]
+/// [NORECURSIVE]`. Mirrors Cassandra's `system_auth.role_permissions` view —
+/// one row per (role, resource, permission). Gated on DESCRIBE over all roles
+/// (the same check as LIST ROLES) so a caller cannot enumerate grants it has no
+/// authority to see.
+async fn route_list_permissions(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    permission: Option<String>,
+    resource: Option<GrantResource>,
+    of: Option<String>,
+    no_recursive: bool,
+) -> Result<BytesMut, CqlError> {
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Describe, &Resource::AllRoles)?;
+
+    let snap = state.schema.snapshot();
+
+    // `OF <role>` restricts to that role and — unless NORECURSIVE — the roles it
+    // is a member of, since a role inherits their permissions.
+    let role_filter: Option<HashSet<String>> = of.as_ref().map(|start| {
+        let mut set = HashSet::new();
+        let mut stack = vec![start.clone()];
+        while let Some(name) = stack.pop() {
+            if !set.insert(name.clone()) {
+                continue;
+            }
+            if !no_recursive {
+                if let Some(role) = snap.roles.get(&name) {
+                    for parent in &role.member_of {
+                        stack.push(parent.clone());
+                    }
+                }
+            }
+        }
+        set
+    });
+
+    // `ON <resource>` compares against the stored resource string form.
+    let resource_filter: Option<String> = match resource {
+        Some(r) => Some(ast_resource_to_schema(&r, ctx.current_keyspace)?.to_string()),
+        None => None,
+    };
+
+    let mut perm_rows = ferrosa_schema::query_role_permissions(&snap);
+    perm_rows.sort_by(|a, b| {
+        a.role
+            .cmp(&b.role)
+            .then_with(|| a.resource.cmp(&b.resource))
+    });
+
+    let column_names = vec![
+        "role".to_string(),
+        "resource".to_string(),
+        "permission".to_string(),
+    ];
+    let column_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Varchar];
+
+    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
+    for row in perm_rows {
+        if let Some(ref roles) = role_filter {
+            if !roles.contains(&row.role) {
+                continue;
+            }
+        }
+        if let Some(ref res) = resource_filter {
+            if &row.resource != res {
+                continue;
+            }
+        }
+        let mut perms: Vec<String> = row.permissions.into_iter().collect();
+        perms.sort();
+        for perm in perms {
+            if let Some(ref want) = permission {
+                if &perm != want {
+                    continue;
+                }
+            }
+            rows.push(vec![
+                Some(CqlValue::Text(row.role.clone())),
+                Some(CqlValue::Text(row.resource.clone())),
+                Some(CqlValue::Text(perm)),
+            ]);
+        }
+    }
+
+    Ok(result::encode_rows(
+        &column_names,
+        &column_types,
+        "system_auth",
+        "role_permissions",
         &rows,
     ))
 }
@@ -15916,6 +16020,38 @@ mod tests {
             .unwrap()
             .member_of
             .contains("reporter"));
+    }
+
+    #[tokio::test]
+    async fn list_permissions_reflects_grants() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for q in [
+            "CREATE KEYSPACE lpks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE lpks.t (k int PRIMARY KEY)",
+            "CREATE ROLE reader WITH PASSWORD = 'pw' AND LOGIN = true",
+            "GRANT SELECT ON lpks.t TO reader",
+        ] {
+            let stmt = crate::parser::parse(q).unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // LIST ALL PERMISSIONS returns a Rows result (kind 0x0002).
+        let stmt = crate::parser::parse("LIST ALL PERMISSIONS OF reader").unwrap();
+        let result = route(&state, &ctx, stmt).await.expect("list permissions");
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes(), "expected Rows result");
+            }
+            _ => panic!("expected a Rows Result from LIST PERMISSIONS"),
+        }
     }
 
     // ── ALTER TABLE with extensions ──────────────────────────────────
