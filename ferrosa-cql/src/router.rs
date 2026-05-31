@@ -15457,7 +15457,7 @@ mod tests {
             route(&state, &ctx, stmt).await.is_err(),
             "CREATE ROLE with ACCESS must be rejected, not silently accepted"
         );
-        assert!(state.schema.snapshot().roles.get("netrole").is_none());
+        assert!(!state.schema.snapshot().roles.contains_key("netrole"));
     }
 
     #[tokio::test]
