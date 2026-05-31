@@ -141,6 +141,26 @@
 </div>
 </div>
 <div class="sect1">
+<h2 id="_multi_model_search">Multi-Model Search</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The lens that makes Ferrosa <em>not just Cassandra</em>: one dataset queried five ways&#8201;&#8212;&#8201;keyword (LIKE), meaning (vector ANN), fuzzy name (phonetic), trending (RRD), and influence (graph)&#8201;&#8212;&#8201;and the results fused into one ranked list. No five-system stack, no ETL.</p>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1"><a href="scholarly-search.html"><strong>Multi-Model Scholarly Search</strong></a> <em>New!</em></dt>
+<dd>
+<p>A paper search engine over one corpus: keyword (LIKE) + vector ANN over real <code>nomic-embed-text-v2-moe</code> embeddings, phonetic author lookup, RRD citation-trend rollups, and a Cypher citation graph&#8201;&#8212;&#8201;composed with reciprocal-rank fusion.</p>
+</dd>
+<dt class="hdlist1"><a href="threat-hunting.html"><strong>Multi-Model Threat Hunting</strong></a> <em>New!</em></dt>
+<dd>
+<p>A threat-intel workbench over one indicator corpus: keyword over IOC notes, vector ANN over real behaviour embeddings, phonetic actor-name lookup, RRD activity-spike rollups, and a Cypher attack-infrastructure graph&#8201;&#8212;&#8201;fused into a single triage order.</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+<div class="sect1">
 <h2 id="_ferrosa_exclusive_graph_cql">Ferrosa-Exclusive: Graph + CQL</h2>
 <div class="sectionbody">
 <div class="dlist">

@@ -1,0 +1,63 @@
+{
+  "_comment": "Editable source for the scholarly-search demo. Run gen_embeddings.py to (re)generate ../data.cql and ../queries.cql with real nomic-embed-text-v2-moe embeddings. Three topic clusters (consensus, vector-search, storage) make ANN meaningful; author names have phonetic variants; citations form a graph; daily_counts make papers 3 and 8 'trend'.",
+  "model": "nomic-embed-text-v2-moe",
+  "authors": [
+    {"id": 1, "name": "John Smith", "affiliation": "MIT"},
+    {"id": 2, "name": "Catherine Green", "affiliation": "Berkeley"},
+    {"id": 3, "name": "Sarah Connor", "affiliation": "CMU"},
+    {"id": 4, "name": "Yuri Malkov", "affiliation": "Cornell"},
+    {"id": 5, "name": "Wei Zhang", "affiliation": "Stanford"},
+    {"id": 6, "name": "Maria Gonzalez", "affiliation": "ETH Zurich"},
+    {"id": 7, "name": "Robert Brown", "affiliation": "Cambridge"},
+    {"id": 8, "name": "David Lee", "affiliation": "Washington"}
+  ],
+  "papers": [
+    {"id": 1, "title": "Paxos Made Practical", "abstract": "We present a practical treatment of the Paxos consensus protocol for building fault-tolerant replicated state machines. Replicas reach agreement on a single value despite crashes and message loss using a majority quorum.", "year": 2019, "venue": "OSDI"},
+    {"id": 2, "title": "Raft: Understandable Distributed Consensus", "abstract": "Raft is a consensus algorithm for managing a replicated log. It is designed to be more understandable than Paxos through leader election, log replication, and strong safety, while providing the same fault tolerance and performance.", "year": 2020, "venue": "USENIX ATC"},
+    {"id": 3, "title": "Accord: Strict-Serializable Distributed Transactions", "abstract": "Accord is a leaderless protocol for multi-partition transactions that guarantees strict serializability. It orders conflicting transactions with hybrid logical clocks and a fast-path quorum, avoiding dedicated coordinators.", "year": 2023, "venue": "SIGMOD"},
+    {"id": 4, "title": "Quorum Replication Under Network Partitions", "abstract": "We analyze how quorum-based replication trades availability for consistency when the network partitions. Tunable read and write quorums let operators choose where to sit on the CAP spectrum.", "year": 2021, "venue": "VLDB"},
+    {"id": 5, "title": "HNSW: Hierarchical Navigable Small World Graphs", "abstract": "Hierarchical Navigable Small World graphs provide efficient and robust approximate nearest neighbor search in high-dimensional vector spaces. A layered proximity graph yields logarithmic search complexity with strong recall.", "year": 2018, "venue": "IEEE TPAMI"},
+    {"id": 6, "title": "Product Quantization for Billion-Scale Similarity Search", "abstract": "Product quantization compresses high-dimensional vectors into compact codes, enabling billion-scale approximate similarity search in memory. We decompose the space into subspaces and quantize each independently.", "year": 2017, "venue": "CVPR"},
+    {"id": 7, "title": "Semantic Retrieval with Dense Text Embeddings", "abstract": "Dense embeddings from transformer encoders map queries and documents into a shared vector space so that semantic similarity becomes nearest-neighbor search. This outperforms lexical retrieval on paraphrased queries.", "year": 2022, "venue": "NeurIPS"},
+    {"id": 8, "title": "Scalar Quantization for Memory-Efficient Vector Search", "abstract": "We quantize embedding vectors to 8-bit and 4-bit scalars to shrink the index, then rerank a small candidate set with full-precision distances. This recovers most of the recall at a fraction of the memory and latency.", "year": 2024, "venue": "ICLR"},
+    {"id": 9, "title": "The Log-Structured Merge Tree", "abstract": "The LSM tree buffers writes in memory and flushes sorted runs to disk, merging them in the background. It trades read amplification for high write throughput, the basis of modern key-value storage engines.", "year": 2016, "venue": "VLDB"},
+    {"id": 10, "title": "Compaction Strategies for Write-Heavy Workloads", "abstract": "We compare size-tiered, leveled, and time-window compaction for LSM storage engines under write-heavy workloads, quantifying write amplification, space amplification, and read latency tradeoffs.", "year": 2021, "venue": "USENIX ATC"},
+    {"id": 11, "title": "Disaggregated Storage on Cloud Object Stores", "abstract": "We move durable storage to a cloud object store and keep local disk as an ephemeral cache, writing behind asynchronously. Compute scales independently of data, eliminating rebalancing on cluster growth.", "year": 2023, "venue": "NSDI"},
+    {"id": 12, "title": "Caching and Tiering for Cloud-Native Databases", "abstract": "A cloud-native database caches hot pages on local NVMe and serves cold data from object storage. Pinning policies and tiered eviction keep tail latency low while minimizing storage cost.", "year": 2022, "venue": "EuroSys"}
+  ],
+  "authored": [
+    [1, 1, 0], [2, 1, 0], [2, 2, 1], [3, 2, 0], [3, 3, 1], [4, 3, 0],
+    [5, 4, 0], [6, 4, 0], [6, 5, 1], [7, 5, 0], [8, 5, 0], [8, 6, 1],
+    [9, 7, 0], [10, 7, 0], [10, 8, 1], [11, 8, 0], [12, 6, 0], [12, 8, 1]
+  ],
+  "cites": [
+    [2, 1], [3, 2], [3, 4], [4, 1], [6, 5], [7, 5], [8, 6], [8, 5], [8, 7],
+    [10, 9], [11, 9], [12, 11], [11, 4]
+  ],
+  "daily_counts": [
+    {"paper_id": 3, "day": "2026-05-25 00:00:00", "count": 4},
+    {"paper_id": 3, "day": "2026-05-26 00:00:00", "count": 6},
+    {"paper_id": 3, "day": "2026-05-27 00:00:00", "count": 9},
+    {"paper_id": 3, "day": "2026-05-28 00:00:00", "count": 14},
+    {"paper_id": 3, "day": "2026-05-29 00:00:00", "count": 22},
+    {"paper_id": 8, "day": "2026-05-25 00:00:00", "count": 5},
+    {"paper_id": 8, "day": "2026-05-26 00:00:00", "count": 8},
+    {"paper_id": 8, "day": "2026-05-27 00:00:00", "count": 13},
+    {"paper_id": 8, "day": "2026-05-28 00:00:00", "count": 21},
+    {"paper_id": 8, "day": "2026-05-29 00:00:00", "count": 30},
+    {"paper_id": 5, "day": "2026-05-25 00:00:00", "count": 11},
+    {"paper_id": 5, "day": "2026-05-26 00:00:00", "count": 10},
+    {"paper_id": 5, "day": "2026-05-27 00:00:00", "count": 12},
+    {"paper_id": 5, "day": "2026-05-28 00:00:00", "count": 9},
+    {"paper_id": 5, "day": "2026-05-29 00:00:00", "count": 11},
+    {"paper_id": 1, "day": "2026-05-25 00:00:00", "count": 7},
+    {"paper_id": 1, "day": "2026-05-26 00:00:00", "count": 6},
+    {"paper_id": 1, "day": "2026-05-27 00:00:00", "count": 5},
+    {"paper_id": 1, "day": "2026-05-28 00:00:00", "count": 6},
+    {"paper_id": 1, "day": "2026-05-29 00:00:00", "count": 5}
+  ],
+  "queries": [
+    {"name": "ann_efficient_nn", "text": "memory-efficient approximate nearest neighbor search over embeddings"},
+    {"name": "ann_consensus", "text": "agreement among replicas despite failures"}
+  ]
+}
