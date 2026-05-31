@@ -232,10 +232,16 @@ impl<'input> Parser<'input> {
 
         let mut cols = vec![];
         loop {
-            // Check if this is a function call: ident(...)
-            let name = self.parse_ident()?;
+            // Check if this is a function call: ident(...) or a keyspace-
+            // qualified function: keyspace.function(...) (e.g. a UDF/UDA).
+            let first = self.parse_ident()?;
+            let (keyspace, name) = if self.lexer.eat(&TokenKind::Dot)? {
+                (Some(first), self.parse_ident()?)
+            } else {
+                (None, first)
+            };
             if self.lexer.eat(&TokenKind::LParen)? {
-                // Function call: COUNT(*), WRITETIME(col), TTL(col), etc.
+                // Function call: COUNT(*), WRITETIME(col), TTL(col), ks.udf(col).
                 let mut args = vec![];
                 if self.lexer.eat(&TokenKind::Star)? {
                     // COUNT(*) — represent * as a special term
@@ -256,11 +262,18 @@ impl<'input> Parser<'input> {
                 };
 
                 cols.push(SelectColumn::FunctionCall {
-                    keyspace: None,
+                    keyspace,
                     name,
                     args,
                     alias,
                 });
+            } else if keyspace.is_some() {
+                // `keyspace.name` without `(` — a qualified column is not valid
+                // in a SELECT list (only qualified function calls are).
+                return Err(CqlError::SyntaxError(format!(
+                    "expected a function call after '{}.{name}' in the SELECT list",
+                    keyspace.unwrap()
+                )));
             } else if self.lexer.eat(&TokenKind::Keyword(Keyword::As))? {
                 // Column with alias: col AS alias
                 let alias = self.parse_ident()?;
@@ -3092,6 +3105,27 @@ mod tests {
                 assert_eq!(s.where_clauses[0].value, Term::StringLiteral("m%".into()));
                 assert!(s.allow_filtering);
             }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_select_keyspace_qualified_function() {
+        let stmt = parse("SELECT test.average(val) FROM atable").unwrap();
+        match stmt {
+            Statement::Select(s) => match &s.columns[0] {
+                SelectColumn::FunctionCall {
+                    keyspace,
+                    name,
+                    args,
+                    ..
+                } => {
+                    assert_eq!(keyspace.as_deref(), Some("test"));
+                    assert_eq!(name, "average");
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected qualified FunctionCall, got {:?}", other),
+            },
             other => panic!("expected Select, got {:?}", other),
         }
     }
