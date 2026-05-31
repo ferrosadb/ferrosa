@@ -4673,6 +4673,14 @@ async fn route_create_keyspace(
         replication: ReplicationParams { strategy, options },
     };
 
+    // Validate the keyspace definition at the PROPOSER, before the DDL enters
+    // the Raft log. The state-machine apply path inserts keyspaces and writes
+    // system tables directly from the committed op and must not reject (that
+    // would diverge replicas), so an invalid replication map — e.g. transient
+    // replication ('3/1'), which strict CQL drivers cannot parse during schema
+    // agreement — has to be rejected here, before replication, on every DdlPath.
+    ferrosa_schema::validation::validate_keyspace(&ks_meta)?;
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
@@ -8702,6 +8710,45 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Transient replication ('<full>/<transient>') must be rejected at the
+    /// proposer, before the DDL enters the Raft log — not at apply (which would
+    /// diverge the state machine). Accepting it would persist an option string
+    /// ('3/1') that strict CQL drivers cannot parse during schema agreement,
+    /// poisoning every subsequent metadata fetch against the node.
+    #[tokio::test]
+    async fn create_keyspace_rejects_transient_replication() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE trans_ks WITH replication = \
+             {'class': 'NetworkTopologyStrategy', 'datacenter1': '3/1'}",
+        )
+        .unwrap();
+        let err = match route(&state, &ctx, stmt).await {
+            Ok(_) => panic!("transient replication must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transient replication"),
+            "expected transient-replication rejection, got: {msg}"
+        );
+
+        // The keyspace must NOT have been created.
+        assert!(
+            !state.schema.snapshot().keyspaces.contains_key("trans_ks"),
+            "rejected keyspace must not exist in the schema"
+        );
     }
 
     #[tokio::test]
