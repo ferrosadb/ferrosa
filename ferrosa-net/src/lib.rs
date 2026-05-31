@@ -13,6 +13,7 @@ pub mod handshake;
 pub mod idle_timeout;
 pub mod lane_actor;
 pub mod message;
+pub mod metrics;
 pub mod peer;
 pub mod pool;
 pub mod protocol;

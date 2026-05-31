@@ -179,6 +179,13 @@ impl RpcClient {
                                 "orphan RPC response: caller dropped before reply"
                             );
                         }
+                    } else {
+                        ORPHAN_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            peer = %read_loop_peer,
+                            stream_id,
+                            "orphan RPC response: no pending caller for stream"
+                        );
                     }
                 }
             }
@@ -210,6 +217,12 @@ impl RpcClient {
         })
     }
 
+    /// Send a request on the given lane and await the response using the lane's
+    /// default timeout.
+    pub async fn send(&self, msg: Message, lane: Lane) -> Result<Message> {
+        self.send_with_timeout(msg, lane, lane.timeout()).await
+    }
+
     /// Send a request on the given lane and await the response.
     ///
     /// # Cancel Safety
@@ -219,7 +232,12 @@ impl RpcClient {
     /// dropped after insertion but before the send completes, the slot is leaked and
     /// the stream ID will never be reclaimed. Only call this from actor loops that
     /// guarantee the future runs to completion.
-    pub async fn send(&self, msg: Message, lane: Lane) -> Result<Message> {
+    pub async fn send_with_timeout(
+        &self,
+        msg: Message,
+        lane: Lane,
+        timeout: std::time::Duration,
+    ) -> Result<Message> {
         let span = tracing::info_span!(
             "net.rpc",
             peer = %self.peer_addr,
@@ -255,10 +273,14 @@ impl RpcClient {
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let result = tokio::time::timeout(lane.timeout(), resp_rx)
-            .await
-            .map_err(|_| NetError::Timeout(format!("{:?} lane timeout", lane)))
-            .and_then(|r| r.map_err(|_| NetError::Protocol("response channel dropped".into())));
+        let result = match tokio::time::timeout(timeout, resp_rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(NetError::Protocol("response channel dropped".into())),
+            Err(_) => {
+                self.pending.remove(&stream_id);
+                Err(NetError::Timeout(format!("{:?} lane timeout", lane)))
+            }
+        };
 
         // Decrement in-flight gauge on response or timeout.
         self.in_flight
@@ -412,12 +434,13 @@ mod tests {
             .await
             .unwrap();
         let result = client
-            .send(
+            .send_with_timeout(
                 Message::Ping {
                     nonce: 1,
                     sent_at: 0,
                 },
                 Lane::Raft,
+                std::time::Duration::from_millis(50),
             )
             .await;
         assert!(matches!(result, Err(NetError::Timeout(_))));
@@ -639,14 +662,15 @@ mod tests {
 
         // Send with a tiny per-call timeout so the response future drops
         // before the slow handler replies.
-        let send_fut = client.send(
+        let send_fut = client.send_with_timeout(
             Message::Ping {
                 nonce: 7,
                 sent_at: 0,
             },
             Lane::Data,
+            std::time::Duration::from_millis(50),
         );
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), send_fut).await;
+        let _ = send_fut.await;
 
         // Wait for the late response to arrive at the read loop.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;

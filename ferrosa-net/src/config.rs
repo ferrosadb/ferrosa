@@ -1,6 +1,8 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::codec::Lane;
+
 /// Configuration for the ferrosa-net transport layer.
 /// All values can be overridden via environment variables.
 #[derive(Debug, Clone)]
@@ -27,6 +29,14 @@ pub struct NetConfig {
     pub max_frame_body_size: u32,
     /// Max concurrent streams per connection lane (T15).
     pub max_streams_per_lane: usize,
+    /// Default timeout for Raft-lane RPCs.
+    pub raft_lane_timeout: Duration,
+    /// Default timeout for Data-lane RPCs.
+    pub data_lane_timeout: Duration,
+    /// Default timeout for Bulk-lane RPCs.
+    pub bulk_lane_timeout: Duration,
+    /// Process-wide cap for concurrently dispatched Data-lane RPCs.
+    pub data_lane_max_in_flight: usize,
     /// Path to TLS certificate file (PEM) for internode encryption.
     pub tls_cert_path: Option<String>,
     /// Path to TLS private key file (PEM).
@@ -57,6 +67,10 @@ impl Default for NetConfig {
             handshake_timeout: Duration::from_secs(5),
             max_frame_body_size: 256 * 1024 * 1024, // 256 MiB
             max_streams_per_lane: 128,
+            raft_lane_timeout: Lane::Raft.timeout(),
+            data_lane_timeout: Lane::Data.timeout(),
+            bulk_lane_timeout: Lane::Bulk.timeout(),
+            data_lane_max_in_flight: 256,
             tls_cert_path: None,
             tls_key_path: None,
             tls_ca_path: None,
@@ -81,6 +95,22 @@ impl NetConfig {
 
     fn parse_seed_list(raw: &str) -> Vec<SocketAddr> {
         raw.split(',').filter_map(Self::parse_socket_addr).collect()
+    }
+
+    fn parse_duration_ms_env(name: &str) -> Option<Duration> {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+    }
+
+    pub fn lane_timeout(&self, lane: Lane) -> Duration {
+        match lane {
+            Lane::Raft => self.raft_lane_timeout,
+            Lane::Data => self.data_lane_timeout,
+            Lane::Bulk => self.bulk_lane_timeout,
+        }
     }
 
     /// Build config from environment variables, with defaults.
@@ -136,6 +166,25 @@ impl NetConfig {
                 cfg.max_streams_per_lane = n;
             }
         }
+        if let Some(timeout) = Self::parse_duration_ms_env("FERROSA_RAFT_ELECTION_MIN_MS") {
+            cfg.raft_lane_timeout = timeout / 3;
+        }
+        if let Some(timeout) = Self::parse_duration_ms_env("FERROSA_RAFT_LANE_TIMEOUT_MS") {
+            cfg.raft_lane_timeout = timeout;
+        }
+        if let Some(timeout) = Self::parse_duration_ms_env("FERROSA_DATA_LANE_TIMEOUT_MS") {
+            cfg.data_lane_timeout = timeout;
+        }
+        if let Some(timeout) = Self::parse_duration_ms_env("FERROSA_BULK_LANE_TIMEOUT_MS") {
+            cfg.bulk_lane_timeout = timeout;
+        }
+        if let Ok(v) = std::env::var("FERROSA_DATA_LANE_MAX_IN_FLIGHT") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > 0 {
+                    cfg.data_lane_max_in_flight = n;
+                }
+            }
+        }
         if let Ok(v) = std::env::var("FERROSA_INTERNODE_TLS_CERT") {
             cfg.tls_cert_path = Some(v);
         }
@@ -184,6 +233,10 @@ mod tests {
         assert_eq!(cfg.max_connections, 512);
         assert_eq!(cfg.max_frame_body_size, 256 * 1024 * 1024);
         assert_eq!(cfg.max_streams_per_lane, 128);
+        assert_eq!(cfg.raft_lane_timeout, Duration::from_secs(1));
+        assert_eq!(cfg.data_lane_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.bulk_lane_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.data_lane_max_in_flight, 256);
         assert_eq!(cfg.heartbeat_interval, Duration::from_millis(500));
         assert_eq!(cfg.heartbeat_timeout, Duration::from_millis(1500));
         assert_eq!(cfg.handshake_timeout, Duration::from_secs(5));

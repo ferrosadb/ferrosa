@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
@@ -35,6 +36,7 @@ use super::FerrosRaftConfig;
 /// on one runtime worker. Sleeping here makes the Raft network future itself
 /// carry the reconnect backoff instead of fast-failing into OpenRaft.
 const RAFT_RECONNECTING_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+const RPC_TIMEOUT_CLEANUP_HEADROOM: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // FerrosRaftNetworkFactory
@@ -189,20 +191,28 @@ async fn backoff_transient_raft_reconnect(e: &NetError) {
     }
 }
 
+fn lane_timeout_for_rpc(option: &RPCOption) -> Duration {
+    option
+        .hard_ttl()
+        .checked_sub(RPC_TIMEOUT_CLEANUP_HEADROOM)
+        .unwrap_or_else(|| option.hard_ttl())
+}
+
 impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
     /// Forward an `AppendEntries` RPC to the target node.
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<FerrosRaftConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let payload = encode(&rpc)?;
         let response = match self
             .peer_manager
-            .send(
+            .send_with_timeout(
                 self.target_host_id,
                 Message::RaftAppendEntries(payload),
                 Lane::Raft,
+                lane_timeout_for_rpc(&option),
             )
             .await
         {
@@ -229,7 +239,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<FerrosRaftConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
@@ -245,10 +255,11 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         // See `crate::raft::snapshot_transport::snapshot_lane`.
         let response = match self
             .peer_manager
-            .send(
+            .send_with_timeout(
                 self.target_host_id,
                 Message::RaftInstallSnapshot(payload),
                 crate::raft::snapshot_transport::snapshot_lane(),
+                lane_timeout_for_rpc(&option),
             )
             .await
         {
@@ -277,12 +288,17 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
     async fn vote(
         &mut self,
         rpc: VoteRequest<u64>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let payload = encode(&rpc)?;
         let response = match self
             .peer_manager
-            .send(self.target_host_id, Message::RaftVote(payload), Lane::Raft)
+            .send_with_timeout(
+                self.target_host_id,
+                Message::RaftVote(payload),
+                Lane::Raft,
+                lane_timeout_for_rpc(&option),
+            )
             .await
         {
             Ok(response) => response,

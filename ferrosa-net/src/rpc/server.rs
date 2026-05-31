@@ -34,6 +34,8 @@ pub struct RpcServer {
     pub bandwidth: Arc<super::client::BandwidthMetrics>,
     /// Dedicated runtime for non-Raft connections (data, bulk, bootstrap).
     data_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Dedicated runtime for Raft RPC handlers.
+    raft_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl RpcServer {
@@ -54,12 +56,19 @@ impl RpcServer {
             inbound_callback: None,
             bandwidth: Arc::new(super::client::BandwidthMetrics::new()),
             data_runtime: None,
+            raft_runtime: None,
         }
     }
 
     /// Set a dedicated runtime for non-Raft connections (data, bulk, bootstrap).
     pub fn with_data_runtime(mut self, rt: Arc<tokio::runtime::Runtime>) -> Self {
         self.data_runtime = Some(rt);
+        self
+    }
+
+    /// Set a dedicated runtime for Raft RPC handlers.
+    pub fn with_raft_runtime(mut self, rt: Arc<tokio::runtime::Runtime>) -> Self {
+        self.raft_runtime = Some(rt);
         self
     }
 
@@ -384,12 +393,13 @@ impl RpcServer {
                 }
             };
 
-            // ALL handlers run on the Data runtime (or main runtime fallback).
-            // Do NOT dispatch Raft handlers to the Raft runtime — the follower's
-            // raft_runtime is saturated with its own election attempts when
-            // heartbeats are delayed. The handler just calls raft.append_entries()
-            // which enqueues to openraft's internal channel — fast, no heavy work.
-            if let Some(ref data_rt) = self.data_runtime {
+            if msg_type.is_raft() {
+                if let Some(ref raft_rt) = self.raft_runtime {
+                    raft_rt.spawn(handler);
+                } else {
+                    tokio::spawn(handler);
+                }
+            } else if let Some(ref data_rt) = self.data_runtime {
                 data_rt.spawn(handler);
             } else {
                 tokio::spawn(handler);

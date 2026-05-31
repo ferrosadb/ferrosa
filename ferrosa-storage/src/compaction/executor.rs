@@ -151,7 +151,6 @@ impl CompactionExecutor {
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
         use ferrosa_sstable::writer::SSTableWriter;
-        use ferrosa_sstable::WriteOptions;
         use std::collections::BinaryHeap;
 
         tracing::info!(
@@ -243,10 +242,8 @@ impl CompactionExecutor {
             "compaction: combined output serialization header"
         );
 
-        let options = WriteOptions {
-            compression: None,
-            ..WriteOptions::default()
-        };
+        let options = crate::engine::write_options_for_schema(&task.schema, true)
+            .map_err(|e| format!("compaction: invalid write options: {e}"))?;
         let mut writer = SSTableWriter::new(options, output_header.clone());
 
         // 3. K-way streaming merge across the input partition iterators.

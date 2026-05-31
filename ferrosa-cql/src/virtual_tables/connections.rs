@@ -5,13 +5,15 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use ferrosa_common::{CellValue, DataType};
 use ferrosa_schema::{RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable};
 
 /// Metadata about a single active CQL connection.
+#[derive(Clone)]
 pub struct ConnectionInfo {
     /// Human-readable peer address (IP string).
     pub peer_address: String,
@@ -31,75 +33,75 @@ pub struct ConnectionInfo {
 
 /// Concurrent registry of active CQL connections.
 ///
-/// Uses `std::sync::RwLock` so reads are lock-free from each other.
-/// All public methods are safe to call from multiple threads.
+/// Uses clone-on-write `ArcSwap` snapshots so reads never acquire locks. Writes
+/// are expected to be small, bounded metadata updates at connection lifecycle
+/// boundaries.
 pub struct ConnectionTracker {
-    connections: RwLock<HashMap<SocketAddr, ConnectionInfo>>,
+    connections: ArcSwap<HashMap<SocketAddr, ConnectionInfo>>,
 }
 
 impl ConnectionTracker {
     /// Create an empty tracker.
     pub fn new() -> Self {
         Self {
-            connections: RwLock::new(HashMap::new()),
+            connections: ArcSwap::new(Arc::new(HashMap::new())),
         }
     }
 
     /// Register a new connection. Replaces any existing entry for `addr`.
     pub fn register(&self, addr: SocketAddr, info: ConnectionInfo) {
-        self.connections
-            .write()
-            .expect("ConnectionTracker lock poisoned")
-            .insert(addr, info);
+        self.connections.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(addr, info.clone());
+            Arc::new(next)
+        });
     }
 
     /// Remove a connection from the tracker.
     pub fn deregister(&self, addr: &SocketAddr) {
-        self.connections
-            .write()
-            .expect("ConnectionTracker lock poisoned")
-            .remove(addr);
+        self.connections.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(addr);
+            Arc::new(next)
+        });
     }
 
     /// Update the lifecycle state of a connection.
     pub fn update_state(&self, addr: &SocketAddr, state: &str) {
-        let mut guard = self
-            .connections
-            .write()
-            .expect("ConnectionTracker lock poisoned");
-        if let Some(info) = guard.get_mut(addr) {
-            info.state = state.to_owned();
-        }
+        self.connections.rcu(|current| {
+            let mut next = (**current).clone();
+            if let Some(info) = next.get_mut(addr) {
+                info.state = state.to_owned();
+            }
+            Arc::new(next)
+        });
     }
 
     /// Record the authenticated username for a connection.
     pub fn update_username(&self, addr: &SocketAddr, username: &str) {
-        let mut guard = self
-            .connections
-            .write()
-            .expect("ConnectionTracker lock poisoned");
-        if let Some(info) = guard.get_mut(addr) {
-            info.username = Some(username.to_owned());
-        }
+        self.connections.rcu(|current| {
+            let mut next = (**current).clone();
+            if let Some(info) = next.get_mut(addr) {
+                info.username = Some(username.to_owned());
+            }
+            Arc::new(next)
+        });
     }
 
     /// Atomically increment the request counter for a connection.
     pub fn increment_requests(&self, addr: &SocketAddr) {
-        let mut guard = self
-            .connections
-            .write()
-            .expect("ConnectionTracker lock poisoned");
-        if let Some(info) = guard.get_mut(addr) {
-            info.requests_served = info.requests_served.saturating_add(1);
-        }
+        self.connections.rcu(|current| {
+            let mut next = (**current).clone();
+            if let Some(info) = next.get_mut(addr) {
+                info.requests_served = info.requests_served.saturating_add(1);
+            }
+            Arc::new(next)
+        });
     }
 
     /// Return the number of currently tracked connections.
     pub fn active_count(&self) -> usize {
-        self.connections
-            .read()
-            .expect("ConnectionTracker lock poisoned")
-            .len()
+        self.connections.load().len()
     }
 }
 
@@ -203,13 +205,9 @@ impl VirtualTable for ConnectionsTable {
 
     fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
         let now = Instant::now();
-        let guard = self
-            .tracker
-            .connections
-            .read()
-            .expect("ConnectionTracker lock poisoned");
+        let snapshot = self.tracker.connections.load();
 
-        guard
+        snapshot
             .values()
             .map(|info| {
                 let idle_secs = now

@@ -1,4 +1,82 @@
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+static LOCAL_WRITE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_WRITE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static LOCAL_WRITE_ACKS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_WRITE_ACKS: AtomicU64 = AtomicU64::new(0);
+static LOCAL_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static REMOTE_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static INBOUND_MUTATION_FORWARDS: AtomicU64 = AtomicU64::new(0);
+static INBOUND_MUTATION_ROWS: AtomicU64 = AtomicU64::new(0);
+static INBOUND_MUTATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub fn inc_replica_write_attempt(local: bool) {
+    if local {
+        LOCAL_WRITE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        REMOTE_WRITE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn inc_replica_write_ack(local: bool) {
+    if local {
+        LOCAL_WRITE_ACKS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        REMOTE_WRITE_ACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn inc_replica_write_failure(local: bool) {
+    if local {
+        LOCAL_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        REMOTE_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn inc_inbound_mutation_forward(rows: usize) {
+    INBOUND_MUTATION_FORWARDS.fetch_add(1, Ordering::Relaxed);
+    INBOUND_MUTATION_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+}
+
+pub fn inc_inbound_mutation_failure() {
+    INBOUND_MUTATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn render_prometheus() -> String {
+    format!(
+        "# HELP ferrosa_coordinator_replica_write_attempts_total Replica write attempts by this coordinator.\n\
+         # TYPE ferrosa_coordinator_replica_write_attempts_total counter\n\
+         ferrosa_coordinator_replica_write_attempts_total{{target=\"local\"}} {}\n\
+         ferrosa_coordinator_replica_write_attempts_total{{target=\"remote\"}} {}\n\
+         # HELP ferrosa_coordinator_replica_write_acks_total Successful replica write acknowledgements observed by this coordinator.\n\
+         # TYPE ferrosa_coordinator_replica_write_acks_total counter\n\
+         ferrosa_coordinator_replica_write_acks_total{{target=\"local\"}} {}\n\
+         ferrosa_coordinator_replica_write_acks_total{{target=\"remote\"}} {}\n\
+         # HELP ferrosa_coordinator_replica_write_failures_total Failed replica writes observed by this coordinator.\n\
+         # TYPE ferrosa_coordinator_replica_write_failures_total counter\n\
+         ferrosa_coordinator_replica_write_failures_total{{target=\"local\"}} {}\n\
+         ferrosa_coordinator_replica_write_failures_total{{target=\"remote\"}} {}\n\
+         # HELP ferrosa_coordinator_inbound_mutation_forwards_total MutationForward RPCs applied on this node.\n\
+         # TYPE ferrosa_coordinator_inbound_mutation_forwards_total counter\n\
+         ferrosa_coordinator_inbound_mutation_forwards_total {}\n\
+         # HELP ferrosa_coordinator_inbound_mutation_rows_total MutationForward rows applied on this node.\n\
+         # TYPE ferrosa_coordinator_inbound_mutation_rows_total counter\n\
+         ferrosa_coordinator_inbound_mutation_rows_total {}\n\
+         # HELP ferrosa_coordinator_inbound_mutation_failures_total MutationForward writes that failed on this node.\n\
+         # TYPE ferrosa_coordinator_inbound_mutation_failures_total counter\n\
+         ferrosa_coordinator_inbound_mutation_failures_total {}\n",
+        LOCAL_WRITE_ATTEMPTS.load(Ordering::Relaxed),
+        REMOTE_WRITE_ATTEMPTS.load(Ordering::Relaxed),
+        LOCAL_WRITE_ACKS.load(Ordering::Relaxed),
+        REMOTE_WRITE_ACKS.load(Ordering::Relaxed),
+        LOCAL_WRITE_FAILURES.load(Ordering::Relaxed),
+        REMOTE_WRITE_FAILURES.load(Ordering::Relaxed),
+        INBOUND_MUTATION_FORWARDS.load(Ordering::Relaxed),
+        INBOUND_MUTATION_ROWS.load(Ordering::Relaxed),
+        INBOUND_MUTATION_FAILURES.load(Ordering::Relaxed),
+    )
+}
 
 /// Prometheus-compatible counters for inline read repair.
 pub struct ReadRepairMetrics {

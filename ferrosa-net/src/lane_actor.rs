@@ -28,7 +28,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -37,6 +37,7 @@ use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::error::{NetError, Result};
 use crate::message::Message;
+use crate::metrics;
 use crate::reconnect::{
     connect_with_retry_cancelable, dec_dormant_peer_count, inc_dormant_peer_count,
     spawn_alive_watcher, LaneState, DORMANT_AFTER_EXHAUSTIONS, DORMANT_PROBE_INTERVAL,
@@ -132,6 +133,7 @@ pub enum LaneStatusReport {
 pub struct LaneHandle {
     tx: mpsc::Sender<LaneCommand>,
     lane: Lane,
+    default_timeout: Duration,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -155,12 +157,14 @@ impl LaneHandle {
         msg: Message,
         timeout_override: Option<Duration>,
     ) -> Result<Message> {
-        let timeout = timeout_override.unwrap_or_else(|| self.lane.timeout());
+        let timeout = timeout_override.unwrap_or(self.default_timeout);
         let (reply_tx, reply_rx) = oneshot::channel();
 
         // Reserve a slot in the channel — cancel-safe because dropping the
         // permit before calling `permit.send()` simply releases the slot.
+        let started = Instant::now();
         let permit = self.tx.reserve().await.map_err(|_| NetError::LaneFailed)?;
+        metrics::record_lane_queue_wait(self.lane, started.elapsed());
         permit.send(LaneCommand::Send {
             msg,
             timeout,
@@ -178,10 +182,12 @@ impl LaneHandle {
         msg: Message,
         timeout_override: Option<Duration>,
     ) -> Result<()> {
-        let timeout = timeout_override.unwrap_or_else(|| self.lane.timeout());
+        let timeout = timeout_override.unwrap_or(self.default_timeout);
         let (reply_tx, reply_rx) = oneshot::channel();
 
+        let started = Instant::now();
         let permit = self.tx.reserve().await.map_err(|_| NetError::LaneFailed)?;
+        metrics::record_lane_queue_wait(self.lane, started.elapsed());
         permit.send(LaneCommand::Fire {
             msg,
             timeout,
@@ -324,10 +330,20 @@ pub fn spawn_lane_actor(
     initial_state: LaneState,
     ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext,
 ) -> LaneHandle {
+    spawn_lane_actor_with_timeout(lane, initial_state, lane.timeout(), ctx_builder)
+}
+
+pub fn spawn_lane_actor_with_timeout(
+    lane: Lane,
+    initial_state: LaneState,
+    default_timeout: Duration,
+    ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext,
+) -> LaneHandle {
     let (tx, rx) = mpsc::channel(lane_channel_capacity());
     let handle = LaneHandle {
         tx,
         lane,
+        default_timeout,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     let ctx = ctx_builder(handle.clone());
@@ -341,9 +357,20 @@ pub fn spawn_lane_actor(
 ///
 /// The actor loop logic is identical to [`spawn_lane_actor`]; only the execution
 /// context differs.
+#[allow(dead_code)]
 pub(crate) fn spawn_raft_lane_actor(
     lane: Lane,
     initial_state: LaneState,
+    peer_label: String,
+    ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext + Send + 'static,
+) -> LaneHandle {
+    spawn_raft_lane_actor_with_timeout(lane, initial_state, lane.timeout(), peer_label, ctx_builder)
+}
+
+pub(crate) fn spawn_raft_lane_actor_with_timeout(
+    lane: Lane,
+    initial_state: LaneState,
+    default_timeout: Duration,
     peer_label: String,
     ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext + Send + 'static,
 ) -> LaneHandle {
@@ -351,6 +378,7 @@ pub(crate) fn spawn_raft_lane_actor(
     let handle = LaneHandle {
         tx,
         lane,
+        default_timeout,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     let ctx = ctx_builder(handle.clone());
@@ -409,14 +437,28 @@ async fn lane_actor_loop(
                 // attached on Connected and propagated via SwapClient /
                 // MarkFailed — no need to mutate state from the spawned
                 // task.
-                dispatch_send(&state, lane, msg, timeout, reply);
+                dispatch_send(
+                    &state,
+                    lane,
+                    msg,
+                    timeout,
+                    ctx.config.data_lane_max_in_flight,
+                    reply,
+                );
             }
             LaneCommand::Fire {
                 msg,
                 timeout,
                 reply,
             } => {
-                dispatch_fire(&state, lane, msg, timeout, reply);
+                dispatch_fire(
+                    &state,
+                    lane,
+                    msg,
+                    timeout,
+                    ctx.config.data_lane_max_in_flight,
+                    reply,
+                );
             }
             LaneCommand::SwapClient(new_client) => {
                 // If we were dormant, decrement the dormant counter.
@@ -563,6 +605,7 @@ fn dispatch_send(
     lane: Lane,
     msg: Message,
     timeout: Duration,
+    data_lane_max_in_flight: usize,
     reply: oneshot::Sender<Result<Message>>,
 ) {
     let client = match state {
@@ -572,12 +615,16 @@ fn dispatch_send(
             return;
         }
     };
+    if !metrics::try_start_rpc(lane, data_lane_max_in_flight) {
+        let _ = reply.send(Err(NetError::Overloaded));
+        return;
+    }
     tokio::spawn(async move {
-        let result = match tokio::time::timeout(timeout, client.send(msg, lane)).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane send timeout"))),
-        };
+        let result = client.send_with_timeout(msg, lane, timeout).await;
+        if matches!(result, Err(NetError::Timeout(_))) {
+            metrics::record_rpc_timeout(lane);
+        }
+        metrics::finish_rpc(lane);
         let _ = reply.send(result);
     });
 }
@@ -588,6 +635,7 @@ fn dispatch_fire(
     lane: Lane,
     msg: Message,
     timeout: Duration,
+    data_lane_max_in_flight: usize,
     reply: oneshot::Sender<Result<()>>,
 ) {
     let client = match state {
@@ -597,12 +645,20 @@ fn dispatch_fire(
             return;
         }
     };
+    if !metrics::try_start_rpc(lane, data_lane_max_in_flight) {
+        let _ = reply.send(Err(NetError::Overloaded));
+        return;
+    }
     tokio::spawn(async move {
         let result = match tokio::time::timeout(timeout, client.fire(msg, lane)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e),
             Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane fire timeout"))),
         };
+        if matches!(result, Err(NetError::Timeout(_))) {
+            metrics::record_rpc_timeout(lane);
+        }
+        metrics::finish_rpc(lane);
         let _ = reply.send(result);
     });
 }

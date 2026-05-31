@@ -1309,14 +1309,19 @@ pub(crate) fn handle_prepare(
         }
     };
 
+    let id = PreparedCache::compute_id(query);
+    if let Some(plan) = state.prepared_cache.get(&id) {
+        if plan.query == query && plan.keyspace.as_ref() == current_keyspace.as_ref() {
+            return HandleResult::Reply(Opcode::Result, encode_prepared_plan(&plan));
+        }
+    }
+
     let stmt = match parser::parse(query) {
         Ok(s) => s,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
         }
     };
-
-    let id = PreparedCache::compute_id(query);
 
     // Determine keyspace and table from the statement for the prepared metadata.
     let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
@@ -1372,25 +1377,27 @@ pub(crate) fn handle_prepare(
         table_name: table_name.clone(),
     };
 
+    let result_body = encode_prepared_plan(&plan);
     state.prepared_cache.insert(plan);
+    HandleResult::Reply(Opcode::Result, result_body)
+}
 
-    let bound_names: Vec<String> = bound_columns.iter().map(|(n, _)| n.clone()).collect();
-    let bound_types: Vec<CqlType> = bound_columns.iter().map(|(_, t)| t.clone()).collect();
-    let result_names: Vec<String> = result_columns.iter().map(|(n, _)| n.clone()).collect();
-    let result_types: Vec<CqlType> = result_columns.iter().map(|(_, t)| t.clone()).collect();
+fn encode_prepared_plan(plan: &PreparedPlan) -> BytesMut {
+    let bound_names: Vec<String> = plan.bound_columns.iter().map(|(n, _)| n.clone()).collect();
+    let bound_types: Vec<CqlType> = plan.bound_columns.iter().map(|(_, t)| t.clone()).collect();
+    let result_names: Vec<String> = plan.result_columns.iter().map(|(n, _)| n.clone()).collect();
+    let result_types: Vec<CqlType> = plan.result_columns.iter().map(|(_, t)| t.clone()).collect();
 
-    let result_body = result::encode_prepared(
-        &id,
+    result::encode_prepared(
+        &plan.id,
         &bound_names,
         &bound_types,
         &result_names,
         &result_types,
-        &table_ks,
-        &table_name,
+        &plan.table_keyspace,
+        &plan.table_name,
         &[],
-    );
-
-    HandleResult::Reply(Opcode::Result, result_body)
+    )
 }
 
 // ── EXECUTE ──────────────────────────────────────────────────────────────
@@ -2656,6 +2663,40 @@ mod tests {
             result_columns,
             vec![("keyspace_name".to_string(), CqlType::Varchar)]
         );
+    }
+
+    #[test]
+    fn prepare_returns_cached_plan_without_reparsing() {
+        let (state, _dir) = shared_state_for_prepare_tests();
+        let query = "not valid cql but already cached";
+        let id = PreparedCache::compute_id(query);
+        let cached_stmt = parser::parse("SELECT keyspace_name FROM system_schema.keyspaces")
+            .expect("cached statement");
+        state.prepared_cache.insert(PreparedPlan {
+            id,
+            query: query.to_string(),
+            statement: cached_stmt,
+            keyspace: None,
+            result_columns: vec![("keyspace_name".to_string(), CqlType::Varchar)],
+            bound_columns: Vec::new(),
+            table_keyspace: "system_schema".to_string(),
+            table_name: "keyspaces".to_string(),
+        });
+
+        let mut body = BytesMut::new();
+        body.put_i32(query.len() as i32);
+        body.put_slice(query.as_bytes());
+
+        let result = handle_prepare(&mut None, &mut None, &state, &body.freeze());
+        match result {
+            HandleResult::Reply(Opcode::Result, body) => {
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                assert_eq!(id_len, 16);
+                assert_eq!(&body[6..22], &id);
+            }
+            _ => panic!("expected cached PREPARE result"),
+        }
     }
 
     #[tokio::test]

@@ -42,6 +42,18 @@ impl Lane {
             Self::Bulk => std::time::Duration::from_secs(60),
         }
     }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raft => "raft",
+            Self::Data => "data",
+            Self::Bulk => "bulk",
+        }
+    }
 }
 
 impl TryFrom<u8> for Lane {

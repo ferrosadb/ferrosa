@@ -67,6 +67,30 @@ pub const SYNC_MARKER_SIZE: usize = 8;
 /// Initial write position: after the 17-byte header and 8-byte first sync marker.
 const INITIAL_POSITION: u64 = (HEADER_SIZE + SYNC_MARKER_SIZE) as u64;
 
+static INCREMENTAL_FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INCREMENTAL_FLUSH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FULL_FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FULL_FLUSH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNCS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct CommitLogFlushMetrics {
+    pub incremental_flushes: u64,
+    pub incremental_bytes: u64,
+    pub full_flushes: u64,
+    pub full_bytes: u64,
+    pub syncs: u64,
+}
+
+pub(crate) fn flush_metrics() -> CommitLogFlushMetrics {
+    CommitLogFlushMetrics {
+        incremental_flushes: INCREMENTAL_FLUSHES_TOTAL.load(Ordering::Relaxed),
+        incremental_bytes: INCREMENTAL_FLUSH_BYTES_TOTAL.load(Ordering::Relaxed),
+        full_flushes: FULL_FLUSHES_TOTAL.load(Ordering::Relaxed),
+        full_bytes: FULL_FLUSH_BYTES_TOTAL.load(Ordering::Relaxed),
+        syncs: SYNCS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
 /// A fixed-size byte buffer with lock-free CAS allocation for commit log entries.
 ///
 /// The segment is `Send + Sync` because concurrent access to the buffer is
@@ -409,16 +433,24 @@ impl Segment {
                 *handle = Some(f);
                 let file = handle.as_mut().unwrap();
                 use std::io::Write;
+                let written = current_pos;
                 file.write_all(&buf[..current_pos])?;
                 file.sync_all()?;
+                INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
+                SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 self.last_flushed
                     .store(current_pos as u64, Ordering::Release);
             }
             Some(file) if current_pos > last_flushed => {
                 // Incremental: append only new bytes.
                 use std::io::Write;
+                let written = current_pos - last_flushed;
                 file.write_all(&buf[last_flushed..current_pos])?;
                 file.sync_all()?;
+                INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
+                SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 self.last_flushed
                     .store(current_pos as u64, Ordering::Release);
             }
@@ -456,6 +488,9 @@ impl Segment {
         use std::io::Write;
         file.write_all(&buf[..snapshot_pos])?;
         file.sync_all()?;
+        FULL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        FULL_FLUSH_BYTES_TOTAL.fetch_add(snapshot_pos as u64, Ordering::Relaxed);
+        SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
         self.last_flushed
             .store(snapshot_pos as u64, Ordering::Release);
 

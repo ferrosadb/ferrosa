@@ -98,6 +98,7 @@ impl RestoreManager {
             "Filter.db",
             "Statistics.db",
             "TOC.txt",
+            "CompressionInfo.db",
         ];
 
         let mut total = 0usize;

@@ -37,8 +37,27 @@ fn decompress_data<R: ReadAt>(data: &R, ci: &CompressionInfo) -> Result<Vec<u8>>
         let mut compressed = vec![0u8; chunk_size];
         data.read_exact_at(&mut compressed, chunk_offset)?;
 
-        // Strip trailing 4-byte CRC32 checksum
-        let payload = &compressed[..chunk_size.saturating_sub(4)];
+        if chunk_size < std::mem::size_of::<u32>() {
+            return Err(ferrosa_common::Error::InvalidFormat(
+                "compressed chunk shorter than CRC trailer".into(),
+            ));
+        }
+
+        let payload_len = chunk_size - std::mem::size_of::<u32>();
+        let payload = &compressed[..payload_len];
+        let stored_crc = u32::from_be_bytes([
+            compressed[payload_len],
+            compressed[payload_len + 1],
+            compressed[payload_len + 2],
+            compressed[payload_len + 3],
+        ]);
+        let actual_crc = crc32fast::hash(payload);
+        if actual_crc != stored_crc {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "compressed chunk CRC mismatch at offset {chunk_offset}: expected {stored_crc:#010x}, got {actual_crc:#010x}"
+            )));
+        }
+
         let chunk = ci.compression.decompress(payload, ci.chunk_length)?;
         decompressed.extend_from_slice(&chunk);
     }
