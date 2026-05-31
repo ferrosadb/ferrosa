@@ -705,6 +705,9 @@ fn call_js_import(
                     )
                 })
                 .unwrap_or_else(|| format!("{detail:?}"));
+            if std::env::var_os("ASC_TRACE").is_some() {
+                eprintln!("[asc-imp] a::{name} threw: {msg}");
+            }
             tracing::debug!(target: "ferrosa_udf::asc", "import a::{name} threw: {msg}");
             return Err(wt_err(e));
         }
@@ -749,6 +752,10 @@ fn invoke_func<'js>(
             .collect::<rquickjs::Result<_>>()?;
         let mut results: Vec<Val> = ty.results().map(default_val).collect();
         func.call(&mut *scm, &params, &mut results).map_err(|e| {
+            if std::env::var_os("ASC_TRACE").is_some() {
+                let trap = e.downcast_ref::<wasmtime::Trap>();
+                eprintln!("[asc-exp] {label} TRAP {trap:?}: {e:?}");
+            }
             rquickjs::Error::new_from_js_message("wasm", "wasm", format!("call {label}: {e}"))
         })?;
         match results.first() {
