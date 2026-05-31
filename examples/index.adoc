@@ -31,7 +31,7 @@ link:timeseries-rrd.html[*RRD Time-Series Aggregation*] _New!_::
 Roll up high-frequency sensor readings into time-window summaries (min/max/avg) automatically -- RRD-style consolidation with streaming built-ins and optional WebAssembly aggregates.
 
 link:advanced-aggregation.html[*Advanced Aggregation*]::
-Group-by aggregates with built-in functions and WebAssembly user-defined aggregates.
+Group-by aggregates with built-in functions and WebAssembly user-defined aggregates -- including writing scalar UDFs as link:advanced-aggregation.html#_alternative_inline_assemblyscript[inline AssemblyScript] that the server compiles at definition time.
 
 link:ecommerce.html[*E-Commerce*]::
 Product catalog, shopping cart, and order processing.
