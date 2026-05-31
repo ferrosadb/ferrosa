@@ -174,6 +174,63 @@ JS engine on the host just orchestrates. The cross-runtime function bridging and
 the memory aliasing are the implementation work; everything upstream (engine,
 bundle, async, init shims, import surface) is proven.
 
+### Shim BUILT and PROVEN end-to-end (2026-05-31) — `examples/asc_compile.rs`
+
+The full bridge now runs. `cargo run -p ferrosa-udf --example asc_compile -- \
+/tmp/asc-host/asc-bundle.mjs "<AS source>"` compiles AssemblyScript to WASM
+**entirely through the wasmtime-backed shim** and the output executes:
+
+- `add(a,b)` → 55-byte module, `add(1,2) → 3`.
+- `fib(n:i32):i64` with a `for` loop → 94-byte module, runs (loop + i64 codegen).
+
+Both outputs start with `\0asm`, load in a *fresh* wasmtime store, and run. The
+shim handles binaryen (8.77 MB) **and** asc's own runtime, exiting cleanly (`0`).
+
+What the build pinned down (the unknowns from the design above, now closed):
+
+1. **Memory is an export named `Ca`, not `memory`.** Emscripten reads
+   `wasmExports.Ca` → `.buffer`. Look memory up by `ExternType::Memory`, not by a
+   hardcoded name. `.buffer` is a **getter** returning a fresh external
+   ArrayBuffer (`JS_NewArrayBuffer`, no copy/free) over `Memory::data_ptr/size`,
+   so callers always see current (post-grow) memory.
+2. **There IS a funcref table export `tB` (13 513 entries)** — earlier analysis
+   missed it because `wasm_imports.rs` only matched Memory/Func exports. Emscripten
+   binds it as `wasmTable` and binaryen's indirect-call glue does
+   `wasmTable.get(idx)`. Must bridge `WebAssembly.Table`: `.get(idx)` returns a JS
+   callable wrapping `Table::get → Ref::Func`; `.length` getter from `Table::size`.
+3. **Re-entrancy is real and required.** binaryen's ctors call exports *from inside
+   host imports* (import → JS → export). A `RefCell` panics; wasmtime supports
+   nested activations on one store, so the shim accesses the store through an
+   `UnsafeCell` accessor. (SPIKE shortcut: aliasing `&mut Store` is technically UB;
+   production threads the active `Caller` instead of re-borrowing the owned store.)
+4. **WebAssembly JS arg semantics matter:** missing trailing args default to `0`,
+   extras are ignored. Marshalling must **pad/truncate to the wasm arity**, not
+   `zip` (which truncated and tripped `expected 6 arguments, got 5`).
+5. **asc needs `fetch` + `WebAssembly.instantiateStreaming`** for its inline
+   `f64_pow` helper, shipped as a `data:application/wasm;base64,…` URL. Shim adds a
+   `fetch` for `data:` URLs (host-side base64 decode → `Uint8Array`) and JS
+   `instantiateStreaming`/`compileStreaming` wrappers over the native `instantiate`.
+6. **Prelude globals QuickJS lacks:** `console`, `performance.now`, **`self`**,
+   `global` (binaryen probes `typeof window/global/self`).
+7. **i64 imports/exports marshal via `BigInt`** (`JS_NewBigInt64` / `BigInt::to_i64`).
+8. **Teardown:** asc/binaryen create JS↔Rust reference cycles across the FFI
+   boundary that QuickJS's GC can't trace, so freeing the runtime trips its debug
+   `gc_obj_list` assertion. The one-shot example `process::exit(0)`s after a
+   successful compile; a long-lived embedding must drop the shim's Stores/Persistents
+   (break the cycle) before freeing the runtime.
+
+### Path to production (next when picked up)
+
+- Replace the `UnsafeCell` store with proper `Caller`-threaded re-entrancy (stash
+  the active `StoreContextMut` for the JS-invoked export wrappers; fall back to the
+  owned store at top level). Removes the only UB in the spike.
+- Lifecycle: build the shim + compile once per `CREATE FUNCTION`, then tear down
+  cleanly (no `process::exit`). Cache the asc/binaryen `Module`s across compiles.
+- Wire into DDL: `CREATE FUNCTION … LANGUAGE assemblyscript AS $$ … $$` → compile
+  to WASM bytes → store/replicate the bytes exactly like an uploaded `.wasm` UDF.
+- Resource bounds: wasmtime fuel/epoch + memory cap on the *compiler* store; cap
+  source size and output size; STRIDE the source-as-input surface.
+
 ## Goal
 
 Let users write UDF/UDA bodies in a high-level language inside

@@ -17,6 +17,7 @@ bumpalo = { version = "3", features = ["collections"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 wat = "1.248"
+anyhow = "1"
 # Spike: host JS engine for the inline-language UDF compiler (see
 # specs/todo/feature-inline-language-to-wasm-udf.md). QuickJS (MIT) via rquickjs.
 rquickjs = { version = "0.9", features = ["loader", "array-buffer", "futures"] }
