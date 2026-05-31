@@ -5,11 +5,12 @@
 //!   ./ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
 //!   cargo run -p ferrosa-udf --example asc_compile -- /tmp/asc-host/asc-bundle.mjs
 //!
-//! Status: spike. Memory is aliased zero-copy over the wasmtime instance;
-//! re-entrant JS imports use Ctx::from_raw. i64 imports are marshalled via
-//! BigInt. memory.grow re-derives the buffer.
+//! Memory is aliased zero-copy over the wasmtime instance; re-entrant JS imports
+//! call back via Ctx::from_raw; i64 imports marshal via BigInt. Re-entrancy
+//! (binaryen calls its exports from inside host imports) is handled by threading
+//! the active wasmtime `Caller` — see [`with_store_ctx`].
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -19,7 +20,8 @@ use rquickjs::{
     Value,
 };
 use wasmtime::{
-    Engine, Func, Instance, Linker, Memory, Module as WtModule, Ref, Store, Val, ValType,
+    AsContextMut, Caller, Engine, Func, Instance, Linker, Memory, Module as WtModule, Ref, Store,
+    StoreContextMut, Val, ValType,
 };
 
 /// Raw QuickJS context pointer, shuttled into wasmtime host closures so they can
@@ -35,28 +37,72 @@ struct ShimData {
     imports_a: Persistent<Object<'static>>,
 }
 
-/// Everything for one instantiated binaryen module, shared with the JS-side
-/// export functions and the memory buffer getter.
-struct Running {
-    store: Store<ShimData>,
-    instance: Instance,
-    memory: Option<Memory>,
+/// Lifetime-erased pointer to the wasmtime store context that is *currently
+/// executing* this instance. A host import publishes its `Caller` here while it
+/// re-enters JS, so the JS-side export/memory/table wrappers run against the SAME
+/// live activation instead of re-borrowing the owned store (which would alias).
+type ActiveCtx = Cell<*mut StoreContextMut<'static, ShimData>>;
+
+/// Single-threaded-only `Send + Sync` handle to the active-context cell, so it can
+/// be captured by wasmtime host closures (which require `Send + Sync`). Never
+/// actually crosses threads — the whole shim runs on one thread.
+struct SendActive(Rc<ActiveCtx>);
+unsafe impl Send for SendActive {}
+unsafe impl Sync for SendActive {}
+
+impl SendActive {
+    // Methods (vs. field access) so a `move` closure captures the whole wrapper —
+    // disjoint closure capture would otherwise grab the inner `!Send` `Rc`.
+    fn replace(
+        &self,
+        p: *mut StoreContextMut<'static, ShimData>,
+    ) -> *mut StoreContextMut<'static, ShimData> {
+        self.0.replace(p)
+    }
+    fn set(&self, p: *mut StoreContextMut<'static, ShimData>) {
+        self.0.set(p)
+    }
 }
 
-/// Single-threaded shared store that permits *re-entrant* access: binaryen's
-/// init calls exports from inside host imports (import -> JS -> export), which a
-/// `RefCell` would reject. wasmtime itself supports nested activations on one
-/// store; only Rust's borrow check is in the way. SPIKE: aliasing `&mut Store`
-/// is technically UB; the production path threads the active `Caller` instead.
-struct StoreSlot(UnsafeCell<Running>);
+/// One instantiated module, shared with its JS-side `instance.exports`. The owned
+/// store is borrowed only at the OUTERMOST call into this instance; deeper
+/// (re-entrant) calls run through `active`, so the `RefCell` is never borrowed
+/// re-entrantly and no `&mut Store` is ever aliased.
+struct Shared {
+    store: RefCell<Store<ShimData>>,
+    instance: Instance,
+    memory: Option<Memory>,
+    active: Rc<ActiveCtx>,
+}
 
-impl StoreSlot {
-    fn new(r: Running) -> Self {
-        StoreSlot(UnsafeCell::new(r))
-    }
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn get(&self) -> &mut Running {
-        &mut *self.0.get()
+/// Run `f` with a `StoreContextMut` for `shared`'s store. If this instance is
+/// already executing (a host import re-entered JS), reuse the live activation;
+/// otherwise borrow the owned store and publish it as active for the call's span.
+///
+/// Soundness: single-threaded, strict stack discipline. The owned store is
+/// borrowed (and published) only at the outermost call; during `f`'s wasm
+/// execution every re-entry arrives through a host import, which publishes its
+/// own `Caller` — so the just-published pointer is dormant while `f` holds it,
+/// and exactly one `&mut StoreContextMut` is ever live.
+fn with_store_ctx<R>(
+    shared: &Rc<Shared>,
+    f: impl FnOnce(&mut StoreContextMut<'_, ShimData>) -> R,
+) -> R {
+    let active = shared.active.get();
+    if active.is_null() {
+        let mut guard = shared.store.borrow_mut();
+        let mut scm = guard.as_context_mut();
+        let ptr = std::ptr::from_mut(&mut scm).cast::<StoreContextMut<'static, ShimData>>();
+        let prev = shared.active.replace(ptr);
+        let r = f(&mut scm);
+        shared.active.set(prev);
+        r
+    } else {
+        // SAFETY: `active` points to a `StoreContextMut` live on an outer frame,
+        // kept valid by push/pop discipline; reborrow to a fresh shorter lifetime.
+        let outer: &mut StoreContextMut<'static, ShimData> = unsafe { &mut *active };
+        let mut scm = outer.as_context_mut();
+        f(&mut scm)
     }
 }
 
@@ -410,6 +456,7 @@ fn instantiate<'js>(
         imports_a: Persistent::save(ctx, imports_a),
     };
     let mut store = Store::new(engine, data);
+    let active: Rc<ActiveCtx> = Rc::new(Cell::new(std::ptr::null_mut()));
 
     // Wire every `a::<name>` import generically: call the JS import function.
     let mut linker: Linker<ShimData> = Linker::new(engine);
@@ -424,47 +471,32 @@ fn instantiate<'js>(
         };
         let nm = name.clone();
         let res_tys: Vec<ValType> = ty.results().collect();
+        let active_h = SendActive(active.clone());
         linker
-            .func_new("a", &name, ty, move |caller, params, results| {
-                if std::env::var_os("ASC_TRACE").is_some() {
-                    eprintln!("[imp] a::{nm}({params:?})");
-                }
-                let cptr = caller.data().ctx.0;
-                let imports_a = caller.data().imports_a.clone();
-                let ctx = unsafe { Ctx::from_raw(cptr) };
-                let a = imports_a.restore(&ctx).map_err(wt_err)?;
-                let f: Function = a.get(nm.as_str()).map_err(|e| {
-                    eprintln!("[imp] a::{nm} MISSING in import object: {e}");
-                    wt_err(e)
-                })?;
-                let mut args = Args::new(ctx.clone(), params.len());
-                for p in params.iter() {
-                    args.push_arg(val_to_js(&ctx, p).map_err(wt_err)?)
-                        .map_err(wt_err)?;
-                }
-                let ret: Value = match f.call_arg::<Value>(args) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let detail = ctx.catch();
-                        let msg = detail
-                            .as_exception()
-                            .map(|x| {
-                                format!(
-                                    "{}\n{}",
-                                    x.message().unwrap_or_default(),
-                                    x.stack().unwrap_or_default()
-                                )
-                            })
-                            .unwrap_or_else(|| format!("{detail:?}"));
-                        eprintln!("[imp] a::{nm} threw: {msg}");
-                        return Err(wt_err(e));
+            .func_new(
+                "a",
+                &name,
+                ty,
+                move |mut caller: Caller<'_, ShimData>, params, results| {
+                    if std::env::var_os("ASC_TRACE").is_some() {
+                        eprintln!("[imp] a::{nm}({params:?})");
                     }
-                };
-                if let (Some(slot), Some(rty)) = (results.get_mut(0), res_tys.first()) {
-                    *slot = js_to_val(rty, &ret).map_err(wt_err)?;
-                }
-                Ok(())
-            })
+                    // Publish this activation so JS that re-enters our exports during
+                    // the import runs against THIS store, then restore on the way out.
+                    let mut scm = caller.as_context_mut();
+                    let ptr =
+                        std::ptr::from_mut(&mut scm).cast::<StoreContextMut<'static, ShimData>>();
+                    let prev = active_h.replace(ptr);
+                    // Copy out what the JS call needs; hold no borrow of `scm` across it.
+                    let (cptr, imports_a) = {
+                        let d = scm.data();
+                        (d.ctx.0, d.imports_a.clone())
+                    };
+                    let result = call_js_import(cptr, &imports_a, &nm, params, results, &res_tys);
+                    active_h.set(prev);
+                    result
+                },
+            )
             .map_err(|e| {
                 rquickjs::Error::new_from_js_message("wasm", "wasm", format!("link {name}: {e}"))
             })?;
@@ -483,11 +515,12 @@ fn instantiate<'js>(
         .as_deref()
         .and_then(|n| instance.get_memory(&mut store, n));
 
-    let running = Rc::new(StoreSlot::new(Running {
-        store,
+    let running = Rc::new(Shared {
+        store: RefCell::new(store),
         instance,
         memory,
-    }));
+        active,
+    });
 
     // Build instance.exports under each export's real name.
     let exports = Object::new(ctx.clone())?;
@@ -515,15 +548,10 @@ fn instantiate<'js>(
             }
             ExportKind::Global => {
                 // Emscripten reads exported globals via `.value`; expose a snapshot.
-                let val = {
-                    let r = unsafe { running.get() };
-                    let Running {
-                        store, instance, ..
-                    } = r;
-                    instance
-                        .get_global(&mut *store, &ename)
-                        .map(|g| g.get(&mut *store))
-                };
+                let inst = running.instance;
+                let val = with_store_ctx(&running, |scm| {
+                    inst.get_global(&mut *scm, &ename).map(|g| g.get(&mut *scm))
+                });
                 if let Some(v) = val {
                     let go = Object::new(ctx.clone())?;
                     go.set("value", val_to_js(ctx, &v)?)?;
@@ -543,90 +571,125 @@ fn instantiate<'js>(
 
 /// A `WebAssembly.Memory`-like object: `.buffer` getter aliasing the live
 /// wasmtime linear memory, plus `.grow(pages)`.
-fn build_memory_object<'js>(
-    ctx: &Ctx<'js>,
-    running: &Rc<StoreSlot>,
-) -> rquickjs::Result<Object<'js>> {
+fn build_memory_object<'js>(ctx: &Ctx<'js>, running: &Rc<Shared>) -> rquickjs::Result<Object<'js>> {
     let mem_obj = Object::new(ctx.clone())?;
     let run = running.clone();
     let buf_getter = Function::new(ctx.clone(), move |cx: Ctx<'js>| -> Value<'js> {
-        let r = unsafe { run.get() };
-        let mem = r.memory.unwrap();
-        let ptr = mem.data_ptr(&r.store);
-        let len = mem.data_size(&r.store);
+        let mem = run.memory.unwrap();
+        let (ptr, len) = with_store_ctx(&run, |scm| {
+            (mem.data_ptr(&mut *scm), mem.data_size(&mut *scm))
+        });
         external_array_buffer(&cx, ptr, len)
     })?;
     // `buffer` is a getter so callers always observe the current (possibly grown) memory.
     define_getter(ctx, &mem_obj, "buffer", buf_getter)?;
     let run_g = running.clone();
     let grow = Function::new(ctx.clone(), move |pages: u64| -> i64 {
-        let r = unsafe { run_g.get() };
-        let mem = r.memory.unwrap();
-        match mem.grow(&mut r.store, pages) {
+        let mem = run_g.memory.unwrap();
+        with_store_ctx(&run_g, |scm| match mem.grow(&mut *scm, pages) {
             Ok(prev) => prev as i64,
             Err(_) => -1,
-        }
+        })
     })?;
     mem_obj.set("grow", grow)?;
     Ok(mem_obj)
 }
 
+/// Marshal JS args and call a JS import function. Touches only the QuickJS side
+/// (no store borrow), so it is safe to run while a store activation is published.
+fn call_js_import(
+    cptr: NonNull<rquickjs::qjs::JSContext>,
+    imports_a: &Persistent<Object<'static>>,
+    name: &str,
+    params: &[Val],
+    results: &mut [Val],
+    res_tys: &[ValType],
+) -> wasmtime::Result<()> {
+    let ctx = unsafe { Ctx::from_raw(cptr) };
+    let a = imports_a.clone().restore(&ctx).map_err(wt_err)?;
+    let f: Function = a.get(name).map_err(|e| {
+        eprintln!("[imp] a::{name} MISSING in import object: {e}");
+        wt_err(e)
+    })?;
+    let mut args = Args::new(ctx.clone(), params.len());
+    for p in params.iter() {
+        args.push_arg(val_to_js(&ctx, p).map_err(wt_err)?)
+            .map_err(wt_err)?;
+    }
+    let ret: Value = match f.call_arg::<Value>(args) {
+        Ok(v) => v,
+        Err(e) => {
+            let detail = ctx.catch();
+            let msg = detail
+                .as_exception()
+                .map(|x| {
+                    format!(
+                        "{}\n{}",
+                        x.message().unwrap_or_default(),
+                        x.stack().unwrap_or_default()
+                    )
+                })
+                .unwrap_or_else(|| format!("{detail:?}"));
+            eprintln!("[imp] a::{name} threw: {msg}");
+            return Err(wt_err(e));
+        }
+    };
+    if let (Some(slot), Some(rty)) = (results.get_mut(0), res_tys.first()) {
+        *slot = js_to_val(rty, &ret).map_err(wt_err)?;
+    }
+    Ok(())
+}
+
 fn call_export<'js>(
     ctx: &Ctx<'js>,
-    run: &Rc<StoreSlot>,
+    run: &Rc<Shared>,
     name: &str,
     args: &[Value<'js>],
 ) -> rquickjs::Result<Value<'js>> {
-    let func = {
-        let r = unsafe { run.get() };
-        r.instance.get_func(&mut r.store, name)
-    }
-    .ok_or_else(|| rquickjs::Error::new_from_js_message("wasm", "export", "missing export"))?;
+    let inst = run.instance;
+    let func = with_store_ctx(run, |scm| inst.get_func(&mut *scm, name))
+        .ok_or_else(|| rquickjs::Error::new_from_js_message("wasm", "export", "missing export"))?;
     invoke_func(ctx, run, func, name, args)
 }
 
 /// Call a wasmtime `Func` with JS args, marshalling the (single) result back.
 fn invoke_func<'js>(
     ctx: &Ctx<'js>,
-    run: &Rc<StoreSlot>,
+    run: &Rc<Shared>,
     func: Func,
     label: &str,
     args: &[Value<'js>],
 ) -> rquickjs::Result<Value<'js>> {
-    let r = unsafe { run.get() };
-    let store = &mut r.store;
-    let ty = func.ty(&*store);
-    // WebAssembly JS semantics: missing trailing args default to 0, extra args
-    // are ignored. Pad/truncate to the wasm arity rather than zip-truncating.
-    let params: Vec<Val> = ty
-        .params()
-        .enumerate()
-        .map(|(i, t)| match args.get(i) {
-            Some(v) => js_to_val(&t, v),
-            None => Ok(default_val(t)),
-        })
-        .collect::<rquickjs::Result<_>>()?;
-    let mut results: Vec<Val> = ty.results().map(default_val).collect();
-    if std::env::var_os("ASC_TRACE").is_some() {
-        eprintln!("[exp] {label}({params:?})");
-    }
-    func.call(&mut *store, &params, &mut results).map_err(|e| {
-        let trap = e.downcast_ref::<wasmtime::Trap>();
-        eprintln!("[exp] {label} TRAP {trap:?}: {e:?}");
-        rquickjs::Error::new_from_js_message("wasm", "wasm", format!("call {label}: {e}"))
-    })?;
-    match results.first() {
-        Some(v) => val_to_js(ctx, v),
-        None => Ok(Value::new_undefined(ctx.clone())),
-    }
+    with_store_ctx(run, |scm| {
+        let ty = func.ty(&mut *scm);
+        // WebAssembly JS semantics: missing trailing args default to 0, extra args
+        // are ignored. Pad/truncate to the wasm arity rather than zip-truncating.
+        let params: Vec<Val> = ty
+            .params()
+            .enumerate()
+            .map(|(i, t)| match args.get(i) {
+                Some(v) => js_to_val(&t, v),
+                None => Ok(default_val(t)),
+            })
+            .collect::<rquickjs::Result<_>>()?;
+        let mut results: Vec<Val> = ty.results().map(default_val).collect();
+        if std::env::var_os("ASC_TRACE").is_some() {
+            eprintln!("[exp] {label}({params:?})");
+        }
+        func.call(&mut *scm, &params, &mut results).map_err(|e| {
+            let trap = e.downcast_ref::<wasmtime::Trap>();
+            eprintln!("[exp] {label} TRAP {trap:?}: {e:?}");
+            rquickjs::Error::new_from_js_message("wasm", "wasm", format!("call {label}: {e}"))
+        })?;
+        match results.first() {
+            Some(v) => val_to_js(ctx, v),
+            None => Ok(Value::new_undefined(ctx.clone())),
+        }
+    })
 }
 
 /// Wrap a wasmtime `Func` handle as a JS callable (used for table entries).
-fn wrap_func<'js>(
-    ctx: &Ctx<'js>,
-    run: &Rc<StoreSlot>,
-    func: Func,
-) -> rquickjs::Result<Function<'js>> {
+fn wrap_func<'js>(ctx: &Ctx<'js>, run: &Rc<Shared>, func: Func) -> rquickjs::Result<Function<'js>> {
     let run = run.clone();
     Function::new(ctx.clone(), move |cx: Ctx<'js>, args: Rest<Value<'js>>| {
         invoke_func(&cx, &run, func, "table_entry", &args.0)
@@ -637,7 +700,7 @@ fn wrap_func<'js>(
 /// funcref at that slot (binaryen's indirect-call glue uses `wasmTable.get`).
 fn build_table_object<'js>(
     ctx: &Ctx<'js>,
-    running: &Rc<StoreSlot>,
+    running: &Rc<Shared>,
     tname: String,
 ) -> rquickjs::Result<Object<'js>> {
     let tbl = Object::new(ctx.clone())?;
@@ -646,16 +709,14 @@ fn build_table_object<'js>(
     let get = Function::new(
         ctx.clone(),
         move |cx: Ctx<'js>, idx: u32| -> rquickjs::Result<Value<'js>> {
-            let func = {
-                let r = unsafe { run.get() };
-                match r.instance.get_table(&mut r.store, &tn) {
-                    Some(t) => match t.get(&mut r.store, idx as u64) {
-                        Some(Ref::Func(f)) => f,
-                        _ => None,
-                    },
-                    None => None,
-                }
-            };
+            let inst = run.instance;
+            let func = with_store_ctx(&run, |scm| match inst.get_table(&mut *scm, &tn) {
+                Some(t) => match t.get(&mut *scm, idx as u64) {
+                    Some(Ref::Func(f)) => f,
+                    _ => None,
+                },
+                None => None,
+            });
             match func {
                 Some(f) => Ok(wrap_func(&cx, &run, f)?.into_value()),
                 None => Ok(Value::new_null(cx.clone())),
@@ -667,11 +728,11 @@ fn build_table_object<'js>(
     let run_l = running.clone();
     let tn_l = tname;
     let len_getter = Function::new(ctx.clone(), move |_cx: Ctx<'js>| -> u32 {
-        let r = unsafe { run_l.get() };
-        r.instance
-            .get_table(&mut r.store, &tn_l)
-            .map(|t| t.size(&r.store) as u32)
-            .unwrap_or(0)
+        let inst = run_l.instance;
+        with_store_ctx(&run_l, |scm| match inst.get_table(&mut *scm, &tn_l) {
+            Some(t) => t.size(&mut *scm) as u32,
+            None => 0,
+        })
     })?;
     define_getter(ctx, &tbl, "length", len_getter)?;
     Ok(tbl)
