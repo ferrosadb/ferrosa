@@ -237,6 +237,10 @@ fn encode_startup_frame_v5() -> BytesMut {
 
 /// Read a v5 framed response: 6-byte LE header + CRC24 + payload + CRC32.
 /// Extracts the 9-byte envelope from inside the frame.
+///
+/// Retained for the future v5 modern-framing work; ferrosa currently caps at
+/// v4 so no test exchanges v5 frames.
+#[allow(dead_code)]
 async fn read_v5_frame(stream: &mut TcpStream) -> RawFrame {
     // Read 6-byte frame header.
     let mut frame_hdr = [0u8; 6];
@@ -272,6 +276,10 @@ async fn read_v5_frame(stream: &mut TcpStream) -> RawFrame {
 }
 
 /// Send a v5 framed message.
+///
+/// Retained for the future v5 modern-framing work; ferrosa currently caps at
+/// v4 so no test exchanges v5 frames.
+#[allow(dead_code)]
 async fn send_v5_frame(stream: &mut TcpStream, opcode: Opcode, body: &[u8]) {
     let header = FrameHeader {
         version: 0x05,
@@ -2174,51 +2182,69 @@ async fn query_with_bind_values_allow_filtering() {
     );
 }
 
-// ── CQL v5 framing tests ────────────────────────────────────────────────
+// ── CQL v4-cap negotiation tests ─────────────────────────────────────────
+//
+// ferrosa caps the native protocol at v4. v5 added a modern framing layer that
+// drivers implement inconsistently (gocql sends plain legacy envelopes at v5;
+// the DataStax Java driver sends CRC-checksummed modern frames), so no single
+// server framing mode serves both. The server therefore rejects any v5 STARTUP
+// with a protocol-version ERROR advertising `supported = 4`, and every
+// well-behaved driver falls back to the one well-tested v4 transport. Proper v5
+// modern framing is tracked as future work.
 
-/// Test that a v5 STARTUP handshake succeeds, and subsequent queries
-/// work over v5 framing (6-byte LE header + CRC24/CRC32).
+/// Parse the `[string]` message out of a CQL ERROR frame body
+/// (`[i32 code][u16 len][utf8 bytes]`).
+fn parse_error_message(body: &[u8]) -> String {
+    assert!(
+        body.len() >= 6,
+        "ERROR body too short to hold a message: {} bytes",
+        body.len()
+    );
+    let len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+    assert!(
+        body.len() >= 6 + len,
+        "ERROR body truncated: need {} bytes, have {}",
+        6 + len,
+        body.len()
+    );
+    String::from_utf8_lossy(&body[6..6 + len]).into_owned()
+}
+
+/// A v5 STARTUP must be rejected with a protocol-version ERROR (code 0x000A),
+/// itself framed as v4 (0x84) so the driver can read it, advertising v4 as the
+/// greatest supported version. The server must NOT reply READY at v5 — that
+/// would leave a v5 driver expecting modern framing the server can't speak.
 #[tokio::test]
-async fn v5_startup_and_query_over_framed_transport() {
+async fn v5_startup_is_rejected_to_force_v4_fallback() {
     let (state, _dir) = setup_state();
     let server = CqlServer::new(test_config(true), state);
     let addr = server.start_background().await.unwrap();
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // Send v5 STARTUP (unframed — same 9-byte envelope as v4).
-    let startup = encode_startup_frame_v5();
-    stream.write_all(&startup).await.unwrap();
+    // Send a v5 STARTUP (version byte 0x05 + USE_BETA flag).
+    stream.write_all(&encode_startup_frame_v5()).await.unwrap();
 
-    // Read READY response (unframed — server hasn't switched yet).
-    let ready = read_frame(&mut stream).await;
+    // The server rejects v5 at decode and replies with a v4-framed ERROR.
+    let resp = read_frame(&mut stream).await;
     assert_eq!(
-        ready.opcode,
-        Opcode::Ready,
-        "expected READY after v5 STARTUP"
+        resp.opcode,
+        Opcode::Error,
+        "v5 STARTUP must be rejected with an ERROR, not accepted with READY"
     );
     assert_eq!(
-        ready.header.version, 0x85,
-        "v5 response version should be 0x85"
+        resp.header.version, 0x84,
+        "the rejection ERROR must be framed as v4 (0x84) so the driver can read it"
     );
-
-    // After READY, both sides switch to v5 framing.
-    // Send a query in v5 frame format.
-    let query = b"SELECT key FROM system.local";
-    let mut body = BytesMut::new();
-    // Query body: [long string][consistency(u16)][flags(u8)]
-    body.put_i32(query.len() as i32);
-    body.put_slice(query);
-    body.put_u16(0x0001); // CL ONE
-    body.put_u8(0x00); // no flags
-    send_v5_frame(&mut stream, Opcode::Query, &body).await;
-
-    // Read result in v5 frame format.
-    let result = read_v5_frame(&mut stream).await;
+    let error_code = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
     assert_eq!(
-        result.opcode,
-        Opcode::Result,
-        "expected RESULT for SELECT query over v5 framing"
+        error_code, 0x000A,
+        "protocol-version rejection must use error code 0x000A (protocol error)"
+    );
+    let msg = parse_error_message(&resp.body);
+    assert!(
+        msg.contains("greatest is 4"),
+        "rejection must advertise v4 as the greatest supported version; got: {msg}"
     );
 }
 
@@ -2505,24 +2531,34 @@ async fn prepare_no_bind_markers_reports_col_count_zero() {
     );
 }
 
-/// Test that v4 connections still work alongside v5.
+/// On the same server, a v4 connection succeeds while a v5 connection is
+/// rejected — the two do NOT coexist under the v4 cap.
 #[tokio::test]
-async fn v4_and_v5_coexist_on_same_server() {
+async fn v4_works_and_v5_is_rejected_on_same_server() {
     let (state, _dir) = setup_state();
     let server = CqlServer::new(test_config(true), state);
     let addr = server.start_background().await.unwrap();
 
-    // v4 connection
+    // v4 connection: STARTUP → READY at 0x84.
     let mut v4 = TcpStream::connect(addr).await.unwrap();
     send_startup(&mut v4).await;
     let ready4 = read_frame(&mut v4).await;
     assert_eq!(ready4.opcode, Opcode::Ready);
     assert_eq!(ready4.header.version, 0x84, "v4 response should be 0x84");
 
-    // v5 connection
+    // v5 connection: STARTUP → protocol-version ERROR, forcing the driver to
+    // retry at v4.
     let mut v5 = TcpStream::connect(addr).await.unwrap();
     v5.write_all(&encode_startup_frame_v5()).await.unwrap();
-    let ready5 = read_frame(&mut v5).await;
-    assert_eq!(ready5.opcode, Opcode::Ready);
-    assert_eq!(ready5.header.version, 0x85, "v5 response should be 0x85");
+    let resp5 = read_frame(&mut v5).await;
+    assert_eq!(
+        resp5.opcode,
+        Opcode::Error,
+        "v5 must be rejected, not accepted alongside v4"
+    );
+    let error_code = i32::from_be_bytes(resp5.body[0..4].try_into().unwrap());
+    assert_eq!(
+        error_code, 0x000A,
+        "v5 rejection must use error code 0x000A (protocol error)"
+    );
 }

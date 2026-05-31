@@ -36,7 +36,11 @@ func ferrosaPort() int {
 func newCluster() *gocql.ClusterConfig {
 	cluster := gocql.NewCluster(ferrosaHost())
 	cluster.Port = ferrosaPort()
-	cluster.ProtoVersion = 5
+	// ferrosa speaks CQL native protocol v4 (it caps negotiation at v4 so all
+	// drivers share one well-tested legacy framing path; v5 adds only
+	// perf/integrity framing, no features). gocql does not auto-downgrade from a
+	// pinned ProtoVersion, so pin v4 explicitly to match the server.
+	cluster.ProtoVersion = 4
 	cluster.Consistency = gocql.One
 	cluster.Timeout = 30 * time.Second
 	cluster.ConnectTimeout = 30 * time.Second

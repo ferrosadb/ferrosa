@@ -331,6 +331,7 @@ pub(crate) async fn handle_connection<S>(
                         VERSION_RESPONSE
                     };
                     let opcode = maybe_frame.header.opcode;
+                    let proto_version = client_protocol_version;
                     let body = maybe_frame.body.clone();
                     let state_clone = state.clone();
                     let resp_tx = resp_tx.clone();
@@ -353,6 +354,7 @@ pub(crate) async fn handle_connection<S>(
                                         &state_clone,
                                         &body,
                                         peer_addr,
+                                        proto_version,
                                     )
                                     .await
                                 }
@@ -363,6 +365,7 @@ pub(crate) async fn handle_connection<S>(
                                         &state_clone,
                                         &body,
                                         peer_addr,
+                                        proto_version,
                                     )
                                     .await
                                 }
@@ -495,16 +498,16 @@ pub(crate) async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // CQL v5 framing (CRC24/CRC32 envelopes) is only
-                            // enabled when the client sets USE_BETA (0x10) in
-                            // the STARTUP flags, matching Cassandra's behavior.
-                            // Clients that negotiate v5 without USE_BETA (e.g.,
-                            // Python cassandra-driver) use v5 semantics over
-                            // v4 unframed transport.
-                            if client_protocol_version >= 0x05 && client_use_beta {
-                                debug!("enabling v5 framing for {peer} (USE_BETA set)");
-                                framed.codec_mut().enable_v5_framing();
-                            }
+                            // Stay on legacy (unframed) envelope transport for
+                            // all clients. Real drivers that negotiate v5 —
+                            // including ones that set USE_BETA (0x10), like
+                            // gocql and the DataStax Java driver — send plain
+                            // 9-byte envelopes, NOT CRC24/CRC32 modern frames.
+                            // Switching to modern framing on USE_BETA misreads
+                            // their legacy envelopes (a v5 frame-header CRC24
+                            // mismatch on every request). v5 message semantics
+                            // ride over the legacy transport.
+                            let _ = client_use_beta;
                         }
                     }
                     HandleResult::StartSubscription {
@@ -896,11 +899,27 @@ async fn handle_frame(
         },
         ConnectionPhase::Ready => match frame.header.opcode {
             Opcode::Query => {
-                handle_query(auth_context, current_keyspace, state, &frame.body, peer).await
+                handle_query(
+                    auth_context,
+                    current_keyspace,
+                    state,
+                    &frame.body,
+                    peer,
+                    frame.header.version,
+                )
+                .await
             }
             Opcode::Prepare => handle_prepare(auth_context, current_keyspace, state, &frame.body),
             Opcode::Execute => {
-                handle_execute(auth_context, current_keyspace, state, &frame.body, peer).await
+                handle_execute(
+                    auth_context,
+                    current_keyspace,
+                    state,
+                    &frame.body,
+                    peer,
+                    frame.header.version,
+                )
+                .await
             }
             Opcode::Batch => {
                 handle_batch(auth_context, current_keyspace, state, &frame.body, peer).await
@@ -1106,6 +1125,7 @@ async fn handle_query(
     state: &SharedState,
     body: &Bytes,
     peer: SocketAddr,
+    protocol_version: u8,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query][short consistency][byte flags]...
     if body.len() < 4 {
@@ -1164,7 +1184,7 @@ async fn handle_query(
             table_keyspace: table_ks,
             table_name,
         };
-        stmt = match substitute_bound_values(&temp_plan, cursor) {
+        stmt = match substitute_bound_values(&temp_plan, cursor, protocol_version) {
             Ok(s) => s,
             Err(e) => {
                 return HandleResult::Reply(Opcode::Error, e.encode_body());
@@ -1317,6 +1337,7 @@ async fn handle_execute(
     state: &SharedState,
     body: &Bytes,
     peer: SocketAddr,
+    protocol_version: u8,
 ) -> HandleResult {
     // Parse the prepared ID: [short id_len][bytes id]
     if body.len() < 2 {
@@ -1354,7 +1375,7 @@ async fn handle_execute(
     };
 
     // Parse bound values from the EXECUTE frame and substitute into the AST.
-    let stmt = match substitute_bound_values(&plan, cursor) {
+    let stmt = match substitute_bound_values(&plan, cursor, protocol_version) {
         Ok(s) => s,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
@@ -1412,6 +1433,10 @@ async fn handle_batch(
         }
         let kind = cursor.get_u8();
 
+        // Parse the statement, then substitute its bound values. BATCH carries
+        // per-statement values (`[short n_values]([int len][bytes])*`) right
+        // after each statement — they must be bound into the bind markers, not
+        // skipped, or route() rejects the leftover markers.
         let stmt = if kind == 0 {
             // Inline query string: [int len][bytes query]
             if cursor.remaining() < 4 {
@@ -1432,11 +1457,31 @@ async fn handle_batch(
             };
             cursor.advance(query_len as usize);
 
-            match parser::parse(&query) {
+            let parsed = match parser::parse(&query) {
                 Ok(s) => s,
                 Err(e) => {
                     return HandleResult::Reply(Opcode::Error, e.encode_body());
                 }
+            };
+
+            // Resolve bind-marker types from the schema (same as the
+            // unprepared QUERY-with-values path) so values decode correctly.
+            let (table_ks, table_name) = extract_keyspace_table(&parsed, current_keyspace);
+            let (bound_columns, _) =
+                analyze_prepared_columns(&parsed, &table_ks, &table_name, state);
+            let temp_plan = PreparedPlan {
+                id: [0u8; 16],
+                query,
+                statement: parsed,
+                keyspace: current_keyspace.clone(),
+                result_columns: Vec::new(),
+                bound_columns,
+                table_keyspace: table_ks,
+                table_name,
+            };
+            match substitute_batch_values(&temp_plan, &mut cursor) {
+                Ok(s) => s,
+                Err(e) => return HandleResult::Reply(Opcode::Error, e.encode_body()),
             }
         } else if kind == 1 {
             // Prepared ID: [short id_len][bytes id]
@@ -1454,7 +1499,10 @@ async fn handle_batch(
             cursor.advance(16);
 
             match state.prepared_cache.get(&id) {
-                Some(p) => p.statement.clone(),
+                Some(p) => match substitute_batch_values(&p, &mut cursor) {
+                    Ok(s) => s,
+                    Err(e) => return HandleResult::Reply(Opcode::Error, e.encode_body()),
+                },
                 None => {
                     let err = CqlError::Unprepared(id);
                     return HandleResult::Reply(Opcode::Error, err.encode_body());
@@ -1464,20 +1512,6 @@ async fn handle_batch(
             let err = CqlError::Protocol(format!("BATCH: invalid statement kind {kind}"));
             return HandleResult::Reply(Opcode::Error, err.encode_body());
         };
-
-        // Skip bound values: [short n_values]([int val_len][bytes val])*
-        if cursor.remaining() >= 2 {
-            let n_values = cursor.get_u16() as usize;
-            for _ in 0..n_values {
-                if cursor.remaining() < 4 {
-                    break;
-                }
-                let val_len = cursor.get_i32();
-                if val_len > 0 && cursor.remaining() >= val_len as usize {
-                    cursor.advance(val_len as usize);
-                }
-            }
-        }
 
         statements.push(stmt);
     }
@@ -1724,13 +1758,73 @@ fn system_schema_column_type(table_ks: &str, table_name: &str, col_name: &str) -
 }
 
 fn system_schema_column_specs(table_ks: &str, table_name: &str) -> Vec<(String, CqlType)> {
-    if table_ks != "system_schema" {
-        return Vec::new();
-    }
-
     let text = || CqlType::Varchar;
     let text_map = || CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar));
     let text_list = || CqlType::List(Box::new(CqlType::Varchar));
+    let text_set = || CqlType::Set(Box::new(CqlType::Varchar));
+
+    // `system` keyspace topology tables. These must mirror the column shape
+    // emitted by the system.local / system.peers handlers in router.rs so that
+    // a prepared `SELECT col, ... FROM system.local` advertises non-empty,
+    // correctly-typed result metadata. Strict drivers (gocql, DataStax Java)
+    // unmarshal EXECUTE rows using this prepared metadata — an empty column
+    // list makes them fail with "not enough columns to scan into".
+    if table_ks == "system" {
+        let specs: Vec<(&str, CqlType)> = match table_name {
+            "local" => vec![
+                ("key", text()),
+                ("cluster_name", text()),
+                ("data_center", text()),
+                ("rack", text()),
+                ("host_id", CqlType::Uuid),
+                ("partitioner", text()),
+                ("native_protocol_version", text()),
+                ("cql_version", text()),
+                ("release_version", text()),
+                ("schema_version", CqlType::Uuid),
+                ("rpc_port", CqlType::Int),
+                ("listen_address", CqlType::Inet),
+                ("broadcast_address", CqlType::Inet),
+                ("rpc_address", CqlType::Inet),
+                ("bootstrapped", text()),
+                ("tokens", text_set()),
+            ],
+            "peers" => vec![
+                ("peer", CqlType::Inet),
+                ("peer_port", CqlType::Int),
+                ("data_center", text()),
+                ("rack", text()),
+                ("host_id", CqlType::Uuid),
+                ("native_address", CqlType::Inet),
+                ("native_port", CqlType::Int),
+                ("rpc_address", CqlType::Inet),
+                ("schema_version", CqlType::Uuid),
+                ("release_version", text()),
+                ("tokens", text_set()),
+            ],
+            "peers_v2" => vec![
+                ("peer", CqlType::Inet),
+                ("peer_port", CqlType::Int),
+                ("data_center", text()),
+                ("rack", text()),
+                ("host_id", CqlType::Uuid),
+                ("native_address", CqlType::Inet),
+                ("native_port", CqlType::Int),
+                ("schema_version", CqlType::Uuid),
+                ("release_version", text()),
+                ("tokens", text_set()),
+            ],
+            _ => Vec::new(),
+        };
+        return specs
+            .into_iter()
+            .map(|(name, ty)| (name.to_string(), ty))
+            .collect();
+    }
+
+    if table_ks != "system_schema" {
+        return Vec::new();
+    }
 
     let specs: Vec<(&str, CqlType)> = match table_name {
         "keyspaces" => vec![
@@ -1951,11 +2045,36 @@ fn build_result_columns(
                     result.push((name.clone(), cql_type));
                 }
             }
-            SelectColumn::FunctionCall { alias, name, .. } => {
-                // For function calls, use the alias or function name;
-                // type is unknown without deeper analysis, default to Varchar.
-                let col_name = alias.as_ref().unwrap_or(name).clone();
-                result.push((col_name, CqlType::Varchar));
+            SelectColumn::FunctionCall {
+                alias, name, args, ..
+            } => {
+                // Type built-in functions so prepared-statement result metadata
+                // matches what EXECUTE returns. Strict drivers (gocql, DataStax
+                // Java) unmarshal using the PREPARE metadata, so a wrong type
+                // (e.g. COUNT(*) as varchar) fails with "can not unmarshal
+                // varchar into *int". Mirror build_column_info()'s typing.
+                let fn_lower = name.to_lowercase();
+                let display = alias.clone().unwrap_or_else(|| {
+                    if fn_lower == "count" {
+                        "count".to_string()
+                    } else {
+                        fn_lower.clone()
+                    }
+                });
+                let cql_type = match fn_lower.as_str() {
+                    "count" | "writetime" | "token" => CqlType::Bigint,
+                    "ttl" => CqlType::Int,
+                    "now" | "totimestamp" | "todate" | "currenttimestamp" => CqlType::Timestamp,
+                    "uuid" | "timeuuid" => CqlType::Uuid,
+                    "avg" => CqlType::Double,
+                    "min" | "max" | "sum" => args
+                        .first()
+                        .and_then(|a| crate::router::extract_column_name(a).ok())
+                        .and_then(|c| resolve(&c))
+                        .unwrap_or(CqlType::Varchar),
+                    _ => CqlType::Varchar,
+                };
+                result.push((display, cql_type));
             }
         }
     }
@@ -2053,12 +2172,27 @@ fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
 /// The cursor should be positioned after the consistency level bytes.
 /// CQL v5 EXECUTE frame layout after consistency:
 ///   `[int flags][short n_values]([int len][bytes value])*`
-fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Statement, CqlError> {
-    // Parse flags byte (CQL v4: 1 byte). Bit 0x01 = Values present.
-    if cursor.remaining() < 1 {
-        return Ok(plan.statement.clone());
-    }
-    let flags = cursor.get_u8();
+fn substitute_bound_values(
+    plan: &PreparedPlan,
+    mut cursor: &[u8],
+    protocol_version: u8,
+) -> Result<Statement, CqlError> {
+    // Query/EXECUTE parameter flags. CQL native protocol v5 (§4.1.4) widened
+    // this field from a 1-byte `[byte]` to a 4-byte `[int]`. Reading the wrong
+    // width misaligns the values section, so bind markers never get
+    // substituted (driver sends `?` + values, server still sees the marker and
+    // rejects it). Bit 0x01 = Values present.
+    let flags = if protocol_version >= 0x05 {
+        if cursor.remaining() < 4 {
+            return Ok(plan.statement.clone());
+        }
+        cursor.get_u32()
+    } else {
+        if cursor.remaining() < 1 {
+            return Ok(plan.statement.clone());
+        }
+        cursor.get_u8() as u32
+    };
     let has_values = (flags & 0x01) != 0;
 
     if !has_values {
@@ -2104,6 +2238,52 @@ fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Sta
     }
 
     // Walk the statement AST and replace BindMarker nodes in order.
+    let mut substitution_idx = 0usize;
+    Ok(substitute_in_statement(
+        &plan.statement,
+        &bound_terms,
+        &mut substitution_idx,
+    ))
+}
+
+/// Substitute bound values for a single statement inside a BATCH.
+///
+/// BATCH per-statement values use a *different* framing than QUERY/EXECUTE:
+/// there is **no leading flags byte** — the section is just
+/// `[short n_values]([int len][bytes value])*` (CQL v4/v5 §4.1.7). The cursor
+/// is advanced past the consumed values so the caller can continue parsing the
+/// next statement (or the trailing consistency level).
+fn substitute_batch_values(plan: &PreparedPlan, cursor: &mut &[u8]) -> Result<Statement, CqlError> {
+    if cursor.remaining() < 2 {
+        return Ok(plan.statement.clone());
+    }
+    let n_values = cursor.get_u16() as usize;
+
+    let mut bound_terms: Vec<Term> = Vec::with_capacity(n_values);
+    for i in 0..n_values {
+        if cursor.remaining() < 4 {
+            return Err(CqlError::Protocol("BATCH: truncated value length".into()));
+        }
+        let val_len = cursor.get_i32();
+        if val_len < 0 {
+            bound_terms.push(Term::Null);
+        } else {
+            let val_len = val_len as usize;
+            if cursor.remaining() < val_len {
+                return Err(CqlError::Protocol("BATCH: truncated value bytes".into()));
+            }
+            let val_bytes = &cursor[..val_len];
+            cursor.advance(val_len);
+
+            let cql_type = if i < plan.bound_columns.len() {
+                &plan.bound_columns[i].1
+            } else {
+                &CqlType::Blob
+            };
+            bound_terms.push(raw_bytes_to_term(cql_type, val_bytes));
+        }
+    }
+
     let mut substitution_idx = 0usize;
     Ok(substitute_in_statement(
         &plan.statement,
@@ -2646,7 +2826,7 @@ mod tests {
         let uuid1 = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let uuid2 = uuid::Uuid::parse_str("86da7931-7c87-54fe-8a49-eabc21c025aa").unwrap();
         let payload = encode_values(&[uuid1.as_bytes(), uuid2.as_bytes()]);
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         // Then: the WHERE clause values should be UuidLiterals, not BindMarkers
         if let Statement::Select(s) = &result {
@@ -2667,6 +2847,137 @@ mod tests {
     }
 
     #[test]
+    fn substitute_batch_values_replaces_bind_markers() {
+        // BATCH per-statement values have NO flags byte — just
+        // [short n_values]([int len][bytes])*. Regression: handle_batch used to
+        // skip these bytes, leaving BindMarkers that route() then rejected.
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name) VALUES (?, ?)",
+            vec![("id", CqlType::Int), ("name", CqlType::Varchar)],
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_be_bytes()); // n_values
+        payload.extend_from_slice(&4i32.to_be_bytes()); // id len
+        payload.extend_from_slice(&7i32.to_be_bytes()); // id = 7
+        let name = b"alice";
+        payload.extend_from_slice(&(name.len() as i32).to_be_bytes());
+        payload.extend_from_slice(name);
+
+        let mut cursor = &payload[..];
+        let result = substitute_batch_values(&plan, &mut cursor).unwrap();
+
+        if let Statement::Insert(i) = &result {
+            assert!(
+                matches!(&i.values[0], Term::IntegerLiteral(7)),
+                "first value should be 7, got {:?}",
+                i.values[0]
+            );
+            assert!(
+                matches!(&i.values[1], Term::StringLiteral(s) if s == "alice"),
+                "second value should be 'alice', got {:?}",
+                i.values[1]
+            );
+            assert!(cursor.is_empty(), "cursor should be fully consumed");
+        } else {
+            panic!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn substitute_batch_values_handles_null() {
+        // A negative length is a NULL bound value → Term::Null (which
+        // build_row now writes as a tombstone).
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name) VALUES (?, ?)",
+            vec![("id", CqlType::Int), ("name", CqlType::Varchar)],
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_be_bytes());
+        payload.extend_from_slice(&4i32.to_be_bytes());
+        payload.extend_from_slice(&7i32.to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+
+        let mut cursor = &payload[..];
+        let result = substitute_batch_values(&plan, &mut cursor).unwrap();
+        if let Statement::Insert(i) = &result {
+            assert!(matches!(&i.values[1], Term::Null), "got {:?}", i.values[1]);
+        } else {
+            panic!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn substitute_v5_four_byte_flags_replaces_bind_markers() {
+        // CQL v5 (§4.1.4) widened the query-parameters <flags> field from a
+        // 1-byte [byte] to a 4-byte [int]. gocql and the DataStax Java driver
+        // send unprepared queries this way; reading 1 byte misaligns the values
+        // section so the bind marker survives and route() rejects it.
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name) VALUES (?, ?)",
+            vec![("id", CqlType::Int), ("name", CqlType::Varchar)],
+        );
+
+        // v5 params: [int flags=0x01][short n_values=2][int len][bytes]...
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_be_bytes()); // 4-byte flags: VALUES
+        payload.extend_from_slice(&2u16.to_be_bytes()); // n_values
+        payload.extend_from_slice(&4i32.to_be_bytes());
+        payload.extend_from_slice(&7i32.to_be_bytes()); // id = 7
+        let name = b"alice";
+        payload.extend_from_slice(&(name.len() as i32).to_be_bytes());
+        payload.extend_from_slice(name);
+
+        let result = substitute_bound_values(&plan, &payload, 5).unwrap();
+        if let Statement::Insert(i) = &result {
+            assert!(
+                matches!(&i.values[0], Term::IntegerLiteral(7)),
+                "got {:?}",
+                i.values[0]
+            );
+            assert!(
+                matches!(&i.values[1], Term::StringLiteral(s) if s == "alice"),
+                "got {:?}",
+                i.values[1]
+            );
+        } else {
+            panic!("expected Insert");
+        }
+
+        // The SAME payload read as v4 (1-byte flags) must NOT substitute — proof
+        // the width matters and we are not accidentally version-agnostic.
+        let v4 = substitute_bound_values(&plan, &payload, 4).unwrap();
+        if let Statement::Insert(i) = &v4 {
+            assert!(
+                matches!(&i.values[0], Term::BindMarker(_)),
+                "v4 misread should leave the marker, got {:?}",
+                i.values[0]
+            );
+        }
+    }
+
+    #[test]
+    fn system_table_column_specs_are_typed_for_prepare() {
+        // A prepared `SELECT cluster_name, data_center FROM system.local` must
+        // advertise non-empty, correctly-typed result metadata, or strict
+        // drivers (gocql, DataStax Java) fail with "not enough columns to scan
+        // into: have N want 0".
+        let local = system_schema_column_specs("system", "local");
+        assert!(!local.is_empty(), "system.local must expose column specs");
+        let by_name: std::collections::HashMap<String, CqlType> = local.into_iter().collect();
+        assert_eq!(by_name.get("cluster_name"), Some(&CqlType::Varchar));
+        assert_eq!(by_name.get("data_center"), Some(&CqlType::Varchar));
+        assert_eq!(by_name.get("host_id"), Some(&CqlType::Uuid));
+        assert_eq!(by_name.get("rpc_port"), Some(&CqlType::Int));
+
+        assert!(!system_schema_column_specs("system", "peers").is_empty());
+        assert!(!system_schema_column_specs("system", "peers_v2").is_empty());
+        // Unrelated keyspaces still resolve to nothing.
+        assert!(system_schema_column_specs("system", "bogus").is_empty());
+        assert!(system_schema_column_specs("myks", "local").is_empty());
+    }
+
+    #[test]
     fn substitute_no_values_flag_returns_unchanged() {
         // Given: a SELECT with bind markers
         let plan = make_plan(
@@ -2676,7 +2987,7 @@ mod tests {
 
         // When: the frame has no values (flags = 0)
         let payload = vec![0x00u8]; // flags: no values
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         // Then: bind markers remain
         if let Statement::Select(s) = &result {
@@ -2699,7 +3010,7 @@ mod tests {
         payload.extend_from_slice(&1u16.to_be_bytes()); // 1 value
         payload.extend_from_slice(&(-1i32).to_be_bytes()); // null
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
         if let Statement::Select(s) = &result {
             assert!(
                 matches!(&s.where_clauses[0].value, Term::Null),
@@ -2726,7 +3037,7 @@ mod tests {
         let score = 42i32.to_be_bytes();
         let payload = encode_values(&[uuid.as_bytes(), name, &score]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
         if let Statement::Insert(i) = &result {
             assert_eq!(i.values.len(), 3);
             assert!(matches!(&i.values[0], Term::UuidLiteral(_)));
@@ -2744,7 +3055,7 @@ mod tests {
             vec![("pk", CqlType::Int)],
         );
 
-        let result = substitute_bound_values(&plan, &[]).unwrap();
+        let result = substitute_bound_values(&plan, &[], 4).unwrap();
         if let Statement::Select(s) = &result {
             assert!(matches!(&s.where_clauses[0].value, Term::BindMarker(_)));
         } else {
@@ -2764,7 +3075,7 @@ mod tests {
         let v2 = b"unknown";
         let payload = encode_values(&[&v1, v2]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
         if let Statement::Select(s) = &result {
             assert!(
                 matches!(&s.where_clauses[0].value, Term::IntegerLiteral(42)),
@@ -2848,7 +3159,7 @@ mod tests {
         let pk_val = b"partition-key-1";
         let payload = encode_values(&[pk_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Select(s) = &result {
             assert_eq!(s.where_clauses.len(), 1, "expected one WHERE clause");
@@ -2876,7 +3187,7 @@ mod tests {
         let v_val = b"hello";
         let payload = encode_values(&[&pk_val, v_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Insert(i) = &result {
             assert_eq!(i.values.len(), 2, "expected two INSERT values");
@@ -2909,7 +3220,7 @@ mod tests {
         let pk_val = 42i32.to_be_bytes();
         let payload = encode_values(&[v_val, &pk_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Update(u) = &result {
             assert_eq!(u.assignments.len(), 1, "expected one assignment");
@@ -2964,7 +3275,7 @@ mod tests {
             entity_id.as_bytes(),
         ]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Update(u) = &result {
             assert_eq!(u.assignments.len(), 1, "expected one assignment");
@@ -2992,7 +3303,7 @@ mod tests {
         let pk_val = 99i32.to_be_bytes();
         let payload = encode_values(&[&pk_val]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Delete(d) = &result {
             assert_eq!(d.where_clauses.len(), 1, "expected one WHERE clause");
@@ -3058,7 +3369,7 @@ mod tests {
             &inet_val,
         ]);
 
-        let result = substitute_bound_values(&plan, &payload).unwrap();
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
 
         if let Statement::Insert(i) = &result {
             assert_eq!(i.values.len(), 10, "expected 10 INSERT values");

@@ -397,7 +397,9 @@ class CqlSmokeTest
             AssertTrue(scores.Contains(200), "scores should contain 200");
             AssertTrue(scores.Contains(300), "scores should contain 300");
 
-            var props = row.GetValue<Dictionary<string, string>>("props");
+            // The C# driver materializes a CQL map as a SortedDictionary
+            // (maps are key-ordered), not a plain Dictionary.
+            var props = row.GetValue<SortedDictionary<string, string>>("props");
             AssertTrue(props != null, "props should not be null");
             AssertEqual(props.Count, 2, "props count");
             AssertEqual(props["env"], "test", "props['env']");

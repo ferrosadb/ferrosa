@@ -271,11 +271,11 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .collect();
                 Ok(CqlValue::Vector(floats))
             }
-            _ => Err(CqlError::Invalid(format!(
-                "type mismatch: expected {}, got blob literal ({} bytes)",
-                cql_type_name(target),
-                b.len()
-            ))),
+            // Bound (`?`) values for collections, tuples, UDTs, and the
+            // remaining scalar types arrive as raw CQL-serialized bytes. Decode
+            // them against the target type rather than rejecting them as an
+            // opaque blob — this is what lets drivers bind list/set/map values.
+            _ => crate::types::decode_value(target, b),
         },
 
         Term::ListLiteral(items) => match target {
@@ -950,6 +950,17 @@ pub fn build_row(
     let mut cells: Vec<(u16, CellValue)> = column_values
         .iter()
         .map(|(idx, val)| {
+            // An explicit NULL deletes the column (Cassandra semantics): emit
+            // a cell tombstone, not a live empty-bytes cell, so reads return
+            // null rather than "" / 0.
+            if matches!(val, CqlValue::Null) {
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let local_deletion_time = i32::try_from(now_secs).unwrap_or(i32::MAX);
+                return (*idx, CellValue::tombstone(timestamp, local_deletion_time));
+            }
             let encoded = encode_value(val);
             let cell = match ttl {
                 Some(ttl_secs) => {
@@ -1077,6 +1088,20 @@ pub fn partition_to_rows(
 /// Convert a storage `Partition` using an explicit storage-index to table-index
 /// map. New schemas use Cassandra column-name order for storage cells, which can
 /// differ from original CQL declaration order.
+/// True if a `local_deletion_time` (seconds since epoch) has passed.
+/// `i32::MAX` is the "no expiry" sentinel and never expires.
+fn ldt_is_expired(local_deletion_time: i32, now_secs: i32) -> bool {
+    // i32::MAX is the "no expiry" sentinel (NO_DELETION_TIME).
+    local_deletion_time != i32::MAX && now_secs >= local_deletion_time
+}
+
+/// True if a cell still holds a live value at `now_secs` — neither a tombstone
+/// nor an expired TTL cell.
+fn cell_is_live(cell: &CellValue, now_secs: i32) -> bool {
+    !(cell.is_tombstone()
+        || cell.is_expiring() && ldt_is_expired(cell.local_deletion_time, now_secs))
+}
+
 pub fn partition_to_rows_with_storage_mapping(
     partition: &ferrosa_sstable::types::Partition,
     column_names: &[String],
@@ -1087,10 +1112,32 @@ pub fn partition_to_rows_with_storage_mapping(
 ) -> Vec<Vec<Option<CqlValue>>> {
     let mut result = Vec::new();
 
+    // Wall-clock seconds for TTL expiry, evaluated once per call. Expiry is
+    // applied at read time because compaction does not purge expired cells.
+    let now_secs = i32::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i32::MAX);
+
     // Pre-decode PK values from the partition key
     let pk_values = decode_pk(&partition.key, pk_columns.len());
 
     for row in &partition.rows {
+        // TTL expiry: a row whose primary-key liveness was written with a TTL
+        // and has expired is gone — unless some cell is still live (a later
+        // non-TTL UPDATE can resurrect it). Mirrors Cassandra semantics.
+        let pkl = &row.primary_key_liveness;
+        let liveness_expired = pkl.has_ttl() && ldt_is_expired(pkl.local_deletion_time, now_secs);
+        if liveness_expired {
+            let any_live_cell = row.cells.iter().any(|(_, c)| cell_is_live(c, now_secs));
+            if !any_live_cell {
+                continue;
+            }
+        }
+
         // Skip tombstone rows — but only if no newer mutation supersedes the
         // tombstone. In Cassandra semantics, an UPDATE or INSERT after a
         // DELETE resurrects the row: the primary_key_liveness timestamp or
@@ -1141,7 +1188,8 @@ pub fn partition_to_rows_with_storage_mapping(
                 None => continue, // out-of-range storage index — skip
             };
             if table_idx < column_types.len() {
-                if cell.is_tombstone() {
+                if !cell_is_live(cell, now_secs) {
+                    // Tombstone or expired TTL cell → reads as null.
                     output_row[table_idx] = None;
                 } else if let Some(ref value_bytes) = cell.value {
                     if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
@@ -2059,6 +2107,21 @@ mod tests {
     }
 
     #[test]
+    fn build_row_null_value_is_a_tombstone_not_an_empty_live_cell() {
+        // An explicit NULL in INSERT/UPDATE deletes the column (Cassandra
+        // semantics). It must become a cell tombstone so reads return null —
+        // not a live empty-bytes cell, which reads back as "" for text.
+        let row = build_row(&[(0, CqlValue::Null)], &[], 1000, None);
+        assert_eq!(row.cells.len(), 1);
+        assert!(
+            row.cells[0].1.is_tombstone(),
+            "null insert should produce a tombstone cell"
+        );
+        assert!(!row.cells[0].1.is_live());
+        assert_eq!(row.cells[0].1.timestamp, 1000);
+    }
+
+    #[test]
     fn build_row_with_clustering() {
         let row = build_row(
             &[(0, CqlValue::Int(42))],
@@ -2246,6 +2309,115 @@ mod tests {
         assert_eq!(rows[0][0], Some(CqlValue::Int(1)));
         // Tombstone cell -> None
         assert_eq!(rows[0][1], None);
+    }
+
+    #[test]
+    fn partition_to_rows_expired_cell_reads_as_null() {
+        use ferrosa_sstable::types::Partition;
+
+        let pk_bytes = encode_value(&CqlValue::Int(1));
+        let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+        // An expiring "name" cell whose local_deletion_time is in the past
+        // (Nov 2023) — always expired relative to any real test-run clock.
+        let expired = CellValue::expiring(b"alice".to_vec(), 1000, 1, 1_700_000_000);
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, expired)],
+            deletion: DeletionTime::LIVE,
+            // Live primary-key liveness keeps the row present (only the cell
+            // expired), so we still see the row with a null name.
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "name".into()],
+            &[CqlType::Int, CqlType::Varchar],
+            &[0],
+            &[],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Some(CqlValue::Int(1)));
+        assert_eq!(rows[0][1], None, "expired cell must read as null");
+    }
+
+    #[test]
+    fn partition_to_rows_skips_fully_expired_ttl_row() {
+        use ferrosa_sstable::types::Partition;
+
+        let pk_bytes = encode_value(&CqlValue::Int(1));
+        let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+        // INSERT ... USING TTL n: both the cell and the primary-key liveness
+        // carry an expiry. Past local_deletion_time => fully expired => the
+        // whole row is gone (Cassandra TTL semantics).
+        let expired_cell = CellValue::expiring(b"alice".to_vec(), 1000, 1, 1_700_000_000);
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, expired_cell)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_ttl(1000, 1, 1_700_000_000),
+        };
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "name".into()],
+            &[CqlType::Int, CqlType::Varchar],
+            &[0],
+            &[],
+        );
+        assert!(
+            rows.is_empty(),
+            "fully expired TTL row must not be returned"
+        );
+    }
+
+    #[test]
+    fn partition_to_rows_keeps_unexpired_ttl_row() {
+        use ferrosa_sstable::types::Partition;
+
+        let pk_bytes = encode_value(&CqlValue::Int(1));
+        let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+        // local_deletion_time far in the future (but not the i32::MAX no-expiry
+        // sentinel) — not yet expired, so the row stays.
+        let future = i32::MAX - 1;
+        let cell = CellValue::expiring(b"alice".to_vec(), 1000, 100, future);
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, cell)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_ttl(1000, 100, future),
+        };
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "name".into()],
+            &[CqlType::Int, CqlType::Varchar],
+            &[0],
+            &[],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Some(CqlValue::Text("alice".into())));
     }
 
     // --- resolve_type_name tests ---
@@ -2806,6 +2978,27 @@ mod tests {
         let val =
             term_to_cql_value(&Term::BlobLiteral(b"hello".to_vec()), &CqlType::Varchar).unwrap();
         assert_eq!(val, CqlValue::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn term_blob_to_list_decodes_collection_wire_format() {
+        // A bound (`?`) list<int> [1, 2, 3] arrives as CQL-serialized bytes:
+        // an i32 count followed by length-prefixed elements.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        for v in [1i32, 2, 3] {
+            bytes.extend_from_slice(&4i32.to_be_bytes());
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        let val = term_to_cql_value(
+            &Term::BlobLiteral(bytes),
+            &CqlType::List(Box::new(CqlType::Int)),
+        )
+        .unwrap();
+        assert_eq!(
+            val,
+            CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)])
+        );
     }
 
     #[test]

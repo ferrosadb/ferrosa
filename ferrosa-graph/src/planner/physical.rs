@@ -166,6 +166,9 @@ pub enum PhysicalPlan {
         hops: Vec<Hop>,
         /// Optional MATCH sequence executed with left-join semantics.
         optional_hops: Vec<Hop>,
+        /// WHERE predicates referencing hop-bound variables, evaluated after the
+        /// expand completes (when all pattern variables are bound).
+        post_filters: Vec<Expr>,
         /// Optional WITH pipeline applied before final RETURN.
         with_pipeline: Option<WithPipeline>,
         /// Return clause for projecting results.
@@ -384,6 +387,86 @@ fn extract_filters(where_clause: &Option<Expr>) -> Vec<Expr> {
     match where_clause {
         Some(expr) => vec![expr.clone()],
         None => vec![],
+    }
+}
+
+/// Split a boolean expression into its top-level AND conjuncts so each can be
+/// placed at the earliest point all its variables are bound.
+fn split_conjuncts(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::And(l, r) => {
+            let mut out = split_conjuncts(l);
+            out.extend(split_conjuncts(r));
+            out
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// Collect every variable referenced by an expression (via `Var` or
+/// `Property`). Used to decide whether a WHERE predicate can be pushed to the
+/// anchor scan or must wait until later hops bind its variables.
+fn collect_referenced_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Var(v) => {
+            out.insert(v.clone());
+        }
+        Expr::Property { var, .. } => {
+            out.insert(var.clone());
+        }
+        Expr::Parameter(_) | Expr::Literal(_) => {}
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_referenced_vars(a, out);
+            }
+        }
+        Expr::Distinct(e) | Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            collect_referenced_vars(e, out)
+        }
+        Expr::Comparison { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
+            collect_referenced_vars(left, out);
+            collect_referenced_vars(right, out);
+        }
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            collect_referenced_vars(l, out);
+            collect_referenced_vars(r, out);
+        }
+        Expr::In { value, list } => {
+            collect_referenced_vars(value, out);
+            collect_referenced_vars(list, out);
+        }
+        Expr::List(items) => {
+            for e in items {
+                collect_referenced_vars(e, out);
+            }
+        }
+        Expr::ListPredicate {
+            list, predicate, ..
+        } => {
+            collect_referenced_vars(list, out);
+            collect_referenced_vars(predicate, out);
+        }
+        Expr::Map(m) => {
+            for (_, e) in m {
+                collect_referenced_vars(e, out);
+            }
+        }
+        Expr::Index { target, index } => {
+            collect_referenced_vars(target, out);
+            collect_referenced_vars(index, out);
+        }
+        Expr::Slice { target, start, end } => {
+            collect_referenced_vars(target, out);
+            if let Some(s) = start {
+                collect_referenced_vars(s, out);
+            }
+            if let Some(e) = end {
+                collect_referenced_vars(e, out);
+            }
+        }
+        Expr::PatternPredicate { start_var, .. } => {
+            out.insert(start_var.clone());
+        }
     }
 }
 
@@ -1308,11 +1391,31 @@ fn plan_match(
         }
     }
 
-    let anchor = anchor.ok_or_else(|| {
+    let mut anchor = anchor.ok_or_else(|| {
         GraphError::Validation(
             "no anchor node found in pattern (need at least one labeled node)".to_string(),
         )
     })?;
+
+    // Partition WHERE predicates by the variables they reference. A predicate
+    // that touches only the anchor variable can be pushed down to the anchor
+    // scan; one that references a hop-bound variable (e.g. the middle node of
+    // an a-[]->s-[]->b chain) must be evaluated AFTER the expand, once that
+    // variable is bound — otherwise it is checked against an unbound variable
+    // at the anchor and silently filters everything out.
+    let anchor_var = anchor.var.clone().unwrap_or_default();
+    let mut anchor_only_filters: Vec<Expr> = Vec::new();
+    let mut post_filters: Vec<Expr> = Vec::new();
+    for conjunct in anchor.filters.iter().flat_map(split_conjuncts) {
+        let mut vars = std::collections::HashSet::new();
+        collect_referenced_vars(&conjunct, &mut vars);
+        if vars.iter().all(|v| v == &anchor_var) {
+            anchor_only_filters.push(conjunct);
+        } else {
+            post_filters.push(conjunct);
+        }
+    }
+    anchor.filters = anchor_only_filters;
 
     // Check if the return clause contains any aggregate functions.
     let has_aggregates = return_clause.items.iter().any(
@@ -1372,6 +1475,7 @@ fn plan_match(
             anchor,
             hops,
             optional_hops: vec![],
+            post_filters,
             with_pipeline: None,
             return_clause: inner_return_clause,
         };
@@ -1387,6 +1491,7 @@ fn plan_match(
             anchor,
             hops,
             optional_hops: vec![],
+            post_filters,
             with_pipeline: None,
             return_clause,
         })
@@ -2170,6 +2275,85 @@ mod tests {
             matches!(physical, PhysicalPlan::Expand { .. }),
             "expected Expand plan for linear pattern, got {physical:?}"
         );
+    }
+
+    #[test]
+    fn where_on_middle_node_becomes_a_post_filter_not_an_anchor_filter() {
+        // (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE b.name = 'mid'
+        // The predicate references `b`, bound by the first hop — it must be a
+        // post-expand filter, not pushed to the anchor (`a`) scan where `b` is
+        // unbound (which would silently filter every row out).
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+        bindings.insert("c".to_string(), person_table());
+        bindings.insert("r1".to_string(), knows_table());
+        bindings.insert("r2".to_string(), knows_table());
+
+        let return_clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Var("c".into()),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+        let where_clause = Some(Expr::Comparison {
+            left: Box::new(Expr::Property {
+                var: "b".into(),
+                name: "name".into(),
+            }),
+            op: crate::parser::CompareOp::Eq,
+            right: Box::new(Expr::Literal(crate::parser::Literal::String("mid".into()))),
+        });
+
+        let mk_node = |v: &str| Pattern::Node {
+            var: Some(v.into()),
+            label: Some("Person".into()),
+            props: vec![],
+        };
+        let mk_rel = |v: &str| Pattern::Rel {
+            var: Some(v.into()),
+            rel_type: Some("KNOWS".into()),
+            direction: Direction::Out,
+            props: vec![],
+            length_range: None,
+        };
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    mk_node("a"),
+                    mk_rel("r1"),
+                    mk_node("b"),
+                    mk_rel("r2"),
+                    mk_node("c"),
+                ])],
+                where_clause,
+                return_clause,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        match plan(logical).unwrap() {
+            PhysicalPlan::Expand {
+                anchor,
+                post_filters,
+                ..
+            } => {
+                assert!(
+                    anchor.filters.is_empty(),
+                    "middle-node predicate must not be pushed to the anchor"
+                );
+                assert_eq!(
+                    post_filters.len(),
+                    1,
+                    "middle-node predicate must be a post-expand filter"
+                );
+            }
+            other => panic!("expected Expand, got {other:?}"),
+        }
     }
 
     #[test]

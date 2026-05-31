@@ -27,7 +27,10 @@ def session():
         contact_points=[FERROSA_HOST],
         port=FERROSA_CQL_PORT,
         load_balancing_policy=RoundRobinPolicy(),
-        protocol_version=5,
+        # ferrosa caps CQL negotiation at v4 (v5 only adds perf/integrity
+        # framing, no features; the gocql and DataStax drivers implement v5
+        # framing incompatibly). Pin v4 like the other example tests.
+        protocol_version=4,
         # Ferrosa's core CQL smoke coverage does not depend on driver-side
         # schema/token metadata refresh, and disabling it avoids treating
         # optional server event registration as a connection blocker.
@@ -477,7 +480,10 @@ class TestErrorHandling:
             session.execute("SELECT * FROM nonexistent_table_xyz")
 
     def test_invalid_syntax(self, session):
-        from cassandra import InvalidRequest, SyntaxException
+        # SyntaxException lives in cassandra.protocol (not the top-level package)
+        # in the cassandra-driver 3.x line.
+        from cassandra import InvalidRequest
+        from cassandra.protocol import SyntaxException
 
         with pytest.raises((SyntaxException, InvalidRequest)):
             session.execute("SELEC BROKEN QUERY")
