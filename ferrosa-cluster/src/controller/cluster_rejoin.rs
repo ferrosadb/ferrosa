@@ -202,8 +202,10 @@ pub async fn attempt_rejoin(
                 "cluster_rejoin: sending JoinNode to peer"
             );
 
-            match forward_ddl_to_leader(&peer_manager, *peer_uuid, op).await {
-                Ok(()) => {
+            // Membership op (JoinNode), not a client DDL — no same-node
+            // read-your-writes wait (and a rejoining node has no usable raft yet).
+            match forward_ddl_to_leader(None, &peer_manager, *peer_uuid, op).await {
+                Ok(_committed) => {
                     tracing::info!(
                         attempt,
                         self_id = %self_host_id,

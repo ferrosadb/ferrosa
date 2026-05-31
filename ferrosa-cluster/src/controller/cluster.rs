@@ -1722,7 +1722,7 @@ impl ModeController {
                         let raft_for_drain = raft_arc.clone();
                         let replayed = drain_ddl_queue(rx, |op| {
                             let raft = raft_for_drain.clone();
-                            async move { execute_via_raft(&raft, op).await }
+                            async move { execute_via_raft(&raft, op).await.map(|_| ()) }
                         })
                         .await;
                         if replayed > 0 {
@@ -1790,7 +1790,10 @@ impl ModeController {
                                     );
                                     for (name, ks) in &user_ks {
                                         let op = DdlOperation::CreateKeyspace((*ks).clone());
+                                        // Bootstrap schema hand-off, not a client
+                                        // DDL — no read-your-writes wait needed.
                                         if let Err(e) = crate::ddl_path::forward_ddl_to_leader(
+                                            None,
                                             &peer_manager_for_bootstrap,
                                             leader_uuid,
                                             op,
@@ -1802,7 +1805,10 @@ impl ModeController {
                                     }
                                     for ((ks, _tbl), table) in &user_tables {
                                         let op = DdlOperation::CreateTable(Box::new((*table).clone()));
+                                        // Bootstrap schema hand-off, not a client
+                                        // DDL — no read-your-writes wait needed.
                                         if let Err(e) = crate::ddl_path::forward_ddl_to_leader(
+                                            None,
                                             &peer_manager_for_bootstrap,
                                             leader_uuid,
                                             op,
