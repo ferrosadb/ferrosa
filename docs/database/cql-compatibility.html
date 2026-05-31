@@ -452,13 +452,37 @@
   <table>
     <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>CREATE ROLE</td><td><span class="check">Supported</span></td><td>WITH PASSWORD, SUPERUSER, LOGIN, IF NOT EXISTS</td></tr>
-      <tr><td>ALTER ROLE</td><td><span class="check">Supported</span></td><td>Change password, superuser, login</td></tr>
+      <tr><td>CREATE ROLE</td><td><span class="check">Supported</span></td><td>WITH PASSWORD, HASHED PASSWORD, SUPERUSER, LOGIN, OPTIONS, IF NOT EXISTS</td></tr>
+      <tr><td>ALTER ROLE</td><td><span class="check">Supported</span></td><td>Change PASSWORD / HASHED PASSWORD, SUPERUSER, LOGIN</td></tr>
+      <tr><td>CREATE USER / ALTER USER</td><td><span class="check">Supported</span></td><td>Legacy alias; WITH [HASHED] PASSWORD, SUPERUSER / NOSUPERUSER</td></tr>
       <tr><td>DROP ROLE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
       <tr><td>GRANT</td><td><span class="check">Supported</span></td><td>GRANT permission ON resource TO role</td></tr>
       <tr><td>REVOKE</td><td><span class="check">Supported</span></td><td>REVOKE permission ON resource FROM role</td></tr>
+      <tr><td>ACCESS TO/FROM (network auth)</td><td><span class="cross">Rejected</span></td><td>ACCESS TO DATACENTERS / FROM CIDRS is parsed but rejected — ferrosa has no network authorizer, so an unenforced access restriction fails loud rather than being silently accepted</td></tr>
     </tbody>
   </table>
+
+  <p><strong>HASHED PASSWORD.</strong> <code>CREATE ROLE … WITH HASHED PASSWORD = '&lt;hash&gt;'</code> (and the legacy <code>CREATE USER … WITH HASHED PASSWORD '&lt;hash&gt;'</code>) stores a pre-computed bcrypt or argon2id hash verbatim — it is not re-hashed, which lets you migrate existing credentials. The hash format is validated on the coordinator and rejected if unsupported, so a role can never hold a credential the authenticator cannot verify. Password and hash literals are redacted from any log line or error message.</p>
+
+  <pre><span class="cm">-- Plaintext password — hashed server-side with bcrypt / argon2id</span>
+<span class="kw">CREATE ROLE</span> app_writer <span class="kw">WITH PASSWORD</span> = <span class="str">'S3cret-Pass!'</span> <span class="kw">AND LOGIN</span> = <span class="kw">true</span>;
+
+<span class="cm">-- Migrate an existing credential: a pre-computed hash, stored verbatim</span>
+<span class="kw">CREATE ROLE</span> legacy_user
+  <span class="kw">WITH HASHED PASSWORD</span> = <span class="str">'$2a$10$JSJEMFm6GeaW9XxT5JIheuEtPvat6i7uKbnTcxX3c1wshIIsGyUtG'</span>
+  <span class="kw">AND LOGIN</span> = <span class="kw">true</span>;
+
+<span class="cm">-- Custom authenticator OPTIONS (accepted; not interpreted by the default authenticator)</span>
+<span class="kw">CREATE ROLE</span> svc <span class="kw">WITH PASSWORD</span> = <span class="str">'p'</span> <span class="kw">AND OPTIONS</span> = { <span class="str">'ttl'</span> : <span class="str">'3600'</span> };
+
+<span class="cm">-- Rotate to a new hashed credential, or toggle superuser/login</span>
+<span class="kw">ALTER ROLE</span> app_writer <span class="kw">WITH HASHED PASSWORD</span> = <span class="str">'$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaA'</span>;
+
+<span class="cm">-- Legacy USER alias: no '=', trailing SUPERUSER / NOSUPERUSER</span>
+<span class="kw">CREATE USER</span> ops <span class="kw">WITH HASHED PASSWORD</span> <span class="str">'$2a$10$JSJEMFm6GeaW9XxT5JIheuEtPvat6i7uKbnTcxX3c1wshIIsGyUtG'</span> <span class="kw">NOSUPERUSER</span>;
+
+<span class="cm">-- Network authorization is parsed but REJECTED (no network authorizer):</span>
+<span class="cm">--   CREATE ROLE r WITH PASSWORD = 'p' AND ACCESS TO DATACENTERS {'DC1'};  -- error</span></pre>
 
   <p>Ferrosa supports column-level permissions, rate limiting per role, and audit logging to configurable sinks (log file, audit table).</p>
 
