@@ -5343,6 +5343,7 @@ fn resolve_index_type(
         Some("phonetic") => Ok(IndexType::Phonetic),
         Some("filtered") => Ok(IndexType::Filtered),
         Some("vector") => Ok(IndexType::Vector),
+        Some("fulltext") => Ok(IndexType::FullText),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -5480,6 +5481,10 @@ async fn route_create_index(
                     dimension,
                     method,
                 )
+            } else if index_type == IndexType::FullText {
+                // Full-text needs its own inverted-index sidecar (built on flush);
+                // the generic add_index() only builds a BTree.
+                state.engine.add_fulltext_index(&table_id, &index_name, pos)
             } else {
                 state.engine.add_index(&table_id, &index_name, pos)
             };
@@ -10339,6 +10344,13 @@ mod tests {
     }
 
     #[test]
+    fn resolve_index_type_fulltext() {
+        let result = resolve_index_type(Some("fulltext"), &["body".to_string()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::FullText);
+    }
+
+    #[test]
     fn resolve_index_type_unknown_errors() {
         let result = resolve_index_type(Some("nonexistent"), &["col".to_string()], &HashMap::new());
         assert!(result.is_err());
@@ -14127,6 +14139,56 @@ mod tests {
                     count, 1,
                     "phonetic index should match 'Jon Smyth' to 'John Smith', got {count} rows"
                 );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Full-text index end-to-end: `CREATE INDEX ... USING 'fulltext'` must be
+    /// accepted and wired to the engine so that, after a flush builds the FTI
+    /// sidecar, `fts_match()` returns the matching rows.
+    #[tokio::test]
+    async fn fulltext_index_fts_match_end_to_end() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE fts_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fts_ks.docs (id int PRIMARY KEY, body text)",
+            "CREATE INDEX docs_fts ON fts_ks.docs (body) USING 'fulltext'",
+            "INSERT INTO fts_ks.docs (id, body) VALUES (1, 'rust is a fast distributed database')",
+            "INSERT INTO fts_ks.docs (id, body) VALUES (2, 'cassandra is a distributed database')",
+            "INSERT INTO fts_ks.docs (id, body) VALUES (3, 'hello world')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt).await.unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        // The FTI sidecar is built on flush; fts_match reads it.
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("fts_ks", "docs"))
+            .unwrap();
+
+        let stmt = crate::parser::parse(
+            "SELECT id FROM fts_ks.docs WHERE body = fts_match('distributed AND database')",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "fts_match query errored: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(count, 2, "docs 1 and 2 have both terms; got {count} rows");
             }
             _ => panic!("expected Result"),
         }
