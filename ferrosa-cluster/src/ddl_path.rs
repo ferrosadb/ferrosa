@@ -1545,6 +1545,7 @@ mod tests {
             is_superuser: None,
             can_login: Some(true),
             password: None,
+            hashed_password: None,
             member_of: None,
         };
         ddl.execute(DdlOperation::AlterRole {
@@ -1682,6 +1683,7 @@ mod tests {
             is_superuser: Some(true),
             can_login: None,
             password: None,
+            hashed_password: None,
             member_of: None,
         };
         let op = DdlOperation::AlterRole {

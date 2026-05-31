@@ -491,8 +491,10 @@ impl Schema {
             role.can_login = can_login;
         }
         // password field carries the already-hashed value during replication;
-        // store it directly without re-hashing.
-        if let Some(hash) = updates.password {
+        // store it directly without re-hashing. hashed_password (HASHED
+        // PASSWORD) is likewise an already-hashed value, validated on the
+        // coordinator before replication.
+        if let Some(hash) = updates.password.or(updates.hashed_password) {
             role.salted_hash = Some(hash);
         }
         if let Some(member_of) = updates.member_of {
@@ -1189,6 +1191,53 @@ impl Schema {
         Ok(())
     }
 
+    /// Validate a `HASHED PASSWORD` value is a supported hash format. Used by
+    /// the coordinator to fail loud before replicating an unusable credential.
+    pub fn validate_password_hash(&self, hash: &str) -> crate::Result<()> {
+        PasswordHasher::validate_password_hash(hash)
+    }
+
+    /// Create a role from a pre-computed password hash (`HASHED PASSWORD`).
+    ///
+    /// The hash is validated for a supported format and stored **verbatim** —
+    /// it is NOT re-hashed and the password-strength policy is NOT applied
+    /// (there is no plaintext to evaluate). The supplied hash never appears in
+    /// the audit payload.
+    pub fn create_role_hashed(
+        &self,
+        role: RoleMetadata,
+        hashed_password: &str,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Create, &Resource::AllRoles)?;
+        PasswordHasher::validate_password_hash(hashed_password)?;
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if snap.roles.contains_key(&role.name) {
+            return Err(SchemaError::RoleExists(role.name));
+        }
+        for parent in &role.member_of {
+            if would_create_cycle(&snap, parent, &role.name) {
+                return Err(SchemaError::RoleCycleDetected(role.name));
+            }
+        }
+        let name = role.name.clone();
+        let is_su = role.is_superuser;
+        let mut role = role;
+        role.salted_hash = Some(hashed_password.to_string());
+        snap.roles.insert(role.name.clone(), role);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::RoleCreated {
+                role: name,
+                is_superuser: is_su,
+            },
+            auth,
+        );
+        Ok(())
+    }
+
     /// Alter an existing role.
     ///
     /// Requires `Alter` permission on `AllRoles`. Applies non-`None` fields
@@ -1203,11 +1252,23 @@ impl Schema {
     ) -> crate::Result<()> {
         self.check_permission(auth, Permission::Alter, &Resource::AllRoles)?;
         // Validate and hash password outside the write lock (expensive)
-        let new_hash = if let Some(ref pw) = updates.password {
-            self.password_policy.validate(pw, name)?;
-            Some(self.hasher_config.hash_password(pw)?)
-        } else {
-            None
+        // PASSWORD is hashed under policy; HASHED PASSWORD is stored verbatim
+        // after format validation. They are mutually exclusive.
+        let new_hash = match (&updates.password, &updates.hashed_password) {
+            (Some(pw), None) => {
+                self.password_policy.validate(pw, name)?;
+                Some(self.hasher_config.hash_password(pw)?)
+            }
+            (None, Some(h)) => {
+                PasswordHasher::validate_password_hash(h)?;
+                Some(h.clone())
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(SchemaError::InvalidSchema(
+                    "cannot specify both PASSWORD and HASHED PASSWORD".to_string(),
+                ))
+            }
         };
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
@@ -2510,6 +2571,61 @@ mod tests {
         assert!(
             PasswordHasher::verify_password_any("s3cretPwd", r.salted_hash.as_ref().unwrap())
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn create_role_hashed_stores_verbatim_and_authenticates() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        // A real bcrypt hash of a known password (HASHED PASSWORD input).
+        let hash = bcrypt::hash("KnownPass1", 4).unwrap();
+        schema
+            .create_role_hashed(test_role("hrole"), &hash, &auth)
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let r = snap.roles.get("hrole").expect("role exists");
+        // Stored VERBATIM — not re-hashed under the policy.
+        assert_eq!(r.salted_hash.as_deref(), Some(hash.as_str()));
+        // The known password authenticates; a wrong one does not (fail-closed).
+        assert!(PasswordHasher::verify_password_any("KnownPass1", &hash).unwrap());
+        assert!(!PasswordHasher::verify_password_any("wrong", &hash).unwrap());
+    }
+
+    #[test]
+    fn create_role_hashed_rejects_unsupported_format() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        // Not bcrypt/argon2 — must be rejected so a role never holds a
+        // credential that verify_password_any cannot interpret (threat T3).
+        let err = schema.create_role_hashed(test_role("badrole"), "not-a-real-hash", &auth);
+        assert!(err.is_err(), "unsupported hash format must be rejected");
+        assert!(schema.snapshot().roles.get("badrole").is_none());
+    }
+
+    #[test]
+    fn alter_role_hashed_stores_verbatim() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_role(test_role("auser"), Some("InitPass1"), &auth)
+            .unwrap();
+        let hash = bcrypt::hash("NewPass2", 4).unwrap();
+        let updates = RoleUpdates {
+            hashed_password: Some(hash.clone()),
+            ..Default::default()
+        };
+        schema.alter_role("auser", updates, &auth).unwrap();
+        assert_eq!(
+            schema
+                .snapshot()
+                .roles
+                .get("auser")
+                .unwrap()
+                .salted_hash
+                .as_deref(),
+            Some(hash.as_str())
         );
     }
 

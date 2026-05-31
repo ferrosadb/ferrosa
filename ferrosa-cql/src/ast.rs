@@ -502,21 +502,45 @@ pub struct CompactStatement {
     pub table: String,
 }
 
+/// A role's network-authorization `ACCESS` clause (Cassandra's CassandraNetworkAuthorizer
+/// grammar). ferrosa parses these for CQL compatibility; enforcement is a separate concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleAccess {
+    /// `ACCESS TO DATACENTERS { 'dc1', 'dc2' }`
+    ToDatacenters(Vec<String>),
+    /// `ACCESS TO ALL DATACENTERS`
+    ToAllDatacenters,
+    /// `ACCESS FROM CIDRS { 'region1' }`
+    FromCidrs(Vec<String>),
+    /// `ACCESS FROM ALL CIDRS`
+    FromAllCidrs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateRoleStatement {
     pub name: String,
     pub if_not_exists: bool,
+    /// Plaintext `PASSWORD = '...'` — hashed before storage.
     pub password: Option<String>,
+    /// Pre-hashed `HASHED PASSWORD = '...'` — stored verbatim.
+    pub hashed_password: Option<String>,
     pub superuser: Option<bool>,
     pub login: Option<bool>,
+    /// Custom `OPTIONS = { 'k': v }` (passed to the authenticator).
+    pub options: Vec<(String, String)>,
+    /// `ACCESS TO/FROM ...` network-auth clauses.
+    pub access: Vec<RoleAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterRoleStatement {
     pub name: String,
     pub password: Option<String>,
+    pub hashed_password: Option<String>,
     pub superuser: Option<bool>,
     pub login: Option<bool>,
+    pub options: Vec<(String, String)>,
+    pub access: Vec<RoleAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -5568,6 +5568,15 @@ async fn route_create_role(
         .schema
         .check_permission(ctx.auth, Permission::Create, &Resource::AllRoles)?;
 
+    // Security (threat-model T9): ferrosa has no network authorizer, so reject
+    // ACCESS TO/FROM clauses rather than silently accept an unenforced access
+    // restriction (which would give a false sense of security). Fail loud.
+    if !s.access.is_empty() {
+        return Err(CqlError::Invalid(
+            "ACCESS (network authorization) is not supported".into(),
+        ));
+    }
+
     let base_role = RoleMetadata {
         name: s.name.clone(),
         is_superuser: s.superuser.unwrap_or(false),
@@ -5580,12 +5589,16 @@ async fn route_create_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Direct path: pass the cleartext through; `Schema::create_role`
-            // validates the policy, hashes it under the schema's
-            // write-lock, and emits the audit event.
-            state
-                .schema
-                .create_role(base_role, s.password.as_deref(), ctx.auth)?;
+            // Direct path: `Schema::create_role` hashes the cleartext under the
+            // write-lock; `create_role_hashed` validates and stores a supplied
+            // HASHED PASSWORD verbatim. Both emit the audit event.
+            if let Some(ref h) = s.hashed_password {
+                state.schema.create_role_hashed(base_role, h, ctx.auth)?;
+            } else {
+                state
+                    .schema
+                    .create_role(base_role, s.password.as_deref(), ctx.auth)?;
+            }
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: serialise `DdlOperation::CreateRole(role)`
@@ -5599,7 +5612,11 @@ async fn route_create_role(
             // Hashing on the coordinator also keeps the cleartext
             // password off the wire and out of the Raft log.
             let mut role = base_role;
-            if let Some(ref pw) = s.password {
+            if let Some(ref h) = s.hashed_password {
+                // HASHED PASSWORD: validate on the coordinator, ship verbatim.
+                state.schema.validate_password_hash(h)?;
+                role.salted_hash = Some(h.clone());
+            } else if let Some(ref pw) = s.password {
                 state.schema.password_policy().validate(pw, &s.name)?;
                 role.salted_hash = Some(state.schema.password_hasher().hash_password(pw)?);
             }
@@ -5637,16 +5654,24 @@ async fn route_alter_role(
         .schema
         .check_permission(ctx.auth, Permission::Alter, &Resource::Role(s.name.clone()))?;
 
+    // Security (threat-model T9): reject unenforced ACCESS clauses. Fail loud.
+    if !s.access.is_empty() {
+        return Err(CqlError::Invalid(
+            "ACCESS (network authorization) is not supported".into(),
+        ));
+    }
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Direct path: pass the cleartext through; `Schema::alter_role`
-            // hashes inside the lock and emits the audit event.
+            // Direct path: `Schema::alter_role` hashes plaintext under the lock,
+            // or validates+stores a HASHED PASSWORD verbatim; emits the audit event.
             let updates = RoleUpdates {
                 is_superuser: s.superuser,
                 can_login: s.login,
                 password: s.password.clone(),
+                hashed_password: s.hashed_password.clone(),
                 member_of: None,
             };
             state.schema.alter_role(&s.name, updates, ctx.auth)?;
@@ -5666,10 +5691,15 @@ async fn route_alter_role(
             } else {
                 None
             };
+            // HASHED PASSWORD: validate on the coordinator before replicating.
+            if let Some(ref h) = s.hashed_password {
+                state.schema.validate_password_hash(h)?;
+            }
             let updates = RoleUpdates {
                 is_superuser: s.superuser,
                 can_login: s.login,
                 password: hashed_password,
+                hashed_password: s.hashed_password.clone(),
                 member_of: None,
             };
             match ddl {
@@ -15344,6 +15374,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_role_with_access_clause_is_rejected() {
+        // Threat T9: ferrosa has no network authorizer, so an ACCESS restriction
+        // must be rejected (fail loud), never silently accepted-and-ignored.
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE ROLE netrole WITH PASSWORD = 'p' AND ACCESS TO DATACENTERS {'DC1'}", // pragma: allowlist secret
+        )
+        .unwrap();
+        assert!(
+            route(&state, &ctx, stmt).await.is_err(),
+            "CREATE ROLE with ACCESS must be rejected, not silently accepted"
+        );
+        assert!(state.schema.snapshot().roles.get("netrole").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_role_with_hashed_password_stores_hash_verbatim() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        // A valid bcrypt hash string (HASHED PASSWORD input).
+        let hash = "$2a$10$JSJEMFm6GeaW9XxT5JIheuEtPvat6i7uKbnTcxX3c1wshIIsGyUtG";
+        let cql = format!("CREATE ROLE hrole WITH HASHED PASSWORD = '{hash}' AND LOGIN = true");
+        route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .schema
+                .snapshot()
+                .roles
+                .get("hrole")
+                .unwrap()
+                .salted_hash
+                .as_deref(),
+            Some(hash),
+            "HASHED PASSWORD must be stored verbatim"
+        );
+    }
+
+    #[tokio::test]
     async fn alter_role_updates_login() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -15365,8 +15450,11 @@ mod tests {
         let stmt = Statement::AlterRole(AlterRoleStatement {
             name: "ar_role".into(),
             password: None,
+            hashed_password: None,
             superuser: None,
             login: Some(true),
+            options: Vec::new(),
+            access: Vec::new(),
         });
         let result = route(&state, &ctx, stmt).await;
         assert!(

@@ -26,6 +26,18 @@ type OrderByResult = (Vec<(String, OrderDirection)>, Option<(String, Term)>);
 /// Security mitigation M6.
 const MAX_COLLECTION_ELEMENTS: usize = 65_536;
 
+/// Options parsed from a CREATE/ALTER ROLE `WITH …` clause. Shared by the
+/// CREATE and ALTER role parsers (identical grammar).
+#[derive(Default)]
+struct RoleOptionSet {
+    password: Option<String>,
+    hashed_password: Option<String>,
+    superuser: Option<bool>,
+    login: Option<bool>,
+    options: Vec<(String, String)>,
+    access: Vec<RoleAccess>,
+}
+
 /// Parse a CQL statement from the given input string.
 pub fn parse(input: &str) -> Result<Statement, CqlError> {
     let span = tracing::info_span!("cql.parse", cql.statement_type = tracing::field::Empty,);
@@ -906,6 +918,123 @@ impl<'input> Parser<'input> {
     /// Cassandra's grammar is permissive about ordering; we accept a
     /// trailing `SUPERUSER`/`NOSUPERUSER` keyword as a shorthand for
     /// `WITH SUPERUSER = true/false`.
+    /// Parsed `WITH option (AND option)*` set for CREATE/ALTER ROLE.
+    fn parse_role_option_set(&mut self) -> Result<RoleOptionSet, CqlError> {
+        let mut o = RoleOptionSet::default();
+        if !self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            return Ok(o);
+        }
+        loop {
+            let tok = self.lexer.peek()?;
+            match &tok.kind {
+                TokenKind::Keyword(Keyword::Password) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    o.password = Some(self.expect_string_literal()?);
+                }
+                TokenKind::Keyword(Keyword::Superuser) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    o.superuser = Some(self.parse_bool()?);
+                }
+                TokenKind::Keyword(Keyword::Login) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    o.login = Some(self.parse_bool()?);
+                }
+                TokenKind::Keyword(Keyword::Options) => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    // parse_string_map enforces MAX_COLLECTION_ELEMENTS (T8/DoS).
+                    o.options = self.parse_string_map()?;
+                }
+                // `HASHED` and `ACCESS` are not reserved keywords — they lex as
+                // identifiers. Match case-insensitively.
+                TokenKind::Ident(s) if s.eq_ignore_ascii_case("hashed") => {
+                    self.lexer.next_token()?;
+                    self.lexer.expect(&TokenKind::Keyword(Keyword::Password))?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    o.hashed_password = Some(self.expect_string_literal()?);
+                }
+                TokenKind::Ident(s) if s.eq_ignore_ascii_case("access") => {
+                    self.lexer.next_token()?;
+                    o.access.push(self.parse_role_access()?);
+                }
+                _ => {
+                    return Err(CqlError::SyntaxError(format!(
+                        "unexpected token {:?} in role options at position {}",
+                        tok.kind, tok.pos
+                    )))
+                }
+            }
+            if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                break;
+            }
+        }
+        Ok(o)
+    }
+
+    /// Parse one `ACCESS TO/FROM …` clause (the `ACCESS` token is already consumed).
+    fn parse_role_access(&mut self) -> Result<RoleAccess, CqlError> {
+        let tok = self.lexer.next_token()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::To) => {
+                if self.lexer.eat(&TokenKind::Keyword(Keyword::All))? {
+                    self.expect_ident_ci("DATACENTERS")?;
+                    Ok(RoleAccess::ToAllDatacenters)
+                } else {
+                    self.expect_ident_ci("DATACENTERS")?;
+                    Ok(RoleAccess::ToDatacenters(self.parse_string_set()?))
+                }
+            }
+            TokenKind::Keyword(Keyword::From) => {
+                if self.lexer.eat(&TokenKind::Keyword(Keyword::All))? {
+                    self.expect_ident_ci("CIDRS")?;
+                    Ok(RoleAccess::FromAllCidrs)
+                } else {
+                    self.expect_ident_ci("CIDRS")?;
+                    Ok(RoleAccess::FromCidrs(self.parse_string_set()?))
+                }
+            }
+            other => Err(CqlError::SyntaxError(format!(
+                "expected TO or FROM after ACCESS, got {:?} at position {}",
+                other, tok.pos
+            ))),
+        }
+    }
+
+    /// Expect a (non-keyword) identifier matching `name`, case-insensitively.
+    fn expect_ident_ci(&mut self, name: &str) -> Result<(), CqlError> {
+        let tok = self.lexer.next_token()?;
+        match &tok.kind {
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case(name) => Ok(()),
+            other => Err(CqlError::SyntaxError(format!(
+                "expected {name}, got {:?} at position {}",
+                other, tok.pos
+            ))),
+        }
+    }
+
+    /// Parse `{ 'a', 'b', ... }` — a set of string literals (bounded).
+    fn parse_string_set(&mut self) -> Result<Vec<String>, CqlError> {
+        self.lexer.expect(&TokenKind::LBrace)?;
+        let mut items = Vec::new();
+        if self.lexer.eat(&TokenKind::RBrace)? {
+            return Ok(items);
+        }
+        loop {
+            items.push(self.expect_string_literal()?);
+            if items.len() > MAX_COLLECTION_ELEMENTS {
+                return Err(CqlError::SyntaxError("collection too large".to_string()));
+            }
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+        self.lexer.expect(&TokenKind::RBrace)?;
+        Ok(items)
+    }
+
     fn parse_create_user_as_role(&mut self) -> Result<CreateRoleStatement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::User))?;
 
@@ -913,13 +1042,21 @@ impl<'input> Parser<'input> {
         let name = self.parse_ident()?;
 
         let mut password = None;
+        let mut hashed_password = None;
         let mut superuser = None;
 
         if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            // Legacy USER grammar: `WITH [HASHED] PASSWORD '...'` (no `=`; we
+            // also tolerate `=` for forgiving compatibility).
             let tok = self.lexer.peek()?;
-            if matches!(&tok.kind, TokenKind::Keyword(Keyword::Password)) {
+            if matches!(&tok.kind, TokenKind::Ident(s) if s.eq_ignore_ascii_case("hashed")) {
                 self.lexer.next_token()?;
-                self.lexer.expect(&TokenKind::Eq)?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Password))?;
+                let _ = self.lexer.eat(&TokenKind::Eq)?;
+                hashed_password = Some(self.expect_string_literal()?);
+            } else if matches!(&tok.kind, TokenKind::Keyword(Keyword::Password)) {
+                self.lexer.next_token()?;
+                let _ = self.lexer.eat(&TokenKind::Eq)?;
                 password = Some(self.expect_string_literal()?);
             }
         }
@@ -942,9 +1079,12 @@ impl<'input> Parser<'input> {
             name,
             if_not_exists,
             password,
+            hashed_password,
             superuser,
             // CREATE USER is the alias that defaults LOGIN = true.
             login: Some(true),
+            options: Vec::new(),
+            access: Vec::new(),
         })
     }
 
@@ -953,49 +1093,17 @@ impl<'input> Parser<'input> {
 
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_ident()?;
-
-        let mut password = None;
-        let mut superuser = None;
-        let mut login = None;
-
-        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
-            loop {
-                let tok = self.lexer.peek()?;
-                match &tok.kind {
-                    TokenKind::Keyword(Keyword::Password) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        password = Some(self.expect_string_literal()?);
-                    }
-                    TokenKind::Keyword(Keyword::Superuser) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        superuser = Some(self.parse_bool()?);
-                    }
-                    TokenKind::Keyword(Keyword::Login) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        login = Some(self.parse_bool()?);
-                    }
-                    _ => {
-                        return Err(CqlError::SyntaxError(format!(
-                            "unexpected token {:?} in CREATE ROLE options at position {}",
-                            tok.kind, tok.pos
-                        )))
-                    }
-                }
-                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
-                    break;
-                }
-            }
-        }
+        let opts = self.parse_role_option_set()?;
 
         Ok(CreateRoleStatement {
             name,
             if_not_exists,
-            password,
-            superuser,
-            login,
+            password: opts.password,
+            hashed_password: opts.hashed_password,
+            superuser: opts.superuser,
+            login: opts.login,
+            options: opts.options,
+            access: opts.access,
         })
     }
 
@@ -1077,48 +1185,16 @@ impl<'input> Parser<'input> {
         ));
 
         let name = self.parse_ident()?;
-
-        let mut password = None;
-        let mut superuser = None;
-        let mut login = None;
-
-        if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
-            loop {
-                let tok = self.lexer.peek()?;
-                match &tok.kind {
-                    TokenKind::Keyword(Keyword::Password) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        password = Some(self.expect_string_literal()?);
-                    }
-                    TokenKind::Keyword(Keyword::Superuser) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        superuser = Some(self.parse_bool()?);
-                    }
-                    TokenKind::Keyword(Keyword::Login) => {
-                        self.lexer.next_token()?;
-                        self.lexer.expect(&TokenKind::Eq)?;
-                        login = Some(self.parse_bool()?);
-                    }
-                    _ => {
-                        return Err(CqlError::SyntaxError(format!(
-                            "unexpected token {:?} in ALTER ROLE options at position {}",
-                            tok.kind, tok.pos
-                        )))
-                    }
-                }
-                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
-                    break;
-                }
-            }
-        }
+        let opts = self.parse_role_option_set()?;
 
         Ok(AlterRoleStatement {
             name,
-            password,
-            superuser,
-            login,
+            password: opts.password,
+            hashed_password: opts.hashed_password,
+            superuser: opts.superuser,
+            login: opts.login,
+            options: opts.options,
+            access: opts.access,
         })
     }
 
@@ -3240,6 +3316,99 @@ mod tests {
                 assert_eq!(s.table, "entity_store");
             }
             other => panic!("expected Compact, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_role_with_hashed_password() {
+        // HASHED PASSWORD stores a pre-computed hash; password stays None.
+        let stmt = parse(
+            "CREATE ROLE alice WITH HASHED PASSWORD = '$2a$10$abcdefghijklmnopqrstuv' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.name, "alice");
+                assert_eq!(s.password, None);
+                assert_eq!(
+                    s.hashed_password.as_deref(),
+                    Some("$2a$10$abcdefghijklmnopqrstuv")
+                );
+                assert_eq!(s.login, Some(true));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_role_with_options_and_access() {
+        let stmt = parse(
+            "CREATE ROLE carlos WITH OPTIONS = { 'opt1' : 'v1', 'opt2' : 99 } \
+             AND ACCESS TO DATACENTERS {'DC1', 'DC3'}",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.options.len(), 2);
+                assert_eq!(s.options[0], ("opt1".into(), "v1".into()));
+                assert_eq!(s.options[1], ("opt2".into(), "99".into()));
+                assert_eq!(
+                    s.access,
+                    vec![RoleAccess::ToDatacenters(vec!["DC1".into(), "DC3".into()])]
+                );
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_role_with_access_from_all_cidrs() {
+        let stmt = parse(
+            "CREATE ROLE hob WITH LOGIN = true AND PASSWORD = 'p' AND ACCESS FROM ALL CIDRS", // pragma: allowlist secret
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(s.access, vec![RoleAccess::FromAllCidrs]);
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_role_with_hashed_password() {
+        let stmt = parse(
+            "ALTER ROLE bob WITH HASHED PASSWORD = '$argon2id$v=19$m=1' AND SUPERUSER = false",
+        ) // pragma: allowlist secret
+        .unwrap();
+        match stmt {
+            Statement::AlterRole(s) => {
+                assert_eq!(s.hashed_password.as_deref(), Some("$argon2id$v=19$m=1"));
+                assert_eq!(s.password, None);
+                assert_eq!(s.superuser, Some(false));
+            }
+            other => panic!("expected AlterRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_user_with_hashed_password() {
+        // Legacy USER grammar: no `=`, trailing NOSUPERUSER.
+        let stmt = parse(
+            "CREATE USER bob WITH HASHED PASSWORD '$2a$10$abcdefghijklmnopqrstuv' NOSUPERUSER",
+        ) // pragma: allowlist secret
+        .unwrap();
+        match stmt {
+            Statement::CreateRole(s) => {
+                assert_eq!(
+                    s.hashed_password.as_deref(),
+                    Some("$2a$10$abcdefghijklmnopqrstuv")
+                );
+                assert_eq!(s.password, None);
+                assert_eq!(s.superuser, Some(false));
+                assert_eq!(s.login, Some(true));
+            }
+            other => panic!("expected CreateRole, got {:?}", other),
         }
     }
 
