@@ -6228,45 +6228,14 @@ impl crate::virtual_tables::ArchiveStatusProvider for StorageEngine {
 
 impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
     fn snapshot_info(&self) -> Vec<crate::virtual_tables::SnapshotInfoRow> {
-        // Snapshot listing requires async S3 access. Bridge the sync/async
-        // boundary by spawning a blocking thread that drives the future on
-        // the current tokio Handle. Returns an empty list when S3 is not
-        // configured or the runtime is unavailable.
-        let (os_config, store) = match self.object_store_and_config() {
-            Ok(pair) => pair,
-            Err(_) => return Vec::new(),
-        };
-        let prefix = os_config.prefix.clone();
-
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
-
-        // Run the async list on a dedicated thread to avoid blocking the
-        // tokio worker. The thread borrows the handle and blocks on it.
-        let result = std::thread::spawn(move || {
-            let manager = crate::snapshot::SnapshotManager::new(store, prefix);
-            handle.block_on(manager.list_snapshots())
-        })
-        .join();
-
-        let snapshots: Vec<crate::snapshot::metadata::SnapshotMetadata> = match result {
-            Ok(Ok(snaps)) => snaps,
-            _ => return Vec::new(),
-        };
-
-        snapshots
-            .into_iter()
-            .map(|meta| crate::virtual_tables::SnapshotInfoRow {
-                name: meta.name,
-                created_at: meta.created_at,
-                expires_at: meta.expires_at,
-                commit_log_segment: meta.commit_log_position.segment_id as i64,
-                commit_log_offset: meta.commit_log_position.offset as i64,
-                node_id: meta.node_id,
-            })
-            .collect()
+        // The virtual table API is synchronous, while snapshot listing may
+        // need async object-store I/O. Do not bridge that boundary here:
+        // metrics and system table reads must never block Tokio worker
+        // threads waiting for object-store futures to make progress.
+        //
+        // Async callers should use `list_snapshots_with_store`; this table
+        // can be backed by a cached snapshot index once one exists.
+        Vec::new()
     }
 }
 
