@@ -341,7 +341,7 @@
       <tr><td>DROP (without TABLE keyword)</td><td><span class="check">Supported</span></td><td>DROP keyspace_name.table_name shorthand</td></tr>
       <tr><td>CREATE MATERIALIZED VIEW</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
       <tr><td>CREATE TYPE (UDT)</td><td><span class="check">Supported</span></td><td>CREATE TYPE, ALTER TYPE, DROP TYPE — full UDT DDL lifecycle</td></tr>
-      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="check">Supported</span></td><td>CREATE/DROP FUNCTION (WASM), CREATE/DROP AGGREGATE — full DDL lifecycle with cluster replication</td></tr>
+      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="check">Supported</span></td><td>CREATE/DROP FUNCTION, CREATE/DROP AGGREGATE — full DDL lifecycle with cluster replication. UDFs are <strong>WebAssembly</strong> components (<code>LANGUAGE wasm AS '&lt;hex&gt;' | AS FILE '…' | AS URL '…' WITH SHA256 = '…'</code>); Java UDFs are not supported. Keyspace-qualified calls (<code>ks.fn(args)</code>) work in SELECT.</td></tr>
     </tbody>
   </table>
 
@@ -475,6 +475,8 @@
       <tr><td>GRANT</td><td><span class="check">Supported</span></td><td>GRANT perm[, perm…] ON resource TO role. Resource: <code>ON TABLE ks.t</code> / <code>ks.t</code>, <code>ON KEYSPACE</code>, <code>ON ALL KEYSPACES</code>, <code>ON ALL ROLES</code>, <code>ON FUNCTION</code>. Unknown permissions are rejected (no silent partial grant).</td></tr>
       <tr><td>REVOKE</td><td><span class="check">Supported</span></td><td>REVOKE perm[, perm…] ON resource FROM role (same resource forms as GRANT)</td></tr>
       <tr><td>GRANT / REVOKE role</td><td><span class="check">Supported</span></td><td><code>GRANT &lt;role&gt; TO &lt;member&gt;</code> / <code>REVOKE &lt;role&gt; FROM &lt;member&gt;</code> — role hierarchy (the member inherits the role's permissions). Replicated additively (one membership edge per op) and cycle-checked at apply, so concurrent grants never clobber and a revoke is never lost to a racing grant.</td></tr>
+      <tr><td>LIST ROLES</td><td><span class="check">Supported</span></td><td><code>LIST ROLES [OF &lt;role&gt;] [NORECURSIVE]</code>; <code>LIST USERS</code> alias</td></tr>
+      <tr><td>LIST PERMISSIONS</td><td><span class="check">Supported</span></td><td><code>LIST [ALL | &lt;permission&gt;] PERMISSIONS [ON &lt;resource&gt;] [OF &lt;role&gt;] [NORECURSIVE]</code> — gated on DESCRIBE over all roles</td></tr>
       <tr><td>ACCESS TO/FROM (network auth)</td><td><span class="cross">Rejected</span></td><td>ACCESS TO DATACENTERS / FROM CIDRS is parsed but rejected — ferrosa has no network authorizer, so an unenforced access restriction fails loud rather than being silently accepted</td></tr>
     </tbody>
   </table>
