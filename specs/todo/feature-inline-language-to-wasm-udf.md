@@ -76,6 +76,47 @@ vs **(B) WASM=0 binaryen**.
   decides the fork: **(A) host JS engine + Wasmtime-backed WebAssembly shim** vs
   **(B) WASM=0 binaryen for an all-in-Wasmtime guest**.
 
+## PoC progress — Path A (host rquickjs + wasmtime-backed `WebAssembly`)
+
+`ferrosa-udf/examples/asc_compile_poc.rs` (rquickjs 0.9 async; build the JS bundle
+with `ferrosa-udf/examples/asc-poc/build-bundle.sh`). Empirically established:
+
+- **rquickjs runs the asc + binaryen toolchain.** With a `console` shim added
+  (binaryen's Emscripten init uses `console`; QuickJS lacks it), the 15 MB ESM
+  bundle's top-level await (binaryen init) runs to completion and reaches
+  binaryen's `WebAssembly.instantiate`. So QuickJS-on-the-host can drive the
+  whole toolchain; the only host shims needed are `console`, `performance.now`,
+  and `WebAssembly`.
+- **Captured the exact shim surface** (the instrumented `WebAssembly` stub):
+  - binaryen instantiates an **~8.77 MB** wasm (its embedded module).
+  - **one import namespace `a`** with **~80 functions** (Emscripten env glue,
+    minified names: `b, ja, u, x, k, U, w, …`). These are JS functions the
+    bundle supplies in the import object — the wasm calls back into them.
+  - binaryen's wasm **exports its memory**; Emscripten's JS reads/writes that
+    linear memory directly via the `Memory.buffer` ArrayBuffer.
+
+### Remaining shim to build (well-defined)
+
+Implement a `WebAssembly` global in rquickjs backed by ferrosa's wasmtime:
+
+1. `WebAssembly.Module(bytes)` → `wasmtime::Module::new`.
+2. `WebAssembly.instantiate(bytes|module, importObject)`:
+   - Build a wasmtime `Linker`; for each `importObject.a.<name>` (a **JS**
+     function), register a wasmtime host function that **calls back into
+     rquickjs**, marshalling `i32/i64/f32/f64` args/results.
+   - Instantiate; expose `instance.exports.<fn>` as **JS functions** that call
+     the wasmtime instance's exports (the JS→wasm direction).
+   - Expose `instance.exports.memory` as a `WebAssembly.Memory` whose `buffer`
+     **aliases the wasmtime instance's linear memory** (the fiddly part — and on
+     `memory.grow` the ArrayBuffer must be re-derived, mirroring Emscripten's
+     `updateMemoryViews`).
+3. `WebAssembly.Memory` / `Table` / `Global` wrappers as needed.
+
+Net: binaryen's real (fast) WASM runs **in ferrosa's wasmtime**, sandboxed; the
+JS engine on the host just orchestrates. The cross-runtime function bridging and
+the memory aliasing are the implementation work; everything upstream (engine,
+bundle, async, init shims, import surface) is proven.
+
 ## Goal
 
 Let users write UDF/UDA bodies in a high-level language inside
