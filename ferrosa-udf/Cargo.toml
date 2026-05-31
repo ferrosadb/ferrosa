@@ -13,7 +13,36 @@ thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 bumpalo = { version = "3", features = ["collections"] }
+# Inline AssemblyScript->WASM compiler (feature `asc-udf`): runs the asc+binaryen
+# JS toolchain in QuickJS with a wasmtime-backed `WebAssembly` shim.
+rquickjs = { version = "0.9", features = [
+    "loader",
+    "array-buffer",
+    "futures",
+], optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+# Wrap the asc core module into a component matching the `udf` WIT world.
+wit-component = { version = "0.244", optional = true }
+wit-parser = { version = "0.244", optional = true }
+
+[features]
+# Inline AssemblyScript UDF compilation (pulls QuickJS via rquickjs) and
+# componentization to the `udf` WIT ABI.
+asc-udf = ["dep:rquickjs", "dep:tokio", "dep:wit-component", "dep:wit-parser"]
+# Opt-in target for tests that need external infrastructure (e.g. the 15 MB
+# asc+binaryen bundle). Default `cargo test` does not build these.
+live-infra-tests = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 wat = "1.248"
+anyhow = "1"
+
+# Spike/demo: drive the inline asc compiler end-to-end. Needs the asc-udf feature.
+[[example]]
+name = "asc_compile"
+required-features = ["asc-udf"]
+
+[[example]]
+name = "asc_compile_poc"
+required-features = ["asc-udf"]
