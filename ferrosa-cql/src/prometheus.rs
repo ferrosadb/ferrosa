@@ -92,7 +92,7 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
 
     // Process memory metrics — critical for diagnosing memory leaks.
     // On Linux (containers), read from /proc/self/status.
-    if let Some((rss, vsize)) = read_process_memory() {
+    if let Some(memory) = read_process_memory() {
         output.push_str(
             "# HELP ferrosa_process_resident_memory_bytes Resident set size (RSS) in bytes.\n",
         );
@@ -100,7 +100,7 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
         output.push_str(&format_metric(
             "ferrosa_process_resident_memory_bytes",
             &[],
-            rss as f64,
+            memory.rss_bytes as f64,
         ));
         output.push_str(
             "# HELP ferrosa_process_virtual_memory_bytes Virtual memory size in bytes.\n",
@@ -109,8 +109,54 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
         output.push_str(&format_metric(
             "ferrosa_process_virtual_memory_bytes",
             &[],
-            vsize as f64,
+            memory.vsize_bytes as f64,
         ));
+        output.push_str("# HELP ferrosa_process_memory_bytes Process memory from /proc/self/status by category.\n");
+        output.push_str("# TYPE ferrosa_process_memory_bytes gauge\n");
+        for (kind, bytes) in memory.as_labeled_bytes() {
+            output.push_str(&format_metric(
+                "ferrosa_process_memory_bytes",
+                &[("kind", kind)],
+                bytes as f64,
+            ));
+        }
+    }
+
+    if let Some(smaps) = read_process_smaps_rollup() {
+        output.push_str("# HELP ferrosa_process_smaps_rollup_bytes Process memory accounting from /proc/self/smaps_rollup by category.\n");
+        output.push_str("# TYPE ferrosa_process_smaps_rollup_bytes gauge\n");
+        for (kind, bytes) in smaps.as_labeled_bytes() {
+            output.push_str(&format_metric(
+                "ferrosa_process_smaps_rollup_bytes",
+                &[("kind", kind)],
+                bytes as f64,
+            ));
+        }
+    }
+
+    if let Some(cgroup) = read_cgroup_memory() {
+        output.push_str(
+            "# HELP ferrosa_cgroup_memory_bytes Cgroup memory usage and limit in bytes.\n",
+        );
+        output.push_str("# TYPE ferrosa_cgroup_memory_bytes gauge\n");
+        for (kind, bytes) in cgroup.as_labeled_bytes() {
+            output.push_str(&format_metric(
+                "ferrosa_cgroup_memory_bytes",
+                &[("kind", kind)],
+                bytes as f64,
+            ));
+        }
+        output.push_str(
+            "# HELP ferrosa_cgroup_memory_events_total Cgroup memory pressure and OOM events.\n",
+        );
+        output.push_str("# TYPE ferrosa_cgroup_memory_events_total counter\n");
+        for (event, count) in &cgroup.events {
+            output.push_str(&format_metric(
+                "ferrosa_cgroup_memory_events_total",
+                &[("event", event)],
+                *count as f64,
+            ));
+        }
     }
 
     if let Some(cpu_seconds) = read_process_cpu_seconds() {
@@ -174,6 +220,55 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
                 "ferrosa_host_network_transmit_bytes_total",
                 &[("interface", &iface.name)],
                 iface.transmit_bytes as f64,
+            ));
+        }
+    }
+
+    let block_devices = read_block_device_counters();
+    if !block_devices.is_empty() {
+        output.push_str("# HELP ferrosa_host_block_device_io_total Block device IO operations from /proc/diskstats.\n");
+        output.push_str("# TYPE ferrosa_host_block_device_io_total counter\n");
+        output.push_str("# HELP ferrosa_host_block_device_io_bytes_total Block device IO bytes from /proc/diskstats, assuming 512-byte sectors.\n");
+        output.push_str("# TYPE ferrosa_host_block_device_io_bytes_total counter\n");
+        output.push_str("# HELP ferrosa_host_block_device_io_seconds_total Block device IO time from /proc/diskstats.\n");
+        output.push_str("# TYPE ferrosa_host_block_device_io_seconds_total counter\n");
+        output.push_str("# HELP ferrosa_host_block_device_in_flight Current in-flight IOs from /proc/diskstats.\n");
+        output.push_str("# TYPE ferrosa_host_block_device_in_flight gauge\n");
+        for device in block_devices {
+            output.push_str(&format_metric(
+                "ferrosa_host_block_device_io_total",
+                &[("device", &device.name), ("direction", "read")],
+                device.reads_completed as f64,
+            ));
+            output.push_str(&format_metric(
+                "ferrosa_host_block_device_io_total",
+                &[("device", &device.name), ("direction", "write")],
+                device.writes_completed as f64,
+            ));
+            output.push_str(&format_metric(
+                "ferrosa_host_block_device_io_bytes_total",
+                &[("device", &device.name), ("direction", "read")],
+                device.read_bytes as f64,
+            ));
+            output.push_str(&format_metric(
+                "ferrosa_host_block_device_io_bytes_total",
+                &[("device", &device.name), ("direction", "write")],
+                device.write_bytes as f64,
+            ));
+            output.push_str(&format_metric(
+                "ferrosa_host_block_device_io_seconds_total",
+                &[("device", &device.name), ("direction", "read")],
+                device.read_seconds,
+            ));
+            output.push_str(&format_metric(
+                "ferrosa_host_block_device_io_seconds_total",
+                &[("device", &device.name), ("direction", "write")],
+                device.write_seconds,
+            ));
+            output.push_str(&format_metric(
+                "ferrosa_host_block_device_in_flight",
+                &[("device", &device.name)],
+                device.in_flight as f64,
             ));
         }
     }
@@ -294,19 +389,57 @@ fn read_fd_budget() -> Option<(u64, u64)> {
 /// Returns `(rss_bytes, vsize_bytes)`. On Linux reads `/proc/self/status`;
 /// on macOS reads `/proc/{pid}/status`-equivalent via `ps`. Returns `None`
 /// on unsupported platforms or if the read fails.
-fn read_process_memory() -> Option<(u64, u64)> {
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcessMemory {
+    rss_bytes: u64,
+    vsize_bytes: u64,
+    rss_hwm_bytes: u64,
+    data_bytes: u64,
+    stack_bytes: u64,
+    locked_bytes: u64,
+    pinned_bytes: u64,
+    swap_bytes: u64,
+}
+
+impl ProcessMemory {
+    fn as_labeled_bytes(&self) -> [(&'static str, u64); 8] {
+        [
+            ("rss", self.rss_bytes),
+            ("vsize", self.vsize_bytes),
+            ("rss_hwm", self.rss_hwm_bytes),
+            ("data", self.data_bytes),
+            ("stack", self.stack_bytes),
+            ("locked", self.locked_bytes),
+            ("pinned", self.pinned_bytes),
+            ("swap", self.swap_bytes),
+        ]
+    }
+}
+
+fn read_process_memory() -> Option<ProcessMemory> {
     // Linux: /proc/self/status has VmRSS and VmSize in kB.
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        let mut rss_kb = 0u64;
-        let mut vsize_kb = 0u64;
+        let mut memory = ProcessMemory::default();
         for line in status.lines() {
-            if let Some(val) = line.strip_prefix("VmRSS:") {
-                rss_kb = val.trim().trim_end_matches(" kB").trim().parse().ok()?;
-            } else if let Some(val) = line.strip_prefix("VmSize:") {
-                vsize_kb = val.trim().trim_end_matches(" kB").trim().parse().ok()?;
+            if let Some(value) = parse_proc_status_bytes(line, "VmRSS:") {
+                memory.rss_bytes = value;
+            } else if let Some(value) = parse_proc_status_bytes(line, "VmSize:") {
+                memory.vsize_bytes = value;
+            } else if let Some(value) = parse_proc_status_bytes(line, "VmHWM:") {
+                memory.rss_hwm_bytes = value;
+            } else if let Some(value) = parse_proc_status_bytes(line, "VmData:") {
+                memory.data_bytes = value;
+            } else if let Some(value) = parse_proc_status_bytes(line, "VmStk:") {
+                memory.stack_bytes = value;
+            } else if let Some(value) = parse_proc_status_bytes(line, "VmLck:") {
+                memory.locked_bytes = value;
+            } else if let Some(value) = parse_proc_status_bytes(line, "VmPin:") {
+                memory.pinned_bytes = value;
+            } else if let Some(value) = parse_proc_status_bytes(line, "VmSwap:") {
+                memory.swap_bytes = value;
             }
         }
-        return Some((rss_kb * 1024, vsize_kb * 1024));
+        return Some(memory);
     }
 
     // macOS fallback: use `ps` to read RSS (no libc dependency).
@@ -320,10 +453,143 @@ fn read_process_memory() -> Option<(u64, u64)> {
     if parts.len() >= 2 {
         let rss_kb: u64 = parts[0].parse().ok()?;
         let vsz_kb: u64 = parts[1].parse().ok()?;
-        return Some((rss_kb * 1024, vsz_kb * 1024));
+        return Some(ProcessMemory {
+            rss_bytes: rss_kb * 1024,
+            vsize_bytes: vsz_kb * 1024,
+            ..ProcessMemory::default()
+        });
     }
 
     None
+}
+
+fn parse_proc_status_bytes(line: &str, key: &str) -> Option<u64> {
+    line.strip_prefix(key)?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb * 1024)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SmapsRollup {
+    rss_bytes: u64,
+    pss_bytes: u64,
+    shared_clean_bytes: u64,
+    shared_dirty_bytes: u64,
+    private_clean_bytes: u64,
+    private_dirty_bytes: u64,
+    referenced_bytes: u64,
+    anonymous_bytes: u64,
+    lazy_free_bytes: u64,
+    anon_huge_pages_bytes: u64,
+    swap_bytes: u64,
+}
+
+impl SmapsRollup {
+    fn as_labeled_bytes(&self) -> [(&'static str, u64); 11] {
+        [
+            ("rss", self.rss_bytes),
+            ("pss", self.pss_bytes),
+            ("shared_clean", self.shared_clean_bytes),
+            ("shared_dirty", self.shared_dirty_bytes),
+            ("private_clean", self.private_clean_bytes),
+            ("private_dirty", self.private_dirty_bytes),
+            ("referenced", self.referenced_bytes),
+            ("anonymous", self.anonymous_bytes),
+            ("lazy_free", self.lazy_free_bytes),
+            ("anon_huge_pages", self.anon_huge_pages_bytes),
+            ("swap", self.swap_bytes),
+        ]
+    }
+}
+
+fn read_process_smaps_rollup() -> Option<SmapsRollup> {
+    let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    Some(read_process_smaps_rollup_from_proc(&text))
+}
+
+fn read_process_smaps_rollup_from_proc(text: &str) -> SmapsRollup {
+    let mut rollup = SmapsRollup::default();
+    for line in text.lines() {
+        if let Some(value) = parse_proc_status_bytes(line, "Rss:") {
+            rollup.rss_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Pss:") {
+            rollup.pss_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Shared_Clean:") {
+            rollup.shared_clean_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Shared_Dirty:") {
+            rollup.shared_dirty_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Private_Clean:") {
+            rollup.private_clean_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Private_Dirty:") {
+            rollup.private_dirty_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Referenced:") {
+            rollup.referenced_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Anonymous:") {
+            rollup.anonymous_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "LazyFree:") {
+            rollup.lazy_free_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "AnonHugePages:") {
+            rollup.anon_huge_pages_bytes = value;
+        } else if let Some(value) = parse_proc_status_bytes(line, "Swap:") {
+            rollup.swap_bytes = value;
+        }
+    }
+    rollup
+}
+
+#[derive(Debug, Clone, Default)]
+struct CgroupMemory {
+    current_bytes: u64,
+    max_bytes: u64,
+    events: Vec<(String, u64)>,
+}
+
+impl CgroupMemory {
+    fn as_labeled_bytes(&self) -> [(&'static str, u64); 2] {
+        [("current", self.current_bytes), ("max", self.max_bytes)]
+    }
+}
+
+fn read_cgroup_memory() -> Option<CgroupMemory> {
+    let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|text| parse_cgroup_memory_max(text.trim()));
+    let events = std::fs::read_to_string("/sys/fs/cgroup/memory.events")
+        .ok()
+        .map(|text| read_cgroup_memory_events_from_proc(&text))
+        .unwrap_or_default();
+    Some(CgroupMemory {
+        current_bytes: current,
+        max_bytes: max.unwrap_or(0),
+        events,
+    })
+}
+
+fn parse_cgroup_memory_max(value: &str) -> Option<u64> {
+    if value == "max" {
+        Some(0)
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn read_cgroup_memory_events_from_proc(text: &str) -> Vec<(String, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?;
+            let value = parts.next()?.parse::<u64>().ok()?;
+            Some((name.to_string(), value))
+        })
+        .collect()
 }
 
 fn read_process_cpu_seconds() -> Option<f64> {
@@ -403,6 +669,57 @@ fn read_host_network_counters_from_proc(text: &str) -> Vec<NetworkCounters> {
                 name: name.to_string(),
                 receive_bytes: fields.first()?.parse().ok()?,
                 transmit_bytes: fields.get(8)?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BlockDeviceCounters {
+    name: String,
+    reads_completed: u64,
+    read_bytes: u64,
+    read_seconds: f64,
+    writes_completed: u64,
+    write_bytes: u64,
+    write_seconds: f64,
+    in_flight: u64,
+}
+
+fn read_block_device_counters() -> Vec<BlockDeviceCounters> {
+    std::fs::read_to_string("/proc/diskstats")
+        .ok()
+        .map(|text| read_block_device_counters_from_proc(&text))
+        .unwrap_or_default()
+}
+
+fn read_block_device_counters_from_proc(text: &str) -> Vec<BlockDeviceCounters> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 14 {
+                return None;
+            }
+            let name = fields[2];
+            if name.starts_with("loop") || name.starts_with("ram") {
+                return None;
+            }
+            let reads_completed = fields[3].parse().ok()?;
+            let sectors_read: u64 = fields[5].parse().ok()?;
+            let read_ms: u64 = fields[6].parse().ok()?;
+            let writes_completed = fields[7].parse().ok()?;
+            let sectors_written: u64 = fields[9].parse().ok()?;
+            let write_ms: u64 = fields[10].parse().ok()?;
+            let in_flight = fields[11].parse().ok()?;
+            Some(BlockDeviceCounters {
+                name: name.to_string(),
+                reads_completed,
+                read_bytes: sectors_read.saturating_mul(512),
+                read_seconds: read_ms as f64 / 1000.0,
+                writes_completed,
+                write_bytes: sectors_written.saturating_mul(512),
+                write_seconds: write_ms as f64 / 1000.0,
+                in_flight,
             })
         })
         .collect()
@@ -545,6 +862,10 @@ mod tests {
             output.contains("ferrosa_process_virtual_memory_bytes"),
             "metrics must include vsize for memory leak diagnosis"
         );
+        assert!(
+            output.contains("ferrosa_process_memory_bytes"),
+            "metrics must include category-level process memory"
+        );
     }
 
     #[test]
@@ -572,6 +893,57 @@ mod tests {
     }
 
     #[test]
+    fn process_status_memory_parser_extracts_kb_values() {
+        assert_eq!(
+            parse_proc_status_bytes("VmRSS:\t 123 kB", "VmRSS:"),
+            Some(123 * 1024)
+        );
+        assert_eq!(
+            parse_proc_status_bytes("VmData:\t456 kB", "VmData:"),
+            Some(456 * 1024)
+        );
+        assert_eq!(parse_proc_status_bytes("VmRSS:\t 123 kB", "VmData:"), None);
+    }
+
+    #[test]
+    fn smaps_rollup_parser_extracts_memory_categories() {
+        let rollup = read_process_smaps_rollup_from_proc(
+            "Rss:                100 kB\n\
+             Pss:                 90 kB\n\
+             Shared_Clean:        10 kB\n\
+             Shared_Dirty:         2 kB\n\
+             Private_Clean:        3 kB\n\
+             Private_Dirty:       80 kB\n\
+             Referenced:          95 kB\n\
+             Anonymous:           70 kB\n\
+             LazyFree:             1 kB\n\
+             AnonHugePages:        0 kB\n\
+             Swap:                 4 kB\n",
+        );
+        assert_eq!(rollup.rss_bytes, 100 * 1024);
+        assert_eq!(rollup.pss_bytes, 90 * 1024);
+        assert_eq!(rollup.private_dirty_bytes, 80 * 1024);
+        assert_eq!(rollup.anonymous_bytes, 70 * 1024);
+        assert_eq!(rollup.swap_bytes, 4 * 1024);
+    }
+
+    #[test]
+    fn cgroup_memory_events_parser_extracts_counts() {
+        let events =
+            read_cgroup_memory_events_from_proc("low 0\nhigh 2\nmax 3\noom 4\noom_kill 5\n");
+        assert_eq!(
+            events,
+            vec![
+                ("low".to_string(), 0),
+                ("high".to_string(), 2),
+                ("max".to_string(), 3),
+                ("oom".to_string(), 4),
+                ("oom_kill".to_string(), 5),
+            ]
+        );
+    }
+
+    #[test]
     fn network_parser_skips_loopback_and_extracts_bytes() {
         let counters = read_host_network_counters_from_proc(
             "Inter-| Receive | Transmit\n\
@@ -590,6 +962,27 @@ mod tests {
     }
 
     #[test]
+    fn diskstats_parser_extracts_block_device_counters() {
+        let counters = read_block_device_counters_from_proc(
+            "   7       0 loop0 1 0 2 3 4 0 5 6 0 8 9 0 0 0 0 0 0\n\
+             254       0 vda 10 0 20 30 40 0 50 60 2 80 90 0 0 0 0 0 0\n",
+        );
+        assert_eq!(
+            counters,
+            vec![BlockDeviceCounters {
+                name: "vda".to_string(),
+                reads_completed: 10,
+                read_bytes: 20 * 512,
+                read_seconds: 0.030,
+                writes_completed: 40,
+                write_bytes: 50 * 512,
+                write_seconds: 0.060,
+                in_flight: 2,
+            }]
+        );
+    }
+
+    #[test]
     fn render_metrics_includes_cpu_io_and_network_when_available() {
         let registry = VirtualTableRegistry::new();
         let output = render_metrics(&registry);
@@ -598,6 +991,9 @@ mod tests {
         }
         if std::path::Path::new("/proc/self/io").exists() {
             assert!(output.contains("ferrosa_process_io_read_bytes_total"));
+        }
+        if std::path::Path::new("/proc/diskstats").exists() {
+            assert!(output.contains("ferrosa_host_block_device_io_total"));
         }
     }
 

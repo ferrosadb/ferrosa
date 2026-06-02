@@ -2127,6 +2127,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "libc",
  "object_store",
  "parking_lot 0.12.5",
  "proptest",

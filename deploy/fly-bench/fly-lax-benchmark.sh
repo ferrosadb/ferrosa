@@ -286,7 +286,7 @@ start_ferrosa_memory_snapshots() {
       set +e
       started=\$(date +%s)
       deadline=\$((started + ${MEMORY_SNAPSHOT_MAX_SECONDS}))
-      metric_filter=\"ferrosa_process_resident_memory_bytes|ferrosa_process_virtual_memory_bytes|ferrosa_process_cpu_seconds_total|ferrosa_process_io_|ferrosa_host_network_|ferrosa_storage_stats_memtable_size_bytes|ferrosa_storage_stats_local_sstable_cache_bytes|ferrosa_storage_stats_sstable_size_bytes|ferrosa_storage_stats_s3_bytes|ferrosa_storage_upload_queue_depth|ferrosa_storage_upload_|ferrosa_storage_flush|ferrosa_storage_compaction_|ferrosa_storage_read_limited_rows|ferrosa_net_rpc_|ferrosa_net_lane_|ferrosa_net_data_lane_|ferrosa_coordinator_inbound_mutation_|ferrosa_commitlog_|ferrosa_cql_|ferrosa_fd_\"
+      metric_filter=\"ferrosa_process_resident_memory_bytes|ferrosa_process_virtual_memory_bytes|ferrosa_process_memory_bytes|ferrosa_process_smaps_rollup_bytes|ferrosa_cgroup_memory_|ferrosa_process_cpu_seconds_total|ferrosa_process_io_|ferrosa_host_network_|ferrosa_host_block_device_|ferrosa_storage_stats_memtable_size_bytes|ferrosa_storage_stats_local_sstable_cache_bytes|ferrosa_storage_stats_sstable_size_bytes|ferrosa_storage_stats_s3_bytes|ferrosa_storage_upload_queue_depth|ferrosa_storage_upload_|ferrosa_storage_flush|ferrosa_storage_compaction_|ferrosa_storage_read_limited_rows|ferrosa_net_rpc_|ferrosa_net_lane_|ferrosa_net_data_lane_|ferrosa_coordinator_inbound_mutation_|ferrosa_commitlog_|ferrosa_cql_|ferrosa_fd_\"
       while [ \$(date +%s) -lt \"\${deadline}\" ]; do
         ts=\$(date -u +%FT%TZ)
         epoch=\$(date +%s)
@@ -744,6 +744,20 @@ run_ferrosa_ramp() {
   done
 }
 
+run_ferrosa_t128() {
+  local size_label
+  size_label="$(ferrosa_size_label)"
+  (
+    WORKLOAD="$RAMP_WORKLOAD"
+    SCENARIO=default
+    THREADS=128
+    WARMUP_CYCLES=1000000
+    MEASURE_CYCLES=1000000
+    REPEATS=1
+    run_target "ferrosa-${size_label}-t128-c1000000" "$FERROSA_APP" "ferrosa-"
+  )
+}
+
 run_cassandra_ramp() {
   local stages=(
     "16:1000:1000:1"
@@ -788,6 +802,7 @@ case "${1:-}" in
   create-bench) create_bench_node ;;
   create-cassandra) create_cassandra_cluster ;;
   run-ferrosa) run_target "ferrosa-$(ferrosa_size_label)" "$FERROSA_APP" "ferrosa-" ;;
+  run-ferrosa-t128) run_ferrosa_t128 ;;
   run-ferrosa-ramp) run_ferrosa_ramp ;;
   run-cassandra) run_target "cassandra-8g" "$CASSANDRA_APP" "cassandra-" ;;
   run-cassandra-ramp) run_cassandra_ramp ;;
@@ -804,7 +819,7 @@ case "${1:-}" in
     ;;
   *)
     cat >&2 <<EOF
-usage: $0 preflight|build-images|create-ferrosa|teardown-ferrosa|teardown-ferrosa-volumes|recreate-ferrosa|create-bench|create-cassandra|run-ferrosa|run-ferrosa-ramp|run-cassandra|run-cassandra-ramp|teardown-cassandra|full
+usage: $0 preflight|build-images|create-ferrosa|teardown-ferrosa|teardown-ferrosa-volumes|recreate-ferrosa|create-bench|create-cassandra|run-ferrosa|run-ferrosa-t128|run-ferrosa-ramp|run-cassandra|run-cassandra-ramp|teardown-cassandra|full
 
 Results are written under: ${RESULTS_DIR}
 EOF

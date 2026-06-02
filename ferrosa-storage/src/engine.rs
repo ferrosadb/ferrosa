@@ -3497,6 +3497,7 @@ impl StorageEngine {
         row: Row,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
+        let total_start = Instant::now();
         // Per-write span emitted at DEBUG level so it is free at the
         // default INFO subscriber filter — every span allocation was
         // measurable on a 50k ops/s workload.
@@ -3505,19 +3506,72 @@ impl StorageEngine {
             table = %table_id,
         )
         .entered();
-        self.check_write_admission()?;
+        let phase_start = Instant::now();
+        if let Err(e) = self.check_write_admission() {
+            crate::metrics::observe_write_phase(
+                crate::metrics::WritePhase::AdmissionDisk,
+                phase_start.elapsed(),
+            );
+            crate::metrics::observe_write_phase(
+                crate::metrics::WritePhase::Total,
+                total_start.elapsed(),
+            );
+            crate::metrics::inc_write_failure();
+            return Err(e);
+        }
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::AdmissionDisk,
+            phase_start.elapsed(),
+        );
+
+        let phase_start = Instant::now();
         {
             let tables = self.tables.read();
             let state = tables.get(table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
             })?;
-            self.check_memtable_write_admission(table_id, state)?;
+            if let Err(e) = self.check_memtable_write_admission(table_id, state) {
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::AdmissionMemtable,
+                    phase_start.elapsed(),
+                );
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::Total,
+                    total_start.elapsed(),
+                );
+                crate::metrics::inc_write_failure();
+                return Err(e);
+            }
         }
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::AdmissionMemtable,
+            phase_start.elapsed(),
+        );
 
         // 1. Append to commit log for durability.
-        let cl_pos = self
+        let phase_start = Instant::now();
+        let cl_pos = match self
             .commit_log
-            .append_single_row(table_id, key, &row, timestamp)?;
+            .append_single_row(table_id, key, &row, timestamp)
+        {
+            Ok(pos) => pos,
+            Err(e) => {
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::CommitLogAppend,
+                    phase_start.elapsed(),
+                );
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::Total,
+                    total_start.elapsed(),
+                );
+                crate::metrics::inc_write_failure();
+                return Err(e);
+            }
+        };
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::CommitLogAppend,
+            phase_start.elapsed(),
+        );
         let observer_mutation = if self.has_observers_for_table(table_id) {
             Some(Mutation::new(
                 table_id.keyspace.clone(),
@@ -3531,12 +3585,24 @@ impl StorageEngine {
         };
 
         // 2. Write to the table's memtable and track commit log position.
+        let phase_start = Instant::now();
         let inline_flush = {
             let tables = self.tables.read();
             let state = tables.get(table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
             })?;
-            state.store.write(key, row)?;
+            if let Err(e) = state.store.write(key, row) {
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::MemtableWrite,
+                    phase_start.elapsed(),
+                );
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::Total,
+                    total_start.elapsed(),
+                );
+                crate::metrics::inc_write_failure();
+                return Err(e);
+            }
             state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
             // Set the first-unflushed timestamp via CAS — succeeds at most once
             // per memtable epoch, no contention after the first write.
@@ -3558,15 +3624,46 @@ impl StorageEngine {
             self.request_flush_if_needed(state);
             inline_flush
         };
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::MemtableWrite,
+            phase_start.elapsed(),
+        );
         if inline_flush {
-            self.flush(table_id)?;
+            crate::metrics::inc_write_inline_flush();
+            let phase_start = Instant::now();
+            if let Err(e) = self.flush(table_id) {
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::InlineFlush,
+                    phase_start.elapsed(),
+                );
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::Total,
+                    total_start.elapsed(),
+                );
+                crate::metrics::inc_write_failure();
+                return Err(e);
+            }
+            crate::metrics::observe_write_phase(
+                crate::metrics::WritePhase::InlineFlush,
+                phase_start.elapsed(),
+            );
         }
 
         // 3. Notify observers after successful commit log + memtable write.
+        let phase_start = Instant::now();
         if let Some(mutation) = observer_mutation.as_ref() {
             self.dispatch_sync_observers(table_id, mutation);
             self.dispatch_async_observers(table_id, mutation);
         }
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::Observers,
+            phase_start.elapsed(),
+        );
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::Total,
+            total_start.elapsed(),
+        );
+        crate::metrics::inc_write_total();
 
         Ok(())
     }

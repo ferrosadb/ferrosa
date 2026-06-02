@@ -109,6 +109,30 @@ pub fn render_prometheus() -> String {
     out.push_str("# HELP ferrosa_commitlog_syncs_total Successful commit-log fsync calls.\n");
     out.push_str("# TYPE ferrosa_commitlog_syncs_total counter\n");
     out.push_str(&format!("ferrosa_commitlog_syncs_total {}\n", flush.syncs));
+    out.push_str("# HELP ferrosa_commitlog_sync_seconds_total Total wall time spent in commit-log flush_to_disk/force_full_flush calls that performed fsync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_seconds_total {:.9}\n",
+        flush.sync_micros_total as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_seconds_max Maximum observed wall time for a commit-log fsync call.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_seconds_max {:.9}\n",
+        flush.sync_micros_max as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_wait_writers_seconds_total Total wall time commit-log sync spent waiting for in-flight writers to finish entries.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_wait_writers_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_wait_writers_seconds_total {:.9}\n",
+        flush.sync_wait_writers_micros_total as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_wait_writers_seconds_max Maximum observed wait-for-writers time before commit-log sync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_wait_writers_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_wait_writers_seconds_max {:.9}\n",
+        flush.sync_wait_writers_micros_max as f64 / 1_000_000.0
+    ));
     out.push_str("# HELP ferrosa_commitlog_periodic_idle_flushes_skipped_total Periodic commit-log timer ticks skipped because no writes were pending.\n");
     out.push_str("# TYPE ferrosa_commitlog_periodic_idle_flushes_skipped_total counter\n");
     out.push_str(&format!(

@@ -174,6 +174,53 @@ const COMPACTION_PHASES: [CompactionPhase; 13] = [
     CompactionPhase::Total,
 ];
 
+#[derive(Clone, Copy)]
+pub enum WritePhase {
+    AdmissionDisk,
+    AdmissionMemtable,
+    CommitLogAppend,
+    MemtableWrite,
+    InlineFlush,
+    Observers,
+    Total,
+}
+
+impl WritePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AdmissionDisk => "admission_disk",
+            Self::AdmissionMemtable => "admission_memtable",
+            Self::CommitLogAppend => "commitlog_append",
+            Self::MemtableWrite => "memtable_write",
+            Self::InlineFlush => "inline_flush",
+            Self::Observers => "observers",
+            Self::Total => "total",
+        }
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            Self::AdmissionDisk => 0,
+            Self::AdmissionMemtable => 1,
+            Self::CommitLogAppend => 2,
+            Self::MemtableWrite => 3,
+            Self::InlineFlush => 4,
+            Self::Observers => 5,
+            Self::Total => 6,
+        }
+    }
+}
+
+const WRITE_PHASES: [WritePhase; 7] = [
+    WritePhase::AdmissionDisk,
+    WritePhase::AdmissionMemtable,
+    WritePhase::CommitLogAppend,
+    WritePhase::MemtableWrite,
+    WritePhase::InlineFlush,
+    WritePhase::Observers,
+    WritePhase::Total,
+];
+
 static FLUSH_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSH_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -214,6 +261,13 @@ static COMPACTION_LAST_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_LAST_INPUT_ROWS: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_LAST_OUTPUT_ROWS: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_LAST_OUTPUT_PARTITIONS: AtomicU64 = AtomicU64::new(0);
+
+static WRITE_PHASE_MICROS_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static WRITE_PHASE_MICROS_MAX: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static WRITE_PHASE_COUNT_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static WRITE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_INLINE_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static READ_LIMITED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_FOUND_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -348,6 +402,26 @@ pub fn observe_compaction_completed(
     observe_compaction_phase(CompactionPhase::Total, duration);
 }
 
+pub fn observe_write_phase(phase: WritePhase, duration: Duration) {
+    let idx = phase.idx();
+    let micros = duration_micros(duration);
+    WRITE_PHASE_MICROS_TOTAL[idx].fetch_add(micros, Ordering::Relaxed);
+    WRITE_PHASE_COUNT_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+    update_max_u64(&WRITE_PHASE_MICROS_MAX[idx], micros);
+}
+
+pub fn inc_write_total() {
+    WRITE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_write_failure() {
+    WRITE_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_write_inline_flush() {
+    WRITE_INLINE_FLUSH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn observe_read_limited_rows(
     duration: Duration,
     found: bool,
@@ -373,6 +447,49 @@ pub fn observe_read_limited_rows(
 
 pub fn render_prometheus() -> String {
     let mut out = String::new();
+    out.push_str(
+        "# HELP ferrosa_storage_writes_total StorageEngine::write calls completed successfully.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_writes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_writes_total {}\n",
+        WRITE_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_write_failures_total StorageEngine::write calls that returned an error.\n");
+    out.push_str("# TYPE ferrosa_storage_write_failures_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_write_failures_total {}\n",
+        WRITE_FAILURE_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_write_inline_flush_total StorageEngine::write calls that synchronously ran a memtable flush.\n");
+    out.push_str("# TYPE ferrosa_storage_write_inline_flush_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_write_inline_flush_total {}\n",
+        WRITE_INLINE_FLUSH_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_write_phase_seconds_total Total wall time spent in StorageEngine::write phases.\n");
+    out.push_str("# TYPE ferrosa_storage_write_phase_seconds_total counter\n");
+    out.push_str("# HELP ferrosa_storage_write_phase_seconds_max Maximum observed wall time for a StorageEngine::write phase.\n");
+    out.push_str("# TYPE ferrosa_storage_write_phase_seconds_max gauge\n");
+    out.push_str("# HELP ferrosa_storage_write_phase_total Number of observations for StorageEngine::write phases.\n");
+    out.push_str("# TYPE ferrosa_storage_write_phase_total counter\n");
+    for phase in WRITE_PHASES {
+        let idx = phase.idx();
+        let label = phase.label();
+        let seconds = WRITE_PHASE_MICROS_TOTAL[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let max_seconds = WRITE_PHASE_MICROS_MAX[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        out.push_str(&format!(
+            "ferrosa_storage_write_phase_seconds_total{{phase=\"{label}\"}} {seconds}\n"
+        ));
+        out.push_str(&format!(
+            "ferrosa_storage_write_phase_seconds_max{{phase=\"{label}\"}} {max_seconds}\n"
+        ));
+        out.push_str(&format!(
+            "ferrosa_storage_write_phase_total{{phase=\"{label}\"}} {}\n",
+            WRITE_PHASE_COUNT_TOTAL[idx].load(Ordering::Relaxed)
+        ));
+    }
+
     out.push_str("# HELP ferrosa_storage_flushes_total Memtable flushes completed.\n");
     out.push_str("# TYPE ferrosa_storage_flushes_total counter\n");
     out.push_str(&format!(

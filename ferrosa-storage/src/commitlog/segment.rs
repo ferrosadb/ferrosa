@@ -60,6 +60,16 @@ use super::config::{CommitLogPosition, TableId};
 use super::descriptor::{SegmentDescriptor, HEADER_SIZE};
 use super::mutation::Mutation;
 
+#[cfg(all(
+    target_os = "macos",
+    not(any(feature = "macos-fullfsync", feature = "macos-standard-sync"))
+))]
+compile_error!(
+    "macOS commitlog durability requires an explicit choice: enable \
+     ferrosa-storage/macos-fullfsync for F_FULLFSYNC, or \
+     ferrosa-storage/macos-standard-sync to accept standard fsync semantics."
+);
+
 /// Entry overhead in bytes: entry_size (4) + size_crc (4) + payload_crc (4).
 pub const ENTRY_OVERHEAD: usize = 12;
 
@@ -74,6 +84,10 @@ static INCREMENTAL_FLUSH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FULL_FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FULL_FLUSH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SYNCS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static SYNC_WAIT_WRITERS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_WAIT_WRITERS_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct CommitLogFlushMetrics {
     pub incremental_flushes: u64,
@@ -81,6 +95,10 @@ pub(crate) struct CommitLogFlushMetrics {
     pub full_flushes: u64,
     pub full_bytes: u64,
     pub syncs: u64,
+    pub sync_micros_total: u64,
+    pub sync_micros_max: u64,
+    pub sync_wait_writers_micros_total: u64,
+    pub sync_wait_writers_micros_max: u64,
 }
 
 pub(crate) fn flush_metrics() -> CommitLogFlushMetrics {
@@ -90,7 +108,85 @@ pub(crate) fn flush_metrics() -> CommitLogFlushMetrics {
         full_flushes: FULL_FLUSHES_TOTAL.load(Ordering::Relaxed),
         full_bytes: FULL_FLUSH_BYTES_TOTAL.load(Ordering::Relaxed),
         syncs: SYNCS_TOTAL.load(Ordering::Relaxed),
+        sync_micros_total: SYNC_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_micros_max: SYNC_MICROS_MAX.load(Ordering::Relaxed),
+        sync_wait_writers_micros_total: SYNC_WAIT_WRITERS_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_wait_writers_micros_max: SYNC_WAIT_WRITERS_MICROS_MAX.load(Ordering::Relaxed),
     }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn update_max_u64(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn observe_sync(duration: Duration) {
+    let micros = duration_micros(duration);
+    SYNC_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&SYNC_MICROS_MAX, micros);
+}
+
+fn observe_wait_writers(duration: Duration) {
+    let micros = duration_micros(duration);
+    SYNC_WAIT_WRITERS_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&SYNC_WAIT_WRITERS_MICROS_MAX, micros);
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+fn full_sync_file(file: &fs::File) -> ferrosa_common::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+fn sync_commitlog_file(file: &fs::File) -> ferrosa_common::Result<()> {
+    #[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+    {
+        return full_sync_file(file);
+    }
+
+    #[cfg(any(
+        not(target_os = "macos"),
+        all(target_os = "macos", feature = "macos-standard-sync")
+    ))]
+    {
+        file.sync_data()?;
+        Ok(())
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> ferrosa_common::Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)?;
+        #[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+        {
+            if full_sync_file(&dir).is_err() {
+                dir.sync_all()?;
+            }
+        }
+        #[cfg(any(
+            not(target_os = "macos"),
+            all(target_os = "macos", feature = "macos-standard-sync")
+        ))]
+        {
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 /// A fixed-size byte buffer with lock-free CAS allocation for commit log entries.
@@ -258,7 +354,8 @@ impl Segment {
 
     /// Spins until all in-flight writers have completed their entries.
     /// Called by `flush_to_disk()` before reading the buffer.
-    fn wait_for_writers(&self) {
+    fn wait_for_writers(&self) -> Duration {
+        let started = Instant::now();
         let mut spins = 0;
         while self.in_flight_writers.load(Ordering::Acquire) > 0 {
             spins += 1;
@@ -268,6 +365,7 @@ impl Segment {
                 std::hint::spin_loop();
             }
         }
+        started.elapsed()
     }
 
     /// Writes a mutation entry at the given offset.
@@ -439,6 +537,7 @@ impl Segment {
     /// Uses incremental flush: only writes bytes since the last flush.
     /// Waits for all in-flight writers to complete before reading the buffer.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
+        let sync_start = Instant::now();
         let _span = tracing::info_span!("commitlog.sync", segment_id = self.id,).entered();
         // Snapshot position BEFORE waiting. This captures only data from
         // writers who have already allocated. New allocations after this
@@ -447,7 +546,7 @@ impl Segment {
 
         // Wait for all in-flight writers to complete their entries.
         // After this returns, buffer[0..snapshot_pos] is fully written.
-        self.wait_for_writers();
+        observe_wait_writers(self.wait_for_writers());
 
         // SAFETY: We only read buffer[0..snapshot_pos]. All bytes in this range
         // have been fully written — wait_for_writers() ensures no in-flight writes.
@@ -477,6 +576,7 @@ impl Segment {
                 if let Some(parent) = self.path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                let created = !self.path.exists();
                 let f = fs::OpenOptions::new()
                     .create(true)
                     .truncate(true)
@@ -487,10 +587,14 @@ impl Segment {
                 use std::io::Write;
                 let written = current_pos;
                 file.write_all(&buf[..current_pos])?;
-                file.sync_all()?;
+                sync_commitlog_file(file)?;
+                if created {
+                    sync_parent_dir(&self.path)?;
+                }
                 INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
                 SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                observe_sync(sync_start.elapsed());
                 self.last_flushed
                     .store(current_pos as u64, Ordering::Release);
             }
@@ -499,10 +603,11 @@ impl Segment {
                 use std::io::Write;
                 let written = current_pos - last_flushed;
                 file.write_all(&buf[last_flushed..current_pos])?;
-                file.sync_all()?;
+                sync_commitlog_file(file)?;
                 INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
                 SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                observe_sync(sync_start.elapsed());
                 self.last_flushed
                     .store(current_pos as u64, Ordering::Release);
             }
@@ -521,8 +626,9 @@ impl Segment {
     /// offsets have been updated after an incremental flush (e.g., during
     /// `force_sync` for catch-up replay).
     pub fn force_full_flush(&self) -> ferrosa_common::Result<()> {
+        let sync_start = Instant::now();
         let snapshot_pos = self.position.load(Ordering::Acquire) as usize;
-        self.wait_for_writers();
+        observe_wait_writers(self.wait_for_writers());
 
         let buf = unsafe { &*self.buffer.get() };
         let mut handle = self.file_handle.lock();
@@ -530,6 +636,7 @@ impl Segment {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let created = !self.path.exists();
         let f = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -539,10 +646,14 @@ impl Segment {
         let file = handle.as_mut().unwrap();
         use std::io::Write;
         file.write_all(&buf[..snapshot_pos])?;
-        file.sync_all()?;
+        sync_commitlog_file(file)?;
+        if created {
+            sync_parent_dir(&self.path)?;
+        }
         FULL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
         FULL_FLUSH_BYTES_TOTAL.fetch_add(snapshot_pos as u64, Ordering::Relaxed);
         SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        observe_sync(sync_start.elapsed());
         self.last_flushed
             .store(snapshot_pos as u64, Ordering::Release);
 
