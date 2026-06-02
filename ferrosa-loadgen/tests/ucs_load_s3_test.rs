@@ -49,6 +49,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         compaction: CompactionConfig::from_env(dir.join("compaction")),
         object_store: Some(object_store),
         local_cache_max_bytes: profile.local_cache_max_bytes,
+        local_disk_free_reserve_bytes: 0,
         flush_threshold_bytes: profile.flush_threshold_bytes,
         memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 30,

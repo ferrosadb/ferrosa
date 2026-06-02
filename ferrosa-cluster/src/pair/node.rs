@@ -58,7 +58,7 @@ impl PeerEventListener for PairEventListener {
             "peer connected"
         );
         let state = self.state.clone();
-        tokio::spawn(async move {
+        ferrosa_net::task_pool::TaskPool::current("pair-peer-state").spawn(async move {
             state.write().await.connected = true;
         });
     }
@@ -71,7 +71,7 @@ impl PeerEventListener for PairEventListener {
             "peer disconnected"
         );
         let state = self.state.clone();
-        tokio::spawn(async move {
+        ferrosa_net::task_pool::TaskPool::current("pair-peer-state").spawn(async move {
             state.write().await.connected = false;
         });
     }
@@ -84,7 +84,7 @@ impl PeerEventListener for PairEventListener {
             "peer suspected dead"
         );
         let state = self.state.clone();
-        tokio::spawn(async move {
+        ferrosa_net::task_pool::TaskPool::current("pair-peer-state").spawn(async move {
             state.write().await.connected = false;
         });
     }
@@ -289,6 +289,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

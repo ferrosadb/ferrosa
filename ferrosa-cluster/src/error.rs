@@ -25,6 +25,9 @@ pub enum ClusterError {
         required: usize,
         data_present: bool,
     },
+    /// The coordinator or a required replica is deliberately applying
+    /// backpressure and the client should slow down/retry later.
+    Overloaded(String),
     /// Pair mode: primary is down, writes unavailable until operator promotes.
     PairWriteUnavailable,
     /// Operation requires primary role but this node is secondary.
@@ -90,6 +93,7 @@ impl fmt::Display for ClusterError {
                     "read timeout: CL={consistency}, received={received}, required={required}, data_present={data_present}"
                 )
             }
+            Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
             Self::PairWriteUnavailable => write!(f, "pair mode: primary unavailable"),
             Self::NotPrimary => write!(f, "this node is not the primary"),
             Self::NotLeader { leader_id } => match leader_id {

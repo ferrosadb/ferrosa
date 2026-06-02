@@ -1,4 +1,696 @@
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
+
+#[derive(Clone, Copy)]
+pub enum FlushPhase {
+    LockWait,
+    SwapMemtable,
+    SnapshotMemtable,
+    SortPartitions,
+    ValidateRows,
+    EncodeSstable,
+    LocalWriteSstable,
+    Total,
+}
+
+impl FlushPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LockWait => "lock_wait",
+            Self::SwapMemtable => "swap_memtable",
+            Self::SnapshotMemtable => "snapshot_memtable",
+            Self::SortPartitions => "sort_partitions",
+            Self::ValidateRows => "validate_rows",
+            Self::EncodeSstable => "encode_sstable",
+            Self::LocalWriteSstable => "local_write_sstable",
+            Self::Total => "total",
+        }
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            Self::LockWait => 0,
+            Self::SwapMemtable => 1,
+            Self::SnapshotMemtable => 2,
+            Self::SortPartitions => 3,
+            Self::ValidateRows => 4,
+            Self::EncodeSstable => 5,
+            Self::LocalWriteSstable => 6,
+            Self::Total => 7,
+        }
+    }
+}
+
+const FLUSH_PHASES: [FlushPhase; 8] = [
+    FlushPhase::LockWait,
+    FlushPhase::SwapMemtable,
+    FlushPhase::SnapshotMemtable,
+    FlushPhase::SortPartitions,
+    FlushPhase::ValidateRows,
+    FlushPhase::EncodeSstable,
+    FlushPhase::LocalWriteSstable,
+    FlushPhase::Total,
+];
+
+#[derive(Clone, Copy)]
+pub enum UploadPhase {
+    SubmitWait,
+    WorkerTask,
+    FilePut,
+    SyncAwait,
+    ManifestSave,
+    PendingLogAdd,
+    PendingLogRemove,
+    PendingLogCompactionAdd,
+}
+
+impl UploadPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SubmitWait => "submit_wait",
+            Self::WorkerTask => "worker_task",
+            Self::FilePut => "file_put",
+            Self::SyncAwait => "sync_await",
+            Self::ManifestSave => "manifest_save",
+            Self::PendingLogAdd => "pending_log_add",
+            Self::PendingLogRemove => "pending_log_remove",
+            Self::PendingLogCompactionAdd => "pending_log_compaction_add",
+        }
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            Self::SubmitWait => 0,
+            Self::WorkerTask => 1,
+            Self::FilePut => 2,
+            Self::SyncAwait => 3,
+            Self::ManifestSave => 4,
+            Self::PendingLogAdd => 5,
+            Self::PendingLogRemove => 6,
+            Self::PendingLogCompactionAdd => 7,
+        }
+    }
+}
+
+const UPLOAD_PHASES: [UploadPhase; 8] = [
+    UploadPhase::SubmitWait,
+    UploadPhase::WorkerTask,
+    UploadPhase::FilePut,
+    UploadPhase::SyncAwait,
+    UploadPhase::ManifestSave,
+    UploadPhase::PendingLogAdd,
+    UploadPhase::PendingLogRemove,
+    UploadPhase::PendingLogCompactionAdd,
+];
+
+#[derive(Clone, Copy)]
+pub enum CompactionPhase {
+    QueueWait,
+    OpenInputs,
+    MergeRead,
+    MergePartition,
+    WriterAddPartition,
+    WriterFinish,
+    LocalWriteSstable,
+    OutputVerify,
+    PromoteOutput,
+    S3UploadAwait,
+    ManifestUpdate,
+    InputCleanup,
+    Total,
+}
+
+impl CompactionPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::QueueWait => "queue_wait",
+            Self::OpenInputs => "open_inputs",
+            Self::MergeRead => "merge_read",
+            Self::MergePartition => "merge_partition",
+            Self::WriterAddPartition => "writer_add_partition",
+            Self::WriterFinish => "writer_finish",
+            Self::LocalWriteSstable => "local_write_sstable",
+            Self::OutputVerify => "output_verify",
+            Self::PromoteOutput => "promote_output",
+            Self::S3UploadAwait => "s3_upload_await",
+            Self::ManifestUpdate => "manifest_update",
+            Self::InputCleanup => "input_cleanup",
+            Self::Total => "total",
+        }
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            Self::QueueWait => 0,
+            Self::OpenInputs => 1,
+            Self::MergeRead => 2,
+            Self::MergePartition => 3,
+            Self::WriterAddPartition => 4,
+            Self::WriterFinish => 5,
+            Self::LocalWriteSstable => 6,
+            Self::OutputVerify => 7,
+            Self::PromoteOutput => 8,
+            Self::S3UploadAwait => 9,
+            Self::ManifestUpdate => 10,
+            Self::InputCleanup => 11,
+            Self::Total => 12,
+        }
+    }
+}
+
+const COMPACTION_PHASES: [CompactionPhase; 13] = [
+    CompactionPhase::QueueWait,
+    CompactionPhase::OpenInputs,
+    CompactionPhase::MergeRead,
+    CompactionPhase::MergePartition,
+    CompactionPhase::WriterAddPartition,
+    CompactionPhase::WriterFinish,
+    CompactionPhase::LocalWriteSstable,
+    CompactionPhase::OutputVerify,
+    CompactionPhase::PromoteOutput,
+    CompactionPhase::S3UploadAwait,
+    CompactionPhase::ManifestUpdate,
+    CompactionPhase::InputCleanup,
+    CompactionPhase::Total,
+];
+
+static FLUSH_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static FLUSH_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FLUSH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FLUSH_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FLUSH_PARTITIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FLUSH_LAST_BYTES: AtomicU64 = AtomicU64::new(0);
+static FLUSH_LAST_ROWS: AtomicU64 = AtomicU64::new(0);
+static FLUSH_LAST_PARTITIONS: AtomicU64 = AtomicU64::new(0);
+
+static UPLOAD_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static UPLOAD_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static UPLOAD_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_TASKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_FILES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+static COMPACTION_PHASE_MICROS_TOTAL: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static COMPACTION_PHASE_MICROS_MAX: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static COMPACTION_PHASE_COUNT_TOTAL: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static COMPACTION_SUBMITTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_SKIPPED_OVERLAP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_RUNNING: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_RUNNING_MAX: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_INPUT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_OUTPUT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_INPUT_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_OUTPUT_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_OUTPUT_PARTITIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_LAST_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_LAST_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_LAST_INPUT_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_LAST_OUTPUT_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_LAST_OUTPUT_PARTITIONS: AtomicU64 = AtomicU64::new(0);
+
+static READ_LIMITED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_FOUND_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_SECONDS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_SECONDS_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_MEMTABLE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_FLUSHING_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn update_max_u64(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+pub fn observe_flush_phase(phase: FlushPhase, duration: Duration) {
+    let idx = phase.idx();
+    FLUSH_PHASE_MICROS_TOTAL[idx].fetch_add(duration_micros(duration), Ordering::Relaxed);
+    FLUSH_PHASE_COUNT_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn observe_flush_output(bytes: u64, rows: u64, partitions: u64) {
+    FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    FLUSH_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    FLUSH_ROWS_TOTAL.fetch_add(rows, Ordering::Relaxed);
+    FLUSH_PARTITIONS_TOTAL.fetch_add(partitions, Ordering::Relaxed);
+    FLUSH_LAST_BYTES.store(bytes, Ordering::Relaxed);
+    FLUSH_LAST_ROWS.store(rows, Ordering::Relaxed);
+    FLUSH_LAST_PARTITIONS.store(partitions, Ordering::Relaxed);
+}
+
+pub fn observe_upload_phase(phase: UploadPhase, duration: Duration) {
+    let idx = phase.idx();
+    UPLOAD_PHASE_MICROS_TOTAL[idx].fetch_add(duration_micros(duration), Ordering::Relaxed);
+    UPLOAD_PHASE_COUNT_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_upload_queue_depth() {
+    let depth = UPLOAD_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+    update_max_u64(&UPLOAD_QUEUE_DEPTH_MAX, depth);
+}
+
+pub fn dec_upload_queue_depth() {
+    let _ = UPLOAD_QUEUE_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
+pub fn observe_upload_file(bytes: u64, duration: Duration) {
+    UPLOAD_FILES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    UPLOAD_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    observe_upload_phase(UploadPhase::FilePut, duration);
+}
+
+pub fn observe_upload_task(duration: Duration) {
+    UPLOAD_TASKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    observe_upload_phase(UploadPhase::WorkerTask, duration);
+}
+
+pub fn observe_compaction_phase(phase: CompactionPhase, duration: Duration) {
+    let idx = phase.idx();
+    let micros = duration_micros(duration);
+    COMPACTION_PHASE_MICROS_TOTAL[idx].fetch_add(micros, Ordering::Relaxed);
+    COMPACTION_PHASE_COUNT_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+    update_max_u64(&COMPACTION_PHASE_MICROS_MAX[idx], micros);
+}
+
+pub fn inc_compaction_submitted() {
+    COMPACTION_SUBMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_compaction_skipped_overlap() {
+    COMPACTION_SKIPPED_OVERLAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_compaction_queue_depth() {
+    let depth = COMPACTION_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+    update_max_u64(&COMPACTION_QUEUE_DEPTH_MAX, depth);
+}
+
+pub fn dec_compaction_queue_depth() {
+    let _ = COMPACTION_QUEUE_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
+pub fn inc_compaction_running() {
+    COMPACTION_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let running = COMPACTION_RUNNING.fetch_add(1, Ordering::Relaxed) + 1;
+    update_max_u64(&COMPACTION_RUNNING_MAX, running);
+}
+
+pub fn dec_compaction_running() {
+    let _ = COMPACTION_RUNNING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
+pub fn inc_compaction_failed() {
+    COMPACTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn observe_compaction_completed(
+    duration: Duration,
+    input_bytes: u64,
+    output_bytes: u64,
+    input_rows: u64,
+    output_rows: u64,
+    output_partitions: u64,
+) {
+    COMPACTION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    COMPACTION_INPUT_BYTES_TOTAL.fetch_add(input_bytes, Ordering::Relaxed);
+    COMPACTION_OUTPUT_BYTES_TOTAL.fetch_add(output_bytes, Ordering::Relaxed);
+    COMPACTION_INPUT_ROWS_TOTAL.fetch_add(input_rows, Ordering::Relaxed);
+    COMPACTION_OUTPUT_ROWS_TOTAL.fetch_add(output_rows, Ordering::Relaxed);
+    COMPACTION_OUTPUT_PARTITIONS_TOTAL.fetch_add(output_partitions, Ordering::Relaxed);
+    COMPACTION_LAST_INPUT_BYTES.store(input_bytes, Ordering::Relaxed);
+    COMPACTION_LAST_OUTPUT_BYTES.store(output_bytes, Ordering::Relaxed);
+    COMPACTION_LAST_INPUT_ROWS.store(input_rows, Ordering::Relaxed);
+    COMPACTION_LAST_OUTPUT_ROWS.store(output_rows, Ordering::Relaxed);
+    COMPACTION_LAST_OUTPUT_PARTITIONS.store(output_partitions, Ordering::Relaxed);
+    observe_compaction_phase(CompactionPhase::Total, duration);
+}
+
+pub fn observe_read_limited_rows(
+    duration: Duration,
+    found: bool,
+    memtable_hits: u64,
+    flushing_hits: u64,
+    sstable_probes: u64,
+    sstable_hits: u64,
+    sstable_errors: u64,
+) {
+    READ_LIMITED_ROWS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if found {
+        READ_LIMITED_ROWS_FOUND_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    let micros = duration_micros(duration);
+    READ_LIMITED_ROWS_SECONDS_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&READ_LIMITED_ROWS_SECONDS_MICROS_MAX, micros);
+    READ_LIMITED_ROWS_MEMTABLE_HITS_TOTAL.fetch_add(memtable_hits, Ordering::Relaxed);
+    READ_LIMITED_ROWS_FLUSHING_HITS_TOTAL.fetch_add(flushing_hits, Ordering::Relaxed);
+    READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL.fetch_add(sstable_probes, Ordering::Relaxed);
+    READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL.fetch_add(sstable_hits, Ordering::Relaxed);
+    READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL.fetch_add(sstable_errors, Ordering::Relaxed);
+}
+
+pub fn render_prometheus() -> String {
+    let mut out = String::new();
+    out.push_str("# HELP ferrosa_storage_flushes_total Memtable flushes completed.\n");
+    out.push_str("# TYPE ferrosa_storage_flushes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_flushes_total {}\n",
+        FLUSHES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_flush_bytes_total Bytes emitted by completed memtable flushes.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_flush_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_flush_bytes_total {}\n",
+        FLUSH_BYTES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_flush_rows_total Rows emitted by completed memtable flushes.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_flush_rows_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_flush_rows_total {}\n",
+        FLUSH_ROWS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_flush_partitions_total Partitions emitted by completed memtable flushes.\n");
+    out.push_str("# TYPE ferrosa_storage_flush_partitions_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_flush_partitions_total {}\n",
+        FLUSH_PARTITIONS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_flush_last_bytes Bytes emitted by the most recent completed memtable flush.\n");
+    out.push_str("# TYPE ferrosa_storage_flush_last_bytes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_flush_last_bytes {}\n",
+        FLUSH_LAST_BYTES.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_flush_last_rows Rows emitted by the most recent completed memtable flush.\n");
+    out.push_str("# TYPE ferrosa_storage_flush_last_rows gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_flush_last_rows {}\n",
+        FLUSH_LAST_ROWS.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_flush_last_partitions Partitions emitted by the most recent completed memtable flush.\n");
+    out.push_str("# TYPE ferrosa_storage_flush_last_partitions gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_flush_last_partitions {}\n",
+        FLUSH_LAST_PARTITIONS.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_flush_phase_seconds_total Total wall time spent in memtable flush phases.\n");
+    out.push_str("# TYPE ferrosa_storage_flush_phase_seconds_total counter\n");
+    out.push_str("# HELP ferrosa_storage_flush_phase_total Number of observations for memtable flush phases.\n");
+    out.push_str("# TYPE ferrosa_storage_flush_phase_total counter\n");
+    for phase in FLUSH_PHASES {
+        let idx = phase.idx();
+        let label = phase.label();
+        let seconds = FLUSH_PHASE_MICROS_TOTAL[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        out.push_str(&format!(
+            "ferrosa_storage_flush_phase_seconds_total{{phase=\"{label}\"}} {seconds}\n"
+        ));
+        out.push_str(&format!(
+            "ferrosa_storage_flush_phase_total{{phase=\"{label}\"}} {}\n",
+            FLUSH_PHASE_COUNT_TOTAL[idx].load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str(
+        "# HELP ferrosa_storage_upload_queue_depth Upload tasks currently queued or in progress.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_upload_queue_depth gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_upload_queue_depth {}\n",
+        UPLOAD_QUEUE_DEPTH.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_upload_queue_depth_max Maximum observed upload queue depth.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_upload_queue_depth_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_upload_queue_depth_max {}\n",
+        UPLOAD_QUEUE_DEPTH_MAX.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_upload_tasks_total Upload tasks processed by the upload worker.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_upload_tasks_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_upload_tasks_total {}\n",
+        UPLOAD_TASKS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_upload_files_total SSTable component files uploaded.\n");
+    out.push_str("# TYPE ferrosa_storage_upload_files_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_upload_files_total {}\n",
+        UPLOAD_FILES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_upload_bytes_total SSTable component bytes uploaded.\n");
+    out.push_str("# TYPE ferrosa_storage_upload_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_upload_bytes_total {}\n",
+        UPLOAD_BYTES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_upload_phase_seconds_total Total wall time spent in upload and S3 sync phases.\n");
+    out.push_str("# TYPE ferrosa_storage_upload_phase_seconds_total counter\n");
+    out.push_str("# HELP ferrosa_storage_upload_phase_total Number of observations for upload and S3 sync phases.\n");
+    out.push_str("# TYPE ferrosa_storage_upload_phase_total counter\n");
+    for phase in UPLOAD_PHASES {
+        let idx = phase.idx();
+        let label = phase.label();
+        let seconds = UPLOAD_PHASE_MICROS_TOTAL[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        out.push_str(&format!(
+            "ferrosa_storage_upload_phase_seconds_total{{phase=\"{label}\"}} {seconds}\n"
+        ));
+        out.push_str(&format!(
+            "ferrosa_storage_upload_phase_total{{phase=\"{label}\"}} {}\n",
+            UPLOAD_PHASE_COUNT_TOTAL[idx].load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str("# HELP ferrosa_storage_compaction_submitted_total Compaction tasks submitted to the executor.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_submitted_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_submitted_total {}\n",
+        COMPACTION_SUBMITTED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_skipped_overlap_total Compaction tasks skipped because an input SSTable was already in flight.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_skipped_overlap_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_skipped_overlap_total {}\n",
+        COMPACTION_SKIPPED_OVERLAP_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_started_total Compaction tasks started by executor workers.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_started_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_started_total {}\n",
+        COMPACTION_STARTED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_completed_total Compaction tasks completed successfully.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_completed_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_completed_total {}\n",
+        COMPACTION_COMPLETED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_failed_total Compaction tasks that failed in executor workers.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_failed_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_failed_total {}\n",
+        COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_compaction_queue_depth Compaction tasks waiting in executor queues.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_compaction_queue_depth gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_queue_depth {}\n",
+        COMPACTION_QUEUE_DEPTH.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_queue_depth_max Maximum observed compaction executor queue depth.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_queue_depth_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_queue_depth_max {}\n",
+        COMPACTION_QUEUE_DEPTH_MAX.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_running Compaction tasks currently running.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_running gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_running {}\n",
+        COMPACTION_RUNNING.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_compaction_running_max Maximum observed concurrent compaction tasks.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_compaction_running_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_running_max {}\n",
+        COMPACTION_RUNNING_MAX.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_input_bytes_total Input bytes read by completed compactions.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_input_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_input_bytes_total {}\n",
+        COMPACTION_INPUT_BYTES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_output_bytes_total Output bytes written by completed compactions.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_output_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_output_bytes_total {}\n",
+        COMPACTION_OUTPUT_BYTES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_input_rows_total Input rows seen by completed compactions.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_input_rows_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_input_rows_total {}\n",
+        COMPACTION_INPUT_ROWS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_output_rows_total Output rows emitted by completed compactions.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_output_rows_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_output_rows_total {}\n",
+        COMPACTION_OUTPUT_ROWS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_output_partitions_total Output partitions emitted by completed compactions.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_output_partitions_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_output_partitions_total {}\n",
+        COMPACTION_OUTPUT_PARTITIONS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_last_input_bytes Input bytes read by the most recent successful compaction.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_last_input_bytes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_last_input_bytes {}\n",
+        COMPACTION_LAST_INPUT_BYTES.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_last_output_bytes Output bytes written by the most recent successful compaction.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_last_output_bytes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_last_output_bytes {}\n",
+        COMPACTION_LAST_OUTPUT_BYTES.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_last_input_rows Input rows seen by the most recent successful compaction.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_last_input_rows gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_last_input_rows {}\n",
+        COMPACTION_LAST_INPUT_ROWS.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_last_output_rows Output rows emitted by the most recent successful compaction.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_last_output_rows gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_last_output_rows {}\n",
+        COMPACTION_LAST_OUTPUT_ROWS.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_last_output_partitions Output partitions emitted by the most recent successful compaction.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_last_output_partitions gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_last_output_partitions {}\n",
+        COMPACTION_LAST_OUTPUT_PARTITIONS.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_phase_seconds_total Total wall time spent in compaction phases.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_phase_seconds_total counter\n");
+    out.push_str("# HELP ferrosa_storage_compaction_phase_seconds_max Maximum observed wall time for a compaction phase.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_phase_seconds_max gauge\n");
+    out.push_str("# HELP ferrosa_storage_compaction_phase_total Number of observations for compaction phases.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_phase_total counter\n");
+    for phase in COMPACTION_PHASES {
+        let idx = phase.idx();
+        let label = phase.label();
+        let seconds =
+            COMPACTION_PHASE_MICROS_TOTAL[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let max_seconds =
+            COMPACTION_PHASE_MICROS_MAX[idx].load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        out.push_str(&format!(
+            "ferrosa_storage_compaction_phase_seconds_total{{phase=\"{label}\"}} {seconds}\n"
+        ));
+        out.push_str(&format!(
+            "ferrosa_storage_compaction_phase_seconds_max{{phase=\"{label}\"}} {max_seconds}\n"
+        ));
+        out.push_str(&format!(
+            "ferrosa_storage_compaction_phase_total{{phase=\"{label}\"}} {}\n",
+            COMPACTION_PHASE_COUNT_TOTAL[idx].load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str(
+        "# HELP ferrosa_storage_read_limited_rows_total Partition read_limited_rows calls.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_total {}\n",
+        READ_LIMITED_ROWS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_found_total Partition read_limited_rows calls that found at least one source.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_found_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_found_total {}\n",
+        READ_LIMITED_ROWS_FOUND_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_seconds_total Total wall time spent in read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_seconds_total {:.9}\n",
+        READ_LIMITED_ROWS_SECONDS_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_seconds_max Maximum observed wall time for read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_seconds_max {:.9}\n",
+        READ_LIMITED_ROWS_SECONDS_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_memtable_hits_total Active memtable hits observed by read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_memtable_hits_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_memtable_hits_total {}\n",
+        READ_LIMITED_ROWS_MEMTABLE_HITS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_flushing_hits_total Flushing memtable hits observed by read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_flushing_hits_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_flushing_hits_total {}\n",
+        READ_LIMITED_ROWS_FLUSHING_HITS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_sstable_probes_total SSTable probes issued by read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_sstable_probes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_sstable_probes_total {}\n",
+        READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_sstable_hits_total SSTable hits observed by read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_sstable_hits_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_sstable_hits_total {}\n",
+        READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_sstable_errors_total SSTable read errors observed by read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_sstable_errors_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_sstable_errors_total {}\n",
+        READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL.load(Ordering::Relaxed)
+    ));
+
+    out
+}
 
 /// Prometheus-compatible metrics for compaction S3 operations.
 pub struct CompactionMetrics {
@@ -356,5 +1048,23 @@ mod tests {
             m.bytes_flushed.load(std::sync::atomic::Ordering::Relaxed),
             6144
         );
+    }
+
+    #[test]
+    fn storage_flush_and_upload_metrics_render() {
+        observe_flush_phase(FlushPhase::EncodeSstable, Duration::from_micros(250));
+        observe_flush_output(1024, 10, 2);
+        observe_upload_phase(UploadPhase::SyncAwait, Duration::from_micros(500));
+        observe_upload_file(2048, Duration::from_micros(750));
+
+        let text = render_prometheus();
+        assert!(text.contains("ferrosa_storage_flushes_total"));
+        assert!(
+            text.contains("ferrosa_storage_flush_phase_seconds_total{phase=\"encode_sstable\"}")
+        );
+        assert!(text.contains("ferrosa_storage_flush_phase_total{phase=\"local_write_sstable\"}"));
+        assert!(text.contains("ferrosa_storage_upload_phase_seconds_total{phase=\"sync_await\"}"));
+        assert!(text.contains("ferrosa_storage_upload_phase_total{phase=\"file_put\"}"));
+        assert!(text.contains("ferrosa_storage_upload_bytes_total"));
     }
 }

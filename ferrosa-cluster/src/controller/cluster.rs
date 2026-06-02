@@ -569,7 +569,15 @@ impl ModeController {
                 let raft_rt = raft_rt_for_connect.clone();
                 let data_rt = data_rt_for_connect.clone();
                 self.spawn_tracked(async move {
-                    match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string(), raft_rt.as_deref(), data_rt.as_deref()).await {
+                    match PriorityPool::connect(
+                        cfg,
+                        local_id,
+                        &reverse_addr.to_string(),
+                        raft_rt,
+                        data_rt,
+                    )
+                    .await
+                    {
                         Ok(pool) => {
                             pm.add_peer((uuid, reverse_addr), pool).await;
                             tracing::info!(%uuid, %reverse_addr, "cluster: reverse connection established");
@@ -799,14 +807,17 @@ impl ModeController {
         // ALTER KEYSPACE to increase RF.
         let initial_rf = 1;
         let initial_cl = ConsistencyLevel::One;
-        let coordinator = Arc::new(ClusterCoordinator::new(
-            ring_arc.clone(),
-            peer_manager,
-            local_node_id,
-            self.storage.clone(),
-            initial_rf,
-            initial_cl,
-        ));
+        let coordinator = Arc::new(
+            ClusterCoordinator::new(
+                ring_arc.clone(),
+                peer_manager,
+                local_node_id,
+                self.storage.clone(),
+                initial_rf,
+                initial_cl,
+            )
+            .with_hint_store(self.hint_store.clone()),
+        );
 
         let repair_metrics_for_handler = coordinator.repair_metrics.clone();
         // Capture handles for the ADR-020 streaming-handler registration
@@ -1399,7 +1410,7 @@ impl ModeController {
                 let guard_raft = raft_arc.clone();
                 let guard_cancel = election_guard_cancel.clone();
                 let guard_timeout_min = raft_election_min_ms;
-                tokio::spawn(async move {
+                ferrosa_net::task_pool::TaskPool::current("raft-election-guard").spawn(async move {
                     run_election_guard(guard_raft, guard_cancel, guard_timeout_min).await;
                 });
             }
@@ -1416,7 +1427,7 @@ impl ModeController {
                 use crate::raft::snapshot_pusher::run_snapshot_pusher;
                 let pusher_raft = raft_arc.clone();
                 let pusher_cancel = election_guard_cancel.clone();
-                tokio::spawn(async move {
+                ferrosa_net::task_pool::TaskPool::current("raft-snapshot-pusher").spawn(async move {
                     run_snapshot_pusher(
                         pusher_raft,
                         pusher_cancel,
@@ -1515,7 +1526,7 @@ impl ModeController {
                         );
                         let desired_raft_members = build_raft_members_from_node_info(&refresh_plan);
                         let raft_for_membership_repair = raft_arc.clone();
-                        tokio::spawn(async move {
+                        ferrosa_net::task_pool::TaskPool::current("raft-membership-repair").spawn(async move {
                             let mut interval =
                                 tokio::time::interval(std::time::Duration::from_secs(2));
                             let mut clean_observations = 0u8;
@@ -2199,7 +2210,7 @@ impl ModeController {
                         let rejoin_cql_broadcast = local_cql_broadcast_for_refresh.clone();
                         let rejoin_peers = peers.clone();
                         let rejoin_pm = peer_manager_for_bootstrap.clone();
-                        tokio::spawn(async move {
+                        ferrosa_net::task_pool::TaskPool::current("cluster-rejoin").spawn(async move {
                             tracing::info!(
                                 self_id = %rejoin_self_id,
                                 peer_count = rejoin_peers.len(),
@@ -2361,15 +2372,21 @@ impl RpcHandler for ClusterInviteHandler {
         // completion before re-broadcasting (replaces raw tokio::spawn +
         // fixed 500ms sleep).
         let mut connect_tasks = tokio::task::JoinSet::new();
+        let raft_rt_for_connect = self.peer_manager.raft_runtime();
+        let data_rt_for_connect = self.peer_manager.data_runtime();
         for (peer_id, reverse_addr) in &new_peers {
             let pm = self.peer_manager.clone();
             let cfg = self.net_config.clone();
             let local_id = self.local_host_id;
             let uuid = *peer_id;
             let addr = *reverse_addr;
+            let raft_rt = raft_rt_for_connect.clone();
+            let data_rt = data_rt_for_connect.clone();
 
             connect_tasks.spawn(async move {
-                match PriorityPool::connect(cfg, local_id, &addr.to_string(), None, None).await {
+                match PriorityPool::connect(cfg, local_id, &addr.to_string(), raft_rt, data_rt)
+                    .await
+                {
                     Ok(pool) => {
                         pm.add_peer((uuid, addr), pool).await;
                         tracing::info!(

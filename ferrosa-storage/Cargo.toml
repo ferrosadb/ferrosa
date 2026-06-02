@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 futures = "0.3"
 async-trait = "0.1"
 bytes = "1"
+fs2 = "0.4"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 crossbeam-skiplist = { version = "0.1", optional = true }
@@ -31,7 +32,10 @@ tracing = "0.1"
 ureq = { version = "3", features = ["json"] }
 
 [features]
-default = []
+# The production write path should avoid the sharded BTree memtable's
+# parking_lot::RwLock hot path by default. The skiplist memtable uses
+# crossbeam's concurrent map plus per-partition CAS updates instead.
+default = ["skiplist-memtable"]
 skiplist-memtable = ["crossbeam-skiplist"]
 # Live infrastructure tests are intentionally absent from the default test
 # target. Opt in with `--features live-infra-tests` plus the documented

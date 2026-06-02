@@ -649,7 +649,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // var is unset; see Sprint A of
     // specs/decisions/design-cql-role-auth-rollout.md.
     let storage_auth_enabled = storage_config.auth_enabled;
-    let rt = tokio::runtime::Handle::current();
+    let storage_upload_threads = std::env::var("FERROSA_STORAGE_UPLOAD_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(4);
+    let _storage_upload_runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(storage_upload_threads)
+            .thread_name("storage-upload-rt")
+            .enable_all()
+            .build()
+            .expect("storage upload runtime"),
+    );
+    let storage_upload_handle = _storage_upload_runtime.handle().clone();
     let has_commitlog_segments = storage_config.commit_log.log_dir.exists()
         && std::fs::read_dir(&storage_config.commit_log.log_dir)
             .map(|entries| {
@@ -664,14 +677,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (storage, pending_mutations) = if has_commitlog_segments {
         tracing::info!("existing commit log segments found — replaying for crash recovery");
-        let (engine, mutations) = ferrosa_storage::StorageEngine::open(storage_config, Some(&rt))?;
+        let (engine, mutations) =
+            ferrosa_storage::StorageEngine::open(storage_config, Some(&storage_upload_handle))?;
         tracing::info!(
             mutation_count = mutations.len(),
             "commit log replay collected pending mutations"
         );
         (engine, mutations)
     } else {
-        let engine = ferrosa_storage::StorageEngine::new(storage_config, Some(&rt))?;
+        let engine =
+            ferrosa_storage::StorageEngine::new(storage_config, Some(&storage_upload_handle))?;
         (engine, Vec::new())
     };
     // Probe object store for conditional put support (CAS).
@@ -715,6 +730,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let schema = Arc::new(ferrosa_schema::Schema::new(schema_config)?);
 
+    // Dedicated subsystem runtimes. The main runtime stays supervisor-only;
+    // work below is routed to an explicit pool.
+    let runtimes = runtime::RuntimeManager::new();
+
     // 4a. Seed default roles if auth is enabled.
     //
     // `ferrosa_schema::Schema::new` always creates the built-in `cassandra`
@@ -730,7 +749,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if storage_auth_enabled {
         ferrosa_schema::auth::bootstrap::seed_default_roles(&schema)?;
         let schema_for_warn = Arc::clone(&schema);
-        tokio::spawn(async move {
+        runtimes.background.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
             if ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema_for_warn) {
                 tracing::warn!(
@@ -894,10 +913,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(ferrosa_cluster::RepairApplyHandler::new(storage.clone())),
     );
 
-    // 5b. Create subsystem runtimes (Raft gets its own so heartbeats
-    // 5b. Dedicated Raft runtime — heartbeats can't be starved by CQL/S3 work.
-    let runtimes = runtime::RuntimeManager::new();
-
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config,
         net_config.clone(),
@@ -913,13 +928,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_id,
         mode_controller.clone(),
     ));
+    peer_manager.set_raft_runtime(runtimes.raft.clone());
+    peer_manager.set_data_runtime(runtimes.data.clone());
     mode_controller.set_peer_manager(peer_manager.clone());
     mode_controller.set_raft_runtime(runtimes.raft.clone());
     mode_controller.set_data_runtime(runtimes.data.clone());
 
     // 6b. Start heartbeat loop for peer failure detection
     let heartbeat_pm = peer_manager.clone();
-    tokio::spawn(async move {
+    runtimes.raft.spawn(async move {
         heartbeat_pm.run_heartbeat_loop().await;
     });
 
@@ -1205,6 +1222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ferrosa_cql::virtual_tables::alerts::spawn_alert_evaluator(
         alert_registry.clone(),
         schema.virtual_tables_arc(),
+        ferrosa_net::task_pool::TaskPool::runtime("alerts", runtimes.background.clone()),
     );
 
     // Register stub virtual tables for deferred observability features.
@@ -1213,7 +1231,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clone write_path and ddl_path before shared_state is moved into the CQL server.
     let cluster_write_path = shared_state.write_path.clone();
     let cluster_ddl_path = shared_state.ddl_path.clone();
-    let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
+    let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state).with_task_pool(
+        ferrosa_net::task_pool::TaskPool::runtime("cql", runtimes.cql.clone()),
+    );
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
 
@@ -1280,7 +1300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schema: schema_for_http,
             auth_disabled,
         };
-        tokio::spawn(async move {
+        runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::http::start_graph_http(&http_config, state).await {
                 tracing::error!(%e, "graph HTTP server failed");
             }
@@ -1305,7 +1325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bolt_engine = graph_engine;
         let bolt_schema = schema.clone();
         let bolt_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::bolt::server::start_bolt_server(
                 bolt_engine,
                 bolt_schema,
@@ -1352,7 +1372,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind_addr: sparql_bind,
         };
 
-        tokio::spawn(async move {
+        runtimes.background.spawn(async move {
             if let Err(e) =
                 ferrosa_sparql::http::start_sparql_http(&sparql_config, sparql_state).await
             {
@@ -1378,7 +1398,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !seed_strs.is_empty() {
         let net_cfg = net_config.clone();
         let pm = peer_manager.clone();
-        tokio::spawn(async move {
+        let raft_runtime = runtimes.raft.clone();
+        let data_runtime = runtimes.data.clone();
+        runtimes.background.spawn(async move {
             let mut delay = std::time::Duration::from_millis(500);
             let max_delay = std::time::Duration::from_secs(10);
 
@@ -1393,8 +1415,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         net_cfg.clone(),
                         host_id,
                         seed.as_str(),
-                        None,
-                        None,
+                        Some(raft_runtime.clone()),
+                        Some(data_runtime.clone()),
                     )
                     .await
                     {
@@ -1433,13 +1455,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .parse()
     .unwrap_or(30);
+    let urgent_s3_sync_interval_secs: u64 = config_val(
+        "FERROSA_URGENT_S3_SYNC_INTERVAL_SECS",
+        &file_config,
+        "storage",
+        "urgent_s3_sync_interval_secs",
+        "1",
+    )
+    .parse()
+    .unwrap_or(1);
+    let urgent_flush_interval_millis: u64 = config_val(
+        "FERROSA_URGENT_FLUSH_INTERVAL_MILLIS",
+        &file_config,
+        "storage",
+        "urgent_flush_interval_millis",
+        "100",
+    )
+    .parse()
+    .unwrap_or(100);
     let maintenance_engine = storage.clone();
     let maintenance_schema = schema.clone();
     let maintenance_data_dir = data_dir.clone();
     let has_s3 = maintenance_engine.has_s3();
-    tokio::spawn(async move {
+    runtimes.background.spawn(async move {
         let mut flush_interval =
             tokio::time::interval(std::time::Duration::from_secs(flush_interval_secs));
+        let mut urgent_flush_interval = tokio::time::interval(std::time::Duration::from_millis(
+            urgent_flush_interval_millis.max(1),
+        ));
+        let mut urgent_s3_sync_interval = tokio::time::interval(std::time::Duration::from_secs(
+            urgent_s3_sync_interval_secs.max(1),
+        ));
         let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         // Persist schema snapshot + flush all memtables to S3 every 30s.
         let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1448,12 +1494,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 _ = flush_interval.tick() => {
-                    // Run flush on a blocking thread so synchronous disk I/O
-                    // (6 file writes + renames per SSTable) doesn't starve the
-                    // async runtime.  spawn_blocking is cancel-safe: the closure
-                    // runs to completion even if the JoinHandle is dropped.
+                    // Run flush on a dedicated OS thread so SSTable encoding,
+                    // compression, and disk I/O do not consume Tokio's shared
+                    // blocking pool.
                     let engine = maintenance_engine.clone();
-                    match tokio::task::spawn_blocking(move || engine.flush_if_needed()).await {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    match std::thread::Builder::new()
+                        .name("storage-flush".into())
+                        .spawn(move || {
+                            let _ = tx.send(engine.flush_if_needed());
+                        }) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(%e, "failed to spawn storage flush thread");
+                            continue;
+                        }
+                    }
+                    match rx.await {
                         Ok(Err(e)) => tracing::warn!(%e, "periodic flush failed"),
                         Err(e) => tracing::error!(%e, "flush task panicked"),
                         _ => {}
@@ -1499,16 +1556,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = compact_interval.tick() => {
                     maintenance_engine.poll_compactions().await;
                 }
+                _ = urgent_flush_interval.tick() => {
+                    if maintenance_engine.take_flush_request() {
+                        let engine = maintenance_engine.clone();
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        match std::thread::Builder::new()
+                            .name("storage-flush-urgent".into())
+                            .spawn(move || {
+                                let _ = tx.send(engine.flush_if_needed());
+                            }) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!(%e, "failed to spawn urgent storage flush thread");
+                                continue;
+                            }
+                        }
+                        match rx.await {
+                            Ok(Err(e)) => tracing::warn!(%e, "urgent flush failed"),
+                            Err(e) => tracing::error!(%e, "urgent flush task panicked"),
+                            _ => {}
+                        }
+                    }
+                }
+                _ = urgent_s3_sync_interval.tick(), if has_s3 => {
+                    if maintenance_engine.take_s3_sync_request() {
+                        let engine = maintenance_engine.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("s3-sync-urgent".into())
+                            .spawn(move || {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .expect("s3-sync-urgent runtime");
+                                rt.block_on(async {
+                                    match engine.sync_sstables_to_s3().await {
+                                        Ok(n) => {
+                                            tracing::info!(
+                                                count = n,
+                                                "urgent S3 SSTable sync completed after write backpressure"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, "urgent S3 SSTable sync failed");
+                                        }
+                                    }
+                                });
+                            });
+                    }
+                }
                 _ = schema_sync_interval.tick() => {
                     let snap = maintenance_schema.snapshot();
                     if snap.version != last_schema_version {
                         // Flush all memtables before persisting schema so SSTables
-                        // on disk match the schema snapshot.  spawn_blocking is
-                        // cancel-safe: the flush runs to completion even on drop.
+                        // on disk match the schema snapshot. Run it outside the
+                        // Tokio blocking pool for the same reason as periodic
+                        // flushes: SSTable compression can be CPU-expensive.
                         let engine = maintenance_engine.clone();
-                        let flush_result =
-                            tokio::task::spawn_blocking(move || engine.flush_all()).await;
-                        match flush_result {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        match std::thread::Builder::new()
+                            .name("storage-schema-flush".into())
+                            .spawn(move || {
+                                let _ = tx.send(engine.flush_all());
+                            }) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!(%e, "failed to spawn schema flush thread");
+                                continue;
+                            }
+                        }
+                        match rx.await {
                             Ok(Err(e)) => {
                                 tracing::warn!(%e, "pre-schema-persist flush failed, skipping schema persist");
                                 continue; // Don't persist schema without data — retry next tick

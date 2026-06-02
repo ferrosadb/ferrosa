@@ -1,12 +1,13 @@
 //! Write coordination -- fans out mutations to replicas with CL enforcement.
 
+use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_sstable::types::Row;
-use ferrosa_storage::{Mutation, TableId};
+use ferrosa_storage::{Mutation, StorageEngine, TableId};
 
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
@@ -17,9 +18,43 @@ use super::ClusterCoordinator;
 
 type ReplicaWriteTarget = (u64, Option<(uuid::Uuid, String)>, String);
 
+enum ReplicaWriteWork {
+    Local {
+        storage: std::sync::Arc<StorageEngine>,
+        table_id: TableId,
+        key: DecoratedKey,
+        row: Row,
+    },
+    Remote {
+        replica_id: u64,
+        remote: Option<(uuid::Uuid, String)>,
+        body: Option<Bytes>,
+    },
+}
+
+enum NtsReplicaWriteWork {
+    Local {
+        storage: std::sync::Arc<StorageEngine>,
+        table_id: TableId,
+        key: DecoratedKey,
+        row: Row,
+        dc: String,
+    },
+    Remote {
+        remote: Option<(uuid::Uuid, String)>,
+        body: Bytes,
+        dc: String,
+    },
+    Failure {
+        dc: String,
+    },
+}
+
 /// Result of a single replica write attempt.
 enum ReplicaResult {
-    Ack,
+    Ack {
+        host_id: Option<uuid::Uuid>,
+    },
     /// Write to a remote replica failed.  Carries the peer's `host_id` so the
     /// coordinator can store a hint when the overall write still meets quorum.
     Failure {
@@ -35,6 +70,52 @@ fn should_refresh_peer_pool(err: &str) -> bool {
 }
 
 impl ClusterCoordinator {
+    fn store_hints_for_replicas(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        body: &[u8],
+        timestamp: i64,
+        peer_ids: impl IntoIterator<Item = uuid::Uuid>,
+        reason: &'static str,
+    ) {
+        let mut peers: Vec<_> = peer_ids.into_iter().collect();
+        peers.sort_unstable();
+        peers.dedup();
+        if peers.is_empty() {
+            return;
+        }
+
+        let Some(ref hint_store) = self.hint_store else {
+            tracing::error!(
+                failed_count = peers.len(),
+                reason,
+                "no hint store available — divergent replicas will require anti-entropy repair"
+            );
+            return;
+        };
+
+        let hint_key = key.key.as_bytes().to_vec();
+        let hint_row = body.to_vec();
+        for peer_id in peers {
+            if let Err(e) = hint_store.store(
+                peer_id,
+                &table_id.keyspace,
+                &table_id.table,
+                hint_key.clone(),
+                hint_row.clone(),
+                timestamp,
+            ) {
+                tracing::error!(
+                    peer = %peer_id,
+                    %e,
+                    reason,
+                    "hint store failed — divergent replica will require anti-entropy repair"
+                );
+            }
+        }
+    }
+
     async fn send_remote_write_with_reconnect(
         &self,
         host_id: uuid::Uuid,
@@ -113,7 +194,7 @@ impl ClusterCoordinator {
         // DEBUG-level span so it costs nothing at the default INFO filter.
         // Keep the span construction outside the awaited fan-out below: a
         // synchronous `entered()` guard must not be held across `.await`.
-        {
+        if tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::debug_span!(
                 "cluster.write",
                 cl = %cl,
@@ -144,6 +225,15 @@ impl ClusterCoordinator {
             .collect();
         drop(ring);
 
+        if replica_targets
+            .iter()
+            .any(|(replica_id, _)| *replica_id == self.local_node_id)
+        {
+            self.storage.check_write_admission().map_err(|e| {
+                ClusterError::Overloaded(format!("local replica write admission failed: {e}"))
+            })?;
+        }
+
         // Lazy mutation encoding: only serialise the mutation if at least
         // one replica is remote.  With cqld4 token-aware routing, every
         // write lands on a coordinator that is also the owning replica
@@ -166,78 +256,123 @@ impl ClusterCoordinator {
         } else {
             None
         };
+        let all_remote_hids: std::collections::HashSet<uuid::Uuid> = replica_targets
+            .iter()
+            .filter_map(|(replica_id, remote)| {
+                if *replica_id == self.local_node_id {
+                    None
+                } else {
+                    remote.as_ref().map(|(hid, _)| *hid)
+                }
+            })
+            .collect();
 
-        // Build concurrent futures for each replica.
+        // Build concurrent futures for each replica. Only the local write
+        // needs the owned row; remote replicas use the encoded mutation body.
+        let mut local_row = Some(row);
         let mut fan_out: FuturesUnordered<_> = replica_targets
             .into_iter()
             .map(|(replica_id, remote)| {
-                let storage = self.storage.clone();
-                let coordinator = self;
-                let table_id = table_id.clone();
-                let key = key.clone();
-                let row = row.clone();
-                let body = body.clone();
-                let local_node_id = self.local_node_id;
-
-                async move {
-                    let is_local = replica_id == local_node_id;
-                    metrics::inc_replica_write_attempt(is_local);
-                    if is_local {
-                        match storage.write(&table_id, &key, row, timestamp) {
-                            Ok(()) => {
-                                metrics::inc_replica_write_ack(true);
-                                ReplicaResult::Ack
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, "local write failed");
-                                metrics::inc_replica_write_failure(true);
-                                ReplicaResult::Failure { host_id: None }
+                let work = if replica_id == self.local_node_id {
+                    match local_row.take() {
+                        Some(row) => ReplicaWriteWork::Local {
+                            storage: self.storage.clone(),
+                            table_id: table_id.clone(),
+                            key: key.clone(),
+                            row,
+                        },
+                        None => {
+                            tracing::error!(replica_id, "token ring returned local replica twice");
+                            ReplicaWriteWork::Remote {
+                                replica_id,
+                                remote: None,
+                                body: None,
                             }
                         }
-                    } else {
-                        match remote {
-                            None => {
-                                tracing::warn!(
-                                    replica_id,
-                                    "no host_id for replica — dropping write"
-                                );
-                                ReplicaResult::Failure { host_id: None }
+                    }
+                } else {
+                    ReplicaWriteWork::Remote {
+                        replica_id,
+                        remote,
+                        body: body.clone(),
+                    }
+                };
+                let coordinator = self;
+
+                async move {
+                    match work {
+                        ReplicaWriteWork::Local {
+                            storage,
+                            table_id,
+                            key,
+                            row,
+                        } => {
+                            metrics::inc_replica_write_attempt(true);
+                            match storage.write(&table_id, &key, row, timestamp) {
+                                Ok(()) => {
+                                    metrics::inc_replica_write_ack(true);
+                                    ReplicaResult::Ack { host_id: None }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, "local write failed");
+                                    metrics::inc_replica_write_failure(true);
+                                    ReplicaResult::Failure { host_id: None }
+                                }
                             }
-                            Some((hid, addr)) => {
-                                // `body` is `Some` here because at least one
-                                // replica was non-local (we set it above when
-                                // `has_remote` was true).
-                                let forward_body = match body {
-                                    Some(b) => b,
-                                    None => {
-                                        tracing::error!(
-                                            replica_id,
-                                            "internal: missing body for remote replica"
-                                        );
-                                        return ReplicaResult::Failure { host_id: Some(hid) };
-                                    }
-                                };
-                                match coordinator
-                                    .send_remote_write_with_reconnect(
-                                        hid,
-                                        &addr,
-                                        Message::MutationForward(forward_body),
-                                    )
-                                    .await
-                                {
-                                    Ok(Message::MutationAck(_)) => {
-                                        metrics::inc_replica_write_ack(false);
-                                        ReplicaResult::Ack
-                                    }
-                                    Ok(other) => {
-                                        tracing::warn!(?other, "unexpected response from replica");
-                                        metrics::inc_replica_write_failure(false);
-                                        ReplicaResult::Failure { host_id: Some(hid) }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(%e, %hid, "MutationForward failed");
-                                        metrics::inc_replica_write_failure(false);
-                                        ReplicaResult::Failure { host_id: Some(hid) }
+                        }
+                        ReplicaWriteWork::Remote {
+                            replica_id,
+                            remote,
+                            body,
+                        } => {
+                            metrics::inc_replica_write_attempt(false);
+                            match remote {
+                                None => {
+                                    tracing::warn!(
+                                        replica_id,
+                                        "no host_id for replica — dropping write"
+                                    );
+                                    ReplicaResult::Failure { host_id: None }
+                                }
+                                Some((hid, addr)) => {
+                                    // `body` is `Some` here because at least one
+                                    // replica was non-local (we set it above when
+                                    // `has_remote` was true).
+                                    let forward_body = match body {
+                                        Some(b) => b,
+                                        None => {
+                                            tracing::error!(
+                                                replica_id,
+                                                "internal: missing body for remote replica"
+                                            );
+                                            return ReplicaResult::Failure { host_id: Some(hid) };
+                                        }
+                                    };
+                                    match coordinator
+                                        .send_remote_write_with_reconnect(
+                                            hid,
+                                            &addr,
+                                            Message::MutationForward(forward_body),
+                                        )
+                                        .await
+                                    {
+                                        Ok(Message::MutationAck(_)) => {
+                                            metrics::inc_replica_write_ack(false);
+                                            ReplicaResult::Ack { host_id: Some(hid) }
+                                        }
+                                        Ok(other) => {
+                                            tracing::warn!(
+                                                ?other,
+                                                "unexpected response from replica"
+                                            );
+                                            metrics::inc_replica_write_failure(false);
+                                            ReplicaResult::Failure { host_id: Some(hid) }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, %hid, "MutationForward failed");
+                                            metrics::inc_replica_write_failure(false);
+                                            ReplicaResult::Failure { host_id: Some(hid) }
+                                        }
                                     }
                                 }
                             }
@@ -248,19 +383,40 @@ impl ClusterCoordinator {
             .collect();
 
         // Drain all futures, collecting ACKs and failed replica host_ids.
-        // We must drain the full set (not just until CL met) so we know which
-        // replicas failed — those get hints if quorum was reached.
         let mut acks = 0usize;
         let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
+        let mut acked_remote_hids: std::collections::HashSet<uuid::Uuid> =
+            std::collections::HashSet::new();
         while let Some(result) = fan_out.next().await {
             match result {
-                ReplicaResult::Ack => {
+                ReplicaResult::Ack { host_id } => {
                     acks += 1;
+                    if let Some(hid) = host_id {
+                        acked_remote_hids.insert(hid);
+                    }
                 }
                 ReplicaResult::Failure { host_id: Some(hid) } => {
                     failed_replicas.push(hid);
                 }
                 ReplicaResult::Failure { host_id: None } => {}
+            }
+
+            if acks >= required {
+                if let Some(ref body) = body {
+                    let unacked = all_remote_hids
+                        .difference(&acked_remote_hids)
+                        .copied()
+                        .chain(failed_replicas.iter().copied());
+                    self.store_hints_for_replicas(
+                        table_id,
+                        key,
+                        body,
+                        timestamp,
+                        unacked,
+                        "quorum satisfied before all remote replicas acked",
+                    );
+                }
+                return Ok(());
             }
         }
 
@@ -275,44 +431,20 @@ impl ClusterCoordinator {
         // are visible in monitoring. The write still proceeds — hint loss
         // means anti-entropy repair must eventually fix divergence.
         if !failed_replicas.is_empty() {
-            if let Some(ref hint_store) = self.hint_store {
-                // Hints only get stored for remote-replica failures (see
-                // the `Failure { host_id: Some(hid) }` arm above), which
-                // means we already computed `body` for forwarding.  If
-                // it's `None` here, hints simply can't be saved — fall
-                // through to the error branch below.
-                let hint_row = match body.as_ref() {
-                    Some(b) => b.to_vec(),
-                    None => {
-                        tracing::error!(
-                            failed_count = failed_replicas.len(),
-                            "internal: failed remote replicas with no encoded body — \
-                             divergent replicas will require anti-entropy repair"
-                        );
-                        Vec::new()
-                    }
-                };
-                let hint_key = key.key.as_bytes().to_vec();
-                for peer_id in &failed_replicas {
-                    if let Err(e) = hint_store.store(
-                        *peer_id,
-                        &table_id.keyspace,
-                        &table_id.table,
-                        hint_key.clone(),
-                        hint_row.clone(),
-                        timestamp,
-                    ) {
-                        tracing::error!(
-                            peer = %peer_id,
-                            %e,
-                            "hint store failed — divergent replica will require anti-entropy repair"
-                        );
-                    }
-                }
+            if let Some(ref body) = body {
+                self.store_hints_for_replicas(
+                    table_id,
+                    key,
+                    body,
+                    timestamp,
+                    failed_replicas,
+                    "replica write failed before quorum was satisfied",
+                );
             } else {
                 tracing::error!(
                     failed_count = failed_replicas.len(),
-                    "no hint store available — divergent replicas will require anti-entropy repair"
+                    "internal: failed remote replicas with no encoded body — \
+                     divergent replicas will require anti-entropy repair"
                 );
             }
         }
@@ -354,8 +486,8 @@ impl ClusterCoordinator {
         let ring = self.ring.load();
         let replicas = ring.replicas_for_strategy(key.token.0, strategy);
 
-        {
-            let span = tracing::info_span!(
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let span = tracing::debug_span!(
                 "cluster.write",
                 cl = %cl,
                 rf = strategy.replication_factor(),
@@ -399,6 +531,12 @@ impl ClusterCoordinator {
             });
         }
 
+        if replicas.contains(&self.local_node_id) {
+            self.storage.check_write_admission().map_err(|e| {
+                ClusterError::Overloaded(format!("local replica write admission failed: {e}"))
+            })?;
+        }
+
         // Build the mutation payload.
         let mutation = Mutation::new(
             table_id.keyspace.clone(),
@@ -420,46 +558,87 @@ impl ClusterCoordinator {
                 (replica_id, remote, dc)
             })
             .collect();
+        let all_remote_hids: std::collections::HashSet<uuid::Uuid> = replica_targets
+            .iter()
+            .filter_map(|(replica_id, remote, _)| {
+                if *replica_id == self.local_node_id {
+                    None
+                } else {
+                    remote.as_ref().map(|(hid, _)| *hid)
+                }
+            })
+            .collect();
         drop(ring);
 
-        // Fan out.
+        // Fan out. Avoid cloning the row into remote-only futures.
+        let mut local_row = Some(row);
         let mut fan_out: FuturesUnordered<_> = replica_targets
             .into_iter()
             .map(|(replica_id, remote, dc)| {
-                let storage = self.storage.clone();
+                let work = if replica_id == self.local_node_id {
+                    match local_row.take() {
+                        Some(row) => NtsReplicaWriteWork::Local {
+                            storage: self.storage.clone(),
+                            table_id: table_id.clone(),
+                            key: key.clone(),
+                            row,
+                            dc,
+                        },
+                        None => {
+                            tracing::error!(replica_id, "token ring returned local replica twice");
+                            NtsReplicaWriteWork::Failure { dc }
+                        }
+                    }
+                } else {
+                    NtsReplicaWriteWork::Remote {
+                        remote,
+                        body: body.clone(),
+                        dc,
+                    }
+                };
                 let coordinator = self;
-                let table_id = table_id.clone();
-                let key = key.clone();
-                let row = row.clone();
-                let body = body.clone();
-                let local_node_id = self.local_node_id;
 
                 async move {
-                    let result = if replica_id == local_node_id {
-                        match storage.write(&table_id, &key, row, timestamp) {
-                            Ok(()) => ReplicaResult::Ack,
-                            Err(_) => ReplicaResult::Failure { host_id: None },
+                    match work {
+                        NtsReplicaWriteWork::Local {
+                            storage,
+                            table_id,
+                            key,
+                            row,
+                            dc,
+                        } => {
+                            let result = match storage.write(&table_id, &key, row, timestamp) {
+                                Ok(()) => ReplicaResult::Ack { host_id: None },
+                                Err(_) => ReplicaResult::Failure { host_id: None },
+                            };
+                            (result, dc)
                         }
-                    } else {
-                        match remote {
-                            None => ReplicaResult::Failure { host_id: None },
-                            Some((hid, addr)) => {
-                                match coordinator
-                                    .send_remote_write_with_reconnect(
-                                        hid,
-                                        &addr,
-                                        Message::MutationForward(body),
-                                    )
-                                    .await
-                                {
-                                    Ok(Message::MutationAck(_)) => ReplicaResult::Ack,
-                                    Ok(_) => ReplicaResult::Failure { host_id: Some(hid) },
-                                    Err(_) => ReplicaResult::Failure { host_id: Some(hid) },
+                        NtsReplicaWriteWork::Remote { remote, body, dc } => {
+                            let result = match remote {
+                                None => ReplicaResult::Failure { host_id: None },
+                                Some((hid, addr)) => {
+                                    match coordinator
+                                        .send_remote_write_with_reconnect(
+                                            hid,
+                                            &addr,
+                                            Message::MutationForward(body),
+                                        )
+                                        .await
+                                    {
+                                        Ok(Message::MutationAck(_)) => {
+                                            ReplicaResult::Ack { host_id: Some(hid) }
+                                        }
+                                        Ok(_) => ReplicaResult::Failure { host_id: Some(hid) },
+                                        Err(_) => ReplicaResult::Failure { host_id: Some(hid) },
+                                    }
                                 }
-                            }
+                            };
+                            (result, dc)
                         }
-                    };
-                    (result, dc)
+                        NtsReplicaWriteWork::Failure { dc } => {
+                            (ReplicaResult::Failure { host_id: None }, dc)
+                        }
+                    }
                 }
             })
             .collect();
@@ -469,17 +648,50 @@ impl ClusterCoordinator {
         let mut dc_acks: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
+        let mut acked_remote_hids: std::collections::HashSet<uuid::Uuid> =
+            std::collections::HashSet::new();
 
         while let Some((result, dc)) = fan_out.next().await {
             match result {
-                ReplicaResult::Ack => {
+                ReplicaResult::Ack { host_id } => {
                     total_acks += 1;
                     *dc_acks.entry(dc).or_insert(0) += 1;
+                    if let Some(hid) = host_id {
+                        acked_remote_hids.insert(hid);
+                    }
                 }
                 ReplicaResult::Failure { host_id: Some(hid) } => {
                     failed_replicas.push(hid);
                 }
                 ReplicaResult::Failure { host_id: None } => {}
+            }
+
+            let satisfied = match cl {
+                ConsistencyLevel::EachQuorum => {
+                    strategy.dc_replication_factors().iter().all(|(dc, &rf)| {
+                        let acks = dc_acks.get(dc).copied().unwrap_or(0);
+                        acks >= cl.block_for_dc(rf)
+                    })
+                }
+                ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => {
+                    total_acks >= required
+                }
+                _ => total_acks >= required,
+            };
+            if satisfied {
+                let unacked = all_remote_hids
+                    .difference(&acked_remote_hids)
+                    .copied()
+                    .chain(failed_replicas.iter().copied());
+                self.store_hints_for_replicas(
+                    table_id,
+                    key,
+                    &body,
+                    timestamp,
+                    unacked,
+                    "quorum satisfied before all NTS remote replicas acked",
+                );
+                return Ok(());
             }
         }
 
@@ -499,25 +711,14 @@ impl ClusterCoordinator {
         // Even when the write fails (below quorum), hints record the mutation
         // so replay can fix divergence when nodes recover.
         if !failed_replicas.is_empty() {
-            if let Some(ref hint_store) = self.hint_store {
-                let hint_row = body.to_vec();
-                let hint_key = key.key.as_bytes().to_vec();
-                for peer_id in &failed_replicas {
-                    if let Err(e) = hint_store.store(
-                        *peer_id,
-                        &table_id.keyspace,
-                        &table_id.table,
-                        hint_key.clone(),
-                        hint_row.clone(),
-                        timestamp,
-                    ) {
-                        tracing::warn!(
-                            peer = %peer_id,
-                            "failed to store hint for NTS replica: {e}"
-                        );
-                    }
-                }
-            }
+            self.store_hints_for_replicas(
+                table_id,
+                key,
+                &body,
+                timestamp,
+                failed_replicas,
+                "NTS replica write failed before quorum was satisfied",
+            );
         }
 
         if satisfied {
@@ -580,6 +781,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

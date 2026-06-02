@@ -28,7 +28,10 @@
 //! simple single-row partitions with live cells; more complex cases
 //! (range tombstones, complex columns) are deferred.
 
+use std::sync::OnceLock;
+
 use ferrosa_common::{CellValue, Result};
+use rayon::prelude::*;
 
 use crate::bloom::BloomFilter;
 use crate::byte_comparable;
@@ -43,6 +46,27 @@ use crate::types::Partition;
 use crate::varint;
 
 const ROW_INDEX_MIN_ROWS: usize = 32;
+
+fn compression_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let thread_count = std::env::var("FERROSA_SSTABLE_COMPRESSION_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|threads| *threads > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(2)
+                    .clamp(1, 4)
+            });
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .thread_name(|idx| format!("sstable-compress-{idx}"))
+            .build()
+            .expect("failed to build SSTable compression thread pool")
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Row / cell flag constants (matching data.rs reader)
@@ -766,22 +790,47 @@ impl SSTableWriter {
     ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         match &options.compression {
             Some(compression) if !matches!(compression, Compression::None) => {
+                struct CompressedChunk {
+                    payload: Vec<u8>,
+                    crc: [u8; 4],
+                    stored_size: usize,
+                }
+
                 let chunk_size = options.chunk_size;
                 let data_length = data_buf.len() as u64;
-                let mut compressed_data = Vec::new();
-                let mut chunk_offsets = Vec::new();
+
+                let chunks: Vec<&[u8]> = data_buf.chunks(chunk_size).collect();
+                let compressed_chunks: Result<Vec<CompressedChunk>> =
+                    compression_pool().install(|| {
+                        chunks
+                            .par_iter()
+                            .map(|chunk| {
+                                let payload = compression.compress(chunk)?;
+                                let crc = crc32fast::hash(&payload).to_be_bytes();
+                                let stored_size = payload.len() + std::mem::size_of::<u32>();
+                                Ok(CompressedChunk {
+                                    payload,
+                                    crc,
+                                    stored_size,
+                                })
+                            })
+                            .collect()
+                    });
+                let compressed_chunks = compressed_chunks?;
+
+                let total_compressed_len: usize = compressed_chunks
+                    .iter()
+                    .map(|chunk| chunk.stored_size)
+                    .sum();
+                let mut compressed_data = Vec::with_capacity(total_compressed_len);
+                let mut chunk_offsets = Vec::with_capacity(compressed_chunks.len());
                 let mut max_compressed_size: usize = 0;
 
-                for chunk in data_buf.chunks(chunk_size) {
+                for chunk in compressed_chunks {
                     chunk_offsets.push(compressed_data.len() as u64);
-                    let compressed_chunk = compression.compress(chunk)?;
-                    let crc = crc32fast::hash(&compressed_chunk);
-                    let stored_chunk_size = compressed_chunk.len() + std::mem::size_of::<u32>();
-                    if stored_chunk_size > max_compressed_size {
-                        max_compressed_size = stored_chunk_size;
-                    }
-                    compressed_data.extend_from_slice(&compressed_chunk);
-                    compressed_data.extend_from_slice(&crc.to_be_bytes());
+                    max_compressed_size = max_compressed_size.max(chunk.stored_size);
+                    compressed_data.extend_from_slice(&chunk.payload);
+                    compressed_data.extend_from_slice(&chunk.crc);
                 }
 
                 let info = CompressionInfo {

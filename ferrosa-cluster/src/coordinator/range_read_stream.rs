@@ -22,6 +22,7 @@ use bytes::Bytes;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::idle_timeout::IdleTimeoutWatchdog;
 use ferrosa_net::message::Message;
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
 use futures::{Stream, StreamExt};
@@ -528,7 +529,7 @@ impl ClusterCoordinator {
 
         let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
         let router = self.stream_router.clone();
-        tokio::spawn(async move {
+        TaskPool::current("range-read-forward").spawn(async move {
             forward_remote_range_stream(receiver, request_id, 1, remote_tx).await;
             router.unregister(request_id);
         });
@@ -536,7 +537,7 @@ impl ClusterCoordinator {
         let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
         let storage = self.storage.clone();
         let table_id = table_id.clone();
-        tokio::spawn(async move {
+        TaskPool::current("range-read-merge").spawn(async move {
             merge_local_and_single_remote_stream(
                 storage,
                 table_id,

@@ -14,12 +14,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
+use ferrosa_common::task_pool::TaskPool;
 use ferrosa_common::Result;
 use ferrosa_index::{IndexKey, RowPosition};
 use ferrosa_sstable::io::ReadAt;
@@ -348,6 +350,19 @@ fn partition_with_matching_clustering(
     })
 }
 
+fn clone_partition_limited(partition: &Partition, row_limit: usize) -> Partition {
+    if row_limit == 0 {
+        return partition.clone();
+    }
+
+    Partition {
+        key: partition.key.clone(),
+        deletion: partition.deletion,
+        static_row: partition.static_row.clone(),
+        rows: partition.rows.iter().take(row_limit).cloned().collect(),
+    }
+}
+
 /// Filters sidecar entries to remove references to deleted partitions.
 ///
 /// After compaction merges partitions, some entries in the collected
@@ -643,28 +658,28 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         row_limit: usize,
     ) -> Result<Option<Partition>> {
+        let started = Instant::now();
         let guard = self.view.load();
         let schema = self.schema.load();
 
         let mut sources: Vec<Partition> = Vec::new();
+        let mut memtable_hits = 0u64;
+        let mut flushing_hits = 0u64;
+        let mut sstable_probes = 0u64;
+        let mut sstable_hits = 0u64;
+        let mut sstable_errors = 0u64;
 
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
-            let mut p = (*p).clone();
-            if row_limit > 0 {
-                p.rows.truncate(row_limit);
-            }
-            sources.push(p);
+            memtable_hits += 1;
+            sources.push(clone_partition_limited(&p, row_limit));
         }
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
             if let Some(p) = flushing.get(key)? {
-                let mut p = (*p).clone();
-                if row_limit > 0 {
-                    p.rows.truncate(row_limit);
-                }
-                sources.push(p);
+                flushing_hits += 1;
+                sources.push(clone_partition_limited(&p, row_limit));
             }
         }
 
@@ -673,8 +688,10 @@ impl<F: FlushTarget> TableStore<F> {
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for (i, sstable) in guard.sstables.iter().enumerate() {
+            sstable_probes += 1;
             match sstable.get_partition_limited_rows(key, row_limit) {
                 Ok(Some(mut p)) => {
+                    sstable_hits += 1;
                     ColumnOrdinalMapping::for_header(&schema, sstable.header())
                         .remap_partition(&mut p);
                     sources.push(p);
@@ -698,11 +715,21 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sstable_errors += 1;
                 }
             }
         }
 
         if sources.is_empty() {
+            crate::metrics::observe_read_limited_rows(
+                started.elapsed(),
+                false,
+                memtable_hits,
+                flushing_hits,
+                sstable_probes,
+                sstable_hits,
+                sstable_errors,
+            );
             return Ok(None);
         }
 
@@ -711,6 +738,15 @@ impl<F: FlushTarget> TableStore<F> {
             merge::apply_deletions(&mut merged);
             merged.rows.truncate(row_limit);
         }
+        crate::metrics::observe_read_limited_rows(
+            started.elapsed(),
+            true,
+            memtable_hits,
+            flushing_hits,
+            sstable_probes,
+            sstable_hits,
+            sstable_errors,
+        );
         Ok(Some(merged))
     }
 
@@ -968,7 +1004,13 @@ impl<F: FlushTarget> TableStore<F> {
     /// 5. Build the SSTable via [`SSTableWriter`] and [`FlushTarget::flush`].
     /// 6. Prepend the new reader to the SSTable list and clear `flushing`.
     pub fn flush(&self) -> Result<()> {
+        let total_start = Instant::now();
+        let phase_start = Instant::now();
         let _guard = self.flush_guard.lock();
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::LockWait,
+            phase_start.elapsed(),
+        );
 
         // Step 1: Swap in a fresh active memtable, move old to flushing.
         // Take the write barrier (exclusive) to ensure no writer is mid-put
@@ -978,6 +1020,7 @@ impl<F: FlushTarget> TableStore<F> {
         let new_active: Arc<dyn Memtable> = new_memtable();
         let fresh_indexes = new_indexes(&self.indexed_columns);
         let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
+        let phase_start = Instant::now();
         let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
             let _wb = self.write_barrier.write(); // block all writers
             let old_view = self.view.load();
@@ -1009,12 +1052,17 @@ impl<F: FlushTarget> TableStore<F> {
                 old_vector_indexes,
             )
         };
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::SwapMemtable,
+            phase_start.elapsed(),
+        );
 
         // Step 2: Snapshot the flushing memtable.
         // Also capture any late writes from the PREVIOUS flushing memtable
         // (kept alive since the last flush). These are writes that landed
         // between the previous snapshot and the view swap.
         let prev_flushing_present = old_view_flushing.is_some();
+        let phase_start = Instant::now();
         let mut partitions = old_active.snapshot();
         if let Some(ref prev_flushing) = old_view_flushing {
             let prev_parts = prev_flushing.snapshot();
@@ -1048,6 +1096,10 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
         }
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::SnapshotMemtable,
+            phase_start.elapsed(),
+        );
 
         let total_rows: usize = partitions.iter().map(|p| p.rows.len()).sum();
         tracing::debug!(
@@ -1078,7 +1130,12 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // Step 4: Sort partitions by key (required by SSTableWriter).
+        let phase_start = Instant::now();
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::SortPartitions,
+            phase_start.elapsed(),
+        );
 
         // Step 5: Build the SSTable.
         let options = self.options.clone();
@@ -1102,6 +1159,7 @@ impl<F: FlushTarget> TableStore<F> {
         let quarantine_dir = self.flush_target.base_dir().to_path_buf();
         let mut quarantine_writer: Option<crate::quarantine::QuarantineWriter> = None;
         let mut total_quarantined = 0usize;
+        let phase_start = Instant::now();
         for p in partitions.iter_mut() {
             if p.rows.is_empty() {
                 continue;
@@ -1119,6 +1177,10 @@ impl<F: FlushTarget> TableStore<F> {
         }
         // Drop partitions that lost all their rows to quarantine.
         partitions.retain(|p| !p.rows.is_empty() || p.static_row.is_some());
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::ValidateRows,
+            phase_start.elapsed(),
+        );
 
         if total_quarantined > 0 {
             tracing::error!(
@@ -1132,11 +1194,41 @@ impl<F: FlushTarget> TableStore<F> {
 
         let header = flush::build_serialization_header(&schema, &partitions);
         let mut writer = SSTableWriter::new(options, header);
+        let phase_start = Instant::now();
         for p in &partitions {
             writer.add_partition(p)?;
         }
         let output = writer.finish()?;
+        let output_bytes = output.data.len()
+            + output.partitions.len()
+            + output.rows.len()
+            + output.filter.len()
+            + output.statistics.len()
+            + output.toc.len()
+            + output
+                .compression_info
+                .as_ref()
+                .map(|ci| ci.len())
+                .unwrap_or(0);
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::EncodeSstable,
+            phase_start.elapsed(),
+        );
+        let phase_start = Instant::now();
         let reader = self.flush_target.flush(output)?;
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::LocalWriteSstable,
+            phase_start.elapsed(),
+        );
+        crate::metrics::observe_flush_output(
+            output_bytes as u64,
+            total_rows as u64,
+            partitions.len() as u64,
+        );
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::Total,
+            total_start.elapsed(),
+        );
         let new_reader = Arc::new(reader);
 
         // Step 5b: Build sidecar readers from the old memtable indexes and
@@ -1505,7 +1597,7 @@ impl<F: FlushTarget> TableStore<F> {
         let wanted_owned = wanted;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
-        tokio::task::spawn_blocking(move || {
+        TaskPool::current("table-store-stream").spawn_blocking(move || {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
@@ -1587,7 +1679,7 @@ impl<F: FlushTarget> TableStore<F> {
         let end_owned = end.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
-        tokio::task::spawn_blocking(move || {
+        TaskPool::current("table-store-stream").spawn_blocking(move || {
             // Build source iterators — these borrow from `view`
             // (memtable Arcs and per-SSTable Arcs) which the closure
             // owns for the task's full lifetime, so there is no
@@ -2441,13 +2533,20 @@ impl<F: FlushTarget> TableStore<F> {
         let mut seen = std::collections::HashSet::new();
         positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
 
-        // 5. Fetch actual partitions by partition key
+        // 5. Fetch actual rows by base-table key. Secondary-index entries carry
+        // the clustering key, so wide clustered tables must not materialize the
+        // whole partition for every index hit.
         let mut partitions = Vec::new();
         for pos in &positions {
             let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
                 pos.partition_key.clone(),
             ));
-            if let Ok(Some(partition)) = self.read(&dk) {
+            let read = if pos.clustering_key.is_empty() {
+                self.read(&dk)
+            } else {
+                self.read_clustering_row(&dk, &pos.clustering_key)
+            };
+            if let Ok(Some(partition)) = read {
                 partitions.push(partition);
             }
         }
@@ -4273,6 +4372,30 @@ mod tests {
             .rows
             .windows(2)
             .all(|pair| pair[0].clustering < pair[1].clustering));
+    }
+
+    #[test]
+    fn read_limited_rows_from_memtable_returns_prefix() {
+        let store = test_store();
+        let key = make_key("wide-memtable");
+
+        for ck in 0..100i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("mem-{ck}").as_bytes(), 1000 + ck as i64),
+                )
+                .unwrap();
+        }
+
+        let partition = store
+            .read_limited_rows(&key, 10)
+            .unwrap()
+            .expect("partition should exist");
+
+        assert_eq!(partition.rows.len(), 10);
+        assert_eq!(partition.rows[0].clustering, 0i32.to_be_bytes());
+        assert_eq!(partition.rows[9].clustering, 9i32.to_be_bytes());
     }
 
     #[test]

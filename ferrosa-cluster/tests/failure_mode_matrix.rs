@@ -320,16 +320,25 @@ async fn s_05_approve_node_replicates_through_raft() {
         cluster.membership_network(),
     );
     changer.approve_node(pending).await.unwrap();
-    let pred = || {
-        for n in &cluster.nodes() {
-            let st = n.state_machine.snapshot_state_blocking();
+    let mut converged = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let nodes = cluster.nodes();
+        let mut ok = true;
+        for n in &nodes {
+            let st = n.state_snapshot().await;
             if !st.approved_nodes.contains(&pending) {
-                return false;
+                ok = false;
+                break;
             }
         }
-        true
-    };
-    assert!(wait_until(pred, Duration::from_secs(3)).await);
+        if ok {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(converged);
     cluster.shutdown().await;
 }
 

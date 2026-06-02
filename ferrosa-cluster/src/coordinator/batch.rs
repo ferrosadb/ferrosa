@@ -14,6 +14,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_storage::batchlog::BatchlogEntry;
 use ferrosa_storage::Mutation;
 
@@ -400,7 +401,7 @@ impl BatchlogReplayTask {
         interval: std::time::Duration,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        TaskPool::current("batchlog-replay").spawn(async move {
             loop {
                 tokio::select! {
                     result = shutdown.changed() => {
@@ -449,6 +450,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

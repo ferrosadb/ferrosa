@@ -361,8 +361,8 @@ impl ClusterCoordinator {
 
         let required = cl.block_for(rf);
 
-        {
-            let span = tracing::info_span!(
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let span = tracing::debug_span!(
                 "cluster.read",
                 cl = %cl,
                 replicas = replicas.len(),
@@ -958,8 +958,8 @@ impl ClusterCoordinator {
         let ring = self.ring.load();
         let all_replicas = ring.replicas_for_strategy(key.token.0, strategy);
 
-        {
-            let span = tracing::info_span!(
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let span = tracing::debug_span!(
                 "cluster.read",
                 cl = %cl,
                 replicas = all_replicas.len(),
@@ -1495,6 +1495,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

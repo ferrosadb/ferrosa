@@ -155,9 +155,15 @@ impl PeriodicSync {
 
 impl SyncStrategy for PeriodicSync {
     fn on_write(&self, _segment: &Segment, _position: u64) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        let (_lock, cvar) = &*self.wake;
-        cvar.notify_one();
+        // Edge-trigger the sync thread when the log transitions from clean to
+        // dirty. This is not a per-write stream: writes already covered by the
+        // open batch only bump the counter, so they cannot interrupt the timer
+        // and collapse batching into tiny fsyncs.
+        let previous = self.pending.fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            let (_lock, cvar) = &*self.wake;
+            cvar.notify_one();
+        }
     }
 
     fn start(&self) {
@@ -171,8 +177,6 @@ impl SyncStrategy for PeriodicSync {
             .name("commitlog-periodic-sync".to_string())
             .spawn(move || {
                 while !stop_flag.load(Ordering::Acquire) {
-                    // Wait for the first write in a batch, then hold the
-                    // batch open for one interval to collect nearby writes.
                     let (lock, cvar) = &*wake;
                     let mut stopped = lock.lock();
                     if pending.load(Ordering::Acquire) == 0 {
@@ -187,7 +191,10 @@ impl SyncStrategy for PeriodicSync {
                         break;
                     }
 
+                    // Hold the batch open for one interval. Additional writes
+                    // do not notify while pending > 0, so they join this batch.
                     let _ = cvar.wait_for(&mut stopped, interval);
+                    drop(stopped);
 
                     if stop_flag.load(Ordering::Acquire) {
                         break;
@@ -550,6 +557,35 @@ mod tests {
         );
 
         sync.stop();
+    }
+
+    #[test]
+    fn periodic_sync_batches_write_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let (segment, offset) = write_mutation(dir.path());
+
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let flush_count_clone = Arc::clone(&flush_count);
+        let flush_cb: FlushCallback = Arc::new(move || {
+            flush_count_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let sync = PeriodicSync::new(Duration::from_millis(50), flush_cb);
+        sync.start();
+
+        for _ in 0..200 {
+            sync.on_write(&segment, offset);
+        }
+
+        thread::sleep(Duration::from_millis(140));
+        sync.stop();
+
+        let total_flushes = flush_count.load(Ordering::SeqCst);
+        assert!(
+            total_flushes <= 4,
+            "periodic sync should batch write notifications; got {total_flushes} flushes"
+        );
     }
 
     #[test]

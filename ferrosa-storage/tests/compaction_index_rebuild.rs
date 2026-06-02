@@ -44,6 +44,7 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
         compaction: CompactionConfig::from_env(dir.join("compaction")),
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
+        local_disk_free_reserve_bytes: 0,
         flush_threshold_bytes: 64 * 1024, // 64KB to avoid auto-flush
         memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 300, // 5min — don't trigger age-based flush in this test

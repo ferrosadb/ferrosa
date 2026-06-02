@@ -1,7 +1,6 @@
 //! Internode transport, RPC service, and failure detection for Ferrosa.
 //!
 //! ferrosa-net owns the wire protocol, connection pool, and peer lifecycle.
-//! It is a standalone transport library with no dependency on ferrosa-common.
 //! ferrosa-cluster registers message handlers and reacts to peer events.
 
 pub mod accord_messages;
@@ -21,4 +20,5 @@ pub mod reconnect;
 pub mod rpc;
 pub mod skew;
 pub mod stream_router;
+pub mod task_pool;
 pub mod tls;

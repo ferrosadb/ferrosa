@@ -39,7 +39,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use ferrosa_common::key::DecoratedKey;
+use ferrosa_sstable::types::Row;
 use parking_lot::Mutex;
+use uuid::Uuid;
 
 use checkpoint::CommitLogCheckpoint;
 use config::CommitLogConfig as Config;
@@ -407,6 +410,59 @@ impl CommitLog {
         segment.mark_table_dirty(&table_id, position);
 
         // Notify sync strategy.
+        self.sync_strategy.on_write(&segment, offset);
+
+        Ok(position)
+    }
+
+    /// Appends a single-row mutation without cloning the row into an owned
+    /// [`Mutation`] first. This is the storage write hot path.
+    pub fn append_single_row(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row: &Row,
+        timestamp: i64,
+    ) -> ferrosa_common::Result<CommitLogPosition> {
+        let total_size =
+            Segment::entry_total_size_single_row(&table_id.keyspace, &table_id.table, key, row);
+
+        let (segment, offset) = {
+            let seg = self.active.load_full();
+            match seg.allocate_and_begin_write(total_size) {
+                Some(offset) => (seg, offset),
+                None => {
+                    drop(seg);
+                    self.force_rotate()?;
+                    let new_seg = self.active.load_full();
+                    let offset = match new_seg.allocate_and_begin_write(total_size) {
+                        Some(o) => o,
+                        None => {
+                            return Err(ferrosa_common::Error::InvalidData(format!(
+                                "commit log entry ({total_size} bytes) exceeds \
+                                 segment capacity; increase segment_size"
+                            )));
+                        }
+                    };
+                    (new_seg, offset)
+                }
+            }
+        };
+
+        let position = segment.write_single_row_entry(
+            offset,
+            Uuid::new_v4().into_bytes(),
+            &table_id.keyspace,
+            &table_id.table,
+            key,
+            row,
+            timestamp,
+        );
+        segment.writer_done();
+        COMMITLOG_APPENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        COMMITLOG_APPEND_BYTES_TOTAL.fetch_add(total_size as u64, Ordering::Relaxed);
+
+        segment.mark_table_dirty(table_id, position);
         self.sync_strategy.on_write(&segment, offset);
 
         Ok(position)

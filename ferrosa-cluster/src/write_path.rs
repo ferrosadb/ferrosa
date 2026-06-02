@@ -18,6 +18,7 @@ use futures::{Stream, StreamExt};
 
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
+use crate::error::ClusterError;
 use crate::pair::coordinator::PairCoordinator;
 use crate::ring::strategy::ReplicationStrategy;
 
@@ -53,6 +54,15 @@ fn local_projected_range_stream(
         .range_iter_projected(table_id, wanted, partition_limit, None, None)
         .map(|item| item.map_err(crate::error::ClusterError::Storage));
     Box::pin(stream)
+}
+
+fn cluster_error_to_common(err: ClusterError) -> ferrosa_common::Error {
+    match err {
+        ClusterError::Overloaded(msg) => {
+            ferrosa_common::Error::InvalidData(format!("overloaded: {msg}"))
+        }
+        other => ferrosa_common::Error::InvalidData(format!("cluster: {other}")),
+    }
 }
 
 /// The active write path. Swapped atomically via `ArcSwap` when the
@@ -121,7 +131,7 @@ impl WritePath {
             Self::Cluster(coordinator) => coordinator
                 .coordinate_logged_batch(mutations)
                 .await
-                .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                .map_err(cluster_error_to_common),
         }
     }
 
@@ -612,17 +622,17 @@ impl WritePath {
                 coordinator
                     .coordinate_write(&mutation)
                     .await
-                    .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}")))
+                    .map_err(cluster_error_to_common)
             }
             Self::Cluster(coordinator) => match strategy {
                 ReplicationStrategy::Simple { replication_factor } => coordinator
                     .coordinate_write_with(table_id, key, row, timestamp, cl, *replication_factor)
                     .await
-                    .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                    .map_err(cluster_error_to_common),
                 ReplicationStrategy::NetworkTopology { .. } => coordinator
                     .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
                     .await
-                    .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                    .map_err(cluster_error_to_common),
             },
         }
     }
@@ -651,6 +661,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

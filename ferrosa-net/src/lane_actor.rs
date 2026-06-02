@@ -26,6 +26,7 @@
 //!                                                   Connected
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +44,7 @@ use crate::reconnect::{
     spawn_alive_watcher, LaneState, DORMANT_AFTER_EXHAUSTIONS, DORMANT_PROBE_INTERVAL,
 };
 use crate::rpc::client::RpcClient;
+use crate::task_pool::TaskPool;
 
 /// Default channel capacity for lane actor commands. Read via
 /// `lane_channel_capacity()` so operators can tune via
@@ -82,6 +84,14 @@ pub(crate) enum LaneCommand {
         timeout: Duration,
         reply: oneshot::Sender<Result<()>>,
     },
+    SendComplete {
+        result: Result<Message>,
+        reply: oneshot::Sender<Result<Message>>,
+    },
+    FireComplete {
+        result: Result<()>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Replace the current RPC client (used after successful reconnect).
     SwapClient(RpcClient),
     /// Signal that one full `connect_with_retry` cycle was exhausted.
@@ -100,6 +110,21 @@ pub(crate) enum LaneCommand {
     /// Gracefully shut down the actor loop.
     #[allow(dead_code)] // used in tests; part of actor API
     Shutdown,
+}
+
+enum PendingLaneCommand {
+    Send {
+        msg: Message,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<Message>>,
+        queued_at: Instant,
+    },
+    Fire {
+        msg: Message,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<()>>,
+        queued_at: Instant,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +190,12 @@ impl LaneHandle {
         let started = Instant::now();
         let permit = self.tx.reserve().await.map_err(|_| NetError::LaneFailed)?;
         metrics::record_lane_queue_wait(self.lane, started.elapsed());
+        let capacity = self.tx.max_capacity();
+        metrics::observe_lane_queue(
+            self.lane,
+            capacity.saturating_sub(self.tx.capacity()),
+            capacity,
+        );
         permit.send(LaneCommand::Send {
             msg,
             timeout,
@@ -188,6 +219,12 @@ impl LaneHandle {
         let started = Instant::now();
         let permit = self.tx.reserve().await.map_err(|_| NetError::LaneFailed)?;
         metrics::record_lane_queue_wait(self.lane, started.elapsed());
+        let capacity = self.tx.max_capacity();
+        metrics::observe_lane_queue(
+            self.lane,
+            capacity.saturating_sub(self.tx.capacity()),
+            capacity,
+        );
         permit.send(LaneCommand::Fire {
             msg,
             timeout,
@@ -261,6 +298,7 @@ pub struct ActorReconnectContext {
     pub tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
     pub handle: LaneHandle,
     pub cancelled: Arc<AtomicBool>,
+    pub task_pool: TaskPool,
 }
 
 impl ActorReconnectContext {
@@ -270,7 +308,7 @@ impl ActorReconnectContext {
     /// On exhaustion, calls `handle.mark_failed(exhaustion_count)`.
     pub(crate) fn spawn_reconnect(&self, exhaustion_count: u32) {
         let ctx = self.clone();
-        tokio::spawn(async move {
+        self.task_pool.spawn(async move {
             if ctx.cancelled.load(Ordering::Relaxed) {
                 return;
             }
@@ -281,6 +319,7 @@ impl ActorReconnectContext {
                 ctx.lane,
                 ctx.tls_connector.clone(),
                 Some(Arc::clone(&ctx.cancelled)),
+                ctx.task_pool.clone(),
             )
             .await;
 
@@ -305,7 +344,7 @@ impl ActorReconnectContext {
     pub(crate) fn spawn_dormant_probe(&self) {
         let handle = self.handle.clone();
         let cancelled = Arc::clone(&self.cancelled);
-        tokio::spawn(async move {
+        self.task_pool.spawn(async move {
             tokio::time::sleep(DORMANT_PROBE_INTERVAL).await;
             if cancelled.load(Ordering::Relaxed) {
                 return;
@@ -347,7 +386,27 @@ pub fn spawn_lane_actor_with_timeout(
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     let ctx = ctx_builder(handle.clone());
-    tokio::spawn(lane_actor_loop(lane, initial_state, rx, ctx));
+    ctx.task_pool
+        .spawn(lane_actor_loop(lane, initial_state, rx, ctx.clone()));
+    handle
+}
+
+pub(crate) fn spawn_lane_actor_on_pool_with_timeout(
+    lane: Lane,
+    initial_state: LaneState,
+    default_timeout: Duration,
+    task_pool: TaskPool,
+    ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext,
+) -> LaneHandle {
+    let (tx, rx) = mpsc::channel(lane_channel_capacity());
+    let handle = LaneHandle {
+        tx,
+        lane,
+        default_timeout,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+    let ctx = ctx_builder(handle.clone());
+    task_pool.spawn(lane_actor_loop(lane, initial_state, rx, ctx));
     handle
 }
 
@@ -408,13 +467,21 @@ async fn lane_actor_loop(
     mut rx: mpsc::Receiver<LaneCommand>,
     ctx: ActorReconnectContext,
 ) {
+    let stream_limit = ctx.config.max_streams_per_lane.max(1);
+    let mut in_flight_streams = 0usize;
+    let mut pending_streams = VecDeque::new();
+
     // If initial state is Connected, attach an alive watcher immediately.
     if let LaneState::Connected(ref client) = state {
         let alive_rx = client.alive_rx();
         let watcher_ctx = ctx.clone();
-        spawn_alive_watcher(alive_rx, move || {
-            watcher_ctx.spawn_reconnect(0);
-        });
+        spawn_alive_watcher(
+            alive_rx,
+            move || {
+                watcher_ctx.spawn_reconnect(0);
+            },
+            ctx.task_pool.clone(),
+        );
     }
 
     while let Some(cmd) = rx.recv().await {
@@ -424,26 +491,19 @@ async fn lane_actor_loop(
                 timeout,
                 reply,
             } => {
-                // Dispatch the RPC on a spawned task so the actor loop
-                // can immediately process the next command. Without this,
-                // every Send was awaited inline and the actor handled
-                // one in-flight RPC per peer-lane at a time — turning
-                // the underlying multiplexed transport (per-stream IDs
-                // + DashMap of pending responses inside RpcClient) into
-                // a single-pipelined channel. On a 32-thread NoSQLBench
-                // workload this capped throughput at ~1 / RTT per peer.
-                //
-                // Connection failures are detected by the alive_watcher
-                // attached on Connected and propagated via SwapClient /
-                // MarkFailed — no need to mutate state from the spawned
-                // task.
-                dispatch_send(
-                    &state,
-                    lane,
+                pending_streams.push_back(PendingLaneCommand::Send {
                     msg,
                     timeout,
-                    ctx.config.data_lane_max_in_flight,
                     reply,
+                    queued_at: Instant::now(),
+                });
+                dispatch_stream_window(
+                    &state,
+                    lane,
+                    &ctx,
+                    stream_limit,
+                    &mut in_flight_streams,
+                    &mut pending_streams,
                 );
             }
             LaneCommand::Fire {
@@ -451,13 +511,43 @@ async fn lane_actor_loop(
                 timeout,
                 reply,
             } => {
-                dispatch_fire(
-                    &state,
-                    lane,
+                pending_streams.push_back(PendingLaneCommand::Fire {
                     msg,
                     timeout,
-                    ctx.config.data_lane_max_in_flight,
                     reply,
+                    queued_at: Instant::now(),
+                });
+                dispatch_stream_window(
+                    &state,
+                    lane,
+                    &ctx,
+                    stream_limit,
+                    &mut in_flight_streams,
+                    &mut pending_streams,
+                );
+            }
+            LaneCommand::SendComplete { result, reply } => {
+                in_flight_streams = in_flight_streams.saturating_sub(1);
+                let _ = reply.send(result);
+                dispatch_stream_window(
+                    &state,
+                    lane,
+                    &ctx,
+                    stream_limit,
+                    &mut in_flight_streams,
+                    &mut pending_streams,
+                );
+            }
+            LaneCommand::FireComplete { result, reply } => {
+                in_flight_streams = in_flight_streams.saturating_sub(1);
+                let _ = reply.send(result);
+                dispatch_stream_window(
+                    &state,
+                    lane,
+                    &ctx,
+                    stream_limit,
+                    &mut in_flight_streams,
+                    &mut pending_streams,
                 );
             }
             LaneCommand::SwapClient(new_client) => {
@@ -475,9 +565,21 @@ async fn lane_actor_loop(
                 let alive_rx = new_client.alive_rx();
                 state = LaneState::Connected(new_client);
                 let watcher_ctx = ctx.clone();
-                spawn_alive_watcher(alive_rx, move || {
-                    watcher_ctx.spawn_reconnect(0);
-                });
+                spawn_alive_watcher(
+                    alive_rx,
+                    move || {
+                        watcher_ctx.spawn_reconnect(0);
+                    },
+                    ctx.task_pool.clone(),
+                );
+                dispatch_stream_window(
+                    &state,
+                    lane,
+                    &ctx,
+                    stream_limit,
+                    &mut in_flight_streams,
+                    &mut pending_streams,
+                );
             }
             LaneCommand::MarkFailed { exhaustion_count } => {
                 let current_exhaustion = match &state {
@@ -530,7 +632,7 @@ async fn lane_actor_loop(
                         exhaustion_count: next_exhaustion,
                     };
                     let retry_ctx = ctx.clone();
-                    tokio::spawn(async move {
+                    ctx.task_pool.spawn(async move {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         retry_ctx.spawn_reconnect(next_exhaustion);
                     });
@@ -544,7 +646,7 @@ async fn lane_actor_loop(
                 }
                 tracing::debug!(?lane, peer = %ctx.peer_host, "dormant probe firing");
                 let probe_ctx = ctx.clone();
-                tokio::spawn(async move {
+                ctx.task_pool.spawn(async move {
                     if probe_ctx.cancelled.load(Ordering::Relaxed) {
                         return;
                     }
@@ -555,6 +657,7 @@ async fn lane_actor_loop(
                         probe_ctx.lane,
                         probe_ctx.tls_connector.clone(),
                         Some(Arc::clone(&probe_ctx.cancelled)),
+                        probe_ctx.task_pool.clone(),
                     )
                     .await;
                     if probe_ctx.cancelled.load(Ordering::Relaxed) {
@@ -595,72 +698,104 @@ async fn lane_actor_loop(
     }
 }
 
-/// Dispatch a Send command non-blocking: clone the client and spawn the
-/// RPC + reply on a task so the actor loop returns immediately.
-///
-/// Connection-error reconnect is handled by the alive_watcher attached on
-/// `LaneState::Connected`, not by mutating state from the spawned task.
-fn dispatch_send(
+/// Dispatch queued lane commands while the per-peer/per-lane stream window has
+/// capacity. The actor owns the window state, so this does not add a semaphore
+/// or shared mutex on the hot path.
+fn dispatch_stream_window(
     state: &LaneState,
     lane: Lane,
-    msg: Message,
-    timeout: Duration,
-    data_lane_max_in_flight: usize,
-    reply: oneshot::Sender<Result<Message>>,
+    ctx: &ActorReconnectContext,
+    stream_limit: usize,
+    in_flight_streams: &mut usize,
+    pending_streams: &mut VecDeque<PendingLaneCommand>,
 ) {
     let client = match state {
         LaneState::Connected(c) => c.clone(),
         LaneState::Reconnecting { .. } | LaneState::Dormant => {
-            let _ = reply.send(Err(NetError::Reconnecting));
+            fail_pending_streams_reconnecting(pending_streams);
             return;
         }
     };
-    if !metrics::try_start_rpc(lane, data_lane_max_in_flight) {
-        let _ = reply.send(Err(NetError::Overloaded));
-        return;
-    }
-    tokio::spawn(async move {
-        let result = client.send_with_timeout(msg, lane, timeout).await;
-        if matches!(result, Err(NetError::Timeout(_))) {
-            metrics::record_rpc_timeout(lane);
+
+    while *in_flight_streams < stream_limit {
+        let Some(pending) = pending_streams.pop_front() else {
+            break;
+        };
+
+        match pending {
+            PendingLaneCommand::Send {
+                msg,
+                timeout,
+                reply,
+                queued_at,
+            } => {
+                metrics::record_lane_stream_wait(lane, queued_at.elapsed(), stream_limit);
+                if !metrics::try_start_rpc(lane, ctx.config.data_lane_max_in_flight) {
+                    let _ = reply.send(Err(NetError::Overloaded));
+                    continue;
+                }
+
+                *in_flight_streams += 1;
+                let client = client.clone();
+                let complete_tx = ctx.handle.tx.clone();
+                ctx.task_pool.spawn(async move {
+                    let result = client.send_with_timeout(msg, lane, timeout).await;
+                    if matches!(result, Err(NetError::Timeout(_))) {
+                        metrics::record_rpc_timeout(lane);
+                    }
+                    metrics::finish_rpc(lane);
+                    let _ = complete_tx
+                        .send(LaneCommand::SendComplete { result, reply })
+                        .await;
+                });
+            }
+            PendingLaneCommand::Fire {
+                msg,
+                timeout,
+                reply,
+                queued_at,
+            } => {
+                metrics::record_lane_stream_wait(lane, queued_at.elapsed(), stream_limit);
+                if !metrics::try_start_rpc(lane, ctx.config.data_lane_max_in_flight) {
+                    let _ = reply.send(Err(NetError::Overloaded));
+                    continue;
+                }
+
+                *in_flight_streams += 1;
+                let client = client.clone();
+                let complete_tx = ctx.handle.tx.clone();
+                ctx.task_pool.spawn(async move {
+                    let result = match tokio::time::timeout(timeout, client.fire(msg, lane)).await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e),
+                        Err(_elapsed) => {
+                            Err(NetError::Timeout(format!("{lane:?} lane fire timeout")))
+                        }
+                    };
+                    if matches!(result, Err(NetError::Timeout(_))) {
+                        metrics::record_rpc_timeout(lane);
+                    }
+                    metrics::finish_rpc(lane);
+                    let _ = complete_tx
+                        .send(LaneCommand::FireComplete { result, reply })
+                        .await;
+                });
+            }
         }
-        metrics::finish_rpc(lane);
-        let _ = reply.send(result);
-    });
+    }
 }
 
-/// Dispatch a Fire command non-blocking. See `dispatch_send` for rationale.
-fn dispatch_fire(
-    state: &LaneState,
-    lane: Lane,
-    msg: Message,
-    timeout: Duration,
-    data_lane_max_in_flight: usize,
-    reply: oneshot::Sender<Result<()>>,
-) {
-    let client = match state {
-        LaneState::Connected(c) => c.clone(),
-        LaneState::Reconnecting { .. } | LaneState::Dormant => {
-            let _ = reply.send(Err(NetError::Reconnecting));
-            return;
+fn fail_pending_streams_reconnecting(pending_streams: &mut VecDeque<PendingLaneCommand>) {
+    while let Some(pending) = pending_streams.pop_front() {
+        match pending {
+            PendingLaneCommand::Send { reply, .. } => {
+                let _ = reply.send(Err(NetError::Reconnecting));
+            }
+            PendingLaneCommand::Fire { reply, .. } => {
+                let _ = reply.send(Err(NetError::Reconnecting));
+            }
         }
-    };
-    if !metrics::try_start_rpc(lane, data_lane_max_in_flight) {
-        let _ = reply.send(Err(NetError::Overloaded));
-        return;
     }
-    tokio::spawn(async move {
-        let result = match tokio::time::timeout(timeout, client.fire(msg, lane)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane fire timeout"))),
-        };
-        if matches!(result, Err(NetError::Timeout(_))) {
-            metrics::record_rpc_timeout(lane);
-        }
-        metrics::finish_rpc(lane);
-        let _ = reply.send(result);
-    });
 }
 
 #[cfg(test)]
@@ -706,6 +841,7 @@ mod tests {
                 tls_connector: None,
                 cancelled: h.cancel_token(),
                 handle: h,
+                task_pool: TaskPool::current("test-lane"),
             },
         );
 
@@ -747,6 +883,7 @@ mod tests {
                 tls_connector: None,
                 cancelled: h.cancel_token(),
                 handle: h,
+                task_pool: TaskPool::current("test-lane"),
             },
         );
 
@@ -787,6 +924,7 @@ mod tests {
                 tls_connector: None,
                 cancelled: h.cancel_token(),
                 handle: h,
+                task_pool: TaskPool::current("test-lane"),
             },
         );
 
@@ -825,6 +963,7 @@ mod tests {
                 tls_connector: None,
                 cancelled: h.cancel_token(),
                 handle: h,
+                task_pool: TaskPool::current("test-lane"),
             },
         );
 

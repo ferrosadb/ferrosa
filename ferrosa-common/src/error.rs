@@ -31,6 +31,21 @@ pub enum Error {
     UnsupportedCompression(String),
 }
 
+impl Error {
+    /// Returns true when this error represents deliberate server-side
+    /// backpressure rather than a malformed request or unexpected failure.
+    pub fn is_backpressure(&self) -> bool {
+        match self {
+            Error::InvalidData(msg) => {
+                msg.contains("local disk free space below write reserve")
+                    || msg.starts_with("overloaded:")
+                    || msg.contains(": overloaded:")
+            }
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -128,7 +128,7 @@ pub async fn start_web_server(
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    ferrosa_common::task_pool::TaskPool::current("web-server").spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
             tracing::error!(%e, "web server error");
         }

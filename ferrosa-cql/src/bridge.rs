@@ -1272,6 +1272,80 @@ pub fn partition_to_rows_with_storage_mapping(
     result
 }
 
+pub fn write_partition_raw_rows_with_storage_mapping<F>(
+    partition: &ferrosa_sstable::types::Partition,
+    column_count: usize,
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+    storage_to_table: &[usize],
+    mut emit: F,
+) where
+    F: FnMut(&[Option<&[u8]>]),
+{
+    let now_secs = i32::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i32::MAX);
+
+    let pk_values = decode_pk(&partition.key, pk_columns.len());
+
+    for row in &partition.rows {
+        let pkl = &row.primary_key_liveness;
+        let liveness_expired = pkl.has_ttl() && ldt_is_expired(pkl.local_deletion_time, now_secs);
+        if liveness_expired {
+            let any_live_cell = row.cells.iter().any(|(_, c)| cell_is_live(c, now_secs));
+            if !any_live_cell {
+                continue;
+            }
+        }
+
+        if !row.deletion.is_live() {
+            let del_ts = row.deletion.marked_for_delete_at;
+            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
+            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
+            if !liveness_supersedes && !any_cell_supersedes {
+                continue;
+            }
+        }
+
+        let ck_values = decode_clustering(&row.clustering, ck_columns.len());
+        let mut output_row: Vec<Option<&[u8]>> = vec![None; column_count];
+
+        for (i, &col_idx) in pk_columns.iter().enumerate() {
+            if col_idx < column_count {
+                output_row[col_idx] = pk_values.get(i).map(Vec::as_slice);
+            }
+        }
+
+        for (i, &col_idx) in ck_columns.iter().enumerate() {
+            if col_idx < column_count {
+                output_row[col_idx] = ck_values.get(i).map(Vec::as_slice);
+            }
+        }
+
+        for (col_index, cell) in &row.cells {
+            let storage_idx = *col_index as usize;
+            let table_idx = match storage_to_table.get(storage_idx) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            if table_idx >= column_count {
+                continue;
+            }
+            if !cell_is_live(cell, now_secs) {
+                output_row[table_idx] = None;
+            } else {
+                output_row[table_idx] = cell.value.as_deref();
+            }
+        }
+
+        emit(&output_row);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Function 7: CellMeta and partition_to_rows_with_metadata
 // ---------------------------------------------------------------------------

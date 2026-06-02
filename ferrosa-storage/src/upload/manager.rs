@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
@@ -98,6 +98,12 @@ pub enum UploadTask {
     Shutdown,
 }
 
+impl UploadTask {
+    fn counts_toward_queue_depth(&self) -> bool {
+        !matches!(self, Self::Shutdown)
+    }
+}
+
 /// Manages async uploads to S3-compatible storage.
 ///
 /// Runs as a spawned tokio task on the caller-provided runtime handle.
@@ -120,6 +126,8 @@ impl UploadManager {
 
         let handle = runtime.spawn(async move {
             while let Some(task) = rx.recv().await {
+                let count_queue_depth = task.counts_toward_queue_depth();
+                let task_start = Instant::now();
                 match task {
                     UploadTask::SSTable {
                         table_id,
@@ -294,6 +302,10 @@ impl UploadManager {
                     }
                     UploadTask::Shutdown => break,
                 }
+                if count_queue_depth {
+                    crate::metrics::observe_upload_task(task_start.elapsed());
+                    crate::metrics::dec_upload_queue_depth();
+                }
             }
         });
 
@@ -305,10 +317,28 @@ impl UploadManager {
 
     /// Submits an upload task. Blocks if the queue is full (backpressure).
     pub async fn submit(&self, task: UploadTask) -> ferrosa_common::Result<()> {
-        self.task_tx
-            .send(task)
-            .await
-            .map_err(|_| ferrosa_common::Error::InvalidFormat("upload channel closed".into()))
+        let count_queue_depth = task.counts_toward_queue_depth();
+        if count_queue_depth {
+            crate::metrics::inc_upload_queue_depth();
+        }
+        let start = Instant::now();
+        match self.task_tx.send(task).await {
+            Ok(()) => {
+                crate::metrics::observe_upload_phase(
+                    crate::metrics::UploadPhase::SubmitWait,
+                    start.elapsed(),
+                );
+                Ok(())
+            }
+            Err(_) => {
+                if count_queue_depth {
+                    crate::metrics::dec_upload_queue_depth();
+                }
+                Err(ferrosa_common::Error::InvalidFormat(
+                    "upload channel closed".into(),
+                ))
+            }
+        }
     }
 
     /// Attempts to submit an upload task without waiting for queue capacity.
@@ -317,14 +347,33 @@ impl UploadManager {
     /// behind slow object-store uploads. Failed submissions leave their
     /// pending-log entries intact for a later retry.
     pub fn try_submit(&self, task: UploadTask) -> ferrosa_common::Result<()> {
-        self.task_tx.try_send(task).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => {
-                ferrosa_common::Error::InvalidFormat("upload queue full".into())
+        let count_queue_depth = task.counts_toward_queue_depth();
+        if count_queue_depth {
+            crate::metrics::inc_upload_queue_depth();
+        }
+        let start = Instant::now();
+        match self.task_tx.try_send(task) {
+            Ok(()) => {
+                crate::metrics::observe_upload_phase(
+                    crate::metrics::UploadPhase::SubmitWait,
+                    start.elapsed(),
+                );
+                Ok(())
             }
-            mpsc::error::TrySendError::Closed(_) => {
-                ferrosa_common::Error::InvalidFormat("upload channel closed".into())
+            Err(e) => {
+                if count_queue_depth {
+                    crate::metrics::dec_upload_queue_depth();
+                }
+                match e {
+                    mpsc::error::TrySendError::Full(_) => Err(
+                        ferrosa_common::Error::InvalidFormat("upload queue full".into()),
+                    ),
+                    mpsc::error::TrySendError::Closed(_) => Err(
+                        ferrosa_common::Error::InvalidFormat("upload channel closed".into()),
+                    ),
+                }
             }
-        })
+        }
     }
 
     /// Shuts down the upload manager, draining the queue.
@@ -405,19 +454,23 @@ impl UploadManager {
                 _ => UploadFileError::Read(e),
             })?;
 
-        if metadata.len() < S3_UPLOAD_PART_BYTES as u64 {
+        let upload_start = Instant::now();
+        let result = if metadata.len() < S3_UPLOAD_PART_BYTES as u64 {
             let mut data = Vec::with_capacity(metadata.len() as usize);
             file.read_to_end(&mut data)
                 .await
                 .map_err(UploadFileError::Read)?;
-            return store
+            store
                 .put(path, Bytes::from(data).into())
                 .await
                 .map(|_| ())
-                .map_err(UploadFileError::Store);
-        }
+                .map_err(UploadFileError::Store)
+        } else {
+            Self::put_reader_multipart_once(store, path, &mut file).await
+        };
 
-        Self::put_reader_multipart_once(store, path, &mut file).await
+        crate::metrics::observe_upload_file(metadata.len(), upload_start.elapsed());
+        result
     }
 
     async fn put_reader_multipart_once<R>(

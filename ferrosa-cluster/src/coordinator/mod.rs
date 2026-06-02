@@ -182,13 +182,13 @@ impl RpcHandler for MutationForwardHandler {
             _ => return None,
         };
         let mutation = decode_mutation(&body).ok()?;
-        metrics::inc_inbound_mutation_forward(mutation.rows.len());
+        let row_count = mutation.rows.len();
+        metrics::inc_inbound_mutation_forward(row_count);
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-        for row in &mutation.rows {
-            if let Err(e) =
-                self.storage
-                    .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
-            {
+        let key = mutation.key;
+        let timestamp = mutation.timestamp;
+        for row in mutation.rows {
+            if let Err(e) = self.storage.write(&table_id, &key, row, timestamp) {
                 metrics::inc_inbound_mutation_failure();
                 // CRITICAL: Do NOT return MutationAck when the write fails.
                 // Returning ACK here would make the coordinator count this as a
@@ -319,11 +319,10 @@ impl RpcHandler for RepairWriteHandler {
             }
         };
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-        for row in &mutation.rows {
-            if let Err(e) =
-                self.storage
-                    .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
-            {
+        let key = mutation.key;
+        let timestamp = mutation.timestamp;
+        for row in mutation.rows {
+            if let Err(e) = self.storage.write(&table_id, &key, row, timestamp) {
                 tracing::warn!("RepairWriteHandler: storage write failed: {e}");
                 self.metrics.inc_failed();
                 return None;
@@ -360,6 +359,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

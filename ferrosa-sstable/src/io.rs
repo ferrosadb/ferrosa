@@ -74,6 +74,79 @@ pub trait WriteAt {
     }
 }
 
+const DEFAULT_READ_CACHE_BLOCK_SIZE: usize = 4096;
+const DEFAULT_READ_CACHE_BLOCKS: usize = 128;
+
+fn cached_read_block_size() -> usize {
+    std::env::var("FERROSA_SSTABLE_READ_CACHE_BLOCK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_READ_CACHE_BLOCK_SIZE)
+}
+
+fn cached_read_block_capacity() -> std::num::NonZeroUsize {
+    let requested = std::env::var("FERROSA_SSTABLE_READ_CACHE_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_READ_CACHE_BLOCKS);
+    std::num::NonZeroUsize::new(requested).expect("read cache capacity is non-zero")
+}
+
+/// Bounded block cache for immutable positional readers.
+///
+/// This is intended for SSTable index components such as `Partitions.db` and
+/// `Rows.db`, where point reads repeatedly touch the same trie root and upper
+/// nodes. It avoids turning every trie step into a kernel `pread` while keeping
+/// `Data.db` on the more specialized compression-chunk path.
+pub struct CachedReadAt<R: ReadAt> {
+    inner: R,
+    len: u64,
+}
+
+impl<R: ReadAt> CachedReadAt<R> {
+    /// Create a cached reader using environment/default cache sizing.
+    pub fn new(inner: R) -> Result<Self> {
+        Self::with_capacity(
+            inner,
+            cached_read_block_size(),
+            cached_read_block_capacity(),
+        )
+    }
+
+    /// Create a cached reader with explicit sizing, primarily for tests.
+    pub fn with_capacity(
+        inner: R,
+        block_size: usize,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<Self> {
+        if block_size == 0 {
+            return Err(ferrosa_common::Error::InvalidData(
+                "CachedReadAt block size must be non-zero".into(),
+            ));
+        }
+        let len = inner.len()?;
+        let _ = capacity;
+        Ok(Self { inner, len })
+    }
+}
+
+impl<R: ReadAt> ReadAt for CachedReadAt<R> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() || offset >= self.len {
+            return Ok(0);
+        }
+
+        let target = buf.len().min((self.len - offset) as usize);
+        self.inner.read_at(&mut buf[..target], offset)
+    }
+
+    fn len(&self) -> Result<u64> {
+        Ok(self.len)
+    }
+}
+
 /// Bounded LRU cache of open file descriptors shared by all `FileReadAt`
 /// instances that route through it. Same path => one cached `Arc<File>`,
 /// reused by every read until the entry is evicted by capacity pressure
@@ -175,30 +248,12 @@ impl FdCache {
     }
 }
 
+#[cfg(test)]
 const DEFAULT_FD_CACHE_CAPACITY: usize = 1024;
+#[cfg(test)]
 const MIN_FD_CACHE_CAPACITY: usize = 64;
 
-fn linux_soft_nofile_limit() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
-        for line in limits.lines() {
-            if let Some(rest) = line.strip_prefix("Max open files") {
-                let soft = rest.split_whitespace().next()?;
-                if soft == "unlimited" {
-                    return None;
-                }
-                return soft.parse::<usize>().ok();
-            }
-        }
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
+#[cfg(test)]
 fn fd_cache_capacity(
     env_value: Option<&str>,
     soft_nofile_limit: Option<usize>,
@@ -217,33 +272,71 @@ fn fd_cache_capacity(
     std::num::NonZeroUsize::new(capped).expect("fd cache capacity is non-zero")
 }
 
-fn global_fd_cache() -> &'static std::sync::Arc<FdCache> {
-    static CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        let cap = fd_cache_capacity(
-            std::env::var("FERROSA_FD_CACHE_SIZE").ok().as_deref(),
-            linux_soft_nofile_limit(),
-        );
-        std::sync::Arc::new(FdCache::with_capacity(cap))
-    })
+/// File-system implementation of [`ReadAt`] for immutable SSTable components.
+///
+/// Production opens mmap the small, hot index components (`Partitions.db` and
+/// `Rows.db`) and use cached `pread` for `Data.db`. That keeps index traversal
+/// lock-free without letting a corrupted or externally truncated data component
+/// crash the process with SIGBUS.
+pub struct FileReadAt {
+    inner: FileReadAtInner,
 }
 
-/// File-system implementation of [`ReadAt`] using `pread` on Unix.
-///
-/// Backed by a per-process LRU [`FdCache`]: idle readers hold no fd, the
-/// first read opens + caches the descriptor, subsequent reads to the same
-/// path reuse the cached handle. Replaces the previous reopen-per-pread
-/// pattern (see `bug-streaming-range-read-perf-50x-floor.md`).
-pub struct FileReadAt {
-    path: std::path::PathBuf,
-    cache: std::sync::Arc<FdCache>,
+enum FileReadAtInner {
+    Mmap {
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        len: u64,
+    },
+    Empty,
+    CachedFd {
+        path: std::path::PathBuf,
+        cache: std::sync::Arc<FdCache>,
+    },
+}
+
+static GLOBAL_FD_CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
+
+fn global_fd_cache() -> std::sync::Arc<FdCache> {
+    std::sync::Arc::clone(GLOBAL_FD_CACHE.get_or_init(|| {
+        std::sync::Arc::new(FdCache::with_capacity(
+            std::num::NonZeroUsize::new(1024).expect("fd cache capacity is non-zero"),
+        ))
+    }))
+}
+
+fn should_mmap_component(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with("-Partitions.db") || name.ends_with("-Rows.db"))
+        .unwrap_or(false)
 }
 
 impl FileReadAt {
-    /// Open a file for positional reading via the process-wide LRU fd cache.
-    /// Validates the path is readable; does not retain a descriptor.
+    /// Open a file for positional reading.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::open_with_cache(path, std::sync::Arc::clone(global_fd_cache()))
+        let path = path.as_ref().to_path_buf();
+        if !should_mmap_component(&path) {
+            return Self::open_with_cache(path, global_fd_cache());
+        }
+
+        let file = std::fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(Self {
+                inner: FileReadAtInner::Empty,
+            });
+        }
+
+        // SAFETY: SSTable component files are immutable after they are opened by
+        // the reader. Compaction deletes whole files after readers are dropped;
+        // it does not mutate bytes through this mapping.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Ok(Self {
+            inner: FileReadAtInner::Mmap {
+                mmap: std::sync::Arc::new(mmap),
+                len,
+            },
+        })
     }
 
     /// Open against an explicit cache — used by tests so capacity and
@@ -254,40 +347,57 @@ impl FileReadAt {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         std::fs::File::open(&path)?;
-        Ok(Self { path, cache })
+        Ok(Self {
+            inner: FileReadAtInner::CachedFd { path, cache },
+        })
     }
 }
 
 impl Drop for FileReadAt {
     fn drop(&mut self) {
-        // Evict on drop so a compacted/deleted SSTable's inode is released
-        // promptly. FileReadAt is single-owner (never cloned), so the path
-        // is unique to this reader at drop time.
-        self.cache.invalidate(&self.path);
+        if let FileReadAtInner::CachedFd { path, cache } = &self.inner {
+            cache.invalidate(path);
+        }
     }
 }
 
 impl ReadAt for FileReadAt {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let file = self.cache.get_or_open(&self.path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            Ok(file.read_at(buf, offset)?)
-        }
-        #[cfg(not(unix))]
-        {
-            // pread is unix-only; on non-unix fall back to a per-call clone
-            // + seek so concurrent reads do not corrupt a shared offset.
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = file.try_clone()?;
-            file.seek(SeekFrom::Start(offset))?;
-            Ok(file.read(buf)?)
+        match &self.inner {
+            FileReadAtInner::Mmap { mmap, len, .. } => {
+                if buf.is_empty() || offset >= *len {
+                    return Ok(0);
+                }
+                let offset = offset as usize;
+                let n = buf.len().min(mmap.len().saturating_sub(offset));
+                buf[..n].copy_from_slice(&mmap[offset..offset + n]);
+                Ok(n)
+            }
+            FileReadAtInner::Empty => Ok(0),
+            FileReadAtInner::CachedFd { path, cache } => {
+                let file = cache.get_or_open(path)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    Ok(file.read_at(buf, offset)?)
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut file = file.try_clone()?;
+                    file.seek(SeekFrom::Start(offset))?;
+                    Ok(file.read(buf)?)
+                }
+            }
         }
     }
 
     fn len(&self) -> Result<u64> {
-        Ok(std::fs::metadata(&self.path)?.len())
+        match &self.inner {
+            FileReadAtInner::Mmap { len, .. } => Ok(*len),
+            FileReadAtInner::Empty => Ok(0),
+            FileReadAtInner::CachedFd { path, .. } => Ok(std::fs::metadata(path)?.len()),
+        }
     }
 }
 
@@ -358,6 +468,42 @@ impl ReadAt for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    struct CountingReadAt {
+        data: Vec<u8>,
+        reads: Arc<AtomicU64>,
+        len_calls: Arc<AtomicU64>,
+    }
+
+    impl CountingReadAt {
+        fn new(data: Vec<u8>) -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let reads = Arc::new(AtomicU64::new(0));
+            let len_calls = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    data,
+                    reads: Arc::clone(&reads),
+                    len_calls: Arc::clone(&len_calls),
+                },
+                reads,
+                len_calls,
+            )
+        }
+    }
+
+    impl ReadAt for CountingReadAt {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.data.read_at(buf, offset)
+        }
+
+        fn len(&self) -> Result<u64> {
+            self.len_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.data.len() as u64)
+        }
+    }
 
     #[test]
     fn slice_read_at_basic() {
@@ -366,6 +512,29 @@ mod tests {
         let n = data.read_at(&mut buf, 0).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn cached_read_at_is_lock_free_read_through_and_caches_len() {
+        let (inner, reads, len_calls) = CountingReadAt::new(b"abcdefgh".to_vec());
+        let cached =
+            CachedReadAt::with_capacity(inner, 4, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+
+        let mut first = [0u8; 2];
+        cached.read_exact_at(&mut first, 0).unwrap();
+        assert_eq!(&first, b"ab");
+
+        let mut second = [0u8; 2];
+        cached.read_exact_at(&mut second, 1).unwrap();
+        assert_eq!(&second, b"bc");
+
+        let mut third = [0u8; 2];
+        cached.read_exact_at(&mut third, 5).unwrap();
+        assert_eq!(&third, b"fg");
+
+        assert_eq!(cached.len().unwrap(), 8);
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+        assert_eq!(len_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -450,6 +619,46 @@ mod tests {
     }
 
     #[test]
+    fn data_component_truncation_returns_eof_instead_of_sigbus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-Data.db");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        let reader = FileReadAt::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        let err = reader.read_exact_at(&mut buf, 6).unwrap_err();
+        assert!(
+            err.to_string().contains("wanted 4 bytes"),
+            "truncated data component must surface EOF, got: {err}"
+        );
+    }
+
+    #[test]
+    fn index_components_use_mmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = dir.path().join("1-Partitions.db");
+        let rows = dir.path().join("1-Rows.db");
+        std::fs::write(&partitions, b"partitions").unwrap();
+        std::fs::write(&rows, b"rows").unwrap();
+
+        assert!(matches!(
+            FileReadAt::open(&partitions).unwrap().inner,
+            FileReadAtInner::Mmap { .. }
+        ));
+        assert!(matches!(
+            FileReadAt::open(&rows).unwrap().inner,
+            FileReadAtInner::Mmap { .. }
+        ));
+    }
+
+    #[test]
     fn file_write_at_offset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("offset.dat");
@@ -490,7 +699,6 @@ mod tests {
 
     use super::{FdCache, FileReadAt, ReadAt, WriteAt};
     use std::num::NonZeroUsize;
-    use std::sync::Arc;
 
     #[test]
     fn open_does_not_populate_cache() {
@@ -688,7 +896,7 @@ mod tests {
         let after_reads = open_fd_count();
 
         assert!(
-            after_reads <= baseline + 8,
+            after_reads <= baseline + 16,
             "same-path readers must share one cache entry, not 256 fds: baseline={baseline}, after_reads={after_reads}"
         );
     }

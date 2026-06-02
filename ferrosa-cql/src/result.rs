@@ -163,6 +163,52 @@ where
     buf
 }
 
+/// Encode a Rows RESULT body from raw CQL wire-format cell bytes.
+///
+/// Each emitted row must contain exactly one entry per result column. `None`
+/// writes a CQL null cell; `Some(bytes)` writes `[i32 len][bytes]` directly.
+/// This is intended for storage fast paths where cells are already stored in
+/// CQL wire format and decoding them into `CqlValue` would only allocate and
+/// re-encode the same bytes.
+pub fn encode_rows_raw_with_writer<F>(
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+    mut write_rows: F,
+) -> BytesMut
+where
+    F: FnMut(&mut dyn FnMut(&[Option<&[u8]>])),
+{
+    let mut buf = BytesMut::new();
+    buf.put_i32(0x0002); // Rows kind
+
+    encode_rows_metadata(&mut buf, column_names, column_types, keyspace, table);
+
+    let rows_count_offset = buf.len();
+    buf.put_i32(0);
+
+    let mut row_count: i32 = 0;
+    {
+        let mut emit = |row: &[Option<&[u8]>]| {
+            row_count = row_count.saturating_add(1);
+            for cell in row {
+                match cell {
+                    None => buf.put_i32(-1),
+                    Some(bytes) => {
+                        buf.put_i32(bytes.len() as i32);
+                        buf.put_slice(bytes);
+                    }
+                }
+            }
+        };
+        write_rows(&mut emit);
+    }
+    buf[rows_count_offset..rows_count_offset + 4].copy_from_slice(&row_count.to_be_bytes());
+
+    buf
+}
+
 /// Encode a Prepared RESULT body.
 ///
 /// Contains:
@@ -376,8 +422,73 @@ fn encode_cell(buf: &mut BytesMut, value: &Option<CqlValue>) {
     match value {
         None => buf.put_i32(-1),
         Some(CqlValue::Null) => buf.put_i32(-1),
-        Some(val) => {
-            let bytes = encode_value(val);
+        Some(val) => encode_cell_value(buf, val),
+    }
+}
+
+fn encode_cell_value(buf: &mut BytesMut, value: &CqlValue) {
+    match value {
+        CqlValue::Ascii(s) | CqlValue::Text(s) => {
+            buf.put_i32(s.len() as i32);
+            buf.put_slice(s.as_bytes());
+        }
+        CqlValue::Blob(bytes) => {
+            buf.put_i32(bytes.len() as i32);
+            buf.put_slice(bytes);
+        }
+        CqlValue::Boolean(b) => {
+            buf.put_i32(1);
+            buf.put_u8(u8::from(*b));
+        }
+        CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) => {
+            buf.put_i32(8);
+            buf.put_i64(*n);
+        }
+        CqlValue::Double(bits) => {
+            buf.put_i32(8);
+            buf.put_u64(*bits);
+        }
+        CqlValue::Float(bits) => {
+            buf.put_i32(4);
+            buf.put_u32(*bits);
+        }
+        CqlValue::Int(n) => {
+            buf.put_i32(4);
+            buf.put_i32(*n);
+        }
+        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => {
+            buf.put_i32(16);
+            buf.put_slice(u.as_bytes());
+        }
+        CqlValue::Inet(ip) => match ip {
+            std::net::IpAddr::V4(v4) => {
+                buf.put_i32(4);
+                buf.put_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                buf.put_i32(16);
+                buf.put_slice(&v6.octets());
+            }
+        },
+        CqlValue::Date(d) => {
+            buf.put_i32(4);
+            buf.put_u32(*d);
+        }
+        CqlValue::Time(t) => {
+            buf.put_i32(8);
+            buf.put_i64(*t);
+        }
+        CqlValue::Smallint(n) => {
+            buf.put_i32(2);
+            buf.put_i16(*n);
+        }
+        CqlValue::Tinyint(n) => {
+            buf.put_i32(1);
+            buf.put_i8(*n);
+        }
+        CqlValue::Null => buf.put_i32(-1),
+        _ => {
+            let bytes = encode_value(value);
             buf.put_i32(bytes.len() as i32);
             buf.put_slice(&bytes);
         }

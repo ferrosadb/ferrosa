@@ -52,6 +52,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use ferrosa_common::key::DecoratedKey;
+use ferrosa_sstable::types::Row;
 use parking_lot::Mutex;
 
 use super::config::{CommitLogPosition, TableId};
@@ -312,6 +314,56 @@ impl Segment {
         mutation.serialize_into(&mut buf[payload_start..payload_end]);
 
         // 4. Write payload_crc (CRC32 of payload bytes).
+        let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
+        buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
+
+        CommitLogPosition {
+            segment_id: self.id,
+            offset,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_single_row_entry(
+        &self,
+        offset: u64,
+        mutation_id: [u8; 16],
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        row: &Row,
+        timestamp: i64,
+    ) -> CommitLogPosition {
+        let payload_size = Mutation::serialized_size_for_single_row(keyspace, table, key, row);
+        let total_size = ENTRY_OVERHEAD + payload_size;
+        let off = offset as usize;
+
+        debug_assert!(
+            off + total_size <= self.capacity,
+            "write_single_row_entry: offset {off} + size {total_size} exceeds capacity {}",
+            self.capacity
+        );
+
+        let buf = unsafe { &mut *self.buffer.get() };
+
+        let entry_size_bytes = (payload_size as u32).to_be_bytes();
+        buf[off..off + 4].copy_from_slice(&entry_size_bytes);
+
+        let size_crc = crc32fast::hash(&entry_size_bytes);
+        buf[off + 4..off + 8].copy_from_slice(&size_crc.to_be_bytes());
+
+        let payload_start = off + 8;
+        let payload_end = payload_start + payload_size;
+        Mutation::serialize_single_row_into(
+            mutation_id,
+            keyspace,
+            table,
+            key,
+            row,
+            timestamp,
+            &mut buf[payload_start..payload_end],
+        );
+
         let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
         buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
 
@@ -600,6 +652,16 @@ impl Segment {
     /// Computes the total entry size for a mutation (payload + overhead).
     pub fn entry_total_size(mutation: &Mutation) -> usize {
         ENTRY_OVERHEAD + mutation.serialized_size()
+    }
+
+    /// Computes the total entry size for a single-row borrowed mutation.
+    pub fn entry_total_size_single_row(
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        row: &Row,
+    ) -> usize {
+        ENTRY_OVERHEAD + Mutation::serialized_size_for_single_row(keyspace, table, key, row)
     }
 
     /// Returns the current heap size of the buffer in bytes.

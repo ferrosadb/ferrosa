@@ -569,7 +569,12 @@ impl ModeController {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.background_tasks.lock().spawn(future);
+        let mut tasks = self.background_tasks.lock();
+        if let Some(rt) = self.data_runtime.get() {
+            tasks.spawn_on(future, rt.handle());
+        } else {
+            tasks.spawn(future);
+        }
     }
 
     /// Get the Raft instance, if cluster mode initialization has completed.
