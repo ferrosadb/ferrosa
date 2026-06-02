@@ -53,6 +53,7 @@ use crate::task_pool::TaskPool;
 /// (specs/in-process/bug-bulk-write-raft-starvation.md), and any
 /// future workload-specific tuning shouldn't require another rebuild.
 pub const DEFAULT_LANE_CHANNEL_CAPACITY: usize = 256;
+const DATA_LANE_CAP_RETRY_DELAY: Duration = Duration::from_micros(250);
 
 /// Resolved channel capacity. Looks up
 /// `FERROSA_LANE_CHANNEL_CAPACITY` once per call; any value that
@@ -64,6 +65,16 @@ pub fn lane_channel_capacity() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_LANE_CHANNEL_CAPACITY)
+}
+
+pub const DEFAULT_LANE_PENDING_STREAM_CAPACITY: usize = 4096;
+
+pub fn lane_pending_stream_capacity() -> usize {
+    std::env::var("FERROSA_LANE_PENDING_STREAM_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_LANE_PENDING_STREAM_CAPACITY)
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +103,10 @@ pub(crate) enum LaneCommand {
         result: Result<()>,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Internal wake-up used when a lane was blocked by the process-wide Data
+    /// lane cap and no completion on this particular peer lane is guaranteed
+    /// to arrive.
+    DispatchPending,
     /// Replace the current RPC client (used after successful reconnect).
     SwapClient(RpcClient),
     /// Signal that one full `connect_with_retry` cycle was exhausted.
@@ -468,8 +483,10 @@ async fn lane_actor_loop(
     ctx: ActorReconnectContext,
 ) {
     let stream_limit = ctx.config.max_streams_per_lane.max(1);
+    let pending_stream_capacity = lane_pending_stream_capacity();
     let mut in_flight_streams = 0usize;
     let mut pending_streams = VecDeque::new();
+    let mut dispatch_retry_scheduled = false;
 
     // If initial state is Connected, attach an alive watcher immediately.
     if let LaneState::Connected(ref client) = state {
@@ -491,19 +508,31 @@ async fn lane_actor_loop(
                 timeout,
                 reply,
             } => {
-                pending_streams.push_back(PendingLaneCommand::Send {
-                    msg,
-                    timeout,
-                    reply,
-                    queued_at: Instant::now(),
-                });
-                dispatch_stream_window(
+                if pending_streams.len() >= pending_stream_capacity {
+                    if lane == Lane::Data {
+                        metrics::record_data_lane_rejected();
+                    }
+                    let _ = reply.send(Err(NetError::Overloaded));
+                    continue;
+                }
+                push_pending_stream(
+                    lane,
+                    &mut pending_streams,
+                    PendingLaneCommand::Send {
+                        msg,
+                        timeout,
+                        reply,
+                        queued_at: Instant::now(),
+                    },
+                );
+                dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
                     &ctx,
                     stream_limit,
                     &mut in_flight_streams,
                     &mut pending_streams,
+                    dispatch_retry_scheduled,
                 );
             }
             LaneCommand::Fire {
@@ -511,43 +540,69 @@ async fn lane_actor_loop(
                 timeout,
                 reply,
             } => {
-                pending_streams.push_back(PendingLaneCommand::Fire {
-                    msg,
-                    timeout,
-                    reply,
-                    queued_at: Instant::now(),
-                });
-                dispatch_stream_window(
+                if pending_streams.len() >= pending_stream_capacity {
+                    if lane == Lane::Data {
+                        metrics::record_data_lane_rejected();
+                    }
+                    let _ = reply.send(Err(NetError::Overloaded));
+                    continue;
+                }
+                push_pending_stream(
+                    lane,
+                    &mut pending_streams,
+                    PendingLaneCommand::Fire {
+                        msg,
+                        timeout,
+                        reply,
+                        queued_at: Instant::now(),
+                    },
+                );
+                dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
                     &ctx,
                     stream_limit,
                     &mut in_flight_streams,
                     &mut pending_streams,
+                    dispatch_retry_scheduled,
                 );
             }
             LaneCommand::SendComplete { result, reply } => {
                 in_flight_streams = in_flight_streams.saturating_sub(1);
                 let _ = reply.send(result);
-                dispatch_stream_window(
+                dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
                     &ctx,
                     stream_limit,
                     &mut in_flight_streams,
                     &mut pending_streams,
+                    dispatch_retry_scheduled,
                 );
             }
             LaneCommand::FireComplete { result, reply } => {
                 in_flight_streams = in_flight_streams.saturating_sub(1);
                 let _ = reply.send(result);
-                dispatch_stream_window(
+                dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
                     &ctx,
                     stream_limit,
                     &mut in_flight_streams,
                     &mut pending_streams,
+                    dispatch_retry_scheduled,
+                );
+            }
+            LaneCommand::DispatchPending => {
+                dispatch_retry_scheduled = false;
+                dispatch_retry_scheduled = dispatch_stream_window(
+                    &state,
+                    lane,
+                    &ctx,
+                    stream_limit,
+                    &mut in_flight_streams,
+                    &mut pending_streams,
+                    dispatch_retry_scheduled,
                 );
             }
             LaneCommand::SwapClient(new_client) => {
@@ -572,13 +627,14 @@ async fn lane_actor_loop(
                     },
                     ctx.task_pool.clone(),
                 );
-                dispatch_stream_window(
+                dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
                     &ctx,
                     stream_limit,
                     &mut in_flight_streams,
                     &mut pending_streams,
+                    dispatch_retry_scheduled,
                 );
             }
             LaneCommand::MarkFailed { exhaustion_count } => {
@@ -708,14 +764,17 @@ fn dispatch_stream_window(
     stream_limit: usize,
     in_flight_streams: &mut usize,
     pending_streams: &mut VecDeque<PendingLaneCommand>,
-) {
+    retry_already_scheduled: bool,
+) -> bool {
     let client = match state {
         LaneState::Connected(c) => c.clone(),
         LaneState::Reconnecting { .. } | LaneState::Dormant => {
             fail_pending_streams_reconnecting(pending_streams);
-            return;
+            metrics::observe_lane_pending_streams(lane, pending_streams.len());
+            return false;
         }
     };
+    let mut retry_scheduled = false;
 
     while *in_flight_streams < stream_limit {
         let Some(pending) = pending_streams.pop_front() else {
@@ -731,8 +790,18 @@ fn dispatch_stream_window(
             } => {
                 metrics::record_lane_stream_wait(lane, queued_at.elapsed(), stream_limit);
                 if !metrics::try_start_rpc(lane, ctx.config.data_lane_max_in_flight) {
-                    let _ = reply.send(Err(NetError::Overloaded));
-                    continue;
+                    pending_streams.push_front(PendingLaneCommand::Send {
+                        msg,
+                        timeout,
+                        reply,
+                        queued_at,
+                    });
+                    metrics::observe_lane_pending_streams(lane, pending_streams.len());
+                    if !retry_already_scheduled {
+                        schedule_dispatch_retry(ctx);
+                    }
+                    retry_scheduled = true;
+                    break;
                 }
 
                 *in_flight_streams += 1;
@@ -757,8 +826,18 @@ fn dispatch_stream_window(
             } => {
                 metrics::record_lane_stream_wait(lane, queued_at.elapsed(), stream_limit);
                 if !metrics::try_start_rpc(lane, ctx.config.data_lane_max_in_flight) {
-                    let _ = reply.send(Err(NetError::Overloaded));
-                    continue;
+                    pending_streams.push_front(PendingLaneCommand::Fire {
+                        msg,
+                        timeout,
+                        reply,
+                        queued_at,
+                    });
+                    metrics::observe_lane_pending_streams(lane, pending_streams.len());
+                    if !retry_already_scheduled {
+                        schedule_dispatch_retry(ctx);
+                    }
+                    retry_scheduled = true;
+                    break;
                 }
 
                 *in_flight_streams += 1;
@@ -783,6 +862,25 @@ fn dispatch_stream_window(
             }
         }
     }
+    metrics::observe_lane_pending_streams(lane, pending_streams.len());
+    retry_scheduled
+}
+
+fn push_pending_stream(
+    lane: Lane,
+    pending_streams: &mut VecDeque<PendingLaneCommand>,
+    pending: PendingLaneCommand,
+) {
+    pending_streams.push_back(pending);
+    metrics::observe_lane_pending_streams(lane, pending_streams.len());
+}
+
+fn schedule_dispatch_retry(ctx: &ActorReconnectContext) {
+    let tx = ctx.handle.tx.clone();
+    ctx.task_pool.spawn(async move {
+        tokio::time::sleep(DATA_LANE_CAP_RETRY_DELAY).await;
+        let _ = tx.send(LaneCommand::DispatchPending).await;
+    });
 }
 
 fn fail_pending_streams_reconnecting(pending_streams: &mut VecDeque<PendingLaneCommand>) {

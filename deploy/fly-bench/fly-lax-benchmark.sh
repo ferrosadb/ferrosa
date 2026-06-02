@@ -21,6 +21,8 @@ FERROSA_RAFT_RUNTIME_THREADS="${FERROSA_RAFT_RUNTIME_THREADS:-2}"
 FERROSA_DATA_RUNTIME_THREADS="${FERROSA_DATA_RUNTIME_THREADS:-4}"
 FERROSA_CQL_RUNTIME_THREADS="${FERROSA_CQL_RUNTIME_THREADS:-4}"
 FERROSA_BACKGROUND_RUNTIME_THREADS="${FERROSA_BACKGROUND_RUNTIME_THREADS:-1}"
+FERROSA_COMMITLOG_BATCH_TARGET_BYTES="${FERROSA_COMMITLOG_BATCH_TARGET_BYTES:-4096}"
+FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS="${FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS:-1000}"
 BENCH_MEMORY_MB="${BENCH_MEMORY_MB:-32768}"
 BENCH_CPUS="${BENCH_CPUS:-8}"
 CASSANDRA_MEMORY_MB="${CASSANDRA_MEMORY_MB:-8192}"
@@ -286,7 +288,7 @@ start_ferrosa_memory_snapshots() {
       set +e
       started=\$(date +%s)
       deadline=\$((started + ${MEMORY_SNAPSHOT_MAX_SECONDS}))
-      metric_filter=\"ferrosa_process_resident_memory_bytes|ferrosa_process_virtual_memory_bytes|ferrosa_process_memory_bytes|ferrosa_process_smaps_rollup_bytes|ferrosa_cgroup_memory_|ferrosa_process_cpu_seconds_total|ferrosa_process_io_|ferrosa_host_network_|ferrosa_host_block_device_|ferrosa_storage_stats_memtable_size_bytes|ferrosa_storage_stats_local_sstable_cache_bytes|ferrosa_storage_stats_sstable_size_bytes|ferrosa_storage_stats_s3_bytes|ferrosa_storage_upload_queue_depth|ferrosa_storage_upload_|ferrosa_storage_flush|ferrosa_storage_compaction_|ferrosa_storage_read_limited_rows|ferrosa_net_rpc_|ferrosa_net_lane_|ferrosa_net_data_lane_|ferrosa_coordinator_inbound_mutation_|ferrosa_commitlog_|ferrosa_cql_|ferrosa_fd_\"
+      metric_filter=\"ferrosa_process_resident_memory_bytes|ferrosa_process_virtual_memory_bytes|ferrosa_process_memory_bytes|ferrosa_process_smaps_rollup_bytes|ferrosa_cgroup_memory_|ferrosa_process_cpu_seconds_total|ferrosa_process_io_|ferrosa_host_network_|ferrosa_host_block_device_|ferrosa_storage_stats_memtable_size_bytes|ferrosa_storage_stats_local_sstable_cache_bytes|ferrosa_storage_stats_sstable_size_bytes|ferrosa_storage_stats_s3_bytes|ferrosa_storage_upload_queue_depth|ferrosa_storage_upload_|ferrosa_storage_flush|ferrosa_storage_compaction_|ferrosa_storage_read_limited_rows|ferrosa_net_rpc_|ferrosa_net_lane_|ferrosa_net_data_lane_|ferrosa_coordinator_|ferrosa_commitlog_|ferrosa_cql_|ferrosa_fd_\"
       while [ \$(date +%s) -lt \"\${deadline}\" ]; do
         ts=\$(date -u +%FT%TZ)
         epoch=\$(date +%s)
@@ -374,6 +376,36 @@ wait_for_cassandra_node() {
       sleep 10
     done
     cat /tmp/nodetool-status.err >&2 || true
+    exit 1
+  '"
+}
+
+wait_for_cassandra_ring() {
+  local expected="${1:-3}"
+  local seed_id
+  seed_id="$(machine_id_for_name "$CASSANDRA_APP" cassandra-1)"
+
+  echo "waiting for Cassandra ring to report ${expected} UN nodes"
+  flyctl ssh console --app "$CASSANDRA_APP" --machine "$seed_id" --command "sh -lc '
+    stable=0
+    for i in \$(seq 1 90); do
+      if /opt/cassandra/bin/nodetool -h ::1 status >/tmp/nodetool-ring.txt 2>/tmp/nodetool-ring.err; then
+        cat /tmp/nodetool-ring.txt
+        up=\$(awk '\''/^UN[[:space:]]/ { c++ } END { print c+0 }'\'' /tmp/nodetool-ring.txt)
+        if [ \"\$up\" -eq \"$expected\" ]; then
+          stable=\$((stable + 1))
+          if [ \"\$stable\" -ge 3 ]; then
+            exit 0
+          fi
+        else
+          stable=0
+        fi
+      else
+        stable=0
+      fi
+      sleep 10
+    done
+    cat /tmp/nodetool-ring.err >&2 || true
     exit 1
   '"
 }
@@ -511,16 +543,25 @@ create_ferrosa_cluster() {
     --env "FERROSA_CLUSTER_NAME=ferrosa-lax-bench"
     --env "FERROSA_GRAPH_ENABLED=false"
     --env "FERROSA_AUTH_ENABLED=false"
-    --env "FERROSA_CACHE_MAX_BYTES=${FERROSA_CACHE_MAX_BYTES:-536870912}"
-    --env "FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES=${FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES:-536870912}"
-    --env "FERROSA_FLUSH_THRESHOLD_BYTES=${FERROSA_FLUSH_THRESHOLD_BYTES:-33554432}"
-    --env "FERROSA_MEMTABLE_BACKPRESSURE_BYTES=${FERROSA_MEMTABLE_BACKPRESSURE_BYTES:-67108864}"
+    --env "FERROSA_CACHE_MAX_BYTES=${FERROSA_CACHE_MAX_BYTES:-805306368}"
+    --env "FERROSA_CACHE_MIN_BYTES=${FERROSA_CACHE_MIN_BYTES:-0}"
+    --env "FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES=${FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES:-268435456}"
+    --env "FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES=${FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES:-536870912}"
+    --env "FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES=${FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES:-805306368}"
+    --env "FERROSA_FLUSH_THRESHOLD_BYTES=${FERROSA_FLUSH_THRESHOLD_BYTES:-67108864}"
+    --env "FERROSA_MEMTABLE_BACKPRESSURE_BYTES=${FERROSA_MEMTABLE_BACKPRESSURE_BYTES:-536870912}"
     --env "FERROSA_FLUSH_INTERVAL_SECS=${FERROSA_FLUSH_INTERVAL_SECS:-5}"
     --env "FERROSA_URGENT_FLUSH_INTERVAL_MILLIS=${FERROSA_URGENT_FLUSH_INTERVAL_MILLIS:-100}"
     --env "FERROSA_URGENT_S3_SYNC_INTERVAL_SECS=${FERROSA_URGENT_S3_SYNC_INTERVAL_SECS:-1}"
     --env "FERROSA_COMPACTION_WORKERS=${FERROSA_COMPACTION_WORKERS:-4}"
     --env "FERROSA_SSTABLE_COMPRESSION_THREADS=${FERROSA_SSTABLE_COMPRESSION_THREADS:-4}"
-    --env "FERROSA_STORAGE_UPLOAD_THREADS=${FERROSA_STORAGE_UPLOAD_THREADS:-4}"
+    --env "FERROSA_S3_UPLOAD_WORKERS=${FERROSA_S3_UPLOAD_WORKERS:-8}"
+    --env "FERROSA_S3_COMPACTION_UPLOAD_WORKERS=${FERROSA_S3_COMPACTION_UPLOAD_WORKERS:-4}"
+    --env "FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH=${FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH:-16}"
+    --env "FERROSA_S3_DELETE_WORKERS=${FERROSA_S3_DELETE_WORKERS:-2}"
+    --env "FERROSA_HINTED_HANDOFF_MAX_MB=${FERROSA_HINTED_HANDOFF_MAX_MB:-64}"
+    --env "FERROSA_COMMITLOG_BATCH_TARGET_BYTES=${FERROSA_COMMITLOG_BATCH_TARGET_BYTES}"
+    --env "FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS=${FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS}"
     --env "FERROSA_FORMATION_TIMEOUT_SECS=90"
     --env "FERROSA_RAFT_HEARTBEAT_MS=${FERROSA_RAFT_HEARTBEAT_MS}"
     --env "FERROSA_RAFT_ELECTION_MIN_MS=${FERROSA_RAFT_ELECTION_MIN_MS}"
@@ -532,8 +573,9 @@ create_ferrosa_cluster() {
     --env "FERROSA_BACKGROUND_RUNTIME_THREADS=${FERROSA_BACKGROUND_RUNTIME_THREADS}"
     --env "FERROSA_HEARTBEAT_INTERVAL_MS=${FERROSA_HEARTBEAT_INTERVAL_MS:-1000}"
     --env "FERROSA_HEARTBEAT_TIMEOUT_MS=${FERROSA_HEARTBEAT_TIMEOUT_MS:-10000}"
-    --env "FERROSA_MAX_STREAMS_PER_LANE=${FERROSA_MAX_STREAMS_PER_LANE:-512}"
-    --env "FERROSA_DATA_LANE_MAX_IN_FLIGHT=${FERROSA_DATA_LANE_MAX_IN_FLIGHT:-256}"
+    --env "FERROSA_LANE_PENDING_STREAM_CAPACITY=${FERROSA_LANE_PENDING_STREAM_CAPACITY:-8192}"
+    --env "FERROSA_MAX_STREAMS_PER_LANE=${FERROSA_MAX_STREAMS_PER_LANE:-2048}"
+    --env "FERROSA_DATA_LANE_MAX_IN_FLIGHT=${FERROSA_DATA_LANE_MAX_IN_FLIGHT:-4096}"
   )
   local volume_args=()
   if [[ "$FERROSA_USE_VOLUMES" == "true" ]]; then
@@ -663,6 +705,7 @@ create_cassandra_cluster() {
     node_id="$(machine_id_for_name "$CASSANDRA_APP" "cassandra-${n}")"
     wait_for_cassandra_node "$node_id" "cassandra-${n}"
   done
+  wait_for_cassandra_ring 3
 }
 
 run_target() {
@@ -759,6 +802,8 @@ run_ferrosa_t128() {
 }
 
 run_cassandra_ramp() {
+  wait_for_cassandra_ring 3
+
   local stages=(
     "16:1000:1000:1"
     "32:10000:10000:1"

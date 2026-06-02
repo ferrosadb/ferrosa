@@ -1,6 +1,7 @@
 //! Upload manager: async task that uploads SSTables to S3-compatible storage.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,8 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 const S3_UPLOAD_PART_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_UPLOAD_WORKERS: usize = 8;
+const DEFAULT_DELETE_WORKERS: usize = 2;
 
 /// Local SSTable component file scheduled for upload.
 #[derive(Debug, Clone)]
@@ -36,6 +39,28 @@ impl SstableComponentFile {
     }
 }
 
+/// SSTable component bytes scheduled for upload without rereading local files.
+#[derive(Debug, Clone)]
+pub struct SstableComponentBytes {
+    /// Bare component name, e.g. `Data.db`.
+    pub component: String,
+    /// Component bytes captured from the SSTable writer output.
+    pub data: Bytes,
+}
+
+impl SstableComponentBytes {
+    pub fn new(component: impl Into<String>, data: Bytes) -> Self {
+        Self {
+            component: component.into(),
+            data,
+        }
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
 /// A task to upload SSTable component files to object storage.
 #[derive(Debug)]
 pub enum UploadTask {
@@ -56,6 +81,17 @@ pub enum UploadTask {
         /// confirms the upload.
         ///
         /// `None` = fire-and-forget.
+        on_complete: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
+    /// Upload SSTable components already held in memory.
+    SSTableBytes {
+        /// Table identifier (e.g., "ks.table").
+        table_id: String,
+        /// SSTable identifier.
+        sstable_id: String,
+        /// Component bytes to PUT directly to object storage.
+        files: Vec<SstableComponentBytes>,
+        /// Notified when all component files have been uploaded successfully.
         on_complete: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     },
     /// Delete SSTable component files from object storage after a grace period.
@@ -104,6 +140,52 @@ impl UploadTask {
     }
 }
 
+enum DeleteTask {
+    SSTable {
+        table_id: String,
+        sstable_id: String,
+        grace_period: Duration,
+        on_complete: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
+}
+
+enum DeleteReadyTask {
+    SSTable {
+        table_id: String,
+        sstable_id: String,
+        on_complete: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
+}
+
+async fn send_delete_to_worker(
+    worker_txs: Arc<Vec<mpsc::Sender<DeleteReadyTask>>>,
+    cursor: Arc<AtomicUsize>,
+    task: DeleteReadyTask,
+) {
+    if worker_txs.is_empty() {
+        if let DeleteReadyTask::SSTable {
+            on_complete: Some(tx),
+            ..
+        } = task
+        {
+            let _ = tx.send(Err("delete worker pool stopped".into()));
+        }
+        return;
+    }
+
+    let idx = cursor.fetch_add(1, Ordering::Relaxed) % worker_txs.len();
+    if let Err(e) = worker_txs[idx].send(task).await {
+        let DeleteReadyTask::SSTable {
+            on_complete: Some(tx),
+            ..
+        } = e.0
+        else {
+            return;
+        };
+        let _ = tx.send(Err("delete worker stopped".into()));
+    }
+}
+
 /// Manages async uploads to S3-compatible storage.
 ///
 /// Runs as a spawned tokio task on the caller-provided runtime handle.
@@ -111,7 +193,10 @@ impl UploadTask {
 /// `submit()` blocks until a slot opens.
 pub struct UploadManager {
     task_tx: mpsc::Sender<UploadTask>,
-    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    dispatcher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    delete_scheduler_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    delete_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl UploadManager {
@@ -122,10 +207,113 @@ impl UploadManager {
         queue_depth: usize,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<UploadTask>(queue_depth);
+        Self::new_with_pools(
+            store,
+            prefix,
+            queue_depth,
+            DEFAULT_UPLOAD_WORKERS,
+            DEFAULT_DELETE_WORKERS,
+            runtime,
+        )
+    }
 
-        let handle = runtime.spawn(async move {
-            while let Some(task) = rx.recv().await {
+    /// Creates a new upload manager with explicit upload and delete pool sizes.
+    pub fn new_with_pools(
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        queue_depth: usize,
+        upload_workers: usize,
+        delete_workers: usize,
+        runtime: &tokio::runtime::Handle,
+    ) -> Self {
+        let upload_workers = upload_workers.max(1);
+        let delete_workers = delete_workers.max(1);
+        let queue_depth = queue_depth.max(1);
+        let (tx, mut rx) = mpsc::channel::<UploadTask>(queue_depth);
+        let (delete_tx, mut delete_rx) =
+            mpsc::channel::<DeleteTask>(queue_depth.max(delete_workers));
+
+        let mut delete_handles = Vec::with_capacity(delete_workers);
+        let mut delete_worker_txs = Vec::with_capacity(delete_workers);
+        for worker_id in 0..delete_workers {
+            let store = Arc::clone(&store);
+            let prefix = prefix.clone();
+            let (worker_tx, mut worker_rx) = mpsc::channel::<DeleteReadyTask>(1);
+            delete_worker_txs.push(worker_tx);
+            delete_handles.push(runtime.spawn(async move {
+                while let Some(task) = worker_rx.recv().await {
+                    match task {
+                        DeleteReadyTask::SSTable {
+                            table_id,
+                            sstable_id,
+                            on_complete,
+                        } => {
+                            let result = Self::delete_sstable_after_grace(
+                                &store,
+                                &prefix,
+                                &table_id,
+                                &sstable_id,
+                                Duration::ZERO,
+                            )
+                            .await;
+                            if let Some(tx) = on_complete {
+                                let _ = tx.send(result);
+                            }
+                        }
+                    }
+                }
+                tracing::debug!(worker_id, "upload delete worker stopped");
+            }));
+        }
+        let delete_worker_txs = Arc::new(delete_worker_txs);
+        let delete_cursor = Arc::new(AtomicUsize::new(0));
+        let delete_scheduler_runtime = runtime.clone();
+        let delete_scheduler_handle = {
+            let delete_worker_txs = Arc::clone(&delete_worker_txs);
+            let delete_cursor = Arc::clone(&delete_cursor);
+            runtime.spawn(async move {
+                while let Some(task) = delete_rx.recv().await {
+                    let DeleteTask::SSTable {
+                        table_id,
+                        sstable_id,
+                        grace_period,
+                        on_complete,
+                    } = task;
+                    let ready = DeleteReadyTask::SSTable {
+                        table_id,
+                        sstable_id,
+                        on_complete,
+                    };
+                    if grace_period.is_zero() {
+                        send_delete_to_worker(
+                            Arc::clone(&delete_worker_txs),
+                            Arc::clone(&delete_cursor),
+                            ready,
+                        )
+                        .await;
+                    } else {
+                        let delete_worker_txs = Arc::clone(&delete_worker_txs);
+                        let delete_cursor = Arc::clone(&delete_cursor);
+                        delete_scheduler_runtime.spawn(async move {
+                            tokio::time::sleep(grace_period).await;
+                            send_delete_to_worker(delete_worker_txs, delete_cursor, ready).await;
+                        });
+                    }
+                }
+                tracing::debug!("upload delete scheduler stopped");
+            })
+        };
+
+        let mut handles = Vec::with_capacity(upload_workers);
+        let mut worker_txs = Vec::with_capacity(upload_workers);
+        for worker_id in 0..upload_workers {
+            let store = Arc::clone(&store);
+            let prefix = prefix.clone();
+            let delete_tx = delete_tx.clone();
+            let (worker_tx, mut worker_rx) = mpsc::channel::<UploadTask>(1);
+            worker_txs.push(worker_tx);
+            handles.push(runtime.spawn(async move {
+                while let Some(task) = worker_rx.recv().await {
                 let count_queue_depth = task.counts_toward_queue_depth();
                 let task_start = Instant::now();
                 match task {
@@ -213,58 +401,59 @@ impl UploadManager {
                             let _ = tx.send(result);
                         }
                     }
+                    UploadTask::SSTableBytes {
+                        table_id,
+                        sstable_id,
+                        files,
+                        on_complete,
+                    } => {
+                        let hex_prefix = hex_prefix_for(&sstable_id);
+                        let mut upload_err: Option<String> = None;
+                        for file in files {
+                            let path = sstable_object_key(
+                                &prefix,
+                                &hex_prefix,
+                                &table_id,
+                                &sstable_id,
+                                &file.component,
+                            );
+                            if let Err(e) =
+                                Self::put_component_bytes_with_retry(&store, &path, file.data, 5)
+                                    .await
+                            {
+                                let msg = format!("upload failed for {path}: {e}");
+                                tracing_or_eprintln(msg.clone());
+                                if upload_err.is_none() {
+                                    upload_err = Some(msg);
+                                }
+                            }
+                        }
+                        if let Some(tx) = on_complete {
+                            let result = match upload_err {
+                                None => Ok(()),
+                                Some(msg) => Err(msg),
+                            };
+                            let _ = tx.send(result);
+                        }
+                    }
                     UploadTask::DeleteSSTable {
                         table_id,
                         sstable_id,
                         grace_period,
                         on_complete,
                     } => {
-                        // Wait for in-flight reads to drain before deleting.
-                        tokio::time::sleep(grace_period).await;
-
-                        let hex_prefix = hex_prefix_for(&sstable_id);
-                        // Ferrosa SSTable component filenames. Keep `Index.db`
-                        // for compatibility with older/foreign layouts; missing
-                        // objects are treated as success below.
-                        let components = [
-                            "Data.db",
-                            "Partitions.db",
-                            "Rows.db",
-                            "Index.db",
-                            "Filter.db",
-                            "Statistics.db",
-                            "CompressionInfo.db",
-                            "TOC.txt",
-                        ];
-                        let mut delete_err: Option<String> = None;
-                        for component in &components {
-                            let path = sstable_object_key(
-                                &prefix,
-                                &hex_prefix,
-                                &table_id,
-                                &sstable_id,
-                                component,
-                            );
-                            match store.delete(&path).await {
-                                Ok(_) => {}
-                                Err(object_store::Error::NotFound { .. }) => {
-                                    // 404 is success — already gone.
-                                }
-                                Err(e) => {
-                                    let msg = format!("delete failed for {path}: {e}");
-                                    tracing_or_eprintln(msg.clone());
-                                    if delete_err.is_none() {
-                                        delete_err = Some(msg);
-                                    }
-                                }
+                        let task = DeleteTask::SSTable {
+                            table_id,
+                            sstable_id,
+                            grace_period,
+                            on_complete,
+                        };
+                        if let Err(e) = delete_tx.send(task).await {
+                            let DeleteTask::SSTable { on_complete, .. } = e.0;
+                            if let Some(tx) = on_complete {
+                                let _ = tx.send(Err("delete channel closed".into()));
                             }
-                        }
-                        if let Some(tx) = on_complete {
-                            let result = match delete_err {
-                                None => Ok(()),
-                                Some(msg) => Err(msg),
-                            };
-                            let _ = tx.send(result);
+                            tracing_or_eprintln("delete channel closed".to_string());
                         }
                     }
                     UploadTask::IndexFiles {
@@ -306,12 +495,39 @@ impl UploadManager {
                     crate::metrics::observe_upload_task(task_start.elapsed());
                     crate::metrics::dec_upload_queue_depth();
                 }
+                }
+                tracing::debug!(worker_id, "upload worker stopped");
+            }));
+        }
+        let dispatcher_handle = runtime.spawn(async move {
+            let mut next_worker = 0usize;
+            while let Some(task) = rx.recv().await {
+                if matches!(task, UploadTask::Shutdown) {
+                    for worker_tx in &worker_txs {
+                        let _ = worker_tx.send(UploadTask::Shutdown).await;
+                    }
+                    break;
+                }
+
+                if worker_txs.is_empty() {
+                    break;
+                }
+
+                let idx = next_worker % worker_txs.len();
+                next_worker = next_worker.wrapping_add(1);
+                if worker_txs[idx].send(task).await.is_err() {
+                    break;
+                }
             }
+            tracing::debug!("upload dispatcher stopped");
         });
 
         Self {
             task_tx: tx,
-            handle: Mutex::new(Some(handle)),
+            dispatcher_handle: Mutex::new(Some(dispatcher_handle)),
+            handles: Mutex::new(handles),
+            delete_scheduler_handle: Mutex::new(Some(delete_scheduler_handle)),
+            delete_handles: Mutex::new(delete_handles),
         }
     }
 
@@ -379,9 +595,62 @@ impl UploadManager {
     /// Shuts down the upload manager, draining the queue.
     pub async fn shutdown(&self) {
         let _ = self.task_tx.send(UploadTask::Shutdown).await;
-        let handle = self.handle.lock().take();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.dispatcher_handle.lock().take() {
             let _ = handle.await;
+        }
+        let handles = self.handles.lock().drain(..).collect::<Vec<_>>();
+        for handle in handles {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.delete_scheduler_handle.lock().take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        let delete_handles = self.delete_handles.lock().drain(..).collect::<Vec<_>>();
+        for handle in delete_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    async fn delete_sstable_after_grace(
+        store: &dyn ObjectStore,
+        prefix: &str,
+        table_id: &str,
+        sstable_id: &str,
+        grace_period: Duration,
+    ) -> Result<(), String> {
+        tokio::time::sleep(grace_period).await;
+
+        let hex_prefix = hex_prefix_for(sstable_id);
+        let components = [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Index.db",
+            "Filter.db",
+            "Statistics.db",
+            "CompressionInfo.db",
+            "TOC.txt",
+        ];
+        let mut delete_err: Option<String> = None;
+        for component in &components {
+            let path = sstable_object_key(prefix, &hex_prefix, table_id, sstable_id, component);
+            match store.delete(&path).await {
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    let msg = format!("delete failed for {path}: {e}");
+                    tracing_or_eprintln(msg.clone());
+                    if delete_err.is_none() {
+                        delete_err = Some(msg);
+                    }
+                }
+            }
+        }
+
+        match delete_err {
+            None => Ok(()),
+            Some(msg) => Err(msg),
         }
     }
 
@@ -406,6 +675,19 @@ impl UploadManager {
         }
 
         unreachable!()
+    }
+
+    async fn put_component_bytes_with_retry(
+        store: &dyn ObjectStore,
+        path: &ObjectPath,
+        data: Bytes,
+        max_retries: u32,
+    ) -> Result<(), object_store::Error> {
+        let size_bytes = data.len() as u64;
+        let upload_start = Instant::now();
+        let result = Self::put_with_retry(store, path, data, max_retries).await;
+        crate::metrics::observe_upload_file(size_bytes, upload_start.elapsed());
+        result
     }
 
     /// Streams a local file into object storage without eagerly materializing
@@ -671,6 +953,45 @@ mod tests {
             let result = store.get(&path).await.unwrap();
             let bytes = result.bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), b"hello sstable data");
+        });
+    }
+
+    #[test]
+    fn upload_sstable_bytes_round_trip() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let store = Arc::new(InMemory::new());
+            let manager = UploadManager::new_with_pools(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "direct".into(),
+                16,
+                2,
+                1,
+                &tokio::runtime::Handle::current(),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+            manager
+                .submit(UploadTask::SSTableBytes {
+                    table_id: "ks.t".into(),
+                    sstable_id: "42".into(),
+                    files: vec![
+                        SstableComponentBytes::new("Data.db", Bytes::from_static(b"direct data")),
+                        SstableComponentBytes::new("TOC.txt", Bytes::from_static(b"Data.db\n")),
+                    ],
+                    on_complete: Some(tx),
+                })
+                .await
+                .unwrap();
+
+            rx.await.unwrap().unwrap();
+            manager.shutdown().await;
+
+            let hex = hex_prefix_for("42");
+            let path = sstable_object_key("direct", &hex, "ks.t", "42", "Data.db");
+            let result = store.get(&path).await.unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(bytes.as_ref(), b"direct data");
         });
     }
 
@@ -1065,6 +1386,50 @@ mod tests {
                     "{component} should be deleted by DeleteSSTable"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn deferred_delete_grace_does_not_exhaust_delete_workers() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let store = Arc::new(InMemory::new());
+            let manager = UploadManager::new_with_pools(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "pfx".into(),
+                2,
+                1,
+                1,
+                &tokio::runtime::Handle::current(),
+            );
+            let mut receivers = Vec::new();
+
+            for i in 0..8 {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+                manager
+                    .submit(UploadTask::DeleteSSTable {
+                        table_id: "ks.t".into(),
+                        sstable_id: format!("stale-{i}"),
+                        grace_period: Duration::from_secs(3600),
+                        on_complete: Some(tx),
+                    })
+                    .await
+                    .unwrap();
+                receivers.push(rx);
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for rx in &mut receivers {
+                assert!(
+                    matches!(
+                        rx.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ),
+                    "long-grace deletes should stay scheduled, not complete early with queue-full"
+                );
+            }
+
+            manager.shutdown().await;
         });
     }
 

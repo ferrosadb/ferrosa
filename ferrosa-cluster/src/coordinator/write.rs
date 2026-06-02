@@ -2,12 +2,16 @@
 
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
+use ferrosa_net::peer::PeerManager;
 use ferrosa_sstable::types::Row;
-use ferrosa_storage::{Mutation, StorageEngine, TableId};
+use ferrosa_storage::{Mutation, TableId};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::task::JoinHandle;
 
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
@@ -17,14 +21,27 @@ use super::metrics;
 use super::ClusterCoordinator;
 
 type ReplicaWriteTarget = (u64, Option<(uuid::Uuid, String)>, String);
+type ReplicaWriteJoin = JoinHandle<ReplicaResult>;
+type NtsReplicaWriteJoin = JoinHandle<(ReplicaResult, String)>;
+
+struct TrackedWritePermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl TrackedWritePermit {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        metrics::inc_write_admission_in_flight();
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for TrackedWritePermit {
+    fn drop(&mut self) {
+        metrics::dec_write_admission_in_flight();
+    }
+}
 
 enum ReplicaWriteWork {
-    Local {
-        storage: std::sync::Arc<StorageEngine>,
-        table_id: TableId,
-        key: DecoratedKey,
-        row: Row,
-    },
     Remote {
         replica_id: u64,
         remote: Option<(uuid::Uuid, String)>,
@@ -33,19 +50,9 @@ enum ReplicaWriteWork {
 }
 
 enum NtsReplicaWriteWork {
-    Local {
-        storage: std::sync::Arc<StorageEngine>,
-        table_id: TableId,
-        key: DecoratedKey,
-        row: Row,
-        dc: String,
-    },
     Remote {
         remote: Option<(uuid::Uuid, String)>,
         body: Bytes,
-        dc: String,
-    },
-    Failure {
         dc: String,
     },
 }
@@ -70,36 +77,40 @@ fn should_refresh_peer_pool(err: &str) -> bool {
 }
 
 impl ClusterCoordinator {
-    fn store_hints_for_replicas(
-        &self,
+    fn store_hints_with_store(
+        hint_store: Option<&Arc<crate::hints::HintStore>>,
         table_id: &TableId,
         key: &DecoratedKey,
         body: &[u8],
         timestamp: i64,
         peer_ids: impl IntoIterator<Item = uuid::Uuid>,
         reason: &'static str,
-    ) {
+    ) -> crate::error::Result<()> {
         let mut peers: Vec<_> = peer_ids.into_iter().collect();
         peers.sort_unstable();
         peers.dedup();
         if peers.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let Some(ref hint_store) = self.hint_store else {
+        let Some(hint_store) = hint_store else {
             tracing::error!(
                 failed_count = peers.len(),
                 reason,
                 "no hint store available — divergent replicas will require anti-entropy repair"
             );
-            return;
+            metrics::inc_hint_rejected();
+            return Err(ClusterError::Overloaded(format!(
+                "hint store unavailable for {} failed replica(s)",
+                peers.len()
+            )));
         };
 
         let hint_key = key.key.as_bytes().to_vec();
         let hint_row = body.to_vec();
-        for peer_id in peers {
+        for peer_id in &peers {
             if let Err(e) = hint_store.store(
-                peer_id,
+                *peer_id,
                 &table_id.keyspace,
                 &table_id.table,
                 hint_key.clone(),
@@ -112,31 +123,102 @@ impl ClusterCoordinator {
                     reason,
                     "hint store failed — divergent replica will require anti-entropy repair"
                 );
+                metrics::inc_hint_rejected();
+                return Err(e);
             }
         }
+        metrics::inc_hint_stored(peers.len());
+        Ok(())
+    }
+
+    fn store_hints_for_replicas(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        body: &[u8],
+        timestamp: i64,
+        peer_ids: impl IntoIterator<Item = uuid::Uuid>,
+        reason: &'static str,
+    ) -> crate::error::Result<()> {
+        Self::store_hints_with_store(
+            self.hint_store.as_ref(),
+            table_id,
+            key,
+            body,
+            timestamp,
+            peer_ids,
+            reason,
+        )
     }
 
     async fn send_remote_write_with_reconnect(
-        &self,
+        peer_manager: Arc<PeerManager>,
         host_id: uuid::Uuid,
         addr: &str,
         message: Message,
     ) -> crate::error::Result<Message> {
-        match self
-            .peer_manager
+        match peer_manager
             .send(host_id, message.clone(), Lane::Data)
             .await
         {
             Ok(resp) => Ok(resp),
             Err(e) if should_refresh_peer_pool(&e.to_string()) => {
-                self.peer_manager.ensure_peer(host_id, addr).await?;
-                self.peer_manager
+                peer_manager.ensure_peer(host_id, addr).await?;
+                peer_manager
                     .send(host_id, message, Lane::Data)
                     .await
                     .map_err(Into::into)
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn spawn_post_quorum_hint_drain(
+        fan_out: FuturesUnordered<ReplicaWriteJoin>,
+        hint_store: Option<Arc<crate::hints::HintStore>>,
+        table_id: TableId,
+        key: DecoratedKey,
+        body: Bytes,
+        timestamp: i64,
+        reason: &'static str,
+        write_permit: TrackedWritePermit,
+    ) {
+        if fan_out.is_empty() {
+            return;
+        }
+        ferrosa_net::task_pool::TaskPool::current("coordinator-post-quorum-write").spawn(
+            async move {
+                let _write_permit = write_permit;
+                drain_post_quorum_replica_writes(
+                    fan_out, hint_store, table_id, key, body, timestamp, reason,
+                )
+                .await;
+            },
+        );
+    }
+
+    fn spawn_post_quorum_hint_drain_nts(
+        fan_out: FuturesUnordered<NtsReplicaWriteJoin>,
+        hint_store: Option<Arc<crate::hints::HintStore>>,
+        table_id: TableId,
+        key: DecoratedKey,
+        body: Bytes,
+        timestamp: i64,
+        reason: &'static str,
+        write_permit: TrackedWritePermit,
+    ) {
+        if fan_out.is_empty() {
+            return;
+        }
+        ferrosa_net::task_pool::TaskPool::current("coordinator-post-quorum-write").spawn(
+            async move {
+                let _write_permit = write_permit;
+                drain_post_quorum_nts_replica_writes(
+                    fan_out, hint_store, table_id, key, body, timestamp, reason,
+                )
+                .await;
+            },
+        );
     }
 
     /// Coordinate a write to the appropriate replicas.
@@ -179,13 +261,17 @@ impl ClusterCoordinator {
     ) -> crate::error::Result<()> {
         // Acquire a write permit — limits concurrent in-flight writes to prevent
         // tokio runtime saturation that would starve Raft heartbeat processing.
-        let _permit = self.write_semaphore.acquire().await.map_err(|_| {
-            crate::error::ClusterError::Unavailable {
+        let permit = self
+            .write_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| crate::error::ClusterError::Unavailable {
                 consistency: cl.to_string(),
                 required: 0,
                 alive: 0,
-            }
-        })?;
+            })?;
+        let permit = TrackedWritePermit::new(permit);
 
         let ring = self.ring.load();
         let replicas = ring.replicas(key.token.0, rf);
@@ -256,70 +342,47 @@ impl ClusterCoordinator {
         } else {
             None
         };
-        let all_remote_hids: std::collections::HashSet<uuid::Uuid> = replica_targets
-            .iter()
-            .filter_map(|(replica_id, remote)| {
-                if *replica_id == self.local_node_id {
-                    None
-                } else {
-                    remote.as_ref().map(|(hid, _)| *hid)
-                }
-            })
-            .collect();
-
-        // Build concurrent futures for each replica. Only the local write
-        // needs the owned row; remote replicas use the encoded mutation body.
+        // Build concurrent remote writes. The local write stays inline to avoid
+        // per-write task overhead on the hot local path. Remote writes are task
+        // backed so dropping the client-visible coordinator future after quorum
+        // does not cancel sends to lagging replicas.
         let mut local_row = Some(row);
-        let mut fan_out: FuturesUnordered<_> = replica_targets
+        let mut acks = 0usize;
+        let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
+        let mut fan_out: FuturesUnordered<ReplicaWriteJoin> = replica_targets
             .into_iter()
-            .map(|(replica_id, remote)| {
-                let work = if replica_id == self.local_node_id {
-                    match local_row.take() {
-                        Some(row) => ReplicaWriteWork::Local {
-                            storage: self.storage.clone(),
-                            table_id: table_id.clone(),
-                            key: key.clone(),
-                            row,
-                        },
-                        None => {
-                            tracing::error!(replica_id, "token ring returned local replica twice");
-                            ReplicaWriteWork::Remote {
-                                replica_id,
-                                remote: None,
-                                body: None,
-                            }
+            .filter_map(|(replica_id, remote)| {
+                if replica_id == self.local_node_id {
+                    let Some(row) = local_row.take() else {
+                        tracing::error!(replica_id, "token ring returned local replica twice");
+                        return None;
+                    };
+                    metrics::inc_replica_write_attempt(true);
+                    match self.storage.write(table_id, key, row, timestamp) {
+                        Ok(()) => {
+                            acks += 1;
+                            metrics::inc_replica_write_ack(true);
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "local write failed");
+                            metrics::inc_replica_write_failure(true);
                         }
                     }
-                } else {
-                    ReplicaWriteWork::Remote {
-                        replica_id,
-                        remote,
-                        body: body.clone(),
-                    }
-                };
-                let coordinator = self;
+                    return None;
+                }
 
-                async move {
+                let work = ReplicaWriteWork::Remote {
+                    replica_id,
+                    remote,
+                    body: body.clone(),
+                };
+                let peer_manager = self.peer_manager.clone();
+
+                Some(ferrosa_net::task_pool::TaskPool::current(
+                    "coordinator-remote-write",
+                )
+                .spawn(async move {
                     match work {
-                        ReplicaWriteWork::Local {
-                            storage,
-                            table_id,
-                            key,
-                            row,
-                        } => {
-                            metrics::inc_replica_write_attempt(true);
-                            match storage.write(&table_id, &key, row, timestamp) {
-                                Ok(()) => {
-                                    metrics::inc_replica_write_ack(true);
-                                    ReplicaResult::Ack { host_id: None }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%e, "local write failed");
-                                    metrics::inc_replica_write_failure(true);
-                                    ReplicaResult::Failure { host_id: None }
-                                }
-                            }
-                        }
                         ReplicaWriteWork::Remote {
                             replica_id,
                             remote,
@@ -348,13 +411,13 @@ impl ClusterCoordinator {
                                             return ReplicaResult::Failure { host_id: Some(hid) };
                                         }
                                     };
-                                    match coordinator
-                                        .send_remote_write_with_reconnect(
-                                            hid,
-                                            &addr,
-                                            Message::MutationForward(forward_body),
-                                        )
-                                        .await
+                                    match ClusterCoordinator::send_remote_write_with_reconnect(
+                                        peer_manager,
+                                        hid,
+                                        &addr,
+                                        Message::MutationForward(forward_body),
+                                    )
+                                    .await
                                     {
                                         Ok(Message::MutationAck(_)) => {
                                             metrics::inc_replica_write_ack(false);
@@ -378,22 +441,42 @@ impl ClusterCoordinator {
                             }
                         }
                     }
-                }
+                }))
             })
             .collect();
 
-        // Drain all futures, collecting ACKs and failed replica host_ids.
-        let mut acks = 0usize;
-        let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
-        let mut acked_remote_hids: std::collections::HashSet<uuid::Uuid> =
-            std::collections::HashSet::new();
-        while let Some(result) = fan_out.next().await {
+        // Drain results until CL is met, collecting only actual failed replica
+        // host_ids. Pending remote writes are left running after quorum and are
+        // drained by a detached task that hints only real post-quorum failures.
+        if acks >= required {
+            if let Some(body) = body {
+                Self::spawn_post_quorum_hint_drain(
+                    fan_out,
+                    self.hint_store.clone(),
+                    table_id.clone(),
+                    key.clone(),
+                    body,
+                    timestamp,
+                    "replica write failed after quorum was satisfied",
+                    permit,
+                );
+            } else {
+                debug_assert!(fan_out.is_empty());
+            }
+            return Ok(());
+        }
+
+        while let Some(joined) = fan_out.next().await {
+            let result = match joined {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(%e, "replica write task failed");
+                    continue;
+                }
+            };
             match result {
-                ReplicaResult::Ack { host_id } => {
+                ReplicaResult::Ack { .. } => {
                     acks += 1;
-                    if let Some(hid) = host_id {
-                        acked_remote_hids.insert(hid);
-                    }
                 }
                 ReplicaResult::Failure { host_id: Some(hid) } => {
                     failed_replicas.push(hid);
@@ -402,19 +485,37 @@ impl ClusterCoordinator {
             }
 
             if acks >= required {
-                if let Some(ref body) = body {
-                    let unacked = all_remote_hids
-                        .difference(&acked_remote_hids)
-                        .copied()
-                        .chain(failed_replicas.iter().copied());
-                    self.store_hints_for_replicas(
-                        table_id,
-                        key,
+                if !failed_replicas.is_empty() {
+                    if let Some(ref body) = body {
+                        self.store_hints_for_replicas(
+                            table_id,
+                            key,
+                            body,
+                            timestamp,
+                            failed_replicas,
+                            "replica write failed before quorum was satisfied",
+                        )?;
+                    } else {
+                        tracing::error!(
+                            failed_count = failed_replicas.len(),
+                            "internal: failed remote replicas with no encoded body — \
+                             divergent replicas will require anti-entropy repair"
+                        );
+                    }
+                }
+                if let Some(body) = body {
+                    Self::spawn_post_quorum_hint_drain(
+                        fan_out,
+                        self.hint_store.clone(),
+                        table_id.clone(),
+                        key.clone(),
                         body,
                         timestamp,
-                        unacked,
-                        "quorum satisfied before all remote replicas acked",
+                        "replica write failed after quorum was satisfied",
+                        permit,
                     );
+                } else {
+                    debug_assert!(fan_out.is_empty());
                 }
                 return Ok(());
             }
@@ -439,7 +540,7 @@ impl ClusterCoordinator {
                     timestamp,
                     failed_replicas,
                     "replica write failed before quorum was satisfied",
-                );
+                )?;
             } else {
                 tracing::error!(
                     failed_count = failed_replicas.len(),
@@ -475,13 +576,17 @@ impl ClusterCoordinator {
         strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<()> {
         // Acquire a write permit — see coordinate_write_with for rationale.
-        let _permit = self.write_semaphore.acquire().await.map_err(|_| {
-            crate::error::ClusterError::Unavailable {
+        let permit = self
+            .write_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| crate::error::ClusterError::Unavailable {
                 consistency: cl.to_string(),
                 required: 0,
                 alive: 0,
-            }
-        })?;
+            })?;
+        let permit = TrackedWritePermit::new(permit);
 
         let ring = self.ring.load();
         let replicas = ring.replicas_for_strategy(key.token.0, strategy);
@@ -558,37 +663,36 @@ impl ClusterCoordinator {
                 (replica_id, remote, dc)
             })
             .collect();
-        let all_remote_hids: std::collections::HashSet<uuid::Uuid> = replica_targets
-            .iter()
-            .filter_map(|(replica_id, remote, _)| {
-                if *replica_id == self.local_node_id {
-                    None
-                } else {
-                    remote.as_ref().map(|(hid, _)| *hid)
-                }
-            })
-            .collect();
         drop(ring);
 
-        // Fan out. Avoid cloning the row into remote-only futures.
+        // Fan out. Remote writes are task-backed so post-quorum sends keep
+        // running instead of being canceled when the coordinator returns.
         let mut local_row = Some(row);
-        let mut fan_out: FuturesUnordered<_> = replica_targets
+        let mut total_acks = 0usize;
+        let mut dc_acks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
+        let mut fan_out: FuturesUnordered<NtsReplicaWriteJoin> = replica_targets
             .into_iter()
-            .map(|(replica_id, remote, dc)| {
+            .filter_map(|(replica_id, remote, dc)| {
                 let work = if replica_id == self.local_node_id {
-                    match local_row.take() {
-                        Some(row) => NtsReplicaWriteWork::Local {
-                            storage: self.storage.clone(),
-                            table_id: table_id.clone(),
-                            key: key.clone(),
-                            row,
-                            dc,
-                        },
-                        None => {
-                            tracing::error!(replica_id, "token ring returned local replica twice");
-                            NtsReplicaWriteWork::Failure { dc }
+                    let Some(row) = local_row.take() else {
+                        tracing::error!(replica_id, "token ring returned local replica twice");
+                        return None;
+                    };
+                    metrics::inc_replica_write_attempt(true);
+                    match self.storage.write(table_id, key, row, timestamp) {
+                        Ok(()) => {
+                            total_acks += 1;
+                            *dc_acks.entry(dc).or_insert(0) += 1;
+                            metrics::inc_replica_write_ack(true);
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "local NTS write failed");
+                            metrics::inc_replica_write_failure(true);
                         }
                     }
+                    return None;
                 } else {
                     NtsReplicaWriteWork::Remote {
                         remote,
@@ -596,69 +700,87 @@ impl ClusterCoordinator {
                         dc,
                     }
                 };
-                let coordinator = self;
+                let peer_manager = self.peer_manager.clone();
 
-                async move {
-                    match work {
-                        NtsReplicaWriteWork::Local {
-                            storage,
-                            table_id,
-                            key,
-                            row,
-                            dc,
-                        } => {
-                            let result = match storage.write(&table_id, &key, row, timestamp) {
-                                Ok(()) => ReplicaResult::Ack { host_id: None },
-                                Err(_) => ReplicaResult::Failure { host_id: None },
-                            };
-                            (result, dc)
-                        }
-                        NtsReplicaWriteWork::Remote { remote, body, dc } => {
-                            let result = match remote {
+                Some(
+                    ferrosa_net::task_pool::TaskPool::current("coordinator-remote-write").spawn(
+                        async move {
+                            match work {
+                                NtsReplicaWriteWork::Remote { remote, body, dc } => {
+                                    metrics::inc_replica_write_attempt(false);
+                                    let result = match remote {
                                 None => ReplicaResult::Failure { host_id: None },
                                 Some((hid, addr)) => {
-                                    match coordinator
-                                        .send_remote_write_with_reconnect(
-                                            hid,
-                                            &addr,
-                                            Message::MutationForward(body),
-                                        )
-                                        .await
+                                    match ClusterCoordinator::send_remote_write_with_reconnect(
+                                        peer_manager,
+                                        hid,
+                                        &addr,
+                                        Message::MutationForward(body),
+                                    )
+                                    .await
                                     {
                                         Ok(Message::MutationAck(_)) => {
+                                            metrics::inc_replica_write_ack(false);
                                             ReplicaResult::Ack { host_id: Some(hid) }
                                         }
-                                        Ok(_) => ReplicaResult::Failure { host_id: Some(hid) },
-                                        Err(_) => ReplicaResult::Failure { host_id: Some(hid) },
+                                        Ok(_) => {
+                                            metrics::inc_replica_write_failure(false);
+                                            ReplicaResult::Failure { host_id: Some(hid) }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, %hid, "NTS MutationForward failed");
+                                            metrics::inc_replica_write_failure(false);
+                                            ReplicaResult::Failure { host_id: Some(hid) }
+                                        }
                                     }
                                 }
                             };
-                            (result, dc)
-                        }
-                        NtsReplicaWriteWork::Failure { dc } => {
-                            (ReplicaResult::Failure { host_id: None }, dc)
-                        }
-                    }
-                }
+                                    (result, dc)
+                                }
+                            }
+                        },
+                    ),
+                )
             })
             .collect();
 
         // Drain results, track per-DC if EACH_QUORUM.
-        let mut total_acks = 0usize;
-        let mut dc_acks: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
-        let mut acked_remote_hids: std::collections::HashSet<uuid::Uuid> =
-            std::collections::HashSet::new();
+        let satisfied = match cl {
+            ConsistencyLevel::EachQuorum => {
+                strategy.dc_replication_factors().iter().all(|(dc, &rf)| {
+                    let acks = dc_acks.get(dc).copied().unwrap_or(0);
+                    acks >= cl.block_for_dc(rf)
+                })
+            }
+            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => total_acks >= required,
+            _ => total_acks >= required,
+        };
+        if satisfied {
+            Self::spawn_post_quorum_hint_drain_nts(
+                fan_out,
+                self.hint_store.clone(),
+                table_id.clone(),
+                key.clone(),
+                body,
+                timestamp,
+                "NTS replica write failed after quorum was satisfied",
+                permit,
+            );
+            return Ok(());
+        }
 
-        while let Some((result, dc)) = fan_out.next().await {
+        while let Some(joined) = fan_out.next().await {
+            let (result, dc) = match joined {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(%e, "NTS replica write task failed");
+                    continue;
+                }
+            };
             match result {
-                ReplicaResult::Ack { host_id } => {
+                ReplicaResult::Ack { .. } => {
                     total_acks += 1;
                     *dc_acks.entry(dc).or_insert(0) += 1;
-                    if let Some(hid) = host_id {
-                        acked_remote_hids.insert(hid);
-                    }
                 }
                 ReplicaResult::Failure { host_id: Some(hid) } => {
                     failed_replicas.push(hid);
@@ -679,17 +801,25 @@ impl ClusterCoordinator {
                 _ => total_acks >= required,
             };
             if satisfied {
-                let unacked = all_remote_hids
-                    .difference(&acked_remote_hids)
-                    .copied()
-                    .chain(failed_replicas.iter().copied());
-                self.store_hints_for_replicas(
-                    table_id,
-                    key,
-                    &body,
+                if !failed_replicas.is_empty() {
+                    self.store_hints_for_replicas(
+                        table_id,
+                        key,
+                        &body,
+                        timestamp,
+                        failed_replicas,
+                        "NTS replica write failed before quorum was satisfied",
+                    )?;
+                }
+                Self::spawn_post_quorum_hint_drain_nts(
+                    fan_out,
+                    self.hint_store.clone(),
+                    table_id.clone(),
+                    key.clone(),
+                    body,
                     timestamp,
-                    unacked,
-                    "quorum satisfied before all NTS remote replicas acked",
+                    "NTS replica write failed after quorum was satisfied",
+                    permit,
                 );
                 return Ok(());
             }
@@ -718,7 +848,7 @@ impl ClusterCoordinator {
                 timestamp,
                 failed_replicas,
                 "NTS replica write failed before quorum was satisfied",
-            );
+            )?;
         }
 
         if satisfied {
@@ -729,6 +859,92 @@ impl ClusterCoordinator {
                 received: total_acks,
                 required,
             })
+        }
+    }
+}
+
+async fn drain_post_quorum_replica_writes(
+    mut fan_out: FuturesUnordered<ReplicaWriteJoin>,
+    hint_store: Option<Arc<crate::hints::HintStore>>,
+    table_id: TableId,
+    key: DecoratedKey,
+    body: Bytes,
+    timestamp: i64,
+    reason: &'static str,
+) {
+    let mut failed_replicas = Vec::new();
+    while let Some(joined) = fan_out.next().await {
+        match joined {
+            Ok(ReplicaResult::Ack { host_id: Some(_) }) => {
+                metrics::inc_post_quorum_remote_ack();
+            }
+            Ok(ReplicaResult::Ack { host_id: None }) => {}
+            Ok(ReplicaResult::Failure { host_id: Some(hid) }) => {
+                metrics::inc_post_quorum_remote_failure();
+                failed_replicas.push(hid);
+            }
+            Ok(ReplicaResult::Failure { host_id: None }) => {}
+            Err(e) => {
+                tracing::warn!(%e, "post-quorum replica write task failed");
+            }
+        }
+    }
+
+    if !failed_replicas.is_empty() {
+        let failed_count = failed_replicas.len();
+        if let Err(e) = ClusterCoordinator::store_hints_with_store(
+            hint_store.as_ref(),
+            &table_id,
+            &key,
+            &body,
+            timestamp,
+            failed_replicas,
+            reason,
+        ) {
+            tracing::error!(%e, failed_count, reason, "post-quorum hint store failed");
+        }
+    }
+}
+
+async fn drain_post_quorum_nts_replica_writes(
+    mut fan_out: FuturesUnordered<NtsReplicaWriteJoin>,
+    hint_store: Option<Arc<crate::hints::HintStore>>,
+    table_id: TableId,
+    key: DecoratedKey,
+    body: Bytes,
+    timestamp: i64,
+    reason: &'static str,
+) {
+    let mut failed_replicas = Vec::new();
+    while let Some(joined) = fan_out.next().await {
+        match joined {
+            Ok((ReplicaResult::Ack { host_id: Some(_) }, _)) => {
+                metrics::inc_post_quorum_remote_ack();
+            }
+            Ok((ReplicaResult::Ack { host_id: None }, _)) => {}
+            Ok((ReplicaResult::Failure { host_id: Some(hid) }, _)) => {
+                metrics::inc_post_quorum_remote_failure();
+                failed_replicas.push(hid);
+            }
+            Ok((ReplicaResult::Failure { host_id: None }, _)) => {}
+            Err(e) => {
+                tracing::warn!(%e, "post-quorum NTS replica write task failed");
+            }
+        }
+    }
+
+    if !failed_replicas.is_empty() {
+        let failed_count = failed_replicas.len();
+        if let Err(e) = ClusterCoordinator::store_hints_with_store(
+            hint_store.as_ref(),
+            &table_id,
+            &key,
+            &body,
+            timestamp,
+            failed_replicas,
+            reason,
+        ) {
+            tracing::error!(%e, failed_count, reason, "post-quorum NTS hint store failed");
         }
     }
 }
@@ -869,6 +1085,18 @@ mod tests {
     fn noop_peer_manager() -> Arc<PeerManager> {
         Arc::new(PeerManager::new(
             Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ))
+    }
+
+    fn short_timeout_peer_manager() -> Arc<PeerManager> {
+        let config = NetConfig {
+            data_lane_timeout: std::time::Duration::from_millis(50),
+            ..NetConfig::default()
+        };
+        Arc::new(PeerManager::new(
+            Arc::new(config),
             Uuid::new_v4(),
             Arc::new(NoopListener),
         ))
@@ -1028,11 +1256,7 @@ mod tests {
 
         let local_node_id = 1u64;
         let remote_down_host_id = Uuid::new_v4();
-        let pm = Arc::new(PeerManager::new(
-            Arc::new(NetConfig::default()),
-            Uuid::new_v4(),
-            Arc::new(NoopListener),
-        ));
+        let pm = short_timeout_peer_manager();
         pm.add_peer_entry((remote_down_host_id, "127.0.0.1:1".parse().unwrap()))
             .await;
 
@@ -1058,7 +1282,8 @@ mod tests {
             storage.clone(),
             3,
             ConsistencyLevel::LocalQuorum,
-        );
+        )
+        .with_hint_store(make_hint_store(dir.path()));
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
@@ -1089,11 +1314,7 @@ mod tests {
             start_rpc_server(MsgType::MutationForward, Arc::new(MutationAckHandler)).await;
 
         let local_node_id = 1u64;
-        let pm = Arc::new(PeerManager::new(
-            Arc::new(NetConfig::default()),
-            Uuid::new_v4(),
-            Arc::new(NoopListener),
-        ));
+        let pm = short_timeout_peer_manager();
 
         let mut ring = TokenRing::new();
         let mut local = make_node("10.0.0.1:7000");
@@ -1320,19 +1541,15 @@ mod tests {
             let remote_uuid_3 = Uuid::new_v4();
 
             // Add peer entries (no real pool — send() will fail).
-            let pm = Arc::new(PeerManager::new(
-                Arc::new(NetConfig::default()),
-                Uuid::new_v4(),
-                Arc::new(NoopListener),
-            ));
-            pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            let pm = short_timeout_peer_manager();
+            pm.add_peer_entry((remote_uuid_2, "127.0.0.1:9".parse().unwrap()))
                 .await;
-            pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+            pm.add_peer_entry((remote_uuid_3, "127.0.0.1:10".parse().unwrap()))
                 .await;
 
-            let mut node2 = make_node("10.0.0.2:7000");
+            let mut node2 = make_node("127.0.0.1:9");
             node2.host_id = remote_uuid_2;
-            let mut node3 = make_node("10.0.0.3:7000");
+            let mut node3 = make_node("127.0.0.1:10");
             node3.host_id = remote_uuid_3;
 
             let mut ring = TokenRing::new();
@@ -1351,7 +1568,8 @@ mod tests {
                 storage.clone(),
                 3, // RF=3
                 ConsistencyLevel::Quorum,
-            );
+            )
+            .with_hint_store(make_hint_store(dir.path()));
 
             let table_id = TableId::new("test_ks", "test_tbl");
             let key = test_key();
@@ -1395,19 +1613,15 @@ mod tests {
             let remote_uuid_2 = Uuid::new_v4();
             let remote_uuid_3 = Uuid::new_v4();
 
-            let pm = Arc::new(PeerManager::new(
-                Arc::new(NetConfig::default()),
-                Uuid::new_v4(),
-                Arc::new(NoopListener),
-            ));
-            pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            let pm = short_timeout_peer_manager();
+            pm.add_peer_entry((remote_uuid_2, "127.0.0.1:9".parse().unwrap()))
                 .await;
-            pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+            pm.add_peer_entry((remote_uuid_3, "127.0.0.1:10".parse().unwrap()))
                 .await;
 
-            let mut node2 = make_node("10.0.0.2:7000");
+            let mut node2 = make_node("127.0.0.1:9");
             node2.host_id = remote_uuid_2;
-            let mut node3 = make_node("10.0.0.3:7000");
+            let mut node3 = make_node("127.0.0.1:10");
             node3.host_id = remote_uuid_3;
 
             let mut ring = TokenRing::new();
@@ -1425,7 +1639,8 @@ mod tests {
                 storage.clone(),
                 3,                     // RF=3
                 ConsistencyLevel::One, // only 1 ACK needed
-            );
+            )
+            .with_hint_store(make_hint_store(dir.path()));
 
             let table_id = TableId::new("test_ks", "test_tbl");
             let key = test_key();
@@ -1455,6 +1670,24 @@ mod tests {
         Arc::new(HintStore::new(config).unwrap())
     }
 
+    async fn wait_for_pending_hint_count(
+        hint_store: &crate::hints::HintStore,
+        peer: Uuid,
+        expected: usize,
+    ) {
+        for _ in 0..50 {
+            if hint_store.pending_count(peer) == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            hint_store.pending_count(peer),
+            expected,
+            "peer {peer} should eventually have {expected} pending hint(s)"
+        );
+    }
+
     /// 3-node ring (local=1, remote=2, remote=3), RF=3, CL=QUORUM.
     /// Remote replicas have no real connection, so they fail.
     /// Local ACK (1) + 0 remote = WriteTimeout.
@@ -1481,14 +1714,14 @@ mod tests {
         ));
         // Register the peer entries so the ring can resolve host_ids,
         // but there are no real connections — sends will fail.
-        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+        pm.add_peer_entry((remote_uuid_2, "127.0.0.1:9".parse().unwrap()))
             .await;
-        pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+        pm.add_peer_entry((remote_uuid_3, "127.0.0.1:10".parse().unwrap()))
             .await;
 
-        let mut node2 = make_node("10.0.0.2:7000");
+        let mut node2 = make_node("127.0.0.1:9");
         node2.host_id = remote_uuid_2;
-        let mut node3 = make_node("10.0.0.3:7000");
+        let mut node3 = make_node("127.0.0.1:10");
         node3.host_id = remote_uuid_3;
 
         let mut ring = TokenRing::new();
@@ -1521,17 +1754,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Both failed remote replicas should each have exactly 1 pending hint.
-        assert_eq!(
-            hint_store.pending_count(remote_uuid_2),
-            1,
-            "remote_2 should have 1 hint"
-        );
-        assert_eq!(
-            hint_store.pending_count(remote_uuid_3),
-            1,
-            "remote_3 should have 1 hint"
-        );
+        // CL=ONE returns before non-required remote writes finish. The
+        // post-quorum drain stores hints asynchronously for real remote
+        // failures, so assert eventual visibility instead of immediate writes.
+        wait_for_pending_hint_count(&hint_store, remote_uuid_2, 1).await;
+        wait_for_pending_hint_count(&hint_store, remote_uuid_3, 1).await;
     }
 
     /// 3-node ring, RF=3, CL=QUORUM (required=2).
@@ -1554,14 +1781,14 @@ mod tests {
             Uuid::new_v4(),
             Arc::new(NoopListener),
         ));
-        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+        pm.add_peer_entry((remote_uuid_2, "127.0.0.1:9".parse().unwrap()))
             .await;
-        pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+        pm.add_peer_entry((remote_uuid_3, "127.0.0.1:10".parse().unwrap()))
             .await;
 
-        let mut node2 = make_node("10.0.0.2:7000");
+        let mut node2 = make_node("127.0.0.1:9");
         node2.host_id = remote_uuid_2;
-        let mut node3 = make_node("10.0.0.3:7000");
+        let mut node3 = make_node("127.0.0.1:10");
         node3.host_id = remote_uuid_3;
 
         let mut ring = TokenRing::new();
@@ -1628,9 +1855,9 @@ mod tests {
         let mut local_info = make_node("10.0.0.1:7000");
         local_info.data_center = "dc1".to_string();
 
-        let mut node2 = make_node("10.0.0.2:7000");
+        let mut node2 = make_node("127.0.0.1:9");
         node2.data_center = "dc1".to_string();
-        let mut node3 = make_node("10.0.0.3:7000");
+        let mut node3 = make_node("127.0.0.1:10");
         node3.data_center = "dc2".to_string();
 
         let mut ring = TokenRing::new();
@@ -1643,12 +1870,13 @@ mod tests {
 
         let coordinator = ClusterCoordinator::new(
             Arc::new(ArcSwap::from_pointee(ring)),
-            noop_peer_manager(),
+            short_timeout_peer_manager(),
             local_node_id,
             storage.clone(),
             3,
             ConsistencyLevel::LocalQuorum,
-        );
+        )
+        .with_hint_store(make_hint_store(dir.path()));
 
         let dc_rf = std::collections::HashMap::from([
             ("dc1".to_string(), 2usize),
@@ -1696,7 +1924,7 @@ mod tests {
         let mut local_info = make_node("10.0.0.1:7000");
         local_info.data_center = "dc1".to_string();
         let remote_uuid = Uuid::new_v4();
-        let mut remote_info = make_node("10.0.0.2:7000");
+        let mut remote_info = make_node("127.0.0.1:9");
         remote_info.data_center = "dc2".to_string();
         remote_info.host_id = remote_uuid;
 
@@ -1706,12 +1934,8 @@ mod tests {
         ring.assign_tokens(local_node_id, &[100]);
         ring.assign_tokens(2, &[200]);
 
-        let pm = Arc::new(PeerManager::new(
-            Arc::new(NetConfig::default()),
-            Uuid::new_v4(),
-            Arc::new(NoopListener),
-        ));
-        pm.add_peer_entry((remote_uuid, "10.0.0.2:7000".parse().unwrap()))
+        let pm = short_timeout_peer_manager();
+        pm.add_peer_entry((remote_uuid, "127.0.0.1:9".parse().unwrap()))
             .await;
 
         let coordinator = ClusterCoordinator::new(
@@ -1721,7 +1945,8 @@ mod tests {
             storage.clone(),
             2,
             ConsistencyLevel::EachQuorum,
-        );
+        )
+        .with_hint_store(make_hint_store(dir.path()));
 
         let dc_rf = std::collections::HashMap::from([
             ("dc1".to_string(), 1usize),
@@ -1831,16 +2056,12 @@ mod tests {
 
         let local_node_id = 1u64;
         let remote_uuid = Uuid::new_v4();
-        let mut node2 = make_node("10.0.0.2:7000");
+        let mut node2 = make_node("127.0.0.1:9");
         node2.host_id = remote_uuid;
 
         // Add peer entry so PeerManager knows about it, but no real connection
-        let pm = Arc::new(PeerManager::new(
-            Arc::new(NetConfig::default()),
-            Uuid::new_v4(),
-            Arc::new(NoopListener),
-        ));
-        pm.add_peer_entry((remote_uuid, "10.0.0.2:7000".parse().unwrap()))
+        let pm = short_timeout_peer_manager();
+        pm.add_peer_entry((remote_uuid, "127.0.0.1:9".parse().unwrap()))
             .await;
 
         let mut ring = TokenRing::new();
@@ -1856,7 +2077,8 @@ mod tests {
             storage.clone(),
             2, // RF=2 — requires both nodes
             ConsistencyLevel::All,
-        );
+        )
+        .with_hint_store(make_hint_store(dir.path()));
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();

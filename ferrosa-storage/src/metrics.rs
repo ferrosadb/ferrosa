@@ -221,6 +221,45 @@ const WRITE_PHASES: [WritePhase; 7] = [
     WritePhase::Total,
 ];
 
+#[derive(Clone, Copy)]
+pub enum WriteFailureReason {
+    DiskReserve,
+    MemtableBackpressure,
+    TableMissing,
+    CommitLogAppend,
+    MemtableWrite,
+}
+
+impl WriteFailureReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DiskReserve => "disk_reserve",
+            Self::MemtableBackpressure => "memtable_backpressure",
+            Self::TableMissing => "table_missing",
+            Self::CommitLogAppend => "commitlog_append",
+            Self::MemtableWrite => "memtable_write",
+        }
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            Self::DiskReserve => 0,
+            Self::MemtableBackpressure => 1,
+            Self::TableMissing => 2,
+            Self::CommitLogAppend => 3,
+            Self::MemtableWrite => 4,
+        }
+    }
+}
+
+const WRITE_FAILURE_REASONS: [WriteFailureReason; 5] = [
+    WriteFailureReason::DiskReserve,
+    WriteFailureReason::MemtableBackpressure,
+    WriteFailureReason::TableMissing,
+    WriteFailureReason::CommitLogAppend,
+    WriteFailureReason::MemtableWrite,
+];
+
 static FLUSH_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSH_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -267,7 +306,11 @@ static WRITE_PHASE_MICROS_MAX: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]
 static WRITE_PHASE_COUNT_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static WRITE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_FAILURE_REASON_TOTAL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static WRITE_INLINE_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
+static MEMTABLE_SIZE_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static MEMTABLE_FLUSH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(0);
+static MEMTABLE_BACKPRESSURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static READ_LIMITED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_FOUND_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -418,8 +461,22 @@ pub fn inc_write_failure() {
     WRITE_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn inc_write_failure_reason(reason: WriteFailureReason) {
+    WRITE_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    WRITE_FAILURE_REASON_TOTAL[reason.idx()].fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn inc_write_inline_flush() {
     WRITE_INLINE_FLUSH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_memtable_thresholds(flush_threshold_bytes: u64, backpressure_bytes: u64) {
+    MEMTABLE_FLUSH_THRESHOLD_BYTES.store(flush_threshold_bytes, Ordering::Relaxed);
+    MEMTABLE_BACKPRESSURE_BYTES.store(backpressure_bytes, Ordering::Relaxed);
+}
+
+pub fn observe_memtable_size(size_bytes: u64) {
+    update_max_u64(&MEMTABLE_SIZE_BYTES_MAX, size_bytes);
 }
 
 pub fn observe_read_limited_rows(
@@ -461,11 +518,38 @@ pub fn render_prometheus() -> String {
         "ferrosa_storage_write_failures_total {}\n",
         WRITE_FAILURE_TOTAL.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP ferrosa_storage_write_failures_by_reason_total StorageEngine::write failures partitioned by the admission or write phase that failed.\n");
+    out.push_str("# TYPE ferrosa_storage_write_failures_by_reason_total counter\n");
+    for reason in WRITE_FAILURE_REASONS {
+        out.push_str(&format!(
+            "ferrosa_storage_write_failures_by_reason_total{{reason=\"{}\"}} {}\n",
+            reason.label(),
+            WRITE_FAILURE_REASON_TOTAL[reason.idx()].load(Ordering::Relaxed)
+        ));
+    }
     out.push_str("# HELP ferrosa_storage_write_inline_flush_total StorageEngine::write calls that synchronously ran a memtable flush.\n");
     out.push_str("# TYPE ferrosa_storage_write_inline_flush_total counter\n");
     out.push_str(&format!(
         "ferrosa_storage_write_inline_flush_total {}\n",
         WRITE_INLINE_FLUSH_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_memtable_size_bytes_max Maximum observed active memtable size across write admission checks.\n");
+    out.push_str("# TYPE ferrosa_storage_memtable_size_bytes_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_memtable_size_bytes_max {}\n",
+        MEMTABLE_SIZE_BYTES_MAX.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_memtable_flush_threshold_bytes Configured memtable flush request threshold.\n");
+    out.push_str("# TYPE ferrosa_storage_memtable_flush_threshold_bytes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_memtable_flush_threshold_bytes {}\n",
+        MEMTABLE_FLUSH_THRESHOLD_BYTES.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_memtable_backpressure_bytes Configured hard memtable write backpressure threshold.\n");
+    out.push_str("# TYPE ferrosa_storage_memtable_backpressure_bytes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_memtable_backpressure_bytes {}\n",
+        MEMTABLE_BACKPRESSURE_BYTES.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_write_phase_seconds_total Total wall time spent in StorageEngine::write phases.\n");
     out.push_str("# TYPE ferrosa_storage_write_phase_seconds_total counter\n");
@@ -1173,6 +1257,8 @@ mod tests {
         observe_flush_output(1024, 10, 2);
         observe_upload_phase(UploadPhase::SyncAwait, Duration::from_micros(500));
         observe_upload_file(2048, Duration::from_micros(750));
+        set_memtable_thresholds(4096, 16384);
+        observe_memtable_size(8192);
 
         let text = render_prometheus();
         assert!(text.contains("ferrosa_storage_flushes_total"));
@@ -1183,5 +1269,8 @@ mod tests {
         assert!(text.contains("ferrosa_storage_upload_phase_seconds_total{phase=\"sync_await\"}"));
         assert!(text.contains("ferrosa_storage_upload_phase_total{phase=\"file_put\"}"));
         assert!(text.contains("ferrosa_storage_upload_bytes_total"));
+        assert!(text.contains("ferrosa_storage_memtable_size_bytes_max 8192"));
+        assert!(text.contains("ferrosa_storage_memtable_flush_threshold_bytes 4096"));
+        assert!(text.contains("ferrosa_storage_memtable_backpressure_bytes 16384"));
     }
 }

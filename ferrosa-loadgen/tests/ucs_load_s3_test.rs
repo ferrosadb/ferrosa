@@ -35,6 +35,10 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         allow_http: true,
         prefix: format!("test-{}", uuid::Uuid::new_v4()),
         upload_queue_depth: 8,
+        upload_workers: 8,
+        compaction_upload_workers: 4,
+        compaction_upload_queue_depth: 8,
+        delete_workers: 2,
     };
 
     StorageEngineConfig {

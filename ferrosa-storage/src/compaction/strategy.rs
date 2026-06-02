@@ -155,29 +155,44 @@ impl CompactionStrategy for SizeTieredStrategy {
             if bucket.len() >= self.config.min_threshold {
                 let mut input_bytes = 0_u64;
                 let mut inputs = Vec::new();
-                for sstable in bucket.into_iter().take(self.config.max_threshold) {
+                for sstable in bucket {
                     let next_bytes = input_bytes.saturating_add(sstable.size_bytes);
                     if !inputs.is_empty() && next_bytes > self.config.max_compaction_bytes {
-                        break;
+                        if inputs.len() >= self.config.min_threshold {
+                            tasks.push(CompactionTask {
+                                inputs: std::mem::take(&mut inputs),
+                                output_dir: self.config.output_dir.join(table_id.to_string()),
+                                schema: schema.clone(),
+                                table_id: table_id.clone(),
+                            });
+                        } else {
+                            inputs.clear();
+                        }
+                        input_bytes = 0;
                     }
-                    input_bytes = next_bytes;
+
+                    input_bytes = input_bytes.saturating_add(sstable.size_bytes);
                     inputs.push(sstable.clone());
+
+                    if inputs.len() >= self.config.max_threshold {
+                        tasks.push(CompactionTask {
+                            inputs: std::mem::take(&mut inputs),
+                            output_dir: self.config.output_dir.join(table_id.to_string()),
+                            schema: schema.clone(),
+                            table_id: table_id.clone(),
+                        });
+                        input_bytes = 0;
+                    }
                 }
 
-                if inputs.len() < self.config.min_threshold {
-                    continue;
+                if inputs.len() >= self.config.min_threshold {
+                    tasks.push(CompactionTask {
+                        inputs,
+                        output_dir: self.config.output_dir.join(table_id.to_string()),
+                        schema: schema.clone(),
+                        table_id: table_id.clone(),
+                    });
                 }
-
-                // Use per-table subdirectory to prevent generation collisions
-                // between concurrent compactions of different tables. Without
-                // this, two tasks scanning the same shared directory both get
-                // the same max_gen and overwrite each other's output.
-                tasks.push(CompactionTask {
-                    inputs,
-                    output_dir: self.config.output_dir.join(table_id.to_string()),
-                    schema: schema.clone(),
-                    table_id: table_id.clone(),
-                });
             }
         }
 
@@ -199,7 +214,6 @@ fn bucket_median(bucket: &[&SSTableMetadata]) -> f64 {
         sizes[mid] as f64
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,8 +325,9 @@ mod tests {
         ];
 
         let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].inputs.len(), 3); // capped at max_threshold
+        assert_eq!(tasks[1].inputs.len(), 2); // remaining non-overlapping inputs compact too
     }
 
     #[test]
@@ -325,14 +340,42 @@ mod tests {
 
         let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
 
-        assert_eq!(tasks.len(), 1);
-        let input_bytes: u64 = tasks[0].inputs.iter().map(|input| input.size_bytes).sum();
-        assert!(
-            input_bytes <= 512 * 1024 * 1024,
-            "selected {} bytes across {} inputs; compaction must stay below the per-task byte cap to avoid container OOM",
-            input_bytes,
-            tasks[0].inputs.len()
-        );
+        assert!(tasks.len() > 1);
+        for task in &tasks {
+            let input_bytes: u64 = task.inputs.iter().map(|input| input.size_bytes).sum();
+            assert!(
+                input_bytes <= 512 * 1024 * 1024,
+                "selected {} bytes across {} inputs; compaction must stay below the per-task byte cap to avoid container OOM",
+                input_bytes,
+                task.inputs.len()
+            );
+        }
+    }
+
+    #[test]
+    fn large_bucket_emits_non_overlapping_parallel_tasks() {
+        let config = CompactionConfig {
+            min_threshold: 2,
+            max_threshold: 4,
+            ..test_config()
+        };
+        let strategy = SizeTieredStrategy::new(config);
+        let sstables: Vec<_> = (0..8)
+            .map(|idx| make_metadata(&format!("sst-{idx}"), 1000 + idx))
+            .collect();
+
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+
+        assert_eq!(tasks.len(), 2);
+        let mut seen = std::collections::HashSet::new();
+        for input in tasks.iter().flat_map(|task| task.inputs.iter()) {
+            assert!(
+                seen.insert(input.id.clone()),
+                "input scheduled twice: {}",
+                input.id
+            );
+        }
+        assert_eq!(seen.len(), 8);
     }
 
     #[test]

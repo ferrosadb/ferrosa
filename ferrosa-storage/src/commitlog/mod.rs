@@ -29,7 +29,10 @@ pub(crate) mod reader;
 pub(crate) mod segment;
 pub(crate) mod sync;
 
-pub use config::{ArchiveConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
+pub use config::{
+    ArchiveConfig, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig,
+    TableId,
+};
 pub use mutation::Mutation;
 
 use std::collections::HashSet;
@@ -69,6 +72,7 @@ pub fn empty_segment_skipped_total() -> u64 {
 /// Renders commit-log counters in Prometheus exposition format.
 pub fn render_prometheus() -> String {
     let flush = segment::flush_metrics();
+    let sync_batch = sync::sync_batch_metrics();
     let mut out = String::new();
     out.push_str("# HELP ferrosa_commitlog_appends_total Total commit-log appends.\n");
     out.push_str("# TYPE ferrosa_commitlog_appends_total counter\n");
@@ -138,6 +142,48 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_commitlog_periodic_idle_flushes_skipped_total {}\n",
         sync::periodic_idle_flush_skipped_total()
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_batches_total Commit-log sync batches flushed.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_batches_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_batches_total {}\n",
+        sync_batch.batches
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_batch_writes_total Commit-log writes included in sync batches.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_batch_writes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_batch_writes_total {}\n",
+        sync_batch.writes
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_batch_bytes_total Commit-log bytes included in sync batches.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_batch_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_batch_bytes_total {}\n",
+        sync_batch.bytes
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_batch_wait_seconds_total Total time sync batches stayed open before flush.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_batch_wait_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_batch_wait_seconds_total {:.9}\n",
+        sync_batch.wait_micros_total as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_batch_wait_seconds_max Maximum time a sync batch stayed open before flush.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_batch_wait_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_batch_wait_seconds_max {:.9}\n",
+        sync_batch.wait_micros_max as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_pending_writes Commit-log writes currently waiting for sync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_pending_writes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_pending_writes {}\n",
+        sync_batch.pending_writes
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_pending_bytes Commit-log bytes currently waiting for sync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_pending_bytes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_pending_bytes {}\n",
+        sync_batch.pending_bytes
     ));
     out.push_str("# HELP ferrosa_commitlog_empty_segments_skipped_total Empty or torn commit-log segments skipped during replay.\n");
     out.push_str("# TYPE ferrosa_commitlog_empty_segments_skipped_total counter\n");
@@ -434,7 +480,8 @@ impl CommitLog {
         segment.mark_table_dirty(&table_id, position);
 
         // Notify sync strategy.
-        self.sync_strategy.on_write(&segment, offset);
+        self.sync_strategy
+            .on_write(&segment, offset, total_size as u64);
 
         Ok(position)
     }
@@ -487,7 +534,8 @@ impl CommitLog {
         COMMITLOG_APPEND_BYTES_TOTAL.fetch_add(total_size as u64, Ordering::Relaxed);
 
         segment.mark_table_dirty(table_id, position);
-        self.sync_strategy.on_write(&segment, offset);
+        self.sync_strategy
+            .on_write(&segment, offset, total_size as u64);
 
         Ok(position)
     }
@@ -834,7 +882,11 @@ impl CommitLog {
                     let seg = active_ref.load();
                     seg.flush_to_disk()
                 });
-                Box::new(PeriodicSync::new(*sync_interval, flush_callback))
+                Box::new(PeriodicSync::with_batch(
+                    *sync_interval,
+                    config.batch.clone(),
+                    flush_callback,
+                ))
             }
             SyncStrategyConfig::Group { max_wait } => {
                 let active_ref = Arc::clone(&active);
@@ -842,7 +894,11 @@ impl CommitLog {
                     let seg = active_ref.load();
                     seg.flush_to_disk()
                 });
-                Box::new(GroupSync::new(*max_wait, flush_callback))
+                Box::new(GroupSync::with_batch(
+                    *max_wait,
+                    config.batch.clone(),
+                    flush_callback,
+                ))
             }
         }
     }

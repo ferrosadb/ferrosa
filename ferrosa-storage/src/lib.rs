@@ -44,7 +44,8 @@ pub use batchlog::{BatchlogConfig, BatchlogEntry, BatchlogManager};
 pub use cache::LocalCache;
 pub use commitlog::cdc::CdcReader;
 pub use commitlog::{
-    CommitLog, CommitLogConfig, CommitLogPosition, Mutation, SyncStrategyConfig, TableId,
+    CommitLog, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, Mutation,
+    SyncStrategyConfig, TableId,
 };
 pub use compaction::{
     CompactionConfig, CompactionExecutor, CompactionStrategy, SizeTieredStrategy,

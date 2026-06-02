@@ -36,7 +36,18 @@ static LANE_STREAM_CAPACITY: [AtomicUsize; 3] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
 ];
+static LANE_PENDING_STREAM_DEPTH: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+static LANE_PENDING_STREAM_DEPTH_MAX: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 static DATA_LANE_REJECTED: AtomicU64 = AtomicU64::new(0);
+static DATA_LANE_CAP_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static DATA_LANE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static DATA_LANE_ACTIVE_MAX: AtomicUsize = AtomicUsize::new(0);
 static DATA_LANE_MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(DEFAULT_DATA_LANE_MAX_IN_FLIGHT);
@@ -92,6 +103,12 @@ pub fn record_lane_stream_wait(lane: Lane, wait: Duration, capacity: usize) {
     update_max_u64(&LANE_STREAM_WAIT_MAX_NS[index], nanos);
 }
 
+pub fn observe_lane_pending_streams(lane: Lane, depth: usize) {
+    let index = lane.index();
+    LANE_PENDING_STREAM_DEPTH[index].store(depth, Ordering::Relaxed);
+    update_max_usize(&LANE_PENDING_STREAM_DEPTH_MAX[index], depth);
+}
+
 pub fn try_start_rpc(lane: Lane, data_lane_max_in_flight: usize) -> bool {
     if lane == Lane::Data {
         let cap = data_lane_max_in_flight.max(1);
@@ -99,7 +116,7 @@ pub fn try_start_rpc(lane: Lane, data_lane_max_in_flight: usize) -> bool {
         let mut current = DATA_LANE_ACTIVE.load(Ordering::Relaxed);
         loop {
             if current >= cap {
-                DATA_LANE_REJECTED.fetch_add(1, Ordering::Relaxed);
+                DATA_LANE_CAP_BLOCKED.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             match DATA_LANE_ACTIVE.compare_exchange_weak(
@@ -121,6 +138,10 @@ pub fn try_start_rpc(lane: Lane, data_lane_max_in_flight: usize) -> bool {
     let in_flight = RPC_IN_FLIGHT[lane.index()].fetch_add(1, Ordering::Relaxed) + 1;
     update_max_i64(&RPC_IN_FLIGHT_MAX[lane.index()], in_flight);
     true
+}
+
+pub fn record_data_lane_rejected() {
+    DATA_LANE_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn finish_rpc(lane: Lane) {
@@ -172,6 +193,10 @@ pub fn render_prometheus() -> String {
     output.push_str("# TYPE ferrosa_net_lane_stream_wait_seconds_max gauge\n");
     output.push_str("# HELP ferrosa_net_lane_stream_capacity Configured max in-flight request/response RPCs per peer lane.\n");
     output.push_str("# TYPE ferrosa_net_lane_stream_capacity gauge\n");
+    output.push_str("# HELP ferrosa_net_lane_pending_stream_depth Pending request/response RPCs waiting inside each lane actor.\n");
+    output.push_str("# TYPE ferrosa_net_lane_pending_stream_depth gauge\n");
+    output.push_str("# HELP ferrosa_net_lane_pending_stream_depth_max Maximum pending request/response RPCs observed inside each lane actor.\n");
+    output.push_str("# TYPE ferrosa_net_lane_pending_stream_depth_max gauge\n");
 
     for lane in LANES {
         let label = lane.as_str();
@@ -224,6 +249,14 @@ pub fn render_prometheus() -> String {
             "ferrosa_net_lane_stream_capacity{{lane=\"{label}\"}} {}\n",
             LANE_STREAM_CAPACITY[index].load(Ordering::Relaxed)
         ));
+        output.push_str(&format!(
+            "ferrosa_net_lane_pending_stream_depth{{lane=\"{label}\"}} {}\n",
+            LANE_PENDING_STREAM_DEPTH[index].load(Ordering::Relaxed)
+        ));
+        output.push_str(&format!(
+            "ferrosa_net_lane_pending_stream_depth_max{{lane=\"{label}\"}} {}\n",
+            LANE_PENDING_STREAM_DEPTH_MAX[index].load(Ordering::Relaxed)
+        ));
     }
 
     output.push_str("# HELP ferrosa_net_data_lane_rejected_total Data lane RPCs rejected by local backpressure.\n");
@@ -231,6 +264,12 @@ pub fn render_prometheus() -> String {
     output.push_str(&format!(
         "ferrosa_net_data_lane_rejected_total {}\n",
         DATA_LANE_REJECTED.load(Ordering::Relaxed)
+    ));
+    output.push_str("# HELP ferrosa_net_data_lane_cap_blocked_total Data lane dispatch attempts delayed by the process-wide in-flight cap.\n");
+    output.push_str("# TYPE ferrosa_net_data_lane_cap_blocked_total counter\n");
+    output.push_str(&format!(
+        "ferrosa_net_data_lane_cap_blocked_total {}\n",
+        DATA_LANE_CAP_BLOCKED.load(Ordering::Relaxed)
     ));
     output.push_str("# HELP ferrosa_net_data_lane_max_in_flight Configured process-wide data lane in-flight cap.\n");
     output.push_str("# TYPE ferrosa_net_data_lane_max_in_flight gauge\n");

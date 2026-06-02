@@ -1103,16 +1103,61 @@ impl ModeController {
             self.registry.register(MsgType::BootstrapComplete, handler);
         }
 
-        // Spawn periodic maintenance loop for memory-bounded data structures.
-        // Runs every 60s and prunes applied Accord transactions, expired
-        // DepWaitGraph entries, and logs memory usage for leak detection.
+        // Spawn periodic maintenance loop for memory-bounded data structures
+        // and storage drain work requested by foreground writes.
         {
             let storage = self.storage.clone();
             let accord_state = accord_state_for_maintenance;
             self.spawn_tracked(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                let urgent_flush_interval_millis =
+                    std::env::var("FERROSA_URGENT_FLUSH_INTERVAL_MILLIS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(100u64)
+                        .max(1);
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                    urgent_flush_interval_millis,
+                ));
+                let mut ticks = 0u64;
                 loop {
                     interval.tick().await;
+                    ticks = ticks.wrapping_add(1);
+
+                    if storage.take_flush_request() {
+                        let storage_for_flush = storage.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            storage_for_flush.flush_if_needed()
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!(
+                                %e,
+                                "maintenance: requested storage flush failed"
+                            ),
+                            Err(e) => tracing::warn!(
+                                %e,
+                                "maintenance: requested storage flush task failed"
+                            ),
+                        }
+                    }
+
+                    if storage.take_s3_sync_request() {
+                        match storage.sync_sstables_to_s3().await {
+                            Ok(uploaded) => {
+                                if uploaded > 0 {
+                                    tracing::info!(
+                                        uploaded,
+                                        "maintenance: uploaded queued SSTables to S3"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                %e,
+                                "maintenance: requested S3 SSTable sync failed"
+                            ),
+                        }
+                    }
 
                     // Log closed-segment buffer memory (P0 OOM regression detector).
                     let closed_buf_bytes = storage.closed_segment_buffer_bytes();
@@ -1123,25 +1168,31 @@ impl ModeController {
                         );
                     }
 
-                    // Prune applied Accord transactions to prevent unbounded
-                    // memory growth in txn_states and committed_txns.
-                    let pruned = {
-                        let mut sm = accord_state.lock();
-                        sm.prune_applied()
-                    };
-                    if pruned > 0 {
-                        tracing::info!(pruned, "maintenance: pruned applied Accord transactions");
-                    }
+                    let prune_ticks = (60_000u64 / urgent_flush_interval_millis).max(1);
+                    if ticks % prune_ticks == 0 {
+                        // Prune applied Accord transactions to prevent unbounded
+                        // memory growth in txn_states and committed_txns.
+                        let pruned = {
+                            let mut sm = accord_state.lock();
+                            sm.prune_applied()
+                        };
+                        if pruned > 0 {
+                            tracing::info!(
+                                pruned,
+                                "maintenance: pruned applied Accord transactions"
+                            );
+                        }
 
-                    // Log table-level memory stats.
-                    let table_count = storage.table_count();
-                    let accord_txns = accord_state.lock().txn_count();
-                    tracing::info!(
-                        table_count,
-                        closed_buf_bytes,
-                        accord_txns,
-                        "maintenance: periodic memory check"
-                    );
+                        // Log table-level memory stats.
+                        let table_count = storage.table_count();
+                        let accord_txns = accord_state.lock().txn_count();
+                        tracing::info!(
+                            table_count,
+                            closed_buf_bytes,
+                            accord_txns,
+                            "maintenance: periodic memory check"
+                        );
+                    }
                 }
             });
         }

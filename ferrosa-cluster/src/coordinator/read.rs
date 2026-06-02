@@ -748,7 +748,9 @@ impl ClusterCoordinator {
             if let Some(ref partition) = result_partition {
                 send_repair_writes(
                     &self.peer_manager,
+                    self.storage.as_ref(),
                     &self.repair_metrics,
+                    self.local_host_id(),
                     table_id,
                     partition,
                     &stale_host_ids,
@@ -773,12 +775,21 @@ impl ClusterCoordinator {
     ) {
         send_repair_writes(
             &self.peer_manager,
+            self.storage.as_ref(),
             &self.repair_metrics,
+            self.local_host_id(),
             table_id,
             partition,
             stale_host_ids,
         )
         .await;
+    }
+
+    fn local_host_id(&self) -> Option<uuid::Uuid> {
+        self.ring
+            .load()
+            .get_node(self.local_node_id)
+            .map(|info| info.host_id)
     }
 
     // -----------------------------------------------------------------------
@@ -1393,7 +1404,9 @@ use super::metrics::ReadRepairMetrics;
 /// and counted but do not fail the read.
 async fn send_repair_writes(
     peer_manager: &PeerManager,
+    storage: &ferrosa_storage::engine::StorageEngine,
     metrics: &ReadRepairMetrics,
+    local_host_id: Option<uuid::Uuid>,
     table_id: &TableId,
     partition: &Partition,
     stale_host_ids: &[uuid::Uuid],
@@ -1414,6 +1427,33 @@ async fn send_repair_writes(
 
     for &host_id in stale_host_ids {
         metrics.inc_attempted();
+        if Some(host_id) == local_host_id {
+            let mut failed = None;
+            for row in mutation.rows.iter().cloned() {
+                if let Err(e) = storage.write(table_id, &mutation.key, row, mutation.timestamp) {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            if let Some(e) = failed {
+                tracing::warn!(
+                    %host_id,
+                    table = %table_id,
+                    %e,
+                    "local read repair failed"
+                );
+                metrics.inc_failed();
+            } else {
+                tracing::info!(
+                    %host_id,
+                    table = %table_id,
+                    "local read repair succeeded"
+                );
+                metrics.inc_succeeded();
+            }
+            continue;
+        }
+
         match peer_manager
             .fire(host_id, Message::RepairWrite(body.clone()), Lane::Data)
             .await
@@ -2360,6 +2400,62 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(attempted, 1, "should attempt repair for 1 stale replica");
         assert_eq!(failed, 1, "should fail when peer is unreachable");
+    }
+
+    #[tokio::test]
+    async fn repair_stale_replicas_applies_local_stale_replica_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let local_host_id = Uuid::new_v4();
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.host_id = local_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(1000)],
+        };
+
+        coordinator
+            .repair_stale_replicas(&table_id, &partition, &[local_host_id])
+            .await;
+
+        let attempted = coordinator
+            .repair_metrics
+            .read_repairs_attempted
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let succeeded = coordinator
+            .repair_metrics
+            .read_repairs_succeeded
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let failed = coordinator
+            .repair_metrics
+            .read_repairs_failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(attempted, 1);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 0);
+        assert!(
+            storage.read(&table_id, &key).unwrap().is_some(),
+            "local repair should write directly to storage"
+        );
     }
 
     /// Verify that the coordinate_read_with code path that calls

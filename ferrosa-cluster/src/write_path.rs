@@ -647,13 +647,15 @@ mod tests {
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         use ferrosa_storage::{
-            CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
+            CommitLogBatchConfig, CommitLogConfig, CompactionConfig, StorageEngineConfig,
+            SyncStrategyConfig,
         };
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
                 segment_size: 4096,
                 max_segment_age: std::time::Duration::from_secs(60),
                 sync_strategy: SyncStrategyConfig::Batch,
+                batch: CommitLogBatchConfig::default(),
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
                 archive: None,

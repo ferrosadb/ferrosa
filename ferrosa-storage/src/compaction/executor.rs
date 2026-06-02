@@ -12,6 +12,8 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
+use crate::upload::manager::SstableComponentBytes;
+
 use super::metadata::{CompactionTask, SSTableMetadata};
 
 struct QueuedCompactionTask {
@@ -26,6 +28,27 @@ pub struct CompactionResult {
     pub task: CompactionTask,
     /// Metadata for the newly-created output SSTable.
     pub output: SSTableMetadata,
+    /// Finished SSTable components captured before the local file flush.
+    ///
+    /// The storage engine still promotes the local files for the current
+    /// file-backed read path, but these bytes allow compaction output to be
+    /// uploaded to S3 without rereading the just-written components.
+    pub direct_upload: Option<CompactionDirectUpload>,
+}
+
+/// In-memory SSTable components produced by compaction.
+#[derive(Debug, Clone)]
+pub struct CompactionDirectUpload {
+    pub files: Vec<SstableComponentBytes>,
+}
+
+impl CompactionDirectUpload {
+    pub fn total_size_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .map(SstableComponentBytes::size_bytes)
+            .sum()
+    }
 }
 
 /// Runs compaction tasks on a background thread.
@@ -90,7 +113,11 @@ impl CompactionExecutor {
                                 match Self::execute_task(&task) {
                                     Ok(output) => {
                                         crate::metrics::dec_compaction_running();
-                                        let _ = result_tx.send(CompactionResult { task, output });
+                                        let _ = result_tx.send(CompactionResult {
+                                            task,
+                                            output: output.metadata,
+                                            direct_upload: output.direct_upload,
+                                        });
                                     }
                                     Err(e) => {
                                         Self::release_in_flight_inputs(&in_flight_inputs, &task);
@@ -222,7 +249,7 @@ impl CompactionExecutor {
     fn execute_task_observing<F>(
         task: &CompactionTask,
         observe_group_width: F,
-    ) -> std::result::Result<SSTableMetadata, String>
+    ) -> std::result::Result<ExecutedCompaction, String>
     where
         F: FnMut(usize),
     {
@@ -245,14 +272,14 @@ impl CompactionExecutor {
     // synchronously and diff the output against its oracle.
     pub(crate) fn execute_task(
         task: &CompactionTask,
-    ) -> std::result::Result<SSTableMetadata, String> {
+    ) -> std::result::Result<ExecutedCompaction, String> {
         Self::execute_task_inner(task, |_| {})
     }
 
     fn execute_task_inner<F>(
         task: &CompactionTask,
         mut observe_group_width: F,
-    ) -> std::result::Result<SSTableMetadata, String>
+    ) -> std::result::Result<ExecutedCompaction, String>
     where
         F: FnMut(usize),
     {
@@ -581,6 +608,7 @@ impl CompactionExecutor {
             crate::metrics::CompactionPhase::WriterFinish,
             finish_start.elapsed(),
         );
+        let direct_upload = Some(compaction_direct_upload_from_output(&output));
 
         // 4. Write to output directory via FileFlushTarget.
         let flush_target = FileFlushTarget::new_starting_at(task.output_dir.clone())
@@ -671,17 +699,52 @@ impl CompactionExecutor {
             merged_row_count as u64,
             partition_count,
         );
-        Ok(SSTableMetadata {
-            id: output_id,
-            path: task.output_dir.clone(),
-            size_bytes: total_size,
-            min_token,
-            max_token,
-            min_timestamp: header_min_ts,
-            max_timestamp: header_max_ts,
-            partition_count,
+        Ok(ExecutedCompaction {
+            metadata: SSTableMetadata {
+                id: output_id,
+                path: task.output_dir.clone(),
+                size_bytes: total_size,
+                min_token,
+                max_token,
+                min_timestamp: header_min_ts,
+                max_timestamp: header_max_ts,
+                partition_count,
+            },
+            direct_upload,
         })
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutedCompaction {
+    pub metadata: SSTableMetadata,
+    pub direct_upload: Option<CompactionDirectUpload>,
+}
+
+fn compaction_direct_upload_from_output(
+    output: &ferrosa_sstable::writer::SSTableOutput,
+) -> CompactionDirectUpload {
+    let mut files = vec![
+        SstableComponentBytes::new("Data.db", bytes::Bytes::from(output.data.clone())),
+        SstableComponentBytes::new(
+            "Partitions.db",
+            bytes::Bytes::from(output.partitions.clone()),
+        ),
+        SstableComponentBytes::new("Rows.db", bytes::Bytes::from(output.rows.clone())),
+        SstableComponentBytes::new("Filter.db", bytes::Bytes::from(output.filter.clone())),
+        SstableComponentBytes::new(
+            "Statistics.db",
+            bytes::Bytes::from(output.statistics.clone()),
+        ),
+        SstableComponentBytes::new("TOC.txt", bytes::Bytes::from(output.toc.clone())),
+    ];
+    if let Some(compression_info) = &output.compression_info {
+        files.push(SstableComponentBytes::new(
+            "CompressionInfo.db",
+            bytes::Bytes::from(compression_info.clone()),
+        ));
+    }
+    CompactionDirectUpload { files }
 }
 
 /// Build an output `SerializationHeader` from the inputs' own headers
@@ -1164,7 +1227,7 @@ mod tests {
         let result = CompactionExecutor::execute_task(&task);
         assert!(result.is_ok(), "compaction should succeed: {result:?}");
 
-        let meta = result.unwrap();
+        let meta = result.unwrap().metadata;
         assert_eq!(
             meta.partition_count, 10,
             "all 10 partitions must be in output"
@@ -1244,7 +1307,7 @@ mod tests {
         });
 
         assert!(result.is_ok(), "compaction should succeed: {result:?}");
-        let meta = result.unwrap();
+        let meta = result.unwrap().metadata;
         assert_eq!(meta.partition_count, 200);
         assert_eq!(
             max_group_width,
@@ -1316,7 +1379,8 @@ mod tests {
         };
 
         let meta = CompactionExecutor::execute_task(&task)
-            .expect("compaction must remap legacy ordinals before writing current-schema output");
+            .expect("compaction must remap legacy ordinals before writing current-schema output")
+            .metadata;
         assert_eq!(meta.partition_count, 1);
 
         let gen = &meta.id;
