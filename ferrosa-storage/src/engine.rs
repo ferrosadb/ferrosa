@@ -4630,6 +4630,10 @@ impl StorageEngine {
     pub async fn poll_compactions(&self) {
         let results = self.compaction_executor.poll_results();
         for result in results {
+            let _input_claim = CompactionResultInputClaim {
+                executor: &self.compaction_executor,
+                task: &result.task,
+            };
             let input_id_paths: Vec<(String, std::path::PathBuf)> = result
                 .task
                 .inputs
@@ -6159,6 +6163,17 @@ impl StorageEngine {
                 }
             })
             .collect()
+    }
+}
+
+struct CompactionResultInputClaim<'a> {
+    executor: &'a CompactionExecutor,
+    task: &'a crate::compaction::metadata::CompactionTask,
+}
+
+impl Drop for CompactionResultInputClaim<'_> {
+    fn drop(&mut self) {
+        self.executor.release_task_inputs(self.task);
     }
 }
 

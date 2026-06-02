@@ -89,7 +89,6 @@ impl CompactionExecutor {
                                 let task = queued.task;
                                 match Self::execute_task(&task) {
                                     Ok(output) => {
-                                        Self::release_in_flight_inputs(&in_flight_inputs, &task);
                                         crate::metrics::dec_compaction_running();
                                         let _ = result_tx.send(CompactionResult { task, output });
                                     }
@@ -163,6 +162,16 @@ impl CompactionExecutor {
             results.push(result);
         }
         results
+    }
+
+    /// Releases a successful task's inputs after its result has been finalized.
+    ///
+    /// Successful compactions must stay claimed while their result waits in the
+    /// result queue. Otherwise a later flush can schedule the same inputs again,
+    /// and the first finalized result can delete files the duplicate task still
+    /// expects to read.
+    pub fn release_task_inputs(&self, task: &CompactionTask) {
+        Self::release_in_flight_inputs(&self.in_flight_inputs, task);
     }
 
     /// Shuts down the compaction executor, waiting for the background thread.
@@ -863,6 +872,34 @@ mod tests {
         let executor = CompactionExecutor::new();
         executor.shutdown();
         // Should not hang or panic.
+    }
+
+    #[test]
+    fn successful_inputs_remain_claimed_until_result_finalization() {
+        let executor = CompactionExecutor::new();
+        let task = CompactionTask {
+            inputs: vec![make_metadata("a", 1000), make_metadata("b", 2000)],
+            output_dir: PathBuf::from("/tmp/output"),
+            schema: test_table_schema(),
+            table_id: test_table_id(),
+        };
+
+        assert!(CompactionExecutor::try_claim_in_flight_inputs(
+            &executor.in_flight_inputs,
+            &task
+        ));
+        assert!(
+            !CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
+            "overlapping compaction must stay blocked while a completed result waits to be finalized"
+        );
+
+        executor.release_task_inputs(&task);
+        assert!(
+            CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
+            "poll_compactions finalization should release inputs for future compaction"
+        );
+        executor.release_task_inputs(&task);
+        executor.shutdown();
     }
 
     /// Helper: write a real SSTable to disk from partitions.
