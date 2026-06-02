@@ -40,6 +40,7 @@ use std::fs;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use ferrosa_common::key::DecoratedKey;
@@ -55,6 +56,37 @@ use sync::{BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
 
 static COMMITLOG_APPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMMITLOG_APPEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_ALLOC_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_ALLOC_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_ROTATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_ROTATE_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_ROTATE_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_WRITE_ENTRY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_WRITE_ENTRY_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_MARK_DIRTY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_MARK_DIRTY_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn update_max_u64(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn observe_duration(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
+    let micros = duration_micros(duration);
+    total.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(max, micros);
+}
 
 /// Process-wide counter of zero-byte commit-log segment files skipped during
 /// crash recovery. A non-zero value means the writer rolled to a new segment
@@ -85,6 +117,72 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_commitlog_append_bytes_total {}\n",
         COMMITLOG_APPEND_BYTES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_alloc_seconds_total Total wall time spent allocating commit-log entry space.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_alloc_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_alloc_seconds_total {:.9}\n",
+        COMMITLOG_APPEND_ALLOC_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_alloc_seconds_max Maximum wall time spent allocating commit-log entry space.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_alloc_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_alloc_seconds_max {:.9}\n",
+        COMMITLOG_APPEND_ALLOC_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_rotations_total Commit-log appends that had to rotate the active segment inline.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_rotations_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_rotations_total {}\n",
+        COMMITLOG_APPEND_ROTATIONS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_rotate_seconds_total Total wall time appends spent rotating the active segment inline.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_rotate_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_rotate_seconds_total {:.9}\n",
+        COMMITLOG_APPEND_ROTATE_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_rotate_seconds_max Maximum wall time an append spent rotating the active segment inline.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_rotate_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_rotate_seconds_max {:.9}\n",
+        COMMITLOG_APPEND_ROTATE_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_write_entry_seconds_total Total wall time spent serializing commit-log entries into memory.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_write_entry_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_write_entry_seconds_total {:.9}\n",
+        COMMITLOG_APPEND_WRITE_ENTRY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_write_entry_seconds_max Maximum wall time spent serializing one commit-log entry into memory.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_write_entry_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_write_entry_seconds_max {:.9}\n",
+        COMMITLOG_APPEND_WRITE_ENTRY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_mark_dirty_seconds_total Total wall time spent updating commit-log dirty-table tracking.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_mark_dirty_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_mark_dirty_seconds_total {:.9}\n",
+        COMMITLOG_APPEND_MARK_DIRTY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_mark_dirty_seconds_max Maximum wall time spent updating commit-log dirty-table tracking.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_mark_dirty_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_mark_dirty_seconds_max {:.9}\n",
+        COMMITLOG_APPEND_MARK_DIRTY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_sync_notify_seconds_total Total wall time append callers spent in the configured sync strategy notification.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_sync_notify_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_sync_notify_seconds_total {:.9}\n",
+        COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_append_sync_notify_seconds_max Maximum wall time an append caller spent in sync strategy notification.\n");
+    out.push_str("# TYPE ferrosa_commitlog_append_sync_notify_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_append_sync_notify_seconds_max {:.9}\n",
+        COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
     ));
     out.push_str("# HELP ferrosa_commitlog_flushes_total Incremental commit-log flushes.\n");
     out.push_str("# TYPE ferrosa_commitlog_flushes_total counter\n");
@@ -136,6 +234,54 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_commitlog_sync_wait_writers_seconds_max {:.9}\n",
         flush.sync_wait_writers_micros_max as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_file_lock_wait_seconds_total Total wall time commit-log sync spent waiting for the segment file mutex.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_file_lock_wait_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_file_lock_wait_seconds_total {:.9}\n",
+        flush.sync_file_lock_wait_micros_total as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_file_lock_wait_seconds_max Maximum wait for the segment file mutex during commit-log sync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_file_lock_wait_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_file_lock_wait_seconds_max {:.9}\n",
+        flush.sync_file_lock_wait_micros_max as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_write_seconds_total Total wall time spent writing commit-log bytes to the file before sync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_write_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_write_seconds_total {:.9}\n",
+        flush.sync_write_micros_total as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_write_seconds_max Maximum wall time spent writing commit-log bytes to the file before sync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_write_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_write_seconds_max {:.9}\n",
+        flush.sync_write_micros_max as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_data_seconds_total Total wall time spent in commit-log file sync_data/fsync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_data_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_data_seconds_total {:.9}\n",
+        flush.sync_data_micros_total as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_data_seconds_max Maximum wall time spent in commit-log file sync_data/fsync.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_data_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_data_seconds_max {:.9}\n",
+        flush.sync_data_micros_max as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_parent_dir_seconds_total Total wall time spent syncing parent directories for newly-created commit-log files.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_parent_dir_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_parent_dir_seconds_total {:.9}\n",
+        flush.sync_parent_dir_micros_total as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_commitlog_sync_parent_dir_seconds_max Maximum wall time spent syncing a commit-log parent directory.\n");
+    out.push_str("# TYPE ferrosa_commitlog_sync_parent_dir_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_sync_parent_dir_seconds_max {:.9}\n",
+        flush.sync_parent_dir_micros_max as f64 / 1_000_000.0
     ));
     out.push_str("# HELP ferrosa_commitlog_periodic_idle_flushes_skipped_total Periodic commit-log timer ticks skipped because no writes were pending.\n");
     out.push_str("# TYPE ferrosa_commitlog_periodic_idle_flushes_skipped_total counter\n");
@@ -442,6 +588,7 @@ impl CommitLog {
         //
         // allocate_and_begin_write() increments in_flight_writers BEFORE the CAS,
         // closing the window where flush could read partially-written data.
+        let alloc_start = Instant::now();
         let (segment, offset) = {
             let seg = self.active.load_full();
             match seg.allocate_and_begin_write(total_size) {
@@ -449,7 +596,14 @@ impl CommitLog {
                 None => {
                     // Segment is full — rotate (serialized) and retry.
                     drop(seg);
+                    let rotate_start = Instant::now();
                     self.force_rotate()?;
+                    COMMITLOG_APPEND_ROTATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    observe_duration(
+                        &COMMITLOG_APPEND_ROTATE_MICROS_TOTAL,
+                        &COMMITLOG_APPEND_ROTATE_MICROS_MAX,
+                        rotate_start.elapsed(),
+                    );
                     let new_seg = self.active.load_full();
                     let offset = match new_seg.allocate_and_begin_write(total_size) {
                         Some(o) => o,
@@ -467,9 +621,20 @@ impl CommitLog {
                 }
             }
         };
+        observe_duration(
+            &COMMITLOG_APPEND_ALLOC_MICROS_TOTAL,
+            &COMMITLOG_APPEND_ALLOC_MICROS_MAX,
+            alloc_start.elapsed(),
+        );
 
+        let write_start = Instant::now();
         let position = segment.write_entry(offset, mutation);
         segment.writer_done();
+        observe_duration(
+            &COMMITLOG_APPEND_WRITE_ENTRY_MICROS_TOTAL,
+            &COMMITLOG_APPEND_WRITE_ENTRY_MICROS_MAX,
+            write_start.elapsed(),
+        );
         COMMITLOG_APPENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
         COMMITLOG_APPEND_BYTES_TOTAL.fetch_add(total_size as u64, Ordering::Relaxed);
 
@@ -477,11 +642,23 @@ impl CommitLog {
         // is a `DashMap<TableId, AtomicU64>` so this is lock-free in steady
         // state — no global commit-log-level mutex on the hot path.
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        let mark_dirty_start = Instant::now();
         segment.mark_table_dirty(&table_id, position);
+        observe_duration(
+            &COMMITLOG_APPEND_MARK_DIRTY_MICROS_TOTAL,
+            &COMMITLOG_APPEND_MARK_DIRTY_MICROS_MAX,
+            mark_dirty_start.elapsed(),
+        );
 
         // Notify sync strategy.
+        let sync_notify_start = Instant::now();
         self.sync_strategy
             .on_write(&segment, offset, total_size as u64);
+        observe_duration(
+            &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL,
+            &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX,
+            sync_notify_start.elapsed(),
+        );
 
         Ok(position)
     }
@@ -498,13 +675,21 @@ impl CommitLog {
         let total_size =
             Segment::entry_total_size_single_row(&table_id.keyspace, &table_id.table, key, row);
 
+        let alloc_start = Instant::now();
         let (segment, offset) = {
             let seg = self.active.load_full();
             match seg.allocate_and_begin_write(total_size) {
                 Some(offset) => (seg, offset),
                 None => {
                     drop(seg);
+                    let rotate_start = Instant::now();
                     self.force_rotate()?;
+                    COMMITLOG_APPEND_ROTATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    observe_duration(
+                        &COMMITLOG_APPEND_ROTATE_MICROS_TOTAL,
+                        &COMMITLOG_APPEND_ROTATE_MICROS_MAX,
+                        rotate_start.elapsed(),
+                    );
                     let new_seg = self.active.load_full();
                     let offset = match new_seg.allocate_and_begin_write(total_size) {
                         Some(o) => o,
@@ -519,7 +704,13 @@ impl CommitLog {
                 }
             }
         };
+        observe_duration(
+            &COMMITLOG_APPEND_ALLOC_MICROS_TOTAL,
+            &COMMITLOG_APPEND_ALLOC_MICROS_MAX,
+            alloc_start.elapsed(),
+        );
 
+        let write_start = Instant::now();
         let position = segment.write_single_row_entry(
             offset,
             Uuid::new_v4().into_bytes(),
@@ -530,12 +721,29 @@ impl CommitLog {
             timestamp,
         );
         segment.writer_done();
+        observe_duration(
+            &COMMITLOG_APPEND_WRITE_ENTRY_MICROS_TOTAL,
+            &COMMITLOG_APPEND_WRITE_ENTRY_MICROS_MAX,
+            write_start.elapsed(),
+        );
         COMMITLOG_APPENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
         COMMITLOG_APPEND_BYTES_TOTAL.fetch_add(total_size as u64, Ordering::Relaxed);
 
+        let mark_dirty_start = Instant::now();
         segment.mark_table_dirty(table_id, position);
+        observe_duration(
+            &COMMITLOG_APPEND_MARK_DIRTY_MICROS_TOTAL,
+            &COMMITLOG_APPEND_MARK_DIRTY_MICROS_MAX,
+            mark_dirty_start.elapsed(),
+        );
+        let sync_notify_start = Instant::now();
         self.sync_strategy
             .on_write(&segment, offset, total_size as u64);
+        observe_duration(
+            &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL,
+            &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX,
+            sync_notify_start.elapsed(),
+        );
 
         Ok(position)
     }
