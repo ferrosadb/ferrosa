@@ -665,6 +665,7 @@ impl<F: FlushTarget> TableStore<F> {
         let mut sources: Vec<Partition> = Vec::new();
         let mut memtable_hits = 0u64;
         let mut flushing_hits = 0u64;
+        let mut sstable_pruned = 0u64;
         let mut sstable_probes = 0u64;
         let mut sstable_hits = 0u64;
         let mut sstable_errors = 0u64;
@@ -688,6 +689,10 @@ impl<F: FlushTarget> TableStore<F> {
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for (i, sstable) in guard.sstables.iter().enumerate() {
+            if !sstable.may_contain_key(key) {
+                sstable_pruned += 1;
+                continue;
+            }
             sstable_probes += 1;
             match sstable.get_partition_limited_rows(key, row_limit) {
                 Ok(Some(mut p)) => {
@@ -726,6 +731,7 @@ impl<F: FlushTarget> TableStore<F> {
                 false,
                 memtable_hits,
                 flushing_hits,
+                sstable_pruned,
                 sstable_probes,
                 sstable_hits,
                 sstable_errors,
@@ -743,6 +749,7 @@ impl<F: FlushTarget> TableStore<F> {
             true,
             memtable_hits,
             flushing_hits,
+            sstable_pruned,
             sstable_probes,
             sstable_hits,
             sstable_errors,
@@ -781,6 +788,9 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         for (i, sstable) in guard.sstables.iter().enumerate() {
+            if !sstable.may_contain_key(key) {
+                continue;
+            }
             match sstable.get_clustering_row(key, clustering) {
                 Ok(Some(mut p)) => {
                     ColumnOrdinalMapping::for_header(&schema, sstable.header())
@@ -3084,28 +3094,44 @@ impl<F: FlushTarget> TableStore<F> {
                 let size_bytes = if path.as_os_str().is_empty() {
                     sst.total_size()
                 } else {
-                    let Some(size_bytes) = sstable_compaction_component_size(&sstable_path, id)
-                    else {
-                        tracing::warn!(
-                            sstable_id = %id,
-                            table_dir = ?sstable_path,
-                            "compaction planning: skipping SSTable because required on-disk \
-                             component files are missing or empty; live readers remain loaded, \
-                             but this SSTable cannot be used as a compaction input"
-                        );
-                        return None;
-                    };
-                    size_bytes
+                    match sstable_compaction_component_size(&sstable_path, id) {
+                        Some(size_bytes) => size_bytes,
+                        None if sstable_compaction_remote_component_available(&sstable_path, id) => {
+                            tracing::warn!(
+                                sstable_id = %id,
+                                table_dir = ?sstable_path,
+                                size_bytes = sst.total_size(),
+                                "compaction planning: SSTable local components are missing or empty; \
+                                 using live-reader size and allowing compaction execution to rehydrate \
+                                 inputs from object storage"
+                            );
+                            sst.total_size()
+                        }
+                        None => {
+                            tracing::warn!(
+                                sstable_id = %id,
+                                table_dir = ?sstable_path,
+                                "compaction planning: skipping SSTable because required on-disk \
+                                 component files are missing or empty and no remote component \
+                                 length hook confirmed object-storage availability"
+                            );
+                            return None;
+                        }
+                    }
                 };
 
                 let header = sst.header();
 
-                // WP-002: compute tokens from the smallest/largest raw key
-                // bytes stored in the partition index. SSTables are sorted
-                // by token, so first key = min token, last key = max token.
+                // WP-002: compute tokens from the smallest/largest index
+                // bounds. New SSTables store byte-comparable decorated keys
+                // here; older fixtures stored raw partition-key bytes.
                 use ferrosa_common::Token;
-                let min_token = Token::from_key(sst.smallest_key_bytes()).0;
-                let max_token = Token::from_key(sst.largest_key_bytes()).0;
+                let min_token = ferrosa_sstable::byte_comparable::decode(sst.smallest_key_bytes())
+                    .map(|key| key.token.0)
+                    .unwrap_or_else(|_| Token::from_key(sst.smallest_key_bytes()).0);
+                let max_token = ferrosa_sstable::byte_comparable::decode(sst.largest_key_bytes())
+                    .map(|key| key.token.0)
+                    .unwrap_or_else(|_| Token::from_key(sst.largest_key_bytes()).0);
 
                 Some(crate::compaction::metadata::SSTableMetadata {
                     id: id.clone(),
@@ -3144,6 +3170,11 @@ fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> O
         total = total.saturating_add(meta.len());
     }
     Some(total)
+}
+
+fn sstable_compaction_remote_component_available(table_dir: &std::path::Path, id: &str) -> bool {
+    let data_path = table_dir.join(format!("{id}-Data.db"));
+    matches!(ferrosa_sstable::io::remote_file_len(data_path), Ok(Some(len)) if len > 0)
 }
 
 fn time_series_row_timestamp(

@@ -300,10 +300,14 @@ pub struct SSTableWriter {
     trie_builder: TrieBuilder,
     /// Number of partitions written so far.
     partition_count: u64,
-    /// First partition key bytes (for key bounds footer).
+    /// First raw partition key bytes (for Statistics.db).
     first_key: Option<Vec<u8>>,
-    /// Last partition key bytes (for key bounds footer).
+    /// Last raw partition key bytes (for Statistics.db).
     last_key: Option<Vec<u8>>,
+    /// First byte-comparable partition key bytes (for Partitions.db bounds).
+    first_index_key: Option<Vec<u8>>,
+    /// Last byte-comparable partition key bytes (for Partitions.db bounds).
+    last_index_key: Option<Vec<u8>>,
     /// Number of rows written to Data.db.
     total_rows: u64,
     /// Number of regular/static cells written to Data.db.
@@ -326,6 +330,8 @@ impl SSTableWriter {
             partition_count: 0,
             first_key: None,
             last_key: None,
+            first_index_key: None,
+            last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
         }
@@ -349,6 +355,8 @@ impl SSTableWriter {
             partition_count: 0,
             first_key: None,
             last_key: None,
+            first_index_key: None,
+            last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
         })
@@ -410,8 +418,10 @@ impl SSTableWriter {
         // 4. Track partition count and key bounds.
         if self.first_key.is_none() {
             self.first_key = Some(partition.key.key.as_bytes().to_vec());
+            self.first_index_key = Some(encoded.clone());
         }
         self.last_key = Some(partition.key.key.as_bytes().to_vec());
+        self.last_index_key = Some(encoded);
         self.partition_count += 1;
         self.total_rows += partition.rows.len() as u64;
         self.total_columns_set += partition
@@ -431,6 +441,8 @@ impl SSTableWriter {
     pub fn finish(self) -> Result<SSTableOutput> {
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone().unwrap_or_default();
+        let first_index_key = self.first_index_key.clone().unwrap_or_default();
+        let last_index_key = self.last_index_key.clone().unwrap_or_default();
         let partition_count = self.partition_count;
         let total_rows = self.total_rows;
         let total_columns_set = self.total_columns_set;
@@ -441,8 +453,12 @@ impl SSTableWriter {
         let header = self.header.clone();
 
         // 1. Finalize trie -> Partitions.db (trie bytes + key bounds footer)
-        let partitions =
-            Self::build_partitions_db(self.trie_builder, &first_key, &last_key, partition_count)?;
+        let partitions = Self::build_partitions_db(
+            self.trie_builder,
+            &first_index_key,
+            &last_index_key,
+            partition_count,
+        )?;
 
         // 2. Build bloom filter -> Filter.db
         let filter = self.bloom.write();
@@ -511,6 +527,8 @@ impl SSTableWriter {
 
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone().unwrap_or_default();
+        let first_index_key = self.first_index_key.clone().unwrap_or_default();
+        let last_index_key = self.last_index_key.clone().unwrap_or_default();
         let partition_count = self.partition_count;
         let total_rows = self.total_rows;
         let total_columns_set = self.total_columns_set;
@@ -528,8 +546,12 @@ impl SSTableWriter {
         let toc_path = staging_dir.join("TOC.txt");
         let compression_info_path = staging_dir.join("CompressionInfo.db");
 
-        let partitions =
-            Self::build_partitions_db(self.trie_builder, &first_key, &last_key, partition_count)?;
+        let partitions = Self::build_partitions_db(
+            self.trie_builder,
+            &first_index_key,
+            &last_index_key,
+            partition_count,
+        )?;
         let partitions_len = write_component_file(&partitions_path, &partitions)?;
 
         let filter = self.bloom.write();
@@ -1040,11 +1062,11 @@ impl SSTableWriter {
     // Internal: component builders
     // -----------------------------------------------------------------------
 
-    /// Build Partitions.db: trie bytes + key bounds + footer.
+    /// Build Partitions.db: trie bytes + byte-comparable key bounds + footer.
     fn build_partitions_db(
         trie_builder: TrieBuilder,
-        first_key: &[u8],
-        last_key: &[u8],
+        first_index_key: &[u8],
+        last_index_key: &[u8],
         partition_count: u64,
     ) -> Result<Vec<u8>> {
         let (trie_data, root_pos) = trie_builder.finish()?;
@@ -1057,11 +1079,11 @@ impl SSTableWriter {
         // Key bounds section
         let key_bounds_offset = buf.len() as i64;
         // smallest key: u16 len + bytes
-        buf.extend_from_slice(&(first_key.len() as u16).to_be_bytes());
-        buf.extend_from_slice(first_key);
+        buf.extend_from_slice(&(first_index_key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(first_index_key);
         // largest key: u16 len + bytes
-        buf.extend_from_slice(&(last_key.len() as u16).to_be_bytes());
-        buf.extend_from_slice(last_key);
+        buf.extend_from_slice(&(last_index_key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(last_index_key);
 
         // Footer: 3 big-endian i64s
         buf.extend_from_slice(&key_bounds_offset.to_be_bytes());
@@ -1599,7 +1621,7 @@ mod tests {
     use super::*;
     use crate::data::DataReader;
     use crate::types::{DeletionTime, LivenessInfo, Row};
-    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
 
     /// Build a minimal serialization header for testing.
     fn test_header() -> SerializationHeader {
@@ -2154,6 +2176,59 @@ mod tests {
     }
 
     #[test]
+    fn writer_stores_token_ordered_index_bounds_for_read_pruning() {
+        use crate::byte_comparable;
+        use crate::reader::{SSTableComponents, SSTableReader};
+
+        let header = test_header();
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+            verify_output: true,
+        };
+
+        let mut p1 = make_partition(b"p1", &[0, 0, 0, 1], b"v1", 1);
+        p1.key = DecoratedKey {
+            token: Token(10),
+            key: PartitionKey::from(b"p1".as_slice()),
+        };
+        let mut p2 = make_partition(b"p2", &[0, 0, 0, 2], b"v2", 2);
+        p2.key = DecoratedKey {
+            token: Token(20),
+            key: PartitionKey::from(b"p2".as_slice()),
+        };
+
+        let mut writer = SSTableWriter::new(options, header);
+        writer.add_partition(&p1).unwrap();
+        writer.add_partition(&p2).unwrap();
+        let output = writer.finish().unwrap();
+
+        let reader = SSTableReader::open(SSTableComponents {
+            data: output.data.as_slice(),
+            partitions: output.partitions.as_slice(),
+            rows: output.rows.as_slice(),
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })
+        .unwrap();
+
+        assert_eq!(
+            reader.smallest_key_bytes(),
+            byte_comparable::encode(&p1.key)
+        );
+        assert_eq!(reader.largest_key_bytes(), byte_comparable::encode(&p2.key));
+        assert!(reader.may_contain_key(&p1.key));
+
+        let same_key_before_range = DecoratedKey {
+            token: Token(9),
+            key: PartitionKey::from(b"p1".as_slice()),
+        };
+        assert!(!reader.may_contain_key(&same_key_before_range));
+    }
+
+    #[test]
     fn round_trip_write_read_all_components() {
         let header = test_header();
         let options = WriteOptions {
@@ -2704,9 +2779,10 @@ mod tests {
             eprintln!("  {:04x}: {:<48}  {}", i * 16, hex, ascii);
         }
 
-        // Verify that the key bounds ordering matches the write order
-        let write_first = partitions[0].key.key.as_bytes();
-        let write_last = partitions[partitions.len() - 1].key.key.as_bytes();
+        // Verify that the key bounds ordering matches the token-sorted write
+        // order in the same byte-comparable representation used by the trie.
+        let write_first = crate::byte_comparable::encode(&partitions[0].key);
+        let write_last = crate::byte_comparable::encode(&partitions[partitions.len() - 1].key);
         assert_eq!(
             first_key, write_first,
             "key bounds first={:?} should match token-sorted first={:?}",

@@ -185,6 +185,7 @@ pub struct SSTableComponents<R> {
 /// Composes all SSTable component readers into a single read interface.
 pub struct SSTableReader<R: ReadAt> {
     partition_index: PartitionIndex<CachedReadAt<R>>,
+    index_bounds_are_byte_comparable: bool,
     bloom_filter: BloomFilter,
     compression_info: Option<CompressionInfo>,
     header: SerializationHeader,
@@ -230,10 +231,14 @@ impl<R: ReadAt> SSTableReader<R> {
         let header = stats.header;
 
         let partition_index = PartitionIndex::open(CachedReadAt::new(components.partitions)?)?;
+        let index_bounds_are_byte_comparable =
+            crate::byte_comparable::decode(partition_index.smallest_key()).is_ok()
+                && crate::byte_comparable::decode(partition_index.largest_key()).is_ok();
         let rows = CachedReadAt::new(components.rows)?;
 
         Ok(SSTableReader {
             partition_index,
+            index_bounds_are_byte_comparable,
             bloom_filter,
             compression_info,
             header,
@@ -386,6 +391,32 @@ impl<R: ReadAt> SSTableReader<R> {
                 data_reader.read_partition_limited_rows(0)
             }
         }
+    }
+
+    /// Return whether a point read should probe this SSTable for `key`.
+    ///
+    /// Bloom filters reject definitely-absent keys. New Ferrosa SSTables also
+    /// store byte-comparable token-ordered key bounds in Partitions.db, which
+    /// lets callers skip tables outside the key range before doing trie/index
+    /// work. Older fixtures stored raw key bytes in that slot, so range pruning
+    /// is enabled only when both bounds decode as byte-comparable keys.
+    pub fn may_contain_key(&self, key: &DecoratedKey) -> bool {
+        let (h1, h2) = key.filter_hash();
+        if !self.bloom_filter.is_present(h1, h2) {
+            return false;
+        }
+
+        if self.index_bounds_are_byte_comparable {
+            let encoded = crate::byte_comparable::encode(key);
+            let encoded = encoded.as_slice();
+            if encoded < self.partition_index.smallest_key()
+                || encoded > self.partition_index.largest_key()
+            {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Look up a single clustered row by partition key and clustering bytes.

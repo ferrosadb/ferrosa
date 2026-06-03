@@ -318,6 +318,7 @@ static READ_LIMITED_ROWS_SECONDS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SECONDS_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_MEMTABLE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_FLUSHING_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_LIMITED_ROWS_SSTABLE_PRUNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -493,6 +494,7 @@ pub fn observe_read_limited_rows(
     found: bool,
     memtable_hits: u64,
     flushing_hits: u64,
+    sstable_pruned: u64,
     sstable_probes: u64,
     sstable_hits: u64,
     sstable_errors: u64,
@@ -506,6 +508,7 @@ pub fn observe_read_limited_rows(
     update_max_u64(&READ_LIMITED_ROWS_SECONDS_MICROS_MAX, micros);
     READ_LIMITED_ROWS_MEMTABLE_HITS_TOTAL.fetch_add(memtable_hits, Ordering::Relaxed);
     READ_LIMITED_ROWS_FLUSHING_HITS_TOTAL.fetch_add(flushing_hits, Ordering::Relaxed);
+    READ_LIMITED_ROWS_SSTABLE_PRUNED_TOTAL.fetch_add(sstable_pruned, Ordering::Relaxed);
     READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL.fetch_add(sstable_probes, Ordering::Relaxed);
     READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL.fetch_add(sstable_hits, Ordering::Relaxed);
     READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL.fetch_add(sstable_errors, Ordering::Relaxed);
@@ -910,6 +913,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_read_limited_rows_flushing_hits_total {}\n",
         READ_LIMITED_ROWS_FLUSHING_HITS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_limited_rows_sstable_pruned_total SSTables skipped before index lookup by read_limited_rows.\n");
+    out.push_str("# TYPE ferrosa_storage_read_limited_rows_sstable_pruned_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_limited_rows_sstable_pruned_total {}\n",
+        READ_LIMITED_ROWS_SSTABLE_PRUNED_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_read_limited_rows_sstable_probes_total SSTable probes issued by read_limited_rows.\n");
     out.push_str("# TYPE ferrosa_storage_read_limited_rows_sstable_probes_total counter\n");

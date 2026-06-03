@@ -21,6 +21,95 @@ struct QueuedCompactionTask {
     queued_at: Instant,
 }
 
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("true" | "1" | "on" | "yes") => true,
+        Some("false" | "0" | "off" | "no") => false,
+        _ => default,
+    }
+}
+
+fn compaction_verify_output_enabled() -> bool {
+    env_flag_enabled("FERROSA_COMPACTION_VERIFY_OUTPUT", true)
+}
+
+fn ensure_compaction_component(
+    path: &std::path::Path,
+    required: bool,
+    reject_empty: bool,
+) -> std::result::Result<Option<u64>, String> {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if reject_empty && meta.len() == 0 {
+                return Err(format!(
+                    "required SSTable component {} is empty",
+                    path.display()
+                ));
+            }
+            return Ok(Some(meta.len()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "failed to inspect SSTable component {}: {e}",
+                path.display()
+            ));
+        }
+    }
+
+    let restored = ferrosa_sstable::io::rehydrate_file(path).map_err(|e| {
+        format!(
+            "failed to rehydrate SSTable component {}: {e}",
+            path.display()
+        )
+    })?;
+    if !restored {
+        return if required {
+            Err(format!(
+                "required SSTable component {} is missing",
+                path.display()
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if reject_empty && meta.len() == 0 {
+                return Err(format!(
+                    "required SSTable component {} is empty after rehydration",
+                    path.display()
+                ));
+            }
+            Ok(Some(meta.len()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(e) => Err(format!(
+            "failed to inspect rehydrated SSTable component {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn read_compaction_component(
+    path: &std::path::Path,
+    required: bool,
+    reject_empty: bool,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    if ensure_compaction_component(path, required, reject_empty)?.is_none() {
+        return Ok(None);
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(e) => Err(format!(
+            "failed to read SSTable component {}: {e}",
+            path.display()
+        )),
+    }
+}
+
 /// Result of a completed compaction.
 #[derive(Debug)]
 pub struct CompactionResult {
@@ -312,7 +401,8 @@ impl CompactionExecutor {
             let dir = &input.path;
 
             let data_path = dir.join(format!("{gen}-Data.db"));
-            let data_file_size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            let data_file_size = ensure_compaction_component(&data_path, true, true)?
+                .expect("required component returns size");
             input_size_bytes = input_size_bytes.saturating_add(data_file_size);
             tracing::info!(
                 %gen,
@@ -320,45 +410,35 @@ impl CompactionExecutor {
                 path = ?data_path,
                 "compaction: opening input SSTable"
             );
-            match std::fs::metadata(&data_path) {
-                Ok(meta) if meta.len() == 0 => {
-                    return Err(format!(
-                        "aborting compaction: SSTable {gen} has empty Data.db — \
-                         cannot compact without all input data"
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "aborting compaction: SSTable {gen} Data.db missing: {e}"
-                    ));
-                }
-                Ok(_) => {}
-            }
 
             let data = FileReadAt::open(&data_path)
                 .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
-            let partitions_file = FileReadAt::open(dir.join(format!("{gen}-Partitions.db")))
-                .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
+            let partitions_path = dir.join(format!("{gen}-Partitions.db"));
             input_size_bytes = input_size_bytes.saturating_add(
-                std::fs::metadata(dir.join(format!("{gen}-Partitions.db")))
-                    .map(|m| m.len())
-                    .unwrap_or(0),
+                ensure_compaction_component(&partitions_path, true, true)?
+                    .expect("required component returns size"),
             );
-            let rows = FileReadAt::open(dir.join(format!("{gen}-Rows.db")))
+            let partitions_file = FileReadAt::open(&partitions_path)
                 .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
+            let rows_path = dir.join(format!("{gen}-Rows.db"));
             input_size_bytes = input_size_bytes.saturating_add(
-                std::fs::metadata(dir.join(format!("{gen}-Rows.db")))
-                    .map(|m| m.len())
-                    .unwrap_or(0),
+                ensure_compaction_component(&rows_path, true, false)?
+                    .expect("required component returns size"),
             );
-            let filter = std::fs::read(dir.join(format!("{gen}-Filter.db")))
+            let rows = FileReadAt::open(&rows_path)
                 .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
+            let filter_path = dir.join(format!("{gen}-Filter.db"));
+            let filter = read_compaction_component(&filter_path, true, false)?
+                .ok_or_else(|| format!("aborting compaction: SSTable {gen}: Filter.db missing"))?;
             input_size_bytes = input_size_bytes.saturating_add(filter.len() as u64);
-            let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db")))
-                .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
+            let statistics_path = dir.join(format!("{gen}-Statistics.db"));
+            let statistics =
+                read_compaction_component(&statistics_path, true, true)?.ok_or_else(|| {
+                    format!("aborting compaction: SSTable {gen}: Statistics.db missing")
+                })?;
             input_size_bytes = input_size_bytes.saturating_add(statistics.len() as u64);
-            let compression_info =
-                std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+            let compression_info_path = dir.join(format!("{gen}-CompressionInfo.db"));
+            let compression_info = read_compaction_component(&compression_info_path, false, false)?;
             input_size_bytes = input_size_bytes.saturating_add(
                 compression_info
                     .as_ref()
@@ -638,48 +718,50 @@ impl CompactionExecutor {
             local_write_start.elapsed(),
         );
 
-        // 5. Streaming readback verification — count partitions and rows
-        //    without materializing the output back into a Vec.  Catches
-        //    Data.db / Partitions.db inconsistencies that would corrupt
-        //    later reads.
-        let mut readback_partitions: u64 = 0;
-        let mut readback_rows: usize = 0;
-        let verify_start = Instant::now();
-        {
-            let mut iter = reader
-                .partitions_iter()
-                .map_err(|e| format!("CORRUPTION: output partitions_iter failed: {e}"))?;
-            while let Some(p) = iter
-                .next_partition()
-                .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
+        if compaction_verify_output_enabled() {
+            // 5. Streaming readback verification — count partitions and rows
+            //    without materializing the output back into a Vec.  Catches
+            //    Data.db / Partitions.db inconsistencies that would corrupt
+            //    later reads.
+            let mut readback_partitions: u64 = 0;
+            let mut readback_rows: usize = 0;
+            let verify_start = Instant::now();
             {
-                readback_partitions += 1;
-                readback_rows += p.rows.len();
+                let mut iter = reader
+                    .partitions_iter()
+                    .map_err(|e| format!("CORRUPTION: output partitions_iter failed: {e}"))?;
+                while let Some(p) = iter
+                    .next_partition()
+                    .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
+                {
+                    readback_partitions += 1;
+                    readback_rows += p.rows.len();
+                }
             }
-        }
-        crate::metrics::observe_compaction_phase(
-            crate::metrics::CompactionPhase::OutputVerify,
-            verify_start.elapsed(),
-        );
-        if readback_partitions != merged_partition_count || readback_rows != merged_row_count {
-            tracing::error!(
-                written_partitions = merged_partition_count,
-                written_rows = merged_row_count,
-                readback_partitions,
-                readback_rows,
-                "compaction: CORRUPTION DETECTED in output SSTable"
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::OutputVerify,
+                verify_start.elapsed(),
             );
-            return Err(format!(
-                "compaction output SSTable is corrupt: expected {} partitions/{} rows, \
-                 readback got {} partitions/{} rows",
-                merged_partition_count, merged_row_count, readback_partitions, readback_rows
-            ));
+            if readback_partitions != merged_partition_count || readback_rows != merged_row_count {
+                tracing::error!(
+                    written_partitions = merged_partition_count,
+                    written_rows = merged_row_count,
+                    readback_partitions,
+                    readback_rows,
+                    "compaction: CORRUPTION DETECTED in output SSTable"
+                );
+                return Err(format!(
+                    "compaction output SSTable is corrupt: expected {} partitions/{} rows, \
+                     readback got {} partitions/{} rows",
+                    merged_partition_count, merged_row_count, readback_partitions, readback_rows
+                ));
+            }
+            tracing::info!(
+                partitions = readback_partitions,
+                rows = readback_rows,
+                "compaction: output verified (streaming readback matches merge)"
+            );
         }
-        tracing::info!(
-            partitions = readback_partitions,
-            rows = readback_rows,
-            "compaction: output verified (streaming readback matches merge)"
-        );
 
         let gen = flush_target.generation();
         let output_id = format!("{gen}");

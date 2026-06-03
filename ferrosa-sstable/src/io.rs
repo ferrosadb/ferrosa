@@ -402,6 +402,22 @@ fn try_rehydrate_file(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Try to restore an immutable component file through the registered
+/// read-through hooks.
+///
+/// Storage-engine maintenance code uses this before opening evicted SSTable
+/// components for compaction. The SSTable crate remains object-store agnostic:
+/// callers only learn whether some registered hook restored the local path.
+pub fn rehydrate_file(path: impl AsRef<Path>) -> Result<bool> {
+    try_rehydrate_file(path.as_ref())
+}
+
+/// Return the length of an immutable component through registered read-through
+/// hooks without restoring it locally.
+pub fn remote_file_len(path: impl AsRef<Path>) -> Result<Option<u64>> {
+    try_file_len(path.as_ref())
+}
+
 fn is_not_found(err: &ferrosa_common::Error) -> bool {
     matches!(err, ferrosa_common::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
@@ -429,7 +445,13 @@ impl FileReadAt {
             return Self::open_with_cache(path, global_fd_cache());
         }
 
-        let file = std::fs::File::open(&path)?;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && try_rehydrate_file(&path)? => {
+                std::fs::File::open(&path)?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let len = file.metadata()?.len();
         if len == 0 {
             return Ok(Self {
@@ -456,7 +478,13 @@ impl FileReadAt {
         cache: std::sync::Arc<FdCache>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        std::fs::File::open(&path)?;
+        match std::fs::File::open(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && try_rehydrate_file(&path)? => {
+                std::fs::File::open(&path)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(Self {
             inner: FileReadAtInner::CachedFd { path, cache },
         })

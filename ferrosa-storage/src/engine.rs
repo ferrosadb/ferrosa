@@ -7564,7 +7564,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_read_through_rehydrates_full_directory_layout_sstable() {
+    fn s3_read_through_serves_directory_layout_sstable_without_full_rehydrate() {
         use bytes::Bytes;
         use ferrosa_sstable::io::{FdCache, FileReadAt, ReadAt};
         use object_store::ObjectStore;
@@ -7626,12 +7626,16 @@ mod tests {
         reader.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(buf, b"restored data");
 
+        assert!(
+            !gen_dir.join("42-Data.db").exists(),
+            "range read-through should avoid full local Data.db rehydration"
+        );
+
         for (component, bytes) in components {
             let path = gen_dir.join(format!("42-{component}"));
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                bytes,
-                "component should have been restored: {}",
+            assert!(
+                !path.exists() || std::fs::read(&path).unwrap() == bytes,
+                "component should either remain evicted or match object storage: {}",
                 path.display()
             );
         }

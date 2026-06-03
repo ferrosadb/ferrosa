@@ -98,7 +98,7 @@ pub struct CommitLogBatchConfig {
 }
 
 impl CommitLogBatchConfig {
-    pub const DEFAULT_TARGET_BYTES: u64 = 4096;
+    pub const DEFAULT_TARGET_BYTES: u64 = 64 * 1024;
 
     pub fn with_max_delay(max_delay: Duration) -> Self {
         Self {
@@ -204,6 +204,7 @@ pub const DEFAULT_MAX_SEGMENT_AGE: Duration = Duration::from_secs(300);
 /// All sizes are configurable. Defaults are suitable for general workloads:
 /// - 32 MB segments with 5-minute max age
 /// - Periodic sync every 10ms (best throughput, up to 10ms data loss on crash)
+/// - 64 KiB commit-log sync batches under sustained write load
 #[derive(Debug, Clone)]
 pub struct CommitLogConfig {
     /// Segment size in bytes (default 32 MB).
@@ -316,9 +317,9 @@ mod tests {
     }
 
     #[test]
-    fn batch_config_default_targets_4k() {
+    fn batch_config_default_targets_64k() {
         let batch = CommitLogBatchConfig::default();
-        assert_eq!(batch.target_bytes, 4096);
+        assert_eq!(batch.target_bytes, 64 * 1024);
         assert_eq!(batch.max_delay, Duration::from_millis(10));
     }
 
