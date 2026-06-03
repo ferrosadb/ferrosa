@@ -8,18 +8,18 @@ CASSANDRA_APP="${CASSANDRA_APP:-ferrosa-cassandra-lax}"
 BENCH_APP="${BENCH_APP:-ferrosa-bench-lax}"
 TIGRIS_BUCKET="${TIGRIS_BUCKET:-ferrosa-lax}"
 
-FERROSA_MEMORY_MB="${FERROSA_MEMORY_MB:-2048}"
-FERROSA_CPUS="${FERROSA_CPUS:-1}"
-FERROSA_CPU_KIND="${FERROSA_CPU_KIND:-shared}"
+FERROSA_MEMORY_MB="${FERROSA_MEMORY_MB:-4096}"
+FERROSA_CPUS="${FERROSA_CPUS:-2}"
+FERROSA_CPU_KIND="${FERROSA_CPU_KIND:-performance}"
 FERROSA_VOLUME_GB="${FERROSA_VOLUME_GB:-2}"
 FERROSA_USE_VOLUMES="${FERROSA_USE_VOLUMES:-true}"
 FERROSA_RAFT_ELECTION_MIN_MS="${FERROSA_RAFT_ELECTION_MIN_MS:-10000}"
 FERROSA_RAFT_ELECTION_MAX_MS="${FERROSA_RAFT_ELECTION_MAX_MS:-20000}"
 FERROSA_RAFT_HEARTBEAT_MS="${FERROSA_RAFT_HEARTBEAT_MS:-$((FERROSA_RAFT_ELECTION_MIN_MS / 3))}"
 FERROSA_RAFT_MAX_PAYLOAD_ENTRIES="${FERROSA_RAFT_MAX_PAYLOAD_ENTRIES:-300}"
-FERROSA_RAFT_RUNTIME_THREADS="${FERROSA_RAFT_RUNTIME_THREADS:-2}"
-FERROSA_DATA_RUNTIME_THREADS="${FERROSA_DATA_RUNTIME_THREADS:-4}"
-FERROSA_CQL_RUNTIME_THREADS="${FERROSA_CQL_RUNTIME_THREADS:-4}"
+FERROSA_RAFT_RUNTIME_THREADS="${FERROSA_RAFT_RUNTIME_THREADS:-$((FERROSA_CPUS <= 2 ? 1 : 2))}"
+FERROSA_DATA_RUNTIME_THREADS="${FERROSA_DATA_RUNTIME_THREADS:-$((FERROSA_CPUS <= 2 ? 2 : 4))}"
+FERROSA_CQL_RUNTIME_THREADS="${FERROSA_CQL_RUNTIME_THREADS:-$((FERROSA_CPUS <= 2 ? 2 : 4))}"
 FERROSA_BACKGROUND_RUNTIME_THREADS="${FERROSA_BACKGROUND_RUNTIME_THREADS:-1}"
 FERROSA_COMMITLOG_BATCH_TARGET_BYTES="${FERROSA_COMMITLOG_BATCH_TARGET_BYTES:-4096}"
 FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS="${FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS:-1000}"
@@ -174,8 +174,8 @@ collect_node_metrics() {
       elif [[ "$kind" == "ferrosa" ]]; then
         flyctl ssh console --app "$app" --machine "$id" --command "sh -lc '
           set +e
-          echo \"## ferrosa metrics\"; curl --max-time 10 -fsS http://127.0.0.1:9090/metrics
-          echo \"## ferrosa cluster status\"; curl --max-time 10 -fsS http://127.0.0.1:9090/api/cluster/status
+          echo \"## ferrosa metrics\"; curl --max-time 10 -g -fsS http://[::1]:9090/metrics
+          echo \"## ferrosa cluster status\"; curl --max-time 10 -g -fsS http://[::1]:9090/api/cluster/status
         '" </dev/null || true
       fi
     } > "$out" 2>&1
@@ -288,7 +288,7 @@ start_ferrosa_memory_snapshots() {
       set +e
       started=\$(date +%s)
       deadline=\$((started + ${MEMORY_SNAPSHOT_MAX_SECONDS}))
-      metric_filter=\"ferrosa_process_resident_memory_bytes|ferrosa_process_virtual_memory_bytes|ferrosa_process_memory_bytes|ferrosa_process_smaps_rollup_bytes|ferrosa_cgroup_memory_|ferrosa_process_cpu_seconds_total|ferrosa_process_io_|ferrosa_host_network_|ferrosa_host_block_device_|ferrosa_storage_stats_memtable_size_bytes|ferrosa_storage_stats_local_sstable_cache_bytes|ferrosa_storage_stats_sstable_size_bytes|ferrosa_storage_stats_s3_bytes|ferrosa_storage_upload_queue_depth|ferrosa_storage_upload_|ferrosa_storage_flush|ferrosa_storage_compaction_|ferrosa_storage_read_limited_rows|ferrosa_net_rpc_|ferrosa_net_lane_|ferrosa_net_data_lane_|ferrosa_coordinator_|ferrosa_commitlog_|ferrosa_cql_|ferrosa_fd_\"
+      metric_filter=\"ferrosa_process_resident_memory_bytes|ferrosa_process_virtual_memory_bytes|ferrosa_process_memory_bytes|ferrosa_process_smaps_rollup_bytes|ferrosa_cgroup_memory_|ferrosa_process_cpu_seconds_total|ferrosa_process_io_|ferrosa_host_network_|ferrosa_host_block_device_|ferrosa_storage_stats_memtable_size_bytes|ferrosa_storage_stats_local_sstable_cache_bytes|ferrosa_storage_stats_sstable_size_bytes|ferrosa_storage_stats_s3_bytes|ferrosa_storage_upload_queue_depth|ferrosa_storage_upload_|ferrosa_storage_flush|ferrosa_storage_compaction_|ferrosa_storage_read_limited_rows|ferrosa_storage_sstable_rehydration_|ferrosa_net_rpc_|ferrosa_net_lane_|ferrosa_net_data_lane_|ferrosa_coordinator_|ferrosa_commitlog_|ferrosa_cql_|ferrosa_fd_\"
       while [ \$(date +%s) -lt \"\${deadline}\" ]; do
         ts=\$(date -u +%FT%TZ)
         epoch=\$(date +%s)
@@ -324,7 +324,7 @@ start_ferrosa_memory_snapshots() {
           echo \"## diskstats\"
           cat /proc/diskstats 2>/dev/null || true
           echo \"## metrics\"
-          curl --max-time 5 -fsS http://127.0.0.1:9090/metrics 2>/dev/null | grep -E \"\${metric_filter}\" || true
+          curl --max-time 5 -g -fsS http://[::1]:9090/metrics 2>/dev/null | grep -E \"\${metric_filter}\" || true
           echo
         }
         if [ -z \"\${pid}\" ]; then
@@ -417,7 +417,7 @@ wait_for_ferrosa_http() {
   echo "waiting for Ferrosa ${label} (${machine_id})"
   flyctl ssh console --app "$FERROSA_APP" --machine "$machine_id" --command "sh -lc '
     for i in \$(seq 1 90); do
-      if curl --max-time 5 -fsS http://127.0.0.1:9090/admin/membership-snapshot >/tmp/ferrosa-status.json 2>/tmp/ferrosa-status.err; then
+      if curl --max-time 5 -g -fsS http://[::1]:9090/admin/membership-snapshot >/tmp/ferrosa-status.json 2>/tmp/ferrosa-status.err; then
         cat /tmp/ferrosa-status.json
         exit 0
       fi
@@ -434,13 +434,13 @@ validate_ferrosa_membership() {
 
   while IFS=$'\t' read -r id name; do
     flyctl ssh console --app "$FERROSA_APP" --machine "$id" --command "sh -lc '
-      curl --max-time 10 -fsS http://127.0.0.1:9090/admin/membership-snapshot
+      curl --max-time 10 -g -fsS http://[::1]:9090/admin/membership-snapshot
     '" | tail -n 1 > "${RESULTS_DIR}/${label}/membership/${name}-${id}-membership.json"
     flyctl ssh console --app "$FERROSA_APP" --machine "$id" --command "sh -lc '
-      curl --max-time 10 -fsS http://127.0.0.1:9090/api/cluster/status || true
+      curl --max-time 10 -g -fsS http://[::1]:9090/api/cluster/status || true
     '" | tail -n 1 > "${RESULTS_DIR}/${label}/membership/${name}-${id}-status.json"
     flyctl ssh console --app "$FERROSA_APP" --machine "$id" --command "sh -lc '
-      curl --max-time 10 -fsS http://127.0.0.1:9090/api/cluster/ring || true
+      curl --max-time 10 -g -fsS http://[::1]:9090/api/cluster/ring || true
     '" | tail -n 1 > "${RESULTS_DIR}/${label}/membership/${name}-${id}-ring.json"
   done < <(machine_json "$FERROSA_APP" | jq -r '.[] | [.id, .name] | @tsv')
 
@@ -543,18 +543,18 @@ create_ferrosa_cluster() {
     --env "FERROSA_CLUSTER_NAME=ferrosa-lax-bench"
     --env "FERROSA_GRAPH_ENABLED=false"
     --env "FERROSA_AUTH_ENABLED=false"
-    --env "FERROSA_CACHE_MAX_BYTES=${FERROSA_CACHE_MAX_BYTES:-805306368}"
+    --env "FERROSA_CACHE_MAX_BYTES=${FERROSA_CACHE_MAX_BYTES:-402653184}"
     --env "FERROSA_CACHE_MIN_BYTES=${FERROSA_CACHE_MIN_BYTES:-0}"
     --env "FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES=${FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES:-268435456}"
-    --env "FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES=${FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES:-536870912}"
-    --env "FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES=${FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES:-805306368}"
+    --env "FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES=${FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES:-805306368}"
+    --env "FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES=${FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES:-1207959552}"
     --env "FERROSA_FLUSH_THRESHOLD_BYTES=${FERROSA_FLUSH_THRESHOLD_BYTES:-67108864}"
     --env "FERROSA_MEMTABLE_BACKPRESSURE_BYTES=${FERROSA_MEMTABLE_BACKPRESSURE_BYTES:-536870912}"
     --env "FERROSA_FLUSH_INTERVAL_SECS=${FERROSA_FLUSH_INTERVAL_SECS:-5}"
     --env "FERROSA_URGENT_FLUSH_INTERVAL_MILLIS=${FERROSA_URGENT_FLUSH_INTERVAL_MILLIS:-100}"
     --env "FERROSA_URGENT_S3_SYNC_INTERVAL_SECS=${FERROSA_URGENT_S3_SYNC_INTERVAL_SECS:-1}"
-    --env "FERROSA_COMPACTION_WORKERS=${FERROSA_COMPACTION_WORKERS:-4}"
-    --env "FERROSA_SSTABLE_COMPRESSION_THREADS=${FERROSA_SSTABLE_COMPRESSION_THREADS:-4}"
+    --env "FERROSA_COMPACTION_WORKERS=${FERROSA_COMPACTION_WORKERS:-$((FERROSA_CPUS <= 2 ? 1 : 2))}"
+    --env "FERROSA_SSTABLE_COMPRESSION_THREADS=${FERROSA_SSTABLE_COMPRESSION_THREADS:-$((FERROSA_CPUS <= 2 ? 1 : 4))}"
     --env "FERROSA_S3_UPLOAD_WORKERS=${FERROSA_S3_UPLOAD_WORKERS:-8}"
     --env "FERROSA_S3_COMPACTION_UPLOAD_WORKERS=${FERROSA_S3_COMPACTION_UPLOAD_WORKERS:-4}"
     --env "FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH=${FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH:-16}"

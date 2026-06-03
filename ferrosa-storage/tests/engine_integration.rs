@@ -37,6 +37,7 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
             segment_size: 256 * 1024, // 256 KB — must fit largest mutation
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.join("commitlog"),
             checkpoint_dir: dir.join("commitlog"),
             archive: None,

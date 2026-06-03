@@ -1193,41 +1193,63 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let header = flush::build_serialization_header(&schema, &partitions);
-        let mut writer = SSTableWriter::new(options, header);
+        let staged_output = self.flush_target.file_output_staging_dir()?;
+        let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw"))?
+        } else {
+            SSTableWriter::new(options, header)
+        };
         let phase_start = Instant::now();
         for p in &partitions {
             writer.add_partition(p)?;
         }
-        let output = writer.finish()?;
-        let output_bytes = output.data.len()
-            + output.partitions.len()
-            + output.rows.len()
-            + output.filter.len()
-            + output.statistics.len()
-            + output.toc.len()
-            + output
-                .compression_info
-                .as_ref()
-                .map(|ci| ci.len())
-                .unwrap_or(0);
-        crate::metrics::observe_flush_phase(
-            crate::metrics::FlushPhase::EncodeSstable,
-            phase_start.elapsed(),
-        );
-        let phase_start = Instant::now();
-        let reader = self.flush_target.flush(output)?;
-        crate::metrics::observe_flush_phase(
-            crate::metrics::FlushPhase::LocalWriteSstable,
-            phase_start.elapsed(),
-        );
-        crate::metrics::observe_flush_output(
-            output_bytes as u64,
-            total_rows as u64,
-            partitions.len() as u64,
-        );
+        let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
+            let output = writer.finish_to_directory(staging_dir)?;
+            let output_bytes = output.total_size_bytes();
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::EncodeSstable,
+                phase_start.elapsed(),
+            );
+            let phase_start = Instant::now();
+            let reader = self.flush_target.flush_files(output)?;
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::LocalWriteSstable,
+                phase_start.elapsed(),
+            );
+            (reader, output_bytes)
+        } else {
+            let output = writer.finish()?;
+            let output_bytes = output.data.len()
+                + output.partitions.len()
+                + output.rows.len()
+                + output.filter.len()
+                + output.statistics.len()
+                + output.toc.len()
+                + output
+                    .compression_info
+                    .as_ref()
+                    .map(|ci| ci.len())
+                    .unwrap_or(0);
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::EncodeSstable,
+                phase_start.elapsed(),
+            );
+            let phase_start = Instant::now();
+            let reader = self.flush_target.flush(output)?;
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::LocalWriteSstable,
+                phase_start.elapsed(),
+            );
+            (reader, output_bytes as u64)
+        };
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::Total,
             total_start.elapsed(),
+        );
+        crate::metrics::observe_flush_output(
+            output_bytes,
+            total_rows as u64,
+            partitions.len() as u64,
         );
         let new_reader = Arc::new(reader);
 
@@ -3051,18 +3073,6 @@ impl<F: FlushTarget> TableStore<F> {
             .take(synced_len)
             .enumerate()
             .filter_map(|(i, sst)| {
-                let header = sst.header();
-
-                // WP-001: compute size from SSTable component buffers
-                let size_bytes = sst.total_size();
-
-                // WP-002: compute tokens from the smallest/largest raw key
-                // bytes stored in the partition index. SSTables are sorted
-                // by token, so first key = min token, last key = max token.
-                use ferrosa_common::Token;
-                let min_token = Token::from_key(sst.smallest_key_bytes()).0;
-                let max_token = Token::from_key(sst.largest_key_bytes()).0;
-
                 // Safe to index: i < synced_len <= sstable_ids.len().
                 let (id, path) = &guard.sstable_ids[i];
                 let sstable_path = if path.as_os_str().is_empty() {
@@ -3071,29 +3081,31 @@ impl<F: FlushTarget> TableStore<F> {
                     path.clone()
                 };
 
-                if !path.as_os_str().is_empty()
-                    && !sstable_has_required_compaction_components(&sstable_path, id)
-                {
-                    tracing::warn!(
-                        sstable_id = %id,
-                        table_dir = ?sstable_path,
-                        "compaction planning: skipping SSTable because required on-disk \
-                         component files are missing or empty; live readers remain loaded, \
-                         but this SSTable cannot be used as a compaction input"
-                    );
-                    return None;
-                }
-                if !sstable_data_stream_is_token_monotonic(sst.as_ref()) {
-                    tracing::warn!(
-                        sstable_id = %id,
-                        table_dir = ?sstable_path,
-                        "compaction planning: skipping SSTable because sequential Data.db \
-                         partition order is not token-monotonic; live readers remain loaded, \
-                         but this SSTable requires explicit repair or quarantine before it can \
-                         be compacted"
-                    );
-                    return None;
-                }
+                let size_bytes = if path.as_os_str().is_empty() {
+                    sst.total_size()
+                } else {
+                    let Some(size_bytes) = sstable_compaction_component_size(&sstable_path, id)
+                    else {
+                        tracing::warn!(
+                            sstable_id = %id,
+                            table_dir = ?sstable_path,
+                            "compaction planning: skipping SSTable because required on-disk \
+                             component files are missing or empty; live readers remain loaded, \
+                             but this SSTable cannot be used as a compaction input"
+                        );
+                        return None;
+                    };
+                    size_bytes
+                };
+
+                let header = sst.header();
+
+                // WP-002: compute tokens from the smallest/largest raw key
+                // bytes stored in the partition index. SSTables are sorted
+                // by token, so first key = min token, last key = max token.
+                use ferrosa_common::Token;
+                let min_token = Token::from_key(sst.smallest_key_bytes()).0;
+                let max_token = Token::from_key(sst.largest_key_bytes()).0;
 
                 Some(crate::compaction::metadata::SSTableMetadata {
                     id: id.clone(),
@@ -3110,7 +3122,8 @@ impl<F: FlushTarget> TableStore<F> {
     }
 }
 
-fn sstable_has_required_compaction_components(table_dir: &std::path::Path, id: &str) -> bool {
+fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> Option<u64> {
+    let mut total = 0u64;
     for suffix in [
         "Data.db",
         "Partitions.db",
@@ -3120,36 +3133,17 @@ fn sstable_has_required_compaction_components(table_dir: &std::path::Path, id: &
         "TOC.txt",
     ] {
         let path = table_dir.join(format!("{id}-{suffix}"));
-        let Ok(meta) = std::fs::metadata(&path) else {
-            return false;
-        };
+        let meta = std::fs::metadata(&path).ok()?;
         if matches!(suffix, "Data.db" | "Partitions.db" | "Statistics.db") && meta.len() == 0 {
-            return false;
+            return None;
         }
+        total = total.saturating_add(meta.len());
     }
-    true
-}
-
-fn sstable_data_stream_is_token_monotonic<R: ReadAt + Send + Sync + 'static>(
-    sstable: &SSTableReader<R>,
-) -> bool {
-    let mut iter = match sstable.partitions_iter() {
-        Ok(iter) => iter,
-        Err(_) => return false,
-    };
-    let mut previous: Option<DecoratedKey> = None;
-    loop {
-        match iter.next_partition_metadata() {
-            Ok(Some(partition)) => {
-                if previous.as_ref().is_some_and(|prev| partition.key < *prev) {
-                    return false;
-                }
-                previous = Some(partition.key);
-            }
-            Ok(None) => return true,
-            Err(_) => return false,
-        }
+    let compression_info = table_dir.join(format!("{id}-CompressionInfo.db"));
+    if let Ok(meta) = std::fs::metadata(compression_info) {
+        total = total.saturating_add(meta.len());
     }
+    Some(total)
 }
 
 fn time_series_row_timestamp(
@@ -5097,7 +5091,7 @@ mod tests {
     }
 
     #[test]
-    fn sstable_metadata_skips_entries_with_out_of_order_data_streams() {
+    fn sstable_metadata_does_not_scan_data_stream_order() {
         let tmp = tempfile::tempdir().unwrap();
         let store = file_backed_test_store(tmp.path());
         let schema = test_schema();
@@ -5127,9 +5121,11 @@ mod tests {
 
         let metadata = store.sstable_metadata(tmp.path());
 
-        assert!(
-            metadata.is_empty(),
-            "compaction planning must not select SSTable {gen} when sequential Data.db order is not token-monotonic"
+        assert_eq!(
+            metadata.len(),
+            1,
+            "compaction planning must remain a lightweight metadata pass for SSTable {gen}; \
+             Data.db order validation belongs in executor/repair paths"
         );
     }
 

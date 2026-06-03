@@ -166,24 +166,6 @@ impl<R: ReadAt> ReadAt for ChunkedCompressedData<'_, R> {
     }
 }
 
-/// Decompress all chunks of Data.db into a contiguous buffer.
-///
-/// Each compressed chunk in Data.db has a trailing 4-byte CRC32 checksum
-/// appended by Cassandra's `CompressedSequentialWriter`. The CRC covers
-/// the compressed data (including the size prefix) and must be stripped
-/// before passing to the decompressor.
-fn decompress_data<R: ReadAt>(data: &R, ci: &CompressionInfo) -> Result<Vec<u8>> {
-    let file_len = data.len()?;
-    let mut decompressed = Vec::with_capacity(ci.data_length as usize);
-
-    for i in 0..ci.chunk_offsets.len() {
-        let chunk = read_compressed_chunk(data, ci, file_len, i)?;
-        decompressed.extend_from_slice(&chunk);
-    }
-
-    Ok(decompressed)
-}
-
 /// Handles to all component files for an SSTable.
 pub struct SSTableComponents<R> {
     /// Data.db file handle.
@@ -611,12 +593,8 @@ impl<R: ReadAt> SSTableReader<R> {
             return Ok(partitions);
         }
         if let Some(ref ci) = self.compression_info {
-            // Decompress on demand — the buffer is freed when this scope ends.
-            // Previously the decompressed buffer was cached in the SSTableReader,
-            // causing ~1.4GB growth on a 28k-row scan because every loaded
-            // SSTable held its entire decompressed Data.db in memory.
-            let decompressed = decompress_data(&self.data, ci)?;
-            let mut reader = crate::data::DataReader::new(&decompressed, &self.header, 0);
+            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
+            let mut reader = crate::data::DataReader::new(&chunked, &self.header, 0);
             while partitions.len() < limit {
                 let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
                 let partition = if is_final_requested_partition {
@@ -651,30 +629,33 @@ impl<R: ReadAt> SSTableReader<R> {
 /// Streaming partition iterator over an SSTable.
 ///
 /// Returned by [`SSTableReader::partitions_iter`]. Yields partitions in
-/// storage (token) order, one at a time. Decompression happens once at
-/// construction time for compressed SSTables; the decompressed buffer is
-/// held for the iterator's lifetime and freed on drop.
+/// storage (token) order, one at a time. Compressed SSTables are read through a
+/// bounded decompressed-chunk cache instead of inflating the entire Data.db.
 ///
 /// Memory cost is constant in the number of partitions — only the
 /// currently-yielded `Partition` is materialized.
 pub struct PartitionIter<'a, R: ReadAt> {
     sst: &'a SSTableReader<R>,
     pos: u64,
-    /// Decompressed Data.db for compressed SSTables. `None` for
+    /// Chunked decompression view for compressed SSTables. `None` for
     /// uncompressed, where the iterator reads directly from `sst.data`.
-    decompressed: Option<Vec<u8>>,
+    compressed: Option<ChunkedCompressedData<'a, R>>,
 }
 
 impl<'a, R: ReadAt> PartitionIter<'a, R> {
     fn new(sst: &'a SSTableReader<R>) -> Result<Self> {
-        let decompressed = match &sst.compression_info {
-            Some(ci) => Some(decompress_data(&sst.data, ci)?),
+        let compressed = match &sst.compression_info {
+            Some(ci) => Some(ChunkedCompressedData::new(
+                &sst.data,
+                ci,
+                &sst.decompressed_chunks,
+            )?),
             None => None,
         };
         Ok(Self {
             sst,
             pos: 0,
-            decompressed,
+            compressed,
         })
     }
 
@@ -699,9 +680,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         )>,
     > {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.read_partition_header_only()?;
             self.pos = reader.position();
             Ok(result)
@@ -727,9 +707,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// one row per source in flight at any moment.
     pub fn next_clustered_row(&mut self) -> Result<Option<crate::types::Row>> {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.read_next_clustered_row()?;
             self.pos = reader.position();
             Ok(result)
@@ -754,9 +733,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         F: FnMut(&crate::types::Row) -> Result<()>,
     {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             reader.stream_clustered_rows(on_row)?;
             self.pos = reader.position();
             Ok(())
@@ -793,9 +771,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         F: FnMut(&crate::types::Row) -> Result<()>,
     {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.read_partition_streaming(on_row)?;
             self.pos = reader.position();
             Ok(result)
@@ -809,9 +786,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
 
     pub fn next_partition(&mut self) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.read_partition()?;
             self.pos = reader.position();
             Ok(result)
@@ -832,9 +808,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         &mut self,
     ) -> Result<Option<(ferrosa_common::key::DecoratedKey, u64)>> {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.read_partition_count()?;
             self.pos = reader.position();
             Ok(result)
@@ -864,9 +839,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         wanted: &[u16],
     ) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.read_partition_projected(wanted)?;
             self.pos = reader.position();
             Ok(result)
@@ -964,9 +938,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// Returns `Ok(None)` at EOF.
     pub fn peek_partition_key(&mut self) -> Result<Option<ferrosa_common::key::DecoratedKey>> {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.peek_partition_key()?;
             // peek does not advance pos
             self.pos = reader.position();
@@ -987,9 +960,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// data. Returns `Ok(None)` at EOF.
     pub fn next_partition_metadata(&mut self) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
-        if let Some(ref buf) = self.decompressed {
-            let slice: &[u8] = buf.as_slice();
-            let mut reader = crate::data::DataReader::new(&slice, header, self.pos);
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
             let result = reader.read_partition_metadata()?;
             self.pos = reader.position();
             Ok(result)

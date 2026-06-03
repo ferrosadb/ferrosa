@@ -39,4 +39,4 @@ pub use compression::Compression;
 pub use io::{FileReadAt, FileWriteAt, ReadAt, WriteAt};
 pub use reader::{SSTableComponents, SSTableReader};
 pub use types::{DeletionTime, LivenessInfo, Partition, Row};
-pub use writer::{SSTableOutput, SSTableWriter, WriteOptions};
+pub use writer::{SSTableOutput, SSTableOutputFiles, SSTableWriter, WriteOptions};

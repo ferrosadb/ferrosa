@@ -20,7 +20,7 @@ use ferrosa_sstable::io::{FileReadAt, ReadAt};
 use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
 use ferrosa_sstable::statistics::SerializationHeader;
 use ferrosa_sstable::types::Partition;
-use ferrosa_sstable::writer::SSTableOutput;
+use ferrosa_sstable::writer::{SSTableOutput, SSTableOutputFiles};
 
 /// Build a [`SerializationHeader`] by scanning partitions for minimum values.
 ///
@@ -186,6 +186,23 @@ pub trait FlushTarget {
 
     /// Write SSTable component bytes to the target and open a reader.
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Self::Reader>>;
+
+    /// Return a staging directory for file-backed SSTable output.
+    ///
+    /// Targets that return `Some` from this method can receive
+    /// `SSTableOutputFiles` through [`FlushTarget::flush_files`], avoiding a
+    /// full in-memory `SSTableOutput` allocation.
+    fn file_output_staging_dir(&self) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// Promote or consume SSTable component files and open a reader.
+    ///
+    /// The default path is intended for tests and non-file targets: it reads
+    /// the staged files into memory, then calls [`FlushTarget::flush`].
+    fn flush_files(&self, output: SSTableOutputFiles) -> Result<SSTableReader<Self::Reader>> {
+        self.flush(output.read_to_memory()?)
+    }
 
     /// Returns the generation number of the most recently flushed SSTable.
     ///
@@ -540,12 +557,8 @@ impl FileFlushTarget {
             .max()
             .unwrap_or(0)
     }
-}
 
-impl FlushTarget for FileFlushTarget {
-    type Reader = FileReadAt;
-
-    fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
+    fn next_generation(&self) -> u64 {
         // Use a timestamp-based generation to guarantee global uniqueness.
         // The sequential counter can collide between the table's flush target
         // and the compaction executor's flush target (different instances with
@@ -556,9 +569,91 @@ impl FlushTarget for FileFlushTarget {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        // Ensure gen is at least ts and strictly greater than the previous gen.
         self.generation.fetch_max(ts, Ordering::SeqCst);
-        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn component_paths(&self, gen: u64) -> FileComponentPaths {
+        let base = &self.base_dir;
+        FileComponentPaths {
+            data: base.join(format!("{gen}-Data.db")),
+            partitions: base.join(format!("{gen}-Partitions.db")),
+            rows: base.join(format!("{gen}-Rows.db")),
+            filter: base.join(format!("{gen}-Filter.db")),
+            statistics: base.join(format!("{gen}-Statistics.db")),
+            toc: base.join(format!("{gen}-TOC.txt")),
+            compression_info: base.join(format!("{gen}-CompressionInfo.db")),
+        }
+    }
+
+    fn tmp_component_path(path: &Path) -> PathBuf {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("txt") => path.with_extension("txt.tmp"),
+            _ => path.with_extension("db.tmp"),
+        }
+    }
+
+    fn open_reader_from_paths(
+        paths: &FileComponentPaths,
+        has_compression_info: bool,
+    ) -> Result<SSTableReader<FileReadAt>> {
+        let data = FileReadAt::open(&paths.data)?;
+        let partitions = FileReadAt::open(&paths.partitions)?;
+        let rows = FileReadAt::open(&paths.rows)?;
+        let filter = std::fs::read(&paths.filter)?;
+        let statistics = std::fs::read(&paths.statistics)?;
+        let compression_info = if has_compression_info {
+            Some(std::fs::read(&paths.compression_info)?)
+        } else {
+            None
+        };
+
+        SSTableReader::open(SSTableComponents {
+            data,
+            partitions,
+            rows,
+            filter,
+            compression_info,
+            statistics,
+        })
+    }
+}
+
+struct FileComponentPaths {
+    data: PathBuf,
+    partitions: PathBuf,
+    rows: PathBuf,
+    filter: PathBuf,
+    statistics: PathBuf,
+    toc: PathBuf,
+    compression_info: PathBuf,
+}
+
+impl FlushTarget for FileFlushTarget {
+    type Reader = FileReadAt;
+
+    fn file_output_staging_dir(&self) -> Result<Option<PathBuf>> {
+        let staging_root = self.base_dir.join(".sstable-staging");
+        std::fs::create_dir_all(&staging_root)?;
+        for attempt in 0..32u32 {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = staging_root.join(format!("{}-{}-{attempt}", std::process::id(), ts));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Some(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(ferrosa_common::Error::InvalidFormat(
+            "failed to allocate unique SSTable staging directory".into(),
+        ))
+    }
+
+    fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
+        let gen = self.next_generation();
         let base = &self.base_dir;
         let data_size = output.data.len();
         tracing::info!(
@@ -569,33 +664,27 @@ impl FlushTarget for FileFlushTarget {
             "flush: writing SSTable"
         );
 
-        let data_path = base.join(format!("{gen}-Data.db"));
-        let partitions_path = base.join(format!("{gen}-Partitions.db"));
-        let rows_path = base.join(format!("{gen}-Rows.db"));
-        let filter_path = base.join(format!("{gen}-Filter.db"));
-        let statistics_path = base.join(format!("{gen}-Statistics.db"));
-        let toc_path = base.join(format!("{gen}-TOC.txt"));
-        let compression_info_path = base.join(format!("{gen}-CompressionInfo.db"));
+        let paths = self.component_paths(gen);
 
         let has_compression_info = output.compression_info.is_some();
 
         // Write to .tmp files first, then atomically rename.
         // If the process crashes mid-flush, only .tmp files exist — no corrupt
         // final SSTables. Stale .tmp files are cleaned up on next startup.
-        let tmp = |p: &Path| p.with_extension("db.tmp");
-        let toc_tmp = toc_path.with_extension("txt.tmp");
+        let tmp = Self::tmp_component_path;
+        let toc_tmp = tmp(&paths.toc);
 
         if let Some(ref ci) = output.compression_info {
-            std::fs::write(tmp(&compression_info_path), ci)?;
+            std::fs::write(tmp(&paths.compression_info), ci)?;
         }
 
         std::thread::scope(|s| {
             let handles: Vec<_> = [
-                s.spawn(|| std::fs::write(tmp(&data_path), &output.data)),
-                s.spawn(|| std::fs::write(tmp(&partitions_path), &output.partitions)),
-                s.spawn(|| std::fs::write(tmp(&rows_path), &output.rows)),
-                s.spawn(|| std::fs::write(tmp(&filter_path), &output.filter)),
-                s.spawn(|| std::fs::write(tmp(&statistics_path), &output.statistics)),
+                s.spawn(|| std::fs::write(tmp(&paths.data), &output.data)),
+                s.spawn(|| std::fs::write(tmp(&paths.partitions), &output.partitions)),
+                s.spawn(|| std::fs::write(tmp(&paths.rows), &output.rows)),
+                s.spawn(|| std::fs::write(tmp(&paths.filter), &output.filter)),
+                s.spawn(|| std::fs::write(tmp(&paths.statistics), &output.statistics)),
                 s.spawn(|| std::fs::write(&toc_tmp, &output.toc)),
             ]
             .into_iter()
@@ -613,7 +702,7 @@ impl FlushTarget for FileFlushTarget {
         // than the in-memory buffer, something overwrote or truncated it.
         {
             let expected_data_size = output.data.len() as u64;
-            let actual_data_size = std::fs::metadata(tmp(&data_path))
+            let actual_data_size = std::fs::metadata(tmp(&paths.data))
                 .map(|m| m.len())
                 .unwrap_or(0);
             if actual_data_size != expected_data_size {
@@ -621,21 +710,21 @@ impl FlushTarget for FileFlushTarget {
                     "FLUSH CORRUPTION: Data.db.tmp gen={gen} expected {expected_data_size} bytes, \
                      got {actual_data_size} on disk. Buffer was {expected_data_size} bytes. \
                      Path: {:?}",
-                    tmp(&data_path)
+                    tmp(&paths.data)
                 )));
             }
         }
 
         // All tmp files written successfully — atomically rename to final names.
         // rename() is atomic on POSIX (same filesystem).
-        std::fs::rename(tmp(&data_path), &data_path)?;
-        std::fs::rename(tmp(&partitions_path), &partitions_path)?;
-        std::fs::rename(tmp(&rows_path), &rows_path)?;
-        std::fs::rename(tmp(&filter_path), &filter_path)?;
-        std::fs::rename(tmp(&statistics_path), &statistics_path)?;
-        std::fs::rename(&toc_tmp, &toc_path)?;
+        std::fs::rename(tmp(&paths.data), &paths.data)?;
+        std::fs::rename(tmp(&paths.partitions), &paths.partitions)?;
+        std::fs::rename(tmp(&paths.rows), &paths.rows)?;
+        std::fs::rename(tmp(&paths.filter), &paths.filter)?;
+        std::fs::rename(tmp(&paths.statistics), &paths.statistics)?;
+        std::fs::rename(&toc_tmp, &paths.toc)?;
         if has_compression_info {
-            std::fs::rename(tmp(&compression_info_path), &compression_info_path)?;
+            std::fs::rename(tmp(&paths.compression_info), &paths.compression_info)?;
         }
 
         // Verify the renamed Data.db file is the correct size.
@@ -643,44 +732,85 @@ impl FlushTarget for FileFlushTarget {
         // wrote a file with the same name in between (gen collision).
         {
             let expected = output.data.len() as u64;
-            let actual = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            let actual = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0);
             if actual != expected {
                 return Err(ferrosa_common::Error::InvalidFormat(format!(
                     "FLUSH COLLISION: Data.db gen={gen} was {expected} bytes after rename, \
                      now {actual} bytes. Another flush/compaction wrote the same file. \
                      Path: {:?}",
-                    data_path
+                    paths.data
                 )));
             }
         }
 
         tracing::info!(
             gen,
-            data_bytes = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0),
-            path = %data_path.display(),
+            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
+            path = %paths.data.display(),
             "flush: Data.db verified on disk"
         );
 
-        // FileReadAt::open returns ferrosa_common::Result — use ? directly
-        let data = FileReadAt::open(&data_path)?;
-        let partitions = FileReadAt::open(&partitions_path)?;
-        let rows = FileReadAt::open(&rows_path)?;
-        let filter = std::fs::read(&filter_path)?;
-        let statistics = std::fs::read(&statistics_path)?;
-        let compression_info = if has_compression_info {
-            Some(std::fs::read(&compression_info_path)?)
-        } else {
-            None
-        };
+        Self::open_reader_from_paths(&paths, has_compression_info)
+    }
 
-        SSTableReader::open(SSTableComponents {
-            data,
-            partitions,
-            rows,
-            filter,
-            compression_info,
-            statistics,
-        })
+    fn flush_files(&self, output: SSTableOutputFiles) -> Result<SSTableReader<FileReadAt>> {
+        let gen = self.next_generation();
+        let paths = self.component_paths(gen);
+        let has_compression_info = output.compression_info.is_some();
+        tracing::info!(
+            gen,
+            data_size = output.data_len,
+            partitions_size = output.partitions_len,
+            dir = %self.base_dir.display(),
+            "flush: promoting staged SSTable"
+        );
+
+        let tmp = Self::tmp_component_path;
+
+        std::fs::rename(&output.data, tmp(&paths.data))?;
+        std::fs::rename(&output.partitions, tmp(&paths.partitions))?;
+        std::fs::rename(&output.rows, tmp(&paths.rows))?;
+        std::fs::rename(&output.filter, tmp(&paths.filter))?;
+        std::fs::rename(&output.statistics, tmp(&paths.statistics))?;
+        std::fs::rename(&output.toc, tmp(&paths.toc))?;
+        if let Some(compression_info) = output.compression_info.as_ref() {
+            std::fs::rename(compression_info, tmp(&paths.compression_info))?;
+        }
+
+        let actual_data_size = std::fs::metadata(tmp(&paths.data))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if actual_data_size != output.data_len {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "FLUSH CORRUPTION: staged Data.db gen={gen} expected {} bytes, got {actual_data_size}",
+                output.data_len
+            )));
+        }
+
+        std::fs::rename(tmp(&paths.data), &paths.data)?;
+        std::fs::rename(tmp(&paths.partitions), &paths.partitions)?;
+        std::fs::rename(tmp(&paths.rows), &paths.rows)?;
+        std::fs::rename(tmp(&paths.filter), &paths.filter)?;
+        std::fs::rename(tmp(&paths.statistics), &paths.statistics)?;
+        std::fs::rename(tmp(&paths.toc), &paths.toc)?;
+        if has_compression_info {
+            std::fs::rename(tmp(&paths.compression_info), &paths.compression_info)?;
+        }
+
+        let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
+        let _ = std::fs::remove_dir(&output.staging_dir);
+        if let Some(parent) = staging_parent {
+            let _ = std::fs::remove_dir(parent);
+        }
+
+        tracing::info!(
+            gen,
+            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
+            path = %paths.data.display(),
+            "flush: staged Data.db promoted"
+        );
+
+        Self::open_reader_from_paths(&paths, has_compression_info)
     }
 
     fn last_generation(&self) -> u64 {
@@ -950,6 +1080,53 @@ mod tests {
         let reader = target.flush(output).unwrap();
 
         // Verify we can read back both partitions
+        for p in &partitions {
+            let got = reader.get_partition(&p.key).unwrap().expect("partition");
+            assert_eq!(got.key.key.as_bytes(), p.key.key.as_bytes());
+            assert_eq!(got.rows.len(), 1);
+        }
+    }
+
+    #[test]
+    fn file_flush_target_promotes_staged_sstable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions::default();
+        let mut writer =
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let staged_data_len = output.data_len;
+        assert!(!staging_dir.join("Data.raw").exists());
+
+        let reader = target.flush_files(output).unwrap();
+
+        assert!(!staging_dir.exists());
+        let gen = target.generation();
+        let data_path = dir.path().join(format!("{gen}-Data.db"));
+        assert_eq!(
+            std::fs::metadata(&data_path).unwrap().len(),
+            staged_data_len
+        );
+        assert!(dir
+            .path()
+            .join(format!("{gen}-CompressionInfo.db"))
+            .exists());
+
         for p in &partitions {
             let got = reader.get_partition(&p.key).unwrap().expect("partition");
             assert_eq!(got.key.key.as_bytes(), p.key.key.as_bytes());

@@ -321,6 +321,15 @@ static READ_LIMITED_ROWS_FLUSHING_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_SUCCESS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_COMPONENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_SECONDS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_SECONDS_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static SSTABLE_REHYDRATION_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 
 fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
@@ -500,6 +509,37 @@ pub fn observe_read_limited_rows(
     READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL.fetch_add(sstable_probes, Ordering::Relaxed);
     READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL.fetch_add(sstable_hits, Ordering::Relaxed);
     READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL.fetch_add(sstable_errors, Ordering::Relaxed);
+}
+
+pub fn inc_sstable_rehydration_request() {
+    SSTABLE_REHYDRATION_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_sstable_rehydration_in_flight() {
+    let in_flight = SSTABLE_REHYDRATION_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+    update_max_u64(&SSTABLE_REHYDRATION_IN_FLIGHT_MAX, in_flight);
+}
+
+pub fn dec_sstable_rehydration_in_flight() {
+    let _ = SSTABLE_REHYDRATION_IN_FLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
+pub fn observe_sstable_rehydration_success(duration: Duration, components: u64, bytes: u64) {
+    SSTABLE_REHYDRATION_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    SSTABLE_REHYDRATION_COMPONENTS_TOTAL.fetch_add(components, Ordering::Relaxed);
+    SSTABLE_REHYDRATION_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    let micros = duration_micros(duration);
+    SSTABLE_REHYDRATION_SECONDS_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&SSTABLE_REHYDRATION_SECONDS_MICROS_MAX, micros);
+}
+
+pub fn observe_sstable_rehydration_failure(duration: Duration) {
+    SSTABLE_REHYDRATION_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let micros = duration_micros(duration);
+    SSTABLE_REHYDRATION_SECONDS_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&SSTABLE_REHYDRATION_SECONDS_MICROS_MAX, micros);
 }
 
 pub fn render_prometheus() -> String {
@@ -889,6 +929,60 @@ pub fn render_prometheus() -> String {
         "ferrosa_storage_read_limited_rows_sstable_errors_total {}\n",
         READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_requests_total SSTable read-through rehydration attempts.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_requests_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_requests_total {}\n",
+        SSTABLE_REHYDRATION_REQUESTS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_success_total SSTable read-through rehydrations that restored at least one component or found the requested component present.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_success_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_success_total {}\n",
+        SSTABLE_REHYDRATION_SUCCESS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_failure_total SSTable read-through rehydrations that failed.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_failure_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_failure_total {}\n",
+        SSTABLE_REHYDRATION_FAILURE_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_components_total SSTable components restored by read-through rehydration.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_components_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_components_total {}\n",
+        SSTABLE_REHYDRATION_COMPONENTS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_bytes_total Bytes restored by SSTable read-through rehydration.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_bytes_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_bytes_total {}\n",
+        SSTABLE_REHYDRATION_BYTES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_seconds_total Total wall time spent in SSTable read-through rehydration.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_seconds_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_seconds_total {:.9}\n",
+        SSTABLE_REHYDRATION_SECONDS_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_seconds_max Maximum observed wall time for one SSTable read-through rehydration.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_seconds_max {:.9}\n",
+        SSTABLE_REHYDRATION_SECONDS_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_in_flight SSTable generations currently being restored by read-through rehydration.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_in_flight gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_in_flight {}\n",
+        SSTABLE_REHYDRATION_IN_FLIGHT.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_sstable_rehydration_in_flight_max Maximum concurrent SSTable read-through rehydrations.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_rehydration_in_flight_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_sstable_rehydration_in_flight_max {}\n",
+        SSTABLE_REHYDRATION_IN_FLIGHT_MAX.load(Ordering::Relaxed)
+    ));
 
     out
 }
@@ -1269,8 +1363,11 @@ mod tests {
         assert!(text.contains("ferrosa_storage_upload_phase_seconds_total{phase=\"sync_await\"}"));
         assert!(text.contains("ferrosa_storage_upload_phase_total{phase=\"file_put\"}"));
         assert!(text.contains("ferrosa_storage_upload_bytes_total"));
-        assert!(text.contains("ferrosa_storage_memtable_size_bytes_max 8192"));
-        assert!(text.contains("ferrosa_storage_memtable_flush_threshold_bytes 4096"));
-        assert!(text.contains("ferrosa_storage_memtable_backpressure_bytes 16384"));
+        // These are global process gauges; other tests running in parallel may
+        // observe larger values before this scrape. This test only verifies
+        // that the metrics are rendered.
+        assert!(text.contains("ferrosa_storage_memtable_size_bytes_max"));
+        assert!(text.contains("ferrosa_storage_memtable_flush_threshold_bytes"));
+        assert!(text.contains("ferrosa_storage_memtable_backpressure_bytes"));
     }
 }

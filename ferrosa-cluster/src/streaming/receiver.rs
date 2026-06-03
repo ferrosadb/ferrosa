@@ -471,6 +471,21 @@ impl SstableStreamSession {
             return Err(err);
         }
 
+        if let Some(existing_files) = self.matching_existing_component_paths(end.checksum)? {
+            self.cleanup_staging()?;
+            tracing::info!(
+                session_id = self.start.session_id,
+                files = existing_files.len(),
+                bytes = self.bytes_received,
+                "sstable_stream: existing SSTable matches stream; treating retry as complete"
+            );
+            return Ok(SstableStreamResult {
+                session_id: self.start.session_id,
+                written_files: existing_files,
+                total_bytes: self.bytes_received,
+            });
+        }
+
         // Write files to staging, then promote atomically.
         let written_files = self
             .assembler
@@ -490,6 +505,104 @@ impl SstableStreamSession {
             written_files: promoted_files,
             total_bytes: self.bytes_received,
         })
+    }
+
+    fn matching_existing_component_paths(&self, checksum: u32) -> Result<Option<Vec<PathBuf>>> {
+        if self.final_dir.exists() {
+            return self.validate_existing_component_set(&self.final_dir, checksum, true);
+        }
+
+        if let Some(parent) = self.final_dir.parent() {
+            let flat = self.validate_existing_component_set(parent, checksum, false)?;
+            if flat.is_some() {
+                return Ok(flat);
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn validate_existing_component_set(
+        &self,
+        dir: &Path,
+        checksum: u32,
+        require_complete: bool,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        let mut paths = Vec::with_capacity(self.start.components.len());
+        let mut saw_any = false;
+        let mut total_bytes = 0u64;
+        let mut hasher = crc32fast::Hasher::new();
+
+        for component in &self.start.components {
+            let path = dir.join(&component.name);
+            if !path.exists() {
+                if saw_any || require_complete {
+                    return Err(ClusterError::Internal(format!(
+                        "sstable_stream: existing destination is incomplete: missing {}",
+                        path.display()
+                    )));
+                }
+                return Ok(None);
+            }
+            saw_any = true;
+
+            let metadata = std::fs::metadata(&path).map_err(|e| {
+                ClusterError::Internal(format!(
+                    "sstable_stream: existing component metadata {} failed: {e}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.is_file() || metadata.len() != component.size {
+                return Err(ClusterError::Internal(format!(
+                    "sstable_stream: existing component mismatch: {} expected {} bytes, got {}",
+                    path.display(),
+                    component.size,
+                    metadata.len()
+                )));
+            }
+
+            let mut file = std::fs::File::open(&path).map_err(|e| {
+                ClusterError::Internal(format!(
+                    "sstable_stream: existing component open {} failed: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buf).map_err(|e| {
+                    ClusterError::Internal(format!(
+                        "sstable_stream: existing component read {} failed: {e}",
+                        path.display()
+                    ))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buf[..read]);
+            }
+
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            paths.push(path);
+        }
+
+        if !saw_any {
+            return Ok(None);
+        }
+        if total_bytes != self.start.total_bytes || total_bytes != self.bytes_received {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: existing component byte total mismatch: existing={}, start={}, received={}",
+                total_bytes, self.start.total_bytes, self.bytes_received
+            )));
+        }
+        let existing_checksum = hasher.finalize();
+        if existing_checksum != checksum {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: existing component checksum mismatch: existing {:#010x}, stream {:#010x}",
+                existing_checksum, checksum
+            )));
+        }
+
+        Ok(Some(paths))
     }
 
     fn promote_staged(&self, written_files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -1351,8 +1464,8 @@ mod tests {
         });
 
         assert!(
-            matches!(result, Err(ClusterError::Internal(ref msg)) if msg.contains("destination already exists")),
-            "existing destinations should fail closed instead of being replaced"
+            matches!(result, Err(ClusterError::Internal(ref msg)) if msg.contains("existing component checksum mismatch")),
+            "mismatched existing destinations should fail closed instead of being replaced"
         );
         assert_eq!(
             std::fs::read(&existing_component).unwrap(),
@@ -1362,6 +1475,68 @@ mod tests {
         assert!(
             !staging_path.exists(),
             "failed stream promotion should remove staging"
+        );
+    }
+
+    #[test]
+    fn sstable_stream_matching_existing_flat_destination_is_idempotent() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let table_dir = dst_dir.path().join("ks.tbl");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let flat_component = table_dir.join("42-Data.db");
+        std::fs::write(&flat_component, b"same").unwrap();
+        let dest_path = table_dir.join("42");
+
+        let start = SstableStreamStartPayload {
+            session_id: 203,
+            source_node: 7,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "42".to_string(),
+            components: vec![SSTableComponent {
+                name: "42-Data.db".to_string(),
+                size: 4,
+            }],
+            total_bytes: 4,
+        };
+
+        let mut session = SstableStreamReceiver::begin(start, dest_path.clone());
+        let staging_path = session.staging_dir.clone();
+        session
+            .apply_chunk(SstableStreamChunkPayload {
+                session_id: 203,
+                component: "42-Data.db".to_string(),
+                offset: 0,
+                data: b"same".to_vec(),
+            })
+            .unwrap();
+
+        let checksum = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(b"same");
+            hasher.finalize()
+        };
+        let result = session
+            .finish(SstableStreamEndPayload {
+                session_id: 203,
+                total_bytes: 4,
+                checksum,
+            })
+            .unwrap();
+
+        assert_eq!(result.written_files, vec![flat_component]);
+        assert!(
+            !dest_path.exists(),
+            "idempotent flat retry should not create a duplicate generation directory"
+        );
+        assert!(
+            !staging_path.exists(),
+            "idempotent retry should remove staging"
         );
     }
 

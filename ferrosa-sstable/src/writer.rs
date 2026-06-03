@@ -2,7 +2,9 @@
 //!
 //! The writer accepts partitions in token order and produces all component
 //! data (Data.db, Partitions.db, Rows.db, Filter.db, CompressionInfo.db,
-//! Statistics.db, TOC.txt) as in-memory byte buffers in an [`SSTableOutput`].
+//! Statistics.db, TOC.txt) either as in-memory byte buffers in an
+//! [`SSTableOutput`] or as staged component files in an
+//! [`SSTableOutputFiles`].
 //!
 //! # Usage
 //!
@@ -28,6 +30,8 @@
 //! simple single-row partitions with live cells; more complex cases
 //! (range tombstones, complex columns) are deferred.
 
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ferrosa_common::{CellValue, Result};
@@ -36,6 +40,8 @@ use rayon::prelude::*;
 use crate::bloom::BloomFilter;
 use crate::byte_comparable;
 use crate::compression::{Compression, CompressionInfo};
+use crate::io::FileReadAt;
+use crate::reader::{SSTableComponents, SSTableReader};
 use crate::statistics::{
     build_simple_bti_stats_metadata, write_statistics, CompactionMetadata, SerializationHeader,
     Statistics, StatsMetadata, ValidationMetadata,
@@ -46,6 +52,7 @@ use crate::types::Partition;
 use crate::varint;
 
 const ROW_INDEX_MIN_ROWS: usize = 32;
+const DEFAULT_COMPRESSION_BATCH_CHUNKS: usize = 16;
 
 fn compression_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -66,6 +73,91 @@ fn compression_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("failed to build SSTable compression thread pool")
     })
+}
+
+fn compression_batch_chunks() -> usize {
+    std::env::var("FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|chunks| *chunks > 0)
+        .unwrap_or(DEFAULT_COMPRESSION_BATCH_CHUNKS)
+}
+
+fn write_component_file(path: &Path, bytes: &[u8]) -> Result<u64> {
+    std::fs::write(path, bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+enum DataBuffer {
+    Memory(Vec<u8>),
+    File {
+        file: std::fs::File,
+        path: PathBuf,
+        len: u64,
+    },
+}
+
+enum DataSource {
+    Memory(Vec<u8>),
+    File { path: PathBuf, len: u64 },
+}
+
+impl DataBuffer {
+    fn memory() -> Self {
+        Self::Memory(Vec::new())
+    }
+
+    fn file(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(Self::File {
+            file: std::fs::File::create(&path)?,
+            path,
+            len: 0,
+        })
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(buf) => buf.len() as u64,
+            Self::File { len, .. } => *len,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> Result<()> {
+        self.extend_from_slice(&[byte])
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Memory(buf) => {
+                buf.extend_from_slice(bytes);
+                Ok(())
+            }
+            Self::File { file, len, .. } => {
+                file.write_all(bytes)?;
+                *len += bytes.len() as u64;
+                Ok(())
+            }
+        }
+    }
+
+    fn into_source(self) -> Result<DataSource> {
+        match self {
+            Self::Memory(buf) => Ok(DataSource::Memory(buf)),
+            Self::File {
+                mut file,
+                path,
+                len,
+            } => {
+                file.flush()?;
+                file.sync_data()?;
+                drop(file);
+                Ok(DataSource::File { path, len })
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,12 +237,60 @@ pub struct SSTableOutput {
     pub toc: Vec<u8>,
 }
 
+/// Result of writing an SSTable to component files.
+pub struct SSTableOutputFiles {
+    pub data: PathBuf,
+    pub partitions: PathBuf,
+    pub rows: PathBuf,
+    pub filter: PathBuf,
+    pub compression_info: Option<PathBuf>,
+    pub statistics: PathBuf,
+    pub toc: PathBuf,
+    pub data_len: u64,
+    pub partitions_len: u64,
+    pub rows_len: u64,
+    pub filter_len: u64,
+    pub compression_info_len: u64,
+    pub statistics_len: u64,
+    pub toc_len: u64,
+    pub staging_dir: PathBuf,
+}
+
+impl SSTableOutputFiles {
+    pub fn total_size_bytes(&self) -> u64 {
+        self.data_len
+            + self.partitions_len
+            + self.rows_len
+            + self.filter_len
+            + self.compression_info_len
+            + self.statistics_len
+            + self.toc_len
+    }
+
+    pub fn read_to_memory(self) -> Result<SSTableOutput> {
+        let output = SSTableOutput {
+            data: std::fs::read(&self.data)?,
+            partitions: std::fs::read(&self.partitions)?,
+            rows: std::fs::read(&self.rows)?,
+            filter: std::fs::read(&self.filter)?,
+            compression_info: match &self.compression_info {
+                Some(path) => Some(std::fs::read(path)?),
+                None => None,
+            },
+            statistics: std::fs::read(&self.statistics)?,
+            toc: std::fs::read(&self.toc)?,
+        };
+        let _ = std::fs::remove_dir_all(&self.staging_dir);
+        Ok(output)
+    }
+}
+
 /// SSTable writer that accumulates partitions and produces all component files.
 pub struct SSTableWriter {
     options: WriteOptions,
     header: SerializationHeader,
     /// Raw (uncompressed) data buffer — the Data.db content.
-    data_buf: Vec<u8>,
+    data_buf: DataBuffer,
     /// Raw Rows.db buffer containing per-partition clustering row indexes for
     /// wide clustered partitions.
     rows_buf: Vec<u8>,
@@ -179,7 +319,7 @@ impl SSTableWriter {
         SSTableWriter {
             options,
             header,
-            data_buf: Vec::new(),
+            data_buf: DataBuffer::memory(),
             rows_buf: Vec::new(),
             bloom,
             trie_builder: TrieBuilder::new(),
@@ -189,6 +329,29 @@ impl SSTableWriter {
             total_rows: 0,
             total_columns_set: 0,
         }
+    }
+
+    /// Create an SSTable writer whose Data.db serialization buffer is backed
+    /// by a raw staging file instead of heap memory.
+    pub fn new_file_backed(
+        options: WriteOptions,
+        header: SerializationHeader,
+        raw_data_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let bloom = BloomFilter::new(10_000, options.bloom_fp_chance);
+        Ok(SSTableWriter {
+            options,
+            header,
+            data_buf: DataBuffer::file(raw_data_path.into())?,
+            rows_buf: Vec::new(),
+            bloom,
+            trie_builder: TrieBuilder::new(),
+            partition_count: 0,
+            first_key: None,
+            last_key: None,
+            total_rows: 0,
+            total_columns_set: 0,
+        })
     }
 
     /// Add a partition to the SSTable. Partitions must be added in token order.
@@ -296,7 +459,15 @@ impl SSTableWriter {
         );
 
         // 4. Optionally compress data chunks -> Data.db + CompressionInfo.db
-        let (data, compression_info) = Self::build_data_db(self.data_buf, &self.options)?;
+        let data_source = self.data_buf.into_source()?;
+        let (data, compression_info) = match data_source {
+            DataSource::Memory(data_buf) => Self::build_data_db(data_buf, &self.options)?,
+            DataSource::File { path, .. } => {
+                let data_buf = std::fs::read(&path)?;
+                let _ = std::fs::remove_file(path);
+                Self::build_data_db(data_buf, &self.options)?
+            }
+        };
 
         // 5. Rows.db: empty for simple partitions, indexed for wide clustered
         // partitions.
@@ -323,6 +494,93 @@ impl SSTableWriter {
         // (see StorageEngineConfig.write_verify).
         if verify_output {
             Self::verify_output_readable(&output, &header, partition_count)?;
+        }
+
+        Ok(output)
+    }
+
+    /// Finalize the SSTable directly into component files under `staging_dir`.
+    ///
+    /// This is the production file-backed path. It avoids constructing a full
+    /// `SSTableOutput` with component `Vec`s, so large flushes and compactions
+    /// do not keep both the writer's uncompressed Data.db buffer and the
+    /// finished compressed Data.db buffer in heap at the same time.
+    pub fn finish_to_directory(self, staging_dir: impl AsRef<Path>) -> Result<SSTableOutputFiles> {
+        let staging_dir = staging_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&staging_dir)?;
+
+        let first_key = self.first_key.clone().unwrap_or_default();
+        let last_key = self.last_key.clone().unwrap_or_default();
+        let partition_count = self.partition_count;
+        let total_rows = self.total_rows;
+        let total_columns_set = self.total_columns_set;
+        let bloom_fp_chance = self.options.bloom_fp_chance;
+        let has_compression = self.options.compression.is_some()
+            && !matches!(self.options.compression, Some(Compression::None));
+        let verify_output = self.options.verify_output;
+        let header = self.header.clone();
+
+        let data_path = staging_dir.join("Data.db");
+        let partitions_path = staging_dir.join("Partitions.db");
+        let rows_path = staging_dir.join("Rows.db");
+        let filter_path = staging_dir.join("Filter.db");
+        let statistics_path = staging_dir.join("Statistics.db");
+        let toc_path = staging_dir.join("TOC.txt");
+        let compression_info_path = staging_dir.join("CompressionInfo.db");
+
+        let partitions =
+            Self::build_partitions_db(self.trie_builder, &first_key, &last_key, partition_count)?;
+        let partitions_len = write_component_file(&partitions_path, &partitions)?;
+
+        let filter = self.bloom.write();
+        let filter_len = write_component_file(&filter_path, &filter)?;
+
+        let statistics = Self::build_statistics_db(
+            &self.header,
+            bloom_fp_chance,
+            &first_key,
+            &last_key,
+            partition_count,
+            total_rows,
+            total_columns_set,
+        );
+        let statistics_len = write_component_file(&statistics_path, &statistics)?;
+
+        let data_source = self.data_buf.into_source()?;
+        let compression_info =
+            Self::build_data_source_to_file(data_source, &self.options, &data_path)?;
+        let compression_info_len = if let Some(info) = compression_info.as_ref() {
+            write_component_file(&compression_info_path, info)?
+        } else {
+            0
+        };
+
+        let rows_len = write_component_file(&rows_path, &self.rows_buf)?;
+
+        let toc = Self::build_toc(has_compression);
+        let toc_len = write_component_file(&toc_path, &toc)?;
+        let data_len = std::fs::metadata(&data_path)?.len();
+
+        let output = SSTableOutputFiles {
+            data: data_path,
+            partitions: partitions_path,
+            rows: rows_path,
+            filter: filter_path,
+            compression_info: compression_info.as_ref().map(|_| compression_info_path),
+            statistics: statistics_path,
+            toc: toc_path,
+            data_len,
+            partitions_len,
+            rows_len,
+            filter_len,
+            compression_info_len,
+            statistics_len,
+            toc_len,
+            staging_dir,
+        };
+
+        if verify_output {
+            Self::verify_output_files(&output, &header, partition_count)?;
         }
 
         Ok(output)
@@ -434,7 +692,8 @@ impl SSTableWriter {
 
     /// Gate B: reopen the finished SSTable via `SSTableReader` and confirm
     /// the partition count matches what was written. Runs in-memory
-    /// (`Vec<u8>` implements `ReadAt`), adds ~200-500µs per flush.
+    /// (`Vec<u8>` implements `ReadAt`), but streams partition objects instead
+    /// of materializing the full SSTable into a `Vec<Partition>`.
     ///
     /// Caught in production: `data_file_len=2,937,236` bytes vs. partition
     /// index claiming 209 MB — the flush serialized a partial memtable
@@ -461,15 +720,74 @@ impl SSTableWriter {
                 "ferrosa-sstable/writer: verify_output_readable: reopen failed: {e}"
             ))
         })?;
-        let partitions = reader.read_all_partitions().map_err(|e| {
+        let mut iter = reader.partitions_iter().map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "ferrosa-sstable/writer: verify_output_readable: read_all_partitions failed: {e}"
+                "ferrosa-sstable/writer: verify_output_readable: partitions_iter failed: {e}"
             ))
         })?;
-        let read_count = partitions.len() as u64;
+        let mut read_count = 0u64;
+        while iter
+            .next_partition()
+            .map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "ferrosa-sstable/writer: verify_output_readable: partition read failed: {e}"
+                ))
+            })?
+            .is_some()
+        {
+            read_count += 1;
+        }
         if read_count != expected_partition_count {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
                 "ferrosa-sstable/writer: verify_output_readable: partition count mismatch — \
+                 writer wrote {expected_partition_count} but reader sees {read_count}. \
+                 Refusing to return corrupt SSTable."
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_output_files(
+        output: &SSTableOutputFiles,
+        _header: &SerializationHeader,
+        expected_partition_count: u64,
+    ) -> Result<()> {
+        let components = SSTableComponents {
+            data: FileReadAt::open(&output.data)?,
+            partitions: FileReadAt::open(&output.partitions)?,
+            rows: FileReadAt::open(&output.rows)?,
+            filter: std::fs::read(&output.filter)?,
+            compression_info: match &output.compression_info {
+                Some(path) => Some(std::fs::read(path)?),
+                None => None,
+            },
+            statistics: std::fs::read(&output.statistics)?,
+        };
+        let reader = SSTableReader::open(components).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "ferrosa-sstable/writer: verify_output_files: reopen failed: {e}"
+            ))
+        })?;
+        let mut iter = reader.partitions_iter().map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "ferrosa-sstable/writer: verify_output_files: partitions_iter failed: {e}"
+            ))
+        })?;
+        let mut read_count = 0u64;
+        while iter
+            .next_partition()
+            .map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "ferrosa-sstable/writer: verify_output_files: partition read failed: {e}"
+                ))
+            })?
+            .is_some()
+        {
+            read_count += 1;
+        }
+        if read_count != expected_partition_count {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "ferrosa-sstable/writer: verify_output_files: partition count mismatch — \
                  writer wrote {expected_partition_count} but reader sees {read_count}. \
                  Refusing to return corrupt SSTable."
             )));
@@ -490,29 +808,29 @@ impl SSTableWriter {
         // Key: u16 BE length + key bytes
         let key_bytes = partition.key.key.as_bytes();
         self.data_buf
-            .extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
-        self.data_buf.extend_from_slice(key_bytes);
+            .extend_from_slice(&(key_bytes.len() as u16).to_be_bytes())?;
+        self.data_buf.extend_from_slice(key_bytes)?;
 
         // Deletion time: Cassandra 5.x UInt format
         if partition.deletion.is_live() {
-            self.data_buf.push(DELETION_IS_LIVE);
+            self.data_buf.push(DELETION_IS_LIVE)?;
         } else {
             // 8-byte markedForDeleteAt (i64 BE) + 4-byte localDeletionTime (u32 BE)
             self.data_buf
-                .extend_from_slice(&partition.deletion.marked_for_delete_at.to_be_bytes());
+                .extend_from_slice(&partition.deletion.marked_for_delete_at.to_be_bytes())?;
             self.data_buf
-                .extend_from_slice(&partition.deletion.local_deletion_time.to_be_bytes());
+                .extend_from_slice(&partition.deletion.local_deletion_time.to_be_bytes())?;
         }
 
         // Static row (if present)
         if let Some(ref static_row) = partition.static_row {
-            self.serialize_row(static_row, true);
+            self.serialize_row(static_row, true)?;
         }
 
         // Clustered rows
         for row in &partition.rows {
             if let Some(trie) = row_trie.as_mut() {
-                let row_offset = self.data_buf.len() as u64 - data_pos;
+                let row_offset = self.data_buf.len() - data_pos;
                 trie.add(
                     &row.clustering,
                     TriePayload {
@@ -521,11 +839,11 @@ impl SSTableWriter {
                     },
                 )?;
             }
-            self.serialize_row(row, false);
+            self.serialize_row(row, false)?;
         }
 
         // END_OF_PARTITION marker
-        self.data_buf.push(END_OF_PARTITION);
+        self.data_buf.push(END_OF_PARTITION)?;
 
         if let Some(trie) = row_trie {
             let rows_start = self.rows_buf.len() as u64;
@@ -549,7 +867,7 @@ impl SSTableWriter {
     }
 
     /// Serialize a single row to the data buffer.
-    fn serialize_row(&mut self, row: &crate::types::Row, is_static: bool) {
+    fn serialize_row(&mut self, row: &crate::types::Row, is_static: bool) -> Result<()> {
         // Determine flags
         let mut flags: u8 = 0;
         let mut extended_flags: u8 = 0;
@@ -619,9 +937,9 @@ impl SSTableWriter {
             flags |= EXTENSION_FLAG;
         }
 
-        self.data_buf.push(flags);
+        self.data_buf.push(flags)?;
         if flags & EXTENSION_FLAG != 0 {
-            self.data_buf.push(extended_flags);
+            self.data_buf.push(extended_flags)?;
         }
 
         // Clustering key (not for static rows and absent for schemas with
@@ -637,15 +955,15 @@ impl SSTableWriter {
         // We must extract each component and write it in BTI format.
         let num_ck = self.header.clustering_types.len();
         if !is_static && num_ck > 0 {
-            push_unsigned_vint_to(&mut self.data_buf, 0); // header: all non-null, non-empty
+            push_unsigned_vint_to_data(&mut self.data_buf, 0)?; // header: all non-null, non-empty
 
             if num_ck == 1 {
                 // Single CK column: raw bytes (no u16 prefix).
                 let type_name = &self.header.clustering_types[0];
                 if crate::marshal::value_length_if_fixed(type_name).is_none() {
-                    push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
+                    push_unsigned_vint_to_data(&mut self.data_buf, row.clustering.len() as u64)?;
                 }
-                self.data_buf.extend_from_slice(&row.clustering);
+                self.data_buf.extend_from_slice(&row.clustering)?;
             } else if num_ck > 1 {
                 // Multi-column CK: extract components from u16-prefixed
                 // encoding, then write each in BTI per-component format.
@@ -653,9 +971,9 @@ impl SSTableWriter {
                 for (i, component) in components.iter().enumerate() {
                     let type_name = &self.header.clustering_types[i];
                     if crate::marshal::value_length_if_fixed(type_name).is_none() {
-                        push_unsigned_vint_to(&mut self.data_buf, component.len() as u64);
+                        push_unsigned_vint_to_data(&mut self.data_buf, component.len() as u64)?;
                     }
-                    self.data_buf.extend_from_slice(component);
+                    self.data_buf.extend_from_slice(component)?;
                 }
             }
         }
@@ -711,10 +1029,11 @@ impl SSTableWriter {
 
         // Write row body size + previous unfiltered size + row body
         let row_body_len = row_body.len() as u64;
-        push_unsigned_vint_to(&mut self.data_buf, row_body_len);
+        push_unsigned_vint_to_data(&mut self.data_buf, row_body_len)?;
         // Previous unfiltered size (0 for simplicity)
-        push_unsigned_vint_to(&mut self.data_buf, 0);
-        self.data_buf.extend_from_slice(&row_body);
+        push_unsigned_vint_to_data(&mut self.data_buf, 0)?;
+        self.data_buf.extend_from_slice(&row_body)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -799,39 +1118,65 @@ impl SSTableWriter {
                 let chunk_size = options.chunk_size;
                 let data_length = data_buf.len() as u64;
 
-                let chunks: Vec<&[u8]> = data_buf.chunks(chunk_size).collect();
-                let compressed_chunks: Result<Vec<CompressedChunk>> =
-                    compression_pool().install(|| {
-                        chunks
-                            .par_iter()
-                            .map(|chunk| {
-                                let payload = compression.compress(chunk)?;
-                                let crc = crc32fast::hash(&payload).to_be_bytes();
-                                let stored_size = payload.len() + std::mem::size_of::<u32>();
-                                Ok(CompressedChunk {
-                                    payload,
-                                    crc,
-                                    stored_size,
-                                })
-                            })
-                            .collect()
-                    });
-                let compressed_chunks = compressed_chunks?;
-
-                let total_compressed_len: usize = compressed_chunks
-                    .iter()
-                    .map(|chunk| chunk.stored_size)
-                    .sum();
-                let mut compressed_data = Vec::with_capacity(total_compressed_len);
-                let mut chunk_offsets = Vec::with_capacity(compressed_chunks.len());
+                let chunk_count = data_buf.chunks(chunk_size).len();
+                let mut compressed_data = Vec::with_capacity(data_buf.len());
+                let mut chunk_offsets = Vec::with_capacity(chunk_count);
                 let mut max_compressed_size: usize = 0;
+                let batch_chunks = compression_batch_chunks();
+                let mut batch: Vec<&[u8]> = Vec::with_capacity(batch_chunks);
 
-                for chunk in compressed_chunks {
-                    chunk_offsets.push(compressed_data.len() as u64);
-                    max_compressed_size = max_compressed_size.max(chunk.stored_size);
-                    compressed_data.extend_from_slice(&chunk.payload);
-                    compressed_data.extend_from_slice(&chunk.crc);
+                let flush_batch = |batch: &mut Vec<&[u8]>,
+                                   compressed_data: &mut Vec<u8>,
+                                   chunk_offsets: &mut Vec<u64>,
+                                   max_compressed_size: &mut usize|
+                 -> Result<()> {
+                    if batch.is_empty() {
+                        return Ok(());
+                    }
+                    let compressed_chunks: Result<Vec<CompressedChunk>> = compression_pool()
+                        .install(|| {
+                            batch
+                                .par_iter()
+                                .map(|chunk| {
+                                    let payload = compression.compress(chunk)?;
+                                    let crc = crc32fast::hash(&payload).to_be_bytes();
+                                    let stored_size = payload.len() + std::mem::size_of::<u32>();
+                                    Ok(CompressedChunk {
+                                        payload,
+                                        crc,
+                                        stored_size,
+                                    })
+                                })
+                                .collect()
+                        });
+
+                    for chunk in compressed_chunks? {
+                        chunk_offsets.push(compressed_data.len() as u64);
+                        *max_compressed_size = (*max_compressed_size).max(chunk.stored_size);
+                        compressed_data.extend_from_slice(&chunk.payload);
+                        compressed_data.extend_from_slice(&chunk.crc);
+                    }
+                    batch.clear();
+                    Ok(())
+                };
+
+                for chunk in data_buf.chunks(chunk_size) {
+                    batch.push(chunk);
+                    if batch.len() == batch_chunks {
+                        flush_batch(
+                            &mut batch,
+                            &mut compressed_data,
+                            &mut chunk_offsets,
+                            &mut max_compressed_size,
+                        )?;
+                    }
                 }
+                flush_batch(
+                    &mut batch,
+                    &mut compressed_data,
+                    &mut chunk_offsets,
+                    &mut max_compressed_size,
+                )?;
 
                 let info = CompressionInfo {
                     compression: compression.clone(),
@@ -847,6 +1192,209 @@ impl SSTableWriter {
             _ => {
                 // No compression
                 Ok((data_buf, None))
+            }
+        }
+    }
+
+    /// Build Data.db directly on disk and return optional CompressionInfo.db
+    /// bytes. The compressed path writes each bounded batch to `data_path`
+    /// before compressing the next batch, so peak heap does not include the
+    /// full compressed Data.db.
+    fn build_data_db_to_file(
+        data_buf: Vec<u8>,
+        options: &WriteOptions,
+        data_path: &Path,
+    ) -> Result<Option<Vec<u8>>> {
+        match &options.compression {
+            Some(compression) if !matches!(compression, Compression::None) => {
+                struct CompressedChunk {
+                    payload: Vec<u8>,
+                    crc: [u8; 4],
+                    stored_size: usize,
+                }
+
+                let chunk_size = options.chunk_size;
+                let data_length = data_buf.len() as u64;
+                let chunk_count = data_buf.chunks(chunk_size).len();
+                let mut chunk_offsets = Vec::with_capacity(chunk_count);
+                let mut max_compressed_size: usize = 0;
+                let batch_chunks = compression_batch_chunks();
+                let mut batch: Vec<&[u8]> = Vec::with_capacity(batch_chunks);
+                let mut file = std::fs::File::create(data_path)?;
+
+                let flush_batch = |batch: &mut Vec<&[u8]>,
+                                   file: &mut std::fs::File,
+                                   chunk_offsets: &mut Vec<u64>,
+                                   max_compressed_size: &mut usize|
+                 -> Result<()> {
+                    if batch.is_empty() {
+                        return Ok(());
+                    }
+                    let compressed_chunks: Result<Vec<CompressedChunk>> = compression_pool()
+                        .install(|| {
+                            batch
+                                .par_iter()
+                                .map(|chunk| {
+                                    let payload = compression.compress(chunk)?;
+                                    let crc = crc32fast::hash(&payload).to_be_bytes();
+                                    let stored_size = payload.len() + std::mem::size_of::<u32>();
+                                    Ok(CompressedChunk {
+                                        payload,
+                                        crc,
+                                        stored_size,
+                                    })
+                                })
+                                .collect()
+                        });
+
+                    for chunk in compressed_chunks? {
+                        chunk_offsets.push(file.stream_position()?);
+                        *max_compressed_size = (*max_compressed_size).max(chunk.stored_size);
+                        file.write_all(&chunk.payload)?;
+                        file.write_all(&chunk.crc)?;
+                    }
+                    batch.clear();
+                    Ok(())
+                };
+
+                for chunk in data_buf.chunks(chunk_size) {
+                    batch.push(chunk);
+                    if batch.len() == batch_chunks {
+                        flush_batch(
+                            &mut batch,
+                            &mut file,
+                            &mut chunk_offsets,
+                            &mut max_compressed_size,
+                        )?;
+                    }
+                }
+                flush_batch(
+                    &mut batch,
+                    &mut file,
+                    &mut chunk_offsets,
+                    &mut max_compressed_size,
+                )?;
+                file.sync_data()?;
+
+                let info = CompressionInfo {
+                    compression: compression.clone(),
+                    chunk_length: chunk_size,
+                    max_compressed_size,
+                    data_length,
+                    chunk_offsets,
+                };
+                info.write().map(Some)
+            }
+            _ => {
+                let mut file = std::fs::File::create(data_path)?;
+                file.write_all(&data_buf)?;
+                file.sync_data()?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn build_data_source_to_file(
+        data_source: DataSource,
+        options: &WriteOptions,
+        data_path: &Path,
+    ) -> Result<Option<Vec<u8>>> {
+        match data_source {
+            DataSource::Memory(data_buf) => {
+                Self::build_data_db_to_file(data_buf, options, data_path)
+            }
+            DataSource::File { path, len } => {
+                let result = Self::build_data_file_to_file(&path, len, options, data_path);
+                if result.is_ok() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                result
+            }
+        }
+    }
+
+    fn build_data_file_to_file(
+        raw_path: &Path,
+        data_length: u64,
+        options: &WriteOptions,
+        data_path: &Path,
+    ) -> Result<Option<Vec<u8>>> {
+        match &options.compression {
+            Some(compression) if !matches!(compression, Compression::None) => {
+                struct CompressedChunk {
+                    payload: Vec<u8>,
+                    crc: [u8; 4],
+                    stored_size: usize,
+                }
+
+                let chunk_size = options.chunk_size;
+                let chunk_count = data_length.div_ceil(chunk_size as u64) as usize;
+                let mut chunk_offsets = Vec::with_capacity(chunk_count);
+                let mut max_compressed_size: usize = 0;
+                let batch_chunks = compression_batch_chunks();
+                let mut raw = std::fs::File::open(raw_path)?;
+                let mut out = std::fs::File::create(data_path)?;
+
+                loop {
+                    let mut batch = Vec::with_capacity(batch_chunks);
+                    for _ in 0..batch_chunks {
+                        let mut chunk = vec![0u8; chunk_size];
+                        let mut read = 0usize;
+                        while read < chunk_size {
+                            let n = raw.read(&mut chunk[read..])?;
+                            if n == 0 {
+                                break;
+                            }
+                            read += n;
+                        }
+                        if read == 0 {
+                            break;
+                        }
+                        chunk.truncate(read);
+                        batch.push(chunk);
+                    }
+                    if batch.is_empty() {
+                        break;
+                    }
+
+                    let compressed_chunks: Result<Vec<CompressedChunk>> = compression_pool()
+                        .install(|| {
+                            batch
+                                .par_iter()
+                                .map(|chunk| {
+                                    let payload = compression.compress(chunk)?;
+                                    let crc = crc32fast::hash(&payload).to_be_bytes();
+                                    let stored_size = payload.len() + std::mem::size_of::<u32>();
+                                    Ok(CompressedChunk {
+                                        payload,
+                                        crc,
+                                        stored_size,
+                                    })
+                                })
+                                .collect()
+                        });
+
+                    for chunk in compressed_chunks? {
+                        chunk_offsets.push(out.stream_position()?);
+                        max_compressed_size = max_compressed_size.max(chunk.stored_size);
+                        out.write_all(&chunk.payload)?;
+                        out.write_all(&chunk.crc)?;
+                    }
+                }
+                out.sync_data()?;
+
+                let info = CompressionInfo {
+                    compression: compression.clone(),
+                    chunk_length: chunk_size,
+                    max_compressed_size,
+                    data_length,
+                    chunk_offsets,
+                };
+                info.write().map(Some)
+            }
+            _ => {
+                std::fs::rename(raw_path, data_path)?;
+                Ok(None)
             }
         }
     }
@@ -983,6 +1531,12 @@ fn push_unsigned_vint_to(buf: &mut Vec<u8>, value: u64) {
     let mut vbuf = [0u8; 9];
     let n = varint::write_unsigned_vint(&mut vbuf, value);
     buf.extend_from_slice(&vbuf[..n]);
+}
+
+fn push_unsigned_vint_to_data(buf: &mut DataBuffer, value: u64) -> Result<()> {
+    let mut vbuf = [0u8; 9];
+    let n = varint::write_unsigned_vint(&mut vbuf, value);
+    buf.extend_from_slice(&vbuf[..n])
 }
 
 fn write_columns_subset(buf: &mut Vec<u8>, present_columns: &[usize], num_columns: usize) {

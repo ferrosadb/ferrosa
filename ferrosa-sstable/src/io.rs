@@ -13,6 +13,8 @@
 //! lookups happen concurrently.
 
 use ferrosa_common::Result;
+use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Positional read — read bytes at an offset without seeking.
 ///
@@ -49,6 +51,16 @@ pub trait ReadAt {
             )));
         }
         Ok(())
+    }
+}
+
+impl<T: ReadAt + ?Sized> ReadAt for &T {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        (**self).read_at(buf, offset)
+    }
+
+    fn len(&self) -> Result<u64> {
+        (**self).len()
     }
 }
 
@@ -295,6 +307,104 @@ enum FileReadAtInner {
 }
 
 static GLOBAL_FD_CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
+type FileReadRehydrationHook = dyn Fn(&Path) -> Result<bool> + Send + Sync + 'static;
+type FileReadRangeHook =
+    dyn Fn(&Path, u64, usize) -> Result<Option<Vec<u8>>> + Send + Sync + 'static;
+type FileReadLenHook = dyn Fn(&Path) -> Result<Option<u64>> + Send + Sync + 'static;
+static FILE_READ_REHYDRATION_HOOKS: OnceLock<RwLock<Vec<Arc<FileReadRehydrationHook>>>> =
+    OnceLock::new();
+static FILE_READ_RANGE_HOOKS: OnceLock<RwLock<Vec<Arc<FileReadRangeHook>>>> = OnceLock::new();
+static FILE_READ_LEN_HOOKS: OnceLock<RwLock<Vec<Arc<FileReadLenHook>>>> = OnceLock::new();
+
+fn file_read_rehydration_hooks() -> &'static RwLock<Vec<Arc<FileReadRehydrationHook>>> {
+    FILE_READ_REHYDRATION_HOOKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn file_read_range_hooks() -> &'static RwLock<Vec<Arc<FileReadRangeHook>>> {
+    FILE_READ_RANGE_HOOKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn file_read_len_hooks() -> &'static RwLock<Vec<Arc<FileReadLenHook>>> {
+    FILE_READ_LEN_HOOKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Register a process-wide hook that can restore an immutable component file
+/// after it has been evicted from local disk.
+///
+/// Hooks are called only when a lazy file read observes `NotFound`. The first
+/// hook to return `Ok(true)` wins and the read is retried. This keeps the
+/// SSTable crate independent from object storage while allowing storage engines
+/// to provide S3-backed read-through for uploaded local-cache entries.
+pub fn register_file_read_rehydration_hook(hook: Arc<FileReadRehydrationHook>) {
+    file_read_rehydration_hooks()
+        .write()
+        .expect("file read rehydration hook registry poisoned")
+        .push(hook);
+}
+
+/// Register a process-wide hook that can satisfy a positional read directly
+/// when an immutable component file has been evicted from local disk.
+///
+/// This is the fast path for S3-backed SSTable cache misses: point reads can
+/// fetch only the addressed byte range instead of rehydrating the whole
+/// component locally before retrying the read.
+pub fn register_file_read_range_hook(hook: Arc<FileReadRangeHook>) {
+    file_read_range_hooks()
+        .write()
+        .expect("file read range hook registry poisoned")
+        .push(hook);
+}
+
+/// Register a process-wide hook that can return the length of an evicted
+/// immutable component without restoring it to local disk.
+pub fn register_file_read_len_hook(hook: Arc<FileReadLenHook>) {
+    file_read_len_hooks()
+        .write()
+        .expect("file read len hook registry poisoned")
+        .push(hook);
+}
+
+fn try_read_file_range(path: &Path, offset: u64, buf: &mut [u8]) -> Result<Option<usize>> {
+    let hooks = file_read_range_hooks()
+        .read()
+        .expect("file read range hook registry poisoned");
+    for hook in hooks.iter() {
+        if let Some(bytes) = hook(path, offset, buf.len())? {
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(Some(n));
+        }
+    }
+    Ok(None)
+}
+
+fn try_file_len(path: &Path) -> Result<Option<u64>> {
+    let hooks = file_read_len_hooks()
+        .read()
+        .expect("file read len hook registry poisoned");
+    for hook in hooks.iter() {
+        if let Some(len) = hook(path)? {
+            return Ok(Some(len));
+        }
+    }
+    Ok(None)
+}
+
+fn try_rehydrate_file(path: &Path) -> Result<bool> {
+    let hooks = file_read_rehydration_hooks()
+        .read()
+        .expect("file read rehydration hook registry poisoned");
+    for hook in hooks.iter() {
+        if hook(path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_not_found(err: &ferrosa_common::Error) -> bool {
+    matches!(err, ferrosa_common::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
 
 fn global_fd_cache() -> std::sync::Arc<FdCache> {
     std::sync::Arc::clone(GLOBAL_FD_CACHE.get_or_init(|| {
@@ -375,7 +485,21 @@ impl ReadAt for FileReadAt {
             }
             FileReadAtInner::Empty => Ok(0),
             FileReadAtInner::CachedFd { path, cache } => {
-                let file = cache.get_or_open(path)?;
+                let file = match cache.get_or_open(path) {
+                    Ok(file) => file,
+                    Err(e) if is_not_found(&e) => {
+                        if let Some(n) = try_read_file_range(path, offset, buf)? {
+                            return Ok(n);
+                        }
+                        if try_rehydrate_file(path)? {
+                            cache.invalidate(path);
+                            cache.get_or_open(path)?
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
@@ -396,7 +520,21 @@ impl ReadAt for FileReadAt {
         match &self.inner {
             FileReadAtInner::Mmap { len, .. } => Ok(*len),
             FileReadAtInner::Empty => Ok(0),
-            FileReadAtInner::CachedFd { path, .. } => Ok(std::fs::metadata(path)?.len()),
+            FileReadAtInner::CachedFd { path, cache } => match std::fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(len) = try_file_len(path)? {
+                        return Ok(len);
+                    }
+                    if try_rehydrate_file(path)? {
+                        cache.invalidate(path);
+                        Ok(std::fs::metadata(path)?.len())
+                    } else {
+                        Err(e.into())
+                    }
+                }
+                Err(e) => Err(e.into()),
+            },
         }
     }
 }
@@ -844,6 +982,89 @@ mod tests {
         assert!(
             msg.contains("No such file") || msg.contains("missing.db") || msg.contains("ENOENT"),
             "expected open-error surfaced from read_at, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cached_data_component_rehydrates_missing_file_before_retrying_read() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(4).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-Data.db");
+        let restored = b"restored sstable bytes";
+        std::fs::write(&path, b"original bytes").unwrap();
+
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate_for_test(&path);
+
+        let hook_path = path.clone();
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        register_file_read_rehydration_hook(Arc::new(move |missing_path| {
+            if missing_path != hook_path {
+                return Ok(false);
+            }
+            hook_calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            std::fs::write(missing_path, restored)?;
+            Ok(true)
+        }));
+
+        let mut buf = vec![0u8; restored.len()];
+        reader.read_exact_at(&mut buf, 0).unwrap();
+
+        assert_eq!(buf, restored);
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(reader.len().unwrap(), restored.len() as u64);
+    }
+
+    #[test]
+    fn cached_data_component_reads_evicted_range_without_full_rehydrate() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(4).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range-fast-path-Data.db");
+        std::fs::write(&path, b"local seed bytes").unwrap();
+
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate_for_test(&path);
+
+        let remote = Arc::new(b"0123456789abcdef".to_vec());
+        let hook_path = path.clone();
+        let range_calls = Arc::new(AtomicU64::new(0));
+        let len_calls = Arc::new(AtomicU64::new(0));
+        let range_calls_for_hook = Arc::clone(&range_calls);
+        let remote_for_range = Arc::clone(&remote);
+        register_file_read_range_hook(Arc::new(move |missing_path, offset, len| {
+            if missing_path != hook_path {
+                return Ok(None);
+            }
+            range_calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            let start = offset as usize;
+            let end = start.saturating_add(len).min(remote_for_range.len());
+            Ok(Some(remote_for_range[start..end].to_vec()))
+        }));
+
+        let hook_path = path.clone();
+        let remote_for_len = Arc::clone(&remote);
+        let len_calls_for_hook = Arc::clone(&len_calls);
+        register_file_read_len_hook(Arc::new(move |missing_path| {
+            if missing_path != hook_path {
+                return Ok(None);
+            }
+            len_calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(remote_for_len.len() as u64))
+        }));
+
+        let mut buf = [0u8; 4];
+        reader.read_exact_at(&mut buf, 4).unwrap();
+
+        assert_eq!(&buf, b"4567");
+        assert_eq!(reader.len().unwrap(), remote.len() as u64);
+        assert_eq!(range_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(len_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            !path.exists(),
+            "range fast path must not rehydrate the whole component"
         );
     }
 

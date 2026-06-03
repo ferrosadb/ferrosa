@@ -28,11 +28,13 @@ pub struct CompactionResult {
     pub task: CompactionTask,
     /// Metadata for the newly-created output SSTable.
     pub output: SSTableMetadata,
-    /// Finished SSTable components captured before the local file flush.
+    /// Optional finished SSTable components captured before local file flush.
     ///
-    /// The storage engine still promotes the local files for the current
-    /// file-backed read path, but these bytes allow compaction output to be
-    /// uploaded to S3 without rereading the just-written components.
+    /// This is reserved for a future truly streaming compaction writer. The
+    /// current in-memory SSTable writer already owns full component buffers;
+    /// cloning those buffers for direct upload doubled peak heap during large
+    /// compactions and contributed to OOMs, so compaction now uploads from the
+    /// flushed files instead.
     pub direct_upload: Option<CompactionDirectUpload>,
 }
 
@@ -407,9 +409,23 @@ impl CompactionExecutor {
             "compaction: combined output serialization header"
         );
 
-        let options = crate::engine::write_options_for_schema(&task.schema, true)
+        // Compaction verifies the promoted output below with a streaming
+        // readback. Keep the writer's generic verification off here so
+        // finish() does not perform a second full output scan.
+        let options = crate::engine::write_options_for_schema(&task.schema, false)
             .map_err(|e| format!("compaction: invalid write options: {e}"))?;
-        let mut writer = SSTableWriter::new(options, output_header.clone());
+        let flush_target = FileFlushTarget::new_starting_at(task.output_dir.clone())
+            .map_err(|e| format!("flush target: {e}"))?;
+        let staging_dir = flush_target
+            .file_output_staging_dir()
+            .map_err(|e| format!("flush staging dir: {e}"))?
+            .ok_or_else(|| "file flush target did not provide staging directory".to_string())?;
+        let mut writer = SSTableWriter::new_file_backed(
+            options,
+            output_header.clone(),
+            staging_dir.join("Data.raw"),
+        )
+        .map_err(|e| format!("writer staging: {e}"))?;
 
         // 3. K-way streaming merge across the input partition iterators.
         //
@@ -603,19 +619,19 @@ impl CompactionExecutor {
         }
 
         let finish_start = Instant::now();
-        let output = writer.finish().map_err(|e| format!("finish: {e}"))?;
+        let output = writer
+            .finish_to_directory(staging_dir)
+            .map_err(|e| format!("finish: {e}"))?;
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::WriterFinish,
             finish_start.elapsed(),
         );
-        let direct_upload = Some(compaction_direct_upload_from_output(&output));
+        let direct_upload = None;
 
-        // 4. Write to output directory via FileFlushTarget.
-        let flush_target = FileFlushTarget::new_starting_at(task.output_dir.clone())
-            .map_err(|e| format!("flush target: {e}"))?;
+        // 4. Promote staged output files via FileFlushTarget.
         let local_write_start = Instant::now();
         let reader = flush_target
-            .flush(output)
+            .flush_files(output)
             .map_err(|e| format!("flush output: {e}"))?;
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::LocalWriteSstable,
@@ -719,32 +735,6 @@ impl CompactionExecutor {
 pub(crate) struct ExecutedCompaction {
     pub metadata: SSTableMetadata,
     pub direct_upload: Option<CompactionDirectUpload>,
-}
-
-fn compaction_direct_upload_from_output(
-    output: &ferrosa_sstable::writer::SSTableOutput,
-) -> CompactionDirectUpload {
-    let mut files = vec![
-        SstableComponentBytes::new("Data.db", bytes::Bytes::from(output.data.clone())),
-        SstableComponentBytes::new(
-            "Partitions.db",
-            bytes::Bytes::from(output.partitions.clone()),
-        ),
-        SstableComponentBytes::new("Rows.db", bytes::Bytes::from(output.rows.clone())),
-        SstableComponentBytes::new("Filter.db", bytes::Bytes::from(output.filter.clone())),
-        SstableComponentBytes::new(
-            "Statistics.db",
-            bytes::Bytes::from(output.statistics.clone()),
-        ),
-        SstableComponentBytes::new("TOC.txt", bytes::Bytes::from(output.toc.clone())),
-    ];
-    if let Some(compression_info) = &output.compression_info {
-        files.push(SstableComponentBytes::new(
-            "CompressionInfo.db",
-            bytes::Bytes::from(compression_info.clone()),
-        ));
-    }
-    CompactionDirectUpload { files }
 }
 
 /// Build an output `SerializationHeader` from the inputs' own headers

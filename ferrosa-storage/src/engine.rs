@@ -13,13 +13,16 @@
 //! Only flush and compaction take per-table serialized guards.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use ferrosa_common::task_pool::TaskPool;
+use futures::TryStreamExt;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 
@@ -781,6 +784,345 @@ fn normalize_consolidation_type(type_name: &str) -> String {
 }
 
 impl StorageEngine {
+    fn block_on_rehydration<F, T>(future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return tokio::task::block_in_place(|| handle.block_on(future));
+            }
+        }
+
+        static REHYDRATION_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        REHYDRATION_RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build SSTable rehydration runtime")
+            })
+            .block_on(future)
+    }
+
+    fn parse_local_sstable_component_path(
+        data_dir: &Path,
+        path: &Path,
+    ) -> Option<(String, String, String)> {
+        let sstable_root = data_dir.join("sstables");
+        let relative = path.strip_prefix(&sstable_root).ok()?;
+        let parts: Vec<_> = relative.components().collect();
+        match parts.as_slice() {
+            [table, file] => {
+                let table_id = table.as_os_str().to_str()?.to_string();
+                let file_name = file.as_os_str().to_str()?;
+                let (sstable_id, component) = file_name.split_once('-')?;
+                Some((table_id, sstable_id.to_string(), component.to_string()))
+            }
+            [table, dir_gen, file] => {
+                let table_id = table.as_os_str().to_str()?.to_string();
+                let dir_gen = dir_gen.as_os_str().to_str()?;
+                let file_name = file.as_os_str().to_str()?;
+                let (sstable_id, component) = file_name.split_once('-')?;
+                if sstable_id == dir_gen {
+                    Some((table_id, sstable_id.to_string(), component.to_string()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn install_s3_file_read_rehydration_hook(
+        data_dir: PathBuf,
+        prefix: String,
+        store: Arc<dyn object_store::ObjectStore>,
+    ) {
+        const SSTABLE_COMPONENTS: &[&str] = &[
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+            "CompressionInfo.db",
+        ];
+
+        let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
+            Arc::new(DashMap::new());
+        {
+            let data_dir = data_dir.clone();
+            let prefix = prefix.clone();
+            let store = Arc::clone(&store);
+            ferrosa_sstable::io::register_file_read_range_hook(Arc::new(
+                move |path, offset, len| {
+                    let Some((table_id, sstable_id, component)) =
+                        Self::parse_local_sstable_component_path(&data_dir, path)
+                    else {
+                        return Ok(None);
+                    };
+                    if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
+                        return Ok(None);
+                    }
+                    if len == 0 {
+                        return Ok(Some(Vec::new()));
+                    }
+
+                    let start = usize::try_from(offset).map_err(|_| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "SSTable range read offset exceeds usize: {}",
+                            offset
+                        ))
+                    })?;
+                    let end = start.checked_add(len).ok_or_else(|| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "SSTable range read overflow: offset={} len={}",
+                            offset, len
+                        ))
+                    })?;
+                    let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
+                    let s3_path = crate::upload::manager::sstable_object_key(
+                        &prefix,
+                        &hex,
+                        &table_id,
+                        &sstable_id,
+                        &component,
+                    );
+                    let store = Arc::clone(&store);
+                    let result = Self::block_on_rehydration(async move {
+                        match store.get_range(&s3_path, start..end).await {
+                            Ok(bytes) => Ok(Some(bytes.to_vec())),
+                            Err(object_store::Error::NotFound { .. }) => Ok(None),
+                            Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                                "failed ranged SSTable component read {s3_path}: {e}"
+                            ))),
+                        }
+                    })?;
+                    if result.is_some() {
+                        tracing::debug!(
+                            local_path = %path.display(),
+                            table = table_id,
+                            sstable = sstable_id,
+                            component,
+                            offset,
+                            len,
+                            "served evicted SSTable component range from object storage"
+                        );
+                    }
+                    Ok(result)
+                },
+            ));
+        }
+        {
+            let data_dir = data_dir.clone();
+            let prefix = prefix.clone();
+            let store = Arc::clone(&store);
+            ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
+                let Some((table_id, sstable_id, component)) =
+                    Self::parse_local_sstable_component_path(&data_dir, path)
+                else {
+                    return Ok(None);
+                };
+                if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
+                    return Ok(None);
+                }
+                let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
+                let s3_path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id,
+                    &sstable_id,
+                    &component,
+                );
+                let store = Arc::clone(&store);
+                Self::block_on_rehydration(async move {
+                    match store.head(&s3_path).await {
+                        Ok(meta) => Ok(Some(meta.size as u64)),
+                        Err(object_store::Error::NotFound { .. }) => Ok(None),
+                        Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "failed SSTable component head {s3_path}: {e}"
+                        ))),
+                    }
+                })
+            }));
+        }
+        ferrosa_sstable::io::register_file_read_rehydration_hook(Arc::new(move |path| {
+            let Some((table_id, sstable_id, component)) =
+                Self::parse_local_sstable_component_path(&data_dir, path)
+            else {
+                return Ok(false);
+            };
+            if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
+                return Ok(false);
+            }
+
+            crate::metrics::inc_sstable_rehydration_request();
+            let started = Instant::now();
+            let lock_key = format!("{table_id}/{sstable_id}");
+            let rehydration_lock = Arc::clone(
+                rehydration_locks
+                    .entry(lock_key.clone())
+                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+                    .value(),
+            );
+            let _guard = rehydration_lock
+                .lock()
+                .expect("SSTable rehydration lock poisoned");
+            let Some(parent) = path.parent() else {
+                return Ok(false);
+            };
+            std::fs::create_dir_all(parent)?;
+
+            if path.exists() {
+                crate::metrics::observe_sstable_rehydration_success(started.elapsed(), 0, 0);
+                return Ok(true);
+            }
+
+            let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
+            let store = Arc::clone(&store);
+            let parent = parent.to_path_buf();
+            let requested_path = path.to_path_buf();
+            let async_prefix = prefix.clone();
+            let async_table_id = table_id.clone();
+            let async_sstable_id = sstable_id.clone();
+            let async_requested_path = requested_path.clone();
+            let components = SSTABLE_COMPONENTS.to_vec();
+
+            crate::metrics::inc_sstable_rehydration_in_flight();
+            let result = Self::block_on_rehydration(async move {
+                let mut restored = 0usize;
+                let mut restored_bytes = 0u64;
+                for component_name in components {
+                    let local_path = parent.join(format!("{async_sstable_id}-{component_name}"));
+                    if local_path.exists() {
+                        continue;
+                    }
+
+                    let s3_path = crate::upload::manager::sstable_object_key(
+                        &async_prefix,
+                        &hex,
+                        &async_table_id,
+                        &async_sstable_id,
+                        component_name,
+                    );
+                    let tmp_path = local_path.with_extension(format!(
+                        "{}.rehydrate.tmp",
+                        local_path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("component")
+                    ));
+
+                    match store.get(&s3_path).await {
+                        Ok(result) => {
+                            let mut stream = result.into_stream();
+                            let mut file =
+                                tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to create SSTable rehydration temp file {}: {e}",
+                                        tmp_path.display()
+                                    ))
+                                })?;
+                            use tokio::io::AsyncWriteExt;
+                            while let Some(chunk) = stream.try_next().await.map_err(|e| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "failed to stream SSTable component {s3_path}: {e}"
+                                ))
+                            })? {
+                                restored_bytes = restored_bytes.saturating_add(chunk.len() as u64);
+                                file.write_all(&chunk).await.map_err(|e| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to write SSTable rehydration temp file {}: {e}",
+                                        tmp_path.display()
+                                    ))
+                                })?;
+                            }
+                            file.sync_data().await.map_err(|e| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "failed to sync SSTable rehydration temp file {}: {e}",
+                                    tmp_path.display()
+                                ))
+                            })?;
+                            drop(file);
+                            tokio::fs::rename(&tmp_path, &local_path)
+                                .await
+                                .map_err(|e| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to promote SSTable rehydration temp file {} to {}: {e}",
+                                        tmp_path.display(),
+                                        local_path.display()
+                                    ))
+                            })?;
+                            restored += 1;
+                        }
+                        Err(object_store::Error::NotFound { .. })
+                            if component_name != "Data.db" =>
+                        {
+                            let _ = tokio::fs::remove_file(&tmp_path).await;
+                            tracing::debug!(
+                                table = async_table_id.as_str(),
+                                sstable = async_sstable_id.as_str(),
+                                component = component_name,
+                                "optional SSTable component absent during read-through rehydration"
+                            );
+                        }
+                        Err(object_store::Error::NotFound { .. }) => {
+                            let _ = tokio::fs::remove_file(&tmp_path).await;
+                            return Ok((false, restored, restored_bytes));
+                        }
+                        Err(e) => {
+                            let _ = tokio::fs::remove_file(&tmp_path).await;
+                            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to rehydrate SSTable component {s3_path}: {e}"
+                            )));
+                        }
+                    }
+                }
+
+                Ok((
+                    async_requested_path.exists() || restored > 0,
+                    restored,
+                    restored_bytes,
+                ))
+            });
+            crate::metrics::dec_sstable_rehydration_in_flight();
+
+            if let Err(err) = &result {
+                crate::metrics::observe_sstable_rehydration_failure(started.elapsed());
+                tracing::warn!(
+                    %err,
+                    local_path = %requested_path.display(),
+                    "SSTable read-through rehydration failed"
+                );
+            } else if let Ok((true, restored, restored_bytes)) = result {
+                crate::metrics::observe_sstable_rehydration_success(
+                    started.elapsed(),
+                    restored as u64,
+                    restored_bytes,
+                );
+                tracing::info!(
+                    local_path = %requested_path.display(),
+                    table = table_id,
+                    sstable = sstable_id,
+                    requested_component = component,
+                    restored,
+                    restored_bytes,
+                    "SSTable generation rehydrated from object storage"
+                );
+                return Ok(true);
+            } else {
+                crate::metrics::observe_sstable_rehydration_failure(started.elapsed());
+            }
+
+            Ok(false)
+        }));
+    }
+
     fn build_upload_managers(
         object_store_config: Option<&ObjectStoreConfig>,
         runtime: Option<&tokio::runtime::Handle>,
@@ -1034,6 +1376,17 @@ impl StorageEngine {
             #[cfg(test)]
             upload_store_override: None,
         };
+
+        if let (Some(os_config), Some(store)) = (
+            engine.config.object_store.as_ref(),
+            engine.object_store.as_ref(),
+        ) {
+            Self::install_s3_file_read_rehydration_hook(
+                engine.config.data_dir.clone(),
+                os_config.prefix.clone(),
+                Arc::clone(store),
+            );
+        }
 
         engine.load_local_schema_if_present();
         Ok(engine)
@@ -2579,9 +2932,11 @@ impl StorageEngine {
                             }
                         }
                     }
+                    let sstable_dir = Self::generation_dir_path(table_dir, gen)
+                        .unwrap_or_else(|| table_dir.to_path_buf());
                     sstables.push(Arc::new(reader));
                     sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
-                    ids.push((gen_str.clone(), table_dir.to_path_buf()));
+                    ids.push((gen_str.clone(), sstable_dir));
                 }
                 Err(e) => match repair_mode {
                     StartupSstableRepairMode::Quarantine => {
@@ -4940,14 +5295,10 @@ impl StorageEngine {
             //   5. Update manifest (remove inputs, add output)
             //
             // If upload_manager is None (no S3 configured) we skip silently.
-            let direct_upload_available = result.direct_upload.is_some();
-            let upload_mgr = if direct_upload_available {
-                self.compaction_upload_manager
-                    .as_ref()
-                    .or_else(|| self.upload_manager.as_ref())
-            } else {
-                self.upload_manager.as_ref()
-            };
+            let upload_mgr = self
+                .compaction_upload_manager
+                .as_ref()
+                .or_else(|| self.upload_manager.as_ref());
             let Some(upload_mgr) = upload_mgr else {
                 continue;
             };
@@ -5477,14 +5828,30 @@ impl StorageEngine {
             "CompressionInfo.db",
         ];
         let mut reclaimed = 0u64;
+
+        // Resolve the component directory once before deleting anything. For
+        // compaction-promoted SSTables components live in `<table>/<gen>/`.
+        // Calling `generation_component_path` after removing `Data.db` would
+        // no longer recognize the generation directory and would leave every
+        // sidecar/index component behind.
+        let component_dir = table_dir
+            .join(gen)
+            .is_dir()
+            .then(|| table_dir.join(gen))
+            .unwrap_or_else(|| table_dir.to_path_buf());
+
         for s in &suffixes {
-            if let Some(path) = Self::generation_component_path(table_dir, gen, s) {
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                if std::fs::remove_file(path).is_ok() {
-                    reclaimed = reclaimed.saturating_add(size);
-                }
+            let path = component_dir.join(format!("{gen}-{s}"));
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                reclaimed = reclaimed.saturating_add(size);
             }
         }
+
+        if component_dir != table_dir {
+            let _ = std::fs::remove_dir(&component_dir);
+        }
+
         reclaimed
     }
 
@@ -7166,6 +7533,108 @@ mod tests {
             table_dir.join("3-Data.db").exists(),
             "unmanifested local SSTables must not be evicted"
         );
+    }
+
+    #[test]
+    fn delete_sstable_files_removes_directory_layout_components_after_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        let gen_dir = table_dir.join("42");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+
+        for component in [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+            "CompressionInfo.db",
+        ] {
+            std::fs::write(gen_dir.join(format!("42-{component}")), b"x").unwrap();
+        }
+
+        let reclaimed = StorageEngine::delete_sstable_files(&table_dir, "42");
+
+        assert!(reclaimed >= 7);
+        assert!(
+            !gen_dir.exists(),
+            "directory-layout SSTable should be removed as a unit"
+        );
+    }
+
+    #[test]
+    fn s3_read_through_rehydrates_full_directory_layout_sstable() {
+        use bytes::Bytes;
+        use ferrosa_sstable::io::{FdCache, FileReadAt, ReadAt};
+        use object_store::ObjectStore;
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let table_id = table_id().to_string();
+        let sstable_id = "42";
+        let table_dir = data_dir.join("sstables").join(&table_id);
+        let gen_dir = table_dir.join(sstable_id);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+
+        let components = [
+            ("Data.db", b"restored data".as_slice()),
+            ("Partitions.db", b"restored partitions".as_slice()),
+            ("Rows.db", b"restored rows".as_slice()),
+            ("Filter.db", b"restored filter".as_slice()),
+            ("Statistics.db", b"restored statistics".as_slice()),
+            ("TOC.txt", b"restored toc".as_slice()),
+            ("CompressionInfo.db", b"restored compression".as_slice()),
+        ];
+
+        std::fs::write(gen_dir.join("42-Data.db"), b"original data").unwrap();
+        let cache = std::sync::Arc::new(FdCache::with_capacity(NonZeroUsize::new(4).unwrap()));
+        let reader = FileReadAt::open_with_cache(gen_dir.join("42-Data.db"), cache).unwrap();
+        StorageEngine::delete_sstable_files(&table_dir, sstable_id);
+
+        let store: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let prefix = "rehydrate-test".to_string();
+        let hex = crate::upload::manager::hex_prefix_for(sstable_id);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (component, bytes) in components {
+                let path = crate::upload::manager::sstable_object_key(
+                    &prefix, &hex, &table_id, sstable_id, component,
+                );
+                store
+                    .put(
+                        &path,
+                        object_store::PutPayload::from(Bytes::copy_from_slice(bytes)),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        StorageEngine::install_s3_file_read_rehydration_hook(
+            data_dir,
+            prefix,
+            std::sync::Arc::clone(&store),
+        );
+
+        let mut buf = vec![0u8; "restored data".len()];
+        reader.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(buf, b"restored data");
+
+        for (component, bytes) in components {
+            let path = gen_dir.join(format!("42-{component}"));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "component should have been restored: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
