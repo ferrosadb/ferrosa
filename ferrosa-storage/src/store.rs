@@ -2449,6 +2449,168 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(merged.into_iter().take(limit).collect())
     }
 
+    /// Approximate heap footprint of a materialised partition, used to bound
+    /// the working set of [`Self::read_token_range_bounded`] by bytes. Sums
+    /// key, clustering, and cell-value bytes plus a small per-cell overhead;
+    /// an estimate is sufficient for a memory budget.
+    fn partition_heap_bytes(p: &Partition) -> usize {
+        fn row_bytes(r: &Row) -> usize {
+            r.clustering.len()
+                + r.cells
+                    .iter()
+                    .map(|(_, c)| c.value.as_ref().map_or(0, |v| v.len()) + 16)
+                    .sum::<usize>()
+        }
+        p.key.key.as_bytes().len()
+            + p.static_row.as_ref().map_or(0, row_bytes)
+            + p.rows.iter().map(row_bytes).sum::<usize>()
+    }
+
+    /// Token-ordered, budget-bounded chunked read for anti-entropy repair.
+    ///
+    /// Walks `[start_token, end_token)` in strict token order via a k-way
+    /// merge across the active memtable, the flushing memtable, and every
+    /// active SSTable (corrupt SSTables are already excluded from
+    /// `guard.sstables` at startup, so this never touches them). It
+    /// materialises cell-merged partitions into the returned `Vec` until
+    /// **either** `max_partitions` have been collected **or** `max_bytes` of
+    /// estimated partition content has accumulated, then stops and returns the
+    /// token of the next partition that would have been emitted as the resume
+    /// cursor (`None` once the range is exhausted).
+    ///
+    /// Unlike [`Self::read_token_range`] — which collects up to `limit`
+    /// partitions in *source* order before sorting, making it both unbounded
+    /// in bytes and unable to resume a partially-read window when more than
+    /// `limit` partitions fall in the span — this emits a true token-ordered
+    /// prefix. Peak working set is therefore bounded by `max_bytes` plus at
+    /// most one in-flight partition, and a chunked caller can resume
+    /// deterministically from the returned cursor.
+    ///
+    /// At least one partition is always emitted when the range is non-empty
+    /// (even if it alone exceeds `max_bytes`) so a chunked caller always makes
+    /// forward progress. A decode error from any source is propagated (fail
+    /// loud) rather than silently truncating the chunk.
+    pub fn read_token_range_bounded(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        max_partitions: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<Partition>, Option<i64>)> {
+        if start_token >= end_token || max_partitions == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let guard = self.view.load();
+        let schema = self.schema.load();
+        let in_range = |t: i64| t >= start_token && t < end_token;
+
+        let mut mem_active: Vec<Partition> = guard
+            .active
+            .range_iter(None, None)
+            .filter(|p: &Partition| in_range(p.key.token.0))
+            .collect();
+        mem_active.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut mem_active_iter = mem_active.into_iter().peekable();
+
+        let mut mem_flushing: Vec<Partition> = match guard.flushing {
+            Some(ref f) => f
+                .range_iter(None, None)
+                .filter(|p: &Partition| in_range(p.key.token.0))
+                .collect(),
+            None => Vec::new(),
+        };
+        mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut mem_flushing_iter = mem_flushing.into_iter().peekable();
+
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
+            Vec::with_capacity(guard.sstables.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(guard.sstables.len());
+        for sstable in guard.sstables.iter() {
+            let mut iter = match sstable.partitions_iter() {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+            let _ = iter.seek_to_token(start_token);
+            while let Ok(Some(k)) = iter.peek_partition_key() {
+                if k.token.0 < start_token {
+                    if iter.skip_to_next_partition().is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            sst_iters.push(iter);
+            sst_mappings.push(ColumnOrdinalMapping::for_header(&schema, sstable.header()));
+        }
+
+        let mut out: Vec<Partition> = Vec::new();
+        let mut out_bytes: usize = 0;
+        let pick = |cur: &Option<DecoratedKey>, candidate: &DecoratedKey| -> bool {
+            cur.as_ref().map(|k| candidate < k).unwrap_or(true)
+        };
+        let next_cursor = loop {
+            // Smallest key across all sources (SSTable keys past the range end
+            // are ignored).
+            let mut smallest_key: Option<DecoratedKey> = None;
+            if let Some(p) = mem_active_iter.peek() {
+                if pick(&smallest_key, &p.key) {
+                    smallest_key = Some(p.key.clone());
+                }
+            }
+            if let Some(p) = mem_flushing_iter.peek() {
+                if pick(&smallest_key, &p.key) {
+                    smallest_key = Some(p.key.clone());
+                }
+            }
+            for iter in sst_iters.iter_mut() {
+                if let Ok(Some(k)) = iter.peek_partition_key() {
+                    if k.token.0 >= end_token {
+                        continue;
+                    }
+                    if pick(&smallest_key, &k) {
+                        smallest_key = Some(k);
+                    }
+                }
+            }
+            let Some(key) = smallest_key else {
+                break None;
+            };
+
+            // Stop once the budget is hit — but only after at least one
+            // partition, so a single oversized partition can't stall progress.
+            if !out.is_empty() && (out.len() >= max_partitions || out_bytes >= max_bytes) {
+                break Some(key.token.0);
+            }
+
+            // Gather every source that holds this key, cell-merge, dedup.
+            let mut sources: Vec<Partition> = Vec::new();
+            if mem_active_iter.peek().map(|p| p.key == key) == Some(true) {
+                sources.push(mem_active_iter.next().expect("peeked key must exist"));
+            }
+            if mem_flushing_iter.peek().map(|p| p.key == key) == Some(true) {
+                sources.push(mem_flushing_iter.next().expect("peeked key must exist"));
+            }
+            for (i, iter) in sst_iters.iter_mut().enumerate() {
+                if matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key) {
+                    if let Some(mut p) = iter.next_partition()? {
+                        sst_mappings[i].remap_partition(&mut p);
+                        sources.push(p);
+                    }
+                }
+            }
+            let mut merged = if sources.len() == 1 {
+                sources.pop().expect("len checked")
+            } else {
+                merge::merge_partitions(sources)
+            };
+            merge::apply_deletions(&mut merged);
+            out_bytes += Self::partition_heap_bytes(&merged);
+            out.push(merged);
+        };
+        Ok((out, next_cursor))
+    }
+
     /// Streaming token-bounded walk: invoke `cb` for every partition
     /// in `[start_token, end_token)`, one at a time, dropping each
     /// before the next is decoded.

@@ -4423,6 +4423,31 @@ impl StorageEngine {
         state.store.read_token_range(start_token, end_token, limit)
     }
 
+    /// Token-ordered, budget-bounded chunked read for anti-entropy repair.
+    /// Collects cell-merged partitions in `[start_token, end_token)` until
+    /// `max_partitions` or `max_bytes` is reached, returning the resume cursor
+    /// (token of the next unread partition, or `None` when exhausted). See
+    /// [`TableStore::read_token_range_bounded`] for the full contract.
+    pub fn read_token_range_bounded(
+        &self,
+        table_id: &TableId,
+        start_token: i64,
+        end_token: i64,
+        max_partitions: usize,
+        max_bytes: usize,
+    ) -> ferrosa_common::Result<(Vec<Partition>, Option<i64>)> {
+        if start_token >= end_token || max_partitions == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let tables = self.tables.read();
+        let Some(state) = tables.get(table_id) else {
+            return Ok((Vec::new(), None));
+        };
+        state
+            .store
+            .read_token_range_bounded(start_token, end_token, max_partitions, max_bytes)
+    }
+
     /// Row-streaming walk over `[start_token, end_token)` for the
     /// anti-entropy repair digest path. For each unique partition
     /// the callback receives the header (key, deletion, optional
@@ -9877,6 +9902,133 @@ mod tests {
             .read_token_range(&tid, i64::MIN, i64::MAX, 100)
             .unwrap();
         assert_eq!(results.len(), 7);
+    }
+
+    /// `read_token_range_bounded` must walk the range in token order, stop once
+    /// the *byte* budget is hit (after at least one partition), and hand back a
+    /// resume cursor so a looping caller covers every partition exactly once.
+    /// This is what bounds repair-fetch working set by bytes rather than by an
+    /// unbounded partition count.
+    #[test]
+    fn read_token_range_bounded_byte_budget_covers_all_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // ~1 KB value per partition so the byte budget bites long before any
+        // partition-count cap.
+        let big = vec![b'x'; 1024];
+        let n = 50usize;
+        for i in 0..n {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i:04}")),
+                    make_row(&big, 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        let max_bytes = 4 * 1024; // ~4 partitions per chunk
+        let mut seen: Vec<i64> = Vec::new();
+        let mut cursor = i64::MIN;
+        let mut chunks = 0;
+        loop {
+            let (chunk, next) = engine
+                .read_token_range_bounded(&tid, cursor, i64::MAX, 1000, max_bytes)
+                .unwrap();
+            if chunk.is_empty() {
+                assert!(next.is_none(), "empty chunk must signal exhaustion");
+                break;
+            }
+            chunks += 1;
+            for p in &chunk {
+                if let Some(&last) = seen.last() {
+                    assert!(p.key.token.0 >= last, "tokens must be non-decreasing");
+                }
+                seen.push(p.key.token.0);
+            }
+            match next {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+
+        assert_eq!(seen.len(), n, "must cover all {n} partitions");
+        let mut uniq = seen.clone();
+        uniq.dedup();
+        assert_eq!(uniq.len(), seen.len(), "no partition read twice");
+        assert!(
+            chunks > 1,
+            "byte budget should have split the read into chunks"
+        );
+    }
+
+    /// The partition-count cap also stops a chunk early and resumes cleanly.
+    #[test]
+    fn read_token_range_bounded_count_budget_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let n = 20usize;
+        for i in 0..n {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i:04}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        let mut total = 0usize;
+        let mut cursor = i64::MIN;
+        let mut chunks = 0;
+        loop {
+            let (chunk, next) = engine
+                .read_token_range_bounded(&tid, cursor, i64::MAX, 5, usize::MAX)
+                .unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            assert!(chunk.len() <= 5, "must honor the partition-count cap");
+            chunks += 1;
+            total += chunk.len();
+            match next {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+        assert_eq!(total, n);
+        assert_eq!(chunks, 4, "20 partitions / cap 5 → 4 chunks");
+    }
+
+    /// A single partition larger than the byte budget must still be emitted
+    /// (a chunk of one) so a chunked caller always makes forward progress.
+    #[test]
+    fn read_token_range_bounded_emits_oversized_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let big = vec![b'y'; 1024];
+        engine
+            .write(&tid, &make_key("only"), make_row(&big, 1000), 1000)
+            .unwrap();
+
+        // Byte budget far below the single partition's size.
+        let (chunk, next) = engine
+            .read_token_range_bounded(&tid, i64::MIN, i64::MAX, 1000, 256)
+            .unwrap();
+        assert_eq!(chunk.len(), 1, "oversized partition must still be emitted");
+        assert!(next.is_none(), "single partition exhausts the range");
     }
 
     /// Streaming contract: even with thousands of partitions in the table,
