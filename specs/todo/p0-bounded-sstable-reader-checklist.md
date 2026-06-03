@@ -49,11 +49,11 @@
 - [x] readers released per tier (no `Arc<SSTableReader>` held across `.await`; staged tiers drop readers before the next tier opens)
 - [x] full lib suite green (785 passed); cluster `repair` tests green (54 passed)
 
-## Phase 5 — Startup smoke-test bounded — FMEA #1 (top risk)
+## Phase 5 — Startup smoke-test bounded — FMEA #1 (top risk) — DONE
 
-- [ ] startup validation builds descriptors + validates transiently (open→check→drop), no resident accumulation
-- [ ] test: startup over N≫cap SSTables → resident ≤ cap
-- [ ] full lib suite green
+- [x] startup validation builds descriptors + validates transiently (open→check→drop), no resident accumulation. `load_existing_sstables_and_sidecars[_with_repair_mode]` now returns `Vec<SstableDescriptor>` (was `Vec<FileSSTableReader>`); each gen is opened through the engine-wide pool (`get_or_open`, keyed identically to the live read path via `SstableDescriptor::gen_num_for`), smoke-tested, reduced to a descriptor, then the Arc is dropped before the next gen. Excluded/quarantined gens are `remove()`d from the pool so they are never served. New `TableStore::new_with_descriptors_and_indexes` builds the `StoreView` from descriptors with no reader materialization (replaces the seeded-then-discarded `new_with_sstables_and_indexes` path at startup). `build_table_state` rewired to it.
+- [x] test: startup over N≫cap SSTables → resident ≤ cap — `engine::tests::startup_build_table_state_holds_resident_readers_within_cap` (N=40, cap=4; asserts `resident_reader_count() <= cap` AND `peak_resident_readers() <= cap`). Proven RED→GREEN: holding the Arcs makes peak = N = 40 and the test fails. Corrupt-exclusion regression covered by `startup_warn_mode_excludes_corrupt_sstable_but_keeps_healthy_sstables_queryable` plus pool-eviction asserts added to the warn/quarantine smoke-test tests.
+- [x] full lib suite green — 786 passed (was 785 + 1 new), 0 failed, 0 ignored; cluster `repair` 54 passed; clippy/fmt clean.
 
 ## Phase 6 — Swap correctness — FMEA #4, #11
 

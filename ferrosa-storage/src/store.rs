@@ -155,7 +155,7 @@ impl SstableDescriptor {
     /// the index footer. The bounds use the same decode precedent as compaction
     /// metadata: byte-comparable decode of the smallest/largest key bytes, with
     /// a raw-key token fallback for older fixtures.
-    fn from_reader<R: ReadAt + Send + Sync + 'static>(
+    pub(crate) fn from_reader<R: ReadAt + Send + Sync + 'static>(
         gen: String,
         dir: std::path::PathBuf,
         reader: &SSTableReader<R>,
@@ -183,10 +183,19 @@ impl SstableDescriptor {
     /// Non-numeric IDs (e.g. the `"compacted"` test fixture) hash to a stable
     /// synthetic value so they still pool correctly.
     fn gen_num(&self) -> u64 {
-        self.gen.parse::<u64>().unwrap_or_else(|_| {
+        Self::gen_num_for(&self.gen)
+    }
+
+    /// Compute the pool-key generation for a raw gen string. Shared by
+    /// [`Self::gen_num`] and the engine startup loop so the transient
+    /// startup open and the live read path key the pool identically — a
+    /// mismatch would silently reopen readers or, worse, miss the cache and
+    /// serve from a different key (FMEA #2/#4 keying correctness).
+    pub(crate) fn gen_num_for(gen: &str) -> u64 {
+        gen.parse::<u64>().unwrap_or_else(|_| {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            self.gen.hash(&mut h);
+            gen.hash(&mut h);
             // Reserve the high bit so synthetic gens never collide with real
             // numeric gens in the pool key space.
             h.finish() | (1u64 << 63)
@@ -864,6 +873,80 @@ impl<F: FlushTarget> TableStore<F> {
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
             pool_table_key,
+            read_merge_fanin_override: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Build a `TableStore` from lightweight SSTable *descriptors* rather than
+    /// live readers (Phase 5, FMEA #1).
+    ///
+    /// The startup load path validates each SSTable transiently — open → smoke
+    /// test → capture descriptor → drop — so it never materializes O(count) live
+    /// readers at once (the observed startup OOM). It hands this constructor only
+    /// the resulting descriptors; the engine-wide reader pool reopens readers on
+    /// demand afterward, bounded by its cap. Unlike
+    /// [`Self::new_with_sstables_and_indexes`], no readers are seeded here: there
+    /// are no live readers to seed, which is the whole point.
+    pub(crate) fn new_with_descriptors_and_indexes(
+        schema: TableSchema,
+        flush_target: F,
+        options: WriteOptions,
+        descriptors: Vec<SstableDescriptor>,
+        initial_sidecars: Vec<Arc<HashMap<String, SidecarReader>>>,
+        initial_ids: Vec<(String, std::path::PathBuf)>,
+        indexed_columns: Vec<(String, usize)>,
+    ) -> Self {
+        let active: Arc<dyn Memtable> = new_memtable();
+        let indexes = new_indexes(&indexed_columns);
+        let sstable_count = descriptors.len();
+
+        // Pad sidecar list with empty maps if shorter than the SSTable list.
+        let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> = initial_sidecars;
+        while sidecars.len() < sstable_count {
+            sidecars.push(Arc::new(HashMap::new()));
+        }
+
+        // Fail loud if caller didn't provide a matching IDs vec, mirroring
+        // `new_with_sstables_and_indexes` — the parallel-length invariant
+        // (`check_invariants`) must hold one (gen_str, dir) per descriptor.
+        assert_eq!(
+            descriptors.len(),
+            initial_ids.len(),
+            "new_with_descriptors_and_indexes: descriptors ({}) and initial_ids ({}) \
+             must have equal length — one (gen_str, dir) per SSTable descriptor",
+            descriptors.len(),
+            initial_ids.len()
+        );
+
+        let reader_pool: SharedReaderPool<F::Reader> = Arc::new(
+            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
+        );
+
+        let initial_view = StoreView {
+            active,
+            flushing: None,
+            sstables: Arc::new(descriptors),
+            sstable_ids: Arc::new(initial_ids),
+            indexes,
+            sidecar_indexes: Arc::new(sidecars),
+            vector_indexes: Arc::new(HashMap::new()),
+        };
+        initial_view.check_invariants("new_with_descriptors");
+        Self {
+            schema: ArcSwap::from_pointee(schema),
+            view: ArcSwap::from_pointee(initial_view),
+            flush_guard: Mutex::new(()),
+            flush_target,
+            options,
+            indexed_columns,
+            fulltext_indexes: vec![],
+            vector_index_configs: vec![],
+            vector_index_methods: HashMap::new(),
+            next_gen: std::sync::atomic::AtomicU64::new(1),
+            write_barrier: parking_lot::RwLock::new(()),
+            sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            reader_pool,
+            pool_table_key: String::new(),
             read_merge_fanin_override: std::sync::atomic::AtomicUsize::new(0),
         }
     }

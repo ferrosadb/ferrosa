@@ -702,10 +702,6 @@ fn now_nanos_since_reference() -> i64 {
     reference_instant().elapsed().as_nanos() as i64
 }
 
-/// SSTable reader type alias for file-backed SSTables.
-type FileSSTableReader =
-    Arc<ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>>;
-
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
 type SSTableSidecarMap = Arc<HashMap<String, crate::index::sidecar::SidecarReader>>;
 
@@ -2245,17 +2241,29 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
         })?;
 
-        // Load any SSTables that already exist on disk (e.g., after crash recovery).
-        let (existing_sstables, existing_sidecars, existing_ids) =
-            Self::load_existing_sstables_and_sidecars(&table_dir);
+        // Load any SSTables that already exist on disk (e.g., after crash
+        // recovery). Phase 5 (FMEA #1): validation is *transient and bounded* —
+        // each generation is opened through the engine-wide pool, smoke-tested,
+        // reduced to a lightweight `SstableDescriptor`, then its reader Arc is
+        // dropped before the next generation opens. The pool's cap bounds how
+        // many readers stay resident, so a node bloated with thousands of
+        // SSTables no longer materializes O(count) readers at startup (the
+        // observed startup OOM). The pool is reused as this table's pool below,
+        // so the readers validated last stay warm for the first reads.
+        let (existing_descriptors, existing_sidecars, existing_ids) =
+            Self::load_existing_sstables_and_sidecars(
+                &table_dir,
+                &reader_pool,
+                &table_id.to_string(),
+            );
 
         let flush_target = FileFlushTarget::new_starting_at(table_dir)?;
         // Thread schema compression options and the engine-level write_verify
         // flag into the writer.
         let write_options = write_options_for_schema(&schema, config.write_verify)?;
-        let mut store = if existing_sstables.is_empty() && indexed_columns.is_empty() {
+        let mut store = if existing_descriptors.is_empty() && indexed_columns.is_empty() {
             TableStore::new(schema.clone(), flush_target, write_options)
-        } else if existing_sstables.is_empty() {
+        } else if existing_descriptors.is_empty() {
             TableStore::new_with_indexes(
                 schema.clone(),
                 flush_target,
@@ -2263,11 +2271,11 @@ impl StorageEngine {
                 indexed_columns,
             )
         } else {
-            TableStore::new_with_sstables_and_indexes(
+            TableStore::new_with_descriptors_and_indexes(
                 schema.clone(),
                 flush_target,
                 write_options,
-                existing_sstables,
+                existing_descriptors,
                 existing_sidecars,
                 existing_ids,
                 indexed_columns,
@@ -2276,7 +2284,9 @@ impl StorageEngine {
 
         // Share the engine-wide reader pool, namespacing this table's
         // generations by its id so generations from different tables never
-        // collide in the pool key space.
+        // collide in the pool key space. The pool already holds the (bounded)
+        // set of readers validated last during the transient startup loop above,
+        // keyed by this same `table_id`, so they remain cache-warm.
         store.attach_reader_pool(reader_pool, table_id.to_string());
 
         Ok(TableState {
@@ -2814,22 +2824,28 @@ impl StorageEngine {
 
     fn load_existing_sstables_and_sidecars(
         table_dir: &std::path::Path,
+        reader_pool: &crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
+        pool_table_key: &str,
     ) -> (
-        Vec<FileSSTableReader>,
+        Vec<crate::store::SstableDescriptor>,
         Vec<SSTableSidecarMap>,
         Vec<(String, std::path::PathBuf)>,
     ) {
         Self::load_existing_sstables_and_sidecars_with_repair_mode(
             table_dir,
+            reader_pool,
+            pool_table_key,
             Self::startup_sstable_repair_mode(),
         )
     }
 
     fn load_existing_sstables_and_sidecars_with_repair_mode(
         table_dir: &std::path::Path,
+        reader_pool: &crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
+        pool_table_key: &str,
         repair_mode: StartupSstableRepairMode,
     ) -> (
-        Vec<FileSSTableReader>,
+        Vec<crate::store::SstableDescriptor>,
         Vec<SSTableSidecarMap>,
         Vec<(String, std::path::PathBuf)>,
     ) {
@@ -2865,7 +2881,7 @@ impl StorageEngine {
         // Sort descending — newest generation first.
         generations.sort_by(|a, b| b.cmp(a));
 
-        let mut sstables = Vec::new();
+        let mut descriptors: Vec<crate::store::SstableDescriptor> = Vec::new();
         let mut sidecars = Vec::new();
         let mut ids: Vec<(String, std::path::PathBuf)> = Vec::new();
         let mut quarantined_count = 0usize;
@@ -2927,7 +2943,20 @@ impl StorageEngine {
                 continue;
             }
 
-            match Self::open_sstable_from_dir(table_dir, &gen_str) {
+            // Open through the engine-wide pool, keyed exactly as the live read
+            // path will key it (`(pool_table_key, gen_num)`). The returned `Arc`
+            // is held only for the duration of validation + descriptor capture in
+            // this iteration, then dropped — so the pool's cap bounds resident
+            // readers and startup never spikes past it (FMEA #1). On the
+            // immediately-following reads, the last `cap` generations are still
+            // cache-warm because the pool survives this loop.
+            let table_dir_owned = table_dir.to_path_buf();
+            let gen_num = crate::store::SstableDescriptor::gen_num_for(&gen_str);
+            let pool_key = (pool_table_key.to_string(), gen_num);
+            let open_result = reader_pool.get_or_open(pool_key, || {
+                Self::open_sstable_from_dir(&table_dir_owned, &gen_str)
+            });
+            match open_result {
                 Ok(reader) => {
                     if repair_mode != StartupSstableRepairMode::Off {
                         smoke_tested_count += 1;
@@ -2941,6 +2970,10 @@ impl StorageEngine {
                                         "storage-engine: startup smoke test found corrupt SSTable; excluded from active readers, files remain in place for salvage"
                                     );
                                     excluded_count += 1;
+                                    // Excluded — must never be served from the
+                                    // pool; drop the held Arc and evict the gen.
+                                    drop(reader);
+                                    reader_pool.remove(&(pool_table_key.to_string(), gen_num));
                                     continue;
                                 }
                                 StartupSstableRepairMode::Quarantine => {
@@ -2950,6 +2983,10 @@ impl StorageEngine {
                                         dir = %table_dir.display(),
                                         "storage-engine: startup smoke test quarantining corrupt SSTable"
                                     );
+                                    // Drop the held Arc and evict from the pool
+                                    // before moving the files out from under it.
+                                    drop(reader);
+                                    reader_pool.remove(&(pool_table_key.to_string(), gen_num));
                                     let quarantine_dir = table_dir.join("quarantine");
                                     let _ = std::fs::create_dir_all(&quarantine_dir);
                                     if let Err(qe) =
@@ -2967,7 +3004,15 @@ impl StorageEngine {
                     }
                     let sstable_dir = Self::generation_dir_path(table_dir, gen)
                         .unwrap_or_else(|| table_dir.to_path_buf());
-                    sstables.push(Arc::new(reader));
+                    // Capture the lightweight descriptor (key/token bounds from
+                    // the index footer) and then let `reader` drop at the end of
+                    // this iteration. It stays cached in the pool until evicted by
+                    // the cap — resident readers never exceed the bound.
+                    descriptors.push(crate::store::SstableDescriptor::from_reader(
+                        gen_str.clone(),
+                        sstable_dir.clone(),
+                        &reader,
+                    ));
                     sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
                     ids.push((gen_str.clone(), sstable_dir));
                 }
@@ -3003,7 +3048,7 @@ impl StorageEngine {
                 smoke_quarantined = smoke_quarantined_count,
                 excluded = excluded_count,
                 elapsed_ms = smoke_start.elapsed().as_millis(),
-                loaded = sstables.len(),
+                loaded = descriptors.len(),
                 dir = %table_dir.display(),
                 mode = ?repair_mode,
                 "storage-engine: startup SSTable smoke test complete"
@@ -3013,7 +3058,7 @@ impl StorageEngine {
         if excluded_count > 0 {
             tracing::error!(
                 excluded = excluded_count,
-                loaded = sstables.len(),
+                loaded = descriptors.len(),
                 dir = %table_dir.display(),
                 "storage-engine: excluded {excluded_count} corrupt SSTable(s) from active readers during startup. \
                  Files were not moved or deleted; rows present only in those generations are unavailable until salvage or operator-controlled quarantine/repair."
@@ -3023,7 +3068,7 @@ impl StorageEngine {
         if quarantined_count > 0 {
             tracing::error!(
                 quarantined = quarantined_count,
-                loaded = sstables.len(),
+                loaded = descriptors.len(),
                 dir = %table_dir.display(),
                 "storage-engine: quarantined {quarantined_count} corrupt SSTable(s) during startup repair \
                  — moved to {}/quarantine/. \
@@ -3032,7 +3077,7 @@ impl StorageEngine {
             );
         }
 
-        (sstables, sidecars, ids)
+        (descriptors, sidecars, ids)
     }
 
     /// Scans a table directory for sidecar files belonging to a given generation.
@@ -9121,11 +9166,22 @@ mod tests {
             .set_len(original_len / 2)
             .unwrap();
 
-        let (_sstables, _sidecars, ids) =
-            StorageEngine::load_existing_sstables_and_sidecars(&table_dir);
+        let pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> =
+            Arc::new(crate::reader_pool::ReaderPool::new(8));
+        let (descriptors, _sidecars, ids) =
+            StorageEngine::load_existing_sstables_and_sidecars(&table_dir, &pool, "smoke-warn");
         assert!(
             ids.is_empty(),
             "default warn-mode startup smoke test must not admit a corrupt SSTable into the live view"
+        );
+        assert!(
+            descriptors.is_empty(),
+            "warn-mode startup must not produce a descriptor for the corrupt SSTable"
+        );
+        assert_eq!(
+            pool.resident(),
+            0,
+            "the excluded corrupt SSTable must be evicted from the pool, not left resident"
         );
 
         let quarantine_dir = table_dir.join("quarantine");
@@ -9199,14 +9255,27 @@ mod tests {
             .set_len(original_len / 2)
             .unwrap();
 
-        let (_sstables, _sidecars, ids) =
+        let pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> =
+            Arc::new(crate::reader_pool::ReaderPool::new(8));
+        let (descriptors, _sidecars, ids) =
             StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode(
                 &table_dir,
+                &pool,
+                "smoke-quarantine",
                 StartupSstableRepairMode::Quarantine,
             );
         assert!(
             ids.is_empty(),
             "explicit quarantine-mode repair must not admit the truncated SSTable"
+        );
+        assert!(
+            descriptors.is_empty(),
+            "quarantine-mode repair must not produce a descriptor for the quarantined SSTable"
+        );
+        assert_eq!(
+            pool.resident(),
+            0,
+            "the quarantined SSTable must be evicted from the pool before its files are moved"
         );
 
         let quarantine_dir = table_dir.join("quarantine");
@@ -9306,6 +9375,69 @@ mod tests {
         assert!(
             corrupt_data_file.exists(),
             "excluded corrupt SSTable component must remain on disk for salvage"
+        );
+    }
+
+    /// Phase 5 gate (FMEA #1, top RPN): startup must validate every on-disk
+    /// SSTable *transiently* — open → smoke-test → capture descriptor → drop —
+    /// never accumulating O(count) live readers before the pool can bound them.
+    ///
+    /// We write N ≫ cap SSTables to a table directory, then drive the real
+    /// startup path (`build_table_state`) with a small-cap reader pool and
+    /// assert the resident reader count and the high-water peak both stay ≤ cap.
+    /// Before the Phase 5 fix this loop materialized all N readers into a `Vec`
+    /// and the peak equalled N, OOM-killing bloated nodes during startup.
+    #[test]
+    fn startup_build_table_state_holds_resident_readers_within_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let tid = table_id();
+        let cap = 4usize;
+        let n = 40usize;
+
+        // Materialize N SSTables on disk in the exact layout the engine startup
+        // loop scans (`<data_dir>/sstables/<table_id>/`). A bare TableStore flush
+        // does not auto-compact, so all N generations persist independently.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+        {
+            let store = TableStore::new(
+                schema.clone(),
+                FileFlushTarget::new_starting_at(table_dir.clone()).unwrap(),
+                write_options_for_schema(&schema, true).unwrap(),
+            );
+            for i in 0..n {
+                let key = make_key(&format!("pk-{i}"));
+                store
+                    .write(&key, make_row(format!("v{i}").as_bytes(), 1000 + i as i64))
+                    .unwrap();
+                store.flush().unwrap();
+            }
+            assert_eq!(store.sstable_count(), n, "test must produce N SSTables");
+        }
+
+        // Drive the real startup path with a small-cap pool.
+        let config = StorageEngineConfig::test_config(dir.path());
+        let pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> =
+            Arc::new(crate::reader_pool::ReaderPool::new(cap));
+        let state =
+            StorageEngine::build_table_state(&config, schema, Vec::new(), Arc::clone(&pool))
+                .unwrap();
+
+        assert_eq!(
+            state.store.sstable_count(),
+            n,
+            "all {n} SSTables must be registered as descriptors after startup"
+        );
+        assert!(
+            state.store.resident_reader_count() <= cap,
+            "startup left {} resident readers; must be <= cap {cap}",
+            state.store.resident_reader_count()
+        );
+        assert!(
+            state.store.peak_resident_readers() <= cap,
+            "startup peaked at {} resident readers; must never spike past cap {cap}",
+            state.store.peak_resident_readers()
         );
     }
 
