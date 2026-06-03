@@ -32,6 +32,7 @@ pub mod pin_config;
 pub mod quantized_range_cache;
 pub mod quarantine;
 pub mod range_merger;
+pub mod reader_pool;
 pub mod restore;
 pub mod snapshot;
 pub mod store;
