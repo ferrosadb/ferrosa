@@ -326,14 +326,15 @@ impl SledLogStore {
         // Run sled disk IO on a blocking thread so the async Raft runtime
         // stays responsive for heartbeat processing.
         let log = self.log.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-            log.apply_batch(batch)
-                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
-        .map_err(|e| *e)?;
+        ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+            .spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+                log.apply_batch(batch)
+                    .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+            .map_err(|e| *e)?;
 
         Ok(())
     }
@@ -654,16 +655,17 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         let meta = self.meta.clone();
         let bytes =
             bincode::serialize(vote).map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
-        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-            meta.insert(META_VOTE, bytes)
-                .map_err(|e| Box::new(StorageIOError::write_vote(to_any_error(e))))?;
-            meta.flush()
-                .map_err(|e| Box::new(StorageIOError::write_vote(to_any_error(e))))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?
-        .map_err(|e| *e)?;
+        ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+            .spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+                meta.insert(META_VOTE, bytes)
+                    .map_err(|e| Box::new(StorageIOError::write_vote(to_any_error(e))))?;
+                meta.flush()
+                    .map_err(|e| Box::new(StorageIOError::write_vote(to_any_error(e))))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?
+            .map_err(|e| *e)?;
         Ok(())
     }
 
@@ -682,14 +684,15 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         // durability barrier.
         Self::save_meta(&self.meta, META_COMMITTED, &committed)?;
         let meta = self.meta.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-            meta.flush()
-                .map_err(|e| Box::new(StorageIOError::write(to_any_error(e))))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| StorageIOError::write(to_any_error(e)))?
-        .map_err(|e| *e)?;
+        ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+            .spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+                meta.flush()
+                    .map_err(|e| Box::new(StorageIOError::write(to_any_error(e))))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| StorageIOError::write(to_any_error(e)))?
+            .map_err(|e| *e)?;
         Ok(())
     }
 
@@ -726,22 +729,23 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let log = self.log.clone();
         let start = Self::index_key(log_id.index);
-        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-            let keys_to_remove: Vec<sled::IVec> = log
-                .range(start..)
-                .filter_map(|r| r.ok().map(|(k, _v)| k))
-                .collect();
-            let mut batch = sled::Batch::default();
-            for key in keys_to_remove {
-                batch.remove(key);
-            }
-            log.apply_batch(batch)
-                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
-        .map_err(|e| *e)?;
+        ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+            .spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+                let keys_to_remove: Vec<sled::IVec> = log
+                    .range(start..)
+                    .filter_map(|r| r.ok().map(|(k, _v)| k))
+                    .collect();
+                let mut batch = sled::Batch::default();
+                for key in keys_to_remove {
+                    batch.remove(key);
+                }
+                log.apply_batch(batch)
+                    .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+            .map_err(|e| *e)?;
         Ok(())
     }
 
@@ -757,23 +761,24 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         // would stall the lane and miss heartbeat deadlines (W1.20 / I-25).
         let log = self.log.clone();
         let end_inclusive = Self::index_key(log_id.index);
-        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-            let keys_to_remove: Vec<sled::IVec> = log
-                .range(..=end_inclusive)
-                .filter_map(|r| r.ok().map(|(k, _v)| k))
-                .collect();
+        ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+            .spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
+                let keys_to_remove: Vec<sled::IVec> = log
+                    .range(..=end_inclusive)
+                    .filter_map(|r| r.ok().map(|(k, _v)| k))
+                    .collect();
 
-            let mut batch = sled::Batch::default();
-            for key in keys_to_remove {
-                batch.remove(key);
-            }
-            log.apply_batch(batch)
-                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
-        .map_err(|e| *e)?;
+                let mut batch = sled::Batch::default();
+                for key in keys_to_remove {
+                    batch.remove(key);
+                }
+                log.apply_batch(batch)
+                    .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+            .map_err(|e| *e)?;
 
         Ok(())
     }

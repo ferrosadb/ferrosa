@@ -4,13 +4,12 @@
 //! [`ActiveQueriesTable`] exposes that map as a [`VirtualTable`] readable
 //! via CQL `SELECT` from `system_observability.active_queries`.
 
-use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use ferrosa_common::{CellValue, DataType};
 use ferrosa_schema::virtual_table::{
     RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
 };
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,10 +38,10 @@ pub struct QueryInfo {
 
 /// Tracks currently executing queries.
 ///
-/// Designed for concurrent use without blocking runtime workers. Active query
-/// state is clone-on-write via `ArcSwap`, so reads take a lock-free snapshot.
+/// Designed for concurrent use without cloning all active queries on every
+/// request. Reads take a point-in-time snapshot for the virtual table.
 pub struct QueryTracker {
-    active: ArcSwap<HashMap<u64, QueryInfo>>,
+    active: DashMap<u64, QueryInfo>,
     next_id: AtomicU64,
     total_executed: AtomicU64,
 }
@@ -51,7 +50,7 @@ impl QueryTracker {
     /// Create an empty tracker.
     pub fn new() -> Self {
         Self {
-            active: ArcSwap::new(Arc::new(HashMap::new())),
+            active: DashMap::new(),
             next_id: AtomicU64::new(1),
             total_executed: AtomicU64::new(0),
         }
@@ -78,11 +77,7 @@ impl QueryTracker {
             start_epoch_ms: now_ms,
             state: "executing".to_string(),
         };
-        self.active.rcu(|current| {
-            let mut next = (**current).clone();
-            next.insert(id, info.clone());
-            Arc::new(next)
-        });
+        self.active.insert(id, info);
         id
     }
 
@@ -104,20 +99,14 @@ impl QueryTracker {
 
     /// Mark a query as complete. If `id` is not found this is a no-op.
     pub fn complete(&self, id: u64) {
-        let removed = AtomicBool::new(false);
-        self.active.rcu(|current| {
-            let mut next = (**current).clone();
-            removed.store(next.remove(&id).is_some(), Ordering::Relaxed);
-            Arc::new(next)
-        });
-        if removed.load(Ordering::Relaxed) {
+        if self.active.remove(&id).is_some() {
             self.total_executed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Number of queries currently in flight.
     pub fn active_count(&self) -> usize {
-        self.active.load().len()
+        self.active.len()
     }
 
     /// Total number of queries that have completed since this tracker was
@@ -128,10 +117,9 @@ impl QueryTracker {
 
     /// Snapshot of all active query infos, for use by [`ActiveQueriesTable`].
     fn snapshot(&self) -> Vec<ActiveQuerySnapshot> {
-        let snapshot = self.active.load();
         let now = Instant::now();
-        snapshot
-            .values()
+        self.active
+            .iter()
             .map(|info| ActiveQuerySnapshot {
                 query_id: info.query_id,
                 client_address: info.client_address.clone(),

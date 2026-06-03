@@ -25,6 +25,14 @@ pub struct ObjectStoreConfig {
     pub prefix: String,
     /// Bounded upload queue depth (backpressure control).
     pub upload_queue_depth: usize,
+    /// Number of concurrent upload workers.
+    pub upload_workers: usize,
+    /// Number of concurrent compaction-output upload workers.
+    pub compaction_upload_workers: usize,
+    /// Bounded compaction-output upload queue depth.
+    pub compaction_upload_queue_depth: usize,
+    /// Number of concurrent delete workers.
+    pub delete_workers: usize,
 }
 
 impl ObjectStoreConfig {
@@ -62,6 +70,31 @@ impl ObjectStoreConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(16);
 
+        let upload_workers = std::env::var("FERROSA_S3_UPLOAD_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(8);
+
+        let compaction_upload_workers = std::env::var("FERROSA_S3_COMPACTION_UPLOAD_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(4);
+
+        let compaction_upload_queue_depth =
+            std::env::var("FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(upload_queue_depth);
+
+        let delete_workers = std::env::var("FERROSA_S3_DELETE_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2);
+
         Ok(Self {
             endpoint,
             bucket,
@@ -71,6 +104,10 @@ impl ObjectStoreConfig {
             allow_http,
             prefix,
             upload_queue_depth,
+            upload_workers,
+            compaction_upload_workers,
+            compaction_upload_queue_depth,
+            delete_workers,
         })
     }
 
@@ -109,6 +146,10 @@ impl ObjectStoreConfig {
             allow_http: true,
             prefix: String::new(),
             upload_queue_depth: 16,
+            upload_workers: 8,
+            compaction_upload_workers: 4,
+            compaction_upload_queue_depth: 16,
+            delete_workers: 2,
         }
     }
 }
@@ -152,6 +193,10 @@ mod tests {
         assert_eq!(config.region, "us-east-1");
         assert!(config.allow_http);
         assert_eq!(config.upload_queue_depth, 16);
+        assert_eq!(config.upload_workers, 8);
+        assert_eq!(config.compaction_upload_workers, 4);
+        assert_eq!(config.compaction_upload_queue_depth, 16);
+        assert_eq!(config.delete_workers, 2);
     }
 
     #[tokio::test]

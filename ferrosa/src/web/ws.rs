@@ -81,13 +81,14 @@ async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
     let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
 
     // Sender task: forward channel messages to WebSocket.
-    let sender_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+    let sender_task =
+        ferrosa_common::task_pool::TaskPool::current("websocket-send").spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        });
 
     let mut subscriptions: HashMap<String, WsSubscription> = HashMap::new();
 
@@ -157,7 +158,10 @@ async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
                                 let cancel = CancellationToken::new();
                                 let task_cancel = cancel.clone();
 
-                                let task = tokio::spawn(async move {
+                                let task = ferrosa_common::task_pool::TaskPool::current(
+                                    "websocket-subscription",
+                                )
+                                .spawn(async move {
                                     let mut ticker = tokio::time::interval(interval);
                                     loop {
                                         tokio::select! {

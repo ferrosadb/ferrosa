@@ -798,7 +798,7 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
                         "cluster_rejoin: registered node in network factory node_map"
                     );
 
-                    tokio::spawn(async move {
+                    ferrosa_net::task_pool::TaskPool::current("cluster-rejoin-promote").spawn(async move {
                         // openraft 0.9 requires two steps to promote a node to voter:
                         // 1. add_learner — registers the node in openraft's node map
                         //    so the leader knows its address and can replicate to it.
@@ -984,6 +984,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

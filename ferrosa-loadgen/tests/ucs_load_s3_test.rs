@@ -35,6 +35,10 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         allow_http: true,
         prefix: format!("test-{}", uuid::Uuid::new_v4()),
         upload_queue_depth: 8,
+        upload_workers: 8,
+        compaction_upload_workers: 4,
+        compaction_upload_queue_depth: 8,
+        delete_workers: 2,
     };
 
     StorageEngineConfig {
@@ -42,6 +46,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
             segment_size: 4096,
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.join("commitlog"),
             checkpoint_dir: dir.join("commitlog"),
             archive: None,
@@ -49,6 +54,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         compaction: CompactionConfig::from_env(dir.join("compaction")),
         object_store: Some(object_store),
         local_cache_max_bytes: profile.local_cache_max_bytes,
+        local_disk_free_reserve_bytes: 0,
         flush_threshold_bytes: profile.flush_threshold_bytes,
         memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 30,

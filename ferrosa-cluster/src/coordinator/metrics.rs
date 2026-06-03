@@ -6,9 +6,25 @@ static LOCAL_WRITE_ACKS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_WRITE_ACKS: AtomicU64 = AtomicU64::new(0);
 static LOCAL_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static REMOTE_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static POST_QUORUM_REMOTE_ACKS: AtomicU64 = AtomicU64::new(0);
+static POST_QUORUM_REMOTE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static HINTS_STORED: AtomicU64 = AtomicU64::new(0);
+static HINTS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static INBOUND_MUTATION_FORWARDS: AtomicU64 = AtomicU64::new(0);
 static INBOUND_MUTATION_ROWS: AtomicU64 = AtomicU64::new(0);
 static INBOUND_MUTATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
+static WRITE_ADMISSION_IN_FLIGHT_MAX: AtomicI64 = AtomicI64::new(0);
+
+fn update_max_i64(target: &AtomicI64, value: i64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
 
 pub fn inc_replica_write_attempt(local: bool) {
     if local {
@@ -34,6 +50,22 @@ pub fn inc_replica_write_failure(local: bool) {
     }
 }
 
+pub fn inc_post_quorum_remote_ack() {
+    POST_QUORUM_REMOTE_ACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_post_quorum_remote_failure() {
+    POST_QUORUM_REMOTE_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_hint_stored(count: usize) {
+    HINTS_STORED.fetch_add(count as u64, Ordering::Relaxed);
+}
+
+pub fn inc_hint_rejected() {
+    HINTS_REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn inc_inbound_mutation_forward(rows: usize) {
     INBOUND_MUTATION_FORWARDS.fetch_add(1, Ordering::Relaxed);
     INBOUND_MUTATION_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
@@ -41,6 +73,15 @@ pub fn inc_inbound_mutation_forward(rows: usize) {
 
 pub fn inc_inbound_mutation_failure() {
     INBOUND_MUTATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_write_admission_in_flight() {
+    let current = WRITE_ADMISSION_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+    update_max_i64(&WRITE_ADMISSION_IN_FLIGHT_MAX, current);
+}
+
+pub fn dec_write_admission_in_flight() {
+    WRITE_ADMISSION_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
 }
 
 pub fn render_prometheus() -> String {
@@ -57,6 +98,18 @@ pub fn render_prometheus() -> String {
          # TYPE ferrosa_coordinator_replica_write_failures_total counter\n\
          ferrosa_coordinator_replica_write_failures_total{{target=\"local\"}} {}\n\
          ferrosa_coordinator_replica_write_failures_total{{target=\"remote\"}} {}\n\
+         # HELP ferrosa_coordinator_post_quorum_remote_acks_total Remote write ACKs observed after client-visible quorum was satisfied.\n\
+         # TYPE ferrosa_coordinator_post_quorum_remote_acks_total counter\n\
+         ferrosa_coordinator_post_quorum_remote_acks_total {}\n\
+         # HELP ferrosa_coordinator_post_quorum_remote_failures_total Remote write failures observed after client-visible quorum was satisfied.\n\
+         # TYPE ferrosa_coordinator_post_quorum_remote_failures_total counter\n\
+         ferrosa_coordinator_post_quorum_remote_failures_total {}\n\
+         # HELP ferrosa_coordinator_hints_stored_total Hints successfully written by coordinators.\n\
+         # TYPE ferrosa_coordinator_hints_stored_total counter\n\
+         ferrosa_coordinator_hints_stored_total {}\n\
+         # HELP ferrosa_coordinator_hints_rejected_total Hint writes rejected by bounded hint backpressure.\n\
+         # TYPE ferrosa_coordinator_hints_rejected_total counter\n\
+         ferrosa_coordinator_hints_rejected_total {}\n\
          # HELP ferrosa_coordinator_inbound_mutation_forwards_total MutationForward RPCs applied on this node.\n\
          # TYPE ferrosa_coordinator_inbound_mutation_forwards_total counter\n\
          ferrosa_coordinator_inbound_mutation_forwards_total {}\n\
@@ -65,16 +118,28 @@ pub fn render_prometheus() -> String {
          ferrosa_coordinator_inbound_mutation_rows_total {}\n\
          # HELP ferrosa_coordinator_inbound_mutation_failures_total MutationForward writes that failed on this node.\n\
          # TYPE ferrosa_coordinator_inbound_mutation_failures_total counter\n\
-         ferrosa_coordinator_inbound_mutation_failures_total {}\n",
+         ferrosa_coordinator_inbound_mutation_failures_total {}\n\
+         # HELP ferrosa_coordinator_write_admission_in_flight Client-visible writes holding coordinator admission permits, including post-quorum replica drain.\n\
+         # TYPE ferrosa_coordinator_write_admission_in_flight gauge\n\
+         ferrosa_coordinator_write_admission_in_flight {}\n\
+         # HELP ferrosa_coordinator_write_admission_in_flight_max Maximum writes holding coordinator admission permits since process start.\n\
+         # TYPE ferrosa_coordinator_write_admission_in_flight_max gauge\n\
+         ferrosa_coordinator_write_admission_in_flight_max {}\n",
         LOCAL_WRITE_ATTEMPTS.load(Ordering::Relaxed),
         REMOTE_WRITE_ATTEMPTS.load(Ordering::Relaxed),
         LOCAL_WRITE_ACKS.load(Ordering::Relaxed),
         REMOTE_WRITE_ACKS.load(Ordering::Relaxed),
         LOCAL_WRITE_FAILURES.load(Ordering::Relaxed),
         REMOTE_WRITE_FAILURES.load(Ordering::Relaxed),
+        POST_QUORUM_REMOTE_ACKS.load(Ordering::Relaxed),
+        POST_QUORUM_REMOTE_FAILURES.load(Ordering::Relaxed),
+        HINTS_STORED.load(Ordering::Relaxed),
+        HINTS_REJECTED.load(Ordering::Relaxed),
         INBOUND_MUTATION_FORWARDS.load(Ordering::Relaxed),
         INBOUND_MUTATION_ROWS.load(Ordering::Relaxed),
         INBOUND_MUTATION_FAILURES.load(Ordering::Relaxed),
+        WRITE_ADMISSION_IN_FLIGHT.load(Ordering::Relaxed),
+        WRITE_ADMISSION_IN_FLIGHT_MAX.load(Ordering::Relaxed),
     )
 }
 

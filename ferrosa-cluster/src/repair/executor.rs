@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use ferrosa_common::DecoratedKey;
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
@@ -183,12 +184,13 @@ impl RepairStore for StorageEngineRepairStore {
         let table = table.clone();
         let chunk_start = cursor.unwrap_or(range_start);
         let probe = limit.saturating_add(1);
-        let result: Result<Vec<Partition>, String> = tokio::task::spawn_blocking(move || {
-            StorageEngine::read_token_range(&engine, &table, chunk_start, range_end, probe)
-                .map_err(|e| format!("read_token_range: {e}"))
-        })
-        .await
-        .map_err(|e| format!("read_range_chunked join: {e}"))?;
+        let result: Result<Vec<Partition>, String> = TaskPool::current("repair-read")
+            .spawn_blocking(move || {
+                StorageEngine::read_token_range(&engine, &table, chunk_start, range_end, probe)
+                    .map_err(|e| format!("read_token_range: {e}"))
+            })
+            .await
+            .map_err(|e| format!("read_range_chunked join: {e}"))?;
         let mut got = result?;
         got.sort_by_key(|p| p.key.token.0);
         let next_cursor = if got.len() > limit {
@@ -209,24 +211,25 @@ impl RepairStore for StorageEngineRepairStore {
         let engine = self.engine.clone();
         let table = table.clone();
         let parts = partitions.to_vec();
-        tokio::task::spawn_blocking(move || {
-            for partition in parts {
-                for row in partition.rows.iter() {
-                    let ts = row
-                        .cells
-                        .iter()
-                        .map(|(_, c)| c.timestamp)
-                        .max()
-                        .unwrap_or(row.primary_key_liveness.timestamp);
-                    engine
-                        .write(&table, &partition.key, row.clone(), ts)
-                        .map_err(|e| format!("apply write: {e}"))?;
+        TaskPool::current("repair-apply")
+            .spawn_blocking(move || {
+                for partition in parts {
+                    for row in partition.rows.iter() {
+                        let ts = row
+                            .cells
+                            .iter()
+                            .map(|(_, c)| c.timestamp)
+                            .max()
+                            .unwrap_or(row.primary_key_liveness.timestamp);
+                        engine
+                            .write(&table, &partition.key, row.clone(), ts)
+                            .map_err(|e| format!("apply write: {e}"))?;
+                    }
                 }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("apply_partitions join: {e}"))?
+                Ok(())
+            })
+            .await
+            .map_err(|e| format!("apply_partitions join: {e}"))?
     }
 
     async fn build_merkle(
@@ -248,12 +251,13 @@ impl RepairStore for StorageEngineRepairStore {
             .map_err(|e| format!("build_merkle semaphore: {e}"))?;
         let engine = self.engine.clone();
         let table = table.clone();
-        tokio::task::spawn_blocking(move || {
-            super::build_tree_for_range(&engine, &table, range_start, range_end)
-                .map_err(|e| format!("build_tree_for_range: {e}"))
-        })
-        .await
-        .map_err(|e| format!("build_merkle join: {e}"))?
+        TaskPool::current("repair-merkle")
+            .spawn_blocking(move || {
+                super::build_tree_for_range(&engine, &table, range_start, range_end)
+                    .map_err(|e| format!("build_tree_for_range: {e}"))
+            })
+            .await
+            .map_err(|e| format!("build_merkle join: {e}"))?
     }
 }
 

@@ -21,10 +21,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use super::config::CommitLogBatchConfig;
 use super::segment::Segment;
 
 /// A flush callback that the sync strategy invokes to fsync the current segment.
@@ -44,7 +45,7 @@ pub trait SyncStrategy: Send + Sync {
     /// Called after each mutation is written to the segment buffer.
     ///
     /// May block (Batch/Group) or return immediately (Periodic).
-    fn on_write(&self, segment: &Segment, position: u64);
+    fn on_write(&self, segment: &Segment, position: u64, bytes: u64);
 
     /// Start background sync work (if any).
     fn start(&self);
@@ -70,7 +71,8 @@ impl BatchSync {
 }
 
 impl SyncStrategy for BatchSync {
-    fn on_write(&self, segment: &Segment, _position: u64) {
+    fn on_write(&self, segment: &Segment, _position: u64, bytes: u64) {
+        observe_sync_batch(1, bytes, Duration::ZERO);
         // Intentionally ignoring the error here — the caller (CommitLog)
         // will handle flush failures at a higher level. In a production
         // system we'd propagate, but the trait signature returns `()`.
@@ -117,10 +119,28 @@ pub struct PeriodicSync {
 
     /// Number of writes waiting for the next timed flush.
     pending: Arc<AtomicU64>,
+
+    /// Bytes waiting for the next timed flush.
+    pending_bytes: Arc<AtomicU64>,
+
+    /// Adaptive batch controls.
+    batch: CommitLogBatchConfig,
 }
 
 impl PeriodicSync {
     pub fn new(sync_interval: Duration, flush_callback: FlushCallback) -> Self {
+        Self::with_batch(
+            sync_interval,
+            CommitLogBatchConfig::with_max_delay(sync_interval),
+            flush_callback,
+        )
+    }
+
+    pub fn with_batch(
+        sync_interval: Duration,
+        batch: CommitLogBatchConfig,
+        flush_callback: FlushCallback,
+    ) -> Self {
         Self {
             sync_interval,
             flush_callback,
@@ -128,6 +148,8 @@ impl PeriodicSync {
             handle: Mutex::new(None),
             wake: Arc::new((Mutex::new(false), Condvar::new())),
             pending: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::new(AtomicU64::new(0)),
+            batch,
         }
     }
 
@@ -154,10 +176,19 @@ impl PeriodicSync {
 }
 
 impl SyncStrategy for PeriodicSync {
-    fn on_write(&self, _segment: &Segment, _position: u64) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        let (_lock, cvar) = &*self.wake;
-        cvar.notify_one();
+    fn on_write(&self, _segment: &Segment, _position: u64, bytes: u64) {
+        // Edge-trigger the sync thread when the log transitions from clean to
+        // dirty. This is not a per-write stream: writes already covered by the
+        // open batch only bump the counter, so they cannot interrupt the timer
+        // and collapse batching into tiny fsyncs.
+        let previous = self.pending.fetch_add(1, Ordering::AcqRel);
+        let previous_bytes = self.pending_bytes.fetch_add(bytes, Ordering::AcqRel);
+        PENDING_WRITES.fetch_add(1, Ordering::Relaxed);
+        PENDING_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        if previous == 0 || previous_bytes.saturating_add(bytes) >= self.batch.target_bytes {
+            let (_lock, cvar) = &*self.wake;
+            cvar.notify_one();
+        }
     }
 
     fn start(&self) {
@@ -166,13 +197,13 @@ impl SyncStrategy for PeriodicSync {
         let interval = self.sync_interval;
         let wake = Arc::clone(&self.wake);
         let pending = Arc::clone(&self.pending);
+        let pending_bytes = Arc::clone(&self.pending_bytes);
+        let batch = self.batch.clone();
 
         let thread = thread::Builder::new()
             .name("commitlog-periodic-sync".to_string())
             .spawn(move || {
                 while !stop_flag.load(Ordering::Acquire) {
-                    // Wait for the first write in a batch, then hold the
-                    // batch open for one interval to collect nearby writes.
                     let (lock, cvar) = &*wake;
                     let mut stopped = lock.lock();
                     if pending.load(Ordering::Acquire) == 0 {
@@ -187,21 +218,44 @@ impl SyncStrategy for PeriodicSync {
                         break;
                     }
 
-                    let _ = cvar.wait_for(&mut stopped, interval);
+                    let opened_at = Instant::now();
+                    loop {
+                        if pending_bytes.load(Ordering::Acquire) >= batch.target_bytes {
+                            break;
+                        }
+                        let elapsed = opened_at.elapsed();
+                        if elapsed >= batch.max_delay {
+                            break;
+                        }
+                        let remaining = batch.max_delay.saturating_sub(elapsed);
+                        let _ = cvar.wait_for(&mut stopped, remaining.min(interval));
+                        if stop_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                    drop(stopped);
 
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
 
                     let pending_writes = pending.swap(0, Ordering::AcqRel);
+                    let batch_bytes = pending_bytes.swap(0, Ordering::AcqRel);
                     if pending_writes == 0 {
                         PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    PENDING_WRITES.fetch_sub(pending_writes, Ordering::Relaxed);
+                    PENDING_BYTES.fetch_sub(batch_bytes, Ordering::Relaxed);
 
                     if let Err(e) = flush_callback() {
                         pending.fetch_add(pending_writes, Ordering::AcqRel);
+                        pending_bytes.fetch_add(batch_bytes, Ordering::AcqRel);
+                        PENDING_WRITES.fetch_add(pending_writes, Ordering::Relaxed);
+                        PENDING_BYTES.fetch_add(batch_bytes, Ordering::Relaxed);
                         tracing::error!(%e, "commitlog: periodic flush_callback failed — data may not be durable");
+                    } else {
+                        observe_sync_batch(pending_writes, batch_bytes, opened_at.elapsed());
                     }
                 }
             })
@@ -241,6 +295,9 @@ pub struct GroupSync {
     /// Maximum time to wait before fsyncing a batch.
     max_wait: Duration,
 
+    /// Adaptive batch controls.
+    batch: CommitLogBatchConfig,
+
     /// Flush callback provided at construction.
     flush_callback: FlushCallback,
 
@@ -259,6 +316,9 @@ struct GroupSyncState {
     /// Number of writes pending flush.
     pending: AtomicU64,
 
+    /// Bytes pending flush.
+    pending_bytes: AtomicU64,
+
     /// Generation counter — incremented after each flush. Writers wait until
     /// the generation advances past the value they observed on entry.
     generation: AtomicU64,
@@ -272,13 +332,27 @@ struct GroupSyncState {
 
 impl GroupSync {
     pub fn new(max_wait: Duration, flush_callback: FlushCallback) -> Self {
+        Self::with_batch(
+            max_wait,
+            CommitLogBatchConfig::with_max_delay(max_wait),
+            flush_callback,
+        )
+    }
+
+    pub fn with_batch(
+        max_wait: Duration,
+        batch: CommitLogBatchConfig,
+        flush_callback: FlushCallback,
+    ) -> Self {
         Self {
             max_wait,
+            batch,
             flush_callback,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
             state: Arc::new(GroupSyncState {
                 pending: AtomicU64::new(0),
+                pending_bytes: AtomicU64::new(0),
                 generation: AtomicU64::new(0),
                 writer_signal: (Mutex::new(()), Condvar::new()),
                 flush_complete: (Mutex::new(()), Condvar::new()),
@@ -313,7 +387,7 @@ impl GroupSync {
 }
 
 impl SyncStrategy for GroupSync {
-    fn on_write(&self, _segment: &Segment, _position: u64) {
+    fn on_write(&self, _segment: &Segment, _position: u64, bytes: u64) {
         // Record the generation before we add our pending write.
         let my_gen = self.state.generation.load(Ordering::Acquire);
 
@@ -330,6 +404,9 @@ impl SyncStrategy for GroupSync {
             let (lock, cvar) = &self.state.writer_signal;
             let _guard = lock.lock();
             self.state.pending.fetch_add(1, Ordering::AcqRel);
+            self.state.pending_bytes.fetch_add(bytes, Ordering::AcqRel);
+            PENDING_WRITES.fetch_add(1, Ordering::Relaxed);
+            PENDING_BYTES.fetch_add(bytes, Ordering::Relaxed);
             cvar.notify_one();
         }
 
@@ -357,11 +434,13 @@ impl SyncStrategy for GroupSync {
         let flush_callback = Arc::clone(&self.flush_callback);
         let state = Arc::clone(&self.state);
         let max_wait = self.max_wait;
+        let batch = self.batch.clone();
 
         let thread = thread::Builder::new()
             .name("commitlog-group-sync".to_string())
             .spawn(move || {
                 while !stop_flag.load(Ordering::Acquire) {
+                    let opened_at;
                     // Wait for a writer signal or max_wait timeout.
                     {
                         let (lock, cvar) = &state.writer_signal;
@@ -375,6 +454,19 @@ impl SyncStrategy for GroupSync {
                                 continue;
                             }
                         }
+
+                        opened_at = Instant::now();
+                        while state.pending_bytes.load(Ordering::Acquire) < batch.target_bytes {
+                            let elapsed = opened_at.elapsed();
+                            if elapsed >= batch.max_delay {
+                                break;
+                            }
+                            let result =
+                                cvar.wait_for(&mut guard, batch.max_delay.saturating_sub(elapsed));
+                            if result.timed_out() || stop_flag.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
                     }
 
                     if stop_flag.load(Ordering::Acquire) {
@@ -383,9 +475,18 @@ impl SyncStrategy for GroupSync {
 
                     // Flush pending writes.
                     let pending = state.pending.swap(0, Ordering::AcqRel);
+                    let batch_bytes = state.pending_bytes.swap(0, Ordering::AcqRel);
                     if pending > 0 {
+                        PENDING_WRITES.fetch_sub(pending, Ordering::Relaxed);
+                        PENDING_BYTES.fetch_sub(batch_bytes, Ordering::Relaxed);
                         if let Err(e) = flush_callback() {
+                            state.pending.fetch_add(pending, Ordering::AcqRel);
+                            state.pending_bytes.fetch_add(batch_bytes, Ordering::AcqRel);
+                            PENDING_WRITES.fetch_add(pending, Ordering::Relaxed);
+                            PENDING_BYTES.fetch_add(batch_bytes, Ordering::Relaxed);
                             tracing::error!(%e, "commitlog: group flush_callback failed — data may not be durable");
+                        } else {
+                            observe_sync_batch(pending, batch_bytes, opened_at.elapsed());
                         }
                     }
 
@@ -410,6 +511,55 @@ impl SyncStrategy for GroupSync {
 impl Drop for GroupSync {
     fn drop(&mut self) {
         self.stop_inner(false);
+    }
+}
+
+static SYNC_BATCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_BATCH_WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_BATCH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_BATCH_WAIT_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_BATCH_WAIT_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static PENDING_WRITES: AtomicU64 = AtomicU64::new(0);
+static PENDING_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct SyncBatchMetrics {
+    pub batches: u64,
+    pub writes: u64,
+    pub bytes: u64,
+    pub wait_micros_total: u64,
+    pub wait_micros_max: u64,
+    pub pending_writes: u64,
+    pub pending_bytes: u64,
+}
+
+pub(crate) fn sync_batch_metrics() -> SyncBatchMetrics {
+    SyncBatchMetrics {
+        batches: SYNC_BATCHES_TOTAL.load(Ordering::Relaxed),
+        writes: SYNC_BATCH_WRITES_TOTAL.load(Ordering::Relaxed),
+        bytes: SYNC_BATCH_BYTES_TOTAL.load(Ordering::Relaxed),
+        wait_micros_total: SYNC_BATCH_WAIT_MICROS_TOTAL.load(Ordering::Relaxed),
+        wait_micros_max: SYNC_BATCH_WAIT_MICROS_MAX.load(Ordering::Relaxed),
+        pending_writes: PENDING_WRITES.load(Ordering::Relaxed),
+        pending_bytes: PENDING_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+fn observe_sync_batch(writes: u64, bytes: u64, wait: Duration) {
+    SYNC_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    SYNC_BATCH_WRITES_TOTAL.fetch_add(writes, Ordering::Relaxed);
+    SYNC_BATCH_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    let micros = wait.as_micros().min(u64::MAX as u128) as u64;
+    SYNC_BATCH_WAIT_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&SYNC_BATCH_WAIT_MICROS_MAX, micros);
+}
+
+fn update_max_u64(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
     }
 }
 
@@ -464,7 +614,7 @@ mod tests {
 
         let sync = BatchSync::new();
         sync.start();
-        sync.on_write(&segment, offset);
+        sync.on_write(&segment, offset, 128);
 
         // After on_write, the file should exist on disk with the written data.
         // Note: on_write flushes then writes a sync marker, so the file
@@ -494,7 +644,7 @@ mod tests {
         sync.start();
 
         let start = Instant::now();
-        sync.on_write(&segment, offset);
+        sync.on_write(&segment, offset, 128);
         let elapsed = start.elapsed();
 
         // on_write should return in under 1ms (it does nothing).
@@ -526,7 +676,7 @@ mod tests {
         });
         let sync = PeriodicSync::new(Duration::from_millis(50), flush_cb);
         sync.start();
-        sync.on_write(&segment, offset);
+        sync.on_write(&segment, offset, 128);
 
         // The old test used a fixed 200ms sleep and then checked the file path.
         // Under full-package parallel test load, OS scheduling can delay the
@@ -553,6 +703,71 @@ mod tests {
     }
 
     #[test]
+    fn periodic_sync_batches_write_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let (segment, offset) = write_mutation(dir.path());
+
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let flush_count_clone = Arc::clone(&flush_count);
+        let flush_cb: FlushCallback = Arc::new(move || {
+            flush_count_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let sync = PeriodicSync::new(Duration::from_millis(50), flush_cb);
+        sync.start();
+
+        for _ in 0..200 {
+            sync.on_write(&segment, offset, 128);
+        }
+
+        thread::sleep(Duration::from_millis(140));
+        sync.stop();
+
+        let total_flushes = flush_count.load(Ordering::SeqCst);
+        assert!(
+            total_flushes <= 4,
+            "periodic sync should batch write notifications; got {total_flushes} flushes"
+        );
+    }
+
+    #[test]
+    fn periodic_sync_flushes_when_target_bytes_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (segment, offset) = write_mutation(dir.path());
+
+        let flush_observed = Arc::new((Mutex::new(false), Condvar::new()));
+        let flush_observed_clone = Arc::clone(&flush_observed);
+        let flush_cb: FlushCallback = Arc::new(move || {
+            let (lock, cvar) = &*flush_observed_clone;
+            *lock.lock() = true;
+            cvar.notify_all();
+            Ok(())
+        });
+        let sync = PeriodicSync::with_batch(
+            Duration::from_secs(3600),
+            CommitLogBatchConfig {
+                target_bytes: 4096,
+                max_delay: Duration::from_secs(3600),
+            },
+            flush_cb,
+        );
+        sync.start();
+        sync.on_write(&segment, offset, 2048);
+        sync.on_write(&segment, offset, 2048);
+
+        let (lock, cvar) = &*flush_observed;
+        let mut flushed = lock.lock();
+        let result = cvar.wait_for(&mut flushed, Duration::from_secs(5));
+        assert!(
+            *flushed && !result.timed_out(),
+            "periodic sync did not flush after reaching target bytes"
+        );
+        drop(flushed);
+        sync.stop();
+    }
+
+    #[test]
     fn group_sync_batches_writes() {
         let dir = tempfile::tempdir().unwrap();
         let (segment, _) = write_mutation(dir.path());
@@ -573,13 +788,13 @@ mod tests {
         let sync1 = Arc::clone(&sync);
         let seg1 = Arc::clone(&segment);
         let t1 = thread::spawn(move || {
-            sync1.on_write(&seg1, 0);
+            sync1.on_write(&seg1, 0, 128);
         });
 
         let sync2 = Arc::clone(&sync);
         let seg2 = Arc::clone(&segment);
         let t2 = thread::spawn(move || {
-            sync2.on_write(&seg2, 0);
+            sync2.on_write(&seg2, 0, 128);
         });
 
         t1.join().unwrap();
@@ -611,7 +826,7 @@ mod tests {
         sync.start();
 
         // on_write doesn't flush for PeriodicSync.
-        sync.on_write(&segment, offset);
+        sync.on_write(&segment, offset, 128);
 
         // File should not exist yet (timer hasn't fired).
         let path = segment.path();

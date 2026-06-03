@@ -193,8 +193,9 @@ impl VirtualTable for AlertsTable {
 pub fn spawn_alert_evaluator(
     alert_registry: Arc<AlertRegistry>,
     vtable_registry: Arc<ferrosa_schema::VirtualTableRegistry>,
+    task_pool: ferrosa_net::task_pool::TaskPool,
 ) {
-    tokio::spawn(async move {
+    task_pool.spawn(async move {
         let interval = std::time::Duration::from_secs(30);
         loop {
             tokio::time::sleep(interval).await;

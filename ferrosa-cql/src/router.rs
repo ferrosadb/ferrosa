@@ -372,6 +372,24 @@ fn projection_storage_ordinals_for_count_predicates(
     projection_storage_ordinals(&names, table_meta)
 }
 
+fn projection_storage_ordinals_for_select_scan(
+    select: &SelectStatement,
+    table_meta: &TableMetadata,
+) -> Option<Vec<u16>> {
+    let mut needed = select.columns.clone();
+    if let Some((ann_col, _)) = &select.ann_of {
+        let already_needed = needed.iter().any(|column| match column {
+            SelectColumn::Column(name) => name.eq_ignore_ascii_case(ann_col),
+            SelectColumn::Star => true,
+            SelectColumn::FunctionCall { .. } => false,
+        });
+        if !already_needed {
+            needed.push(SelectColumn::Column(ann_col.clone()));
+        }
+    }
+    projection_storage_ordinals(&needed, table_meta)
+}
+
 fn is_count_only_select(columns: &[SelectColumn]) -> bool {
     !columns.is_empty()
         && columns.iter().all(|c| {
@@ -896,16 +914,6 @@ pub async fn route(
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
-    // Track the query for observability; the guard calls complete() on drop.
-    let query_desc: String = format!("{:?}", &stmt).chars().take(200).collect();
-    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
-    let _guard = state.query_tracker.begin_guarded(
-        &query_desc,
-        keyspace,
-        &ctx.client_address,
-        &ctx.auth.role,
-    );
-
     // Classify the statement opcode for metrics before matching.
     let opcode = match &stmt {
         Statement::Select(_) => CqlOpcode::Select,
@@ -935,6 +943,19 @@ pub async fn route(
         | Statement::Compact(_) => CqlOpcode::Ddl,
         _ => CqlOpcode::Other,
     };
+
+    // Track the query for observability; the guard calls complete() on drop.
+    // Keep this compact. Formatting the full substituted AST on every EXECUTE
+    // allocates and copies bound values on the hot path, while active_queries
+    // only needs a recognizable in-flight operation label.
+    let query_desc = statement_query_label(&stmt, opcode);
+    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+    let _guard = state.query_tracker.begin_guarded(
+        &query_desc,
+        keyspace,
+        &ctx.client_address,
+        &ctx.auth.role,
+    );
 
     // Check if this statement requires Accord consensus (LWT).
     // Determined by serial_consistency being set in the request context.
@@ -1171,6 +1192,43 @@ pub async fn route(
     }
 
     result
+}
+
+fn statement_query_label(stmt: &Statement, opcode: CqlOpcode) -> String {
+    match stmt {
+        Statement::Select(s) => {
+            format!("SELECT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table)
+        }
+        Statement::Insert(s) => {
+            format!("INSERT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table)
+        }
+        Statement::Update(s) => {
+            format!("UPDATE {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table)
+        }
+        Statement::Delete(s) => {
+            format!("DELETE {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table)
+        }
+        Statement::Batch(b) => format!("BATCH {}", b.statements.len()),
+        Statement::CreateKeyspace(s) => format!("CREATE KEYSPACE {}", s.name),
+        Statement::AlterKeyspace(s) => format!("ALTER KEYSPACE {}", s.name),
+        Statement::DropKeyspace(s) => format!("DROP KEYSPACE {}", s.name),
+        Statement::CreateTable(s) => format!(
+            "CREATE TABLE {}.{}",
+            s.keyspace.as_deref().unwrap_or(""),
+            s.name
+        ),
+        Statement::AlterTable(s) => format!(
+            "ALTER TABLE {}.{}",
+            s.keyspace.as_deref().unwrap_or(""),
+            s.table
+        ),
+        Statement::DropTable(s) => format!(
+            "DROP TABLE {}.{}",
+            s.keyspace.as_deref().unwrap_or(""),
+            s.table
+        ),
+        _ => format!("{:?}", opcode),
+    }
 }
 
 // ── SELECT ───────────────────────────────────────────────────────────────
@@ -2172,6 +2230,267 @@ async fn route_select(
     }
 }
 
+fn next_prepared_select_term<'a>(
+    template: &'a Term,
+    bound_terms: &'a [Term],
+    bind_idx: &mut usize,
+) -> Option<&'a Term> {
+    match template {
+        Term::BindMarker(_) => {
+            let term = bound_terms.get(*bind_idx)?;
+            *bind_idx += 1;
+            Some(term)
+        }
+        other if term_has_bind_marker(other) => None,
+        other => Some(other),
+    }
+}
+
+fn prepared_select_limit(
+    limit: &Option<Limit>,
+    bound_terms: &[Term],
+    bind_idx: &mut usize,
+) -> Option<Result<Option<i32>, CqlError>> {
+    match limit {
+        None => Some(Ok(None)),
+        Some(Limit::Literal(n)) => Some(Ok(Some(*n))),
+        Some(Limit::BindMarker | Limit::NamedBindMarker(_)) => {
+            let term = bound_terms.get(*bind_idx)?;
+            *bind_idx += 1;
+            match term {
+                Term::IntegerLiteral(n) => Some(
+                    i32::try_from(*n)
+                        .map(Some)
+                        .map_err(|_| CqlError::Invalid(format!("LIMIT value {n} out of range"))),
+                ),
+                other => Some(Err(CqlError::Invalid(format!(
+                    "LIMIT bind marker must be an integer, got {other:?}"
+                )))),
+            }
+        }
+    }
+}
+
+/// Execute the hot NoSQLBench-style prepared SELECT shape without cloning and
+/// rewriting the AST: exact full partition key equality, optional literal or
+/// top-level bound LIMIT, no secondary filters, no ORDER BY/ANN/aggregation.
+pub async fn route_prepared_select_fast(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &SelectStatement,
+    bound_terms: &[Term],
+) -> Option<Result<RouteResult, CqlError>> {
+    if s.distinct
+        || s.allow_filtering
+        || !s.order_by.is_empty()
+        || s.ann_of.is_some()
+        || s.where_clauses.is_empty()
+    {
+        return None;
+    }
+    if s.columns.iter().any(|col| match col {
+        SelectColumn::FunctionCall { .. } => true,
+        SelectColumn::Star | SelectColumn::Column(_) => false,
+    }) {
+        return None;
+    }
+    if s.where_clauses.iter().any(|wc| {
+        wc.op != ComparisonOp::Eq || wc.token_fn || !prepared_insert_term_fast_supported(&wc.value)
+    }) {
+        return None;
+    }
+
+    let ks = match s.keyspace.as_deref().or(ctx.current_keyspace.as_deref()) {
+        Some(ks) => ks,
+        None => {
+            return Some(Err(CqlError::Invalid("no keyspace specified".into())));
+        }
+    };
+    if let Err(e) = validate_keyspace_exists(&state.schema, ks) {
+        return Some(Err(e));
+    }
+    let snap = state.schema.snapshot();
+    let table_meta = match snap.tables.get(&(ks.to_string(), s.table.clone())) {
+        Some(table_meta) => table_meta,
+        None => {
+            return Some(Err(CqlError::Invalid(format!(
+                "table {}.{} not found",
+                ks, s.table
+            ))));
+        }
+    };
+    if s.where_clauses.len() != table_meta.partition_key.len() {
+        return None;
+    }
+    if s.where_clauses.iter().any(|wc| {
+        table_meta
+            .columns
+            .get(&wc.column)
+            .is_none_or(|col| col.kind != ColumnKind::PartitionKey)
+    }) {
+        return None;
+    }
+
+    let opcode = CqlOpcode::Select;
+    let query_desc = format!("SELECT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table);
+    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+    let _guard = state.query_tracker.begin_guarded(
+        &query_desc,
+        keyspace,
+        &ctx.client_address,
+        &ctx.auth.role,
+    );
+
+    let result = async {
+        state.schema.check_permission(
+            ctx.auth,
+            Permission::Select,
+            &Resource::Table(ks.to_string(), s.table.clone()),
+        )?;
+
+        let mut bind_idx = 0usize;
+        let mut pk_values_by_position: Vec<(i32, CqlValue)> =
+            Vec::with_capacity(table_meta.partition_key.len());
+        for wc in &s.where_clauses {
+            let col_meta = table_meta
+                .columns
+                .get(&wc.column)
+                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", wc.column)))?;
+            let term = next_prepared_select_term(&wc.value, bound_terms, &mut bind_idx)
+                .ok_or_else(|| {
+                    CqlError::Invalid("unsupported prepared SELECT bind shape".into())
+                })?;
+            let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+            pk_values_by_position.push((
+                col_meta.position,
+                bridge::term_to_cql_value(term, &cql_type)?,
+            ));
+        }
+        let limit =
+            prepared_select_limit(&s.limit, bound_terms, &mut bind_idx).ok_or_else(|| {
+                CqlError::Invalid("missing prepared SELECT LIMIT bind value".into())
+            })??;
+
+        pk_values_by_position.sort_by_key(|(position, _)| *position);
+        for (expected, (position, _)) in pk_values_by_position.iter().enumerate() {
+            if *position as usize != expected {
+                return Err(CqlError::Invalid(
+                    "prepared SELECT fast path requires each partition key once".into(),
+                ));
+            }
+        }
+        let pk_values: Vec<CqlValue> = pk_values_by_position
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let pk_types: Vec<CqlType> = table_meta
+            .partition_key
+            .iter()
+            .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
+        let read_strategy = keyspace_strategy(&state.schema, ks);
+        let row_limit = limit.unwrap_or(0).max(0) as usize;
+
+        let partition = state
+            .write_path
+            .load()
+            .pk_read_limited_rows(
+                &table_id,
+                &decorated_key,
+                ctx.consistency,
+                &read_strategy,
+                row_limit,
+            )
+            .await?;
+
+        let (col_names, col_types) = build_column_info(table_meta, &s.columns, ks, &state.schema)?;
+        if matches!(s.columns.as_slice(), [SelectColumn::Star]) {
+            let body =
+                result::encode_rows_raw_with_writer(&col_names, &col_types, ks, &s.table, |emit| {
+                    if let Some(partition) = partition.as_ref() {
+                        let pk_indices: Vec<usize> = table_meta
+                            .partition_key
+                            .iter()
+                            .filter_map(|name| table_meta.columns.get_index_of(name))
+                            .collect();
+                        let ck_indices: Vec<usize> = table_meta
+                            .clustering_key
+                            .iter()
+                            .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+                            .collect();
+                        let storage_to_table = storage_to_table_indices(table_meta);
+                        bridge::write_partition_raw_rows_with_storage_mapping(
+                            partition,
+                            col_names.len(),
+                            &pk_indices,
+                            &ck_indices,
+                            &storage_to_table,
+                            emit,
+                        );
+                    }
+                });
+            return Ok(RouteResult::Result(body));
+        }
+
+        let rows = if let Some(partition) = partition {
+            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+            let all_col_types: Vec<CqlType> = table_meta
+                .columns
+                .values()
+                .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            let pk_indices: Vec<usize> = table_meta
+                .partition_key
+                .iter()
+                .filter_map(|name| table_meta.columns.get_index_of(name))
+                .collect();
+            let ck_indices: Vec<usize> = table_meta
+                .clustering_key
+                .iter()
+                .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+                .collect();
+            let storage_to_table = storage_to_table_indices(table_meta);
+            let rows = bridge::partition_to_rows_with_storage_mapping(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+                &storage_to_table,
+            );
+            let selected = select_columns(&rows, &all_col_names, &col_names);
+            if let Some(limit) = limit {
+                selected.into_iter().take(limit.max(0) as usize).collect()
+            } else {
+                selected
+            }
+        } else {
+            Vec::new()
+        };
+
+        Ok(RouteResult::Result(
+            SelectRawResult {
+                column_names: col_names,
+                column_types: col_types,
+                rows,
+                keyspace: ks.to_string(),
+                table: s.table.clone(),
+                paging_state: None,
+            }
+            .encode(),
+        ))
+    }
+    .await;
+
+    state.cql_metrics.inc_request(opcode);
+    if result.is_err() {
+        state.cql_metrics.inc_error();
+    }
+    Some(result)
+}
+
 async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -2781,44 +3100,45 @@ async fn route_select_user_table(
                 // table and apply LIMIT/page semantics after filtering.
                 // Ordered and aggregate queries still materialize their scan
                 // window before sorting/counting.
-                let scan_bound = if s.order_by.is_empty() && !count_only_select {
-                    let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
-                    if has_post_filter {
-                        None
-                    } else {
-                        let page_size = ctx
-                            .paging
-                            .page_size
-                            .and_then(|ps| (ps > 0).then_some(ps as usize));
-                        let limit_size = s
-                            .limit
-                            .as_ref()
-                            .and_then(|l| l.as_literal())
-                            .map(|n| n as usize);
-                        let base = match (page_size, limit_size) {
-                            (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
-                            (Some(ps), None) => Some(ps),
-                            (None, Some(lim)) => Some(lim),
-                            (None, None) => None,
-                        };
-                        let start = ctx
-                            .paging
-                            .paging_state
-                            .as_deref()
-                            .and_then(|bytes| crate::paging::PagingState::decode(bytes).ok())
-                            .and_then(|state| {
-                                (state.partition_key.len() == 8).then(|| {
-                                    u64::from_be_bytes(
-                                        state.partition_key.as_slice().try_into().unwrap(),
-                                    ) as usize
+                let scan_bound =
+                    if s.order_by.is_empty() && s.ann_of.is_none() && !count_only_select {
+                        let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
+                        if has_post_filter {
+                            None
+                        } else {
+                            let page_size = ctx
+                                .paging
+                                .page_size
+                                .and_then(|ps| (ps > 0).then_some(ps as usize));
+                            let limit_size = s
+                                .limit
+                                .as_ref()
+                                .and_then(|l| l.as_literal())
+                                .map(|n| n as usize);
+                            let base = match (page_size, limit_size) {
+                                (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
+                                (Some(ps), None) => Some(ps),
+                                (None, Some(lim)) => Some(lim),
+                                (None, None) => None,
+                            };
+                            let start = ctx
+                                .paging
+                                .paging_state
+                                .as_deref()
+                                .and_then(|bytes| crate::paging::PagingState::decode(bytes).ok())
+                                .and_then(|state| {
+                                    (state.partition_key.len() == 8).then(|| {
+                                        u64::from_be_bytes(
+                                            state.partition_key.as_slice().try_into().unwrap(),
+                                        ) as usize
+                                    })
                                 })
-                            })
-                            .unwrap_or(0);
-                        base.map(|n| start.saturating_add(n).max(1))
-                    }
-                } else {
-                    None
-                };
+                                .unwrap_or(0);
+                            base.map(|n| start.saturating_add(n).max(1))
+                        }
+                    } else {
+                        None
+                    };
                 let row_limit =
                     safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
                         .unwrap_or(0);
@@ -2831,7 +3151,7 @@ async fn route_select_user_table(
                 // Non-count SELECT requires no WHERE because predicates over
                 // unprojected regular columns would evaluate against NULL.
                 let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
-                    projection_storage_ordinals(&s.columns, table_meta)
+                    projection_storage_ordinals_for_select_scan(s, table_meta)
                 } else {
                     None
                 };
@@ -3468,6 +3788,226 @@ fn using_ttl_as_i32(t: &Option<Term>) -> Result<Option<i32>, CqlError> {
 }
 
 // ── INSERT ───────────────────────────────────────────────────────────────
+
+fn term_has_bind_marker(term: &Term) -> bool {
+    match term {
+        Term::BindMarker(_) => true,
+        Term::InList(items)
+        | Term::ListLiteral(items)
+        | Term::SetLiteral(items)
+        | Term::TupleLiteral(items) => items.iter().any(term_has_bind_marker),
+        Term::MapLiteral(entries) => entries
+            .iter()
+            .any(|(key, value)| term_has_bind_marker(key) || term_has_bind_marker(value)),
+        Term::FunctionCall { args, .. } => args.iter().any(term_has_bind_marker),
+        Term::TemporalArithmetic { base, offset, .. } => {
+            term_has_bind_marker(base) || term_has_bind_marker(offset)
+        }
+        _ => false,
+    }
+}
+
+fn next_prepared_insert_term<'a>(
+    template: &'a Term,
+    bound_terms: &'a [Term],
+    bind_idx: &mut usize,
+) -> Option<&'a Term> {
+    match template {
+        Term::BindMarker(_) => {
+            let term = bound_terms.get(*bind_idx)?;
+            *bind_idx += 1;
+            Some(term)
+        }
+        other if term_has_bind_marker(other) => None,
+        other => Some(other),
+    }
+}
+
+fn prepared_insert_term_fast_supported(term: &Term) -> bool {
+    matches!(term, Term::BindMarker(_)) || !term_has_bind_marker(term)
+}
+
+fn using_timestamp_term_as_i64(t: Option<&Term>) -> Result<Option<i64>, CqlError> {
+    match t {
+        None => Ok(None),
+        Some(Term::IntegerLiteral(n)) => Ok(Some(*n)),
+        Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
+            "USING TIMESTAMP bind marker was not substituted before execution".into(),
+        )),
+        Some(other) => Err(CqlError::Invalid(format!(
+            "USING TIMESTAMP must be an integer literal or bind marker, got {other:?}"
+        ))),
+    }
+}
+
+fn using_ttl_term_as_i32(t: Option<&Term>) -> Result<Option<i32>, CqlError> {
+    match t {
+        None => Ok(None),
+        Some(Term::IntegerLiteral(n)) => i32::try_from(*n)
+            .map(Some)
+            .map_err(|_| CqlError::Invalid(format!("USING TTL value {n} out of i32 range"))),
+        Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
+            "USING TTL bind marker was not substituted before execution".into(),
+        )),
+        Some(other) => Err(CqlError::Invalid(format!(
+            "USING TTL must be an integer literal or bind marker, got {other:?}"
+        ))),
+    }
+}
+
+/// Execute a common prepared INSERT shape without cloning and rewriting the
+/// full AST. This intentionally supports only top-level bind markers in VALUES
+/// and USING TIMESTAMP/TTL; complex nested bind markers fall back to the
+/// generic substitution path in the connection handler.
+pub async fn route_prepared_insert_fast(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &InsertStatement,
+    bound_terms: &[Term],
+) -> Option<Result<RouteResult, CqlError>> {
+    if s.if_not_exists || s.columns.len() != s.values.len() {
+        return None;
+    }
+    if s.values
+        .iter()
+        .any(|term| !prepared_insert_term_fast_supported(term))
+        || s.using_timestamp
+            .as_ref()
+            .is_some_and(|term| !prepared_insert_term_fast_supported(term))
+        || s.using_ttl
+            .as_ref()
+            .is_some_and(|term| !prepared_insert_term_fast_supported(term))
+    {
+        return None;
+    }
+
+    let opcode = CqlOpcode::Insert;
+    let query_desc = format!("INSERT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table);
+    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+    let _guard = state.query_tracker.begin_guarded(
+        &query_desc,
+        keyspace,
+        &ctx.client_address,
+        &ctx.auth.role,
+    );
+
+    let result = async {
+        let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+        validate_keyspace_exists(&state.schema, ks)?;
+
+        state.schema.check_permission(
+            ctx.auth,
+            Permission::Modify,
+            &Resource::Table(ks.to_string(), s.table.clone()),
+        )?;
+
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&(ks.to_string(), s.table.clone()))
+            .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+        let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
+        let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
+        let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+        let mut bind_idx = 0usize;
+
+        for (i, col_name) in s.columns.iter().enumerate() {
+            let term = next_prepared_insert_term(&s.values[i], bound_terms, &mut bind_idx)
+                .ok_or_else(|| {
+                    CqlError::Invalid("unsupported prepared INSERT bind shape".into())
+                })?;
+            let col_meta = table_meta
+                .columns
+                .get(col_name)
+                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
+            let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+            let value = bridge::term_to_cql_value(term, &cql_type)?;
+
+            match col_meta.kind {
+                ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
+                ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
+                ColumnKind::Regular | ColumnKind::Static => {
+                    let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+                        CqlError::Invalid(format!(
+                            "column '{}' not found in storage schema",
+                            col_name
+                        ))
+                    })?;
+                    regular_cells.push((col_idx, value));
+                }
+            }
+        }
+
+        let timestamp_term = match &s.using_timestamp {
+            Some(t) => Some(
+                next_prepared_insert_term(t, bound_terms, &mut bind_idx).ok_or_else(|| {
+                    CqlError::Invalid(
+                        "unsupported prepared INSERT USING TIMESTAMP bind shape".into(),
+                    )
+                })?,
+            ),
+            None => None,
+        };
+        let ttl_term = match &s.using_ttl {
+            Some(t) => Some(
+                next_prepared_insert_term(t, bound_terms, &mut bind_idx).ok_or_else(|| {
+                    CqlError::Invalid("unsupported prepared INSERT USING TTL bind shape".into())
+                })?,
+            ),
+            None => None,
+        };
+        let timestamp = match using_timestamp_term_as_i64(timestamp_term)? {
+            Some(ts) => ts,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+                .as_micros() as i64,
+        };
+
+        pk_vals.sort_by_key(|(pos, _)| *pos);
+        ck_vals.sort_by_key(|(pos, _)| *pos);
+        let pk_values: Vec<CqlValue> = pk_vals.into_iter().map(|(_, v)| v).collect();
+        let ck_values: Vec<CqlValue> = ck_vals.into_iter().map(|(_, v)| v).collect();
+        let pk_types: Vec<CqlType> = table_meta
+            .partition_key
+            .iter()
+            .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        let row = bridge::build_row(
+            &regular_cells,
+            &ck_values,
+            timestamp,
+            using_ttl_term_as_i32(ttl_term)?,
+        );
+        let table_id = TableId::new(ks, &s.table);
+        let strategy = keyspace_strategy(&state.schema, ks);
+
+        state
+            .write_path
+            .load()
+            .write(
+                &table_id,
+                &decorated_key,
+                row,
+                timestamp,
+                ctx.consistency,
+                &strategy,
+            )
+            .await?;
+
+        Ok(RouteResult::Result(result::encode_void()))
+    }
+    .await;
+
+    state.cql_metrics.inc_request(opcode);
+    if result.is_err() {
+        state.cql_metrics.inc_error();
+    }
+    Some(result)
+}
 
 async fn route_insert(
     state: &SharedState,
@@ -4372,7 +4912,7 @@ async fn route_logged_batch(
         .load()
         .write_batch(mutations, ctx.consistency, rf)
         .await
-        .map_err(|e| CqlError::Invalid(format!("logged batch failed: {e}")))?;
+        .map_err(CqlError::from)?;
 
     Ok(result::encode_void())
 }
@@ -7751,12 +8291,13 @@ async fn compile_assemblyscript_body(
     let nm = name.to_string();
     let at = arg_types.to_vec();
     let rt = return_type.clone();
-    let component = tokio::task::spawn_blocking(move || {
-        ferrosa_udf::component::compile_to_component(&nm, &source, &at, &rt)
-    })
-    .await
-    .map_err(|e| CqlError::Invalid(format!("AssemblyScript compile task panicked: {e}")))?
-    .map_err(|e| CqlError::Invalid(format!("{e}")))?;
+    let component = ferrosa_net::task_pool::TaskPool::current("cql-udf-compile")
+        .spawn_blocking(move || {
+            ferrosa_udf::component::compile_to_component(&nm, &source, &at, &rt)
+        })
+        .await
+        .map_err(|e| CqlError::Invalid(format!("AssemblyScript compile task panicked: {e}")))?
+        .map_err(|e| CqlError::Invalid(format!("{e}")))?;
     let stored = hex_encode_bytes(&component);
     Ok((component, stored))
 }
@@ -8804,6 +9345,7 @@ mod tests {
             segment_size: 4096,
             max_segment_age: std::time::Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
             archive: None,
@@ -8814,6 +9356,7 @@ mod tests {
             compaction,
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -9002,6 +9545,101 @@ mod tests {
             opts,
         );
         assert_eq!(keyspace_rf(&state.schema, "test_multi_dc"), 5);
+    }
+
+    #[tokio::test]
+    async fn prepared_insert_fast_path_executes_top_level_binds() {
+        let (state, _dir) = setup();
+        let current_keyspace = Some("fastins".to_string());
+        let auth = dev_auth();
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE fastins WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE fastins.t (id int PRIMARY KEY, name text)").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let insert = match crate::parser::parse("INSERT INTO t (id, name) VALUES (?, ?)").unwrap() {
+            Statement::Insert(insert) => insert,
+            other => panic!("expected insert, got {other:?}"),
+        };
+        let bound_terms = vec![Term::IntegerLiteral(7), Term::StringLiteral("seven".into())];
+        let executed_before = state.query_tracker.total_executed();
+
+        let result = route_prepared_insert_fast(&state, &ctx, &insert, &bound_terms)
+            .await
+            .expect("simple top-level prepared INSERT should take fast path")
+            .unwrap();
+
+        match result {
+            RouteResult::Result(body) => assert_eq!(&body[0..4], &0x0001i32.to_be_bytes()),
+            _ => panic!("expected void result"),
+        }
+        assert_eq!(state.query_tracker.total_executed(), executed_before + 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_select_fast_path_reads_full_partition_key_with_limit() {
+        let (state, _dir) = setup();
+        let current_keyspace = Some("fastsel".to_string());
+        let auth = dev_auth();
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE fastsel WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE fastsel.t (id int PRIMARY KEY, name text)").unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("INSERT INTO fastsel.t (id, name) VALUES (7, 'seven')").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let select = match crate::parser::parse("SELECT * FROM t WHERE id = ? LIMIT 10").unwrap() {
+            Statement::Select(select) => select,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let bound_terms = vec![Term::IntegerLiteral(7)];
+        let executed_before = state.query_tracker.total_executed();
+
+        let result = route_prepared_select_fast(&state, &ctx, &select, &bound_terms)
+            .await
+            .expect("full partition-key prepared SELECT should take fast path")
+            .unwrap();
+
+        match result {
+            RouteResult::Result(body) => assert_eq!(&body[0..4], &0x0002i32.to_be_bytes()),
+            _ => panic!("expected rows result"),
+        }
+        assert_eq!(state.query_tracker.total_executed(), executed_before + 1);
     }
 
     #[test]
@@ -11677,7 +12315,8 @@ mod tests {
             &mut Some("ks".into()),
             &state,
             &body.freeze(),
-        );
+        )
+        .await;
         match result {
             crate::connection::HandleResult::Reply(opcode, body) => {
                 // PREPARED = 0x04 Result opcode
@@ -11979,7 +12618,8 @@ mod tests {
             &mut Some("ks".into()),
             &state,
             &body.freeze(),
-        );
+        )
+        .await;
         match result {
             crate::connection::HandleResult::Reply(opcode, body) => {
                 assert_eq!(opcode, crate::frame::Opcode::Result);
@@ -12049,7 +12689,8 @@ mod tests {
             &mut Some("ks".into()),
             &state,
             &body.freeze(),
-        );
+        )
+        .await;
         match result {
             crate::connection::HandleResult::Reply(opcode, body) => {
                 assert_eq!(opcode, crate::frame::Opcode::Result);
@@ -14488,7 +15129,8 @@ mod tests {
             &mut Some("bug024".into()),
             &state,
             &body.freeze(),
-        );
+        )
+        .await;
 
         match result {
             crate::connection::HandleResult::Reply(opcode, body) => {
@@ -14601,7 +15243,8 @@ mod tests {
             &mut Some("bug024b".into()),
             &state,
             &body.freeze(),
-        );
+        )
+        .await;
 
         match result {
             crate::connection::HandleResult::Reply(opcode, body) => {
@@ -14704,6 +15347,7 @@ mod tests {
             segment_size: 4096,
             max_segment_age: std::time::Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
             archive: None,
@@ -14713,6 +15357,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.path().join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -16796,6 +17441,19 @@ mod tests {
             "projection must use the SSTable name-sorted storage ordinal (embedding=1), \
              not the table-definition position (embedding=2)"
         );
+
+        let stmt = crate::parser::parse(
+            "SELECT id, title FROM ks.t ORDER BY embedding ANN OF [0.1, 0.2, 0.3, 0.4] LIMIT 5",
+        )
+        .unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected SELECT statement");
+        };
+        assert_eq!(
+            projection_storage_ordinals_for_select_scan(&select, &table_meta),
+            Some(vec![2, 1]),
+            "ANN scans must fetch the ORDER BY vector column even when it is not projected"
+        );
     }
 
     // ── parse_permissions coverage for remaining variants ────────────
@@ -17382,18 +18040,22 @@ mod tests {
     #[test]
     fn single_partition_limit_pushes_row_cap_into_point_read() {
         let source = include_str!("router.rs");
-        let pk_lookup = source
+        let pk_lookup_blocks: Vec<&str> = source
             .split("let decorated_key = bridge::build_decorated_key")
-            .nth(1)
-            .and_then(|rest| rest.split("} else if let Some(in_rows)").next())
-            .expect("single-partition lookup block must be present");
+            .skip(1)
+            .filter_map(|rest| rest.split("} else if let Some(in_rows)").next())
+            .collect();
 
         assert!(
-            pk_lookup.contains("safe_partition_key_filter_row_limit"),
+            pk_lookup_blocks
+                .iter()
+                .any(|block| block.contains("safe_partition_key_filter_row_limit")),
             "single-partition SELECT must derive a safe row cap from CQL LIMIT before reading storage"
         );
         assert!(
-            pk_lookup.contains(".pk_read_limited_rows("),
+            pk_lookup_blocks
+                .iter()
+                .any(|block| block.contains(".pk_read_limited_rows(")),
             "single-partition SELECT ... LIMIT must push the row cap into the point-read path instead of materializing the whole partition"
         );
     }
@@ -17401,18 +18063,22 @@ mod tests {
     #[test]
     fn full_primary_key_lookup_pushes_clustering_key_into_point_read() {
         let source = include_str!("router.rs");
-        let pk_lookup = source
+        let pk_lookup_blocks: Vec<&str> = source
             .split("let decorated_key = bridge::build_decorated_key")
-            .nth(1)
-            .and_then(|rest| rest.split("} else if let Some(in_rows)").next())
-            .expect("single-partition lookup block must be present");
+            .skip(1)
+            .filter_map(|rest| rest.split("} else if let Some(in_rows)").next())
+            .collect();
 
         assert!(
-            pk_lookup.contains("extract_clustering_key_values"),
+            pk_lookup_blocks
+                .iter()
+                .any(|block| block.contains("extract_clustering_key_values")),
             "single-partition SELECT with equality on every clustering column must detect a full primary-key lookup"
         );
         assert!(
-            pk_lookup.contains(".pk_read_clustering_row("),
+            pk_lookup_blocks
+                .iter()
+                .any(|block| block.contains(".pk_read_clustering_row(")),
             "full primary-key SELECT must read the exact clustering row instead of scanning the whole partition"
         );
     }

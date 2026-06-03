@@ -20,6 +20,7 @@ use crate::frame::{
     CqlCodec, CqlFrame, FrameHeader, Opcode, DEFAULT_MAX_FRAME_SIZE, VERSION_RESPONSE,
 };
 use crate::router::SharedState;
+use ferrosa_net::task_pool::TaskPool;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -177,8 +178,13 @@ impl Drop for IpSlotGuard {
 /// By spawning the send into its own task, slow rejection-writes are
 /// quarantined to their own task. The accept loop returns to
 /// `listener.accept()` on the very next instruction.
-fn spawn_reject(stream: tokio::net::TcpStream, max_frame_size: u32, err: CqlError) {
-    tokio::spawn(async move {
+fn spawn_reject(
+    task_pool: &TaskPool,
+    stream: tokio::net::TcpStream,
+    max_frame_size: u32,
+    err: CqlError,
+) {
+    task_pool.spawn(async move {
         let codec = CqlCodec::new(max_frame_size);
         let mut framed = Framed::new(stream, codec);
         let body = err.encode_body().freeze();
@@ -203,6 +209,7 @@ pub struct CqlServer {
     state: Arc<SharedState>,
     active_connections: Arc<AtomicUsize>,
     ip_tracker: Arc<IpConnectionTracker>,
+    task_pool: TaskPool,
 }
 
 impl CqlServer {
@@ -212,7 +219,13 @@ impl CqlServer {
             state,
             active_connections: Arc::new(AtomicUsize::new(0)),
             ip_tracker: Arc::new(IpConnectionTracker::new()),
+            task_pool: TaskPool::current("cql"),
         }
+    }
+
+    pub fn with_task_pool(mut self, task_pool: TaskPool) -> Self {
+        self.task_pool = task_pool;
+        self
     }
 
     /// Build a TLS acceptor from cert/key paths if configured.
@@ -266,8 +279,7 @@ impl CqlServer {
     /// Start the server in the background. Returns the bound address.
     pub async fn start_background(&self) -> Result<SocketAddr, CqlError> {
         let tls_acceptor = self.build_tls_acceptor()?;
-        let listener = TcpListener::bind(self.config.bind_addr).await?;
-        let addr = listener.local_addr()?;
+        let bind_addr = self.config.bind_addr;
         let max_connections = self.config.max_connections;
         let max_connections_per_ip = self.config.max_connections_per_ip;
         let max_frame_size = self.config.max_frame_size;
@@ -276,13 +288,35 @@ impl CqlServer {
         let active = self.active_connections.clone();
         let ip_tracker = self.ip_tracker.clone();
         let state = self.state.clone();
+        let task_pool = self.task_pool.clone();
+        let accept_task_pool = task_pool.clone();
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
 
-        info!("CQL server listening on {addr}");
         if auth_disabled {
             warn!("auth: DISABLED (env override) — all connections are unauthenticated");
         }
 
-        tokio::spawn(async move {
+        task_pool.spawn(async move {
+            let listener = match TcpListener::bind(bind_addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    let _ = addr_tx.send(Err(CqlError::from(e)));
+                    return;
+                }
+            };
+            let addr = match listener.local_addr() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    let _ = addr_tx.send(Err(CqlError::from(e)));
+                    return;
+                }
+            };
+            info!(
+                pool = accept_task_pool.name(),
+                "CQL server listening on {addr}"
+            );
+            let _ = addr_tx.send(Ok(addr));
+
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
@@ -291,6 +325,7 @@ impl CqlServer {
                             active.fetch_sub(1, Ordering::Relaxed);
                             warn!("connection limit reached, rejecting {peer}");
                             spawn_reject(
+                                &accept_task_pool,
                                 stream,
                                 max_frame_size,
                                 CqlError::Overloaded("connection limit reached".into()),
@@ -305,6 +340,7 @@ impl CqlServer {
                                 "rejecting CQL connection: node is pair-mode secondary"
                             );
                             spawn_reject(
+                                &accept_task_pool,
                                 stream,
                                 max_frame_size,
                                 CqlError::Overloaded(
@@ -320,6 +356,7 @@ impl CqlServer {
                             active.fetch_sub(1, Ordering::Relaxed);
                             warn!("per-IP limit reached for {peer_ip}, rejecting");
                             spawn_reject(
+                                &accept_task_pool,
                                 stream,
                                 max_frame_size,
                                 CqlError::Overloaded("per-IP connection limit reached".into()),
@@ -348,7 +385,8 @@ impl CqlServer {
                         let active = active.clone();
                         let state = state.clone();
                         let tls_acceptor = tls_acceptor.clone();
-                        tokio::spawn(async move {
+                        let connection_task_pool = accept_task_pool.clone();
+                        accept_task_pool.spawn(async move {
                             if let Some(acceptor) = tls_acceptor {
                                 // TLS handshake with 10s timeout
                                 match tokio::time::timeout(
@@ -366,6 +404,7 @@ impl CqlServer {
                                             auth_disabled,
                                             state,
                                             Some(ip_guard),
+                                            connection_task_pool.clone(),
                                         )
                                         .await;
                                     }
@@ -386,6 +425,7 @@ impl CqlServer {
                                     auth_disabled,
                                     state,
                                     Some(ip_guard),
+                                    connection_task_pool.clone(),
                                 )
                                 .await;
                             }
@@ -400,7 +440,9 @@ impl CqlServer {
             }
         });
 
-        Ok(addr)
+        addr_rx
+            .await
+            .map_err(|e| CqlError::ServerError(format!("CQL bind task failed: {e}")))?
     }
 
     /// Returns the number of active connections.
@@ -436,6 +478,7 @@ mod tests {
             segment_size: 4096,
             max_segment_age: std::time::Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
             archive: None,
@@ -446,6 +489,7 @@ mod tests {
             compaction,
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -551,7 +595,7 @@ mod tests {
         let header = FrameHeader::decode(&buf[..HEADER_SIZE]).unwrap();
         assert_eq!(header.opcode, Opcode::Error);
         let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
-        assert_eq!(error_code, 0x1100);
+        assert_eq!(error_code, 0x1001);
     }
 
     /// Send a v4 STARTUP frame and read one response frame.
@@ -708,7 +752,7 @@ mod tests {
         let header = FrameHeader::decode(&buf[..HEADER_SIZE]).unwrap();
         assert_eq!(header.opcode, Opcode::Error);
         let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
-        assert_eq!(error_code, 0x1100); // Overloaded
+        assert_eq!(error_code, 0x1001); // Overloaded
     }
 
     #[test]
@@ -784,6 +828,7 @@ mod tests {
             segment_size: 4096,
             max_segment_age: std::time::Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
             archive: None,
@@ -794,6 +839,7 @@ mod tests {
             compaction,
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -884,9 +930,9 @@ mod tests {
         assert!(n >= HEADER_SIZE, "expected at least a frame header");
         let header = FrameHeader::decode(&buf[..HEADER_SIZE]).unwrap();
         assert_eq!(header.opcode, Opcode::Error);
-        // 0x1100 = Overloaded error code
+        // 0x1001 = Overloaded error code
         let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
-        assert_eq!(error_code, 0x1100, "expected Overloaded error code");
+        assert_eq!(error_code, 0x1001, "expected Overloaded error code");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -9,6 +10,7 @@ use crate::config::NetConfig;
 use crate::message::Message;
 use crate::pool::{LaneOutcome, PriorityPool};
 use crate::rpc::handler::PeerId;
+use crate::task_pool::TaskPool;
 
 /// Subscribe to peer lifecycle events.
 pub trait PeerEventListener: Send + Sync {
@@ -26,17 +28,40 @@ pub struct PeerManager {
     config: Arc<NetConfig>,
     #[allow(dead_code)]
     local_host_id: uuid::Uuid,
-    peers: RwLock<HashMap<uuid::Uuid, PeerState>>,
+    peers: RwLock<HashMap<uuid::Uuid, Arc<PeerState>>>,
     listener: Arc<dyn PeerEventListener>,
     /// CQL broadcast addresses learned from peer handshakes.
     peer_cql_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
+    raft_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
+    data_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
+    started_at: tokio::time::Instant,
 }
 
 struct PeerState {
     pool: Option<Arc<PriorityPool>>, // None for unit-test entries (add_peer_entry)
     peer_id: PeerId,
-    last_heartbeat: tokio::time::Instant,
-    missed_heartbeats: u32,
+    last_activity_ms: AtomicU64,
+    missed_heartbeats: AtomicU32,
+}
+
+impl PeerState {
+    fn new(peer_id: PeerId, pool: Option<Arc<PriorityPool>>, now_ms: u64) -> Self {
+        Self {
+            pool,
+            peer_id,
+            last_activity_ms: AtomicU64::new(now_ms),
+            missed_heartbeats: AtomicU32::new(0),
+        }
+    }
+
+    fn record_activity(&self, now_ms: u64) {
+        self.last_activity_ms.store(now_ms, Ordering::Relaxed);
+        self.missed_heartbeats.store(0, Ordering::Relaxed);
+    }
+
+    fn activity_elapsed(&self, now_ms: u64) -> Duration {
+        Duration::from_millis(now_ms.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)))
+    }
 }
 
 impl PeerManager {
@@ -51,7 +76,47 @@ impl PeerManager {
             peers: RwLock::new(HashMap::new()),
             listener,
             peer_cql_broadcasts: RwLock::new(HashMap::new()),
+            raft_runtime: OnceLock::new(),
+            data_runtime: OnceLock::new(),
+            started_at: tokio::time::Instant::now(),
         }
+    }
+
+    pub fn set_raft_runtime(&self, runtime: Arc<tokio::runtime::Runtime>) {
+        let _ = self.raft_runtime.set(runtime);
+    }
+
+    pub fn set_data_runtime(&self, runtime: Arc<tokio::runtime::Runtime>) {
+        let _ = self.data_runtime.set(runtime);
+    }
+
+    pub fn raft_runtime(&self) -> Option<Arc<tokio::runtime::Runtime>> {
+        self.raft_runtime.get().cloned()
+    }
+
+    pub fn data_runtime(&self) -> Option<Arc<tokio::runtime::Runtime>> {
+        self.data_runtime.get().cloned()
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    async fn pool_for_peer(
+        &self,
+        host_id: uuid::Uuid,
+    ) -> crate::error::Result<(Arc<PeerState>, Arc<PriorityPool>)> {
+        let peers = self.peers.read().await;
+        let state =
+            Arc::clone(peers.get(&host_id).ok_or_else(|| {
+                crate::error::NetError::Protocol(format!("unknown peer: {host_id}"))
+            })?);
+        let pool = state
+            .pool
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| crate::error::NetError::Protocol("no connection pool".into()))?;
+        Ok((state, pool))
     }
 
     /// Add a connected peer with a real connection pool.
@@ -67,18 +132,13 @@ impl PeerManager {
                 .await
                 .insert(host_id, broadcast.to_string());
         }
-        let state = PeerState {
-            pool: Some(Arc::new(pool)),
-            peer_id,
-            last_heartbeat: tokio::time::Instant::now(),
-            missed_heartbeats: 0,
-        };
+        let state = Arc::new(PeerState::new(peer_id, Some(Arc::new(pool)), self.now_ms()));
         let old_pool = self
             .peers
             .write()
             .await
             .insert(host_id, state)
-            .and_then(|old| old.pool);
+            .and_then(|old| old.pool.clone());
         self.listener.on_peer_connected(peer_id);
         if let Some(pool) = old_pool {
             pool.shutdown().await;
@@ -141,8 +201,16 @@ impl PeerManager {
             }
         }
 
-        let pool = PriorityPool::connect(self.config.clone(), self.local_host_id, addr, None, None)
-            .await?;
+        let raft_runtime = self.raft_runtime.get().cloned();
+        let data_runtime = self.data_runtime.get().cloned();
+        let pool = PriorityPool::connect(
+            self.config.clone(),
+            self.local_host_id,
+            addr,
+            raft_runtime,
+            data_runtime,
+        )
+        .await?;
         self.add_peer((host_id, resolved), pool).await;
         Ok(())
     }
@@ -150,12 +218,7 @@ impl PeerManager {
     /// Add a peer entry without a connection pool (for unit testing).
     pub async fn add_peer_entry(&self, peer_id: PeerId) {
         let (host_id, _addr) = peer_id;
-        let state = PeerState {
-            pool: None,
-            peer_id,
-            last_heartbeat: tokio::time::Instant::now(),
-            missed_heartbeats: 0,
-        };
+        let state = Arc::new(PeerState::new(peer_id, None, self.now_ms()));
         self.peers.write().await.insert(host_id, state);
         self.listener.on_peer_connected(peer_id);
     }
@@ -174,25 +237,9 @@ impl PeerManager {
         msg: Message,
         lane: Lane,
     ) -> crate::error::Result<Message> {
-        // Clone the pool Arc and drop the read lock BEFORE the network
-        // round-trip. Holding the lock across .await starves writers
-        // (heartbeat loop, peer additions) and blocks all other sends.
-        let pool = {
-            let peers = self.peers.read().await;
-            let state = peers.get(&host_id).ok_or_else(|| {
-                crate::error::NetError::Protocol(format!("unknown peer: {host_id}"))
-            })?;
-            match &state.pool {
-                Some(pool) => Arc::clone(pool),
-                None => {
-                    return Err(crate::error::NetError::Protocol(
-                        "no connection pool".into(),
-                    ))
-                }
-            }
-        };
+        let (state, pool) = self.pool_for_peer(host_id).await?;
         let resp = pool.send(msg, lane).await?;
-        self.record_activity(host_id).await;
+        state.record_activity(self.now_ms());
         Ok(resp)
     }
 
@@ -210,22 +257,9 @@ impl PeerManager {
         lane: Lane,
         timeout: Duration,
     ) -> crate::error::Result<Message> {
-        let pool = {
-            let peers = self.peers.read().await;
-            let state = peers.get(&host_id).ok_or_else(|| {
-                crate::error::NetError::Protocol(format!("unknown peer: {host_id}"))
-            })?;
-            match &state.pool {
-                Some(pool) => Arc::clone(pool),
-                None => {
-                    return Err(crate::error::NetError::Protocol(
-                        "no connection pool".into(),
-                    ))
-                }
-            }
-        };
+        let (state, pool) = self.pool_for_peer(host_id).await?;
         let resp = pool.send_with_timeout(msg, lane, timeout).await?;
-        self.record_activity(host_id).await;
+        state.record_activity(self.now_ms());
         Ok(resp)
     }
 
@@ -239,22 +273,9 @@ impl PeerManager {
         msg: Message,
         lane: Lane,
     ) -> crate::error::Result<()> {
-        let pool = {
-            let peers = self.peers.read().await;
-            let state = peers.get(&host_id).ok_or_else(|| {
-                crate::error::NetError::Protocol(format!("unknown peer: {host_id}"))
-            })?;
-            match &state.pool {
-                Some(pool) => Arc::clone(pool),
-                None => {
-                    return Err(crate::error::NetError::Protocol(
-                        "no connection pool".into(),
-                    ))
-                }
-            }
-        };
+        let (state, pool) = self.pool_for_peer(host_id).await?;
         pool.fire(msg, lane).await?;
-        self.record_activity(host_id).await;
+        state.record_activity(self.now_ms());
         Ok(())
     }
 
@@ -266,46 +287,50 @@ impl PeerManager {
     ///
     /// # Cancel Safety
     ///
-    /// This method is cancel-safe. All mutable state is updated while holding
-    /// the write lock with no `.await` inside the critical section. Per-peer
+    /// This method is cancel-safe. Liveness state is updated with atomics while
+    /// holding only the peer-map read lock. Per-peer
     /// Ping sends are dispatched via `tokio::spawn`, so dropping this future
     /// between ticks does not leave shared state inconsistent. Note that
     /// `PriorityPool::send` (used inside each spawned task) is itself not
     /// cancel-safe; wrapping it in `tokio::spawn` is what makes it safe here.
     pub async fn run_heartbeat_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(self.config.heartbeat_interval);
+        let task_pool =
+            TaskPool::from_optional_runtime("peer-heartbeat", self.raft_runtime.get().cloned());
         loop {
             interval.tick().await;
 
-            // Collect work under the write lock, then release before any I/O.
+            // Collect work under the read lock, then release before any I/O.
             let mut to_ping: Vec<(uuid::Uuid, Arc<PriorityPool>)> = Vec::new();
             let mut suspected: Vec<(PeerId, Option<Arc<PriorityPool>>)> = Vec::new();
             {
-                let mut peers = self.peers.write().await;
-                for (host_id, state) in peers.iter_mut() {
-                    let elapsed = state.last_heartbeat.elapsed();
+                let peers = self.peers.read().await;
+                let now_ms = self.now_ms();
+                for (host_id, state) in peers.iter() {
+                    let elapsed = state.activity_elapsed(now_ms);
                     if elapsed >= self.config.heartbeat_timeout {
-                        state.missed_heartbeats += 1;
-                        if state.missed_heartbeats == 3 {
+                        let missed_heartbeats =
+                            state.missed_heartbeats.fetch_add(1, Ordering::Relaxed) + 1;
+                        if missed_heartbeats == 3 {
                             // Only push on the first detection (== 3) to avoid
                             // spawning a new monitor task on every subsequent tick.
                             tracing::warn!(
                                 %host_id,
                                 "peer suspected dead: {} missed heartbeats",
-                                state.missed_heartbeats
+                                missed_heartbeats
                             );
                             let pool_arc = state.pool.as_ref().map(Arc::clone);
                             suspected.push((state.peer_id, pool_arc));
                         }
                     } else {
-                        state.missed_heartbeats = 0;
+                        state.missed_heartbeats.store(0, Ordering::Relaxed);
                     }
 
                     if let Some(pool) = &state.pool {
                         to_ping.push((*host_id, Arc::clone(pool)));
                     }
                 }
-            } // write lock released
+            } // read lock released
 
             // Notify listener and trigger reconnection outside the lock.
             for (peer_id, pool_opt) in suspected {
@@ -317,7 +342,7 @@ impl PeerManager {
                     pool.reconnect_all_lanes();
 
                     let listener = Arc::clone(&self.listener);
-                    tokio::spawn(async move {
+                    task_pool.spawn(async move {
                         for _ in 0u32..120 {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
@@ -343,7 +368,7 @@ impl PeerManager {
             // pending map and record_heartbeat resets the miss counter.
             for (host_id, pool) in to_ping {
                 let this = Arc::clone(&self);
-                tokio::spawn(async move {
+                task_pool.spawn(async move {
                     let nonce: u64 = rand::random();
                     let sent_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -367,10 +392,9 @@ impl PeerManager {
 
     /// Called when recent successful peer traffic proves the connection is alive.
     pub async fn record_activity(&self, host_id: uuid::Uuid) {
-        let mut peers = self.peers.write().await;
-        if let Some(state) = peers.get_mut(&host_id) {
-            state.last_heartbeat = tokio::time::Instant::now();
-            state.missed_heartbeats = 0;
+        let peers = self.peers.read().await;
+        if let Some(state) = peers.get(&host_id) {
+            state.record_activity(self.now_ms());
         }
     }
 

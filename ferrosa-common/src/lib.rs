@@ -18,6 +18,7 @@ pub mod error;
 pub mod key;
 pub mod murmur3;
 pub mod schema;
+pub mod task_pool;
 pub mod token;
 
 #[cfg(feature = "test-generators")]

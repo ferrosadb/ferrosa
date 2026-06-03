@@ -4,6 +4,7 @@
 //! `encode_body()` produces the wire-format error response body.
 
 use bytes::{BufMut, BytesMut};
+use ferrosa_cluster::consistency::ConsistencyLevel;
 
 /// CQL protocol error with structured data for each error code.
 #[derive(Debug, Clone)]
@@ -16,8 +17,26 @@ pub enum CqlError {
     /// 0x0100 — authentication rejected.
     BadCredentials,
     /// 0x1000 — not enough replicas.
-    Unavailable,
-    /// 0x1100 — server backpressure.
+    Unavailable {
+        consistency: ConsistencyLevel,
+        required: usize,
+        alive: usize,
+    },
+    /// 0x1100 — replicas alive but not enough acknowledged the write.
+    WriteTimeout {
+        consistency: ConsistencyLevel,
+        received: usize,
+        required: usize,
+        write_type: &'static str,
+    },
+    /// 0x1200 — replicas alive but not enough responded to the read.
+    ReadTimeout {
+        consistency: ConsistencyLevel,
+        received: usize,
+        required: usize,
+        data_present: bool,
+    },
+    /// 0x1001 — server backpressure.
     Overloaded(String),
     /// 0x2000 — CQL syntax error.
     SyntaxError(String),
@@ -44,8 +63,10 @@ impl CqlError {
             Self::ServerError(_) => 0x0000,
             Self::Protocol(_) | Self::ProtocolVersionMismatch { .. } => 0x000A,
             Self::BadCredentials => 0x0100,
-            Self::Unavailable => 0x1000,
-            Self::Overloaded(_) => 0x1100,
+            Self::Unavailable { .. } => 0x1000,
+            Self::Overloaded(_) => 0x1001,
+            Self::WriteTimeout { .. } => 0x1100,
+            Self::ReadTimeout { .. } => 0x1200,
             Self::SyntaxError(_) => 0x2000,
             Self::Unauthorized(_) => 0x2100,
             Self::Invalid(_) => 0x2200,
@@ -68,6 +89,37 @@ impl CqlError {
 
         // Extra fields for specific error types.
         match self {
+            Self::Unavailable {
+                consistency,
+                required,
+                alive,
+            } => {
+                put_consistency(&mut buf, *consistency);
+                buf.put_i32(saturating_i32(*required));
+                buf.put_i32(saturating_i32(*alive));
+            }
+            Self::WriteTimeout {
+                consistency,
+                received,
+                required,
+                write_type,
+            } => {
+                put_consistency(&mut buf, *consistency);
+                buf.put_i32(saturating_i32(*received));
+                buf.put_i32(saturating_i32(*required));
+                put_string(&mut buf, write_type);
+            }
+            Self::ReadTimeout {
+                consistency,
+                received,
+                required,
+                data_present,
+            } => {
+                put_consistency(&mut buf, *consistency);
+                buf.put_i32(saturating_i32(*received));
+                buf.put_i32(saturating_i32(*required));
+                buf.put_u8(u8::from(*data_present));
+            }
             Self::AlreadyExists { keyspace, table } => {
                 buf.put_u16(keyspace.len() as u16);
                 buf.put_slice(keyspace.as_bytes());
@@ -85,13 +137,55 @@ impl CqlError {
     }
 }
 
+fn put_consistency(buf: &mut BytesMut, consistency: ConsistencyLevel) {
+    buf.put_u16(consistency.to_wire());
+}
+
+fn put_string(buf: &mut BytesMut, value: &str) {
+    buf.put_u16(value.len() as u16);
+    buf.put_slice(value.as_bytes());
+}
+
+fn saturating_i32(value: usize) -> i32 {
+    value.min(i32::MAX as usize) as i32
+}
+
+fn parse_consistency(value: &str) -> ConsistencyLevel {
+    ConsistencyLevel::from_str(value).unwrap_or(ConsistencyLevel::One)
+}
+
 impl std::fmt::Display for CqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ServerError(msg) => write!(f, "server error: {msg}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::BadCredentials => write!(f, "bad credentials"),
-            Self::Unavailable => write!(f, "unavailable"),
+            Self::Unavailable {
+                consistency,
+                required,
+                alive,
+            } => write!(
+                f,
+                "unavailable: CL={consistency}, required={required}, alive={alive}"
+            ),
+            Self::WriteTimeout {
+                consistency,
+                received,
+                required,
+                ..
+            } => write!(
+                f,
+                "write timeout: CL={consistency}, received={received}, required={required}"
+            ),
+            Self::ReadTimeout {
+                consistency,
+                received,
+                required,
+                data_present,
+            } => write!(
+                f,
+                "read timeout: CL={consistency}, received={received}, required={required}, data_present={data_present}"
+            ),
             Self::Overloaded(msg) => write!(f, "{msg}"),
             Self::SyntaxError(msg) => write!(f, "{msg}"),
             Self::Unauthorized(msg) => write!(f, "unauthorized: {msg}"),
@@ -170,7 +264,11 @@ impl From<ferrosa_schema::SchemaError> for CqlError {
 
 impl From<ferrosa_common::Error> for CqlError {
     fn from(err: ferrosa_common::Error) -> Self {
-        Self::ServerError(format!("storage error: {err}"))
+        if err.is_backpressure() {
+            Self::Overloaded(format!("storage backpressure: {err}"))
+        } else {
+            Self::ServerError(format!("storage error: {err}"))
+        }
     }
 }
 
@@ -182,7 +280,44 @@ impl From<std::io::Error> for CqlError {
 
 impl From<ferrosa_cluster::ClusterError> for CqlError {
     fn from(err: ferrosa_cluster::ClusterError) -> Self {
-        Self::ServerError(format!("cluster error: {err}"))
+        use ferrosa_cluster::ClusterError;
+        match err {
+            ClusterError::Unavailable {
+                consistency,
+                required,
+                alive,
+            } => Self::Unavailable {
+                consistency: parse_consistency(&consistency),
+                required,
+                alive,
+            },
+            ClusterError::WriteTimeout {
+                consistency,
+                received,
+                required,
+            } => Self::WriteTimeout {
+                consistency: parse_consistency(&consistency),
+                received,
+                required,
+                write_type: "SIMPLE",
+            },
+            ClusterError::ReadTimeout {
+                consistency,
+                received,
+                required,
+                data_present,
+            } => Self::ReadTimeout {
+                consistency: parse_consistency(&consistency),
+                received,
+                required,
+                data_present,
+            },
+            ClusterError::Overloaded(msg) => Self::Overloaded(msg),
+            ClusterError::Storage(e) if e.is_backpressure() => {
+                Self::Overloaded(format!("storage backpressure: {e}"))
+            }
+            other => Self::ServerError(format!("cluster error: {other}")),
+        }
     }
 }
 
@@ -218,8 +353,36 @@ mod tests {
         assert_eq!(CqlError::ServerError("".into()).error_code(), 0x0000);
         assert_eq!(CqlError::Protocol("".into()).error_code(), 0x000A);
         assert_eq!(CqlError::BadCredentials.error_code(), 0x0100);
-        assert_eq!(CqlError::Unavailable.error_code(), 0x1000);
-        assert_eq!(CqlError::Overloaded("test".into()).error_code(), 0x1100);
+        assert_eq!(
+            CqlError::Unavailable {
+                consistency: ConsistencyLevel::Quorum,
+                required: 2,
+                alive: 1,
+            }
+            .error_code(),
+            0x1000
+        );
+        assert_eq!(CqlError::Overloaded("test".into()).error_code(), 0x1001);
+        assert_eq!(
+            CqlError::WriteTimeout {
+                consistency: ConsistencyLevel::LocalQuorum,
+                received: 1,
+                required: 2,
+                write_type: "SIMPLE",
+            }
+            .error_code(),
+            0x1100
+        );
+        assert_eq!(
+            CqlError::ReadTimeout {
+                consistency: ConsistencyLevel::LocalQuorum,
+                received: 1,
+                required: 2,
+                data_present: false,
+            }
+            .error_code(),
+            0x1200
+        );
         assert_eq!(CqlError::SyntaxError("".into()).error_code(), 0x2000);
         assert_eq!(CqlError::Unauthorized("".into()).error_code(), 0x2100);
         assert_eq!(CqlError::Invalid("".into()).error_code(), 0x2200);
@@ -244,6 +407,50 @@ mod tests {
         let str_len = u16::from_be_bytes([body[4], body[5]]) as usize;
         let msg = std::str::from_utf8(&body[6..6 + str_len]).unwrap();
         assert_eq!(msg, "bad query");
+    }
+
+    #[test]
+    fn encode_write_timeout_includes_write_type() {
+        let err = CqlError::WriteTimeout {
+            consistency: ConsistencyLevel::LocalQuorum,
+            received: 1,
+            required: 2,
+            write_type: "SIMPLE",
+        };
+        let body = err.encode_body();
+
+        assert_eq!(&body[..4], &0x1100u32.to_be_bytes());
+        let msg_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+        let mut offset = 6 + msg_len;
+        assert_eq!(
+            u16::from_be_bytes([body[offset], body[offset + 1]]),
+            ConsistencyLevel::LocalQuorum.to_wire()
+        );
+        offset += 2;
+        assert_eq!(
+            i32::from_be_bytes([
+                body[offset],
+                body[offset + 1],
+                body[offset + 2],
+                body[offset + 3],
+            ]),
+            1
+        );
+        offset += 4;
+        assert_eq!(
+            i32::from_be_bytes([
+                body[offset],
+                body[offset + 1],
+                body[offset + 2],
+                body[offset + 3],
+            ]),
+            2
+        );
+        offset += 4;
+        let write_type_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        offset += 2;
+        assert_eq!(&body[offset..offset + write_type_len], b"SIMPLE");
+        assert_eq!(offset + write_type_len, body.len());
     }
 
     #[test]

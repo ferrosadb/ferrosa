@@ -84,6 +84,53 @@ impl Default for SyncStrategyConfig {
     }
 }
 
+/// Adaptive commit-log sync batching tunables.
+///
+/// The sync strategy opens a batch when the first dirty write arrives. Under
+/// low load it flushes after `max_delay`; under high load it can flush earlier
+/// once accumulated WAL bytes reach `target_bytes`.
+#[derive(Debug, Clone)]
+pub struct CommitLogBatchConfig {
+    /// Flush as soon as pending WAL bytes reach this target.
+    pub target_bytes: u64,
+    /// Maximum time to hold a dirty batch open.
+    pub max_delay: Duration,
+}
+
+impl CommitLogBatchConfig {
+    pub const DEFAULT_TARGET_BYTES: u64 = 64 * 1024;
+
+    pub fn with_max_delay(max_delay: Duration) -> Self {
+        Self {
+            target_bytes: Self::DEFAULT_TARGET_BYTES,
+            max_delay,
+        }
+    }
+
+    pub fn from_env(default: Self) -> Self {
+        let target_bytes = std::env::var("FERROSA_COMMITLOG_BATCH_TARGET_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default.target_bytes);
+        let max_delay = std::env::var("FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(default.max_delay);
+        Self {
+            target_bytes,
+            max_delay,
+        }
+    }
+}
+
+impl Default for CommitLogBatchConfig {
+    fn default() -> Self {
+        Self::with_max_delay(Duration::from_millis(10))
+    }
+}
+
 /// Default archive poll interval: 5 seconds.
 pub const DEFAULT_ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -157,6 +204,7 @@ pub const DEFAULT_MAX_SEGMENT_AGE: Duration = Duration::from_secs(300);
 /// All sizes are configurable. Defaults are suitable for general workloads:
 /// - 32 MB segments with 5-minute max age
 /// - Periodic sync every 10ms (best throughput, up to 10ms data loss on crash)
+/// - 64 KiB commit-log sync batches under sustained write load
 #[derive(Debug, Clone)]
 pub struct CommitLogConfig {
     /// Segment size in bytes (default 32 MB).
@@ -165,6 +213,8 @@ pub struct CommitLogConfig {
     pub max_segment_age: Duration,
     /// Sync strategy selection.
     pub sync_strategy: SyncStrategyConfig,
+    /// Adaptive batching controls for periodic/group sync.
+    pub batch: CommitLogBatchConfig,
     /// Directory for commit log segment files.
     pub log_dir: PathBuf,
     /// Directory for checkpoint file (may be same as log_dir).
@@ -184,6 +234,7 @@ impl CommitLogConfig {
             segment_size: 4096, // 4 KB for fast rotation in tests
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch, // immediate fsync for deterministic tests
+            batch: CommitLogBatchConfig::default(),
             log_dir: dir.to_path_buf(),
             checkpoint_dir: dir.to_path_buf(),
             archive: None,
@@ -197,6 +248,7 @@ impl Default for CommitLogConfig {
             segment_size: DEFAULT_SEGMENT_SIZE,
             max_segment_age: DEFAULT_MAX_SEGMENT_AGE,
             sync_strategy: SyncStrategyConfig::default(),
+            batch: CommitLogBatchConfig::default(),
             log_dir: PathBuf::from("/var/lib/ferrosa/commitlog"),
             checkpoint_dir: PathBuf::from("/var/lib/ferrosa/commitlog"),
             archive: None,
@@ -218,6 +270,11 @@ mod tests {
             SyncStrategyConfig::Periodic { sync_interval }
             if sync_interval == Duration::from_millis(10)
         ));
+        assert_eq!(
+            config.batch.target_bytes,
+            CommitLogBatchConfig::DEFAULT_TARGET_BYTES
+        );
+        assert_eq!(config.batch.max_delay, Duration::from_millis(10));
     }
 
     #[test]
@@ -257,6 +314,13 @@ mod tests {
     fn sync_strategy_default_is_periodic() {
         let strategy = SyncStrategyConfig::default();
         assert!(matches!(strategy, SyncStrategyConfig::Periodic { .. }));
+    }
+
+    #[test]
+    fn batch_config_default_targets_64k() {
+        let batch = CommitLogBatchConfig::default();
+        assert_eq!(batch.target_bytes, 64 * 1024);
+        assert_eq!(batch.max_delay, Duration::from_millis(10));
     }
 
     #[test]

@@ -14,12 +14,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
+use ferrosa_common::task_pool::TaskPool;
 use ferrosa_common::Result;
 use ferrosa_index::{IndexKey, RowPosition};
 use ferrosa_sstable::io::ReadAt;
@@ -348,6 +350,19 @@ fn partition_with_matching_clustering(
     })
 }
 
+fn clone_partition_limited(partition: &Partition, row_limit: usize) -> Partition {
+    if row_limit == 0 {
+        return partition.clone();
+    }
+
+    Partition {
+        key: partition.key.clone(),
+        deletion: partition.deletion,
+        static_row: partition.static_row.clone(),
+        rows: partition.rows.iter().take(row_limit).cloned().collect(),
+    }
+}
+
 /// Filters sidecar entries to remove references to deleted partitions.
 ///
 /// After compaction merges partitions, some entries in the collected
@@ -643,28 +658,29 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         row_limit: usize,
     ) -> Result<Option<Partition>> {
+        let started = Instant::now();
         let guard = self.view.load();
         let schema = self.schema.load();
 
         let mut sources: Vec<Partition> = Vec::new();
+        let mut memtable_hits = 0u64;
+        let mut flushing_hits = 0u64;
+        let mut sstable_pruned = 0u64;
+        let mut sstable_probes = 0u64;
+        let mut sstable_hits = 0u64;
+        let mut sstable_errors = 0u64;
 
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
-            let mut p = (*p).clone();
-            if row_limit > 0 {
-                p.rows.truncate(row_limit);
-            }
-            sources.push(p);
+            memtable_hits += 1;
+            sources.push(clone_partition_limited(&p, row_limit));
         }
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
             if let Some(p) = flushing.get(key)? {
-                let mut p = (*p).clone();
-                if row_limit > 0 {
-                    p.rows.truncate(row_limit);
-                }
-                sources.push(p);
+                flushing_hits += 1;
+                sources.push(clone_partition_limited(&p, row_limit));
             }
         }
 
@@ -673,8 +689,14 @@ impl<F: FlushTarget> TableStore<F> {
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for (i, sstable) in guard.sstables.iter().enumerate() {
+            if !sstable.may_contain_key(key) {
+                sstable_pruned += 1;
+                continue;
+            }
+            sstable_probes += 1;
             match sstable.get_partition_limited_rows(key, row_limit) {
                 Ok(Some(mut p)) => {
+                    sstable_hits += 1;
                     ColumnOrdinalMapping::for_header(&schema, sstable.header())
                         .remap_partition(&mut p);
                     sources.push(p);
@@ -698,11 +720,22 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sstable_errors += 1;
                 }
             }
         }
 
         if sources.is_empty() {
+            crate::metrics::observe_read_limited_rows(
+                started.elapsed(),
+                false,
+                memtable_hits,
+                flushing_hits,
+                sstable_pruned,
+                sstable_probes,
+                sstable_hits,
+                sstable_errors,
+            );
             return Ok(None);
         }
 
@@ -711,6 +744,16 @@ impl<F: FlushTarget> TableStore<F> {
             merge::apply_deletions(&mut merged);
             merged.rows.truncate(row_limit);
         }
+        crate::metrics::observe_read_limited_rows(
+            started.elapsed(),
+            true,
+            memtable_hits,
+            flushing_hits,
+            sstable_pruned,
+            sstable_probes,
+            sstable_hits,
+            sstable_errors,
+        );
         Ok(Some(merged))
     }
 
@@ -745,6 +788,9 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         for (i, sstable) in guard.sstables.iter().enumerate() {
+            if !sstable.may_contain_key(key) {
+                continue;
+            }
             match sstable.get_clustering_row(key, clustering) {
                 Ok(Some(mut p)) => {
                     ColumnOrdinalMapping::for_header(&schema, sstable.header())
@@ -968,7 +1014,13 @@ impl<F: FlushTarget> TableStore<F> {
     /// 5. Build the SSTable via [`SSTableWriter`] and [`FlushTarget::flush`].
     /// 6. Prepend the new reader to the SSTable list and clear `flushing`.
     pub fn flush(&self) -> Result<()> {
+        let total_start = Instant::now();
+        let phase_start = Instant::now();
         let _guard = self.flush_guard.lock();
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::LockWait,
+            phase_start.elapsed(),
+        );
 
         // Step 1: Swap in a fresh active memtable, move old to flushing.
         // Take the write barrier (exclusive) to ensure no writer is mid-put
@@ -978,6 +1030,7 @@ impl<F: FlushTarget> TableStore<F> {
         let new_active: Arc<dyn Memtable> = new_memtable();
         let fresh_indexes = new_indexes(&self.indexed_columns);
         let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
+        let phase_start = Instant::now();
         let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
             let _wb = self.write_barrier.write(); // block all writers
             let old_view = self.view.load();
@@ -1009,12 +1062,17 @@ impl<F: FlushTarget> TableStore<F> {
                 old_vector_indexes,
             )
         };
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::SwapMemtable,
+            phase_start.elapsed(),
+        );
 
         // Step 2: Snapshot the flushing memtable.
         // Also capture any late writes from the PREVIOUS flushing memtable
         // (kept alive since the last flush). These are writes that landed
         // between the previous snapshot and the view swap.
         let prev_flushing_present = old_view_flushing.is_some();
+        let phase_start = Instant::now();
         let mut partitions = old_active.snapshot();
         if let Some(ref prev_flushing) = old_view_flushing {
             let prev_parts = prev_flushing.snapshot();
@@ -1048,6 +1106,10 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
         }
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::SnapshotMemtable,
+            phase_start.elapsed(),
+        );
 
         let total_rows: usize = partitions.iter().map(|p| p.rows.len()).sum();
         tracing::debug!(
@@ -1078,7 +1140,12 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // Step 4: Sort partitions by key (required by SSTableWriter).
+        let phase_start = Instant::now();
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::SortPartitions,
+            phase_start.elapsed(),
+        );
 
         // Step 5: Build the SSTable.
         let options = self.options.clone();
@@ -1102,6 +1169,7 @@ impl<F: FlushTarget> TableStore<F> {
         let quarantine_dir = self.flush_target.base_dir().to_path_buf();
         let mut quarantine_writer: Option<crate::quarantine::QuarantineWriter> = None;
         let mut total_quarantined = 0usize;
+        let phase_start = Instant::now();
         for p in partitions.iter_mut() {
             if p.rows.is_empty() {
                 continue;
@@ -1119,6 +1187,10 @@ impl<F: FlushTarget> TableStore<F> {
         }
         // Drop partitions that lost all their rows to quarantine.
         partitions.retain(|p| !p.rows.is_empty() || p.static_row.is_some());
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::ValidateRows,
+            phase_start.elapsed(),
+        );
 
         if total_quarantined > 0 {
             tracing::error!(
@@ -1131,12 +1203,64 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let header = flush::build_serialization_header(&schema, &partitions);
-        let mut writer = SSTableWriter::new(options, header);
+        let staged_output = self.flush_target.file_output_staging_dir()?;
+        let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw"))?
+        } else {
+            SSTableWriter::new(options, header)
+        };
+        let phase_start = Instant::now();
         for p in &partitions {
             writer.add_partition(p)?;
         }
-        let output = writer.finish()?;
-        let reader = self.flush_target.flush(output)?;
+        let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
+            let output = writer.finish_to_directory(staging_dir)?;
+            let output_bytes = output.total_size_bytes();
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::EncodeSstable,
+                phase_start.elapsed(),
+            );
+            let phase_start = Instant::now();
+            let reader = self.flush_target.flush_files(output)?;
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::LocalWriteSstable,
+                phase_start.elapsed(),
+            );
+            (reader, output_bytes)
+        } else {
+            let output = writer.finish()?;
+            let output_bytes = output.data.len()
+                + output.partitions.len()
+                + output.rows.len()
+                + output.filter.len()
+                + output.statistics.len()
+                + output.toc.len()
+                + output
+                    .compression_info
+                    .as_ref()
+                    .map(|ci| ci.len())
+                    .unwrap_or(0);
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::EncodeSstable,
+                phase_start.elapsed(),
+            );
+            let phase_start = Instant::now();
+            let reader = self.flush_target.flush(output)?;
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::LocalWriteSstable,
+                phase_start.elapsed(),
+            );
+            (reader, output_bytes as u64)
+        };
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::Total,
+            total_start.elapsed(),
+        );
+        crate::metrics::observe_flush_output(
+            output_bytes,
+            total_rows as u64,
+            partitions.len() as u64,
+        );
         let new_reader = Arc::new(reader);
 
         // Step 5b: Build sidecar readers from the old memtable indexes and
@@ -1505,7 +1629,7 @@ impl<F: FlushTarget> TableStore<F> {
         let wanted_owned = wanted;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
-        tokio::task::spawn_blocking(move || {
+        TaskPool::current("table-store-stream").spawn_blocking(move || {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
@@ -1587,7 +1711,7 @@ impl<F: FlushTarget> TableStore<F> {
         let end_owned = end.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
-        tokio::task::spawn_blocking(move || {
+        TaskPool::current("table-store-stream").spawn_blocking(move || {
             // Build source iterators — these borrow from `view`
             // (memtable Arcs and per-SSTable Arcs) which the closure
             // owns for the task's full lifetime, so there is no
@@ -2441,13 +2565,20 @@ impl<F: FlushTarget> TableStore<F> {
         let mut seen = std::collections::HashSet::new();
         positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
 
-        // 5. Fetch actual partitions by partition key
+        // 5. Fetch actual rows by base-table key. Secondary-index entries carry
+        // the clustering key, so wide clustered tables must not materialize the
+        // whole partition for every index hit.
         let mut partitions = Vec::new();
         for pos in &positions {
             let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
                 pos.partition_key.clone(),
             ));
-            if let Ok(Some(partition)) = self.read(&dk) {
+            let read = if pos.clustering_key.is_empty() {
+                self.read(&dk)
+            } else {
+                self.read_clustering_row(&dk, &pos.clustering_key)
+            };
+            if let Ok(Some(partition)) = read {
                 partitions.push(partition);
             }
         }
@@ -2952,18 +3083,6 @@ impl<F: FlushTarget> TableStore<F> {
             .take(synced_len)
             .enumerate()
             .filter_map(|(i, sst)| {
-                let header = sst.header();
-
-                // WP-001: compute size from SSTable component buffers
-                let size_bytes = sst.total_size();
-
-                // WP-002: compute tokens from the smallest/largest raw key
-                // bytes stored in the partition index. SSTables are sorted
-                // by token, so first key = min token, last key = max token.
-                use ferrosa_common::Token;
-                let min_token = Token::from_key(sst.smallest_key_bytes()).0;
-                let max_token = Token::from_key(sst.largest_key_bytes()).0;
-
                 // Safe to index: i < synced_len <= sstable_ids.len().
                 let (id, path) = &guard.sstable_ids[i];
                 let sstable_path = if path.as_os_str().is_empty() {
@@ -2972,29 +3091,47 @@ impl<F: FlushTarget> TableStore<F> {
                     path.clone()
                 };
 
-                if !path.as_os_str().is_empty()
-                    && !sstable_has_required_compaction_components(&sstable_path, id)
-                {
-                    tracing::warn!(
-                        sstable_id = %id,
-                        table_dir = ?sstable_path,
-                        "compaction planning: skipping SSTable because required on-disk \
-                         component files are missing or empty; live readers remain loaded, \
-                         but this SSTable cannot be used as a compaction input"
-                    );
-                    return None;
-                }
-                if !sstable_data_stream_is_token_monotonic(sst.as_ref()) {
-                    tracing::warn!(
-                        sstable_id = %id,
-                        table_dir = ?sstable_path,
-                        "compaction planning: skipping SSTable because sequential Data.db \
-                         partition order is not token-monotonic; live readers remain loaded, \
-                         but this SSTable requires explicit repair or quarantine before it can \
-                         be compacted"
-                    );
-                    return None;
-                }
+                let size_bytes = if path.as_os_str().is_empty() {
+                    sst.total_size()
+                } else {
+                    match sstable_compaction_component_size(&sstable_path, id) {
+                        Some(size_bytes) => size_bytes,
+                        None if sstable_compaction_remote_component_available(&sstable_path, id) => {
+                            tracing::warn!(
+                                sstable_id = %id,
+                                table_dir = ?sstable_path,
+                                size_bytes = sst.total_size(),
+                                "compaction planning: SSTable local components are missing or empty; \
+                                 using live-reader size and allowing compaction execution to rehydrate \
+                                 inputs from object storage"
+                            );
+                            sst.total_size()
+                        }
+                        None => {
+                            tracing::warn!(
+                                sstable_id = %id,
+                                table_dir = ?sstable_path,
+                                "compaction planning: skipping SSTable because required on-disk \
+                                 component files are missing or empty and no remote component \
+                                 length hook confirmed object-storage availability"
+                            );
+                            return None;
+                        }
+                    }
+                };
+
+                let header = sst.header();
+
+                // WP-002: compute tokens from the smallest/largest index
+                // bounds. New SSTables store byte-comparable decorated keys
+                // here; older fixtures stored raw partition-key bytes.
+                use ferrosa_common::Token;
+                let min_token = ferrosa_sstable::byte_comparable::decode(sst.smallest_key_bytes())
+                    .map(|key| key.token.0)
+                    .unwrap_or_else(|_| Token::from_key(sst.smallest_key_bytes()).0);
+                let max_token = ferrosa_sstable::byte_comparable::decode(sst.largest_key_bytes())
+                    .map(|key| key.token.0)
+                    .unwrap_or_else(|_| Token::from_key(sst.largest_key_bytes()).0);
 
                 Some(crate::compaction::metadata::SSTableMetadata {
                     id: id.clone(),
@@ -3011,7 +3148,8 @@ impl<F: FlushTarget> TableStore<F> {
     }
 }
 
-fn sstable_has_required_compaction_components(table_dir: &std::path::Path, id: &str) -> bool {
+fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> Option<u64> {
+    let mut total = 0u64;
     for suffix in [
         "Data.db",
         "Partitions.db",
@@ -3021,36 +3159,22 @@ fn sstable_has_required_compaction_components(table_dir: &std::path::Path, id: &
         "TOC.txt",
     ] {
         let path = table_dir.join(format!("{id}-{suffix}"));
-        let Ok(meta) = std::fs::metadata(&path) else {
-            return false;
-        };
+        let meta = std::fs::metadata(&path).ok()?;
         if matches!(suffix, "Data.db" | "Partitions.db" | "Statistics.db") && meta.len() == 0 {
-            return false;
+            return None;
         }
+        total = total.saturating_add(meta.len());
     }
-    true
+    let compression_info = table_dir.join(format!("{id}-CompressionInfo.db"));
+    if let Ok(meta) = std::fs::metadata(compression_info) {
+        total = total.saturating_add(meta.len());
+    }
+    Some(total)
 }
 
-fn sstable_data_stream_is_token_monotonic<R: ReadAt + Send + Sync + 'static>(
-    sstable: &SSTableReader<R>,
-) -> bool {
-    let mut iter = match sstable.partitions_iter() {
-        Ok(iter) => iter,
-        Err(_) => return false,
-    };
-    let mut previous: Option<DecoratedKey> = None;
-    loop {
-        match iter.next_partition_metadata() {
-            Ok(Some(partition)) => {
-                if previous.as_ref().is_some_and(|prev| partition.key < *prev) {
-                    return false;
-                }
-                previous = Some(partition.key);
-            }
-            Ok(None) => return true,
-            Err(_) => return false,
-        }
-    }
+fn sstable_compaction_remote_component_available(table_dir: &std::path::Path, id: &str) -> bool {
+    let data_path = table_dir.join(format!("{id}-Data.db"));
+    matches!(ferrosa_sstable::io::remote_file_len(data_path), Ok(Some(len)) if len > 0)
 }
 
 fn time_series_row_timestamp(
@@ -4276,6 +4400,30 @@ mod tests {
     }
 
     #[test]
+    fn read_limited_rows_from_memtable_returns_prefix() {
+        let store = test_store();
+        let key = make_key("wide-memtable");
+
+        for ck in 0..100i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("mem-{ck}").as_bytes(), 1000 + ck as i64),
+                )
+                .unwrap();
+        }
+
+        let partition = store
+            .read_limited_rows(&key, 10)
+            .unwrap()
+            .expect("partition should exist");
+
+        assert_eq!(partition.rows.len(), 10);
+        assert_eq!(partition.rows[0].clustering, 0i32.to_be_bytes());
+        assert_eq!(partition.rows[9].clustering, 9i32.to_be_bytes());
+    }
+
+    #[test]
     fn exact_clustering_row_read_returns_only_matching_row_across_sources() {
         let store = test_store();
         let key = make_key("wide");
@@ -4974,7 +5122,7 @@ mod tests {
     }
 
     #[test]
-    fn sstable_metadata_skips_entries_with_out_of_order_data_streams() {
+    fn sstable_metadata_does_not_scan_data_stream_order() {
         let tmp = tempfile::tempdir().unwrap();
         let store = file_backed_test_store(tmp.path());
         let schema = test_schema();
@@ -5004,9 +5152,11 @@ mod tests {
 
         let metadata = store.sstable_metadata(tmp.path());
 
-        assert!(
-            metadata.is_empty(),
-            "compaction planning must not select SSTable {gen} when sequential Data.db order is not token-monotonic"
+        assert_eq!(
+            metadata.len(),
+            1,
+            "compaction planning must remain a lightweight metadata pass for SSTable {gen}; \
+             Data.db order validation belongs in executor/repair paths"
         );
     }
 

@@ -21,6 +21,7 @@ use crate::ast::Statement;
 use crate::router::{RequestContext, RouteResult, SharedState};
 use crate::types::CqlValue;
 
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_schema::AuthContext;
 
 /// A frame pushed from a subscription task to the connection writer.
@@ -186,8 +187,9 @@ pub fn spawn_subscription_poll(
     push_tx: mpsc::Sender<SubscriptionPush>,
     cancel: CancellationToken,
     delta: bool,
+    task_pool: TaskPool,
 ) {
-    tokio::spawn(async move {
+    task_pool.spawn(async move {
         // SUBSCRIBE no longer sets allow_filtering — queries must use
         // partition keys or indexes, consistent with the ALLOW FILTERING
         // rejection policy.
@@ -344,6 +346,7 @@ mod tests {
             segment_size: 4096,
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
             archive: None,
@@ -354,6 +357,7 @@ mod tests {
             compaction,
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -455,6 +459,7 @@ mod tests {
             tx,
             cancel,
             false, // delta=false: full delivery (regression guard)
+            TaskPool::current("test-subscription"),
         );
 
         // Wait up to 2 seconds for a frame to arrive.
@@ -496,6 +501,7 @@ mod tests {
             tx,
             cancel.clone(),
             false, // delta=false: full delivery
+            TaskPool::current("test-subscription"),
         );
 
         // Receive at least one frame to confirm the task is running.
@@ -536,6 +542,7 @@ mod tests {
             tx,
             cancel,
             false, // delta=false: full delivery
+            TaskPool::current("test-subscription"),
         );
 
         // Drop the receiver — next send will fail and the task should exit.
@@ -856,6 +863,7 @@ mod tests {
             tx,
             cancel.clone(),
             true, // delta=true: row-level diff
+            TaskPool::current("test-subscription"),
         );
 
         // ── Tick 1: all 10 rows must be delivered ─────────────────────────
@@ -942,6 +950,7 @@ mod tests {
             tx,
             cancel.clone(),
             false, // delta=false: full delivery on every tick
+            TaskPool::current("test-subscription"),
         );
 
         // First tick.

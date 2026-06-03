@@ -108,6 +108,20 @@ fn parse_segment_number(name: &str) -> Option<u32> {
     num_str.parse().ok()
 }
 
+fn encoded_hint_size(record: &HintRecord) -> u64 {
+    // 4 (length prefix) + 8 (ts) + 2+ks + 2+tbl + 4+key + 4+row + 4 (crc)
+    (4 + 8
+        + 2
+        + record.keyspace.len()
+        + 2
+        + record.table.len()
+        + 4
+        + record.key.len()
+        + 4
+        + record.row.len()
+        + 4) as u64
+}
+
 // ---------------------------------------------------------------------------
 // HintStore
 // ---------------------------------------------------------------------------
@@ -172,8 +186,10 @@ impl HintStore {
     // store
     // -----------------------------------------------------------------------
 
-    /// Append a hint for `peer_id`.  Rolls over the segment when full and
-    /// evicts oldest segments when the per-peer byte cap is exceeded.
+    /// Append a hint for `peer_id`. Rolls over the segment when full. When the
+    /// per-peer byte budget would be exceeded, rejects before appending so the
+    /// coordinator can apply client-visible backpressure instead of losing
+    /// hint data.
     pub fn store(
         &self,
         peer_id: Uuid,
@@ -190,9 +206,17 @@ impl HintStore {
             key,
             row,
         };
+        let encoded_size = encoded_hint_size(&record);
 
         let mut peers = self.peers.lock().unwrap();
         let state = peers.entry(peer_id).or_insert_with(PeerHintState::new);
+        let cap_bytes = self.config.max_per_peer_mb.saturating_mul(1024 * 1024);
+        if cap_bytes > 0 && state.total_bytes.saturating_add(encoded_size) > cap_bytes {
+            return Err(ClusterError::Overloaded(format!(
+                "hint budget exceeded for peer {peer_id}: current={} incoming={} cap={}",
+                state.total_bytes, encoded_size, cap_bytes
+            )));
+        }
 
         // Ensure the peer directory exists.
         let pdir = peer_dir(&self.config.dir, peer_id);
@@ -238,70 +262,9 @@ impl HintStore {
             state.writer = Some(new_writer);
         }
 
-        // Estimate the encoded size for bookkeeping.
-        // 4 (length prefix) + 8 (ts) + 2+ks + 2+tbl + 4+key + 4+row + 4 (crc)
-        let encoded_size = (4
-            + 8
-            + 2
-            + record.keyspace.len()
-            + 2
-            + record.table.len()
-            + 4
-            + record.key.len()
-            + 4
-            + record.row.len()
-            + 4) as u64;
         state.total_bytes += encoded_size;
         state.record_count += 1;
 
-        // Check eviction.
-        let cap_bytes = self.config.max_per_peer_mb * 1024 * 1024;
-        if state.total_bytes > cap_bytes {
-            self.evict_oldest(peer_id, state, cap_bytes)?;
-        }
-
-        Ok(())
-    }
-
-    /// Delete oldest segments until we are below the byte cap.
-    /// Sets `needs_repair = true`.
-    fn evict_oldest(&self, peer_id: Uuid, state: &mut PeerHintState, cap_bytes: u64) -> Result<()> {
-        let pdir = peer_dir(&self.config.dir, peer_id);
-        let mut segments = scan_segments(&pdir).map_err(|e| {
-            ClusterError::Internal(format!("hints: scan failed during eviction: {e}"))
-        })?;
-
-        // Sort ascending (oldest first).
-        segments.sort_by_key(|(n, _)| *n);
-
-        // Skip the segment currently being written.
-        let current_seg = state.segment_counter;
-
-        for (n, path) in &segments {
-            if state.total_bytes <= cap_bytes {
-                break;
-            }
-            // Don't delete the segment we're currently writing to.
-            if *n == current_seg {
-                continue;
-            }
-            if let Ok(meta) = fs::metadata(path) {
-                let file_size = meta.len();
-                if let Err(e) = fs::remove_file(path) {
-                    tracing::warn!("hints: failed to delete segment {:?}: {e}", path);
-                } else {
-                    state.total_bytes = state.total_bytes.saturating_sub(file_size);
-                    tracing::error!(
-                        peer = %peer_id,
-                        "HINT DATA LOSS: evicted segment {} — mutations in this segment \
-                         will never be delivered. Anti-entropy repair required.",
-                        n
-                    );
-                }
-            }
-        }
-
-        state.needs_repair = true;
         Ok(())
     }
 
@@ -595,29 +558,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 5. Eviction: exceed cap, verify eviction + needs_repair flag
+    // 5. Budget: exceed cap, verify fail-safe rejection without data loss
     // -----------------------------------------------------------------------
     #[test]
-    fn eviction_deletes_oldest_and_sets_needs_repair() {
+    fn budget_exceeded_rejects_without_eviction() {
         let dir = TempDir::new().unwrap();
         let peer = Uuid::new_v4();
 
-        // Very small cap: 1 MB max, 1 MB segment size.
-        // We'll write enough data to exceed the cap.
-        // Each hint ≈ ~100 bytes.  1 MB cap → ~10000 hints would exceed it,
-        // but let's use a smaller cap in bytes by setting max_per_peer_mb=0.
-        // Instead we use a tiny cap of 1 KB by manipulating the multiplier.
-        // The config is in MB, so set max_per_peer_mb=1 and write > 1 MB of data.
-        // Easier: set max = 1 (MB) but write rows of size 512 KB each.
-
-        // Use segment_size_mb=1 and max_per_peer_mb=1.
-        // Write rows of ~512 KB so that 3 of them exceed the 1 MB cap.
         let store = HintStore::new(make_config(&dir, 1, 1)).unwrap();
+        let big_row = vec![0u8; 500 * 1024]; // 500 KB
 
-        let big_row = vec![0u8; 512 * 1024]; // 512 KB
-
-        // Store 3 hints, each ~512 KB row.  After the third, total > 1 MB.
-        for i in 0..3u64 {
+        for i in 0..2u64 {
             store
                 .store(
                     peer,
@@ -630,30 +581,17 @@ mod tests {
                 .unwrap();
         }
 
+        let err = store
+            .store(peer, "ks", "tbl", b"key_2".to_vec(), big_row, 2)
+            .unwrap_err();
+        assert!(matches!(err, ClusterError::Overloaded(_)));
         assert!(
-            store.needs_repair(peer),
-            "needs_repair must be set after eviction"
+            !store.needs_repair(peer),
+            "budget rejection must not create hint data loss"
         );
 
-        // At least one segment file should have been deleted.
-        let pdir = peer_dir(&store.config.dir, peer);
-        let remaining = scan_segments(&pdir).unwrap();
-        // We had segments 0 and possibly 1; oldest (0) should have been evicted.
-        // The current segment (being written) is never evicted.
-        // With 3 hints of 512 KB each:
-        //   - hints 0..1 may fit in segment 0
-        //   - remaining go to segment 1
-        // After eviction, segment 0 (oldest) should be gone.
-        let pdir_entries: Vec<_> = remaining.iter().map(|(n, _)| *n).collect();
-        if pdir_entries.len() > 1 {
-            // If multiple segments remain, the lowest-numbered one should NOT be 0
-            // (i.e. segment 0 was evicted).
-            assert!(
-                !pdir_entries.contains(&0),
-                "oldest segment should have been evicted; remaining: {:?}",
-                pdir_entries
-            );
-        }
-        // If only one segment remains, that's the current one being written — also fine.
+        let drain = store.drain(peer).unwrap();
+        let records: Vec<_> = drain.collect();
+        assert_eq!(records.len(), 2, "accepted hints must remain readable");
     }
 }

@@ -22,6 +22,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -64,11 +65,16 @@ impl PendingUploadsLog {
     /// after this call returns — a fundamental requirement for closing the
     /// manifest-before-S3 crash window.
     pub fn add_entry(&self, table_id: &str, sstable_id: &str) -> std::io::Result<()> {
+        let start = Instant::now();
         let encoded = format!("{}\t{}\n", url_encode(table_id), url_encode(sstable_id),);
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
         file.write_all(encoded.as_bytes())?;
         file.flush()?;
         file.sync_all()?;
+        crate::metrics::observe_upload_phase(
+            crate::metrics::UploadPhase::PendingLogAdd,
+            start.elapsed(),
+        );
         Ok(())
     }
 
@@ -83,6 +89,7 @@ impl PendingUploadsLog {
         sstable_id: &str,
         compaction: PendingCompactionUpload,
     ) -> std::io::Result<()> {
+        let start = Instant::now();
         let payload = serde_json::to_string(&compaction).map_err(std::io::Error::other)?;
         let encoded = format!(
             "{}\t{}\t{}\n",
@@ -94,6 +101,10 @@ impl PendingUploadsLog {
         file.write_all(encoded.as_bytes())?;
         file.flush()?;
         file.sync_all()?;
+        crate::metrics::observe_upload_phase(
+            crate::metrics::UploadPhase::PendingLogCompactionAdd,
+            start.elapsed(),
+        );
         Ok(())
     }
 
@@ -103,6 +114,7 @@ impl PendingUploadsLog {
     /// the list is short (at most a few hundred entries) and this is called
     /// only after S3 confirms an upload.
     pub fn remove_entry(&self, table_id: &str, sstable_id: &str) -> std::io::Result<()> {
+        let start = Instant::now();
         let entries = self.pending_entries()?;
         let encoded_table_id = url_encode(table_id);
         let encoded_id = url_encode(sstable_id);
@@ -118,6 +130,10 @@ impl PendingUploadsLog {
         }
         file.flush()?;
         file.sync_all()?;
+        crate::metrics::observe_upload_phase(
+            crate::metrics::UploadPhase::PendingLogRemove,
+            start.elapsed(),
+        );
         Ok(())
     }
 

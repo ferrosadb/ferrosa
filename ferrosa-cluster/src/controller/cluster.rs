@@ -569,7 +569,15 @@ impl ModeController {
                 let raft_rt = raft_rt_for_connect.clone();
                 let data_rt = data_rt_for_connect.clone();
                 self.spawn_tracked(async move {
-                    match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string(), raft_rt.as_deref(), data_rt.as_deref()).await {
+                    match PriorityPool::connect(
+                        cfg,
+                        local_id,
+                        &reverse_addr.to_string(),
+                        raft_rt,
+                        data_rt,
+                    )
+                    .await
+                    {
                         Ok(pool) => {
                             pm.add_peer((uuid, reverse_addr), pool).await;
                             tracing::info!(%uuid, %reverse_addr, "cluster: reverse connection established");
@@ -799,14 +807,17 @@ impl ModeController {
         // ALTER KEYSPACE to increase RF.
         let initial_rf = 1;
         let initial_cl = ConsistencyLevel::One;
-        let coordinator = Arc::new(ClusterCoordinator::new(
-            ring_arc.clone(),
-            peer_manager,
-            local_node_id,
-            self.storage.clone(),
-            initial_rf,
-            initial_cl,
-        ));
+        let coordinator = Arc::new(
+            ClusterCoordinator::new(
+                ring_arc.clone(),
+                peer_manager,
+                local_node_id,
+                self.storage.clone(),
+                initial_rf,
+                initial_cl,
+            )
+            .with_hint_store(self.hint_store.clone()),
+        );
 
         let repair_metrics_for_handler = coordinator.repair_metrics.clone();
         // Capture handles for the ADR-020 streaming-handler registration
@@ -1092,16 +1103,61 @@ impl ModeController {
             self.registry.register(MsgType::BootstrapComplete, handler);
         }
 
-        // Spawn periodic maintenance loop for memory-bounded data structures.
-        // Runs every 60s and prunes applied Accord transactions, expired
-        // DepWaitGraph entries, and logs memory usage for leak detection.
+        // Spawn periodic maintenance loop for memory-bounded data structures
+        // and storage drain work requested by foreground writes.
         {
             let storage = self.storage.clone();
             let accord_state = accord_state_for_maintenance;
             self.spawn_tracked(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                let urgent_flush_interval_millis =
+                    std::env::var("FERROSA_URGENT_FLUSH_INTERVAL_MILLIS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(100u64)
+                        .max(1);
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                    urgent_flush_interval_millis,
+                ));
+                let mut ticks = 0u64;
                 loop {
                     interval.tick().await;
+                    ticks = ticks.wrapping_add(1);
+
+                    if storage.take_flush_request() {
+                        let storage_for_flush = storage.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            storage_for_flush.flush_if_needed()
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!(
+                                %e,
+                                "maintenance: requested storage flush failed"
+                            ),
+                            Err(e) => tracing::warn!(
+                                %e,
+                                "maintenance: requested storage flush task failed"
+                            ),
+                        }
+                    }
+
+                    if storage.take_s3_sync_request() {
+                        match storage.sync_sstables_to_s3().await {
+                            Ok(uploaded) => {
+                                if uploaded > 0 {
+                                    tracing::info!(
+                                        uploaded,
+                                        "maintenance: uploaded queued SSTables to S3"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                %e,
+                                "maintenance: requested S3 SSTable sync failed"
+                            ),
+                        }
+                    }
 
                     // Log closed-segment buffer memory (P0 OOM regression detector).
                     let closed_buf_bytes = storage.closed_segment_buffer_bytes();
@@ -1112,25 +1168,31 @@ impl ModeController {
                         );
                     }
 
-                    // Prune applied Accord transactions to prevent unbounded
-                    // memory growth in txn_states and committed_txns.
-                    let pruned = {
-                        let mut sm = accord_state.lock();
-                        sm.prune_applied()
-                    };
-                    if pruned > 0 {
-                        tracing::info!(pruned, "maintenance: pruned applied Accord transactions");
-                    }
+                    let prune_ticks = (60_000u64 / urgent_flush_interval_millis).max(1);
+                    if ticks.is_multiple_of(prune_ticks) {
+                        // Prune applied Accord transactions to prevent unbounded
+                        // memory growth in txn_states and committed_txns.
+                        let pruned = {
+                            let mut sm = accord_state.lock();
+                            sm.prune_applied()
+                        };
+                        if pruned > 0 {
+                            tracing::info!(
+                                pruned,
+                                "maintenance: pruned applied Accord transactions"
+                            );
+                        }
 
-                    // Log table-level memory stats.
-                    let table_count = storage.table_count();
-                    let accord_txns = accord_state.lock().txn_count();
-                    tracing::info!(
-                        table_count,
-                        closed_buf_bytes,
-                        accord_txns,
-                        "maintenance: periodic memory check"
-                    );
+                        // Log table-level memory stats.
+                        let table_count = storage.table_count();
+                        let accord_txns = accord_state.lock().txn_count();
+                        tracing::info!(
+                            table_count,
+                            closed_buf_bytes,
+                            accord_txns,
+                            "maintenance: periodic memory check"
+                        );
+                    }
                 }
             });
         }
@@ -1399,7 +1461,7 @@ impl ModeController {
                 let guard_raft = raft_arc.clone();
                 let guard_cancel = election_guard_cancel.clone();
                 let guard_timeout_min = raft_election_min_ms;
-                tokio::spawn(async move {
+                ferrosa_net::task_pool::TaskPool::current("raft-election-guard").spawn(async move {
                     run_election_guard(guard_raft, guard_cancel, guard_timeout_min).await;
                 });
             }
@@ -1416,7 +1478,7 @@ impl ModeController {
                 use crate::raft::snapshot_pusher::run_snapshot_pusher;
                 let pusher_raft = raft_arc.clone();
                 let pusher_cancel = election_guard_cancel.clone();
-                tokio::spawn(async move {
+                ferrosa_net::task_pool::TaskPool::current("raft-snapshot-pusher").spawn(async move {
                     run_snapshot_pusher(
                         pusher_raft,
                         pusher_cancel,
@@ -1515,7 +1577,7 @@ impl ModeController {
                         );
                         let desired_raft_members = build_raft_members_from_node_info(&refresh_plan);
                         let raft_for_membership_repair = raft_arc.clone();
-                        tokio::spawn(async move {
+                        ferrosa_net::task_pool::TaskPool::current("raft-membership-repair").spawn(async move {
                             let mut interval =
                                 tokio::time::interval(std::time::Duration::from_secs(2));
                             let mut clean_observations = 0u8;
@@ -2199,7 +2261,7 @@ impl ModeController {
                         let rejoin_cql_broadcast = local_cql_broadcast_for_refresh.clone();
                         let rejoin_peers = peers.clone();
                         let rejoin_pm = peer_manager_for_bootstrap.clone();
-                        tokio::spawn(async move {
+                        ferrosa_net::task_pool::TaskPool::current("cluster-rejoin").spawn(async move {
                             tracing::info!(
                                 self_id = %rejoin_self_id,
                                 peer_count = rejoin_peers.len(),
@@ -2361,15 +2423,21 @@ impl RpcHandler for ClusterInviteHandler {
         // completion before re-broadcasting (replaces raw tokio::spawn +
         // fixed 500ms sleep).
         let mut connect_tasks = tokio::task::JoinSet::new();
+        let raft_rt_for_connect = self.peer_manager.raft_runtime();
+        let data_rt_for_connect = self.peer_manager.data_runtime();
         for (peer_id, reverse_addr) in &new_peers {
             let pm = self.peer_manager.clone();
             let cfg = self.net_config.clone();
             let local_id = self.local_host_id;
             let uuid = *peer_id;
             let addr = *reverse_addr;
+            let raft_rt = raft_rt_for_connect.clone();
+            let data_rt = data_rt_for_connect.clone();
 
             connect_tasks.spawn(async move {
-                match PriorityPool::connect(cfg, local_id, &addr.to_string(), None, None).await {
+                match PriorityPool::connect(cfg, local_id, &addr.to_string(), raft_rt, data_rt)
+                    .await
+                {
                     Ok(pool) => {
                         pm.add_peer((uuid, addr), pool).await;
                         tracing::info!(

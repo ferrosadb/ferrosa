@@ -37,6 +37,7 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
             segment_size: 4096,
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.join("commitlog"),
             checkpoint_dir: dir.join("commitlog"),
             archive: None,
@@ -44,6 +45,7 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
         compaction: CompactionConfig::from_env(dir.join("compaction")),
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
+        local_disk_free_reserve_bytes: 0,
         flush_threshold_bytes: 64 * 1024, // 64KB to avoid auto-flush
         memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 300, // 5min — don't trigger age-based flush in this test

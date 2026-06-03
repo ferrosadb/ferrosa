@@ -195,6 +195,10 @@ fn main() {
         allow_http: true,
         prefix: format!("loadgen-{}", uuid::Uuid::new_v4()),
         upload_queue_depth: 16,
+        upload_workers: 8,
+        compaction_upload_workers: 4,
+        compaction_upload_queue_depth: 16,
+        delete_workers: 2,
     });
 
     let config = StorageEngineConfig {
@@ -207,10 +211,12 @@ fn main() {
             log_dir: args.data_dir.join("commitlog"),
             checkpoint_dir: args.data_dir.join("commitlog"),
             archive: None,
+            batch: Default::default(),
         },
         compaction: CompactionConfig::from_env(args.data_dir.join("compaction")),
         object_store,
         local_cache_max_bytes: profile.local_cache_max_bytes,
+        local_disk_free_reserve_bytes: 0,
         flush_threshold_bytes: profile.flush_threshold_bytes,
         memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 30,

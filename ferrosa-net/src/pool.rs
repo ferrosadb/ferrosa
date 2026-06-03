@@ -10,12 +10,13 @@ use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::error::Result;
 use crate::lane_actor::{
-    spawn_lane_actor_with_timeout, spawn_raft_lane_actor_with_timeout, ActorReconnectContext,
-    LaneHandle, LaneStatusReport,
+    spawn_lane_actor_on_pool_with_timeout, spawn_raft_lane_actor_with_timeout,
+    ActorReconnectContext, LaneHandle, LaneStatusReport,
 };
 use crate::message::Message;
 use crate::reconnect::LaneState;
 use crate::rpc::client::RpcClient;
+use crate::task_pool::TaskPool;
 
 /// Outcome of checking all lane states in a [`PriorityPool`].
 #[derive(Debug, PartialEq, Eq)]
@@ -66,19 +67,33 @@ impl PriorityPool {
         local_host_id: Uuid,
         peer_addr: SocketAddr,
         tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
-        runtime: Option<&tokio::runtime::Runtime>,
+        task_pool: TaskPool,
     ) -> Result<RpcClient> {
-        if let Some(rt) = runtime {
+        if let Some(rt) = task_pool.runtime_ref() {
             let cfg = config;
             let tls = tls_connector;
+            let task_pool_for_client = task_pool.clone();
             rt.spawn(async move {
-                RpcClient::connect_with_tls(cfg, local_host_id, peer_addr, tls.as_deref()).await
+                RpcClient::connect_with_tls_on_pool(
+                    cfg,
+                    local_host_id,
+                    peer_addr,
+                    tls.as_deref(),
+                    task_pool_for_client,
+                )
+                .await
             })
             .await
             .map_err(|e| NetError::Protocol(format!("runtime join error: {e}")))?
         } else {
-            RpcClient::connect_with_tls(config, local_host_id, peer_addr, tls_connector.as_deref())
-                .await
+            RpcClient::connect_with_tls_on_pool(
+                config,
+                local_host_id,
+                peer_addr,
+                tls_connector.as_deref(),
+                task_pool,
+            )
+            .await
         }
     }
 
@@ -91,8 +106,8 @@ impl PriorityPool {
         config: Arc<NetConfig>,
         local_host_id: Uuid,
         peer_host: &str,
-        raft_runtime: Option<&tokio::runtime::Runtime>,
-        data_runtime: Option<&tokio::runtime::Runtime>,
+        raft_runtime: Option<Arc<tokio::runtime::Runtime>>,
+        data_runtime: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Result<Self> {
         let peer_addr: SocketAddr = tokio::net::lookup_host(peer_host)
             .await
@@ -101,13 +116,16 @@ impl PriorityPool {
             .ok_or_else(|| NetError::Protocol(format!("no address resolved for {peer_host}")))?;
 
         let tls_connector = crate::tls::build_tls_connector(&config)?.map(Arc::new);
+        let raft_task_pool = TaskPool::from_optional_runtime("raft-lane", raft_runtime.clone());
+        let data_task_pool = TaskPool::from_optional_runtime("data-lane", data_runtime.clone());
+        let bulk_task_pool = TaskPool::from_optional_runtime("bulk-lane", data_runtime.clone());
 
         let raft_client = Self::connect_client_on(
             Arc::clone(&config),
             local_host_id,
             peer_addr,
             tls_connector.clone(),
-            raft_runtime,
+            raft_task_pool.clone(),
         )
         .await?;
         let data_client = Self::connect_client_on(
@@ -115,7 +133,7 @@ impl PriorityPool {
             local_host_id,
             peer_addr,
             tls_connector.clone(),
-            data_runtime,
+            data_task_pool.clone(),
         )
         .await?;
         let bulk_client = Self::connect_client_on(
@@ -123,7 +141,7 @@ impl PriorityPool {
             local_host_id,
             peer_addr,
             tls_connector.clone(),
-            data_runtime,
+            bulk_task_pool.clone(),
         )
         .await?;
 
@@ -138,6 +156,7 @@ impl PriorityPool {
         let raft_config = Arc::clone(&config);
         let raft_peer_host = peer_host.clone();
         let raft_tls = tls_connector.clone();
+        let raft_task_pool_for_ctx = raft_task_pool.clone();
         let raft = spawn_raft_lane_actor_with_timeout(
             Lane::Raft,
             LaneState::Connected(raft_client),
@@ -151,35 +170,51 @@ impl PriorityPool {
                 tls_connector: raft_tls,
                 cancelled: h.cancel_token(),
                 handle: h,
+                task_pool: raft_task_pool_for_ctx,
             },
         );
-        let data = spawn_lane_actor_with_timeout(
+        let data_config = Arc::clone(&config);
+        let data_peer_host = peer_host.clone();
+        let data_tls = tls_connector.clone();
+        let data_task_pool_for_ctx = data_task_pool.clone();
+        let data_ctx = move |h: LaneHandle| ActorReconnectContext {
+            lane: Lane::Data,
+            config: data_config,
+            local_host_id,
+            peer_host: data_peer_host,
+            tls_connector: data_tls,
+            cancelled: h.cancel_token(),
+            handle: h,
+            task_pool: data_task_pool_for_ctx,
+        };
+        let data = spawn_lane_actor_on_pool_with_timeout(
             Lane::Data,
             LaneState::Connected(data_client),
             config.lane_timeout(Lane::Data),
-            |h| ActorReconnectContext {
-                lane: Lane::Data,
-                config: Arc::clone(&config),
-                local_host_id,
-                peer_host: peer_host.clone(),
-                tls_connector: tls_connector.clone(),
-                cancelled: h.cancel_token(),
-                handle: h,
-            },
+            data_task_pool,
+            data_ctx,
         );
-        let bulk = spawn_lane_actor_with_timeout(
+
+        let bulk_config = Arc::clone(&config);
+        let bulk_peer_host = peer_host;
+        let bulk_tls = tls_connector.clone();
+        let bulk_task_pool_for_ctx = bulk_task_pool.clone();
+        let bulk_ctx = move |h: LaneHandle| ActorReconnectContext {
+            lane: Lane::Bulk,
+            config: bulk_config,
+            local_host_id,
+            peer_host: bulk_peer_host,
+            tls_connector: bulk_tls,
+            cancelled: h.cancel_token(),
+            handle: h,
+            task_pool: bulk_task_pool_for_ctx,
+        };
+        let bulk = spawn_lane_actor_on_pool_with_timeout(
             Lane::Bulk,
             LaneState::Connected(bulk_client),
             config.lane_timeout(Lane::Bulk),
-            |h| ActorReconnectContext {
-                lane: Lane::Bulk,
-                config: Arc::clone(&config),
-                local_host_id,
-                peer_host,
-                tls_connector: tls_connector.clone(),
-                cancelled: h.cancel_token(),
-                handle: h,
-            },
+            bulk_task_pool,
+            bulk_ctx,
         );
 
         Ok(Self {
@@ -450,6 +485,7 @@ mod tests {
                 tls_connector: None,
                 cancelled: h.cancel_token(),
                 handle: h,
+                task_pool: TaskPool::current("test-lane"),
             },
         );
 

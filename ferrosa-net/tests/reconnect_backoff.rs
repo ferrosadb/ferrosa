@@ -10,6 +10,7 @@ use ferrosa_net::codec::Lane;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::lane_actor::{spawn_lane_actor, ActorReconnectContext, LaneStatusReport};
 use ferrosa_net::reconnect::{dormant_peer_count, total_reconnect_attempts, LaneState};
+use ferrosa_net::task_pool::TaskPool;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,7 @@ async fn dead_peer_enters_dormant_after_exhausted_reconnects() {
             tls_connector: None,
             cancelled: h.cancel_token(),
             handle: h,
+            task_pool: TaskPool::current("test-lane"),
         },
     );
 
@@ -95,6 +97,7 @@ async fn dormant_lane_rate_limits_probes() {
             tls_connector: None,
             cancelled: h.cancel_token(),
             handle: h,
+            task_pool: TaskPool::current("test-lane"),
         },
     );
 

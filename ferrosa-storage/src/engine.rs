@@ -12,12 +12,17 @@
 //! take no global lock — the commit log uses CAS, memtable is lock-free.
 //! Only flush and compaction take per-table serialized guards.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use ferrosa_common::task_pool::TaskPool;
+use futures::TryStreamExt;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 
@@ -219,17 +224,18 @@ pub struct StorageEngineConfig {
     pub compaction: CompactionConfig,
     pub object_store: Option<ObjectStoreConfig>,
     pub local_cache_max_bytes: u64,
+    /// Minimum free bytes to preserve on the local data filesystem before
+    /// admitting a new write. When the filesystem is below this reserve, writes
+    /// fail closed before appending to the commit log, so periodic fsync and
+    /// flush cleanup do not degrade into ENOSPC.
+    pub local_disk_free_reserve_bytes: u64,
     pub flush_threshold_bytes: u64,
-    /// Active memtable size at which an in-line, synchronous flush
-    /// is triggered from inside `write()` — write-path
-    /// backpressure. Distinct from `flush_threshold_bytes`, which
-    /// is the soft "schedule an async flush" trigger consulted by
-    /// the maintenance loop. The backpressure trigger is much
-    /// higher so it only fires under sustained-write pressure
-    /// (anti-entropy repair's apply phase, bulk load, PITR
-    /// restore, raft state-machine catch-up) where writes
-    /// outpace the maintenance loop's drain rate and pile up
-    /// flushing memtables in RSS faster than S3 uploads complete.
+    /// Active memtable size at which foreground writes fail closed and ask the
+    /// background maintenance loop to flush. Distinct from
+    /// `flush_threshold_bytes`, which is the soft "schedule an async flush"
+    /// trigger. The backpressure trigger is much higher so it only fires under
+    /// sustained-write pressure where writes outpace the maintenance loop's
+    /// drain rate.
     /// Default: `max(flush_threshold_bytes * 4, 64 MB)`.
     pub memtable_backpressure_bytes: u64,
     /// Maximum age (seconds) of unflushed memtable data before a time-based
@@ -301,11 +307,13 @@ impl StorageEngineConfig {
             std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into()),
         );
 
-        let commit_log = CommitLogConfig {
+        let mut commit_log = CommitLogConfig {
             log_dir: data_dir.join("commitlog"),
             checkpoint_dir: data_dir.join("commitlog"),
             ..CommitLogConfig::default()
         };
+        commit_log.batch =
+            crate::commitlog::config::CommitLogBatchConfig::from_env(commit_log.batch.clone());
 
         let compaction = CompactionConfig::from_env(data_dir.join("compaction"));
 
@@ -315,6 +323,11 @@ impl StorageEngineConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10 * 1024 * 1024 * 1024); // 10 GB default
+
+        let local_disk_free_reserve_bytes = std::env::var("FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512 * 1024 * 1024); // 512 MB default
 
         let flush_threshold_bytes: u64 = std::env::var("FERROSA_FLUSH_THRESHOLD_BYTES")
             .ok()
@@ -402,6 +415,7 @@ impl StorageEngineConfig {
             compaction,
             object_store,
             local_cache_max_bytes,
+            local_disk_free_reserve_bytes,
             flush_threshold_bytes,
             memtable_backpressure_bytes,
             flush_max_age_secs,
@@ -427,6 +441,7 @@ impl StorageEngineConfig {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,    // 1 MB
+            local_disk_free_reserve_bytes: 0,      // disabled by default in tests
             flush_threshold_bytes: 4096,           // 4 KB — triggers flush quickly in tests
             memtable_backpressure_bytes: u64::MAX, // disabled by default in tests; opt-in per test
             flush_max_age_secs: 5,                 // 5s — fast age-based flush in tests
@@ -584,6 +599,7 @@ pub struct StorageEngine {
     deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
     compaction_executor: CompactionExecutor,
     upload_manager: Option<UploadManager>,
+    compaction_upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
     observers: RwLock<Vec<Arc<dyn crate::observer::WriteObserver>>>,
     async_observers: RwLock<Vec<AsyncObserverState>>,
@@ -604,10 +620,24 @@ pub struct StorageEngine {
     pub compaction_metrics: Arc<crate::metrics::CompactionMetrics>,
     /// NVMe pin/unpin operation metrics (pinned tables, bytes, evictions).
     pub pin_metrics: Arc<crate::metrics::PinMetrics>,
+    /// Shared S3 object store client for manifest/sync/snapshot operations.
+    object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Whether the configured object store supports conditional PUT (CAS).
     /// Set by `probe_s3_cas()` at startup.  When `false`, manifest saves
     /// fall back to unconditional PUT (last-writer-wins).
     pub(crate) s3_cas_supported: std::sync::atomic::AtomicBool,
+    /// Single-flight guard for S3 SSTable sync. Periodic flush sync, schema
+    /// sync, compaction retry, and operator-triggered syncs can otherwise race
+    /// from the same manifest snapshot and re-upload the same SSTables.
+    s3_sync_running: AtomicBool,
+    /// Set when write admission observes local disk pressure. The process
+    /// maintenance loop consumes this flag to run an urgent S3 upload/eviction
+    /// pass instead of waiting for the next normal flush tick.
+    s3_sync_requested: AtomicBool,
+    /// Set when the write path observes a memtable at/near the flush threshold.
+    /// The process maintenance loop consumes this flag to run an urgent flush
+    /// outside request handling.
+    flush_requested: AtomicBool,
     /// Last observed live manifest object/byte totals per table. Updated by
     /// S3 sync/restore paths and used by sync-only metrics surfaces.
     s3_manifest_stats: RwLock<HashMap<String, (i32, i64)>>,
@@ -754,6 +784,374 @@ fn normalize_consolidation_type(type_name: &str) -> String {
 }
 
 impl StorageEngine {
+    fn block_on_rehydration<F, T>(future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return tokio::task::block_in_place(|| handle.block_on(future));
+            }
+        }
+
+        static REHYDRATION_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        REHYDRATION_RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build SSTable rehydration runtime")
+            })
+            .block_on(future)
+    }
+
+    fn parse_local_sstable_component_path(
+        data_dir: &Path,
+        path: &Path,
+    ) -> Option<(String, String, String)> {
+        let sstable_root = data_dir.join("sstables");
+        let relative = path.strip_prefix(&sstable_root).ok()?;
+        let parts: Vec<_> = relative.components().collect();
+        match parts.as_slice() {
+            [table, file] => {
+                let table_id = table.as_os_str().to_str()?.to_string();
+                let file_name = file.as_os_str().to_str()?;
+                let (sstable_id, component) = file_name.split_once('-')?;
+                Some((table_id, sstable_id.to_string(), component.to_string()))
+            }
+            [table, dir_gen, file] => {
+                let table_id = table.as_os_str().to_str()?.to_string();
+                let dir_gen = dir_gen.as_os_str().to_str()?;
+                let file_name = file.as_os_str().to_str()?;
+                let (sstable_id, component) = file_name.split_once('-')?;
+                if sstable_id == dir_gen {
+                    Some((table_id, sstable_id.to_string(), component.to_string()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn install_s3_file_read_rehydration_hook(
+        data_dir: PathBuf,
+        prefix: String,
+        store: Arc<dyn object_store::ObjectStore>,
+    ) {
+        const SSTABLE_COMPONENTS: &[&str] = &[
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+            "CompressionInfo.db",
+        ];
+
+        let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
+            Arc::new(DashMap::new());
+        {
+            let data_dir = data_dir.clone();
+            let prefix = prefix.clone();
+            let store = Arc::clone(&store);
+            ferrosa_sstable::io::register_file_read_range_hook(Arc::new(
+                move |path, offset, len| {
+                    let Some((table_id, sstable_id, component)) =
+                        Self::parse_local_sstable_component_path(&data_dir, path)
+                    else {
+                        return Ok(None);
+                    };
+                    if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
+                        return Ok(None);
+                    }
+                    if len == 0 {
+                        return Ok(Some(Vec::new()));
+                    }
+
+                    let start = usize::try_from(offset).map_err(|_| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "SSTable range read offset exceeds usize: {}",
+                            offset
+                        ))
+                    })?;
+                    let end = start.checked_add(len).ok_or_else(|| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "SSTable range read overflow: offset={} len={}",
+                            offset, len
+                        ))
+                    })?;
+                    let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
+                    let s3_path = crate::upload::manager::sstable_object_key(
+                        &prefix,
+                        &hex,
+                        &table_id,
+                        &sstable_id,
+                        &component,
+                    );
+                    let store = Arc::clone(&store);
+                    let result = Self::block_on_rehydration(async move {
+                        match store.get_range(&s3_path, start..end).await {
+                            Ok(bytes) => Ok(Some(bytes.to_vec())),
+                            Err(object_store::Error::NotFound { .. }) => Ok(None),
+                            Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                                "failed ranged SSTable component read {s3_path}: {e}"
+                            ))),
+                        }
+                    })?;
+                    if result.is_some() {
+                        tracing::debug!(
+                            local_path = %path.display(),
+                            table = table_id,
+                            sstable = sstable_id,
+                            component,
+                            offset,
+                            len,
+                            "served evicted SSTable component range from object storage"
+                        );
+                    }
+                    Ok(result)
+                },
+            ));
+        }
+        {
+            let data_dir = data_dir.clone();
+            let prefix = prefix.clone();
+            let store = Arc::clone(&store);
+            ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
+                let Some((table_id, sstable_id, component)) =
+                    Self::parse_local_sstable_component_path(&data_dir, path)
+                else {
+                    return Ok(None);
+                };
+                if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
+                    return Ok(None);
+                }
+                let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
+                let s3_path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id,
+                    &sstable_id,
+                    &component,
+                );
+                let store = Arc::clone(&store);
+                Self::block_on_rehydration(async move {
+                    match store.head(&s3_path).await {
+                        Ok(meta) => Ok(Some(meta.size as u64)),
+                        Err(object_store::Error::NotFound { .. }) => Ok(None),
+                        Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "failed SSTable component head {s3_path}: {e}"
+                        ))),
+                    }
+                })
+            }));
+        }
+        ferrosa_sstable::io::register_file_read_rehydration_hook(Arc::new(move |path| {
+            let Some((table_id, sstable_id, component)) =
+                Self::parse_local_sstable_component_path(&data_dir, path)
+            else {
+                return Ok(false);
+            };
+            if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
+                return Ok(false);
+            }
+
+            crate::metrics::inc_sstable_rehydration_request();
+            let started = Instant::now();
+            let lock_key = format!("{table_id}/{sstable_id}");
+            let rehydration_lock = Arc::clone(
+                rehydration_locks
+                    .entry(lock_key.clone())
+                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+                    .value(),
+            );
+            let _guard = rehydration_lock
+                .lock()
+                .expect("SSTable rehydration lock poisoned");
+            let Some(parent) = path.parent() else {
+                return Ok(false);
+            };
+            std::fs::create_dir_all(parent)?;
+
+            if path.exists() {
+                crate::metrics::observe_sstable_rehydration_success(started.elapsed(), 0, 0);
+                return Ok(true);
+            }
+
+            let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
+            let store = Arc::clone(&store);
+            let parent = parent.to_path_buf();
+            let requested_path = path.to_path_buf();
+            let async_prefix = prefix.clone();
+            let async_table_id = table_id.clone();
+            let async_sstable_id = sstable_id.clone();
+            let async_requested_path = requested_path.clone();
+            let components = SSTABLE_COMPONENTS.to_vec();
+
+            crate::metrics::inc_sstable_rehydration_in_flight();
+            let result = Self::block_on_rehydration(async move {
+                let mut restored = 0usize;
+                let mut restored_bytes = 0u64;
+                for component_name in components {
+                    let local_path = parent.join(format!("{async_sstable_id}-{component_name}"));
+                    if local_path.exists() {
+                        continue;
+                    }
+
+                    let s3_path = crate::upload::manager::sstable_object_key(
+                        &async_prefix,
+                        &hex,
+                        &async_table_id,
+                        &async_sstable_id,
+                        component_name,
+                    );
+                    let tmp_path = local_path.with_extension(format!(
+                        "{}.rehydrate.tmp",
+                        local_path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("component")
+                    ));
+
+                    match store.get(&s3_path).await {
+                        Ok(result) => {
+                            let mut stream = result.into_stream();
+                            let mut file =
+                                tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to create SSTable rehydration temp file {}: {e}",
+                                        tmp_path.display()
+                                    ))
+                                })?;
+                            use tokio::io::AsyncWriteExt;
+                            while let Some(chunk) = stream.try_next().await.map_err(|e| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "failed to stream SSTable component {s3_path}: {e}"
+                                ))
+                            })? {
+                                restored_bytes = restored_bytes.saturating_add(chunk.len() as u64);
+                                file.write_all(&chunk).await.map_err(|e| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to write SSTable rehydration temp file {}: {e}",
+                                        tmp_path.display()
+                                    ))
+                                })?;
+                            }
+                            file.sync_data().await.map_err(|e| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "failed to sync SSTable rehydration temp file {}: {e}",
+                                    tmp_path.display()
+                                ))
+                            })?;
+                            drop(file);
+                            tokio::fs::rename(&tmp_path, &local_path)
+                                .await
+                                .map_err(|e| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "failed to promote SSTable rehydration temp file {} to {}: {e}",
+                                        tmp_path.display(),
+                                        local_path.display()
+                                    ))
+                            })?;
+                            restored += 1;
+                        }
+                        Err(object_store::Error::NotFound { .. })
+                            if component_name != "Data.db" =>
+                        {
+                            let _ = tokio::fs::remove_file(&tmp_path).await;
+                            tracing::debug!(
+                                table = async_table_id.as_str(),
+                                sstable = async_sstable_id.as_str(),
+                                component = component_name,
+                                "optional SSTable component absent during read-through rehydration"
+                            );
+                        }
+                        Err(object_store::Error::NotFound { .. }) => {
+                            let _ = tokio::fs::remove_file(&tmp_path).await;
+                            return Ok((false, restored, restored_bytes));
+                        }
+                        Err(e) => {
+                            let _ = tokio::fs::remove_file(&tmp_path).await;
+                            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to rehydrate SSTable component {s3_path}: {e}"
+                            )));
+                        }
+                    }
+                }
+
+                Ok((
+                    async_requested_path.exists() || restored > 0,
+                    restored,
+                    restored_bytes,
+                ))
+            });
+            crate::metrics::dec_sstable_rehydration_in_flight();
+
+            if let Err(err) = &result {
+                crate::metrics::observe_sstable_rehydration_failure(started.elapsed());
+                tracing::warn!(
+                    %err,
+                    local_path = %requested_path.display(),
+                    "SSTable read-through rehydration failed"
+                );
+            } else if let Ok((true, restored, restored_bytes)) = result {
+                crate::metrics::observe_sstable_rehydration_success(
+                    started.elapsed(),
+                    restored as u64,
+                    restored_bytes,
+                );
+                tracing::info!(
+                    local_path = %requested_path.display(),
+                    table = table_id,
+                    sstable = sstable_id,
+                    requested_component = component,
+                    restored,
+                    restored_bytes,
+                    "SSTable generation rehydrated from object storage"
+                );
+                return Ok(true);
+            } else {
+                crate::metrics::observe_sstable_rehydration_failure(started.elapsed());
+            }
+
+            Ok(false)
+        }));
+    }
+
+    fn build_upload_managers(
+        object_store_config: Option<&ObjectStoreConfig>,
+        runtime: Option<&tokio::runtime::Handle>,
+        object_store: Option<&Arc<dyn object_store::ObjectStore>>,
+    ) -> (Option<UploadManager>, Option<UploadManager>) {
+        match (object_store_config, runtime, object_store) {
+            (Some(os_config), Some(rt), Some(store)) => {
+                let upload_manager = UploadManager::new_with_pools(
+                    Arc::clone(store),
+                    os_config.prefix.clone(),
+                    os_config.upload_queue_depth,
+                    os_config.upload_workers,
+                    os_config.delete_workers,
+                    rt,
+                );
+                let compaction_upload_manager = UploadManager::new_with_pools(
+                    Arc::clone(store),
+                    os_config.prefix.clone(),
+                    os_config.compaction_upload_queue_depth,
+                    os_config.compaction_upload_workers,
+                    os_config.delete_workers,
+                    rt,
+                );
+                (Some(upload_manager), Some(compaction_upload_manager))
+            }
+            _ => (None, None),
+        }
+    }
+
     /// Remove stale local compaction staging files from previous processes.
     ///
     /// Compaction output is only live while an in-process compaction result is
@@ -829,6 +1227,76 @@ impl StorageEngine {
         Ok(count)
     }
 
+    pub fn check_write_admission(&self) -> ferrosa_common::Result<()> {
+        let reserve = self.config.local_disk_free_reserve_bytes;
+        if reserve == 0 {
+            return Ok(());
+        }
+
+        let available = fs2::available_space(&self.config.data_dir)?;
+        if available < self.local_disk_eviction_low_water_bytes() {
+            self.request_s3_sync();
+        }
+        if available < reserve {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "local disk free space below write reserve: available={available} reserve={reserve} path={}",
+                self.config.data_dir.display()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn local_cache_min_bytes(&self) -> u64 {
+        std::env::var("FERROSA_CACHE_MIN_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+            .min(self.config.local_cache_max_bytes)
+    }
+
+    fn local_disk_eviction_low_water_bytes(&self) -> u64 {
+        std::env::var("FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| self.config.local_disk_free_reserve_bytes.saturating_mul(2))
+    }
+
+    fn local_disk_eviction_target_free_bytes(&self) -> u64 {
+        std::env::var("FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| {
+                self.local_disk_eviction_low_water_bytes()
+                    .max(self.config.local_disk_free_reserve_bytes.saturating_mul(3))
+            })
+    }
+
+    fn check_memtable_write_admission(
+        &self,
+        table_id: &TableId,
+        state: &TableState,
+    ) -> ferrosa_common::Result<()> {
+        let memtable_size = state.store.memtable_size() as u64;
+        crate::metrics::observe_memtable_size(memtable_size);
+        if memtable_size >= self.config.memtable_backpressure_bytes {
+            self.request_flush();
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "overloaded: memtable backpressure threshold exceeded: table={table_id} size={memtable_size} threshold={}",
+                self.config.memtable_backpressure_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn request_flush_if_needed(&self, state: &TableState) {
+        let memtable_size = state.store.memtable_size() as u64;
+        crate::metrics::observe_memtable_size(memtable_size);
+        if memtable_size >= self.config.flush_threshold_bytes {
+            self.request_flush();
+        }
+    }
+
     /// Creates a new storage engine. Initializes the commit log, compaction
     /// executor, and optional upload manager.
     pub fn new(
@@ -841,6 +1309,10 @@ impl StorageEngine {
         // FERROSA_MEMTABLE_NUM_SHARDS (or the explicit field on
         // `StorageEngineConfig`).
         crate::memtable::sharded::set_configured_num_shards(config.memtable_num_shards);
+        crate::metrics::set_memtable_thresholds(
+            config.flush_threshold_bytes,
+            config.memtable_backpressure_bytes,
+        );
 
         // Ensure data directories exist.
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
@@ -854,18 +1326,16 @@ impl StorageEngine {
         let commit_log = CommitLog::new(config.commit_log.clone())?;
         let compaction_executor = CompactionExecutor::new();
 
-        let upload_manager = match (&config.object_store, runtime) {
-            (Some(os_config), Some(rt)) => {
-                let store = os_config.build_object_store()?;
-                Some(UploadManager::new(
-                    Arc::from(store),
-                    os_config.prefix.clone(),
-                    os_config.upload_queue_depth,
-                    rt,
-                ))
-            }
-            _ => None,
+        let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
+            Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
+            None => None,
         };
+
+        let (upload_manager, compaction_upload_manager) = Self::build_upload_managers(
+            config.object_store.as_ref(),
+            runtime,
+            object_store.as_ref(),
+        );
 
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
@@ -879,6 +1349,7 @@ impl StorageEngine {
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
             upload_manager,
+            compaction_upload_manager,
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
@@ -896,11 +1367,26 @@ impl StorageEngine {
             archiver_handle: None,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_sync_running: AtomicBool::new(false),
+            s3_sync_requested: AtomicBool::new(false),
+            flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             #[cfg(test)]
             upload_store_override: None,
         };
+
+        if let (Some(os_config), Some(store)) = (
+            engine.config.object_store.as_ref(),
+            engine.object_store.as_ref(),
+        ) {
+            Self::install_s3_file_read_rehydration_hook(
+                engine.config.data_dir.clone(),
+                os_config.prefix.clone(),
+                Arc::clone(store),
+            );
+        }
 
         engine.load_local_schema_if_present();
         Ok(engine)
@@ -955,18 +1441,16 @@ impl StorageEngine {
         let mut commit_log = CommitLog::new(config.commit_log.clone())?;
         let compaction_executor = CompactionExecutor::new();
 
-        let upload_manager = match (&config.object_store, runtime) {
-            (Some(os_config), Some(rt)) => {
-                let store = os_config.build_object_store()?;
-                Some(UploadManager::new(
-                    Arc::from(store),
-                    os_config.prefix.clone(),
-                    os_config.upload_queue_depth,
-                    rt,
-                ))
-            }
-            _ => None,
+        let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
+            Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
+            None => None,
         };
+
+        let (upload_manager, compaction_upload_manager) = Self::build_upload_managers(
+            config.object_store.as_ref(),
+            runtime,
+            object_store.as_ref(),
+        );
 
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
@@ -1026,6 +1510,7 @@ impl StorageEngine {
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
             upload_manager,
+            compaction_upload_manager,
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
@@ -1043,7 +1528,11 @@ impl StorageEngine {
             archiver_handle,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_sync_running: AtomicBool::new(false),
+            s3_sync_requested: AtomicBool::new(false),
+            flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             #[cfg(test)]
             upload_store_override: None,
@@ -1070,18 +1559,16 @@ impl StorageEngine {
 
         let compaction_executor = CompactionExecutor::new();
 
-        let upload_manager = match (&config.object_store, runtime) {
-            (Some(os_config), Some(rt)) => {
-                let store = os_config.build_object_store()?;
-                Some(UploadManager::new(
-                    Arc::from(store),
-                    os_config.prefix.clone(),
-                    os_config.upload_queue_depth,
-                    rt,
-                ))
-            }
-            _ => None,
+        let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
+            Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
+            None => None,
         };
+
+        let (upload_manager, compaction_upload_manager) = Self::build_upload_managers(
+            config.object_store.as_ref(),
+            runtime,
+            object_store.as_ref(),
+        );
 
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
@@ -1154,6 +1641,7 @@ impl StorageEngine {
             deferred_replay_mutations,
             compaction_executor,
             upload_manager,
+            compaction_upload_manager,
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
@@ -1171,7 +1659,11 @@ impl StorageEngine {
             archiver_handle: None,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_sync_running: AtomicBool::new(false),
+            s3_sync_requested: AtomicBool::new(false),
+            flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             #[cfg(test)]
             upload_store_override: None,
@@ -1250,19 +1742,21 @@ impl StorageEngine {
             };
             match upload_mgr.try_submit(task) {
                 Ok(()) => {
-                    finalize_handles.push(tokio::spawn(Self::finalize_replayed_pending_upload(
-                        PendingUploadReplayFinalize {
-                            store: Arc::clone(&store),
-                            prefix: prefix.clone(),
-                            pending_log_path: pending_log_path.clone(),
-                            table_id: record.table_id.clone(),
-                            sstable_id: record.sstable_id.clone(),
-                            total_size,
-                            compaction: record.compaction.clone(),
-                            cas_supported,
-                        },
-                        rx,
-                    )));
+                    finalize_handles.push(TaskPool::current("storage-upload-finalize").spawn(
+                        Self::finalize_replayed_pending_upload(
+                            PendingUploadReplayFinalize {
+                                store: Arc::clone(&store),
+                                prefix: prefix.clone(),
+                                pending_log_path: pending_log_path.clone(),
+                                table_id: record.table_id.clone(),
+                                sstable_id: record.sstable_id.clone(),
+                                total_size,
+                                compaction: record.compaction.clone(),
+                                cas_supported,
+                            },
+                            rx,
+                        ),
+                    ));
                 }
                 Err(e) if e.to_string().contains("upload queue full") => {
                     tracing::warn!(
@@ -2438,9 +2932,11 @@ impl StorageEngine {
                             }
                         }
                     }
+                    let sstable_dir = Self::generation_dir_path(table_dir, gen)
+                        .unwrap_or_else(|| table_dir.to_path_buf());
                     sstables.push(Arc::new(reader));
                     sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
-                    ids.push((gen_str.clone(), table_dir.to_path_buf()));
+                    ids.push((gen_str.clone(), sstable_dir));
                 }
                 Err(e) => match repair_mode {
                     StartupSstableRepairMode::Quarantine => {
@@ -2978,7 +3474,7 @@ impl StorageEngine {
         poll_interval: std::time::Duration,
         batch_limit: usize,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        TaskPool::current("time-series-materialization").spawn(async move {
             let poll_interval = poll_interval.max(std::time::Duration::from_millis(1));
             let batch_limit = batch_limit.max(1);
             let mut interval = tokio::time::interval(poll_interval);
@@ -2987,10 +3483,11 @@ impl StorageEngine {
             loop {
                 interval.tick().await;
                 let worker_engine = engine.clone();
-                match tokio::task::spawn_blocking(move || {
-                    worker_engine.process_pending_time_series_materializations(batch_limit)
-                })
-                .await
+                match TaskPool::current("time-series-materialization-blocking")
+                    .spawn_blocking(move || {
+                        worker_engine.process_pending_time_series_materializations(batch_limit)
+                    })
+                    .await
                 {
                     Ok(Ok(processed)) if processed > 0 => {
                         tracing::debug!(
@@ -3202,7 +3699,7 @@ impl StorageEngine {
         let capacity = self.async_observer_capacity;
         let mut rx = self.register_async_observer(observer.clone(), capacity);
 
-        tokio::spawn(async move {
+        TaskPool::current("storage-observer-drain").spawn(async move {
             while let Some((table_id, mutation)) = rx.recv().await {
                 // observer.on_write is synchronous and non-blocking.
                 // Wrap in catch_unwind so a panicking observer does not kill the drain loop.
@@ -3242,6 +3739,15 @@ impl StorageEngine {
     /// ERROR level and the write is skipped; derived mutation failures must
     /// not crash the engine.
     fn apply_derived_mutation(&self, dm: &Mutation) {
+        if let Err(e) = self.check_write_admission() {
+            tracing::error!(
+                %e,
+                keyspace = %dm.keyspace,
+                table = %dm.table,
+                "observer drain: local disk reserve exhausted; derived mutation dropped"
+            );
+            return;
+        }
         if let Err(e) = self.commit_log.append(dm) {
             tracing::error!(
                 %e,
@@ -3284,6 +3790,15 @@ impl StorageEngine {
             if obs.mode() == crate::observer::ObserverMode::Sync && obs.watches_table(table_id) {
                 let derived = obs.on_write(table_id, mutation);
                 for dm in derived {
+                    if let Err(e) = self.check_write_admission() {
+                        tracing::error!(
+                            %e,
+                            keyspace = %dm.keyspace,
+                            table = %dm.table,
+                            "observer: local disk reserve exhausted; derived mutation dropped"
+                        );
+                        continue;
+                    }
                     // Durability: go through commit log.
                     if let Err(e) = self.commit_log.append(&dm) {
                         tracing::error!(%e, "observer: commit log append failed");
@@ -3299,6 +3814,18 @@ impl StorageEngine {
                 }
             }
         }
+    }
+
+    fn has_observers_for_table(&self, table_id: &TableId) -> bool {
+        self.observers
+            .read()
+            .iter()
+            .any(|obs| obs.watches_table(table_id))
+            || self
+                .async_observers
+                .read()
+                .iter()
+                .any(|state| state.observer.watches_table(table_id))
     }
 
     /// Dispatches a mutation to all async observers watching the given table.
@@ -3378,6 +3905,7 @@ impl StorageEngine {
         row: Row,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
+        let total_start = Instant::now();
         // Per-write span emitted at DEBUG level so it is free at the
         // default INFO subscriber filter — every span allocation was
         // measurable on a 50k ops/s workload.
@@ -3386,73 +3914,181 @@ impl StorageEngine {
             table = %table_id,
         )
         .entered();
-        // 1. Append to commit log for durability.
-        let mutation = Mutation::new(
-            table_id.keyspace.clone(),
-            table_id.table.clone(),
-            key.clone(),
-            vec![row.clone()],
-            timestamp,
+        let phase_start = Instant::now();
+        if let Err(e) = self.check_write_admission() {
+            crate::metrics::observe_write_phase(
+                crate::metrics::WritePhase::AdmissionDisk,
+                phase_start.elapsed(),
+            );
+            crate::metrics::observe_write_phase(
+                crate::metrics::WritePhase::Total,
+                total_start.elapsed(),
+            );
+            crate::metrics::inc_write_failure_reason(
+                crate::metrics::WriteFailureReason::DiskReserve,
+            );
+            return Err(e);
+        }
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::AdmissionDisk,
+            phase_start.elapsed(),
         );
-        let cl_pos = self.commit_log.append(&mutation)?;
+
+        let phase_start = Instant::now();
+        {
+            let tables = self.tables.read();
+            let state = match tables.get(table_id) {
+                Some(state) => state,
+                None => {
+                    crate::metrics::observe_write_phase(
+                        crate::metrics::WritePhase::AdmissionMemtable,
+                        phase_start.elapsed(),
+                    );
+                    crate::metrics::observe_write_phase(
+                        crate::metrics::WritePhase::Total,
+                        total_start.elapsed(),
+                    );
+                    crate::metrics::inc_write_failure_reason(
+                        crate::metrics::WriteFailureReason::TableMissing,
+                    );
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "table not registered: {table_id}"
+                    )));
+                }
+            };
+            if let Err(e) = self.check_memtable_write_admission(table_id, state) {
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::AdmissionMemtable,
+                    phase_start.elapsed(),
+                );
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::Total,
+                    total_start.elapsed(),
+                );
+                crate::metrics::inc_write_failure_reason(
+                    crate::metrics::WriteFailureReason::MemtableBackpressure,
+                );
+                return Err(e);
+            }
+        }
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::AdmissionMemtable,
+            phase_start.elapsed(),
+        );
+
+        // 1. Append to commit log for durability.
+        let phase_start = Instant::now();
+        let cl_pos = match self
+            .commit_log
+            .append_single_row(table_id, key, &row, timestamp)
+        {
+            Ok(pos) => pos,
+            Err(e) => {
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::CommitLogAppend,
+                    phase_start.elapsed(),
+                );
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::Total,
+                    total_start.elapsed(),
+                );
+                crate::metrics::inc_write_failure_reason(
+                    crate::metrics::WriteFailureReason::CommitLogAppend,
+                );
+                return Err(e);
+            }
+        };
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::CommitLogAppend,
+            phase_start.elapsed(),
+        );
+        let observer_mutation = if self.has_observers_for_table(table_id) {
+            Some(Mutation::new(
+                table_id.keyspace.clone(),
+                table_id.table.clone(),
+                key.clone(),
+                vec![row.clone()],
+                timestamp,
+            ))
+        } else {
+            None
+        };
 
         // 2. Write to the table's memtable and track commit log position.
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
-        state.store.write(key, row)?;
-        state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
-        // Set the first-unflushed timestamp via CAS — succeeds at most once
-        // per memtable epoch, no contention after the first write.
-        if state
-            .first_unflushed_write_at_nanos
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
+        let phase_start = Instant::now();
         {
-            let now = now_nanos_since_reference();
-            let _ = state.first_unflushed_write_at_nanos.compare_exchange(
-                0,
-                now,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let tables = self.tables.read();
+            let state = match tables.get(table_id) {
+                Some(state) => state,
+                None => {
+                    crate::metrics::observe_write_phase(
+                        crate::metrics::WritePhase::MemtableWrite,
+                        phase_start.elapsed(),
+                    );
+                    crate::metrics::observe_write_phase(
+                        crate::metrics::WritePhase::Total,
+                        total_start.elapsed(),
+                    );
+                    crate::metrics::inc_write_failure_reason(
+                        crate::metrics::WriteFailureReason::TableMissing,
+                    );
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "table not registered: {table_id}"
+                    )));
+                }
+            };
+            if let Err(e) = state.store.write(key, row) {
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::MemtableWrite,
+                    phase_start.elapsed(),
+                );
+                crate::metrics::observe_write_phase(
+                    crate::metrics::WritePhase::Total,
+                    total_start.elapsed(),
+                );
+                crate::metrics::inc_write_failure_reason(
+                    crate::metrics::WriteFailureReason::MemtableWrite,
+                );
+                return Err(e);
+            }
+            state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
+            // Set the first-unflushed timestamp via CAS — succeeds at most once
+            // per memtable epoch, no contention after the first write.
+            if state
+                .first_unflushed_write_at_nanos
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                let now = now_nanos_since_reference();
+                let _ = state.first_unflushed_write_at_nanos.compare_exchange(
+                    0,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            self.request_flush_if_needed(state);
         }
-        // Write-path backpressure. Routine threshold crossings
-        // (memtable size ≥ `flush_threshold_bytes`) are handled
-        // by the maintenance loop's periodic `flush_if_needed` —
-        // no per-write cost in the common case. But when writes
-        // arrive faster than the maintenance loop drains and the
-        // active memtable crosses `memtable_backpressure_bytes`,
-        // we block the writer by calling `self.flush(...)`
-        // synchronously here. The store's `flush_guard`
-        // serialises concurrent flushes, so a runaway writer
-        // waits for the in-progress flush instead of growing a
-        // second unbounded memtable in parallel.
-        //
-        // Without this, sustained writes (anti-entropy repair's
-        // apply phase, bulk load, PITR restore, raft state-
-        // machine catch-up) pile up flushing memtables in RSS
-        // faster than S3 uploads drain them and trip the per-
-        // node cgroup cap.
-        //
-        // Default in production is `max(flush_threshold × 4,
-        // 64 MB)`; default in `test_config` is `u64::MAX`
-        // (effectively disabled) so tests that intentionally
-        // pick tiny thresholds for flush-behaviour coverage
-        // don't deadlock against each other in unrelated test
-        // scenarios.
-        let mt_size = state.store.memtable_size() as u64;
-        let needs_flush = mt_size >= self.config.memtable_backpressure_bytes;
-        drop(tables);
-
-        if needs_flush {
-            self.flush(table_id)?;
-        }
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::MemtableWrite,
+            phase_start.elapsed(),
+        );
 
         // 3. Notify observers after successful commit log + memtable write.
-        self.dispatch_sync_observers(table_id, &mutation);
-        self.dispatch_async_observers(table_id, &mutation);
+        let phase_start = Instant::now();
+        if let Some(mutation) = observer_mutation.as_ref() {
+            self.dispatch_sync_observers(table_id, mutation);
+            self.dispatch_async_observers(table_id, mutation);
+        }
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::Observers,
+            phase_start.elapsed(),
+        );
+        crate::metrics::observe_write_phase(
+            crate::metrics::WritePhase::Total,
+            total_start.elapsed(),
+        );
+        crate::metrics::inc_write_total();
 
         Ok(())
     }
@@ -3473,6 +4109,17 @@ impl StorageEngine {
 
         // Collect committed mutations for observer dispatch after each write.
         for (key, row, timestamp) in mutations {
+            self.check_write_admission()?;
+            {
+                let tables = self.tables.read();
+                let state = tables.get(table_id).ok_or_else(|| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "table not registered: {table_id}"
+                    ))
+                })?;
+                self.check_memtable_write_admission(table_id, state)?;
+            }
+
             let mutation = Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
@@ -3507,6 +4154,7 @@ impl StorageEngine {
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
+                self.request_flush_if_needed(state);
             }
 
             // Notify observers after successful commit log + memtable write.
@@ -3534,6 +4182,27 @@ impl StorageEngine {
     pub fn write_atomic_batch(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
         if mutations.is_empty() {
             return Ok(());
+        }
+
+        // Preflight every target table before appending any batch mutation to
+        // the commitlog. This preserves all-or-nothing client-visible failure
+        // semantics for overload rejection.
+        {
+            let tables = self.tables.read();
+            let mut checked = HashSet::new();
+            for m in &mutations {
+                self.check_write_admission()?;
+                let table_id = TableId::new(&m.keyspace, &m.table);
+                if !checked.insert(table_id.clone()) {
+                    continue;
+                }
+                let state = tables.get(&table_id).ok_or_else(|| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "table not registered: {table_id}"
+                    ))
+                })?;
+                self.check_memtable_write_admission(&table_id, state)?;
+            }
         }
 
         // Phase 1: Append all mutations to the commit log, tracking positions.
@@ -3570,6 +4239,7 @@ impl StorageEngine {
                     );
                 }
             }
+            self.request_flush_if_needed(state);
         }
         drop(tables);
 
@@ -4478,6 +5148,10 @@ impl StorageEngine {
     pub async fn poll_compactions(&self) {
         let results = self.compaction_executor.poll_results();
         for result in results {
+            let _input_claim = CompactionResultInputClaim {
+                executor: &self.compaction_executor,
+                task: &result.task,
+            };
             let input_id_paths: Vec<(String, std::path::PathBuf)> = result
                 .task
                 .inputs
@@ -4486,9 +5160,20 @@ impl StorageEngine {
                 .collect();
             let table_id = &result.task.table_id;
 
+            let promote_start = Instant::now();
             let output = match self.promote_compaction_output(table_id, &result.output) {
-                Ok(output) => output,
+                Ok(output) => {
+                    crate::metrics::observe_compaction_phase(
+                        crate::metrics::CompactionPhase::PromoteOutput,
+                        promote_start.elapsed(),
+                    );
+                    output
+                }
                 Err(e) => {
+                    crate::metrics::observe_compaction_phase(
+                        crate::metrics::CompactionPhase::PromoteOutput,
+                        promote_start.elapsed(),
+                    );
                     tracing::error!(%e, %table_id, "compaction: failed to promote output SSTable");
                     continue;
                 }
@@ -4565,7 +5250,12 @@ impl StorageEngine {
             // Register in local cache.
             self.local_cache
                 .register(&output.id, output.path.clone(), output.size_bytes);
+            let cleanup_start = Instant::now();
             Self::evict_local_input_sstable_files(&result.task.inputs);
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::InputCleanup,
+                cleanup_start.elapsed(),
+            );
 
             // ── Skip S3 upload for pinned tables ────────────────────────────
             //
@@ -4605,7 +5295,11 @@ impl StorageEngine {
             //   5. Update manifest (remove inputs, add output)
             //
             // If upload_manager is None (no S3 configured) we skip silently.
-            let Some(upload_mgr) = self.upload_manager.as_ref() else {
+            let upload_mgr = self
+                .compaction_upload_manager
+                .as_ref()
+                .or(self.upload_manager.as_ref());
+            let Some(upload_mgr) = upload_mgr else {
                 continue;
             };
             let Some((store, prefix)) = self.resolve_store_and_prefix() else {
@@ -4627,13 +5321,20 @@ impl StorageEngine {
             // The compaction output has been promoted into the table SSTable directory.
             let output_dir = output.path.clone();
 
-            let files = Self::collect_sstable_files(&output_dir, gen_u64);
-            if files.is_empty() {
-                tracing::warn!(%sstable_id, "compaction: no files for output SSTable, skipping S3 upload");
+            let direct_upload = result.direct_upload;
+            let total_size: u64 = direct_upload
+                .as_ref()
+                .map(|upload| upload.total_size_bytes())
+                .unwrap_or_else(|| {
+                    Self::collect_sstable_files(&output_dir, gen_u64)
+                        .iter()
+                        .map(|file| file.size_bytes)
+                        .sum()
+                });
+            if total_size == 0 {
+                tracing::warn!(%sstable_id, "compaction: no bytes for output SSTable, skipping S3 upload");
                 continue;
             }
-
-            let total_size: u64 = files.iter().map(|file| file.size_bytes).sum();
             let manifest_plan = crate::compaction::finalize::plan_manifest_update(
                 &table_id_str,
                 &result.task.inputs,
@@ -4667,11 +5368,28 @@ impl StorageEngine {
             // periodic `sync_sstables_to_s3` will re-submit. On queue-full
             // we skip the rest of the S3 dance and continue.
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-            let task = crate::upload::UploadTask::SSTable {
-                table_id: table_id_str.clone(),
-                sstable_id: sstable_id.clone(),
-                files,
-                on_complete: Some(tx),
+            let task = if let Some(direct_upload) = direct_upload {
+                crate::upload::UploadTask::SSTableBytes {
+                    table_id: table_id_str.clone(),
+                    sstable_id: sstable_id.clone(),
+                    files: direct_upload.files,
+                    on_complete: Some(tx),
+                }
+            } else {
+                let files = Self::collect_sstable_files(&output_dir, gen_u64);
+                if files.is_empty() {
+                    tracing::warn!(
+                        %sstable_id,
+                        "compaction: no files for output SSTable, skipping S3 upload"
+                    );
+                    continue;
+                }
+                crate::upload::UploadTask::SSTable {
+                    table_id: table_id_str.clone(),
+                    sstable_id: sstable_id.clone(),
+                    files,
+                    on_complete: Some(tx),
+                }
             };
             if let Err(e) = upload_mgr.try_submit(task) {
                 tracing::warn!(
@@ -4688,9 +5406,20 @@ impl StorageEngine {
             // pending-log entry from Step 1 means we lose no durability
             // by giving up here — sync_sstables_to_s3 will pick it up.
             const UPLOAD_AWAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+            let upload_await_start = Instant::now();
             let rx_result = match tokio::time::timeout(UPLOAD_AWAIT_TIMEOUT, rx).await {
-                Ok(r) => r,
+                Ok(r) => {
+                    crate::metrics::observe_compaction_phase(
+                        crate::metrics::CompactionPhase::S3UploadAwait,
+                        upload_await_start.elapsed(),
+                    );
+                    r
+                }
                 Err(_) => {
+                    crate::metrics::observe_compaction_phase(
+                        crate::metrics::CompactionPhase::S3UploadAwait,
+                        upload_await_start.elapsed(),
+                    );
                     tracing::warn!(
                         %sstable_id,
                         timeout_secs = UPLOAD_AWAIT_TIMEOUT.as_secs(),
@@ -4762,6 +5491,7 @@ impl StorageEngine {
             };
 
             let mut manifest_saved = false;
+            let manifest_update_start = Instant::now();
             match crate::manifest::Manifest::load(store.as_ref(), &prefix).await {
                 Ok((mut manifest, _version)) => {
                     manifest
@@ -4801,6 +5531,10 @@ impl StorageEngine {
                     tracing::error!(%e, "compaction: failed to load manifest for update");
                 }
             }
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::ManifestUpdate,
+                manifest_update_start.elapsed(),
+            );
 
             // Step 5: remove the pending-log entry only after both S3 upload
             // confirmation and manifest save. If the process crashes or manifest
@@ -5083,7 +5817,7 @@ impl StorageEngine {
     }
 
     /// Deletes all on-disk component files for an SSTable generation.
-    fn delete_sstable_files(table_dir: &std::path::Path, gen: &str) {
+    fn delete_sstable_files(table_dir: &std::path::Path, gen: &str) -> u64 {
         let suffixes = [
             "Data.db",
             "Partitions.db",
@@ -5093,11 +5827,32 @@ impl StorageEngine {
             "TOC.txt",
             "CompressionInfo.db",
         ];
+        let mut reclaimed = 0u64;
+
+        // Resolve the component directory once before deleting anything. For
+        // compaction-promoted SSTables components live in `<table>/<gen>/`.
+        // Calling `generation_component_path` after removing `Data.db` would
+        // no longer recognize the generation directory and would leave every
+        // sidecar/index component behind.
+        let component_dir = if table_dir.join(gen).is_dir() {
+            table_dir.join(gen)
+        } else {
+            table_dir.to_path_buf()
+        };
+
         for s in &suffixes {
-            if let Some(path) = Self::generation_component_path(table_dir, gen, s) {
-                let _ = std::fs::remove_file(path);
+            let path = component_dir.join(format!("{gen}-{s}"));
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                reclaimed = reclaimed.saturating_add(size);
             }
         }
+
+        if component_dir != table_dir {
+            let _ = std::fs::remove_dir(&component_dir);
+        }
+
+        reclaimed
     }
 
     /// Enforces the `max_bytes` cap for a pinned table after a new SSTable is
@@ -5211,6 +5966,24 @@ impl StorageEngine {
         self.upload_manager.is_some()
     }
 
+    pub fn request_s3_sync(&self) {
+        if self.has_s3() {
+            self.s3_sync_requested.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn take_s3_sync_request(&self) -> bool {
+        self.s3_sync_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn request_flush(&self) {
+        self.flush_requested.store(true, Ordering::Release);
+    }
+
+    pub fn take_flush_request(&self) -> bool {
+        self.flush_requested.swap(false, Ordering::AcqRel)
+    }
+
     /// Returns the shared index state tracker.
     pub fn index_tracker(&self) -> &Arc<crate::index::IndexStateTracker> {
         &self.index_tracker
@@ -5225,8 +5998,11 @@ impl StorageEngine {
             .object_store
             .as_ref()
             .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
-        let store = os_config.build_object_store()?;
-        Ok((os_config, Arc::from(store)))
+        let store = match &self.object_store {
+            Some(store) => Arc::clone(store),
+            None => Arc::from(os_config.build_object_store()?),
+        };
+        Ok((os_config, store))
     }
 
     /// Returns the object store and prefix for S3 operations.
@@ -5313,6 +6089,13 @@ impl StorageEngine {
         manifest: &crate::manifest::Manifest,
     ) -> ferrosa_common::Result<usize> {
         let max_bytes = self.config.local_cache_max_bytes;
+        let min_bytes = self.local_cache_min_bytes();
+        let target_free = self.local_disk_eviction_target_free_bytes();
+        let mut projected_available = if target_free > 0 {
+            fs2::available_space(&self.config.data_dir).unwrap_or(0)
+        } else {
+            0
+        };
         let candidates = self.collect_uploaded_local_sstables(manifest);
         let mut total_bytes = candidates
             .iter()
@@ -5320,19 +6103,36 @@ impl StorageEngine {
         let mut evicted = 0usize;
 
         for (table_id, sstable_id, table_dir, size, _) in candidates {
-            if total_bytes <= max_bytes {
+            let over_cache_limit = total_bytes > max_bytes;
+            let under_free_target = target_free > 0 && projected_available < target_free;
+            if !over_cache_limit && !under_free_target {
+                break;
+            }
+            if total_bytes <= min_bytes {
+                tracing::warn!(
+                    total_uploaded_cache_bytes = total_bytes,
+                    min_uploaded_cache_bytes = min_bytes,
+                    projected_available_bytes = projected_available,
+                    target_free_bytes = target_free,
+                    "s3-sync: uploaded local cache at floor; cannot evict more for disk pressure"
+                );
                 break;
             }
 
-            Self::delete_sstable_files(&table_dir, &sstable_id);
+            let reclaimed = Self::delete_sstable_files(&table_dir, &sstable_id);
             total_bytes = total_bytes.saturating_sub(size);
+            projected_available = projected_available.saturating_add(reclaimed);
             evicted += 1;
             tracing::info!(
                 table = table_id,
                 sstable = sstable_id,
                 size_bytes = size,
+                reclaimed_bytes = reclaimed,
                 remaining_uploaded_cache_bytes = total_bytes,
                 max_uploaded_cache_bytes = max_bytes,
+                min_uploaded_cache_bytes = min_bytes,
+                projected_available_bytes = projected_available,
+                target_free_bytes = target_free,
                 "s3-sync: evicted uploaded local SSTable from cache"
             );
         }
@@ -5358,6 +6158,26 @@ impl StorageEngine {
     /// files for each generation, uploads them via UploadManager, and
     /// updates the S3 manifest with new entries.
     pub async fn sync_sstables_to_s3(&self) -> ferrosa_common::Result<usize> {
+        struct S3SyncGuard<'a>(&'a AtomicBool);
+        impl Drop for S3SyncGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        let _guard = match self.s3_sync_running.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => S3SyncGuard(&self.s3_sync_running),
+            Err(_) => {
+                tracing::debug!("s3-sync: skipped because another sync is already running");
+                return Ok(0);
+            }
+        };
+
         let (os_config, store) = self.object_store_and_config()?;
         let prefix = os_config.prefix.clone();
         let upload_mgr = self.upload_manager.as_ref().ok_or_else(|| {
@@ -5424,8 +6244,13 @@ impl StorageEngine {
                 };
                 upload_mgr.submit(task).await?;
 
+                let phase_start = Instant::now();
                 match rx.await {
                     Ok(Ok(())) => {
+                        crate::metrics::observe_upload_phase(
+                            crate::metrics::UploadPhase::SyncAwait,
+                            phase_start.elapsed(),
+                        );
                         manifest.add_sstable(
                             table_id_str,
                             crate::manifest::ManifestEntry {
@@ -5440,6 +6265,10 @@ impl StorageEngine {
                         uploaded += 1;
                     }
                     Ok(Err(msg)) => {
+                        crate::metrics::observe_upload_phase(
+                            crate::metrics::UploadPhase::SyncAwait,
+                            phase_start.elapsed(),
+                        );
                         // "skipped: source compacted away before upload" is the
                         // race signal from the upload worker: the SSTable was
                         // already merged into a successor by compaction
@@ -5461,6 +6290,10 @@ impl StorageEngine {
                         }
                     }
                     Err(_) => {
+                        crate::metrics::observe_upload_phase(
+                            crate::metrics::UploadPhase::SyncAwait,
+                            phase_start.elapsed(),
+                        );
                         tracing::error!(
                             table = table_id_str,
                             sstable = gen_str,
@@ -5473,11 +6306,16 @@ impl StorageEngine {
 
         if uploaded > 0 {
             // Save updated manifest — use CAS if supported, unconditional otherwise.
+            let phase_start = Instant::now();
             if self.cas_supported() {
                 manifest.save_with_retry(store.as_ref(), &prefix).await?;
             } else {
                 manifest.save_without_cas(store.as_ref(), &prefix).await?;
             }
+            crate::metrics::observe_upload_phase(
+                crate::metrics::UploadPhase::ManifestSave,
+                phase_start.elapsed(),
+            );
             self.update_s3_manifest_stats(&manifest);
         }
 
@@ -5919,6 +6757,17 @@ impl StorageEngine {
     }
 }
 
+struct CompactionResultInputClaim<'a> {
+    executor: &'a CompactionExecutor,
+    task: &'a crate::compaction::metadata::CompactionTask,
+}
+
+impl Drop for CompactionResultInputClaim<'_> {
+    fn drop(&mut self) {
+        self.executor.release_task_inputs(self.task);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test constructor: inject an in-memory object store
 // ---------------------------------------------------------------------------
@@ -5961,10 +6810,20 @@ impl StorageEngine {
         let commit_log = CommitLog::new(config.commit_log.clone())?;
         let compaction_executor = CompactionExecutor::new();
 
-        let upload_manager = Some(UploadManager::new(
+        let upload_manager = Some(UploadManager::new_with_pools(
             Arc::clone(&store),
             prefix.clone(),
             upload_queue_depth,
+            8,
+            2,
+            runtime,
+        ));
+        let compaction_upload_manager = Some(UploadManager::new_with_pools(
+            Arc::clone(&store),
+            prefix.clone(),
+            upload_queue_depth,
+            4,
+            2,
             runtime,
         ));
 
@@ -5980,6 +6839,7 @@ impl StorageEngine {
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
             upload_manager,
+            compaction_upload_manager,
             local_cache,
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
@@ -5997,7 +6857,11 @@ impl StorageEngine {
             archiver_handle: None,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            object_store: Some(Arc::clone(&store)),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
+            s3_sync_running: AtomicBool::new(false),
+            s3_sync_requested: AtomicBool::new(false),
+            flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             upload_store_override: Some((store, prefix)),
         })
@@ -6672,6 +7536,151 @@ mod tests {
     }
 
     #[test]
+    fn delete_sstable_files_removes_directory_layout_components_after_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        let gen_dir = table_dir.join("42");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+
+        for component in [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+            "CompressionInfo.db",
+        ] {
+            std::fs::write(gen_dir.join(format!("42-{component}")), b"x").unwrap();
+        }
+
+        let reclaimed = StorageEngine::delete_sstable_files(&table_dir, "42");
+
+        assert!(reclaimed >= 7);
+        assert!(
+            !gen_dir.exists(),
+            "directory-layout SSTable should be removed as a unit"
+        );
+    }
+
+    #[test]
+    fn s3_read_through_serves_directory_layout_sstable_without_full_rehydrate() {
+        use bytes::Bytes;
+        use ferrosa_sstable::io::{FdCache, FileReadAt, ReadAt};
+        use object_store::ObjectStore;
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let table_id = table_id().to_string();
+        let sstable_id = "42";
+        let table_dir = data_dir.join("sstables").join(&table_id);
+        let gen_dir = table_dir.join(sstable_id);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+
+        let components = [
+            ("Data.db", b"restored data".as_slice()),
+            ("Partitions.db", b"restored partitions".as_slice()),
+            ("Rows.db", b"restored rows".as_slice()),
+            ("Filter.db", b"restored filter".as_slice()),
+            ("Statistics.db", b"restored statistics".as_slice()),
+            ("TOC.txt", b"restored toc".as_slice()),
+            ("CompressionInfo.db", b"restored compression".as_slice()),
+        ];
+
+        std::fs::write(gen_dir.join("42-Data.db"), b"original data").unwrap();
+        let cache = std::sync::Arc::new(FdCache::with_capacity(NonZeroUsize::new(4).unwrap()));
+        let reader = FileReadAt::open_with_cache(gen_dir.join("42-Data.db"), cache).unwrap();
+        StorageEngine::delete_sstable_files(&table_dir, sstable_id);
+
+        let store: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let prefix = "rehydrate-test".to_string();
+        let hex = crate::upload::manager::hex_prefix_for(sstable_id);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (component, bytes) in components {
+                let path = crate::upload::manager::sstable_object_key(
+                    &prefix, &hex, &table_id, sstable_id, component,
+                );
+                store
+                    .put(
+                        &path,
+                        object_store::PutPayload::from(Bytes::copy_from_slice(bytes)),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        StorageEngine::install_s3_file_read_rehydration_hook(
+            data_dir,
+            prefix,
+            std::sync::Arc::clone(&store),
+        );
+
+        let mut buf = vec![0u8; "restored data".len()];
+        reader.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(buf, b"restored data");
+
+        assert!(
+            !gen_dir.join("42-Data.db").exists(),
+            "range read-through should avoid full local Data.db rehydration"
+        );
+
+        for (component, bytes) in components {
+            let path = gen_dir.join(format!("42-{component}"));
+            assert!(
+                !path.exists() || std::fs::read(&path).unwrap() == bytes,
+                "component should either remain evicted or match object storage: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn uploaded_sstable_cache_eviction_responds_to_disk_pressure_before_cache_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_cache_max_bytes = 1024 * 1024;
+        config.local_disk_free_reserve_bytes = u64::MAX / 4;
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let table_id = table_id().to_string();
+        let table_dir = dir.path().join("sstables").join(&table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("1-Data.db"), vec![1u8; 80]).unwrap();
+        std::fs::write(table_dir.join("2-Data.db"), vec![2u8; 80]).unwrap();
+
+        let mut manifest = crate::manifest::Manifest::new();
+        for id in ["1", "2"] {
+            manifest.add_sstable(
+                &table_id,
+                crate::manifest::ManifestEntry {
+                    id: id.to_string(),
+                    size: 80,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+        }
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert!(
+            evicted > 0,
+            "free-space target should evict manifest-confirmed SSTables even below cache max"
+        );
+    }
+
+    #[test]
     fn storage_engine_new_removes_stale_compaction_staging_without_touching_sstables() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
@@ -6859,6 +7868,60 @@ mod tests {
         assert_eq!(
             partition.rows[0].cells[0].1.value.as_deref(),
             Some(b"hello".as_slice())
+        );
+    }
+
+    #[test]
+    fn write_fails_closed_when_local_disk_reserve_is_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_disk_free_reserve_bytes = u64::MAX;
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+
+        let key = make_key("pk1");
+        let before = engine.commit_log_position();
+        let err = engine
+            .write(&table_id(), &key, make_row(b"hello", 1000), 1000)
+            .expect_err("write must fail before commitlog append when disk reserve is exhausted");
+        assert!(
+            err.to_string()
+                .contains("local disk free space below write reserve"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(engine.commit_log_position(), before);
+    }
+
+    #[tokio::test]
+    async fn write_pressure_requests_urgent_s3_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_disk_free_reserve_bytes = u64::MAX;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let engine = StorageEngine::new_with_upload_store(
+            config,
+            store,
+            "urgent-sync".into(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let key = make_key("pk1");
+
+        let err = engine
+            .write(&table_id(), &key, make_row(b"hello", 1000), 1000)
+            .expect_err("write must fail under impossible reserve");
+        assert!(err.is_backpressure(), "unexpected error: {err}");
+        assert!(
+            engine.take_s3_sync_request(),
+            "disk-pressure write admission should request urgent S3 sync"
+        );
+        assert!(
+            !engine.take_s3_sync_request(),
+            "urgent S3 sync request should be consumed exactly once"
         );
     }
 
@@ -8719,42 +9782,47 @@ mod tests {
     /// hundreds of MB of partitions in RSS while a previous
     /// flush is still draining S3.
     ///
-    /// `write` itself must trigger a synchronous flush when the
-    /// active memtable crosses the threshold — concurrent writers
-    /// then serialise on the store's `flush_guard`, which is the
-    /// natural backpressure mechanism: a writer that overshoots
-    /// waits for the in-progress flush to complete before its own
-    /// flush call returns.
-    ///
-    /// This test pins the contract end-to-end: a single `write`
-    /// that pushes the memtable past `flush_threshold_bytes`
-    /// produces exactly one SSTable WITHOUT any explicit
-    /// `flush_if_needed` / `flush_all` call.
+    /// The foreground path must not run the flush inline. Once the
+    /// active memtable crosses the hard backpressure threshold, the next
+    /// writer fails closed and requests a background flush. That gives the
+    /// client backpressure without parking request handlers behind
+    /// SSTable encoding/S3 cleanup.
     #[test]
-    fn write_triggers_inline_flush_when_backpressure_exceeded() {
+    fn write_requests_background_flush_when_backpressure_exceeded() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = StorageEngineConfig::test_config(dir.path());
-        // Opt into backpressure with a tiny trigger so a single
-        // write trips it. Test confirms inline flush fires
-        // BEFORE any maintenance-loop tick or `flush_if_needed`
-        // call — the contract the production write path needs
-        // for sustained-write scenarios (anti-entropy repair
-        // apply, bulk load, restore).
         config.memtable_backpressure_bytes = 1;
+        config.flush_threshold_bytes = 1;
         let engine = StorageEngine::new(config, None).unwrap();
         engine.register_table(test_schema()).unwrap();
         let tid = table_id();
         engine
             .write(&tid, &make_key("k"), make_row(b"data", 1000), 1000)
             .unwrap();
+        assert!(
+            engine.take_flush_request(),
+            "crossing the soft threshold should request background flush"
+        );
+
+        let err = engine
+            .write(&tid, &make_key("k2"), make_row(b"data", 1000), 1000)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("memtable backpressure"),
+            "write past memtable_backpressure_bytes must fail closed; got {err}"
+        );
         assert_eq!(
             engine.sstable_count(&tid),
-            1,
-            "write past memtable_backpressure_bytes must trigger an \
-             inline flush — otherwise sustained-write workloads (repair \
-             apply, bulk load, restore) accumulate memtable RSS \
-             unboundedly between maintenance ticks"
+            0,
+            "foreground write must not block on inline SSTable flush"
         );
+        assert!(
+            engine.take_flush_request(),
+            "hard backpressure rejection should request background flush"
+        );
+
+        engine.flush_if_needed().unwrap();
+        assert_eq!(engine.sstable_count(&tid), 1);
     }
 
     #[test]

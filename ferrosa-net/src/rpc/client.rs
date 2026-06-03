@@ -13,6 +13,7 @@ use crate::config::NetConfig;
 use crate::error::{NetError, Result};
 use crate::handshake::initiate_handshake;
 use crate::message::Message;
+use crate::task_pool::TaskPool;
 
 /// Process-wide counter of orphan RPC responses — replies that arrived after
 /// the caller had already dropped the response future (e.g. timeout, cancel).
@@ -97,7 +98,14 @@ impl RpcClient {
         peer_addr: std::net::SocketAddr,
     ) -> Result<Self> {
         let tls_connector = crate::tls::build_tls_connector(&config)?;
-        Self::connect_with_tls(config, local_host_id, peer_addr, tls_connector.as_ref()).await
+        Self::connect_with_tls_on_pool(
+            config,
+            local_host_id,
+            peer_addr,
+            tls_connector.as_ref(),
+            TaskPool::current("rpc-client"),
+        )
+        .await
     }
 
     /// Connect with an optional pre-built TLS connector (avoids rebuilding per lane).
@@ -106,6 +114,23 @@ impl RpcClient {
         local_host_id: uuid::Uuid,
         peer_addr: std::net::SocketAddr,
         tls_connector: Option<&tokio_rustls::TlsConnector>,
+    ) -> Result<Self> {
+        Self::connect_with_tls_on_pool(
+            config,
+            local_host_id,
+            peer_addr,
+            tls_connector,
+            TaskPool::current("rpc-client"),
+        )
+        .await
+    }
+
+    pub async fn connect_with_tls_on_pool(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        peer_addr: std::net::SocketAddr,
+        tls_connector: Option<&tokio_rustls::TlsConnector>,
+        task_pool: TaskPool,
     ) -> Result<Self> {
         let tcp_stream = TcpStream::connect(peer_addr).await?;
 
@@ -118,10 +143,10 @@ impl RpcClient {
                 NetError::Protocol(format!("TLS connect to {peer_addr} failed: {e}"))
             })?;
             let framed = Framed::new(tls_stream, InternodeCodec::new(config.max_frame_body_size));
-            Self::finish_connect(config, local_host_id, peer_addr, framed).await
+            Self::finish_connect(config, local_host_id, peer_addr, framed, task_pool).await
         } else {
             let framed = Framed::new(tcp_stream, InternodeCodec::new(config.max_frame_body_size));
-            Self::finish_connect(config, local_host_id, peer_addr, framed).await
+            Self::finish_connect(config, local_host_id, peer_addr, framed, task_pool).await
         }
     }
 
@@ -130,6 +155,7 @@ impl RpcClient {
         local_host_id: uuid::Uuid,
         peer_addr: std::net::SocketAddr,
         mut framed: Framed<S, InternodeCodec>,
+        task_pool: TaskPool,
     ) -> Result<Self>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -149,7 +175,7 @@ impl RpcClient {
         let (mut sink, mut stream) = framed.split();
 
         // Write loop
-        tokio::spawn(async move {
+        task_pool.spawn(async move {
             while let Some(frame) = rx.recv().await {
                 if sink.send(frame).await.is_err() {
                     break;
@@ -161,7 +187,7 @@ impl RpcClient {
         let pending_clone = pending.clone();
         let alive_tx_clone = alive_tx.clone();
         let read_loop_peer = peer_addr;
-        tokio::spawn(async move {
+        task_pool.spawn(async move {
             while let Some(Ok(frame)) = stream.next().await {
                 let stream_id = frame.header.stream_id;
                 if let Ok(msg) = Message::decode(frame.header.msg_type, &mut frame.body.clone()) {
@@ -238,15 +264,17 @@ impl RpcClient {
         lane: Lane,
         timeout: std::time::Duration,
     ) -> Result<Message> {
-        let span = tracing::info_span!(
-            "net.rpc",
-            peer = %self.peer_addr,
-            msg_type = ?msg.msg_type(),
-            lane = ?lane,
-        );
-        let _enter = span.enter();
-        drop(_enter);
-        // Span is recorded but not held across await points.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let span = tracing::debug_span!(
+                "net.rpc",
+                peer = %self.peer_addr,
+                msg_type = ?msg.msg_type(),
+                lane = ?lane,
+            );
+            let _enter = span.enter();
+            drop(_enter);
+            // Span is recorded but not held across await points.
+        }
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();
 
