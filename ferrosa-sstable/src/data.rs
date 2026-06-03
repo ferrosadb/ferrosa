@@ -23,6 +23,13 @@ use crate::statistics::SerializationHeader;
 use crate::types::{DeletionTime, LivenessInfo, Partition, Row};
 use crate::varint;
 
+/// Upper bound on any single length-prefixed buffer (clustering value or cell
+/// value) read from a Data.db file. A larger on-disk length means the SSTable
+/// is corrupt; it must be rejected *before* it drives an allocation, otherwise
+/// a bogus varint (a corrupt SSTable once encoded a multi-terabyte length here)
+/// would attempt a pathological `Vec` allocation and OOM the process.
+const MAX_VALUE_LEN: usize = 256 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Row flags (bit positions in the flags byte preceding each unfiltered row)
 // Reference: UnfilteredSerializer.java lines 108-118
@@ -621,23 +628,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                     if is_null || is_empty {
                         continue;
                     }
-                    let type_name = &self.header.clustering_types[i];
-                    let vlen = match marshal::value_length_if_fixed(type_name) {
-                        Some(fixed_len) => fixed_len,
-                        None => {
-                            let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-                            self.pos += n as u64;
-                            len as usize
-                        }
-                    };
-                    let mut vbuf = vec![0u8; vlen];
-                    self.reader.read_exact_at(&mut vbuf, self.pos)?;
-                    self.pos += vlen as u64;
-
-                    if num_clustering > 1 {
-                        ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
-                    }
-                    ck_bytes.extend_from_slice(&vbuf);
+                    self.read_clustering_value_into(i, num_clustering, &mut ck_bytes)?;
                 }
             }
             ck_bytes
@@ -986,26 +977,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                         continue;
                     }
 
-                    let type_name = &self.header.clustering_types[i];
-                    let vlen = match marshal::value_length_if_fixed(type_name) {
-                        Some(fixed_len) => fixed_len,
-                        None => {
-                            let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-                            self.pos += n as u64;
-                            len as usize
-                        }
-                    };
-                    let mut vbuf = vec![0u8; vlen];
-                    self.reader.read_exact_at(&mut vbuf, self.pos)?;
-                    self.pos += vlen as u64;
-
-                    // For multi-column CK, add u16 BE length prefix per component
-                    // so the CQL layer's decode_clustering can split them back.
-                    // Single-column CK uses raw bytes (no prefix).
-                    if num_clustering > 1 {
-                        ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
-                    }
-                    ck_bytes.extend_from_slice(&vbuf);
+                    self.read_clustering_value_into(i, num_clustering, &mut ck_bytes)?;
                 }
             }
             ck_bytes
@@ -1183,23 +1155,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                     if is_null || is_empty {
                         continue;
                     }
-                    let type_name = &self.header.clustering_types[i];
-                    let vlen = match marshal::value_length_if_fixed(type_name) {
-                        Some(fixed_len) => fixed_len,
-                        None => {
-                            let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-                            self.pos += n as u64;
-                            len as usize
-                        }
-                    };
-                    let mut vbuf = vec![0u8; vlen];
-                    self.reader.read_exact_at(&mut vbuf, self.pos)?;
-                    self.pos += vlen as u64;
-
-                    if num_clustering > 1 {
-                        ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
-                    }
-                    ck_bytes.extend_from_slice(&vbuf);
+                    self.read_clustering_value_into(i, num_clustering, &mut ck_bytes)?;
                 }
             }
             ck_bytes
@@ -1454,19 +1410,66 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 self.pos += n as u64;
                 vlen
             };
-            // Same corruption guard as read_cell so a bogus vlen
-            // doesn't carry us past EOF silently.
-            const MAX_CELL_VALUE_LEN: u64 = 256 * 1024 * 1024;
-            if vlen > MAX_CELL_VALUE_LEN {
+            // Same corruption guard as read_value_bytes so a bogus vlen
+            // doesn't carry us past EOF silently. This path only skips the
+            // value (no allocation), so it guards without reading.
+            if vlen > MAX_VALUE_LEN as u64 {
                 return Err(Error::from(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "cell value length {vlen} exceeds maximum ({MAX_CELL_VALUE_LEN}), likely corrupt SSTable"
+                        "cell value length {vlen} exceeds maximum ({MAX_VALUE_LEN}), likely corrupt SSTable"
                     ),
                 )));
             }
             self.pos += vlen;
         }
+        Ok(())
+    }
+
+    /// Allocate and fill a `len`-byte value buffer at the cursor, rejecting a
+    /// corrupt length *before* allocation. A length above [`MAX_VALUE_LEN`]
+    /// indicates a corrupt SSTable; surfacing a clean error lets the engine
+    /// exclude the file instead of OOMing on a pathological allocation.
+    /// Advances `self.pos` past the value on success.
+    fn read_value_bytes(&mut self, len: usize, what: &str) -> Result<Vec<u8>> {
+        if len > MAX_VALUE_LEN {
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{what} length {len} exceeds maximum ({MAX_VALUE_LEN}), likely corrupt SSTable"
+                ),
+            )));
+        }
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact_at(&mut buf, self.pos)?;
+        self.pos += len as u64;
+        Ok(buf)
+    }
+
+    /// Read clustering component `i` (`self.header.clustering_types[i]`) at the
+    /// cursor and append it to `ck_bytes`, length-prefixing each component when
+    /// the clustering key has more than one so the CQL layer's
+    /// `decode_clustering` can split them back. The on-disk length is bounded
+    /// via [`Self::read_value_bytes`].
+    fn read_clustering_value_into(
+        &mut self,
+        i: usize,
+        num_clustering: usize,
+        ck_bytes: &mut Vec<u8>,
+    ) -> Result<()> {
+        let vlen = match marshal::value_length_if_fixed(&self.header.clustering_types[i]) {
+            Some(fixed_len) => fixed_len,
+            None => {
+                let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                len as usize
+            }
+        };
+        let vbuf = self.read_value_bytes(vlen, "clustering value")?;
+        if num_clustering > 1 {
+            ck_bytes.extend_from_slice(&(vbuf.len() as u16).to_be_bytes());
+        }
+        ck_bytes.extend_from_slice(&vbuf);
         Ok(())
     }
 
@@ -1536,21 +1539,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 self.pos += n as u64;
                 vlen as usize
             };
-            // Guard against corrupt length values that would cause capacity overflow.
-            // A single cell value should never exceed 256 MB.
-            const MAX_CELL_VALUE_LEN: usize = 256 * 1024 * 1024;
-            if vlen > MAX_CELL_VALUE_LEN {
-                return Err(Error::from(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "cell value length {vlen} exceeds maximum ({MAX_CELL_VALUE_LEN}), likely corrupt SSTable"
-                    ),
-                )));
-            }
-            let mut vbuf = vec![0u8; vlen];
-            self.reader.read_exact_at(&mut vbuf, self.pos)?;
-            self.pos += vlen as u64;
-            Some(vbuf)
+            Some(self.read_value_bytes(vlen, "cell value")?)
         };
 
         if is_deleted {
@@ -1650,6 +1639,51 @@ mod tests {
         data.push(END_OF_PARTITION);
 
         data
+    }
+
+    /// A corrupt clustering-value length must be rejected *before* it drives a
+    /// `Vec` allocation — otherwise a bogus multi-terabyte varint in a corrupt
+    /// SSTable OOM-kills the process. Regression for the previously unbounded
+    /// `vec![0u8; vlen]` in the clustering read path.
+    #[test]
+    fn corrupt_clustering_length_is_rejected_before_alloc() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            // Variable-length clustering type → the reader takes a varint
+            // length prefix, which is where corruption injects a huge length.
+            clustering_types: vec!["org.apache.cassandra.db.marshal.UTF8Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+
+        let mut data = Vec::new();
+        let key = b"pk1";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
+        // Clustering prefix header: all components present, non-empty.
+        push_unsigned_vint(&mut data, 0);
+        // Corrupt clustering-value length: one byte past the bound. The guard
+        // must fire here, before any allocation or read of the (absent) value.
+        push_unsigned_vint(&mut data, MAX_VALUE_LEN as u64 + 1);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let err = reader
+            .read_partition()
+            .expect_err("corrupt clustering length must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds maximum"),
+            "expected a bounds-guard error, got: {msg}"
+        );
     }
 
     #[test]
