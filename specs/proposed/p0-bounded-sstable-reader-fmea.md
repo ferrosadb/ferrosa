@@ -23,9 +23,15 @@ critical (silent data loss/corruption outranks a crash, per the project fail-lou
 | 9 | **Cap too low → open/evict thrash** | Perf collapse (constant re-open), not OOM | 4 | 5 | 5 | 100 | Tune default vs 2 GiB budget; expose hit-rate + eviction metrics; default reader_cap=256 / fanin_cap=32 as starting point. |
 | 10 | **Eviction drops a reader still mid-iteration** (refcount check race) | Use-after-evict / reopened mid-scan inconsistency | 9 | 2 | 5 | 90 | Only evict entries with `strong_count == 1`; the iterating path holds an `Arc` for its lifetime. Test: evict-pressure during an active scan does not disturb results. |
 | 11 | **Compaction still opens its own fan-in (32) readers outside the pool** | Double-counts memory (pool cap + 32 compaction readers + concurrent tasks) | 6 | 4 | 4 | 96 | Route compaction input opens through the pool too (or account them); cap concurrent compaction tasks. Lower priority — compaction fan-in already bounded per task. |
+| 13 | **Read-merge bounds reader COUNT but materializes whole tiers of partition DATA** (the Phase-4 `stage_sstable_tiers` regression) | OOM-kill on a full-range digest/repair build over a table whose SSTables span the whole ring — exactly the `entity_store` Merkle-build OOM observed on a quiesced 3-node cluster. The fix for #5 (bound reader count) silently *introduced* this by collecting `O(table)` partitions per tier into a `Vec` up front. | 9 | 7 | 4 | 252 | **Stream, never materialize.** Remove tier materialization; k-way-merge one partition per source in flight so peak DATA = `O(open sources)`, not `O(table)`. For budgeted reads, check the budget before merging the next partition. Accept `O(open readers)` reader *count* under full overlap (structs are small; pool + compaction bound it) — strict reader-count bounding via external multi-pass is OUT OF SCOPE. **Test gate (this was the missing detection):** a *large-range data-bound* test asserting peak materialized partitions in flight is `O(fanin)` not `O(total partitions)` — `large_range_digest_is_data_bounded_not_table_bounded` + `bounded_fetch_is_data_bounded_not_table_bounded` (RED on tier code, GREEN on streaming). |
 
 ## Top risks to design out first (highest RPN)
 
+0. **#13 tier-materialization data OOM (252)** — the highest-RPN mode, and the one that
+   actually fired in production *after* the Phase-4 reader-count fix shipped. A mitigation that
+   bounds reader *count* but not partition *DATA* is not a fix. The detection gap (no
+   data-bound test, only reader-count tests) is why it regressed silently; the mandatory gate is
+   a large-range *data*-bound test, not just a reader-count gauge. Fixed in Phase 6.5.
 1. **#1 startup smoke-test residency (216)** — the actually-observed OOM. The pool is
    useless if startup still materializes every reader. This must be in P0a.
 2. **#3 staged-merge dedup correctness (160)** and **#2 descriptor-bounds pruning (160)** —

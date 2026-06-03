@@ -40,12 +40,19 @@
 - [x] golden equivalence covered by full suite (785 lib tests incl. flush/compaction/restart roundtrips) + Phase-4 equivalence tests
 - [x] full `ferrosa-storage` lib suite green (785 passed)
 
-## Phase 4 — Staged bounded read-merge — FMEA #3, #5 — DONE
+## Phase 4 — Staged bounded read-merge — FMEA #3, #5 — DONE, then SUPERSEDED by Phase 6.5
 
-- [x] staged merge helper `stage_sstable_tiers`: ≤ `fanin_cap` readers open at any instant (sequential per-tier open/drain/drop; multi-pass tiers); `FERROSA_READ_MERGE_FANIN` (default 32)
+> **Superseded:** the `stage_sstable_tiers` helper introduced here bounded reader count but
+> unbounded partition DATA and caused a P0 OOM (see Phase 6.5). It was removed; the read-merge
+> paths now stream one partition per source. The boxes below record what Phase 4 did before the
+> revert; the `peak_open_readers_stays_within_fanin_during_staged_merge` and
+> `bounded_fetch_peak_readers_stays_within_fanin` reader-count gates were replaced by the Phase 6.5
+> DATA-bound gates (a reader-count cap under full overlap is intentionally not enforced — see Phase 6.5).
+
+- [x] ~~staged merge helper `stage_sstable_tiers`: ≤ `fanin_cap` readers open at any instant~~ (removed in Phase 6.5)
 - [x] migrate `read_token_range`, `walk_token_range`, `walk_token_range_for_digest` (NOT `read_token_range_bounded` — lives on a held branch, absent here)
-- [x] test: `peak_open_readers_stays_within_fanin_during_staged_merge` (peak resident ≤ fanin, soft_cap_breaches == 0)
-- [x] equivalence tests: `staged_token_range_read_is_byte_identical_to_single_pass`, `staged_digest_walk_is_byte_identical_to_single_pass` (staged == single-pass, byte-identical, 6 random windows; dedup + LWW identical)
+- [x] ~~test: `peak_open_readers_stays_within_fanin_during_staged_merge`~~ (replaced by `large_range_digest_is_data_bounded_not_table_bounded`)
+- [x] equivalence tests (renamed `staged_*` → `streaming_*` in Phase 6.5; still == single-pass, byte-identical, 6 windows; dedup + LWW identical)
 - [x] readers released per tier (no `Arc<SSTableReader>` held across `.await`; staged tiers drop readers before the next tier opens)
 - [x] full lib suite green (785 passed); cluster `repair` tests green (54 passed)
 
@@ -63,6 +70,55 @@
   - `store::tests::held_reader_survives_concurrent_swap_eviction` (FileFlushTarget; 16-row partition): a reader `Arc` taken before eviction reads the full 16 rows, then `reader_pool.remove` evicts that gen, and the held `Arc` still yields identical complete rows (no panic / truncation / use-after-evict; `Arc::strong_count == 1` proves the pool released its ref while the scan keeps the reader alive). A fresh post-eviction store read reopens the gen and returns the same rows.
   - Added test-only `ReaderPool::contains(key)` + `TableStore::pool_contains_gen(gen)` (keys identically to the live path via `SstableDescriptor::gen_num_for`).
 - [ ] (optional) route compaction input opens through pool / cap concurrent compactions — deferred (FMEA #11, lower priority; compaction planning already opens through the pool via `open_reader`).
+
+## Phase 6.5 — Tier-materialization OOM regression: stream, don't materialize — FMEA #3/#5/#13 — DONE
+
+> **Regression found in Phase 4.** `stage_sstable_tiers` (added in Phase 4) bounded the
+> reader *count* but **unbounded the partition DATA**: each tier collected every in-range
+> partition of its SSTables into a `Vec<Partition>` up front. The digest Merkle build calls
+> `walk_token_range_for_digest` over the **full token range**, so on a table whose SSTables
+> each span the whole ring (`entity_store`/`typed_edges`) every tier materialized ~the entire
+> table → peak `O(total partitions)` → node OOM-killed. Live proof: a quiesced 3-node cluster
+> OOM-killed both repair peers during `entity_store` Merkle build. This regressed the digest
+> path from its original (pre-Phase-4) **streaming k-way merge** ("one partition per source in
+> flight regardless of table size") to tier-materialization.
+
+- [x] **Fix — stream, never materialize tiers.** Removed `stage_sstable_tiers` entirely. In
+  `walk_token_range_for_digest`, `read_token_range_bounded`, and `walk_token_range`, open one
+  pooled streaming reader per overlapping SSTable (token-pruned by `overlaps_token_range`) and
+  k-way-merge **one partition at a time**: peek smallest key across all sources, cell-merge the
+  same-key partitions across sources (`merge::merge_partitions` + `apply_deletions`, unchanged),
+  emit/hash that ONE partition, advance. Peak materialized partitions = `O(open sources)`, never
+  `O(table)`. For `read_token_range_bounded` the byte/count budget is checked **before** the next
+  partition is merged, so peak working set is `max_bytes` + one in-flight partition.
+- [x] **Full-overlap vs disjoint.** When SSTables are token-disjoint the merge naturally only
+  decodes the few sources covering the current key. When every SSTable spans the full range
+  (`entity_store`/`typed_edges`), sub-ranging cannot reduce fan-in — so we open all overlapping
+  readers and stream. That keeps DATA bounded (one partition per source); reader *structs* are
+  small and the resident pool + compaction bound how many overlap. **Strict reader-count bounding
+  under full overlap (external multi-pass merge) is explicitly OUT OF SCOPE** — DATA bounding is
+  what fixes the OOM. Documented inline in `walk_token_range_for_digest`.
+- [x] **New test gate (the gap that let the regression through): large-range DATA-bound.**
+  - `store::tests::large_range_digest_is_data_bounded_not_table_bounded` — 40 full-overlap SSTables
+    × 12 keys (480 partition copies on disk, 12 merged in range). Asserts the test-only
+    peak-in-flight gauge (`store::inflight`) stays `O(open sources)` for both `walk_token_range_for_digest`
+    and `walk_token_range`, NOT `O(480)`.
+  - `store::tests::bounded_fetch_is_data_bounded_not_table_bounded` — 30 full-overlap SSTables × 10
+    keys; tight count budget; asserts peak in-flight is budget-bounded, not `O(300)`.
+  - **RED→GREEN proven**: temporarily re-staging overlapping SSTable partitions into a
+    `PartitionSource` (the old regression shape) drives the digest gauge to 480 and fails the test;
+    the streaming fix passes.
+  - Instrumentation: test-only `store::inflight` peak gauge + `PartitionSource` wrapper (compiles
+    away in production via `#[cfg(test)]`).
+- [x] **Equivalence tests kept/renamed** (correctness on the consensus path): `streaming_token_range_read_is_byte_identical_to_single_pass`,
+  `streaming_digest_walk_is_byte_identical_to_single_pass`, `bounded_fetch_is_byte_identical_to_single_pass_read_token_range`
+  (== single-pass `read_token_range` golden across 6 windows / all budgets).
+- [x] Removed now-dead `effective_read_merge_fanin` + `read_merge_fanin_override` field +
+  `set_read_merge_fanin_for_test` (the fanin knob only selected the tier path, which no longer exists).
+  `read_token_range` (Vec-returning, `limit`-bounded) audited: it never routed through
+  `stage_sstable_tiers` and is bounded by its caller-supplied `limit`; no production caller passes an
+  unbounded limit over a large range, so left as-is.
+- [x] full `ferrosa-storage` lib suite green (793 passed, 0 failed, 0 ignored — unchanged count); cluster green with CI skips; clippy/fmt clean.
 
 ## Phase 7 — End-to-end verification
 
