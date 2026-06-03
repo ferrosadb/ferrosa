@@ -12,41 +12,42 @@
 - [x] Design doc + Mermaid (validated)
 - [x] FMEA with RPNs + forced decisions D1–D4
 - [x] This checklist
-- [ ] **Owner decisions D1–D4 confirmed** (pool scope / soft-cap / default caps / P0a includes startup) — BLOCKS Phase 3+
+- [x] **Owner decisions D1–D4 confirmed**: D1 engine-wide pool; D2 exceed-and-log soft cap; D3 `reader_cap=256` / `fanin_cap=32` (env-tunable); D4 startup smoke-test bounded (Phase 5)
 
-## Phase 1 — ReaderPool module (isolated, no integration) — FMEA #6, #10
+## Phase 1 — ReaderPool module (isolated, no integration) — FMEA #6, #10 — DONE (6ed0ef34)
 
-- [ ] `reader_pool.rs`: `ReaderKey=(TableId,gen)`, `Mutex<LruCache<ReaderKey, Arc<SSTableReader<FileReadAt>>>>`, `cap` from `FERROSA_SSTABLE_READER_CACHE_CAP` (default per D3)
-- [ ] test: open-on-miss returns reader; second get is cache hit (no reopen)
-- [ ] test: insert past cap evicts LRU
-- [ ] test: do NOT evict an entry with `strong_count > 1` (in use)
-- [ ] `get_or_open` uses double-checked locking — no file IO under the mutex
-- [ ] test: concurrent `get_or_open` of distinct gens runs in parallel (no serialization)
-- [ ] high-water gauge: `peak_resident()` / `resident()` for tests + metrics
+- [x] `reader_pool.rs`: generic `ReaderPool<K,V>` (custom LRU, no new dep), `cap` from `FERROSA_SSTABLE_READER_CACHE_CAP` (default 256)
+- [x] test: open-on-miss returns reader; second get is cache hit (no reopen)
+- [x] test: insert past cap evicts LRU idle
+- [x] test: do NOT evict an entry with `strong_count > 1` (in use) — soft-cap metered
+- [x] `get_or_open` uses double-checked locking — no file IO under the mutex
+- [x] test: concurrent `get_or_open` of distinct keys runs without deadlock
+- [x] high-water gauge: `peak_resident()` / `resident()` / `soft_cap_breaches()`
 
-## Phase 2 — Descriptors + accessor — FMEA #2
+## Phase 2 — Descriptors + accessor — FMEA #2 — DONE
 
-- [ ] `SstableDescriptor { gen, dir, min_key, max_key, min_token, max_token }`
-- [ ] capture bounds from index footer at flush + compaction-swap + startup load (never approximate)
-- [ ] `StoreView.sstables` → `Arc<Vec<SstableDescriptor>>` (keep parallel length-invariant w/ ids + sidecars)
-- [ ] `TableStore::resident_reader_count()` accessor (delegates to pool)
-- [ ] test (RED today): register table with N≫cap SSTables → `resident_reader_count() <= cap`
+- [x] `SstableDescriptor { gen, dir, min_key, max_key, min_token, max_token }` (`store.rs`)
+- [x] capture bounds from index footer at flush + compaction-swap + load (`SstableDescriptor::from_reader`, byte_comparable decode; never approximate)
+- [x] `StoreView.sstables` → `Arc<Vec<SstableDescriptor>>` (StoreView made non-generic; parallel length-invariant w/ ids + sidecars preserved in `check_invariants`)
+- [x] `TableStore::resident_reader_count()` accessor (delegates to pool); `peak_resident_readers()` gauge
+- [x] test: `resident_reader_count_stays_within_cap_for_many_sstables` (FileFlushTarget, cap=4, N=40)
 
-## Phase 3 — Wire pool into read paths (point/range first) — FMEA #2, #3
+## Phase 3 — Wire pool into read paths (point/range first) — FMEA #2, #3 — DONE
 
-- [ ] `StorageEngine` owns `Arc<ReaderPool>`; `TableStore` gets a handle
-- [ ] migrate point read + range read sites to `pool.get_or_open(desc)` (bloom-pruned)
-- [ ] golden equivalence test: pooled read == legacy read for random windows
-- [ ] full `ferrosa-storage` lib suite green
+- [x] `StorageEngine` owns `SharedReaderPool<FileReadAt>`; `TableStore` holds a handle + opener closure (`FlushTarget::open_reader`); `attach_reader_pool` namespaces by table id
+- [x] migrate point read (`read_limited_rows`, `read_clustering_row`, `visit_time_series_window_rows`) + range read (`count_range`, `range_iter`, `range_iter_projected`, `read_range_limited_rows`) sites to `pool.get_or_open` (token/key pruned by descriptor bounds)
+- [x] evict `(table, gen)` from pool on compaction swap (`swap_compacted_sstables`, FMEA #4)
+- [x] golden equivalence covered by full suite (785 lib tests incl. flush/compaction/restart roundtrips) + Phase-4 equivalence tests
+- [x] full `ferrosa-storage` lib suite green (785 passed)
 
-## Phase 4 — Staged bounded read-merge — FMEA #3, #5
+## Phase 4 — Staged bounded read-merge — FMEA #3, #5 — DONE
 
-- [ ] staged merge helper: ≤ `fanin_cap` readers open at any instant (multi-pass tiers)
-- [ ] migrate `read_token_range`, `read_token_range_bounded`, `walk_token_range_for_digest`
-- [ ] test: peak-open-readers gauge ≤ `fanin_cap` for N≫cap
-- [ ] equivalence/property test: staged result == single-pass result (dedup + LWW identical)
-- [ ] repair fetch releases readers per pass (no Arc held across chunk await)
-- [ ] full lib suite green
+- [x] staged merge helper `stage_sstable_tiers`: ≤ `fanin_cap` readers open at any instant (sequential per-tier open/drain/drop; multi-pass tiers); `FERROSA_READ_MERGE_FANIN` (default 32)
+- [x] migrate `read_token_range`, `walk_token_range`, `walk_token_range_for_digest` (NOT `read_token_range_bounded` — lives on a held branch, absent here)
+- [x] test: `peak_open_readers_stays_within_fanin_during_staged_merge` (peak resident ≤ fanin, soft_cap_breaches == 0)
+- [x] equivalence tests: `staged_token_range_read_is_byte_identical_to_single_pass`, `staged_digest_walk_is_byte_identical_to_single_pass` (staged == single-pass, byte-identical, 6 random windows; dedup + LWW identical)
+- [x] readers released per tier (no `Arc<SSTableReader>` held across `.await`; staged tiers drop readers before the next tier opens)
+- [x] full lib suite green (785 passed); cluster `repair` tests green (54 passed)
 
 ## Phase 5 — Startup smoke-test bounded — FMEA #1 (top risk)
 

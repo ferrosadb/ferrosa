@@ -44,6 +44,11 @@ use crate::memtable::Memtable;
 use crate::merge;
 use crate::range_merger::ColumnOrdinalMapping;
 
+/// Engine-wide bounded reader pool keyed by `(table_id, gen)`, shared by every
+/// `TableStore` so resident reader memory is `O(reader_cap)` across all tables.
+pub(crate) type SharedReaderPool<R> =
+    Arc<crate::reader_pool::ReaderPool<(String, u64), SSTableReader<R>>>;
+
 /// Maximum number of row positions collected from secondary index before
 /// returning an error. Prevents OOM from high-cardinality queries.
 const INDEX_RESULT_CAP: usize = 10_000;
@@ -115,22 +120,110 @@ pub(crate) fn search_quantized_vector_artifact_reader<R: ReadAt>(
     })
 }
 
+/// Lightweight, always-resident identity + pruning metadata for one SSTable.
+///
+/// This replaces the previously-resident `Arc<SSTableReader>` as the
+/// `StoreView` source of truth. Holding one reader per SSTable made resident
+/// memory scale with SSTable count and OOM-killed bloated nodes
+/// (`specs/todo/p0-unbounded-sstable-reader-memory-oom.md`). A descriptor is
+/// cheap to clone and carries no file handles, bloom filter, or index — the
+/// actual reader is opened on demand through the engine-wide
+/// [`crate::reader_pool::ReaderPool`] and evicted when idle.
+///
+/// Key/token bounds are captured from the SSTable's index footer at the moment
+/// the reader exists (flush / compaction-swap / startup load) and are never
+/// approximated (FMEA #2: wrong bounds silently drop matching rows on read).
+#[derive(Clone, Debug)]
+pub(crate) struct SstableDescriptor {
+    /// Stable generation ID (used for file names, swap matching, and the pool key).
+    pub gen: String,
+    /// Directory containing the SSTable component files. May be empty for legacy
+    /// in-memory rows, in which case the flush target's base dir is used.
+    pub dir: std::path::PathBuf,
+    /// Smallest decorated-key bytes in this SSTable (byte-comparable order).
+    pub min_key: Vec<u8>,
+    /// Largest decorated-key bytes in this SSTable (byte-comparable order).
+    pub max_key: Vec<u8>,
+    /// Smallest partition token covered by this SSTable.
+    pub min_token: i64,
+    /// Largest partition token covered by this SSTable.
+    pub max_token: i64,
+}
+
+impl SstableDescriptor {
+    /// Build a descriptor from a live reader, capturing key/token bounds from
+    /// the index footer. The bounds use the same decode precedent as compaction
+    /// metadata: byte-comparable decode of the smallest/largest key bytes, with
+    /// a raw-key token fallback for older fixtures.
+    fn from_reader<R: ReadAt + Send + Sync + 'static>(
+        gen: String,
+        dir: std::path::PathBuf,
+        reader: &SSTableReader<R>,
+    ) -> Self {
+        use ferrosa_common::Token;
+        let min_key = reader.smallest_key_bytes().to_vec();
+        let max_key = reader.largest_key_bytes().to_vec();
+        let min_token = ferrosa_sstable::byte_comparable::decode(&min_key)
+            .map(|key| key.token.0)
+            .unwrap_or_else(|_| Token::from_key(&min_key).0);
+        let max_token = ferrosa_sstable::byte_comparable::decode(&max_key)
+            .map(|key| key.token.0)
+            .unwrap_or_else(|_| Token::from_key(&max_key).0);
+        Self {
+            gen,
+            dir,
+            min_key,
+            max_key,
+            min_token,
+            max_token,
+        }
+    }
+
+    /// Numeric generation parsed from the stable ID, used as the pool key gen.
+    /// Non-numeric IDs (e.g. the `"compacted"` test fixture) hash to a stable
+    /// synthetic value so they still pool correctly.
+    fn gen_num(&self) -> u64 {
+        self.gen.parse::<u64>().unwrap_or_else(|_| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.gen.hash(&mut h);
+            // Reserve the high bit so synthetic gens never collide with real
+            // numeric gens in the pool key space.
+            h.finish() | (1u64 << 63)
+        })
+    }
+
+    /// Can this SSTable contain a partition whose token is in `[start, end)`?
+    /// Used to prune descriptors before opening their readers on range reads.
+    fn overlaps_token_range(&self, start: i64, end: i64) -> bool {
+        // Half-open [start, end): a descriptor covering [min_token, max_token]
+        // overlaps when min_token < end && max_token >= start.
+        self.min_token < end && self.max_token >= start
+    }
+}
+
 /// Atomic snapshot of the storage engine's current state.
 ///
 /// Held inside an [`ArcSwap`] so any thread can load a consistent view
 /// without locking. The `Arc` fields inside ensure the data structures
 /// remain alive as long as any reader holds a guard.
-struct StoreView<R: ReadAt + Send + Sync + 'static> {
+struct StoreView {
     /// The active memtable: accepts all current writes.
     active: Arc<dyn Memtable>,
     /// A memtable that has been swapped out and is being flushed.
     /// Readable during the flush; `None` when no flush is in progress.
     flushing: Option<Arc<dyn Memtable>>,
-    /// Completed SSTables, newest first.
-    sstables: Arc<Vec<Arc<SSTableReader<R>>>>,
+    /// Completed SSTables, newest first. Lightweight descriptors only — the
+    /// readers are opened on demand through the engine-wide reader pool so
+    /// resident memory is `O(reader_cap)` rather than `O(sstable_count)`.
+    sstables: Arc<Vec<SstableDescriptor>>,
     /// Stable generation IDs and file directories for each SSTable, parallel to `sstables`.
     /// The String is the gen (used for file names and swap matching).
     /// The PathBuf is the directory containing the SSTable files.
+    ///
+    /// Retained for now to preserve the parallel-length invariant and the many
+    /// existing call sites; the same `(gen, dir)` pair is also stored on each
+    /// descriptor.
     sstable_ids: Arc<Vec<(String, std::path::PathBuf)>>,
     /// Per-index MemtableIndex companions for the active memtable, keyed by
     /// index name. Swapped atomically alongside the active memtable during flush.
@@ -144,7 +237,7 @@ struct StoreView<R: ReadAt + Send + Sync + 'static> {
     vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>>,
 }
 
-impl<R: ReadAt + Send + Sync + 'static> StoreView<R> {
+impl StoreView {
     /// Check the three-parallel-vector invariant:
     /// `sstables.len() == sstable_ids.len() == sidecar_indexes.len()`.
     ///
@@ -219,7 +312,18 @@ pub struct TableStore<F: FlushTarget> {
     /// COLUMN` left the schema stale and the flush path produced silently
     /// corrupt SSTables (bug-sstable-writer-produces-zero-byte-rows-db.md).
     schema: ArcSwap<TableSchema>,
-    view: ArcSwap<StoreView<F::Reader>>,
+    view: ArcSwap<StoreView>,
+    /// Engine-wide bounded reader pool, shared across all tables. Opens
+    /// `SSTableReader<F::Reader>` on demand keyed by `(table, gen)`.
+    reader_pool: SharedReaderPool<F::Reader>,
+    /// Stable identifier for this table, used as the high-order half of the
+    /// pool key so generations from different tables never collide.
+    pool_table_key: String,
+    /// Test-only override for the staged read-merge fan-in. `0` means "use the
+    /// environment / default" (`configured_read_merge_fanin`). Lets equivalence
+    /// tests force the multi-pass tiered path deterministically without racing
+    /// on a process-global env var.
+    read_merge_fanin_override: std::sync::atomic::AtomicUsize,
     /// Serializes concurrent flushes. The read/write paths never touch this.
     flush_guard: Mutex<()>,
     /// Write barrier: writes hold shared (read), flush holds exclusive (write)
@@ -421,7 +525,229 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
+                crate::reader_pool::configured_reader_cache_cap(),
+            )),
+            pool_table_key: String::new(),
+            read_merge_fanin_override: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Replace this store's reader pool with a shared engine-wide pool and set
+    /// the table key used to namespace generations in that pool.
+    ///
+    /// Called by the engine right after constructing the store so all tables
+    /// share one global resident-reader budget (FMEA #8 — a per-table pool
+    /// would bound only `N_tables × cap`).
+    pub fn attach_reader_pool(&mut self, pool: SharedReaderPool<F::Reader>, table_key: String) {
+        self.reader_pool = pool;
+        self.pool_table_key = table_key;
+    }
+
+    /// Current number of resident open readers attributable across the shared
+    /// pool. Bounded by the pool cap (soft cap when readers are in use).
+    pub fn resident_reader_count(&self) -> usize {
+        self.reader_pool.resident()
+    }
+
+    /// Effective staged read-merge fan-in: the test override if set, otherwise
+    /// the env/default value.
+    fn effective_read_merge_fanin(&self) -> usize {
+        let ovr = self
+            .read_merge_fanin_override
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if ovr > 0 {
+            ovr
+        } else {
+            crate::reader_pool::configured_read_merge_fanin()
+        }
+    }
+
+    /// Test hook: force the staged read-merge fan-in for this store so tiered
+    /// multi-pass merges are exercised deterministically.
+    #[cfg(test)]
+    fn set_read_merge_fanin_for_test(&self, n: usize) {
+        self.read_merge_fanin_override
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// High-water mark of resident readers in the pool (test/metrics gauge).
+    pub fn peak_resident_readers(&self) -> usize {
+        self.reader_pool.peak_resident()
+    }
+
+    /// Pool key for a generation belonging to this table.
+    fn pool_key(&self, desc: &SstableDescriptor) -> (String, u64) {
+        (self.pool_table_key.clone(), desc.gen_num())
+    }
+
+    /// Open (or fetch from the pool) the reader for `desc`. The returned `Arc`
+    /// keeps the reader resident for the caller's lifetime; once dropped it
+    /// becomes evictable.
+    fn open_reader(&self, desc: &SstableDescriptor) -> Result<Arc<SSTableReader<F::Reader>>> {
+        let dir = desc.dir.clone();
+        let gen = desc.gen_num();
+        let key = self.pool_key(desc);
+        let flush_target = &self.flush_target;
+        self.reader_pool
+            .get_or_open(key, || flush_target.open_reader(&dir, gen))
+    }
+
+    /// Open (pooled) the readers for every descriptor whose key range overlaps
+    /// `[start, end]`, newest-first, returning the `Arc`s so the caller can hand
+    /// a `&[Arc<SSTableReader>]` slice to the range merger and keep them alive
+    /// for the merge's lifetime.
+    ///
+    /// Pruning is conservative — a descriptor is skipped only when its
+    /// byte-comparable key range is provably disjoint from the requested window
+    /// (FMEA #2: never prune away an SSTable that might hold a matching row).
+    fn open_readers_for_key_range(
+        &self,
+        descriptors: &[SstableDescriptor],
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> Result<Vec<Arc<SSTableReader<F::Reader>>>> {
+        let start_bytes = start.map(ferrosa_sstable::byte_comparable::encode);
+        let end_bytes = end.map(ferrosa_sstable::byte_comparable::encode);
+        let mut readers = Vec::new();
+        for desc in descriptors.iter() {
+            // Skip only on provable disjointness:
+            //   start > desc.max_key  → window begins after this SSTable ends
+            //   end   < desc.min_key  → window ends before this SSTable begins
+            if let Some(ref sb) = start_bytes {
+                if sb.as_slice() > desc.max_key.as_slice() {
+                    continue;
+                }
+            }
+            if let Some(ref eb) = end_bytes {
+                if eb.as_slice() < desc.min_key.as_slice() {
+                    continue;
+                }
+            }
+            readers.push(self.open_reader(desc)?);
+        }
+        Ok(readers)
+    }
+
+    /// Collapse the SSTable descriptors overlapping `[start_token, end_token)`
+    /// into a set of token-ordered, tombstone-preserving partition tiers, never
+    /// holding more than `fanin_cap` readers open at any instant.
+    ///
+    /// Each returned tier is a `Vec<Partition>` sorted by key, where partitions
+    /// sharing a key **within** the tier are cell-merged via
+    /// [`merge::merge_partitions`] **without** applying deletions — tombstones
+    /// are preserved so the caller's final cross-tier + memtable merge applies
+    /// deletions exactly once. Because cell-level last-write-wins is
+    /// associative, collapsing within tiers then merging across tiers yields a
+    /// byte-identical result to a single-pass merge of all sources (FMEA #3).
+    ///
+    /// Reader residency: tier `k` opens up to `fanin_cap` readers, drains them
+    /// into the tier buffer, then drops them before tier `k+1` opens — so at
+    /// most `fanin_cap` SSTable readers are resident at any instant (FMEA #5).
+    fn stage_sstable_tiers(
+        &self,
+        descriptors: &[SstableDescriptor],
+        schema: &TableSchema,
+        start_token: i64,
+        end_token: i64,
+        fanin_cap: usize,
+    ) -> Result<Vec<Vec<Partition>>> {
+        let overlapping: Vec<&SstableDescriptor> = descriptors
+            .iter()
+            .filter(|d| d.overlaps_token_range(start_token, end_token))
+            .collect();
+
+        let mut tiers: Vec<Vec<Partition>> = Vec::new();
+        for group in overlapping.chunks(fanin_cap.max(1)) {
+            // Collect every in-range partition from this group's SSTables, then
+            // cell-merge same-key partitions (tombstone-preserving).
+            let mut collected: Vec<Partition> = Vec::new();
+            for desc in group {
+                let sstable = match self.open_reader(desc) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(gen = %desc.gen, "staged merge: failed to open SSTable reader: {e}");
+                        continue;
+                    }
+                };
+                let mapping = ColumnOrdinalMapping::for_header(schema, sstable.header());
+                let mut iter = match sstable.partitions_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        tracing::warn!(gen = %desc.gen, "staged merge: broken SSTable iterator: {e}");
+                        continue;
+                    }
+                };
+                let _ = iter.seek_to_token(start_token);
+                loop {
+                    match iter.next_partition() {
+                        Ok(Some(mut p)) => {
+                            let t = p.key.token.0;
+                            if t >= end_token {
+                                break;
+                            }
+                            if t >= start_token {
+                                mapping.remap_partition(&mut p);
+                                collected.push(p);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::warn!(gen = %desc.gen, "staged merge: partition decode error: {e}");
+                            break;
+                        }
+                    }
+                }
+                // `iter` and `sstable` drop here — reader becomes evictable
+                // before the next descriptor in this (or the next) tier opens.
+            }
+
+            // Within-tier collapse, mirroring the final-merge rule so a key is
+            // byte-identical whether its SSTables land in one tier or several:
+            //   * a key from a single SSTable stays raw (no apply_deletions),
+            //     exactly like the single-pass `group.len() == 1` path;
+            //   * a key from multiple SSTables is `merge_partitions` + a
+            //     `apply_deletions`, exactly like single-pass `group.len() > 1`.
+            // `apply_deletions` is idempotent and only purges rows shadowed by a
+            // tombstone in the same partition; the partition-level deletion
+            // marker is retained, so it still propagates to the final merge.
+            collected.sort_by(|a, b| a.key.cmp(&b.key));
+            let mut tier: Vec<Partition> = Vec::new();
+            let mut last_was_merged = false;
+            for p in collected {
+                if let Some(last) = tier.last_mut() {
+                    if last.key == p.key {
+                        *last = merge::merge_partitions(vec![last.clone(), p]);
+                        last_was_merged = true;
+                        continue;
+                    }
+                }
+                // Finalize the previous group if it was a multi-source merge.
+                if last_was_merged {
+                    if let Some(prev) = tier.last_mut() {
+                        merge::apply_deletions(prev);
+                    }
+                    last_was_merged = false;
+                }
+                tier.push(p);
+            }
+            if last_was_merged {
+                if let Some(prev) = tier.last_mut() {
+                    merge::apply_deletions(prev);
+                }
+            }
+            if !tier.is_empty() {
+                tiers.push(tier);
+            }
+        }
+        Ok(tiers)
+    }
+
+    /// Seed the pool with an already-open reader for `desc` (e.g. just-flushed
+    /// or just-compacted), so the immediately-following read is a cache hit and
+    /// does not reopen freshly-written component files.
+    fn seed_reader(&self, desc: &SstableDescriptor, reader: Arc<SSTableReader<F::Reader>>) {
+        self.reader_pool.insert_arc(self.pool_key(desc), reader);
     }
 
     /// Create a `TableStore` with an initial set of SSTable readers already loaded.
@@ -491,10 +817,32 @@ impl<F: FlushTarget> TableStore<F> {
             initial_sstables.len(),
             initial_ids.len()
         );
+
+        // Build the engine-local pool first so we can seed the provided readers.
+        let reader_pool: SharedReaderPool<F::Reader> = Arc::new(
+            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
+        );
+        let pool_table_key = String::new();
+
+        // Convert each provided reader into a lightweight descriptor and seed
+        // the pool so the immediately-following reads hit the cache instead of
+        // reopening. The pool's cap still bounds how many stay resident.
+        let descriptors: Vec<SstableDescriptor> = initial_sstables
+            .iter()
+            .zip(initial_ids.iter())
+            .map(|(reader, (gen, dir))| {
+                SstableDescriptor::from_reader(gen.clone(), dir.clone(), reader)
+            })
+            .collect();
+        for (reader, desc) in initial_sstables.into_iter().zip(descriptors.iter()) {
+            let key = (pool_table_key.clone(), desc.gen_num());
+            reader_pool.insert_arc(key, reader);
+        }
+
         let initial_view = StoreView {
             active,
             flushing: None,
-            sstables: Arc::new(initial_sstables),
+            sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
             sidecar_indexes: Arc::new(sidecars),
@@ -514,6 +862,9 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            reader_pool,
+            pool_table_key,
+            read_merge_fanin_override: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -688,7 +1039,26 @@ impl<F: FlushTarget> TableStore<F> {
         // Tolerate I/O errors from individual SSTables — a corrupt or
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
-        for (i, sstable) in guard.sstables.iter().enumerate() {
+        for (i, desc) in guard.sstables.iter().enumerate() {
+            // Token-prune by descriptor bounds first (no reader open). The
+            // partition's token must lie within the SSTable's covered range or
+            // it cannot hold the key.
+            let token = key.token.0;
+            if token < desc.min_token || token > desc.max_token {
+                sstable_pruned += 1;
+                continue;
+            }
+            // In range — open the reader (pooled) and bloom-check precisely.
+            let sstable = match self.open_reader(desc) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(%e, gen = %desc.gen, "point read: failed to open SSTable reader");
+                    self.sstable_read_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sstable_errors += 1;
+                    continue;
+                }
+            };
             if !sstable.may_contain_key(key) {
                 sstable_pruned += 1;
                 continue;
@@ -787,7 +1157,20 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        for (i, sstable) in guard.sstables.iter().enumerate() {
+        for (i, desc) in guard.sstables.iter().enumerate() {
+            let token = key.token.0;
+            if token < desc.min_token || token > desc.max_token {
+                continue;
+            }
+            let sstable = match self.open_reader(desc) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(%e, gen = %desc.gen, "clustering read: failed to open SSTable reader");
+                    self.sstable_read_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+            };
             if !sstable.may_contain_key(key) {
                 continue;
             }
@@ -883,11 +1266,28 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
+        // Open readers (pooled) for descriptors whose token range covers the
+        // key. Hold the `Arc`s for the lifetime of the borrowed iterators so
+        // the pool cannot evict a reader mid-scan (FMEA #5/#10).
+        let token = key.token.0;
+        let mut sst_readers: Vec<Arc<SSTableReader<F::Reader>>> = Vec::new();
+        for desc in guard.sstables.iter() {
+            if token < desc.min_token || token > desc.max_token {
+                continue;
+            }
+            match self.open_reader(desc) {
+                Ok(r) => sst_readers.push(r),
+                Err(e) => {
+                    tracing::warn!(%e, gen = %desc.gen, "time-series cursor: failed to open SSTable reader");
+                }
+            }
+        }
+
         let mut sst_sources: Vec<(
             ferrosa_sstable::reader::PartitionIter<'_, F::Reader>,
             ColumnOrdinalMapping,
         )> = Vec::new();
-        for sstable in guard.sstables.iter() {
+        for sstable in sst_readers.iter() {
             let mut iter = match sstable.partitions_iter() {
                 Ok(iter) => iter,
                 Err(e) => {
@@ -1491,14 +1891,22 @@ impl<F: FlushTarget> TableStore<F> {
             "flush: SSTable written, updating view"
         );
         let current_view = self.view.load();
-        let mut new_sstables = vec![new_reader];
-        new_sstables.extend(current_view.sstables.iter().cloned());
 
         // Use the actual base directory from the flush target, not empty PathBuf.
         // An empty path causes ID collisions with compaction output:
         // swap_compacted_sstables matches by ID only, so a flush SSTable with
         // the same gen as a compaction input gets incorrectly removed during swap.
         let flush_dir = self.flush_target.base_dir().to_path_buf();
+
+        // Build the lightweight descriptor from the freshly-flushed reader
+        // (capturing its key/token bounds), seed the pool so the next read is a
+        // cache hit, then store only the descriptor in the view.
+        let new_desc =
+            SstableDescriptor::from_reader(format!("{gen}"), flush_dir.clone(), &new_reader);
+        self.seed_reader(&new_desc, new_reader);
+        let mut new_sstables = vec![new_desc];
+        new_sstables.extend(current_view.sstables.iter().cloned());
+
         let mut new_ids = vec![(format!("{gen}"), flush_dir)];
         new_ids.extend(current_view.sstable_ids.iter().cloned());
 
@@ -1567,7 +1975,14 @@ impl<F: FlushTarget> TableStore<F> {
             .flushing
             .as_ref()
             .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
-        let sstables_slice = &view.sstables[..];
+        // Open readers for descriptors overlapping the key window (pooled).
+        // Held for the merger's lifetime so they cannot be evicted mid-merge.
+        let sst_readers = self.open_readers_for_key_range(
+            &view.sstables,
+            start_owned.as_ref(),
+            end_owned.as_ref(),
+        )?;
+        let sstables_slice = &sst_readers[..];
 
         let mut merger = crate::range_merger::merger_for_metadata_sources(
             active_iter,
@@ -1623,11 +2038,28 @@ impl<F: FlushTarget> TableStore<F> {
 
         let view = self.view.load_full();
         let schema = self.schema.load_full();
-        let column_mappings = sstable_column_mappings(&schema, &view.sstables);
         let start_owned = start.cloned();
         let end_owned = end.cloned();
         let wanted_owned = wanted;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+
+        // Open the overlapping readers (pooled) up front and move the `Arc`s
+        // into the blocking task. The readers stay resident only while the
+        // stream runs; the pool cap (soft when in use) bounds total residency.
+        let sst_readers = match self.open_readers_for_key_range(
+            &view.sstables,
+            start_owned.as_ref(),
+            end_owned.as_ref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.try_send(Err(e));
+                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }));
+            }
+        };
+        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
 
         TaskPool::current("table-store-stream").spawn_blocking(move || {
             let active_iter = view
@@ -1637,7 +2069,7 @@ impl<F: FlushTarget> TableStore<F> {
                 .flushing
                 .as_ref()
                 .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
-            let sstables_slice = &view.sstables[..];
+            let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
                 active_iter,
@@ -1706,16 +2138,31 @@ impl<F: FlushTarget> TableStore<F> {
 
         let view = self.view.load_full();
         let schema = self.schema.load_full();
-        let column_mappings = sstable_column_mappings(&schema, &view.sstables);
         let start_owned = start.cloned();
         let end_owned = end.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
+        // Open overlapping readers (pooled) and move the Arcs into the task.
+        let sst_readers = match self.open_readers_for_key_range(
+            &view.sstables,
+            start_owned.as_ref(),
+            end_owned.as_ref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.try_send(Err(e));
+                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }));
+            }
+        };
+        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
+
         TaskPool::current("table-store-stream").spawn_blocking(move || {
             // Build source iterators — these borrow from `view`
-            // (memtable Arcs and per-SSTable Arcs) which the closure
-            // owns for the task's full lifetime, so there is no
-            // self-referential lifetime problem.
+            // (memtable Arcs) and from the opened SSTable reader Arcs, both
+            // of which the closure owns for the task's full lifetime, so there
+            // is no self-referential lifetime problem.
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
@@ -1723,7 +2170,7 @@ impl<F: FlushTarget> TableStore<F> {
                 .flushing
                 .as_ref()
                 .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
-            let sstables_slice = &view.sstables[..];
+            let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
                 active_iter,
@@ -1831,10 +2278,24 @@ impl<F: FlushTarget> TableStore<F> {
         // (O(log N) via the SSTable's lazy `partition_token_offsets`
         // cache) so each repair session pays O(matches), not
         // O(table_size).
-        for (i, sstable) in guard.sstables.iter().enumerate() {
+        // Staged fan-in: process each SSTable's iterator to completion (for the
+        // window) and drop its reader before opening the next, so at most ONE
+        // SSTable reader is resident at any instant in this loop — well within
+        // `fanin_cap`. Token-prune by descriptor bounds before opening.
+        for (i, desc) in guard.sstables.iter().enumerate() {
             if matched.len() >= limit {
                 break;
             }
+            if !desc.overlaps_token_range(start_token, end_token) {
+                continue;
+            }
+            let sstable = match self.open_reader(desc) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(gen = %desc.gen, "read_token_range: failed to open SSTable reader: {e}");
+                    continue;
+                }
+            };
             let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
             let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
@@ -1973,14 +2434,21 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
         let schema = self.schema.load();
 
-        // Memtable bootstrap (same shape as walk_token_range).
+        // Vec-style partition sources, each pre-sorted by key. Always includes
+        // the active and flushing memtables; when the overlapping SSTable count
+        // exceeds the fan-in cap, the SSTables are staged into tombstone-
+        // preserving tiers and appended here too (so reader residency stays
+        // bounded — FMEA #5). Each is a peekable `Vec<Partition>` iterator,
+        // treated uniformly by the merge loop below.
+        let mut vec_sources: Vec<std::iter::Peekable<std::vec::IntoIter<Partition>>> = Vec::new();
+
         let mut mem_active: Vec<Partition> = guard
             .active
             .range_iter(None, None)
             .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
             .collect();
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut mem_active_iter = mem_active.into_iter().peekable();
+        vec_sources.push(mem_active.into_iter().peekable());
 
         let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
             Some(ref f) => f
@@ -1990,12 +2458,44 @@ impl<F: FlushTarget> TableStore<F> {
             None => Vec::new(),
         };
         mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut mem_flushing_iter = mem_flushing_vec.into_iter().peekable();
+        vec_sources.push(mem_flushing_vec.into_iter().peekable());
+
+        // Decide whether to stream SSTable readers directly (bounded fan-in) or
+        // stage them into tiers. Hold the opened reader `Arc`s for the lifetime
+        // of any borrowed iterator so the pool cannot evict mid-scan.
+        let fanin_cap = self.effective_read_merge_fanin();
+        let overlapping: Vec<&SstableDescriptor> = guard
+            .sstables
+            .iter()
+            .filter(|d| d.overlaps_token_range(start_token, end_token))
+            .collect();
+
+        let mut sst_readers: Vec<Arc<SSTableReader<F::Reader>>> = Vec::new();
+        if overlapping.len() > fanin_cap {
+            for tier in self.stage_sstable_tiers(
+                &guard.sstables,
+                &schema,
+                start_token,
+                end_token,
+                fanin_cap,
+            )? {
+                vec_sources.push(tier.into_iter().peekable());
+            }
+        } else {
+            for desc in overlapping {
+                match self.open_reader(desc) {
+                    Ok(r) => sst_readers.push(r),
+                    Err(e) => {
+                        tracing::warn!(gen = %desc.gen, "digest walk: failed to open SSTable reader: {e}");
+                    }
+                }
+            }
+        }
 
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
-            Vec::with_capacity(guard.sstables.len());
-        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(guard.sstables.len());
-        for sstable in guard.sstables.iter() {
+            Vec::with_capacity(sst_readers.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(sst_readers.len());
+        for sstable in sst_readers.iter() {
             let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
                 Err(_) => continue,
@@ -2020,14 +2520,11 @@ impl<F: FlushTarget> TableStore<F> {
             let pick = |cur: &Option<DecoratedKey>, candidate: &DecoratedKey| -> bool {
                 cur.as_ref().map(|k| candidate < k).unwrap_or(true)
             };
-            if let Some(p) = mem_active_iter.peek() {
-                if pick(&smallest_key, &p.key) {
-                    smallest_key = Some(p.key.clone());
-                }
-            }
-            if let Some(p) = mem_flushing_iter.peek() {
-                if pick(&smallest_key, &p.key) {
-                    smallest_key = Some(p.key.clone());
+            for src in vec_sources.iter_mut() {
+                if let Some(p) = src.peek() {
+                    if pick(&smallest_key, &p.key) {
+                        smallest_key = Some(p.key.clone());
+                    }
                 }
             }
             for iter in sst_iters.iter_mut() {
@@ -2044,9 +2541,15 @@ impl<F: FlushTarget> TableStore<F> {
                 break;
             };
 
-            // Count how many sources hold `key`.
-            let mem_active_has = mem_active_iter.peek().map(|p| p.key == key) == Some(true);
-            let mem_flushing_has = mem_flushing_iter.peek().map(|p| p.key == key) == Some(true);
+            // Which vec sources hold `key`?
+            let vec_match_indices: Vec<usize> = vec_sources
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, src)| match src.peek() {
+                    Some(p) if p.key == key => Some(i),
+                    _ => None,
+                })
+                .collect();
             let sst_match_indices: Vec<usize> = sst_iters
                 .iter_mut()
                 .enumerate()
@@ -2055,8 +2558,7 @@ impl<F: FlushTarget> TableStore<F> {
                     _ => None,
                 })
                 .collect();
-            let total_sources =
-                (mem_active_has as usize) + (mem_flushing_has as usize) + sst_match_indices.len();
+            let total_sources = vec_match_indices.len() + sst_match_indices.len();
 
             if total_sources == 1 && sst_match_indices.len() == 1 {
                 // Hot path: single SSTable source. Use the 2-phase
@@ -2112,18 +2614,8 @@ impl<F: FlushTarget> TableStore<F> {
                     Option<ferrosa_sstable::types::Row>,
                 )> = Vec::with_capacity(total_sources);
 
-                if mem_active_has {
-                    let p = mem_active_iter.next().expect("peeked");
-                    let key_p = p.key.clone();
-                    let deletion = p.deletion;
-                    let static_row = p.static_row;
-                    let mut rows = p.rows;
-                    rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
-                    headers.push((key_p, deletion, static_row));
-                    mem_row_iters.push(rows.into_iter());
-                }
-                if mem_flushing_has {
-                    let p = mem_flushing_iter.next().expect("peeked");
+                for &vi in &vec_match_indices {
+                    let p = vec_sources[vi].next().expect("peeked");
                     let key_p = p.key.clone();
                     let deletion = p.deletion;
                     let static_row = p.static_row;
@@ -2276,16 +2768,18 @@ impl<F: FlushTarget> TableStore<F> {
         // and OOM'd the 2 GiB cgroup at ~1.8 GiB on a 235-SSTable
         // replica with fat partitions.
 
-        // Memtable matches are cheap to collect (memtables are
-        // already in memory by design) and small. Sort by key so
-        // the merge can rely on per-source order.
+        // Vec-style partition sources (active + flushing memtables, plus staged
+        // SSTable tiers when the overlapping SSTable count exceeds the fan-in
+        // cap). See `walk_token_range_for_digest` for the staging rationale.
+        let mut vec_sources: Vec<std::iter::Peekable<std::vec::IntoIter<Partition>>> = Vec::new();
+
         let mut mem_active: Vec<Partition> = guard
             .active
             .range_iter(None, None)
             .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
             .collect();
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut mem_active_iter = mem_active.into_iter().peekable();
+        vec_sources.push(mem_active.into_iter().peekable());
 
         let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
             Some(ref f) => f
@@ -2295,15 +2789,44 @@ impl<F: FlushTarget> TableStore<F> {
             None => Vec::new(),
         };
         mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut mem_flushing_iter = mem_flushing_vec.into_iter().peekable();
+        vec_sources.push(mem_flushing_vec.into_iter().peekable());
 
-        // For each SSTable: an iter parked at the first in-range
-        // partition. We do NOT decode the body — we keep only the
-        // peeked DecoratedKey (small).
+        let fanin_cap = self.effective_read_merge_fanin();
+        let overlapping: Vec<&SstableDescriptor> = guard
+            .sstables
+            .iter()
+            .filter(|d| d.overlaps_token_range(start_token, end_token))
+            .collect();
+
+        let mut sst_readers: Vec<Arc<SSTableReader<F::Reader>>> = Vec::new();
+        if overlapping.len() > fanin_cap {
+            for tier in self.stage_sstable_tiers(
+                &guard.sstables,
+                &schema,
+                start_token,
+                end_token,
+                fanin_cap,
+            )? {
+                vec_sources.push(tier.into_iter().peekable());
+            }
+        } else {
+            for desc in overlapping {
+                match self.open_reader(desc) {
+                    Ok(r) => sst_readers.push(r),
+                    Err(e) => {
+                        tracing::warn!(gen = %desc.gen, "walk_token_range: failed to open SSTable reader: {e}");
+                    }
+                }
+            }
+        }
+
+        // For each open SSTable reader: an iter parked at the first in-range
+        // partition. We do NOT decode the body — we keep only the peeked
+        // DecoratedKey (small).
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
-            Vec::with_capacity(guard.sstables.len());
-        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(guard.sstables.len());
-        for sstable in guard.sstables.iter() {
+            Vec::with_capacity(sst_readers.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(sst_readers.len());
+        for sstable in sst_readers.iter() {
             let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
                 Err(_) => continue,
@@ -2336,14 +2859,11 @@ impl<F: FlushTarget> TableStore<F> {
             let pick = |cur: &Option<DecoratedKey>, candidate: &DecoratedKey| -> bool {
                 cur.as_ref().map(|k| candidate < k).unwrap_or(true)
             };
-            if let Some(p) = mem_active_iter.peek() {
-                if pick(&smallest_key, &p.key) {
-                    smallest_key = Some(p.key.clone());
-                }
-            }
-            if let Some(p) = mem_flushing_iter.peek() {
-                if pick(&smallest_key, &p.key) {
-                    smallest_key = Some(p.key.clone());
+            for src in vec_sources.iter_mut() {
+                if let Some(p) = src.peek() {
+                    if pick(&smallest_key, &p.key) {
+                        smallest_key = Some(p.key.clone());
+                    }
                 }
             }
             for iter in sst_iters.iter_mut() {
@@ -2366,11 +2886,10 @@ impl<F: FlushTarget> TableStore<F> {
             // a handful when the same key landed in both memtable
             // and an SSTable (or got split across compactions).
             let mut group: Vec<Partition> = Vec::new();
-            if mem_active_iter.peek().map(|p| p.key == key) == Some(true) {
-                group.push(mem_active_iter.next().expect("peeked"));
-            }
-            if mem_flushing_iter.peek().map(|p| p.key == key) == Some(true) {
-                group.push(mem_flushing_iter.next().expect("peeked"));
+            for src in vec_sources.iter_mut() {
+                if src.peek().map(|p| p.key == key) == Some(true) {
+                    group.push(src.next().expect("peeked"));
+                }
             }
             for (idx, iter) in sst_iters.iter_mut().enumerate() {
                 let matches = matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key);
@@ -2449,11 +2968,19 @@ impl<F: FlushTarget> TableStore<F> {
         // SSTables — read only the remaining budget from each, and when a row
         // cap is requested skip unretained rows while decoding instead of
         // materializing full wide partitions and truncating afterwards.
-        for (i, sstable) in guard.sstables.iter().enumerate() {
+        for (i, desc) in guard.sstables.iter().enumerate() {
             let remaining = limit.saturating_sub(all_partitions.len());
             if remaining == 0 {
                 break;
             }
+            // One reader open at a time — opened, drained, dropped per loop.
+            let sstable = match self.open_reader(desc) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(gen = %desc.gen, "read_range: failed to open SSTable reader: {e}");
+                    continue;
+                }
+            };
             match sstable.read_partitions_limited_rows(remaining, row_limit) {
                 Ok(mut parts) => {
                     let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
@@ -2993,7 +3520,9 @@ impl<F: FlushTarget> TableStore<F> {
 
         for (i, id_entry) in current.sstable_ids.iter().enumerate() {
             if !input_id_set.contains(id_entry.0.as_str()) {
-                new_sstables.push(Arc::clone(&current.sstables[i]));
+                if let Some(desc) = current.sstables.get(i) {
+                    new_sstables.push(desc.clone());
+                }
                 new_ids.push(id_entry.clone());
                 if i < current.sidecar_indexes.len() {
                     new_sidecars.push(Arc::clone(&current.sidecar_indexes[i]));
@@ -3001,8 +3530,19 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // Prepend the compacted output.
-        new_sstables.insert(0, add);
+        // Evict every removed input generation from the pool so a stale reader
+        // can never be served or reopened after its files are deleted (FMEA #4).
+        for desc in current.sstables.iter() {
+            if input_id_set.contains(desc.gen.as_str()) {
+                self.reader_pool.remove(&self.pool_key(desc));
+            }
+        }
+
+        // Build the descriptor for the compacted output, seed its reader into
+        // the pool, then prepend it.
+        let out_desc = SstableDescriptor::from_reader(output_id.clone(), output_path.clone(), &add);
+        self.seed_reader(&out_desc, add);
+        new_sstables.insert(0, out_desc);
         new_ids.insert(0, (output_id, output_path));
         new_sidecars.insert(0, Arc::new(output_sidecars));
 
@@ -3082,13 +3622,24 @@ impl<F: FlushTarget> TableStore<F> {
             .iter()
             .take(synced_len)
             .enumerate()
-            .filter_map(|(i, sst)| {
+            .filter_map(|(i, desc)| {
                 // Safe to index: i < synced_len <= sstable_ids.len().
                 let (id, path) = &guard.sstable_ids[i];
                 let sstable_path = if path.as_os_str().is_empty() {
                     table_dir.to_path_buf()
                 } else {
                     path.clone()
+                };
+
+                // Open the reader (pooled) for size/header/key_count. One reader
+                // is resident per planning iteration; it becomes evictable when
+                // this closure returns.
+                let sst = match self.open_reader(desc) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(sstable_id = %id, %e, "compaction planning: cannot open SSTable reader; skipping");
+                        return None;
+                    }
                 };
 
                 let size_bytes = if path.as_os_str().is_empty() {
@@ -3122,16 +3673,10 @@ impl<F: FlushTarget> TableStore<F> {
 
                 let header = sst.header();
 
-                // WP-002: compute tokens from the smallest/largest index
-                // bounds. New SSTables store byte-comparable decorated keys
-                // here; older fixtures stored raw partition-key bytes.
-                use ferrosa_common::Token;
-                let min_token = ferrosa_sstable::byte_comparable::decode(sst.smallest_key_bytes())
-                    .map(|key| key.token.0)
-                    .unwrap_or_else(|_| Token::from_key(sst.smallest_key_bytes()).0);
-                let max_token = ferrosa_sstable::byte_comparable::decode(sst.largest_key_bytes())
-                    .map(|key| key.token.0)
-                    .unwrap_or_else(|_| Token::from_key(sst.largest_key_bytes()).0);
+                // Token bounds were captured into the descriptor from the same
+                // index footer at construction time (FMEA #2 — never approximate).
+                let min_token = desc.min_token;
+                let max_token = desc.max_token;
 
                 Some(crate::compaction::metadata::SSTableMetadata {
                     id: id.clone(),
@@ -3415,7 +3960,16 @@ mod tests {
         legacy.flush().unwrap();
 
         let legacy_view = legacy.view.load();
-        let initial_sstables = legacy_view.sstables.iter().cloned().collect();
+        // Open the legacy descriptors' readers (from the legacy store's pool /
+        // retained in-memory components) and hand them to the new store, which
+        // seeds them into its own pool. With a single SSTable far below the
+        // cap, the seeded reader is never evicted, so no cross-store reopen is
+        // attempted.
+        let initial_sstables: Vec<Arc<SSTableReader<Vec<u8>>>> = legacy_view
+            .sstables
+            .iter()
+            .map(|desc| legacy.open_reader(desc).expect("open legacy reader"))
+            .collect();
         let initial_ids = vec![("1".to_string(), std::path::PathBuf::new())];
 
         TableStore::new_with_sstables(
@@ -3616,10 +4170,19 @@ mod tests {
             Some(7),
         ));
         let current = store.view.load_full();
+        let good_desc =
+            SstableDescriptor::from_reader("good".to_string(), std::path::PathBuf::new(), &good);
+        let corrupt_desc = SstableDescriptor::from_reader(
+            "corrupt".to_string(),
+            std::path::PathBuf::new(),
+            &corrupt,
+        );
+        store.seed_reader(&good_desc, good);
+        store.seed_reader(&corrupt_desc, corrupt);
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
             flushing: None,
-            sstables: Arc::new(vec![good, corrupt]),
+            sstables: Arc::new(vec![good_desc, corrupt_desc]),
             sstable_ids: Arc::new(vec![
                 ("good".to_string(), std::path::PathBuf::new()),
                 ("corrupt".to_string(), std::path::PathBuf::new()),
@@ -4214,7 +4777,7 @@ mod tests {
             .unwrap();
         store.flush().unwrap();
         let view = store.view.load();
-        let new_sst = Arc::clone(&view.sstables[0]);
+        let new_sst = store.open_reader(&view.sstables[0]).unwrap();
         drop(view);
 
         // Get the actual stored IDs.
@@ -4495,7 +5058,7 @@ mod tests {
             .unwrap();
         store.flush().unwrap();
         let view = store.view.load();
-        let output_sst = Arc::clone(&view.sstables[0]);
+        let output_sst = store.open_reader(&view.sstables[0]).unwrap();
         drop(view);
 
         // Swap: this MUST remove the 2 inputs even though their paths
@@ -5754,6 +6317,233 @@ mod tests {
             flushed_results.len(),
             1,
             "sparse vector update should remain visible to ANN after flush"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Bounded SSTable reader pool — Phase 2/4 gates (FileFlushTarget).
+    // -------------------------------------------------------------------------
+
+    /// Build a file-backed store with an explicit reader-pool cap, then flush
+    /// `n_sstables` SSTables (one per flush). Each flush writes a fresh row for
+    /// `pk-{i % distinct_keys}`, so keys recur across SSTables to exercise
+    /// cross-source merge and tier splitting.
+    fn file_store_with_many_sstables(
+        dir: &std::path::Path,
+        cap: usize,
+        n_sstables: usize,
+        distinct_keys: usize,
+    ) -> TableStore<crate::flush::FileFlushTarget> {
+        let mut store = file_backed_test_store(dir);
+        let pool = Arc::new(crate::reader_pool::ReaderPool::new(cap));
+        store.attach_reader_pool(pool, "bound-test".to_string());
+        for i in 0..n_sstables {
+            let key = make_key(&format!("pk-{}", i % distinct_keys.max(1)));
+            store
+                .write(&key, make_row(format!("v{i}").as_bytes(), 1000 + i as i64))
+                .unwrap();
+            store.flush().unwrap();
+        }
+        store
+    }
+
+    /// Re-attach a fresh pool of capacity `cap`, resetting the peak gauge so a
+    /// subsequent read path's residency can be measured in isolation.
+    fn reset_pool(store: &mut TableStore<crate::flush::FileFlushTarget>, cap: usize) {
+        let pool = Arc::new(crate::reader_pool::ReaderPool::new(cap));
+        store.attach_reader_pool(pool, "bound-test".to_string());
+    }
+
+    #[test]
+    fn resident_reader_count_stays_within_cap_for_many_sstables() {
+        // Phase 2 gate: load N >> cap SSTables on a FileFlushTarget store and
+        // assert resident readers never exceed the cap.
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 4;
+        let n = 40;
+        let store = file_store_with_many_sstables(dir.path(), cap, n, n);
+
+        assert_eq!(store.sstable_count(), n, "all SSTables registered");
+        assert!(
+            store.resident_reader_count() <= cap,
+            "resident readers {} must be <= cap {cap}",
+            store.resident_reader_count()
+        );
+        for i in 0..n {
+            let _ = store.read(&make_key(&format!("pk-{i}"))).unwrap();
+        }
+        assert!(
+            store.resident_reader_count() <= cap,
+            "resident readers {} must stay <= cap {cap} after reads",
+            store.resident_reader_count()
+        );
+        assert!(
+            store.peak_resident_readers() <= cap,
+            "peak resident {} must be <= cap {cap}",
+            store.peak_resident_readers()
+        );
+    }
+
+    #[test]
+    fn staged_token_range_read_is_byte_identical_to_single_pass() {
+        // Phase 4 GOLDEN EQUIVALENCE (FMEA #2/#3): the staged multi-pass merge
+        // must return exactly the same partitions as the single-pass merge for
+        // every token window, with the same dedup/LWW result.
+        let dir = tempfile::tempdir().unwrap();
+        let store = file_store_with_many_sstables(dir.path(), 256, 12, 5);
+
+        let windows: [(i64, i64); 6] = [
+            (i64::MIN, i64::MAX),
+            (i64::MIN, 0),
+            (0, i64::MAX),
+            (-5_000_000_000_000_000_000, 5_000_000_000_000_000_000),
+            (-1, 1),
+            (i64::MIN + 1, i64::MAX - 1),
+        ];
+
+        for (start, end) in windows {
+            // Single-pass: large fan-in, no tiering.
+            store.set_read_merge_fanin_for_test(1024);
+            let single_rtr = store.read_token_range(start, end, usize::MAX).unwrap();
+            let mut single_walk: Vec<Partition> = Vec::new();
+            store
+                .walk_token_range(start, end, |p| {
+                    single_walk.push(p.clone());
+                    Ok(())
+                })
+                .unwrap();
+
+            // Staged: fan-in 2 forces multi-pass tiers over the 12 SSTables.
+            store.set_read_merge_fanin_for_test(2);
+            let staged_rtr = store.read_token_range(start, end, usize::MAX).unwrap();
+            let mut staged_walk: Vec<Partition> = Vec::new();
+            store
+                .walk_token_range(start, end, |p| {
+                    staged_walk.push(p.clone());
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(
+                single_rtr, staged_rtr,
+                "read_token_range staged result diverged for window [{start}, {end})"
+            );
+            assert_eq!(
+                single_walk, staged_walk,
+                "walk_token_range staged result diverged for window [{start}, {end})"
+            );
+            assert_eq!(
+                single_rtr, single_walk,
+                "read_token_range vs walk_token_range diverged for window [{start}, {end})"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_digest_walk_is_byte_identical_to_single_pass() {
+        // Phase 4 equivalence for the digest path.
+        let dir = tempfile::tempdir().unwrap();
+        let store = file_store_with_many_sstables(dir.path(), 256, 10, 4);
+
+        let collect_digest = |fanin: usize| -> Vec<Partition> {
+            store.set_read_merge_fanin_for_test(fanin);
+            let mut out: Vec<Partition> = Vec::new();
+            store
+                .walk_token_range_for_digest(
+                    i64::MIN,
+                    i64::MAX,
+                    |key, deletion, static_row, emit| {
+                        let mut rows: Vec<Row> = Vec::new();
+                        emit(&mut |row| {
+                            rows.push(row.clone());
+                            Ok(())
+                        })?;
+                        out.push(Partition {
+                            key: key.clone(),
+                            deletion,
+                            static_row: static_row.cloned(),
+                            rows,
+                        });
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            out
+        };
+
+        let single = collect_digest(1024);
+        let staged = collect_digest(2);
+        assert_eq!(
+            single, staged,
+            "staged digest walk diverged from single-pass digest walk"
+        );
+
+        store.set_read_merge_fanin_for_test(1024);
+        let rtr = store
+            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            single, rtr,
+            "digest walk partitions must match read_token_range partitions"
+        );
+    }
+
+    #[test]
+    fn peak_open_readers_stays_within_fanin_during_staged_merge() {
+        // Phase 4 gate: with N >> fanin SSTables, the staged merge opens at most
+        // `fanin` readers per tier and drops them before the next tier. A reader
+        // is evictable the instant its `Arc` is released, so with the pool cap
+        // pinned to `fanin` the pool evicts each finished tier's idle readers
+        // before the next tier pushes residency past the cap — peak resident
+        // therefore stays <= fanin. (In production cap=256 > fanin=32, so the
+        // pool retains idle readers for reuse; the *in-use* working set is still
+        // bounded by `fanin` per op — this test makes that bound observable by
+        // setting cap == fanin so residency mirrors the in-use set.)
+        let dir = tempfile::tempdir().unwrap();
+        let fanin = 3;
+        let mut store = file_store_with_many_sstables(dir.path(), fanin, 20, 6);
+        store.set_read_merge_fanin_for_test(fanin);
+
+        // Fresh pool (cap == fanin) → peak gauge starts at 0.
+        reset_pool(&mut store, fanin);
+        store.set_read_merge_fanin_for_test(fanin);
+
+        let mut count = 0usize;
+        store
+            .walk_token_range(i64::MIN, i64::MAX, |_p| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(count > 0, "walk must visit partitions");
+        assert!(
+            store.peak_resident_readers() <= fanin,
+            "peak resident readers {} exceeded fan-in cap {fanin}",
+            store.peak_resident_readers()
+        );
+        assert_eq!(
+            store.reader_pool.soft_cap_breaches(),
+            0,
+            "no soft-cap breach: staged merge never pins more than fanin readers at once"
+        );
+
+        // Same bound for the digest walk.
+        reset_pool(&mut store, fanin);
+        store.set_read_merge_fanin_for_test(fanin);
+        store
+            .walk_token_range_for_digest(i64::MIN, i64::MAX, |_k, _d, _s, emit| {
+                emit(&mut |_row| Ok(()))
+            })
+            .unwrap();
+        assert!(
+            store.peak_resident_readers() <= fanin,
+            "digest peak resident readers {} exceeded fan-in cap {fanin}",
+            store.peak_resident_readers()
+        );
+        assert_eq!(
+            store.reader_pool.soft_cap_breaches(),
+            0,
+            "digest staged merge must not breach the soft cap"
         );
     }
 }

@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use ferrosa_index::{IndexKey, RowPosition};
 
@@ -187,6 +188,26 @@ pub trait FlushTarget {
     /// Write SSTable component bytes to the target and open a reader.
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Self::Reader>>;
 
+    /// Open (or re-open) a reader for the SSTable generation `gen` living in
+    /// `dir`, on demand.
+    ///
+    /// This is the opener used by the bounded [`crate::reader_pool::ReaderPool`]:
+    /// `StoreView` holds only lightweight descriptors, and a reader is
+    /// materialised through this method when a read path needs it, then evicted
+    /// when idle. File-backed targets re-read the component files from disk
+    /// (`gen` is the numeric generation, `dir` the directory holding the
+    /// `{gen}-*.db` components). In-memory targets return the components they
+    /// retained at flush time.
+    ///
+    /// The default fails loud: a target that participates in the bounded-reader
+    /// pool must provide a real opener (fail-loud rule — never fake a reader).
+    fn open_reader(&self, _dir: &Path, gen: u64) -> Result<SSTableReader<Self::Reader>> {
+        Err(ferrosa_common::Error::InvalidFormat(format!(
+            "FlushTarget::open_reader not implemented for this target (gen {gen}); \
+             the bounded SSTable reader pool requires an opener"
+        )))
+    }
+
     /// Return a staging directory for file-backed SSTable output.
     ///
     /// Targets that return `Some` from this method can receive
@@ -323,6 +344,10 @@ pub trait FlushTarget {
 /// touching the filesystem.
 pub struct InMemoryFlushTarget {
     generation: std::sync::atomic::AtomicU64,
+    /// Retained component bytes keyed by generation, so [`FlushTarget::open_reader`]
+    /// can re-open a reader on demand for the bounded reader pool. In-memory
+    /// targets have nothing on disk, so the bytes must be held here instead.
+    components: std::sync::Mutex<HashMap<u64, Arc<RetainedComponents>>>,
     /// Vector sidecar bytes keyed by `(generation, index_name)`.
     vector_sidecars: std::sync::Mutex<HashMap<(u64, String), Vec<u8>>>,
     /// Quantized vector sidecar bytes keyed by `(generation, index_name)`.
@@ -330,11 +355,36 @@ pub struct InMemoryFlushTarget {
     vector_sidecar_bytes_read: std::sync::atomic::AtomicU64,
 }
 
+/// Component bytes retained by [`InMemoryFlushTarget`] so a reader can be
+/// re-opened on demand (the in-memory analogue of on-disk component files).
+struct RetainedComponents {
+    data: Vec<u8>,
+    partitions: Vec<u8>,
+    rows: Vec<u8>,
+    filter: Vec<u8>,
+    compression_info: Option<Vec<u8>>,
+    statistics: Vec<u8>,
+}
+
+impl RetainedComponents {
+    fn open(&self) -> Result<SSTableReader<Vec<u8>>> {
+        SSTableReader::open(SSTableComponents {
+            data: self.data.clone(),
+            partitions: self.partitions.clone(),
+            rows: self.rows.clone(),
+            filter: self.filter.clone(),
+            compression_info: self.compression_info.clone(),
+            statistics: self.statistics.clone(),
+        })
+    }
+}
+
 impl InMemoryFlushTarget {
     /// Create a new in-memory flush target with the generation counter at 0.
     pub fn new() -> Self {
         Self {
             generation: std::sync::atomic::AtomicU64::new(0),
+            components: std::sync::Mutex::new(HashMap::new()),
             vector_sidecars: std::sync::Mutex::new(HashMap::new()),
             quantized_vector_sidecars: std::sync::Mutex::new(HashMap::new()),
             vector_sidecar_bytes_read: std::sync::atomic::AtomicU64::new(0),
@@ -362,16 +412,43 @@ impl FlushTarget for InMemoryFlushTarget {
     type Reader = Vec<u8>;
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Vec<u8>>> {
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        SSTableReader::open(SSTableComponents {
+        // `fetch_add` returns the previous value; the new generation (matching
+        // `last_generation()` after this call) is `prev + 1`.
+        let gen = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let retained = Arc::new(RetainedComponents {
             data: output.data,
             partitions: output.partitions,
             rows: output.rows,
             filter: output.filter,
             compression_info: output.compression_info,
             statistics: output.statistics,
-        })
+        });
+        let reader = retained.open()?;
+        // Retain the component bytes so the reader pool can re-open this gen on
+        // demand after eviction (in-memory targets have no on-disk fallback).
+        self.components
+            .lock()
+            .expect("in-memory components poisoned")
+            .insert(gen, retained);
+        Ok(reader)
+    }
+
+    fn open_reader(&self, _dir: &Path, gen: u64) -> Result<SSTableReader<Vec<u8>>> {
+        let retained = self
+            .components
+            .lock()
+            .expect("in-memory components poisoned")
+            .get(&gen)
+            .cloned();
+        match retained {
+            Some(c) => c.open(),
+            None => Err(ferrosa_common::Error::InvalidFormat(format!(
+                "InMemoryFlushTarget has no retained components for generation {gen}"
+            ))),
+        }
     }
 
     fn last_generation(&self) -> u64 {
@@ -629,8 +706,57 @@ struct FileComponentPaths {
     compression_info: PathBuf,
 }
 
+/// Open a file-backed SSTable reader from component files for generation `gen`
+/// in `dir`. Shared by [`FileFlushTarget::open_reader`] and the engine's
+/// startup/load path so on-demand reopens go through one code path.
+///
+/// Required components (`Data.db`, `Partitions.db`, `Rows.db`) must exist;
+/// optional components (`Filter.db`, `Statistics.db`, `CompressionInfo.db`)
+/// default to empty/absent when missing, matching the historical engine loader.
+pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
+    let required = |suffix: &str| -> Result<PathBuf> {
+        let p = dir.join(format!("{gen}-{suffix}"));
+        if p.exists() {
+            Ok(p)
+        } else {
+            Err(ferrosa_common::Error::InvalidFormat(format!(
+                "missing required {suffix} for sstable generation {gen} in {}",
+                dir.display()
+            )))
+        }
+    };
+
+    let data = FileReadAt::open(required("Data.db")?)?;
+    let partitions = FileReadAt::open(required("Partitions.db")?)?;
+    let rows = FileReadAt::open(required("Rows.db")?)?;
+
+    let filter = std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap_or_default();
+    let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap_or_default();
+    let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+
+    SSTableReader::open(SSTableComponents {
+        data,
+        partitions,
+        rows,
+        filter,
+        compression_info,
+        statistics,
+    })
+}
+
 impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
+
+    fn open_reader(&self, dir: &Path, gen: u64) -> Result<SSTableReader<FileReadAt>> {
+        // A descriptor may carry an empty dir (legacy flush rows) — fall back
+        // to this target's base dir, mirroring the store's path-resolution rule.
+        let resolved = if dir.as_os_str().is_empty() {
+            self.base_dir.as_path()
+        } else {
+            dir
+        };
+        open_file_sstable(resolved, &gen.to_string())
+    }
 
     fn file_output_staging_dir(&self) -> Result<Option<PathBuf>> {
         let staging_root = self.base_dir.join(".sstable-staging");

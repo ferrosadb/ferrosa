@@ -43,6 +43,21 @@ pub fn configured_reader_cache_cap() -> usize {
         .unwrap_or(DEFAULT_READER_CACHE_CAP)
 }
 
+/// Default fan-in for a single staged token-range read-merge: at most this many
+/// SSTable readers are open at any instant during one read. Override with
+/// `FERROSA_READ_MERGE_FANIN`. Aligns with compaction's `max_threshold`.
+pub const DEFAULT_READ_MERGE_FANIN: usize = 32;
+
+/// Resolve the configured read-merge fan-in (env override, sane default,
+/// never zero).
+pub fn configured_read_merge_fanin() -> usize {
+    std::env::var("FERROSA_READ_MERGE_FANIN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_READ_MERGE_FANIN)
+}
+
 struct Entry<V> {
     value: Arc<V>,
     /// Logical clock stamp of the most recent access; lowest = least-recently-used.
@@ -162,6 +177,19 @@ impl<K: Eq + Hash + Clone, V> ReaderPool<K, V> {
                 }
             }
         }
+    }
+
+    /// Insert an already-constructed `Arc<V>` for `key`, replacing any existing
+    /// entry. Used to seed the pool with a reader that was just produced (flush,
+    /// compaction output, or initial load) so the next access is a cache hit
+    /// without reopening freshly-written files.
+    pub fn insert_arc(&self, key: K, value: Arc<V>) {
+        let mut guard = self.inner.lock().expect("reader pool mutex poisoned");
+        let last_used = self.tick();
+        guard.insert(key, Entry { value, last_used });
+        self.enforce_cap(&mut guard);
+        let len = guard.len();
+        self.peak.fetch_max(len, Ordering::Relaxed);
     }
 
     /// Drop a reader from the pool — e.g. its generation was removed by a

@@ -645,6 +645,10 @@ pub struct StorageEngine {
     /// When `Some`, `resolve_store_and_prefix()` returns this store instead of building one.
     #[cfg(test)]
     upload_store_override: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    /// Engine-wide bounded SSTable reader pool, shared by every `TableStore`
+    /// so resident reader memory is `O(reader_cap)` across all tables rather
+    /// than `O(sstable_count)` per table (FMEA #8).
+    reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
 }
 
 /// Per-table state: schema + store + optional NVMe pin config.
@@ -1373,6 +1377,9 @@ impl StorageEngine {
             s3_sync_requested: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
+            reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
+                crate::reader_pool::configured_reader_cache_cap(),
+            )),
             #[cfg(test)]
             upload_store_override: None,
         };
@@ -1534,6 +1541,9 @@ impl StorageEngine {
             s3_sync_requested: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
+            reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
+                crate::reader_pool::configured_reader_cache_cap(),
+            )),
             #[cfg(test)]
             upload_store_override: None,
         })
@@ -1575,6 +1585,12 @@ impl StorageEngine {
 
         let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
+        // Engine-wide reader pool, created here so tables registered during
+        // startup replay share it with those registered later.
+        let reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> = Arc::new(
+            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
+        );
+
         let tables = RwLock::new(HashMap::new());
         let schema_path = config.data_dir.join("schema.json");
         if let Ok(data) = std::fs::read_to_string(&schema_path) {
@@ -1582,7 +1598,12 @@ impl StorageEngine {
                 Ok(schemas) => {
                     for schema in schemas {
                         let table_id = TableId::new(&schema.keyspace, &schema.table);
-                        match Self::build_table_state(&config, schema, vec![]) {
+                        match Self::build_table_state(
+                            &config,
+                            schema,
+                            vec![],
+                            Arc::clone(&reader_pool),
+                        ) {
                             Ok(state) => {
                                 for (index_name, _col_pos) in state.store.indexed_columns() {
                                     index_tracker.register_index(
@@ -1665,6 +1686,7 @@ impl StorageEngine {
             s3_sync_requested: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
+            reader_pool,
             #[cfg(test)]
             upload_store_override: None,
         };
@@ -2211,6 +2233,7 @@ impl StorageEngine {
         config: &StorageEngineConfig,
         schema: TableSchema,
         indexed_columns: Vec<(String, usize)>,
+        reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
     ) -> ferrosa_common::Result<TableState> {
         if let Some(warning) = schema.legacy_storage_column_order_warning() {
             tracing::warn!("{warning}");
@@ -2230,7 +2253,7 @@ impl StorageEngine {
         // Thread schema compression options and the engine-level write_verify
         // flag into the writer.
         let write_options = write_options_for_schema(&schema, config.write_verify)?;
-        let store = if existing_sstables.is_empty() && indexed_columns.is_empty() {
+        let mut store = if existing_sstables.is_empty() && indexed_columns.is_empty() {
             TableStore::new(schema.clone(), flush_target, write_options)
         } else if existing_sstables.is_empty() {
             TableStore::new_with_indexes(
@@ -2250,6 +2273,11 @@ impl StorageEngine {
                 indexed_columns,
             )
         };
+
+        // Share the engine-wide reader pool, namespacing this table's
+        // generations by its id so generations from different tables never
+        // collide in the pool key space.
+        store.attach_reader_pool(reader_pool, table_id.to_string());
 
         Ok(TableState {
             schema,
@@ -2278,7 +2306,12 @@ impl StorageEngine {
             }
         }
         let time_series_handle = self.build_time_series_consolidator(&table_id, &schema)?;
-        let state = Self::build_table_state(&self.config, schema, indexed_columns)?;
+        let state = Self::build_table_state(
+            &self.config,
+            schema,
+            indexed_columns,
+            Arc::clone(&self.reader_pool),
+        )?;
 
         // Register each declared index in the tracker.
         for (index_name, _col_pos) in state.store.indexed_columns() {
@@ -6863,6 +6896,9 @@ impl StorageEngine {
             s3_sync_requested: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
+            reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
+                crate::reader_pool::configured_reader_cache_cap(),
+            )),
             upload_store_override: Some((store, prefix)),
         })
     }
