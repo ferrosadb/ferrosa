@@ -2471,7 +2471,11 @@ impl<F: FlushTarget> TableStore<F> {
     /// Walks `[start_token, end_token)` in strict token order via a k-way
     /// merge across the active memtable, the flushing memtable, and every
     /// active SSTable (corrupt SSTables are already excluded from
-    /// `guard.sstables` at startup, so this never touches them). It
+    /// `guard.sstables` at startup, so this never touches them). SSTable
+    /// readers are opened through the engine-wide pool; when more than
+    /// `fanin_cap` descriptors overlap the window they are collapsed into
+    /// token-ordered tombstone-preserving tiers via [`Self::stage_sstable_tiers`]
+    /// so at most `fanin_cap` readers are resident at any instant. It
     /// materialises cell-merged partitions into the returned `Vec` until
     /// **either** `max_partitions` have been collected **or** `max_bytes` of
     /// estimated partition content has accumulated, then stops and returns the
@@ -2504,13 +2508,23 @@ impl<F: FlushTarget> TableStore<F> {
         let schema = self.schema.load();
         let in_range = |t: i64| t >= start_token && t < end_token;
 
+        // Token-ordered, peekable source streams. Memtable sources are always
+        // staged into sorted vecs; SSTable sources are EITHER staged into
+        // tombstone-preserving tiers (when more than `fanin_cap` descriptors
+        // overlap the window) OR streamed directly through bounded
+        // concurrently-open readers — mirroring `walk_token_range_for_digest`
+        // so the concurrently-open reader count never exceeds `fanin_cap`
+        // (FMEA #5). Either way the k-way merge below is identical, so the
+        // token-ordered prefix and resume cursor are preserved.
+        let mut vec_sources: Vec<std::iter::Peekable<std::vec::IntoIter<Partition>>> = Vec::new();
+
         let mut mem_active: Vec<Partition> = guard
             .active
             .range_iter(None, None)
             .filter(|p: &Partition| in_range(p.key.token.0))
             .collect();
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut mem_active_iter = mem_active.into_iter().peekable();
+        vec_sources.push(mem_active.into_iter().peekable());
 
         let mut mem_flushing: Vec<Partition> = match guard.flushing {
             Some(ref f) => f
@@ -2520,12 +2534,44 @@ impl<F: FlushTarget> TableStore<F> {
             None => Vec::new(),
         };
         mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut mem_flushing_iter = mem_flushing.into_iter().peekable();
+        vec_sources.push(mem_flushing.into_iter().peekable());
+
+        // Decide staged tiers vs. direct streaming. Hold the opened reader
+        // `Arc`s for the lifetime of any borrowed iterator so the pool cannot
+        // evict mid-scan.
+        let fanin_cap = self.effective_read_merge_fanin();
+        let overlapping: Vec<&SstableDescriptor> = guard
+            .sstables
+            .iter()
+            .filter(|d| d.overlaps_token_range(start_token, end_token))
+            .collect();
+
+        let mut sst_readers: Vec<Arc<SSTableReader<F::Reader>>> = Vec::new();
+        if overlapping.len() > fanin_cap {
+            for tier in self.stage_sstable_tiers(
+                &guard.sstables,
+                &schema,
+                start_token,
+                end_token,
+                fanin_cap,
+            )? {
+                vec_sources.push(tier.into_iter().peekable());
+            }
+        } else {
+            for desc in overlapping {
+                match self.open_reader(desc) {
+                    Ok(r) => sst_readers.push(r),
+                    Err(e) => {
+                        tracing::warn!(gen = %desc.gen, "read_token_range_bounded: failed to open SSTable reader: {e}");
+                    }
+                }
+            }
+        }
 
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
-            Vec::with_capacity(guard.sstables.len());
-        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(guard.sstables.len());
-        for sstable in guard.sstables.iter() {
+            Vec::with_capacity(sst_readers.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(sst_readers.len());
+        for sstable in sst_readers.iter() {
             let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
                 Err(_) => continue,
@@ -2551,16 +2597,13 @@ impl<F: FlushTarget> TableStore<F> {
         };
         let next_cursor = loop {
             // Smallest key across all sources (SSTable keys past the range end
-            // are ignored).
+            // are ignored; tiers and memtables are pre-filtered to the range).
             let mut smallest_key: Option<DecoratedKey> = None;
-            if let Some(p) = mem_active_iter.peek() {
-                if pick(&smallest_key, &p.key) {
-                    smallest_key = Some(p.key.clone());
-                }
-            }
-            if let Some(p) = mem_flushing_iter.peek() {
-                if pick(&smallest_key, &p.key) {
-                    smallest_key = Some(p.key.clone());
+            for src in vec_sources.iter_mut() {
+                if let Some(p) = src.peek() {
+                    if pick(&smallest_key, &p.key) {
+                        smallest_key = Some(p.key.clone());
+                    }
                 }
             }
             for iter in sst_iters.iter_mut() {
@@ -2585,11 +2628,10 @@ impl<F: FlushTarget> TableStore<F> {
 
             // Gather every source that holds this key, cell-merge, dedup.
             let mut sources: Vec<Partition> = Vec::new();
-            if mem_active_iter.peek().map(|p| p.key == key) == Some(true) {
-                sources.push(mem_active_iter.next().expect("peeked key must exist"));
-            }
-            if mem_flushing_iter.peek().map(|p| p.key == key) == Some(true) {
-                sources.push(mem_flushing_iter.next().expect("peeked key must exist"));
+            for src in vec_sources.iter_mut() {
+                if src.peek().map(|p| p.key == key) == Some(true) {
+                    sources.push(src.next().expect("peeked key must exist"));
+                }
             }
             for (i, iter) in sst_iters.iter_mut().enumerate() {
                 if matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key) {
@@ -6803,6 +6845,112 @@ mod tests {
             store.reader_pool.soft_cap_breaches(),
             0,
             "digest staged merge must not breach the soft cap"
+        );
+    }
+
+    /// Silent-corruption guard for the repair *fetch* path: looping
+    /// `read_token_range_bounded` across a window must return byte-identical
+    /// partitions, in token order, to the single-pass `read_token_range` for
+    /// the same window — across both the direct-streaming (overlapping <=
+    /// fanin) and staged-tier (overlapping > fanin) source-construction paths.
+    /// This proves the reader-pool migration preserved the merge semantics.
+    #[test]
+    fn bounded_fetch_is_byte_identical_to_single_pass_read_token_range() {
+        let dir = tempfile::tempdir().unwrap();
+        // 64 SSTables over 12 distinct keys → heavy cross-source recurrence so
+        // the cell-merge / dedup / tombstone-preservation paths are exercised.
+        let store = file_store_with_many_sstables(dir.path(), 1024, 64, 12);
+
+        // Reference: single-pass, unbounded.
+        store.set_read_merge_fanin_for_test(1024);
+        let reference = store
+            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
+            .unwrap();
+        assert!(!reference.is_empty(), "fixture must produce partitions");
+
+        // Loop the bounded fetch over the full window under several fan-ins
+        // (some force tiering: 64 overlapping >> fanin) and budgets. Use a
+        // deterministic spread of (fanin, max_partitions, max_bytes).
+        let cases: &[(usize, usize, usize)] = &[
+            (1024, usize::MAX, usize::MAX), // single chunk, no staging
+            (1024, 3, usize::MAX),          // count budget, no staging
+            (1024, usize::MAX, 64),         // byte budget, no staging
+            (2, usize::MAX, usize::MAX),    // staged tiers, single chunk
+            (2, 2, usize::MAX),             // staged tiers + count budget
+            (3, usize::MAX, 48),            // staged tiers + byte budget
+        ];
+
+        for &(fanin, max_partitions, max_bytes) in cases {
+            store.set_read_merge_fanin_for_test(fanin);
+            let mut collected: Vec<Partition> = Vec::new();
+            let mut cursor = i64::MIN;
+            let mut guard_iters = 0usize;
+            loop {
+                guard_iters += 1;
+                assert!(guard_iters < 100_000, "bounded loop failed to terminate");
+                let (chunk, next) = store
+                    .read_token_range_bounded(cursor, i64::MAX, max_partitions, max_bytes)
+                    .unwrap();
+                if !chunk.is_empty() {
+                    assert!(
+                        max_partitions == usize::MAX || chunk.len() <= max_partitions,
+                        "chunk len {} exceeded count budget {max_partitions}",
+                        chunk.len()
+                    );
+                    if let Some(prev) = collected.last() {
+                        assert!(chunk[0].key >= prev.key, "chunk boundary broke token order");
+                    }
+                    collected.extend(chunk);
+                }
+                match next {
+                    Some(c) => cursor = c,
+                    None => break,
+                }
+            }
+            assert_eq!(
+                collected, reference,
+                "bounded fetch (fanin={fanin}, max_partitions={max_partitions}, \
+                 max_bytes={max_bytes}) diverged from single-pass read_token_range"
+            );
+        }
+    }
+
+    /// Fan-in gate for the repair *fetch* path: with N >> fanin overlapping
+    /// SSTables, a bounded read must keep peak resident readers <= fanin (the
+    /// staged-tier path drains each tier before opening the next). Mirrors the
+    /// digest/walk fan-in gate.
+    #[test]
+    fn bounded_fetch_peak_readers_stays_within_fanin() {
+        let dir = tempfile::tempdir().unwrap();
+        let fanin = 3;
+        // 24 SSTables over 6 keys, all overlapping the full window → 24 >> 3.
+        let mut store = file_store_with_many_sstables(dir.path(), fanin, 24, 6);
+
+        reset_pool(&mut store, fanin);
+        store.set_read_merge_fanin_for_test(fanin);
+
+        let mut total = 0usize;
+        let mut cursor = i64::MIN;
+        loop {
+            let (chunk, next) = store
+                .read_token_range_bounded(cursor, i64::MAX, 2, usize::MAX)
+                .unwrap();
+            total += chunk.len();
+            match next {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+        assert!(total > 0, "bounded fetch must visit partitions");
+        assert!(
+            store.peak_resident_readers() <= fanin,
+            "bounded fetch peak resident readers {} exceeded fan-in cap {fanin}",
+            store.peak_resident_readers()
+        );
+        assert_eq!(
+            store.reader_pool.soft_cap_breaches(),
+            0,
+            "bounded fetch must not pin more than fanin readers at once"
         );
     }
 
