@@ -363,14 +363,15 @@ mod tests {
     ) -> (PairCoordinator, Uuid) {
         use ferrosa_common::schema::{ColumnDefinition, TableSchema};
         use ferrosa_storage::{
-            CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig,
-            SyncStrategyConfig,
+            CommitLogBatchConfig, CommitLogConfig, CompactionConfig, StorageEngine,
+            StorageEngineConfig, SyncStrategyConfig,
         };
 
         let commit_log = CommitLogConfig {
             segment_size: 4096,
             max_segment_age: std::time::Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: CommitLogBatchConfig::default(),
             log_dir: dir.to_path_buf(),
             checkpoint_dir: dir.to_path_buf(),
             archive: None,
@@ -380,6 +381,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

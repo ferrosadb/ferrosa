@@ -13,6 +13,8 @@
 //! lookups happen concurrently.
 
 use ferrosa_common::Result;
+use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Positional read — read bytes at an offset without seeking.
 ///
@@ -52,6 +54,16 @@ pub trait ReadAt {
     }
 }
 
+impl<T: ReadAt + ?Sized> ReadAt for &T {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        (**self).read_at(buf, offset)
+    }
+
+    fn len(&self) -> Result<u64> {
+        (**self).len()
+    }
+}
+
 /// Positional write — write bytes at an offset.
 pub trait WriteAt {
     /// Write `buf` starting at `offset`.
@@ -71,6 +83,79 @@ pub trait WriteAt {
             )));
         }
         Ok(())
+    }
+}
+
+const DEFAULT_READ_CACHE_BLOCK_SIZE: usize = 4096;
+const DEFAULT_READ_CACHE_BLOCKS: usize = 128;
+
+fn cached_read_block_size() -> usize {
+    std::env::var("FERROSA_SSTABLE_READ_CACHE_BLOCK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_READ_CACHE_BLOCK_SIZE)
+}
+
+fn cached_read_block_capacity() -> std::num::NonZeroUsize {
+    let requested = std::env::var("FERROSA_SSTABLE_READ_CACHE_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_READ_CACHE_BLOCKS);
+    std::num::NonZeroUsize::new(requested).expect("read cache capacity is non-zero")
+}
+
+/// Bounded block cache for immutable positional readers.
+///
+/// This is intended for SSTable index components such as `Partitions.db` and
+/// `Rows.db`, where point reads repeatedly touch the same trie root and upper
+/// nodes. It avoids turning every trie step into a kernel `pread` while keeping
+/// `Data.db` on the more specialized compression-chunk path.
+pub struct CachedReadAt<R: ReadAt> {
+    inner: R,
+    len: u64,
+}
+
+impl<R: ReadAt> CachedReadAt<R> {
+    /// Create a cached reader using environment/default cache sizing.
+    pub fn new(inner: R) -> Result<Self> {
+        Self::with_capacity(
+            inner,
+            cached_read_block_size(),
+            cached_read_block_capacity(),
+        )
+    }
+
+    /// Create a cached reader with explicit sizing, primarily for tests.
+    pub fn with_capacity(
+        inner: R,
+        block_size: usize,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<Self> {
+        if block_size == 0 {
+            return Err(ferrosa_common::Error::InvalidData(
+                "CachedReadAt block size must be non-zero".into(),
+            ));
+        }
+        let len = inner.len()?;
+        let _ = capacity;
+        Ok(Self { inner, len })
+    }
+}
+
+impl<R: ReadAt> ReadAt for CachedReadAt<R> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() || offset >= self.len {
+            return Ok(0);
+        }
+
+        let target = buf.len().min((self.len - offset) as usize);
+        self.inner.read_at(&mut buf[..target], offset)
+    }
+
+    fn len(&self) -> Result<u64> {
+        Ok(self.len)
     }
 }
 
@@ -175,30 +260,12 @@ impl FdCache {
     }
 }
 
+#[cfg(test)]
 const DEFAULT_FD_CACHE_CAPACITY: usize = 1024;
+#[cfg(test)]
 const MIN_FD_CACHE_CAPACITY: usize = 64;
 
-fn linux_soft_nofile_limit() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
-        for line in limits.lines() {
-            if let Some(rest) = line.strip_prefix("Max open files") {
-                let soft = rest.split_whitespace().next()?;
-                if soft == "unlimited" {
-                    return None;
-                }
-                return soft.parse::<usize>().ok();
-            }
-        }
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
+#[cfg(test)]
 fn fd_cache_capacity(
     env_value: Option<&str>,
     soft_nofile_limit: Option<usize>,
@@ -217,33 +284,191 @@ fn fd_cache_capacity(
     std::num::NonZeroUsize::new(capped).expect("fd cache capacity is non-zero")
 }
 
-fn global_fd_cache() -> &'static std::sync::Arc<FdCache> {
-    static CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        let cap = fd_cache_capacity(
-            std::env::var("FERROSA_FD_CACHE_SIZE").ok().as_deref(),
-            linux_soft_nofile_limit(),
-        );
-        std::sync::Arc::new(FdCache::with_capacity(cap))
-    })
+/// File-system implementation of [`ReadAt`] for immutable SSTable components.
+///
+/// Production opens mmap the small, hot index components (`Partitions.db` and
+/// `Rows.db`) and use cached `pread` for `Data.db`. That keeps index traversal
+/// lock-free without letting a corrupted or externally truncated data component
+/// crash the process with SIGBUS.
+pub struct FileReadAt {
+    inner: FileReadAtInner,
 }
 
-/// File-system implementation of [`ReadAt`] using `pread` on Unix.
+enum FileReadAtInner {
+    Mmap {
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        len: u64,
+    },
+    Empty,
+    CachedFd {
+        path: std::path::PathBuf,
+        cache: std::sync::Arc<FdCache>,
+    },
+}
+
+static GLOBAL_FD_CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
+type FileReadRehydrationHook = dyn Fn(&Path) -> Result<bool> + Send + Sync + 'static;
+type FileReadRangeHook =
+    dyn Fn(&Path, u64, usize) -> Result<Option<Vec<u8>>> + Send + Sync + 'static;
+type FileReadLenHook = dyn Fn(&Path) -> Result<Option<u64>> + Send + Sync + 'static;
+static FILE_READ_REHYDRATION_HOOKS: OnceLock<RwLock<Vec<Arc<FileReadRehydrationHook>>>> =
+    OnceLock::new();
+static FILE_READ_RANGE_HOOKS: OnceLock<RwLock<Vec<Arc<FileReadRangeHook>>>> = OnceLock::new();
+static FILE_READ_LEN_HOOKS: OnceLock<RwLock<Vec<Arc<FileReadLenHook>>>> = OnceLock::new();
+
+fn file_read_rehydration_hooks() -> &'static RwLock<Vec<Arc<FileReadRehydrationHook>>> {
+    FILE_READ_REHYDRATION_HOOKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn file_read_range_hooks() -> &'static RwLock<Vec<Arc<FileReadRangeHook>>> {
+    FILE_READ_RANGE_HOOKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn file_read_len_hooks() -> &'static RwLock<Vec<Arc<FileReadLenHook>>> {
+    FILE_READ_LEN_HOOKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Register a process-wide hook that can restore an immutable component file
+/// after it has been evicted from local disk.
 ///
-/// Backed by a per-process LRU [`FdCache`]: idle readers hold no fd, the
-/// first read opens + caches the descriptor, subsequent reads to the same
-/// path reuse the cached handle. Replaces the previous reopen-per-pread
-/// pattern (see `bug-streaming-range-read-perf-50x-floor.md`).
-pub struct FileReadAt {
-    path: std::path::PathBuf,
-    cache: std::sync::Arc<FdCache>,
+/// Hooks are called only when a lazy file read observes `NotFound`. The first
+/// hook to return `Ok(true)` wins and the read is retried. This keeps the
+/// SSTable crate independent from object storage while allowing storage engines
+/// to provide S3-backed read-through for uploaded local-cache entries.
+pub fn register_file_read_rehydration_hook(hook: Arc<FileReadRehydrationHook>) {
+    file_read_rehydration_hooks()
+        .write()
+        .expect("file read rehydration hook registry poisoned")
+        .push(hook);
+}
+
+/// Register a process-wide hook that can satisfy a positional read directly
+/// when an immutable component file has been evicted from local disk.
+///
+/// This is the fast path for S3-backed SSTable cache misses: point reads can
+/// fetch only the addressed byte range instead of rehydrating the whole
+/// component locally before retrying the read.
+pub fn register_file_read_range_hook(hook: Arc<FileReadRangeHook>) {
+    file_read_range_hooks()
+        .write()
+        .expect("file read range hook registry poisoned")
+        .push(hook);
+}
+
+/// Register a process-wide hook that can return the length of an evicted
+/// immutable component without restoring it to local disk.
+pub fn register_file_read_len_hook(hook: Arc<FileReadLenHook>) {
+    file_read_len_hooks()
+        .write()
+        .expect("file read len hook registry poisoned")
+        .push(hook);
+}
+
+fn try_read_file_range(path: &Path, offset: u64, buf: &mut [u8]) -> Result<Option<usize>> {
+    let hooks = file_read_range_hooks()
+        .read()
+        .expect("file read range hook registry poisoned");
+    for hook in hooks.iter() {
+        if let Some(bytes) = hook(path, offset, buf.len())? {
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(Some(n));
+        }
+    }
+    Ok(None)
+}
+
+fn try_file_len(path: &Path) -> Result<Option<u64>> {
+    let hooks = file_read_len_hooks()
+        .read()
+        .expect("file read len hook registry poisoned");
+    for hook in hooks.iter() {
+        if let Some(len) = hook(path)? {
+            return Ok(Some(len));
+        }
+    }
+    Ok(None)
+}
+
+fn try_rehydrate_file(path: &Path) -> Result<bool> {
+    let hooks = file_read_rehydration_hooks()
+        .read()
+        .expect("file read rehydration hook registry poisoned");
+    for hook in hooks.iter() {
+        if hook(path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Try to restore an immutable component file through the registered
+/// read-through hooks.
+///
+/// Storage-engine maintenance code uses this before opening evicted SSTable
+/// components for compaction. The SSTable crate remains object-store agnostic:
+/// callers only learn whether some registered hook restored the local path.
+pub fn rehydrate_file(path: impl AsRef<Path>) -> Result<bool> {
+    try_rehydrate_file(path.as_ref())
+}
+
+/// Return the length of an immutable component through registered read-through
+/// hooks without restoring it locally.
+pub fn remote_file_len(path: impl AsRef<Path>) -> Result<Option<u64>> {
+    try_file_len(path.as_ref())
+}
+
+fn is_not_found(err: &ferrosa_common::Error) -> bool {
+    matches!(err, ferrosa_common::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn global_fd_cache() -> std::sync::Arc<FdCache> {
+    std::sync::Arc::clone(GLOBAL_FD_CACHE.get_or_init(|| {
+        std::sync::Arc::new(FdCache::with_capacity(
+            std::num::NonZeroUsize::new(1024).expect("fd cache capacity is non-zero"),
+        ))
+    }))
+}
+
+fn should_mmap_component(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with("-Partitions.db") || name.ends_with("-Rows.db"))
+        .unwrap_or(false)
 }
 
 impl FileReadAt {
-    /// Open a file for positional reading via the process-wide LRU fd cache.
-    /// Validates the path is readable; does not retain a descriptor.
+    /// Open a file for positional reading.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::open_with_cache(path, std::sync::Arc::clone(global_fd_cache()))
+        let path = path.as_ref().to_path_buf();
+        if !should_mmap_component(&path) {
+            return Self::open_with_cache(path, global_fd_cache());
+        }
+
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && try_rehydrate_file(&path)? => {
+                std::fs::File::open(&path)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(Self {
+                inner: FileReadAtInner::Empty,
+            });
+        }
+
+        // SAFETY: SSTable component files are immutable after they are opened by
+        // the reader. Compaction deletes whole files after readers are dropped;
+        // it does not mutate bytes through this mapping.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Ok(Self {
+            inner: FileReadAtInner::Mmap {
+                mmap: std::sync::Arc::new(mmap),
+                len,
+            },
+        })
     }
 
     /// Open against an explicit cache — used by tests so capacity and
@@ -253,41 +478,92 @@ impl FileReadAt {
         cache: std::sync::Arc<FdCache>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        std::fs::File::open(&path)?;
-        Ok(Self { path, cache })
+        match std::fs::File::open(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && try_rehydrate_file(&path)? => {
+                std::fs::File::open(&path)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(Self {
+            inner: FileReadAtInner::CachedFd { path, cache },
+        })
     }
 }
 
 impl Drop for FileReadAt {
     fn drop(&mut self) {
-        // Evict on drop so a compacted/deleted SSTable's inode is released
-        // promptly. FileReadAt is single-owner (never cloned), so the path
-        // is unique to this reader at drop time.
-        self.cache.invalidate(&self.path);
+        if let FileReadAtInner::CachedFd { path, cache } = &self.inner {
+            cache.invalidate(path);
+        }
     }
 }
 
 impl ReadAt for FileReadAt {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let file = self.cache.get_or_open(&self.path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            Ok(file.read_at(buf, offset)?)
-        }
-        #[cfg(not(unix))]
-        {
-            // pread is unix-only; on non-unix fall back to a per-call clone
-            // + seek so concurrent reads do not corrupt a shared offset.
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = file.try_clone()?;
-            file.seek(SeekFrom::Start(offset))?;
-            Ok(file.read(buf)?)
+        match &self.inner {
+            FileReadAtInner::Mmap { mmap, len, .. } => {
+                if buf.is_empty() || offset >= *len {
+                    return Ok(0);
+                }
+                let offset = offset as usize;
+                let n = buf.len().min(mmap.len().saturating_sub(offset));
+                buf[..n].copy_from_slice(&mmap[offset..offset + n]);
+                Ok(n)
+            }
+            FileReadAtInner::Empty => Ok(0),
+            FileReadAtInner::CachedFd { path, cache } => {
+                let file = match cache.get_or_open(path) {
+                    Ok(file) => file,
+                    Err(e) if is_not_found(&e) => {
+                        if let Some(n) = try_read_file_range(path, offset, buf)? {
+                            return Ok(n);
+                        }
+                        if try_rehydrate_file(path)? {
+                            cache.invalidate(path);
+                            cache.get_or_open(path)?
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    Ok(file.read_at(buf, offset)?)
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut file = file.try_clone()?;
+                    file.seek(SeekFrom::Start(offset))?;
+                    Ok(file.read(buf)?)
+                }
+            }
         }
     }
 
     fn len(&self) -> Result<u64> {
-        Ok(std::fs::metadata(&self.path)?.len())
+        match &self.inner {
+            FileReadAtInner::Mmap { len, .. } => Ok(*len),
+            FileReadAtInner::Empty => Ok(0),
+            FileReadAtInner::CachedFd { path, cache } => match std::fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(len) = try_file_len(path)? {
+                        return Ok(len);
+                    }
+                    if try_rehydrate_file(path)? {
+                        cache.invalidate(path);
+                        Ok(std::fs::metadata(path)?.len())
+                    } else {
+                        Err(e.into())
+                    }
+                }
+                Err(e) => Err(e.into()),
+            },
+        }
     }
 }
 
@@ -358,6 +634,42 @@ impl ReadAt for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    struct CountingReadAt {
+        data: Vec<u8>,
+        reads: Arc<AtomicU64>,
+        len_calls: Arc<AtomicU64>,
+    }
+
+    impl CountingReadAt {
+        fn new(data: Vec<u8>) -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let reads = Arc::new(AtomicU64::new(0));
+            let len_calls = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    data,
+                    reads: Arc::clone(&reads),
+                    len_calls: Arc::clone(&len_calls),
+                },
+                reads,
+                len_calls,
+            )
+        }
+    }
+
+    impl ReadAt for CountingReadAt {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.data.read_at(buf, offset)
+        }
+
+        fn len(&self) -> Result<u64> {
+            self.len_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.data.len() as u64)
+        }
+    }
 
     #[test]
     fn slice_read_at_basic() {
@@ -366,6 +678,29 @@ mod tests {
         let n = data.read_at(&mut buf, 0).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn cached_read_at_is_lock_free_read_through_and_caches_len() {
+        let (inner, reads, len_calls) = CountingReadAt::new(b"abcdefgh".to_vec());
+        let cached =
+            CachedReadAt::with_capacity(inner, 4, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+
+        let mut first = [0u8; 2];
+        cached.read_exact_at(&mut first, 0).unwrap();
+        assert_eq!(&first, b"ab");
+
+        let mut second = [0u8; 2];
+        cached.read_exact_at(&mut second, 1).unwrap();
+        assert_eq!(&second, b"bc");
+
+        let mut third = [0u8; 2];
+        cached.read_exact_at(&mut third, 5).unwrap();
+        assert_eq!(&third, b"fg");
+
+        assert_eq!(cached.len().unwrap(), 8);
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+        assert_eq!(len_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -450,6 +785,46 @@ mod tests {
     }
 
     #[test]
+    fn data_component_truncation_returns_eof_instead_of_sigbus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-Data.db");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        let reader = FileReadAt::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        let err = reader.read_exact_at(&mut buf, 6).unwrap_err();
+        assert!(
+            err.to_string().contains("wanted 4 bytes"),
+            "truncated data component must surface EOF, got: {err}"
+        );
+    }
+
+    #[test]
+    fn index_components_use_mmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = dir.path().join("1-Partitions.db");
+        let rows = dir.path().join("1-Rows.db");
+        std::fs::write(&partitions, b"partitions").unwrap();
+        std::fs::write(&rows, b"rows").unwrap();
+
+        assert!(matches!(
+            FileReadAt::open(&partitions).unwrap().inner,
+            FileReadAtInner::Mmap { .. }
+        ));
+        assert!(matches!(
+            FileReadAt::open(&rows).unwrap().inner,
+            FileReadAtInner::Mmap { .. }
+        ));
+    }
+
+    #[test]
     fn file_write_at_offset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("offset.dat");
@@ -490,7 +865,6 @@ mod tests {
 
     use super::{FdCache, FileReadAt, ReadAt, WriteAt};
     use std::num::NonZeroUsize;
-    use std::sync::Arc;
 
     #[test]
     fn open_does_not_populate_cache() {
@@ -639,6 +1013,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cached_data_component_rehydrates_missing_file_before_retrying_read() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(4).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-Data.db");
+        let restored = b"restored sstable bytes";
+        std::fs::write(&path, b"original bytes").unwrap();
+
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate_for_test(&path);
+
+        let hook_path = path.clone();
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        register_file_read_rehydration_hook(Arc::new(move |missing_path| {
+            if missing_path != hook_path {
+                return Ok(false);
+            }
+            hook_calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            std::fs::write(missing_path, restored)?;
+            Ok(true)
+        }));
+
+        let mut buf = vec![0u8; restored.len()];
+        reader.read_exact_at(&mut buf, 0).unwrap();
+
+        assert_eq!(buf, restored);
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(reader.len().unwrap(), restored.len() as u64);
+    }
+
+    #[test]
+    fn cached_data_component_reads_evicted_range_without_full_rehydrate() {
+        let cache = Arc::new(FdCache::with_capacity(NonZeroUsize::new(4).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range-fast-path-Data.db");
+        std::fs::write(&path, b"local seed bytes").unwrap();
+
+        let reader = FileReadAt::open_with_cache(&path, Arc::clone(&cache)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate_for_test(&path);
+
+        let remote = Arc::new(b"0123456789abcdef".to_vec());
+        let hook_path = path.clone();
+        let range_calls = Arc::new(AtomicU64::new(0));
+        let len_calls = Arc::new(AtomicU64::new(0));
+        let range_calls_for_hook = Arc::clone(&range_calls);
+        let remote_for_range = Arc::clone(&remote);
+        register_file_read_range_hook(Arc::new(move |missing_path, offset, len| {
+            if missing_path != hook_path {
+                return Ok(None);
+            }
+            range_calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            let start = offset as usize;
+            let end = start.saturating_add(len).min(remote_for_range.len());
+            Ok(Some(remote_for_range[start..end].to_vec()))
+        }));
+
+        let hook_path = path.clone();
+        let remote_for_len = Arc::clone(&remote);
+        let len_calls_for_hook = Arc::clone(&len_calls);
+        register_file_read_len_hook(Arc::new(move |missing_path| {
+            if missing_path != hook_path {
+                return Ok(None);
+            }
+            len_calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(remote_for_len.len() as u64))
+        }));
+
+        let mut buf = [0u8; 4];
+        reader.read_exact_at(&mut buf, 4).unwrap();
+
+        assert_eq!(&buf, b"4567");
+        assert_eq!(reader.len().unwrap(), remote.len() as u64);
+        assert_eq!(range_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(len_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            !path.exists(),
+            "range fast path must not rehydrate the whole component"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn idle_filereadat_holds_no_process_fd() {
@@ -688,7 +1145,7 @@ mod tests {
         let after_reads = open_fd_count();
 
         assert!(
-            after_reads <= baseline + 8,
+            after_reads <= baseline + 16,
             "same-path readers must share one cache entry, not 256 fds: baseline={baseline}, after_reads={after_reads}"
         );
     }

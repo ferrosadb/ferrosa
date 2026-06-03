@@ -23,6 +23,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_storage::TableId;
 
 use crate::ring::TokenRing;
@@ -161,7 +162,7 @@ impl RepairCoordinator {
             let table = table.clone();
             let executor = executor.clone();
             let sem = sem.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(TaskPool::current("repair-session").spawn(async move {
                 // OwnedSemaphorePermit: held for the body of run_session,
                 // released on drop. Bound on the runtime queue, not on
                 // throughput of any single session.

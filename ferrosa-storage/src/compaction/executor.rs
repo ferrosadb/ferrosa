@@ -4,13 +4,111 @@
 //! background thread using the existing `merge_partitions` logic, and sends
 //! back [`CompactionResult`]s.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
+use crate::upload::manager::SstableComponentBytes;
+
 use super::metadata::{CompactionTask, SSTableMetadata};
+
+struct QueuedCompactionTask {
+    task: CompactionTask,
+    queued_at: Instant,
+}
+
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("true" | "1" | "on" | "yes") => true,
+        Some("false" | "0" | "off" | "no") => false,
+        _ => default,
+    }
+}
+
+fn compaction_verify_output_enabled() -> bool {
+    env_flag_enabled("FERROSA_COMPACTION_VERIFY_OUTPUT", true)
+}
+
+fn ensure_compaction_component(
+    path: &std::path::Path,
+    required: bool,
+    reject_empty: bool,
+) -> std::result::Result<Option<u64>, String> {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if reject_empty && meta.len() == 0 {
+                return Err(format!(
+                    "required SSTable component {} is empty",
+                    path.display()
+                ));
+            }
+            return Ok(Some(meta.len()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "failed to inspect SSTable component {}: {e}",
+                path.display()
+            ));
+        }
+    }
+
+    let restored = ferrosa_sstable::io::rehydrate_file(path).map_err(|e| {
+        format!(
+            "failed to rehydrate SSTable component {}: {e}",
+            path.display()
+        )
+    })?;
+    if !restored {
+        return if required {
+            Err(format!(
+                "required SSTable component {} is missing",
+                path.display()
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if reject_empty && meta.len() == 0 {
+                return Err(format!(
+                    "required SSTable component {} is empty after rehydration",
+                    path.display()
+                ));
+            }
+            Ok(Some(meta.len()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(e) => Err(format!(
+            "failed to inspect rehydrated SSTable component {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn read_compaction_component(
+    path: &std::path::Path,
+    required: bool,
+    reject_empty: bool,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    if ensure_compaction_component(path, required, reject_empty)?.is_none() {
+        return Ok(None);
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(e) => Err(format!(
+            "failed to read SSTable component {}: {e}",
+            path.display()
+        )),
+    }
+}
 
 /// Result of a completed compaction.
 #[derive(Debug)]
@@ -19,6 +117,29 @@ pub struct CompactionResult {
     pub task: CompactionTask,
     /// Metadata for the newly-created output SSTable.
     pub output: SSTableMetadata,
+    /// Optional finished SSTable components captured before local file flush.
+    ///
+    /// This is reserved for a future truly streaming compaction writer. The
+    /// current in-memory SSTable writer already owns full component buffers;
+    /// cloning those buffers for direct upload doubled peak heap during large
+    /// compactions and contributed to OOMs, so compaction now uploads from the
+    /// flushed files instead.
+    pub direct_upload: Option<CompactionDirectUpload>,
+}
+
+/// In-memory SSTable components produced by compaction.
+#[derive(Debug, Clone)]
+pub struct CompactionDirectUpload {
+    pub files: Vec<SstableComponentBytes>,
+}
+
+impl CompactionDirectUpload {
+    pub fn total_size_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .map(SstableComponentBytes::size_bytes)
+            .sum()
+    }
 }
 
 /// Runs compaction tasks on a background thread.
@@ -26,10 +147,12 @@ pub struct CompactionResult {
 /// `StorageEngine` submits tasks via `submit()` and polls results via
 /// `poll_results()`. The executor is stopped on `shutdown()`.
 pub struct CompactionExecutor {
-    task_tx: std::sync::mpsc::Sender<CompactionTask>,
+    task_txs: Vec<std::sync::mpsc::Sender<QueuedCompactionTask>>,
+    next_worker: AtomicUsize,
     result_rx: Mutex<std::sync::mpsc::Receiver<CompactionResult>>,
-    handle: Mutex<Option<thread::JoinHandle<()>>>,
+    handles: Mutex<Vec<thread::JoinHandle<()>>>,
     stop_flag: Arc<AtomicBool>,
+    in_flight_inputs: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for CompactionExecutor {
@@ -41,44 +164,112 @@ impl Default for CompactionExecutor {
 impl CompactionExecutor {
     /// Creates and starts the compaction executor background thread.
     pub fn new() -> Self {
-        let (task_tx, task_rx) = std::sync::mpsc::channel::<CompactionTask>();
+        let worker_count = std::env::var("FERROSA_COMPACTION_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(2)
+                    .clamp(1, 4)
+            });
         let (result_tx, result_rx) = std::sync::mpsc::channel::<CompactionResult>();
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop = Arc::clone(&stop_flag);
+        let in_flight_inputs = Arc::new(Mutex::new(HashSet::new()));
+        let mut task_txs = Vec::with_capacity(worker_count);
+        let mut handles = Vec::with_capacity(worker_count);
 
-        let handle = thread::Builder::new()
-            .name("compaction-executor".to_string())
-            .spawn(move || {
-                while !stop.load(Ordering::Acquire) {
-                    match task_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                        Ok(task) => match Self::execute_task(&task) {
-                            Ok(output) => {
-                                let _ = result_tx.send(CompactionResult { task, output });
+        for worker_idx in 0..worker_count {
+            let (task_tx, task_rx) = std::sync::mpsc::channel::<QueuedCompactionTask>();
+            task_txs.push(task_tx);
+            let result_tx = result_tx.clone();
+            let stop = Arc::clone(&stop_flag);
+            let in_flight_inputs = Arc::clone(&in_flight_inputs);
+
+            let handle = thread::Builder::new()
+                .name(format!("compaction-executor-{worker_idx}"))
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        match task_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                            Ok(queued) => {
+                                crate::metrics::dec_compaction_queue_depth();
+                                crate::metrics::observe_compaction_phase(
+                                    crate::metrics::CompactionPhase::QueueWait,
+                                    queued.queued_at.elapsed(),
+                                );
+                                crate::metrics::inc_compaction_running();
+                                let task_start = Instant::now();
+                                let task = queued.task;
+                                match Self::execute_task(&task) {
+                                    Ok(output) => {
+                                        crate::metrics::dec_compaction_running();
+                                        let _ = result_tx.send(CompactionResult {
+                                            task,
+                                            output: output.metadata,
+                                            direct_upload: output.direct_upload,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        Self::release_in_flight_inputs(&in_flight_inputs, &task);
+                                        crate::metrics::observe_compaction_phase(
+                                            crate::metrics::CompactionPhase::Total,
+                                            task_start.elapsed(),
+                                        );
+                                        crate::metrics::inc_compaction_failed();
+                                        crate::metrics::dec_compaction_running();
+                                        tracing::error!(%e, "compaction: task failed");
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!(%e, "compaction: task failed");
-                            }
-                        },
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
                     }
-                }
-            })
-            .expect("failed to spawn compaction executor thread");
+                })
+                .expect("failed to spawn compaction executor thread");
+            handles.push(handle);
+        }
 
         Self {
-            task_tx,
+            task_txs,
+            next_worker: AtomicUsize::new(0),
             result_rx: Mutex::new(result_rx),
-            handle: Mutex::new(Some(handle)),
+            handles: Mutex::new(handles),
             stop_flag,
+            in_flight_inputs,
         }
     }
 
     /// Submits a compaction task to the background thread.
     pub fn submit(&self, task: CompactionTask) -> ferrosa_common::Result<()> {
-        self.task_tx
-            .send(task)
-            .map_err(|_| ferrosa_common::Error::InvalidFormat("compaction channel closed".into()))
+        crate::metrics::inc_compaction_submitted();
+        if !Self::try_claim_in_flight_inputs(&self.in_flight_inputs, &task) {
+            crate::metrics::inc_compaction_skipped_overlap();
+            tracing::debug!(
+                table_id = %task.table_id,
+                inputs = task.inputs.len(),
+                "compaction: skipping overlapping task already in flight"
+            );
+            return Ok(());
+        }
+
+        let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.task_txs.len();
+        crate::metrics::inc_compaction_queue_depth();
+        let queued = QueuedCompactionTask {
+            task,
+            queued_at: Instant::now(),
+        };
+        match self.task_txs[worker_idx].send(queued) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                crate::metrics::dec_compaction_queue_depth();
+                Self::release_in_flight_inputs(&self.in_flight_inputs, &err.0.task);
+                Err(ferrosa_common::Error::InvalidFormat(
+                    "compaction channel closed".into(),
+                ))
+            }
+        }
     }
 
     /// Polls for completed compaction results (non-blocking).
@@ -91,11 +282,49 @@ impl CompactionExecutor {
         results
     }
 
+    /// Releases a successful task's inputs after its result has been finalized.
+    ///
+    /// Successful compactions must stay claimed while their result waits in the
+    /// result queue. Otherwise a later flush can schedule the same inputs again,
+    /// and the first finalized result can delete files the duplicate task still
+    /// expects to read.
+    pub fn release_task_inputs(&self, task: &CompactionTask) {
+        Self::release_in_flight_inputs(&self.in_flight_inputs, task);
+    }
+
     /// Shuts down the compaction executor, waiting for the background thread.
     pub fn shutdown(&self) {
         self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.lock().take() {
+        for handle in self.handles.lock().drain(..) {
             let _ = handle.join();
+        }
+    }
+
+    fn input_key(task: &CompactionTask, input_id: &str) -> String {
+        format!("{}:{input_id}", task.table_id)
+    }
+
+    fn try_claim_in_flight_inputs(
+        in_flight_inputs: &Mutex<HashSet<String>>,
+        task: &CompactionTask,
+    ) -> bool {
+        let keys: Vec<String> = task
+            .inputs
+            .iter()
+            .map(|input| Self::input_key(task, &input.id))
+            .collect();
+        let mut in_flight = in_flight_inputs.lock();
+        if keys.iter().any(|key| in_flight.contains(key)) {
+            return false;
+        }
+        in_flight.extend(keys);
+        true
+    }
+
+    fn release_in_flight_inputs(in_flight_inputs: &Mutex<HashSet<String>>, task: &CompactionTask) {
+        let mut in_flight = in_flight_inputs.lock();
+        for input in &task.inputs {
+            in_flight.remove(&Self::input_key(task, &input.id));
         }
     }
 }
@@ -111,7 +340,7 @@ impl CompactionExecutor {
     fn execute_task_observing<F>(
         task: &CompactionTask,
         observe_group_width: F,
-    ) -> std::result::Result<SSTableMetadata, String>
+    ) -> std::result::Result<ExecutedCompaction, String>
     where
         F: FnMut(usize),
     {
@@ -134,14 +363,14 @@ impl CompactionExecutor {
     // synchronously and diff the output against its oracle.
     pub(crate) fn execute_task(
         task: &CompactionTask,
-    ) -> std::result::Result<SSTableMetadata, String> {
+    ) -> std::result::Result<ExecutedCompaction, String> {
         Self::execute_task_inner(task, |_| {})
     }
 
     fn execute_task_inner<F>(
         task: &CompactionTask,
         mut observe_group_width: F,
-    ) -> std::result::Result<SSTableMetadata, String>
+    ) -> std::result::Result<ExecutedCompaction, String>
     where
         F: FnMut(usize),
     {
@@ -159,49 +388,63 @@ impl CompactionExecutor {
             "compaction: starting streaming task"
         );
 
+        let task_start = Instant::now();
+        let mut input_size_bytes: u64 = 0;
+
         // 1. Open every input SSTable.  ANY missing/corrupt input aborts the
         //    whole compaction — silent skipping previously caused data loss
         //    because swap_compacted_sstables removes all inputs.
+        let open_start = Instant::now();
         let mut readers: Vec<SSTableReader<FileReadAt>> = Vec::with_capacity(task.inputs.len());
         for input in &task.inputs {
             let gen = &input.id;
             let dir = &input.path;
 
             let data_path = dir.join(format!("{gen}-Data.db"));
-            let data_file_size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            let data_file_size = ensure_compaction_component(&data_path, true, true)?
+                .expect("required component returns size");
+            input_size_bytes = input_size_bytes.saturating_add(data_file_size);
             tracing::info!(
                 %gen,
                 data_file_size,
                 path = ?data_path,
                 "compaction: opening input SSTable"
             );
-            match std::fs::metadata(&data_path) {
-                Ok(meta) if meta.len() == 0 => {
-                    return Err(format!(
-                        "aborting compaction: SSTable {gen} has empty Data.db — \
-                         cannot compact without all input data"
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "aborting compaction: SSTable {gen} Data.db missing: {e}"
-                    ));
-                }
-                Ok(_) => {}
-            }
 
             let data = FileReadAt::open(&data_path)
                 .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
-            let partitions_file = FileReadAt::open(dir.join(format!("{gen}-Partitions.db")))
+            let partitions_path = dir.join(format!("{gen}-Partitions.db"));
+            input_size_bytes = input_size_bytes.saturating_add(
+                ensure_compaction_component(&partitions_path, true, true)?
+                    .expect("required component returns size"),
+            );
+            let partitions_file = FileReadAt::open(&partitions_path)
                 .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
-            let rows = FileReadAt::open(dir.join(format!("{gen}-Rows.db")))
+            let rows_path = dir.join(format!("{gen}-Rows.db"));
+            input_size_bytes = input_size_bytes.saturating_add(
+                ensure_compaction_component(&rows_path, true, false)?
+                    .expect("required component returns size"),
+            );
+            let rows = FileReadAt::open(&rows_path)
                 .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
-            let filter = std::fs::read(dir.join(format!("{gen}-Filter.db")))
-                .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
-            let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db")))
-                .map_err(|e| format!("aborting compaction: SSTable {gen}: {e}"))?;
-            let compression_info =
-                std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+            let filter_path = dir.join(format!("{gen}-Filter.db"));
+            let filter = read_compaction_component(&filter_path, true, false)?
+                .ok_or_else(|| format!("aborting compaction: SSTable {gen}: Filter.db missing"))?;
+            input_size_bytes = input_size_bytes.saturating_add(filter.len() as u64);
+            let statistics_path = dir.join(format!("{gen}-Statistics.db"));
+            let statistics =
+                read_compaction_component(&statistics_path, true, true)?.ok_or_else(|| {
+                    format!("aborting compaction: SSTable {gen}: Statistics.db missing")
+                })?;
+            input_size_bytes = input_size_bytes.saturating_add(statistics.len() as u64);
+            let compression_info_path = dir.join(format!("{gen}-CompressionInfo.db"));
+            let compression_info = read_compaction_component(&compression_info_path, false, false)?;
+            input_size_bytes = input_size_bytes.saturating_add(
+                compression_info
+                    .as_ref()
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(0),
+            );
 
             let reader = SSTableReader::open(SSTableComponents {
                 data,
@@ -215,6 +458,10 @@ impl CompactionExecutor {
 
             readers.push(reader);
         }
+        crate::metrics::observe_compaction_phase(
+            crate::metrics::CompactionPhase::OpenInputs,
+            open_start.elapsed(),
+        );
 
         if readers.is_empty() {
             return Err("no input SSTables to compact".into());
@@ -242,9 +489,23 @@ impl CompactionExecutor {
             "compaction: combined output serialization header"
         );
 
-        let options = crate::engine::write_options_for_schema(&task.schema, true)
+        // Compaction verifies the promoted output below with a streaming
+        // readback. Keep the writer's generic verification off here so
+        // finish() does not perform a second full output scan.
+        let options = crate::engine::write_options_for_schema(&task.schema, false)
             .map_err(|e| format!("compaction: invalid write options: {e}"))?;
-        let mut writer = SSTableWriter::new(options, output_header.clone());
+        let flush_target = FileFlushTarget::new_starting_at(task.output_dir.clone())
+            .map_err(|e| format!("flush target: {e}"))?;
+        let staging_dir = flush_target
+            .file_output_staging_dir()
+            .map_err(|e| format!("flush staging dir: {e}"))?
+            .ok_or_else(|| "file flush target did not provide staging directory".to_string())?;
+        let mut writer = SSTableWriter::new_file_backed(
+            options,
+            output_header.clone(),
+            staging_dir.join("Data.raw"),
+        )
+        .map_err(|e| format!("writer staging: {e}"))?;
 
         // 3. K-way streaming merge across the input partition iterators.
         //
@@ -255,10 +516,15 @@ impl CompactionExecutor {
         let mut iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, FileReadAt>> =
             Vec::with_capacity(readers.len());
         for r in &readers {
-            iters.push(
-                r.partitions_iter()
-                    .map_err(|e| format!("partitions_iter: {e}"))?,
+            let read_start = Instant::now();
+            let iter = r
+                .partitions_iter()
+                .map_err(|e| format!("partitions_iter: {e}"))?;
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::MergeRead,
+                read_start.elapsed(),
             );
+            iters.push(iter);
         }
 
         // Heap entry: the Partition is moved into the heap (no key
@@ -291,9 +557,13 @@ impl CompactionExecutor {
 
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(iters.len());
         for (idx, it) in iters.iter_mut().enumerate() {
-            if let Some(mut partition) =
-                it.next_partition().map_err(|e| format!("iter init: {e}"))?
-            {
+            let read_start = Instant::now();
+            let next = it.next_partition().map_err(|e| format!("iter init: {e}"))?;
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::MergeRead,
+                read_start.elapsed(),
+            );
+            if let Some(mut partition) = next {
                 mappings[idx].remap_partition(&mut partition);
                 heap.push(HeapEntry {
                     partition,
@@ -325,10 +595,15 @@ impl CompactionExecutor {
             let mut group: Vec<ferrosa_sstable::types::Partition> = Vec::with_capacity(1);
             group.push(first_partition);
             // Advance reader first_idx.
-            if let Some(next) = iters[first_idx]
+            let read_start = Instant::now();
+            let next = iters[first_idx]
                 .next_partition()
-                .map_err(|e| format!("iter advance: {e}"))?
-            {
+                .map_err(|e| format!("iter advance: {e}"))?;
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::MergeRead,
+                read_start.elapsed(),
+            );
+            if let Some(next) = next {
                 let mut next = next;
                 mappings[first_idx].remap_partition(&mut next);
                 heap.push(HeapEntry {
@@ -344,10 +619,15 @@ impl CompactionExecutor {
                 } = heap.pop().expect("peek implies pop");
                 total_input_rows += partition.rows.len();
                 group.push(partition);
-                if let Some(next) = iters[reader_idx]
+                let read_start = Instant::now();
+                let next = iters[reader_idx]
                     .next_partition()
-                    .map_err(|e| format!("iter advance: {e}"))?
-                {
+                    .map_err(|e| format!("iter advance: {e}"))?;
+                crate::metrics::observe_compaction_phase(
+                    crate::metrics::CompactionPhase::MergeRead,
+                    read_start.elapsed(),
+                );
+                if let Some(next) = next {
                     let mut next = next;
                     mappings[reader_idx].remap_partition(&mut next);
                     heap.push(HeapEntry {
@@ -359,7 +639,12 @@ impl CompactionExecutor {
 
             observe_group_width(group.len());
 
+            let merge_start = Instant::now();
             let merged = merge::merge_partitions(group);
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::MergePartition,
+                merge_start.elapsed(),
+            );
             merged_row_count += merged.rows.len();
             merged_partition_count += 1;
             let token = merged.key.token.0;
@@ -369,11 +654,16 @@ impl CompactionExecutor {
             if token > max_token {
                 max_token = token;
             }
+            let write_start = Instant::now();
             validate_partition_writable(&merged, &output_header)
                 .map_err(|e| format!("write partition: {e}"))?;
             writer
                 .add_partition(&merged)
                 .map_err(|e| format!("write partition: {e}"))?;
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::WriterAddPartition,
+                write_start.elapsed(),
+            );
         }
 
         if merged_partition_count == 0 {
@@ -408,52 +698,70 @@ impl CompactionExecutor {
             );
         }
 
-        let output = writer.finish().map_err(|e| format!("finish: {e}"))?;
-
-        // 4. Write to output directory via FileFlushTarget.
-        let flush_target = FileFlushTarget::new_starting_at(task.output_dir.clone())
-            .map_err(|e| format!("flush target: {e}"))?;
-        let reader = flush_target
-            .flush(output)
-            .map_err(|e| format!("flush output: {e}"))?;
-
-        // 5. Streaming readback verification — count partitions and rows
-        //    without materializing the output back into a Vec.  Catches
-        //    Data.db / Partitions.db inconsistencies that would corrupt
-        //    later reads.
-        let mut readback_partitions: u64 = 0;
-        let mut readback_rows: usize = 0;
-        {
-            let mut iter = reader
-                .partitions_iter()
-                .map_err(|e| format!("CORRUPTION: output partitions_iter failed: {e}"))?;
-            while let Some(p) = iter
-                .next_partition()
-                .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
-            {
-                readback_partitions += 1;
-                readback_rows += p.rows.len();
-            }
-        }
-        if readback_partitions != merged_partition_count || readback_rows != merged_row_count {
-            tracing::error!(
-                written_partitions = merged_partition_count,
-                written_rows = merged_row_count,
-                readback_partitions,
-                readback_rows,
-                "compaction: CORRUPTION DETECTED in output SSTable"
-            );
-            return Err(format!(
-                "compaction output SSTable is corrupt: expected {} partitions/{} rows, \
-                 readback got {} partitions/{} rows",
-                merged_partition_count, merged_row_count, readback_partitions, readback_rows
-            ));
-        }
-        tracing::info!(
-            partitions = readback_partitions,
-            rows = readback_rows,
-            "compaction: output verified (streaming readback matches merge)"
+        let finish_start = Instant::now();
+        let output = writer
+            .finish_to_directory(staging_dir)
+            .map_err(|e| format!("finish: {e}"))?;
+        crate::metrics::observe_compaction_phase(
+            crate::metrics::CompactionPhase::WriterFinish,
+            finish_start.elapsed(),
         );
+        let direct_upload = None;
+
+        // 4. Promote staged output files via FileFlushTarget.
+        let local_write_start = Instant::now();
+        let reader = flush_target
+            .flush_files(output)
+            .map_err(|e| format!("flush output: {e}"))?;
+        crate::metrics::observe_compaction_phase(
+            crate::metrics::CompactionPhase::LocalWriteSstable,
+            local_write_start.elapsed(),
+        );
+
+        if compaction_verify_output_enabled() {
+            // 5. Streaming readback verification — count partitions and rows
+            //    without materializing the output back into a Vec.  Catches
+            //    Data.db / Partitions.db inconsistencies that would corrupt
+            //    later reads.
+            let mut readback_partitions: u64 = 0;
+            let mut readback_rows: usize = 0;
+            let verify_start = Instant::now();
+            {
+                let mut iter = reader
+                    .partitions_iter()
+                    .map_err(|e| format!("CORRUPTION: output partitions_iter failed: {e}"))?;
+                while let Some(p) = iter
+                    .next_partition()
+                    .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
+                {
+                    readback_partitions += 1;
+                    readback_rows += p.rows.len();
+                }
+            }
+            crate::metrics::observe_compaction_phase(
+                crate::metrics::CompactionPhase::OutputVerify,
+                verify_start.elapsed(),
+            );
+            if readback_partitions != merged_partition_count || readback_rows != merged_row_count {
+                tracing::error!(
+                    written_partitions = merged_partition_count,
+                    written_rows = merged_row_count,
+                    readback_partitions,
+                    readback_rows,
+                    "compaction: CORRUPTION DETECTED in output SSTable"
+                );
+                return Err(format!(
+                    "compaction output SSTable is corrupt: expected {} partitions/{} rows, \
+                     readback got {} partitions/{} rows",
+                    merged_partition_count, merged_row_count, readback_partitions, readback_rows
+                ));
+            }
+            tracing::info!(
+                partitions = readback_partitions,
+                rows = readback_rows,
+                "compaction: output verified (streaming readback matches merge)"
+            );
+        }
 
         let gen = flush_target.generation();
         let output_id = format!("{gen}");
@@ -466,6 +774,7 @@ impl CompactionExecutor {
             format!("{gen}-Filter.db"),
             format!("{gen}-Statistics.db"),
             format!("{gen}-TOC.txt"),
+            format!("{gen}-CompressionInfo.db"),
         ]
         .iter()
         .filter_map(|name| {
@@ -480,17 +789,34 @@ impl CompactionExecutor {
         // Use the combined-header timestamps (from input headers) for the
         // output metadata. Input metadata may have stale/incorrect values
         // that would propagate; the header values are authoritative.
-        Ok(SSTableMetadata {
-            id: output_id,
-            path: task.output_dir.clone(),
-            size_bytes: total_size,
-            min_token,
-            max_token,
-            min_timestamp: header_min_ts,
-            max_timestamp: header_max_ts,
+        crate::metrics::observe_compaction_completed(
+            task_start.elapsed(),
+            input_size_bytes,
+            total_size,
+            total_input_rows as u64,
+            merged_row_count as u64,
             partition_count,
+        );
+        Ok(ExecutedCompaction {
+            metadata: SSTableMetadata {
+                id: output_id,
+                path: task.output_dir.clone(),
+                size_bytes: total_size,
+                min_token,
+                max_token,
+                min_timestamp: header_min_ts,
+                max_timestamp: header_max_ts,
+                partition_count,
+            },
+            direct_upload,
         })
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutedCompaction {
+    pub metadata: SSTableMetadata,
+    pub direct_upload: Option<CompactionDirectUpload>,
 }
 
 /// Build an output `SerializationHeader` from the inputs' own headers
@@ -681,6 +1007,34 @@ mod tests {
         let executor = CompactionExecutor::new();
         executor.shutdown();
         // Should not hang or panic.
+    }
+
+    #[test]
+    fn successful_inputs_remain_claimed_until_result_finalization() {
+        let executor = CompactionExecutor::new();
+        let task = CompactionTask {
+            inputs: vec![make_metadata("a", 1000), make_metadata("b", 2000)],
+            output_dir: PathBuf::from("/tmp/output"),
+            schema: test_table_schema(),
+            table_id: test_table_id(),
+        };
+
+        assert!(CompactionExecutor::try_claim_in_flight_inputs(
+            &executor.in_flight_inputs,
+            &task
+        ));
+        assert!(
+            !CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
+            "overlapping compaction must stay blocked while a completed result waits to be finalized"
+        );
+
+        executor.release_task_inputs(&task);
+        assert!(
+            CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
+            "poll_compactions finalization should release inputs for future compaction"
+        );
+        executor.release_task_inputs(&task);
+        executor.shutdown();
     }
 
     /// Helper: write a real SSTable to disk from partitions.
@@ -945,7 +1299,7 @@ mod tests {
         let result = CompactionExecutor::execute_task(&task);
         assert!(result.is_ok(), "compaction should succeed: {result:?}");
 
-        let meta = result.unwrap();
+        let meta = result.unwrap().metadata;
         assert_eq!(
             meta.partition_count, 10,
             "all 10 partitions must be in output"
@@ -1025,7 +1379,7 @@ mod tests {
         });
 
         assert!(result.is_ok(), "compaction should succeed: {result:?}");
-        let meta = result.unwrap();
+        let meta = result.unwrap().metadata;
         assert_eq!(meta.partition_count, 200);
         assert_eq!(
             max_group_width,
@@ -1097,7 +1451,8 @@ mod tests {
         };
 
         let meta = CompactionExecutor::execute_task(&task)
-            .expect("compaction must remap legacy ordinals before writing current-schema output");
+            .expect("compaction must remap legacy ordinals before writing current-schema output")
+            .metadata;
         assert_eq!(meta.partition_count, 1);
 
         let gen = &meta.id;

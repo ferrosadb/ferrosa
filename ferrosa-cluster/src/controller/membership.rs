@@ -393,8 +393,8 @@ impl ModeController {
                         net_config.clone(),
                         local_host_id,
                         &desired_addr,
-                        raft_runtime.as_deref(),
-                        data_runtime.as_deref(),
+                        raft_runtime.clone(),
+                        data_runtime.clone(),
                     )
                     .await
                     {

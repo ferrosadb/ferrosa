@@ -1818,6 +1818,7 @@ dependencies = [
  "num-bigint",
  "proptest",
  "serde",
+ "tokio",
  "uuid",
 ]
 
@@ -2020,6 +2021,7 @@ dependencies = [
  "capnp",
  "capnpc",
  "dashmap",
+ "ferrosa-common",
  "futures",
  "hmac 0.12.1",
  "lz4_flex",
@@ -2101,7 +2103,9 @@ dependencies = [
  "ferrosa-common",
  "lru",
  "lz4_flex",
+ "memmap2",
  "proptest",
+ "rayon",
  "tempfile",
  "zstd",
 ]
@@ -2120,8 +2124,10 @@ dependencies = [
  "ferrosa-index",
  "ferrosa-schema",
  "ferrosa-sstable",
+ "fs2",
  "futures",
  "hex",
+ "libc",
  "object_store",
  "parking_lot 0.12.5",
  "proptest",
@@ -3272,6 +3278,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

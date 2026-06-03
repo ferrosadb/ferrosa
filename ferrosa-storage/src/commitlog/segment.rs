@@ -52,11 +52,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use ferrosa_common::key::DecoratedKey;
+use ferrosa_sstable::types::Row;
 use parking_lot::Mutex;
 
 use super::config::{CommitLogPosition, TableId};
 use super::descriptor::{SegmentDescriptor, HEADER_SIZE};
 use super::mutation::Mutation;
+
+#[cfg(all(
+    target_os = "macos",
+    not(any(feature = "macos-fullfsync", feature = "macos-standard-sync"))
+))]
+compile_error!(
+    "macOS commitlog durability requires an explicit choice: enable \
+     ferrosa-storage/macos-fullfsync for F_FULLFSYNC, or \
+     ferrosa-storage/macos-standard-sync to accept standard fsync semantics."
+);
 
 /// Entry overhead in bytes: entry_size (4) + size_crc (4) + payload_crc (4).
 pub const ENTRY_OVERHEAD: usize = 12;
@@ -72,6 +84,18 @@ static INCREMENTAL_FLUSH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FULL_FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FULL_FLUSH_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SYNCS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static SYNC_WAIT_WRITERS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_WAIT_WRITERS_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static SYNC_FILE_LOCK_WAIT_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_FILE_LOCK_WAIT_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static SYNC_WRITE_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_WRITE_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static SYNC_DATA_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_DATA_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static SYNC_PARENT_DIR_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_PARENT_DIR_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct CommitLogFlushMetrics {
     pub incremental_flushes: u64,
@@ -79,6 +103,18 @@ pub(crate) struct CommitLogFlushMetrics {
     pub full_flushes: u64,
     pub full_bytes: u64,
     pub syncs: u64,
+    pub sync_micros_total: u64,
+    pub sync_micros_max: u64,
+    pub sync_wait_writers_micros_total: u64,
+    pub sync_wait_writers_micros_max: u64,
+    pub sync_file_lock_wait_micros_total: u64,
+    pub sync_file_lock_wait_micros_max: u64,
+    pub sync_write_micros_total: u64,
+    pub sync_write_micros_max: u64,
+    pub sync_data_micros_total: u64,
+    pub sync_data_micros_max: u64,
+    pub sync_parent_dir_micros_total: u64,
+    pub sync_parent_dir_micros_max: u64,
 }
 
 pub(crate) fn flush_metrics() -> CommitLogFlushMetrics {
@@ -88,7 +124,99 @@ pub(crate) fn flush_metrics() -> CommitLogFlushMetrics {
         full_flushes: FULL_FLUSHES_TOTAL.load(Ordering::Relaxed),
         full_bytes: FULL_FLUSH_BYTES_TOTAL.load(Ordering::Relaxed),
         syncs: SYNCS_TOTAL.load(Ordering::Relaxed),
+        sync_micros_total: SYNC_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_micros_max: SYNC_MICROS_MAX.load(Ordering::Relaxed),
+        sync_wait_writers_micros_total: SYNC_WAIT_WRITERS_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_wait_writers_micros_max: SYNC_WAIT_WRITERS_MICROS_MAX.load(Ordering::Relaxed),
+        sync_file_lock_wait_micros_total: SYNC_FILE_LOCK_WAIT_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_file_lock_wait_micros_max: SYNC_FILE_LOCK_WAIT_MICROS_MAX.load(Ordering::Relaxed),
+        sync_write_micros_total: SYNC_WRITE_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_write_micros_max: SYNC_WRITE_MICROS_MAX.load(Ordering::Relaxed),
+        sync_data_micros_total: SYNC_DATA_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_data_micros_max: SYNC_DATA_MICROS_MAX.load(Ordering::Relaxed),
+        sync_parent_dir_micros_total: SYNC_PARENT_DIR_MICROS_TOTAL.load(Ordering::Relaxed),
+        sync_parent_dir_micros_max: SYNC_PARENT_DIR_MICROS_MAX.load(Ordering::Relaxed),
     }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn update_max_u64(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn observe_sync(duration: Duration) {
+    let micros = duration_micros(duration);
+    SYNC_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&SYNC_MICROS_MAX, micros);
+}
+
+fn observe_wait_writers(duration: Duration) {
+    let micros = duration_micros(duration);
+    SYNC_WAIT_WRITERS_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(&SYNC_WAIT_WRITERS_MICROS_MAX, micros);
+}
+
+fn observe_phase(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
+    let micros = duration_micros(duration);
+    total.fetch_add(micros, Ordering::Relaxed);
+    update_max_u64(max, micros);
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+fn full_sync_file(file: &fs::File) -> ferrosa_common::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+fn sync_commitlog_file(file: &fs::File) -> ferrosa_common::Result<()> {
+    #[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+    {
+        return full_sync_file(file);
+    }
+
+    #[cfg(any(
+        not(target_os = "macos"),
+        all(target_os = "macos", feature = "macos-standard-sync")
+    ))]
+    {
+        file.sync_data()?;
+        Ok(())
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> ferrosa_common::Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)?;
+        #[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+        {
+            if full_sync_file(&dir).is_err() {
+                dir.sync_all()?;
+            }
+        }
+        #[cfg(any(
+            not(target_os = "macos"),
+            all(target_os = "macos", feature = "macos-standard-sync")
+        ))]
+        {
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 /// A fixed-size byte buffer with lock-free CAS allocation for commit log entries.
@@ -150,6 +278,48 @@ pub struct Segment {
     /// written, the previous marker's `next_marker_offset` is patched to
     /// point to the new one.
     last_sync_marker_offset: AtomicU64,
+}
+
+#[derive(Default)]
+struct SyncPhaseDurations {
+    wait_writers: Duration,
+    file_lock_wait: Duration,
+    write: Duration,
+    sync_data: Duration,
+    parent_dir_sync: Duration,
+}
+
+fn slow_sync_warn_threshold() -> Duration {
+    static THRESHOLD_MICROS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_micros(*THRESHOLD_MICROS.get_or_init(|| {
+        std::env::var("FERROSA_COMMITLOG_SLOW_SYNC_WARN_MILLIS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.saturating_mul(1_000))
+            .unwrap_or(250_000)
+    }))
+}
+
+fn maybe_warn_slow_sync(
+    segment_id: u64,
+    written: usize,
+    total: Duration,
+    phases: &SyncPhaseDurations,
+) {
+    if total < slow_sync_warn_threshold() {
+        return;
+    }
+    tracing::warn!(
+        segment_id,
+        written,
+        total_ms = total.as_secs_f64() * 1_000.0,
+        wait_writers_ms = phases.wait_writers.as_secs_f64() * 1_000.0,
+        file_lock_wait_ms = phases.file_lock_wait.as_secs_f64() * 1_000.0,
+        write_ms = phases.write.as_secs_f64() * 1_000.0,
+        sync_data_ms = phases.sync_data.as_secs_f64() * 1_000.0,
+        parent_dir_sync_ms = phases.parent_dir_sync.as_secs_f64() * 1_000.0,
+        "commitlog: slow sync"
+    );
 }
 
 // SAFETY: The CAS allocation protocol guarantees that concurrent writers access
@@ -256,7 +426,8 @@ impl Segment {
 
     /// Spins until all in-flight writers have completed their entries.
     /// Called by `flush_to_disk()` before reading the buffer.
-    fn wait_for_writers(&self) {
+    fn wait_for_writers(&self) -> Duration {
+        let started = Instant::now();
         let mut spins = 0;
         while self.in_flight_writers.load(Ordering::Acquire) > 0 {
             spins += 1;
@@ -266,6 +437,7 @@ impl Segment {
                 std::hint::spin_loop();
             }
         }
+        started.elapsed()
     }
 
     /// Writes a mutation entry at the given offset.
@@ -312,6 +484,56 @@ impl Segment {
         mutation.serialize_into(&mut buf[payload_start..payload_end]);
 
         // 4. Write payload_crc (CRC32 of payload bytes).
+        let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
+        buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
+
+        CommitLogPosition {
+            segment_id: self.id,
+            offset,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_single_row_entry(
+        &self,
+        offset: u64,
+        mutation_id: [u8; 16],
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        row: &Row,
+        timestamp: i64,
+    ) -> CommitLogPosition {
+        let payload_size = Mutation::serialized_size_for_single_row(keyspace, table, key, row);
+        let total_size = ENTRY_OVERHEAD + payload_size;
+        let off = offset as usize;
+
+        debug_assert!(
+            off + total_size <= self.capacity,
+            "write_single_row_entry: offset {off} + size {total_size} exceeds capacity {}",
+            self.capacity
+        );
+
+        let buf = unsafe { &mut *self.buffer.get() };
+
+        let entry_size_bytes = (payload_size as u32).to_be_bytes();
+        buf[off..off + 4].copy_from_slice(&entry_size_bytes);
+
+        let size_crc = crc32fast::hash(&entry_size_bytes);
+        buf[off + 4..off + 8].copy_from_slice(&size_crc.to_be_bytes());
+
+        let payload_start = off + 8;
+        let payload_end = payload_start + payload_size;
+        Mutation::serialize_single_row_into(
+            mutation_id,
+            keyspace,
+            table,
+            key,
+            row,
+            timestamp,
+            &mut buf[payload_start..payload_end],
+        );
+
         let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
         buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
 
@@ -387,7 +609,9 @@ impl Segment {
     /// Uses incremental flush: only writes bytes since the last flush.
     /// Waits for all in-flight writers to complete before reading the buffer.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
+        let sync_start = Instant::now();
         let _span = tracing::info_span!("commitlog.sync", segment_id = self.id,).entered();
+        let mut phases = SyncPhaseDurations::default();
         // Snapshot position BEFORE waiting. This captures only data from
         // writers who have already allocated. New allocations after this
         // point will be flushed on the next call.
@@ -395,7 +619,8 @@ impl Segment {
 
         // Wait for all in-flight writers to complete their entries.
         // After this returns, buffer[0..snapshot_pos] is fully written.
-        self.wait_for_writers();
+        phases.wait_writers = self.wait_for_writers();
+        observe_wait_writers(phases.wait_writers);
 
         // SAFETY: We only read buffer[0..snapshot_pos]. All bytes in this range
         // have been fully written — wait_for_writers() ensures no in-flight writes.
@@ -405,7 +630,14 @@ impl Segment {
         // flushers from writing duplicate bytes. `release_buffer()` also
         // takes this lock, so once we hold it the buffer's (ptr, len, cap)
         // is stable for the duration of this flush.
+        let lock_start = Instant::now();
         let mut handle = self.file_handle.lock();
+        phases.file_lock_wait = lock_start.elapsed();
+        observe_phase(
+            &SYNC_FILE_LOCK_WAIT_MICROS_TOTAL,
+            &SYNC_FILE_LOCK_WAIT_MICROS_MAX,
+            phases.file_lock_wait,
+        );
         let last_flushed = self.last_flushed.load(Ordering::Acquire) as usize;
         let current_pos = snapshot_pos;
 
@@ -425,6 +657,7 @@ impl Segment {
                 if let Some(parent) = self.path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                let created = !self.path.exists();
                 let f = fs::OpenOptions::new()
                     .create(true)
                     .truncate(true)
@@ -434,11 +667,38 @@ impl Segment {
                 let file = handle.as_mut().unwrap();
                 use std::io::Write;
                 let written = current_pos;
+                let write_start = Instant::now();
                 file.write_all(&buf[..current_pos])?;
-                file.sync_all()?;
+                phases.write = write_start.elapsed();
+                observe_phase(
+                    &SYNC_WRITE_MICROS_TOTAL,
+                    &SYNC_WRITE_MICROS_MAX,
+                    phases.write,
+                );
+                let sync_data_start = Instant::now();
+                sync_commitlog_file(file)?;
+                phases.sync_data = sync_data_start.elapsed();
+                observe_phase(
+                    &SYNC_DATA_MICROS_TOTAL,
+                    &SYNC_DATA_MICROS_MAX,
+                    phases.sync_data,
+                );
+                if created {
+                    let parent_sync_start = Instant::now();
+                    sync_parent_dir(&self.path)?;
+                    phases.parent_dir_sync = parent_sync_start.elapsed();
+                    observe_phase(
+                        &SYNC_PARENT_DIR_MICROS_TOTAL,
+                        &SYNC_PARENT_DIR_MICROS_MAX,
+                        phases.parent_dir_sync,
+                    );
+                }
                 INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
                 SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let total = sync_start.elapsed();
+                observe_sync(total);
+                maybe_warn_slow_sync(self.id, written, total, &phases);
                 self.last_flushed
                     .store(current_pos as u64, Ordering::Release);
             }
@@ -446,11 +706,28 @@ impl Segment {
                 // Incremental: append only new bytes.
                 use std::io::Write;
                 let written = current_pos - last_flushed;
+                let write_start = Instant::now();
                 file.write_all(&buf[last_flushed..current_pos])?;
-                file.sync_all()?;
+                phases.write = write_start.elapsed();
+                observe_phase(
+                    &SYNC_WRITE_MICROS_TOTAL,
+                    &SYNC_WRITE_MICROS_MAX,
+                    phases.write,
+                );
+                let sync_data_start = Instant::now();
+                sync_commitlog_file(file)?;
+                phases.sync_data = sync_data_start.elapsed();
+                observe_phase(
+                    &SYNC_DATA_MICROS_TOTAL,
+                    &SYNC_DATA_MICROS_MAX,
+                    phases.sync_data,
+                );
                 INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
                 INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
                 SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let total = sync_start.elapsed();
+                observe_sync(total);
+                maybe_warn_slow_sync(self.id, written, total, &phases);
                 self.last_flushed
                     .store(current_pos as u64, Ordering::Release);
             }
@@ -469,15 +746,26 @@ impl Segment {
     /// offsets have been updated after an incremental flush (e.g., during
     /// `force_sync` for catch-up replay).
     pub fn force_full_flush(&self) -> ferrosa_common::Result<()> {
+        let sync_start = Instant::now();
+        let mut phases = SyncPhaseDurations::default();
         let snapshot_pos = self.position.load(Ordering::Acquire) as usize;
-        self.wait_for_writers();
+        phases.wait_writers = self.wait_for_writers();
+        observe_wait_writers(phases.wait_writers);
 
         let buf = unsafe { &*self.buffer.get() };
+        let lock_start = Instant::now();
         let mut handle = self.file_handle.lock();
+        phases.file_lock_wait = lock_start.elapsed();
+        observe_phase(
+            &SYNC_FILE_LOCK_WAIT_MICROS_TOTAL,
+            &SYNC_FILE_LOCK_WAIT_MICROS_MAX,
+            phases.file_lock_wait,
+        );
 
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let created = !self.path.exists();
         let f = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -486,11 +774,38 @@ impl Segment {
         *handle = Some(f);
         let file = handle.as_mut().unwrap();
         use std::io::Write;
+        let write_start = Instant::now();
         file.write_all(&buf[..snapshot_pos])?;
-        file.sync_all()?;
+        phases.write = write_start.elapsed();
+        observe_phase(
+            &SYNC_WRITE_MICROS_TOTAL,
+            &SYNC_WRITE_MICROS_MAX,
+            phases.write,
+        );
+        let sync_data_start = Instant::now();
+        sync_commitlog_file(file)?;
+        phases.sync_data = sync_data_start.elapsed();
+        observe_phase(
+            &SYNC_DATA_MICROS_TOTAL,
+            &SYNC_DATA_MICROS_MAX,
+            phases.sync_data,
+        );
+        if created {
+            let parent_sync_start = Instant::now();
+            sync_parent_dir(&self.path)?;
+            phases.parent_dir_sync = parent_sync_start.elapsed();
+            observe_phase(
+                &SYNC_PARENT_DIR_MICROS_TOTAL,
+                &SYNC_PARENT_DIR_MICROS_MAX,
+                phases.parent_dir_sync,
+            );
+        }
         FULL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
         FULL_FLUSH_BYTES_TOTAL.fetch_add(snapshot_pos as u64, Ordering::Relaxed);
         SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let total = sync_start.elapsed();
+        observe_sync(total);
+        maybe_warn_slow_sync(self.id, snapshot_pos, total, &phases);
         self.last_flushed
             .store(snapshot_pos as u64, Ordering::Release);
 
@@ -600,6 +915,16 @@ impl Segment {
     /// Computes the total entry size for a mutation (payload + overhead).
     pub fn entry_total_size(mutation: &Mutation) -> usize {
         ENTRY_OVERHEAD + mutation.serialized_size()
+    }
+
+    /// Computes the total entry size for a single-row borrowed mutation.
+    pub fn entry_total_size_single_row(
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        row: &Row,
+    ) -> usize {
+        ENTRY_OVERHEAD + Mutation::serialized_size_for_single_row(keyspace, table, key, row)
     }
 
     /// Returns the current heap size of the buffer in bytes.

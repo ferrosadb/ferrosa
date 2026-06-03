@@ -36,6 +36,7 @@ fn test_config(dir: &Path) -> CommitLogConfig {
         log_dir: dir.to_path_buf(),
         checkpoint_dir: dir.to_path_buf(),
         archive: None,
+        ..CommitLogConfig::default()
     }
 }
 

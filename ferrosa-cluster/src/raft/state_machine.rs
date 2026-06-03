@@ -1524,11 +1524,12 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
             let meta_for_disk = meta.clone();
             let bytes_for_disk = bytes.clone();
             #[allow(clippy::result_large_err)]
-            tokio::task::spawn_blocking(move || {
-                Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
-            })
-            .await
-            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+            ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+                .spawn_blocking(move || {
+                    Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
+                })
+                .await
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
         }
 
         Ok(Snapshot {
@@ -1613,11 +1614,12 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         if let Some(path) = self.snapshot_path.clone() {
             let meta_for_disk = meta.clone();
             #[allow(clippy::result_large_err)]
-            tokio::task::spawn_blocking(move || {
-                Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes)
-            })
-            .await
-            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+            ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+                .spawn_blocking(move || {
+                    Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes)
+                })
+                .await
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
         }
 
         Ok(())
@@ -3393,6 +3395,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,

@@ -29,6 +29,7 @@ use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
 
@@ -407,7 +408,7 @@ where
         self.cancellations.insert(req.request_id, token.clone());
         let cancellations = self.cancellations.clone();
 
-        tokio::spawn(async move {
+        TaskPool::current("range-stream-request").spawn(async move {
             let request_id = req.request_id;
             handle_stream_request_with_cancel(req, reader, &sink, chunk_size, token).await;
             cancellations.remove(&request_id);

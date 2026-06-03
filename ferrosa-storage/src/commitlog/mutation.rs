@@ -316,6 +316,23 @@ impl Mutation {
         size
     }
 
+    /// Computes the serialized size for a single-row mutation without first
+    /// constructing an owned [`Mutation`].
+    pub fn serialized_size_for_single_row(
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        row: &Row,
+    ) -> usize {
+        16 + string_size(keyspace)
+            + string_size(table)
+            + byte_vec_size(key.key.as_bytes())
+            + 8
+            + 8
+            + 2
+            + row_size(row)
+    }
+
     /// Serializes this mutation into a pre-sized buffer.
     ///
     /// # Panics
@@ -346,6 +363,40 @@ impl Mutation {
         for row in &self.rows {
             Self::serialize_row(&mut w, row);
         }
+    }
+
+    /// Serializes a single-row mutation into a pre-sized buffer without
+    /// cloning the row into an owned [`Mutation`] first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buf.len()` is too small for the serialized mutation.
+    pub fn serialize_single_row_into(
+        mutation_id: [u8; 16],
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        row: &Row,
+        timestamp: i64,
+        buf: &mut [u8],
+    ) {
+        let required = Self::serialized_size_for_single_row(keyspace, table, key, row);
+        assert!(
+            buf.len() >= required,
+            "buffer too small: got {}, need {}",
+            buf.len(),
+            required
+        );
+
+        let mut w = WriteCursor::new(buf);
+        w.write_bytes(&mutation_id);
+        w.write_string(keyspace);
+        w.write_string(table);
+        w.write_byte_vec(key.key.as_bytes());
+        w.write_i64(key.token.0);
+        w.write_i64(timestamp);
+        w.write_u16(1);
+        Self::serialize_row(&mut w, row);
     }
 
     fn serialize_row(w: &mut WriteCursor<'_>, row: &Row) {

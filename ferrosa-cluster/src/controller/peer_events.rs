@@ -100,8 +100,8 @@ async fn refresh_outbound_peer_for_inbound(
         net_config,
         local_host_id,
         &reverse_addr.to_string(),
-        raft_runtime.as_deref(),
-        data_runtime.as_deref(),
+        raft_runtime,
+        data_runtime,
     )
     .await
     {
@@ -352,7 +352,7 @@ impl InboundPeerCallback for ModeController {
                 let pm = pm.clone();
                 let hid = host_id;
                 let broadcast = broadcast.clone();
-                tokio::spawn(async move {
+                ferrosa_net::task_pool::TaskPool::current("peer-cql-broadcast").spawn(async move {
                     pm.set_peer_cql_broadcast(hid, broadcast).await;
                 });
             }

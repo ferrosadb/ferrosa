@@ -167,7 +167,9 @@ pub fn compact_all_to(
         schema: schema.clone(),
         table_id,
     };
-    let meta = CompactionExecutor::execute_task(&task).expect("compaction must succeed");
+    let meta = CompactionExecutor::execute_task(&task)
+        .expect("compaction must succeed")
+        .metadata;
     (output_dir, meta.id)
 }
 
@@ -311,7 +313,8 @@ mod tests {
                 schema: schema.clone(),
                 table_id: table_id.clone(),
             })
-            .expect("compaction must succeed");
+            .expect("compaction must succeed")
+            .metadata;
             surviving.retain(|(_, id)| !consumed.contains(id));
             surviving.push((out, result.id));
         }

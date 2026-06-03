@@ -435,34 +435,160 @@ impl Encoder<CqlFrame> for CqlCodec {
         dst: &mut BytesMut,
     ) -> std::result::Result<(), Self::Error> {
         let mut header = item.header;
+        let original_body_len = item.body.len();
+        let error_info = if header.opcode == Opcode::Error {
+            parse_error_body_for_log(&item.body)
+        } else {
+            None
+        };
 
-        let (body, flags) = if let Some(compression) = self.compression {
+        if header.opcode == Opcode::Error {
+            // Keep ERROR frames uncompressed. Drivers often enter error decode
+            // paths while connections are already degraded; making these small
+            // frames plain avoids compounding backpressure failures with a
+            // compression/framing decode failure.
+            header.flags &= !COMPRESSION_FLAG;
+        } else if let Some(compression) = self.compression {
             let compressed = match compression {
                 Compression::Lz4 => compress_lz4(&item.body),
                 Compression::Snappy => compress_snappy(&item.body),
             };
             if compressed.len() < item.body.len() {
-                (compressed, header.flags | COMPRESSION_FLAG)
-            } else {
-                (item.body.to_vec(), header.flags & !COMPRESSION_FLAG)
+                header.length = compressed.len() as u32;
+                header.flags |= COMPRESSION_FLAG;
+                log_encoded_error_frame(
+                    &header,
+                    original_body_len,
+                    compressed.len(),
+                    Some(compression),
+                    error_info.as_ref(),
+                );
+                if self.v5_framed {
+                    encode_v5_frame(&header, &compressed, dst);
+                } else {
+                    dst.reserve(HEADER_SIZE + compressed.len());
+                    header.encode(dst);
+                    dst.put_slice(&compressed);
+                }
+                return Ok(());
             }
+            header.flags &= !COMPRESSION_FLAG;
         } else {
-            (item.body.to_vec(), header.flags & !COMPRESSION_FLAG)
-        };
+            header.flags &= !COMPRESSION_FLAG;
+        }
 
-        header.length = body.len() as u32;
-        header.flags = flags;
-
+        header.length = item.body.len() as u32;
+        log_encoded_error_frame(
+            &header,
+            original_body_len,
+            item.body.len(),
+            None,
+            error_info.as_ref(),
+        );
         if self.v5_framed {
             // v5: wrap envelope in a frame with CRC24/CRC32.
-            encode_v5_frame(&header, &body, dst);
+            encode_v5_frame(&header, &item.body, dst);
         } else {
             // v4 / pre-STARTUP: raw 9-byte envelope header + body.
-            dst.reserve(HEADER_SIZE + body.len());
+            dst.reserve(HEADER_SIZE + item.body.len());
             header.encode(dst);
-            dst.put_slice(&body);
+            dst.put_slice(&item.body);
         }
         Ok(())
+    }
+}
+
+struct ErrorBodyLogInfo {
+    code: u32,
+    message_len: usize,
+    extra_len: usize,
+    body_len: usize,
+    prefix: String,
+}
+
+fn parse_error_body_for_log(body: &[u8]) -> Option<ErrorBodyLogInfo> {
+    if body.len() < 6 {
+        return Some(ErrorBodyLogInfo {
+            code: 0,
+            message_len: 0,
+            extra_len: 0,
+            body_len: body.len(),
+            prefix: body_prefix_hex(body, 64),
+        });
+    }
+    let code = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    let message_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+    let extra_len = body.len().saturating_sub(6 + message_len);
+    Some(ErrorBodyLogInfo {
+        code,
+        message_len,
+        extra_len,
+        body_len: body.len(),
+        prefix: body_prefix_hex(body, 64),
+    })
+}
+
+fn error_extra_min_len(error_code: u32) -> Option<usize> {
+    match error_code {
+        0x1000 => Some(10),
+        0x1100 => Some(12),
+        0x1200 => Some(11),
+        _ => None,
+    }
+}
+
+fn body_prefix_hex(body: &[u8], max: usize) -> String {
+    let mut out = String::with_capacity(max.saturating_mul(2));
+    for byte in body.iter().take(max) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn log_encoded_error_frame(
+    header: &FrameHeader,
+    original_body_len: usize,
+    wire_body_len: usize,
+    compression: Option<Compression>,
+    info: Option<&ErrorBodyLogInfo>,
+) {
+    let Some(info) = info else {
+        return;
+    };
+    let expected_extra_min = error_extra_min_len(info.code);
+    let malformed = expected_extra_min.is_some_and(|min| info.extra_len < min);
+    let compression_name = compression.map(|c| c.protocol_name()).unwrap_or("none");
+    if malformed {
+        tracing::warn!(
+            cql.codec.error.code = format_args!("0x{:04x}", info.code),
+            cql.codec.error.body_len = info.body_len,
+            cql.codec.error.message_len = info.message_len,
+            cql.codec.error.extra_len = info.extra_len,
+            cql.codec.error.expected_extra_min = expected_extra_min.unwrap_or_default(),
+            cql.codec.error.body_prefix = %info.prefix,
+            cql.codec.stream_id = header.stream_id,
+            cql.codec.response_version = header.version,
+            cql.codec.flags = header.flags,
+            cql.codec.original_body_len = original_body_len,
+            cql.codec.wire_body_len = wire_body_len,
+            cql.codec.compression = compression_name,
+            "malformed CQL ERROR response body at codec encode"
+        );
+    } else {
+        tracing::debug!(
+            cql.codec.error.code = format_args!("0x{:04x}", info.code),
+            cql.codec.error.body_len = info.body_len,
+            cql.codec.error.message_len = info.message_len,
+            cql.codec.error.extra_len = info.extra_len,
+            cql.codec.stream_id = header.stream_id,
+            cql.codec.response_version = header.version,
+            cql.codec.flags = header.flags,
+            cql.codec.original_body_len = original_body_len,
+            cql.codec.wire_body_len = wire_body_len,
+            cql.codec.compression = compression_name,
+            "encoding CQL ERROR response"
+        );
     }
 }
 
@@ -1070,6 +1196,57 @@ mod tests {
         decoder.set_compression(Compression::Lz4);
         let decoded = decoder.decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.body.as_ref(), &body_data[..]);
+    }
+
+    #[test]
+    fn test_error_frames_remain_uncompressed_with_lz4_enabled() {
+        let mut encoder = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        encoder.set_compression(Compression::Lz4);
+
+        let body = crate::error::CqlError::WriteTimeout {
+            consistency: ferrosa_cluster::consistency::ConsistencyLevel::LocalQuorum,
+            received: 1,
+            required: 2,
+            write_type: "SIMPLE",
+        }
+        .encode_body();
+
+        let frame = CqlFrame {
+            header: FrameHeader {
+                version: VERSION_RESPONSE,
+                flags: 0,
+                stream_id: 7,
+                opcode: Opcode::Error,
+                length: 0,
+            },
+            body: body.clone().freeze(),
+        };
+
+        let mut buf = BytesMut::new();
+        encoder.encode(frame, &mut buf).unwrap();
+
+        let header = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(header.opcode, Opcode::Error);
+        assert_eq!(header.flags & COMPRESSION_FLAG, 0);
+        assert_eq!(header.length as usize, body.len());
+
+        let mut decoder = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        decoder.set_compression(Compression::Lz4);
+        let decoded = decoder.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.body.as_ref(), &body[..]);
+
+        let mut cursor = decoded.body.as_ref();
+        assert_eq!(cursor.get_u32(), 0x1100);
+        let msg_len = cursor.get_u16() as usize;
+        cursor.advance(msg_len);
+        assert_eq!(
+            cursor.get_u16(),
+            ferrosa_cluster::consistency::ConsistencyLevel::LocalQuorum.to_wire()
+        );
+        assert_eq!(cursor.get_i32(), 1);
+        assert_eq!(cursor.get_i32(), 2);
+        let write_type_len = cursor.get_u16() as usize;
+        assert_eq!(&cursor[..write_type_len], b"SIMPLE");
     }
 
     #[test]

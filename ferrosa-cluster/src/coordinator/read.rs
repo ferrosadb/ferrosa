@@ -8,8 +8,8 @@
 //! 1. Compute replica set from the token ring (`ring.replicas(token, rf)`).
 //! 2. Verify `replicas.len() >= block_for(cl)`, else return `Unavailable`.
 //! 3. Pick one replica for a **full read** (prefer local if self is a replica).
-//! 4. Send **digest-only reads** to the remaining `block_for(cl) - 1` replicas.
-//! 5. Fan out concurrently via `FuturesUnordered`.
+//! 4. Send **digest-only reads** to the next required replicas.
+//! 5. If one fails, launch spare digest reads from remaining eligible replicas.
 //!
 //! **Phase 2 — Resolve**
 //! 1. All digests match the full read's digest → return data (fast path).
@@ -163,6 +163,73 @@ fn read_local_partition(
     match clustering {
         Some(clustering) => storage.read_clustering_row(table_id, key, clustering),
         None => storage.read_limited_rows(table_id, key, row_limit),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn digest_read_attempt(
+    coordinator: &ClusterCoordinator,
+    storage: std::sync::Arc<ferrosa_storage::StorageEngine>,
+    table_id: TableId,
+    key: DecoratedKey,
+    local_node_id: u64,
+    replica_id: u64,
+    remote: Option<(uuid::Uuid, String)>,
+    row_limit: usize,
+    clustering: Option<Vec<u8>>,
+) -> ReplicaRead {
+    if replica_id == local_node_id {
+        match read_local_partition(&storage, &table_id, &key, row_limit, clustering.as_deref()) {
+            Ok(Some(p)) => {
+                use crate::raft::handlers::compute_partition_digest;
+                let ts = p
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
+                    .max()
+                    .unwrap_or(i64::MIN);
+                let digest = compute_partition_digest(&p).ok();
+                ReplicaRead::Digest {
+                    digest,
+                    timestamp: ts,
+                    host_id: None,
+                }
+            }
+            Ok(None) => ReplicaRead::Digest {
+                digest: None,
+                timestamp: i64::MIN,
+                host_id: None,
+            },
+            Err(_) => ReplicaRead::Failed,
+        }
+    } else {
+        let payload = ReadRequestPayload {
+            keyspace: table_id.keyspace,
+            table: table_id.table,
+            key: key.key.as_bytes().to_vec(),
+            digest_only: true,
+            page_size: row_limit.min(u32::MAX as usize) as u32,
+            page_state: vec![],
+            clustering: clustering.unwrap_or_default(),
+        };
+        let body = encode_read_request(&payload);
+        match remote {
+            None => ReplicaRead::Failed,
+            Some((hid, addr)) => match coordinator
+                .send_remote_with_reconnect(hid, &addr, Message::ReadRequest(body))
+                .await
+            {
+                Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
+                    Some(resp) => ReplicaRead::Digest {
+                        digest: resp.digest,
+                        timestamp: resp.timestamp,
+                        host_id: Some(hid),
+                    },
+                    None => ReplicaRead::Failed,
+                },
+                _ => ReplicaRead::Failed,
+            },
+        }
     }
 }
 
@@ -361,8 +428,8 @@ impl ClusterCoordinator {
 
         let required = cl.block_for(rf);
 
-        {
-            let span = tracing::info_span!(
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let span = tracing::debug_span!(
                 "cluster.read",
                 cl = %cl,
                 replicas = replicas.len(),
@@ -407,12 +474,13 @@ impl ClusterCoordinator {
             replicas[0]
         };
 
-        // The remaining replicas (up to `required - 1`) do digest-only reads.
+        // Start with only the digest reads needed for quorum. Spare eligible
+        // replicas are kept in reserve and launched only if an initial read
+        // fails, avoiding a permanent extra digest RPC on every healthy read.
         let digest_replicas: Vec<u64> = replicas
             .iter()
             .copied()
             .filter(|&r| r != full_replica)
-            .take(required - 1)
             .collect();
 
         // Collect node metadata before dropping the ring guard.
@@ -420,10 +488,11 @@ impl ClusterCoordinator {
             .get_node(full_replica)
             .map(|n| (n.host_id, n.addr.clone()));
         let full_host_id = full_remote.as_ref().map(|(host_id, _)| *host_id);
-        let digest_remotes: Vec<(u64, Option<(uuid::Uuid, String)>)> = digest_replicas
-            .iter()
-            .map(|&r| (r, ring.get_node(r).map(|n| (n.host_id, n.addr.clone()))))
-            .collect();
+        let mut digest_remotes: std::collections::VecDeque<(u64, Option<(uuid::Uuid, String)>)> =
+            digest_replicas
+                .iter()
+                .map(|&r| (r, ring.get_node(r).map(|n| (n.host_id, n.addr.clone()))))
+                .collect();
         drop(ring);
 
         // -------------------------------------------------------------------
@@ -498,98 +567,25 @@ impl ClusterCoordinator {
                 }
             };
 
-            // Digest-only futures
-            let digest_futures = digest_remotes.into_iter().map(|(replica_id, remote)| {
-                let storage = self.storage.clone();
-                let coordinator = self;
-                let table_id = table_id.clone();
-                let key = key.clone();
-                let local_node_id = self.local_node_id;
-                let keyspace = table_id.keyspace.clone();
-                let table_name = table_id.table.clone();
-                let key_bytes = key.key.as_bytes().to_vec();
-                let clustering = clustering.clone();
-
-                async move {
-                    if replica_id == local_node_id {
-                        // Local digest read.
-                        match read_local_partition(
-                            &storage,
-                            &table_id,
-                            &key,
-                            row_limit,
-                            clustering.as_deref(),
-                        ) {
-                            Ok(Some(p)) => {
-                                use crate::raft::handlers::compute_partition_digest;
-                                let ts = p
-                                    .rows
-                                    .iter()
-                                    .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
-                                    .max()
-                                    .unwrap_or(i64::MIN);
-                                let digest = compute_partition_digest(&p).ok();
-                                ReplicaRead::Digest {
-                                    digest,
-                                    timestamp: ts,
-                                    host_id: None, // local — no re-fetch needed
-                                }
-                            }
-                            Ok(None) => ReplicaRead::Digest {
-                                digest: None,
-                                timestamp: i64::MIN,
-                                host_id: None,
-                            },
-                            Err(_) => ReplicaRead::Failed,
-                        }
-                    } else {
-                        // Remote digest-only read.
-                        let payload = ReadRequestPayload {
-                            keyspace,
-                            table: table_name,
-                            key: key_bytes,
-                            digest_only: true,
-                            page_size: row_limit.min(u32::MAX as usize) as u32,
-                            page_state: vec![],
-                            clustering: clustering.unwrap_or_default(),
-                        };
-                        let body = encode_read_request(&payload);
-                        match remote {
-                            None => ReplicaRead::Failed,
-                            Some((hid, addr)) => {
-                                match coordinator
-                                    .send_remote_with_reconnect(
-                                        hid,
-                                        &addr,
-                                        Message::ReadRequest(body),
-                                    )
-                                    .await
-                                {
-                                    Ok(Message::ReadResponse(b)) => {
-                                        match decode_read_response(&b) {
-                                            Some(resp) => ReplicaRead::Digest {
-                                                digest: resp.digest,
-                                                timestamp: resp.timestamp,
-                                                host_id: Some(hid),
-                                            },
-                                            None => ReplicaRead::Failed,
-                                        }
-                                    }
-                                    _ => ReplicaRead::Failed,
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-
             // Collect all futures into one FuturesUnordered.
             let all: FuturesUnordered<
                 std::pin::Pin<Box<dyn std::future::Future<Output = ReplicaRead> + Send>>,
             > = FuturesUnordered::new();
             all.push(Box::pin(full_future));
-            for f in digest_futures {
-                all.push(Box::pin(f));
+            for _ in 0..required.saturating_sub(1) {
+                if let Some((replica_id, remote)) = digest_remotes.pop_front() {
+                    all.push(Box::pin(digest_read_attempt(
+                        self,
+                        self.storage.clone(),
+                        table_id.clone(),
+                        key.clone(),
+                        self.local_node_id,
+                        replica_id,
+                        remote,
+                        row_limit,
+                        clustering.clone(),
+                    )));
+                }
             }
             all
         };
@@ -622,7 +618,22 @@ impl ClusterCoordinator {
                     received += 1;
                 }
                 ReplicaRead::Failed => {
-                    // Don't count failures toward `received`.
+                    // Don't count failures toward `received`. If another
+                    // eligible digest replica is available, launch it now so a
+                    // single failed remote doesn't fail the quorum read.
+                    if let Some((replica_id, remote)) = digest_remotes.pop_front() {
+                        fan_out.push(Box::pin(digest_read_attempt(
+                            self,
+                            self.storage.clone(),
+                            table_id.clone(),
+                            key.clone(),
+                            self.local_node_id,
+                            replica_id,
+                            remote,
+                            row_limit,
+                            clustering.clone(),
+                        )));
+                    }
                 }
             }
 
@@ -748,7 +759,9 @@ impl ClusterCoordinator {
             if let Some(ref partition) = result_partition {
                 send_repair_writes(
                     &self.peer_manager,
+                    self.storage.as_ref(),
                     &self.repair_metrics,
+                    self.local_host_id(),
                     table_id,
                     partition,
                     &stale_host_ids,
@@ -773,12 +786,21 @@ impl ClusterCoordinator {
     ) {
         send_repair_writes(
             &self.peer_manager,
+            self.storage.as_ref(),
             &self.repair_metrics,
+            self.local_host_id(),
             table_id,
             partition,
             stale_host_ids,
         )
         .await;
+    }
+
+    fn local_host_id(&self) -> Option<uuid::Uuid> {
+        self.ring
+            .load()
+            .get_node(self.local_node_id)
+            .map(|info| info.host_id)
     }
 
     // -----------------------------------------------------------------------
@@ -958,8 +980,8 @@ impl ClusterCoordinator {
         let ring = self.ring.load();
         let all_replicas = ring.replicas_for_strategy(key.token.0, strategy);
 
-        {
-            let span = tracing::info_span!(
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let span = tracing::debug_span!(
                 "cluster.read",
                 cl = %cl,
                 replicas = all_replicas.len(),
@@ -1393,7 +1415,9 @@ use super::metrics::ReadRepairMetrics;
 /// and counted but do not fail the read.
 async fn send_repair_writes(
     peer_manager: &PeerManager,
+    storage: &ferrosa_storage::engine::StorageEngine,
     metrics: &ReadRepairMetrics,
+    local_host_id: Option<uuid::Uuid>,
     table_id: &TableId,
     partition: &Partition,
     stale_host_ids: &[uuid::Uuid],
@@ -1414,6 +1438,33 @@ async fn send_repair_writes(
 
     for &host_id in stale_host_ids {
         metrics.inc_attempted();
+        if Some(host_id) == local_host_id {
+            let mut failed = None;
+            for row in mutation.rows.iter().cloned() {
+                if let Err(e) = storage.write(table_id, &mutation.key, row, mutation.timestamp) {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            if let Some(e) = failed {
+                tracing::warn!(
+                    %host_id,
+                    table = %table_id,
+                    %e,
+                    "local read repair failed"
+                );
+                metrics.inc_failed();
+            } else {
+                tracing::info!(
+                    %host_id,
+                    table = %table_id,
+                    "local read repair succeeded"
+                );
+                metrics.inc_succeeded();
+            }
+            continue;
+        }
+
         match peer_manager
             .fire(host_id, Message::RepairWrite(body.clone()), Lane::Data)
             .await
@@ -1495,6 +1546,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -1942,18 +1994,18 @@ mod tests {
             Uuid::new_v4(),
             Arc::new(NoopListener),
         ));
-        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+        pm.add_peer_entry((remote_uuid_2, "127.0.0.1:1".parse().unwrap()))
             .await;
-        pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+        pm.add_peer_entry((remote_uuid_3, "127.0.0.1:2".parse().unwrap()))
             .await;
 
-        let mut node2 = make_node("10.0.0.2:7000");
+        let mut node2 = make_node("127.0.0.1:1");
         node2.host_id = remote_uuid_2;
-        let mut node3 = make_node("10.0.0.3:7000");
+        let mut node3 = make_node("127.0.0.1:2");
         node3.host_id = remote_uuid_3;
 
         let mut ring = TokenRing::new();
-        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.add_node(local_node_id, make_node("127.0.0.1:7000"));
         ring.add_node(2u64, node2);
         ring.add_node(3u64, node3);
         ring.assign_tokens(local_node_id, &[50]);
@@ -1986,6 +2038,79 @@ mod tests {
             }
             other => panic!("expected ReadTimeout, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn coordinate_read_quorum_uses_spare_digest_replica_when_one_remote_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(1000)],
+        };
+        storage
+            .write(&table_id, &key, partition.rows[0].clone(), 1000)
+            .unwrap();
+
+        let (server, addr, remote_host_id_3) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(StaticDigestReadHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+
+        let local_node_id = 1u64;
+        let remote_host_id_2 = Uuid::new_v4();
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        pm.add_peer_entry((remote_host_id_2, "127.0.0.1:1".parse().unwrap()))
+            .await;
+
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut failing_remote = make_node("127.0.0.1:1");
+        failing_remote.host_id = remote_host_id_2;
+        let mut healthy_remote = make_node(&addr.to_string());
+        healthy_remote.host_id = remote_host_id_3;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, failing_remote);
+        ring.add_node(3u64, healthy_remote);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        ring.assign_tokens(3u64, &[200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage,
+            3,
+            ConsistencyLevel::Quorum,
+        );
+
+        let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
+        assert!(
+            result.is_some(),
+            "quorum read should use a spare digest replica when the first remote fails"
+        );
+        assert!(
+            pm.has_peer(remote_host_id_3),
+            "healthy spare digest replica should be connected"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
@@ -2359,6 +2484,62 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(attempted, 1, "should attempt repair for 1 stale replica");
         assert_eq!(failed, 1, "should fail when peer is unreachable");
+    }
+
+    #[tokio::test]
+    async fn repair_stale_replicas_applies_local_stale_replica_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let local_host_id = Uuid::new_v4();
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.host_id = local_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(1000)],
+        };
+
+        coordinator
+            .repair_stale_replicas(&table_id, &partition, &[local_host_id])
+            .await;
+
+        let attempted = coordinator
+            .repair_metrics
+            .read_repairs_attempted
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let succeeded = coordinator
+            .repair_metrics
+            .read_repairs_succeeded
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let failed = coordinator
+            .repair_metrics
+            .read_repairs_failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(attempted, 1);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 0);
+        assert!(
+            storage.read(&table_id, &key).unwrap().is_some(),
+            "local repair should write directly to storage"
+        );
     }
 
     /// Verify that the coordinate_read_with code path that calls

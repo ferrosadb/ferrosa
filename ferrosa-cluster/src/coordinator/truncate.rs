@@ -2,6 +2,7 @@
 
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_storage::TableId;
 
 use super::encode_truncate_payload;
@@ -44,7 +45,7 @@ impl ClusterCoordinator {
             let pm = self.peer_manager.clone();
             let body = payload.clone();
             let host_id = *hid;
-            handles.push(tokio::spawn(async move {
+            handles.push(TaskPool::current("truncate-fanout").spawn(async move {
                 match pm
                     .send(host_id, Message::TruncateForward(body), Lane::Data)
                     .await

@@ -18,7 +18,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use tracing::{debug, warn, Instrument};
+use tracing::{debug, warn, Instrument, Level, Span};
 
 use crate::ast::{Assignment, SelectColumn, SelectStatement, Statement, Term};
 use crate::auth::{
@@ -35,12 +35,109 @@ use crate::subscribe::SubscriptionState;
 use crate::types::{decode_value, encode_value, CqlType, CqlValue};
 use crate::virtual_tables::connections::{ConnectionInfo, ConnectionTracker};
 
+use ferrosa_net::task_pool::TaskPool;
 use ferrosa_schema::AuthContext;
 
 use futures::SinkExt;
 
 /// Idle timeout: drop connection if no complete frame arrives within this duration (M11).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn cql_request_span(opcode: Opcode, peer: SocketAddr) -> Span {
+    if tracing::enabled!(Level::DEBUG) {
+        tracing::debug_span!(
+            "cql.request",
+            cql.opcode = ?opcode,
+            client.address = %peer,
+        )
+    } else {
+        Span::none()
+    }
+}
+
+fn error_extra_min_len(error_code: u32) -> Option<usize> {
+    match error_code {
+        0x1000 => Some(10), // consistency + required + alive
+        0x1100 => Some(12), // consistency + received + required + write_type string
+        0x1200 => Some(11), // consistency + received + required + data_present
+        _ => None,
+    }
+}
+
+fn body_prefix_hex(body: &[u8], max: usize) -> String {
+    let mut out = String::with_capacity(max.saturating_mul(2));
+    for byte in body.iter().take(max) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn log_error_reply_body(
+    context: &'static str,
+    peer: SocketAddr,
+    stream_id: i16,
+    response_version: u8,
+    body: &[u8],
+) {
+    if body.len() < 6 {
+        warn!(
+            cql.error.context = context,
+            client.address = %peer,
+            cql.stream_id = stream_id,
+            cql.response_version = response_version,
+            cql.error.body_len = body.len(),
+            cql.error.body_prefix = %body_prefix_hex(body, 32),
+            "CQL ERROR response body too short for code/message header"
+        );
+        return;
+    }
+
+    let error_code = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    let msg_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+    let msg_start = 6;
+    let msg_end = msg_start + msg_len;
+    let (message, extra_len) = if msg_end <= body.len() {
+        (
+            String::from_utf8_lossy(&body[msg_start..msg_end]).into_owned(),
+            body.len() - msg_end,
+        )
+    } else {
+        ("<truncated message>".to_string(), 0)
+    };
+    let expected_extra_min = error_extra_min_len(error_code);
+    let malformed = expected_extra_min.is_some_and(|min| extra_len < min);
+
+    if malformed {
+        warn!(
+            cql.error.context = context,
+            client.address = %peer,
+            cql.stream_id = stream_id,
+            cql.response_version = response_version,
+            cql.error.code = format_args!("0x{error_code:04x}"),
+            cql.error.message_len = msg_len,
+            cql.error.extra_len = extra_len,
+            cql.error.expected_extra_min = expected_extra_min.unwrap_or_default(),
+            cql.error.body_len = body.len(),
+            cql.error.body_prefix = %body_prefix_hex(body, 64),
+            cql.error.message = %message,
+            "malformed CQL ERROR response body before framing"
+        );
+    } else {
+        debug!(
+            cql.error.context = context,
+            client.address = %peer,
+            cql.stream_id = stream_id,
+            cql.response_version = response_version,
+            cql.error.code = format_args!("0x{error_code:04x}"),
+            cql.error.message_len = msg_len,
+            cql.error.extra_len = extra_len,
+            cql.error.body_len = body.len(),
+            cql.error.message = %message,
+            "sending CQL ERROR response"
+        );
+    }
+}
 
 /// Authenticate on the blocking pool so bcrypt (`cost=12` ≈ 200 ms per call on
 /// commodity hardware) does not block the async worker that runs this
@@ -52,29 +149,42 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The `JoinError` path (task panicked) is mapped to `AuthenticationFailed`
 /// so panics in the auth path become auth failures rather than dropped
 /// futures.
+#[cfg(test)]
 pub(crate) async fn authenticate_off_runtime(
     schema: Arc<ferrosa_schema::Schema>,
     username: String,
     password: String,
 ) -> ferrosa_schema::Result<ferrosa_schema::AuthContext> {
-    authenticate_off_runtime_observed(schema, username, password, || {}).await
+    authenticate_off_runtime_on_pool(schema, username, password, TaskPool::current("cql-auth"))
+        .await
+}
+
+pub(crate) async fn authenticate_off_runtime_on_pool(
+    schema: Arc<ferrosa_schema::Schema>,
+    username: String,
+    password: String,
+    task_pool: TaskPool,
+) -> ferrosa_schema::Result<ferrosa_schema::AuthContext> {
+    authenticate_off_runtime_observed(schema, username, password, task_pool, || {}).await
 }
 
 async fn authenticate_off_runtime_observed<F>(
     schema: Arc<ferrosa_schema::Schema>,
     username: String,
     password: String,
+    task_pool: TaskPool,
     on_blocking_start: F,
 ) -> ferrosa_schema::Result<ferrosa_schema::AuthContext>
 where
     F: FnOnce() + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        on_blocking_start();
-        schema.authenticate(&username, &password)
-    })
-    .await
-    .unwrap_or(Err(ferrosa_schema::SchemaError::AuthenticationFailed))
+    task_pool
+        .spawn_blocking(move || {
+            on_blocking_start();
+            schema.authenticate(&username, &password)
+        })
+        .await
+        .unwrap_or(Err(ferrosa_schema::SchemaError::AuthenticationFailed))
 }
 
 /// Connection phase state machine (M7).
@@ -111,6 +221,7 @@ impl Drop for ConnectionGuard {
 /// In-flight request limiting: a semaphore bounds the number of concurrent
 /// requests being processed. When the limit is reached, new requests receive
 /// ERROR(Overloaded) without consuming a permit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_connection<S>(
     stream: S,
     peer: SocketAddr,
@@ -119,6 +230,7 @@ pub(crate) async fn handle_connection<S>(
     auth_disabled: bool,
     state: Arc<SharedState>,
     mut ip_slot: Option<crate::server::IpSlotGuard>,
+    task_pool: TaskPool,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -174,10 +286,11 @@ pub(crate) async fn handle_connection<S>(
         // Use select to handle client frames, subscription pushes, and
         // responses from spawned request handlers.
         //
-        // `biased;` prefers draining responses first so the writer side
-        // doesn't lag the reader side under heavy concurrent load.
+        // Do not use a biased select here. Under sustained EXECUTE load the
+        // response channel can remain continuously ready; always preferring it
+        // starves reads of new client frames, including PREPARE cache misses
+        // that drivers issue during workload ramp-up.
         let frame_or_push = tokio::select! {
-            biased;
             Some(resp) = resp_rx.recv() => FrameOrPush::Response(resp),
             // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
             result = timeout(IDLE_TIMEOUT, framed.next()) => {
@@ -266,15 +379,12 @@ pub(crate) async fn handle_connection<S>(
             FrameOrPush::ClientFrame(maybe_frame) => {
                 let stream_id = maybe_frame.header.stream_id;
 
-                // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
+                // Check in-flight limit for request opcodes.
                 // The permit lifetime is tied to the request: held inline
                 // (in `_permit`) for the rare opcodes still handled inline,
-                // and *moved into the spawned task* for Ready-phase
-                // Query/Execute/Batch via the concurrent dispatch path.
-                let is_request = matches!(
-                    maybe_frame.header.opcode,
-                    Opcode::Query | Opcode::Execute | Opcode::Batch
-                );
+                // and *moved into the spawned task* for Ready-phase requests
+                // via the concurrent dispatch path.
+                let is_request = is_request_opcode(maybe_frame.header.opcode);
                 let acquired_permit: Option<tokio::sync::OwnedSemaphorePermit> = if is_request {
                     match in_flight.clone().try_acquire_owned() {
                         Ok(permit) => Some(permit),
@@ -311,20 +421,13 @@ pub(crate) async fn handle_connection<S>(
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
 
-                // Concurrent dispatch path: in `Ready` phase, run the
-                // common request opcodes on spawned tasks so the main
-                // loop can immediately read the next frame. This is what
-                // turns a per-connection serial channel into a real
-                // stream-id-multiplexed one (matching CQL native
-                // protocol semantics).
-                if was_ready
-                    && matches!(
-                        maybe_frame.header.opcode,
-                        Opcode::Query | Opcode::Execute | Opcode::Batch
-                    )
-                {
-                    let permit =
-                        acquired_permit.expect("permit acquired above for Query/Execute/Batch");
+                // Concurrent dispatch path: in `Ready` phase, run common
+                // request opcodes on spawned tasks so the main loop can
+                // immediately read the next frame. This is what turns a
+                // per-connection serial channel into a real stream-id-
+                // multiplexed one (matching CQL native protocol semantics).
+                if was_ready && dispatches_concurrently(maybe_frame.header.opcode) {
+                    let permit = acquired_permit.expect("permit acquired above for request opcode");
                     let response_version = if client_protocol_version >= 0x05 {
                         0x85
                     } else {
@@ -339,12 +442,9 @@ pub(crate) async fn handle_connection<S>(
                     let mut auth_for_handler = auth_context.clone();
                     let mut ks_for_handler = ks_at_spawn.clone();
                     let peer_addr = peer;
-                    tokio::spawn(async move {
-                        let request_span = tracing::info_span!(
-                            "cql.request",
-                            cql.opcode = ?opcode,
-                            client.address = %peer_addr,
-                        );
+                    let request_task_pool = task_pool.clone();
+                    request_task_pool.spawn(async move {
+                        let request_span = cql_request_span(opcode, peer_addr);
                         let result = (async {
                             match opcode {
                                 Opcode::Query => {
@@ -355,6 +455,15 @@ pub(crate) async fn handle_connection<S>(
                                         &body,
                                         peer_addr,
                                         proto_version,
+                                    )
+                                    .await
+                                }
+                                Opcode::Prepare => {
+                                    handle_prepare(
+                                        &mut auth_for_handler,
+                                        &mut ks_for_handler,
+                                        &state_clone,
+                                        &body,
                                     )
                                     .await
                                 }
@@ -380,7 +489,7 @@ pub(crate) async fn handle_connection<S>(
                                     .await
                                 }
                                 _ => unreachable!(
-                                    "concurrent dispatch only entered for Query/Execute/Batch"
+                                    "concurrent dispatch only entered for ready request opcodes"
                                 ),
                             }
                         })
@@ -416,11 +525,7 @@ pub(crate) async fn handle_connection<S>(
                     maybe_frame.header.opcode, stream_id, phase
                 );
 
-                let request_span = tracing::info_span!(
-                    "cql.request",
-                    cql.opcode = ?maybe_frame.header.opcode,
-                    client.address = %peer,
-                );
+                let request_span = cql_request_span(maybe_frame.header.opcode, peer);
 
                 match (async {
                     handle_frame(
@@ -432,6 +537,7 @@ pub(crate) async fn handle_connection<S>(
                         &maybe_frame,
                         &mut pending_compression,
                         peer,
+                        task_pool.clone(),
                     )
                     .await
                 })
@@ -475,6 +581,15 @@ pub(crate) async fn handle_connection<S>(
                         } else {
                             VERSION_RESPONSE // 0x84
                         };
+                        if opcode == Opcode::Error {
+                            log_error_reply_body(
+                                "inline-reply",
+                                peer,
+                                stream_id,
+                                response_version,
+                                &body_bytes,
+                            );
+                        }
                         let frame = CqlFrame {
                             header: FrameHeader {
                                 version: response_version,
@@ -600,6 +715,7 @@ pub(crate) async fn handle_connection<S>(
                             sub_tx.clone(),
                             cancel,
                             delta,
+                            task_pool.clone(),
                         );
 
                         debug!(
@@ -653,6 +769,17 @@ pub(crate) async fn handle_connection<S>(
     debug!("connection handler for {peer} finished");
 }
 
+fn is_request_opcode(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Query | Opcode::Prepare | Opcode::Execute | Opcode::Batch
+    )
+}
+
+fn dispatches_concurrently(opcode: Opcode) -> bool {
+    matches!(opcode, Opcode::Prepare | Opcode::Execute | Opcode::Batch)
+}
+
 /// Apply a `HandleResult` from a spawned post-Ready handler to the
 /// connection's outbound side: writes the appropriate frame on `framed`,
 /// kicks off / cancels subscriptions if requested. Returns `false` if the
@@ -671,7 +798,7 @@ async fn apply_handle_result<S>(
     response_version: u8,
     framed: &mut Framed<S, CqlCodec>,
     state: &Arc<SharedState>,
-    _peer: SocketAddr,
+    peer: SocketAddr,
     auth_context: &Option<AuthContext>,
     current_keyspace: &Option<String>,
     sub_tx: &tokio::sync::mpsc::Sender<crate::subscribe::SubscriptionPush>,
@@ -682,6 +809,10 @@ where
 {
     match result {
         HandleResult::Reply(opcode, body) => {
+            let body = body.freeze();
+            if opcode == Opcode::Error {
+                log_error_reply_body("spawned-reply", peer, stream_id, response_version, &body);
+            }
             let frame = CqlFrame {
                 header: FrameHeader {
                     version: response_version,
@@ -690,7 +821,7 @@ where
                     opcode,
                     length: 0,
                 },
-                body: body.freeze(),
+                body,
             };
             framed.send(frame).await.is_ok()
         }
@@ -767,6 +898,7 @@ where
                 sub_tx.clone(),
                 cancel,
                 delta,
+                TaskPool::current("cql-subscription"),
             );
             true
         }
@@ -866,6 +998,7 @@ async fn handle_frame(
     frame: &CqlFrame,
     pending_compression: &mut Option<Compression>,
     peer: SocketAddr,
+    task_pool: TaskPool,
 ) -> HandleResult {
     match phase {
         ConnectionPhase::AwaitingStartup => match frame.header.opcode {
@@ -883,7 +1016,7 @@ async fn handle_frame(
         },
         ConnectionPhase::Authenticating { .. } => match frame.header.opcode {
             Opcode::AuthResponse => {
-                handle_auth_response(phase, auth_context, state, &frame.body).await
+                handle_auth_response(phase, auth_context, state, &frame.body, task_pool).await
             }
             _ => {
                 // Any opcode other than AUTH_RESPONSE before authentication is
@@ -909,7 +1042,9 @@ async fn handle_frame(
                 )
                 .await
             }
-            Opcode::Prepare => handle_prepare(auth_context, current_keyspace, state, &frame.body),
+            Opcode::Prepare => {
+                handle_prepare(auth_context, current_keyspace, state, &frame.body).await
+            }
             Opcode::Execute => {
                 handle_execute(
                     auth_context,
@@ -1060,6 +1195,7 @@ async fn handle_auth_response(
     auth_context: &mut Option<AuthContext>,
     state: &SharedState,
     body: &Bytes,
+    task_pool: TaskPool,
 ) -> HandleResult {
     // Parse the SASL payload: [int length][bytes payload]
     if body.len() < 4 {
@@ -1085,10 +1221,11 @@ async fn handle_auth_response(
     };
 
     // Offload bcrypt to the blocking pool — see `authenticate_off_runtime`.
-    let result = authenticate_off_runtime(
+    let result = authenticate_off_runtime_on_pool(
         state.schema.clone(),
         username.to_string(),
         password.to_string(),
+        task_pool,
     )
     .await;
 
@@ -1282,7 +1419,10 @@ async fn handle_query(
 
 // ── PREPARE ──────────────────────────────────────────────────────────────
 
-pub(crate) fn handle_prepare(
+const PREPARE_SCHEMA_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const PREPARE_SCHEMA_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+pub(crate) async fn handle_prepare(
     _auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
     state: &SharedState,
@@ -1335,8 +1475,22 @@ pub(crate) fn handle_prepare(
     let expected_bind_count = count_bind_markers(&stmt);
 
     // Build bound_columns and result_columns from the statement + schema metadata.
-    let (bound_columns, result_columns) =
-        analyze_prepared_columns(&stmt, &table_ks, &table_name, state);
+    //
+    // Cluster DDL is committed through Raft, but a driver may immediately send
+    // PREPARE to a follower whose local state machine has not applied the
+    // committed schema entry yet. Treat a partial bind-column resolution as a
+    // short local schema-apply wait before returning the protocol error.
+    let deadline = tokio::time::Instant::now() + PREPARE_SCHEMA_WAIT_TIMEOUT;
+    let (bound_columns, result_columns) = loop {
+        let columns = analyze_prepared_columns(&stmt, &table_ks, &table_name, state);
+        if columns.0.len() == expected_bind_count
+            || expected_bind_count == 0
+            || tokio::time::Instant::now() >= deadline
+        {
+            break columns;
+        }
+        tokio::time::sleep(PREPARE_SCHEMA_WAIT_INTERVAL).await;
+    };
 
     // Guard: if the schema lookup returned fewer bound columns than the
     // statement has bind markers, something is wrong with this node's local
@@ -1445,15 +1599,45 @@ async fn handle_execute(
         }
     };
 
-    // Parse bound values from the EXECUTE frame and substitute into the AST.
-    let stmt = match substitute_bound_values(&plan, cursor, protocol_version) {
-        Ok(s) => s,
+    // Parse bound values from the EXECUTE frame. Common prepared INSERTs can
+    // route directly from the cached plan and bound terms; complex statements
+    // fall back to the generic AST substitution path.
+    let bound_terms = match decode_bound_values(&plan, cursor, protocol_version) {
+        Ok(terms) => terms,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
         }
     };
 
     let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
+
+    if let Some(bound_terms) = bound_terms.as_ref() {
+        let fast_result = match &plan.statement {
+            Statement::Select(select) => {
+                crate::router::route_prepared_select_fast(state, &ctx, select, bound_terms).await
+            }
+            Statement::Insert(insert) => {
+                crate::router::route_prepared_insert_fast(state, &ctx, insert, bound_terms).await
+            }
+            _ => None,
+        };
+        if let Some(result) = fast_result {
+            return match result {
+                Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
+                Ok(RouteResult::SetKeyspace(ks, body)) => {
+                    *current_keyspace = Some(ks);
+                    HandleResult::Reply(Opcode::Result, body)
+                }
+                Ok(RouteResult::Subscribe { .. } | RouteResult::Unsubscribe { .. }) => {
+                    let err = CqlError::Invalid("SUBSCRIBE via EXECUTE not supported".into());
+                    HandleResult::Reply(Opcode::Error, err.encode_body())
+                }
+                Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
+            };
+        }
+    }
+
+    let stmt = substitute_bound_terms(&plan, bound_terms.as_deref());
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -2245,9 +2429,26 @@ fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
 ///   `[int flags][short n_values]([int len][bytes value])*`
 fn substitute_bound_values(
     plan: &PreparedPlan,
-    mut cursor: &[u8],
+    cursor: &[u8],
     protocol_version: u8,
 ) -> Result<Statement, CqlError> {
+    let bound_terms = decode_bound_values(plan, cursor, protocol_version)?;
+    Ok(substitute_bound_terms(plan, bound_terms.as_deref()))
+}
+
+fn substitute_bound_terms(plan: &PreparedPlan, bound_terms: Option<&[Term]>) -> Statement {
+    let Some(bound_terms) = bound_terms else {
+        return plan.statement.clone();
+    };
+    let mut substitution_idx = 0usize;
+    substitute_in_statement(&plan.statement, bound_terms, &mut substitution_idx)
+}
+
+fn decode_bound_values(
+    plan: &PreparedPlan,
+    mut cursor: &[u8],
+    protocol_version: u8,
+) -> Result<Option<Vec<Term>>, CqlError> {
     // Query/EXECUTE parameter flags. CQL native protocol v5 (§4.1.4) widened
     // this field from a 1-byte `[byte]` to a 4-byte `[int]`. Reading the wrong
     // width misaligns the values section, so bind markers never get
@@ -2255,19 +2456,19 @@ fn substitute_bound_values(
     // rejects it). Bit 0x01 = Values present.
     let flags = if protocol_version >= 0x05 {
         if cursor.remaining() < 4 {
-            return Ok(plan.statement.clone());
+            return Ok(None);
         }
         cursor.get_u32()
     } else {
         if cursor.remaining() < 1 {
-            return Ok(plan.statement.clone());
+            return Ok(None);
         }
         cursor.get_u8() as u32
     };
     let has_values = (flags & 0x01) != 0;
 
     if !has_values {
-        return Ok(plan.statement.clone());
+        return Ok(None);
     }
 
     // Parse [short n_values]
@@ -2308,13 +2509,7 @@ fn substitute_bound_values(
         }
     }
 
-    // Walk the statement AST and replace BindMarker nodes in order.
-    let mut substitution_idx = 0usize;
-    Ok(substitute_in_statement(
-        &plan.statement,
-        &bound_terms,
-        &mut substitution_idx,
-    ))
+    Ok(Some(bound_terms))
 }
 
 /// Substitute bound values for a single statement inside a BATCH.
@@ -2501,6 +2696,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ready_prepare_uses_concurrent_request_path() {
+        assert!(is_request_opcode(Opcode::Prepare));
+        assert!(dispatches_concurrently(Opcode::Prepare));
+    }
+
+    #[test]
+    fn ready_query_stays_on_ordered_connection_path() {
+        assert!(is_request_opcode(Opcode::Query));
+        assert!(!dispatches_concurrently(Opcode::Query));
+    }
+
+    #[test]
     fn redact_cql_secrets_removes_password_literals() {
         // PASSWORD = '...'  (ROLE form)
         let r = redact_cql_secrets("CREATE ROLE x WITH PASSWORD = 'sup3rSecret' AND LOGIN = true");
@@ -2568,6 +2775,7 @@ mod tests {
                 segment_size: 4096,
                 max_segment_age: std::time::Duration::from_secs(60),
                 sync_strategy: SyncStrategyConfig::Batch,
+                batch: Default::default(),
                 log_dir: dir.path().join("commitlog"),
                 checkpoint_dir: dir.path().join("commitlog"),
                 archive: None,
@@ -2575,6 +2783,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.path().join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -2665,8 +2874,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prepare_returns_cached_plan_without_reparsing() {
+    #[tokio::test]
+    async fn prepare_returns_cached_plan_without_reparsing() {
         let (state, _dir) = shared_state_for_prepare_tests();
         let query = "not valid cql but already cached";
         let id = PreparedCache::compute_id(query);
@@ -2687,7 +2896,7 @@ mod tests {
         body.put_i32(query.len() as i32);
         body.put_slice(query.as_bytes());
 
-        let result = handle_prepare(&mut None, &mut None, &state, &body.freeze());
+        let result = handle_prepare(&mut None, &mut None, &state, &body.freeze()).await;
         match result {
             HandleResult::Reply(Opcode::Result, body) => {
                 assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
@@ -2722,6 +2931,7 @@ mod tests {
                     s,
                     "cassandra".into(),
                     "cassandra".into(),
+                    TaskPool::current("test-auth"),
                     move || tx.send(std::thread::current().id()).unwrap(),
                 )
                 .await

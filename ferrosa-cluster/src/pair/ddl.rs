@@ -504,7 +504,7 @@ impl RpcHandler for PairDdlForwardHandler {
 
                 let coord = Arc::clone(&self.coordinator);
                 let op_clone = op.clone();
-                tokio::spawn(async move {
+                ferrosa_net::task_pool::TaskPool::current("pair-ddl-replicate").spawn(async move {
                     if let Err(e) = coord.replicate_ddl(&op_clone, version).await {
                         tracing::warn!("pair DDL replication-back failed: {e}");
                     }

@@ -14,6 +14,7 @@ use crate::error::NetError;
 use crate::handshake::accept_handshake;
 use crate::message::Message;
 use crate::rpc::handler::{HandlerRegistry, PeerId};
+use crate::task_pool::TaskPool;
 
 /// Callback invoked when the server accepts an inbound peer connection.
 pub trait InboundPeerCallback: Send + Sync {
@@ -78,6 +79,14 @@ impl RpcServer {
         self
     }
 
+    fn data_task_pool(&self) -> TaskPool {
+        TaskPool::from_optional_runtime("internode-data", self.data_runtime.clone())
+    }
+
+    fn raft_task_pool(&self) -> TaskPool {
+        TaskPool::from_optional_runtime("internode-raft", self.raft_runtime.clone())
+    }
+
     /// Signal the server to stop accepting new connections and wait for in-flight
     /// connections to drain, up to `drain_timeout`. Any connections still active after
     /// the timeout are abandoned (the OS will close the socket).
@@ -116,10 +125,11 @@ impl RpcServer {
         // main runtime where they'd compete with CQL/bootstrap work.
         let bind_addr = self.config.bind_addr;
         let server = self.clone();
+        let data_task_pool = self.data_task_pool();
 
-        if let Some(ref data_rt) = self.data_runtime {
+        if self.data_runtime.is_some() {
             let bound_addr_tx = self.bound_addr.clone();
-            data_rt.spawn(async move {
+            data_task_pool.spawn(async move {
                 match TcpListener::bind(bind_addr).await {
                     Ok(listener) => {
                         let addr = match listener.local_addr() {
@@ -200,7 +210,7 @@ impl RpcServer {
                 );
             }
             tracing::info!(%addr, "internode server listening");
-            tokio::spawn(async move { server.accept_loop(listener, tls_acceptor).await });
+            data_task_pool.spawn(async move { server.accept_loop(listener, tls_acceptor).await });
             Ok(addr)
         }
     }
@@ -232,7 +242,7 @@ impl RpcServer {
                 tracing::warn!(%peer_addr, "rejecting: max connections reached");
                 let config = self.config.clone();
                 let host_id = self.local_host_id;
-                tokio::spawn(async move {
+                self.data_task_pool().spawn(async move {
                     let mut framed =
                         Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
                     if let Some(Ok(_frame)) = framed.next().await {
@@ -268,7 +278,7 @@ impl RpcServer {
             self.active_connections.fetch_add(1, Ordering::Relaxed);
             let server = self.clone();
             let tls_acceptor = tls_acceptor.clone();
-            tokio::spawn(async move {
+            self.data_task_pool().spawn(async move {
                 let result = if let Some(acceptor) = tls_acceptor {
                     match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
                         .await
@@ -331,7 +341,7 @@ impl RpcServer {
         let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Frame>(64);
 
         let bw_write = bandwidth.clone();
-        let write_task = tokio::spawn(async move {
+        let write_task = self.data_task_pool().spawn(async move {
             while let Some(frame) = resp_rx.recv().await {
                 bw_write.bytes_sent.fetch_add(
                     frame.body.len() as u64,
@@ -394,15 +404,9 @@ impl RpcServer {
             };
 
             if msg_type.is_raft() {
-                if let Some(ref raft_rt) = self.raft_runtime {
-                    raft_rt.spawn(handler);
-                } else {
-                    tokio::spawn(handler);
-                }
-            } else if let Some(ref data_rt) = self.data_runtime {
-                data_rt.spawn(handler);
+                self.raft_task_pool().spawn(handler);
             } else {
-                tokio::spawn(handler);
+                self.data_task_pool().spawn(handler);
             }
         }
 

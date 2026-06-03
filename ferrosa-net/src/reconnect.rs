@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::rpc::client::RpcClient;
+use crate::task_pool::TaskPool;
 
 // ---------------------------------------------------------------------------
 // Backoff + dormant constants
@@ -171,8 +172,9 @@ pub enum LaneState {
 pub(crate) fn spawn_alive_watcher(
     mut alive_rx: watch::Receiver<bool>,
     on_dead: impl Fn() + Send + 'static,
+    task_pool: TaskPool,
 ) {
-    tokio::spawn(async move {
+    task_pool.spawn(async move {
         loop {
             // Wait for the watch value to change.
             if alive_rx.changed().await.is_err() {
@@ -204,6 +206,7 @@ pub(crate) async fn connect_with_retry_cancelable(
     lane: Lane,
     tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
     cancelled: Option<Arc<AtomicBool>>,
+    task_pool: TaskPool,
 ) -> Option<RpcClient> {
     let mut backoff = ExponentialBackoff::new(
         Duration::from_millis(BACKOFF_INITIAL_MS),
@@ -257,11 +260,12 @@ pub(crate) async fn connect_with_retry_cancelable(
             }
         };
 
-        let result = RpcClient::connect_with_tls(
+        let result = RpcClient::connect_with_tls_on_pool(
             config.clone(),
             local_host_id,
             peer_addr,
             tls_connector.as_deref(),
+            task_pool.clone(),
         )
         .await;
 
@@ -384,6 +388,7 @@ mod tests {
             Lane::Data,
             None,
             Some(cancelled),
+            TaskPool::current("test-reconnect"),
         )
         .await;
 
