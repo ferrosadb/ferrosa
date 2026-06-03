@@ -173,6 +173,7 @@ impl ClusterCoordinator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_post_quorum_hint_drain(
         fan_out: FuturesUnordered<ReplicaWriteJoin>,
         hint_store: Option<Arc<crate::hints::HintStore>>,
@@ -197,6 +198,7 @@ impl ClusterCoordinator {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_post_quorum_hint_drain_nts(
         fan_out: FuturesUnordered<NtsReplicaWriteJoin>,
         hint_store: Option<Arc<crate::hints::HintStore>>,

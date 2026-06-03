@@ -46,6 +46,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
             segment_size: 4096,
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
             log_dir: dir.join("commitlog"),
             checkpoint_dir: dir.join("commitlog"),
             archive: None,

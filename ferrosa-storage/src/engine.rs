@@ -5298,7 +5298,7 @@ impl StorageEngine {
             let upload_mgr = self
                 .compaction_upload_manager
                 .as_ref()
-                .or_else(|| self.upload_manager.as_ref());
+                .or(self.upload_manager.as_ref());
             let Some(upload_mgr) = upload_mgr else {
                 continue;
             };
@@ -5834,11 +5834,11 @@ impl StorageEngine {
         // Calling `generation_component_path` after removing `Data.db` would
         // no longer recognize the generation directory and would leave every
         // sidecar/index component behind.
-        let component_dir = table_dir
-            .join(gen)
-            .is_dir()
-            .then(|| table_dir.join(gen))
-            .unwrap_or_else(|| table_dir.to_path_buf());
+        let component_dir = if table_dir.join(gen).is_dir() {
+            table_dir.join(gen)
+        } else {
+            table_dir.to_path_buf()
+        };
 
         for s in &suffixes {
             let path = component_dir.join(format!("{gen}-{s}"));

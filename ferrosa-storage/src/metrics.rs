@@ -489,6 +489,7 @@ pub fn observe_memtable_size(size_bytes: u64) {
     update_max_u64(&MEMTABLE_SIZE_BYTES_MAX, size_bytes);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn observe_read_limited_rows(
     duration: Duration,
     found: bool,

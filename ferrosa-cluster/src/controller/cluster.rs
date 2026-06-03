@@ -1169,7 +1169,7 @@ impl ModeController {
                     }
 
                     let prune_ticks = (60_000u64 / urgent_flush_interval_millis).max(1);
-                    if ticks % prune_ticks == 0 {
+                    if ticks.is_multiple_of(prune_ticks) {
                         // Prune applied Accord transactions to prevent unbounded
                         // memory growth in txn_states and committed_txns.
                         let pruned = {

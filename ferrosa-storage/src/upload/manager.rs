@@ -595,14 +595,16 @@ impl UploadManager {
     /// Shuts down the upload manager, draining the queue.
     pub async fn shutdown(&self) {
         let _ = self.task_tx.send(UploadTask::Shutdown).await;
-        if let Some(handle) = self.dispatcher_handle.lock().take() {
+        let dispatcher_handle = { self.dispatcher_handle.lock().take() };
+        if let Some(handle) = dispatcher_handle {
             let _ = handle.await;
         }
         let handles = self.handles.lock().drain(..).collect::<Vec<_>>();
         for handle in handles {
             let _ = handle.await;
         }
-        if let Some(handle) = self.delete_scheduler_handle.lock().take() {
+        let delete_scheduler_handle = { self.delete_scheduler_handle.lock().take() };
+        if let Some(handle) = delete_scheduler_handle {
             handle.abort();
             let _ = handle.await;
         }

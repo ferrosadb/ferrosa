@@ -166,6 +166,7 @@ fn read_local_partition(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn digest_read_attempt(
     coordinator: &ClusterCoordinator,
     storage: std::sync::Arc<ferrosa_storage::StorageEngine>,

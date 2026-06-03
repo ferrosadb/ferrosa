@@ -480,6 +480,7 @@ mod tests {
                 segment_size: 4096,
                 max_segment_age: Duration::from_secs(60),
                 sync_strategy: SyncStrategyConfig::Batch,
+                batch: Default::default(),
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
                 archive: None,
