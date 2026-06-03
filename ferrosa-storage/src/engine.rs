@@ -1324,7 +1324,12 @@ impl StorageEngine {
         Self::cleanup_stale_compaction_staging(&config)?;
 
         let commit_log = CommitLog::new(config.commit_log.clone())?;
-        let compaction_executor = CompactionExecutor::new();
+        // Engine-wide reader pool, created before the compaction executor so the
+        // executor can route input opens through it (FMEA #11).
+        let reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> = Arc::new(
+            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
+        );
+        let compaction_executor = CompactionExecutor::with_reader_pool(Arc::clone(&reader_pool));
 
         let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
             Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
@@ -1373,9 +1378,7 @@ impl StorageEngine {
             s3_sync_requested: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
-            reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
-                crate::reader_pool::configured_reader_cache_cap(),
-            )),
+            reader_pool,
             #[cfg(test)]
             upload_store_override: None,
         };
@@ -1442,7 +1445,12 @@ impl StorageEngine {
         Self::cleanup_stale_compaction_staging(&config)?;
 
         let mut commit_log = CommitLog::new(config.commit_log.clone())?;
-        let compaction_executor = CompactionExecutor::new();
+        // Engine-wide reader pool, created before the compaction executor so the
+        // executor can route input opens through it (FMEA #11).
+        let reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> = Arc::new(
+            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
+        );
+        let compaction_executor = CompactionExecutor::with_reader_pool(Arc::clone(&reader_pool));
 
         let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
             Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
@@ -1537,9 +1545,7 @@ impl StorageEngine {
             s3_sync_requested: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
-            reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
-                crate::reader_pool::configured_reader_cache_cap(),
-            )),
+            reader_pool,
             #[cfg(test)]
             upload_store_override: None,
         })
@@ -1563,7 +1569,14 @@ impl StorageEngine {
         })?;
         Self::cleanup_stale_compaction_staging(&config)?;
 
-        let compaction_executor = CompactionExecutor::new();
+        // Engine-wide reader pool, created here so tables registered during
+        // startup replay share it with those registered later — and so the
+        // compaction executor routes its input opens through the same bounded
+        // pool (FMEA #11).
+        let reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> = Arc::new(
+            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
+        );
+        let compaction_executor = CompactionExecutor::with_reader_pool(Arc::clone(&reader_pool));
 
         let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
             Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
@@ -1580,12 +1593,6 @@ impl StorageEngine {
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
         let (index_scheduler, index_tracker) = build_index_scheduler(&config);
-
-        // Engine-wide reader pool, created here so tables registered during
-        // startup replay share it with those registered later.
-        let reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> = Arc::new(
-            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
-        );
 
         let tables = RwLock::new(HashMap::new());
         let schema_path = config.data_dir.join("schema.json");
@@ -6911,7 +6918,10 @@ impl StorageEngine {
         })?;
 
         let commit_log = CommitLog::new(config.commit_log.clone())?;
-        let compaction_executor = CompactionExecutor::new();
+        let reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> = Arc::new(
+            crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
+        );
+        let compaction_executor = CompactionExecutor::with_reader_pool(Arc::clone(&reader_pool));
 
         let upload_manager = Some(UploadManager::new_with_pools(
             Arc::clone(&store),
@@ -6966,9 +6976,7 @@ impl StorageEngine {
             s3_sync_requested: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
-            reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
-                crate::reader_pool::configured_reader_cache_cap(),
-            )),
+            reader_pool,
             upload_store_override: Some((store, prefix)),
         })
     }

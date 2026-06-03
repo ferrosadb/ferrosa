@@ -69,7 +69,54 @@
   - `store::tests::swap_evicts_removed_gens_no_stale_reopen` (FileFlushTarget; 3 input SSTables primed into the pool, real file-backed compaction output via a standalone `FileFlushTarget`, swap removes all 3 inputs): asserts each removed gen's pool key is gone (`pool_contains_gen == false`), the output gen is seeded resident, post-swap reads return the post-compaction values (`merged{i}`, never stale input rows), removed gens are never reopened by reads, and only the 1 output reader stays resident.
   - `store::tests::held_reader_survives_concurrent_swap_eviction` (FileFlushTarget; 16-row partition): a reader `Arc` taken before eviction reads the full 16 rows, then `reader_pool.remove` evicts that gen, and the held `Arc` still yields identical complete rows (no panic / truncation / use-after-evict; `Arc::strong_count == 1` proves the pool released its ref while the scan keeps the reader alive). A fresh post-eviction store read reopens the gen and returns the same rows.
   - Added test-only `ReaderPool::contains(key)` + `TableStore::pool_contains_gen(gen)` (keys identically to the live path via `SstableDescriptor::gen_num_for`).
-- [ ] (optional) route compaction input opens through pool / cap concurrent compactions — deferred (FMEA #11, lower priority; compaction planning already opens through the pool via `open_reader`).
+- [x] route compaction input opens through pool / cap concurrent compactions — **DONE in Phase 6.6** (FMEA #11). See below.
+
+## Phase 6.6 — Bound compaction memory: pool-routed inputs + concurrency cap — FMEA #11 — DONE
+
+> **Why now.** A repair on a node bloated with ~258 `entity_store` SSTables OOM-killed
+> node1. Startup (Phase 5) and read-merge (Phase 6.5) are bounded, but the *compaction
+> executor* opened its input SSTables directly via `FileReadAt::open` (a private path outside
+> the engine-wide pool) and ran up to `worker_count` (≤4) tasks concurrently with no global
+> cap. Peak compaction memory was therefore unbounded in `(concurrent tasks × per-task
+> inputs)`, competing with repair/read memory under the 2 GiB cgroup.
+
+**Concurrency model found:** `CompactionExecutor` spawns `worker_count` (`FERROSA_COMPACTION_WORKERS`,
+default `available_parallelism().clamp(1,4)`) worker threads, each draining its own mpsc
+queue. Tasks run **concurrently** across workers — so a global cap was required, not just a
+per-node serial guarantee.
+
+- [x] **Fix #1 — pool-routed input opens.** `execute_task_inner` now takes an
+  `Option<&SharedReaderPool<FileReadAt>>`. Each input is still strictly validated/sized
+  (`ensure_compaction_component` + rehydration; **any missing/corrupt input still aborts the
+  whole task** — abort-on-corrupt is unchanged regardless of cache state), then the opened
+  `SSTableReader` is obtained through `pool.get_or_open((table_id, gen_num_for(id)), …)` —
+  keyed **identically to the live read/startup path** — so compaction's resident input readers
+  are shared with and evictable by the same global bound. Readers held as `Arc` for the merge
+  (soft cap never evicts an in-use reader). The engine creates the pool *before* the executor
+  and passes it via `CompactionExecutor::with_reader_pool` (all three production constructors +
+  the test constructor). `metrics::COMPACTION_POOL_INPUT_OPENS_TOTAL` /
+  `ferrosa_storage_compaction_pool_input_opens_total` counts pool-routed opens.
+- [x] **Fix #2 — concurrency cap.** `CompactionGate` (counting semaphore over
+  `parking_lot::{Mutex,Condvar}`) caps concurrent merges at
+  `FERROSA_MAX_CONCURRENT_COMPACTIONS` (default **2**). A worker acquires a permit *before*
+  running the merge and `inc_compaction_running` is bumped only after the permit is taken — so
+  `ferrosa_storage_compaction_running_max` reflects tasks actually executing, never those
+  blocked at the gate. `acquire` polls the `stop` flag (bounded 100 ms wait) so shutdown never
+  deadlocks a gated worker.
+- [x] tests (`compaction::executor::tests`):
+  - `compaction_gate_caps_concurrent_holders` — 8 threads × 50 iters contend on a cap-2 gate;
+    asserts max concurrent holders ≤ 2 (the invariant `running_max ≤ cap` relies on).
+  - `compaction_gate_unblocks_on_shutdown` — a worker blocked on an exhausted gate returns
+    `None` once `stop` is set (no deadlock).
+  - `compaction_inputs_routed_through_reader_pool` — after a pool-routed compaction, both input
+    gens are resident in the pool (keyed as the read path keys them), the pool-routed-open
+    counter advanced once per input, and all input partitions survive the merge (correctness).
+  - `concurrent_compaction_cap_default_is_small_and_positive` — default cap = 2, parsing ≥ 1.
+- [x] `execute_task` (direct, non-pooled) retained only for tests + the `compaction-validator`
+  harness (gated `#[cfg(any(test, feature = "compaction-validator"))]`); production workers use
+  the pool-routed path.
+- [x] full `ferrosa-storage` lib suite green (797 passed = 793 + 4 new, 0 failed, 0 ignored);
+  cluster green with CI skips; clippy/fmt clean.
 
 ## Phase 6.5 — Tier-materialization OOM regression: stream, don't materialize — FMEA #3/#5/#13 — DONE
 

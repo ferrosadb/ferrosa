@@ -300,6 +300,10 @@ static COMPACTION_LAST_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_LAST_INPUT_ROWS: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_LAST_OUTPUT_ROWS: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_LAST_OUTPUT_PARTITIONS: AtomicU64 = AtomicU64::new(0);
+/// Count of compaction input SSTable readers obtained via the engine-wide
+/// reader pool (FMEA #11). Non-zero confirms compaction input opens are routed
+/// through the bounded pool rather than opening unbounded readers directly.
+static COMPACTION_POOL_INPUT_OPENS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static WRITE_PHASE_MICROS_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static WRITE_PHASE_MICROS_MAX: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
@@ -431,6 +435,18 @@ pub fn dec_compaction_running() {
 
 pub fn inc_compaction_failed() {
     COMPACTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a compaction input reader obtained through the engine-wide reader
+/// pool (FMEA #11). Called once per input SSTable per task when the executor is
+/// pool-routed.
+pub fn inc_compaction_pool_input_opens() {
+    COMPACTION_POOL_INPUT_OPENS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total compaction input readers obtained via the reader pool since startup.
+pub fn compaction_pool_input_opens_total() -> u64 {
+    COMPACTION_POOL_INPUT_OPENS_TOTAL.load(Ordering::Relaxed)
 }
 
 pub fn observe_compaction_completed(
@@ -791,6 +807,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_running_max {}\n",
         COMPACTION_RUNNING_MAX.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_pool_input_opens_total Compaction input readers obtained via the engine-wide reader pool (FMEA #11).\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_pool_input_opens_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_pool_input_opens_total {}\n",
+        COMPACTION_POOL_INPUT_OPENS_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_input_bytes_total Input bytes read by completed compactions.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_input_bytes_total counter\n");
