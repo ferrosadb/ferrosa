@@ -6437,6 +6437,20 @@ mod tests {
         store.attach_reader_pool(pool, "bound-test".to_string());
     }
 
+    impl TableStore<crate::flush::FileFlushTarget> {
+        /// Test-only: is the pool holding a resident reader for this raw gen
+        /// string? Keys identically to the live read path via
+        /// `SstableDescriptor::gen_num_for`, so a removed input gen showing up
+        /// here would be a stale-reopen / non-eviction bug (FMEA #4).
+        fn pool_contains_gen(&self, gen: &str) -> bool {
+            let key = (
+                self.pool_table_key.clone(),
+                SstableDescriptor::gen_num_for(gen),
+            );
+            self.reader_pool.contains(&key)
+        }
+    }
+
     #[test]
     fn resident_reader_count_stays_within_cap_for_many_sstables() {
         // Phase 2 gate: load N >> cap SSTables on a FileFlushTarget store and
@@ -6627,6 +6641,222 @@ mod tests {
             store.reader_pool.soft_cap_breaches(),
             0,
             "digest staged merge must not breach the soft cap"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 6 — Swap correctness (FMEA #4: stale gen after swap; #11).
+    // -------------------------------------------------------------------------
+
+    /// FMEA #4: after a compaction swap removes input generations, those gens
+    /// must be evicted from the reader pool and never reopened or served. Reads
+    /// must return the post-compaction data from the output SSTable, not stale
+    /// rows from the removed inputs.
+    #[test]
+    fn swap_evicts_removed_gens_no_stale_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = file_backed_test_store(dir.path());
+        // Generous cap: the bound is irrelevant here — we are proving eviction
+        // semantics, so we must not let LRU pressure mask a missing remove().
+        reset_pool(&mut store, 64);
+
+        // Three input SSTables, distinct partition keys, one per flush.
+        for i in 0..3 {
+            store
+                .write(
+                    &make_key(&format!("k{i}")),
+                    make_row(format!("v{i}").as_bytes(), 1000 + i as i64),
+                )
+                .unwrap();
+            store.flush().unwrap();
+        }
+        assert_eq!(store.sstable_count(), 3);
+
+        // Prime the pool: read every input so all three gens are resident.
+        for i in 0..3 {
+            let p = store.read(&make_key(&format!("k{i}"))).unwrap();
+            assert!(p.is_some(), "input k{i} must be readable before swap");
+        }
+
+        // Snapshot the three input (gen, dir) pairs to be removed.
+        let view = store.view.load();
+        let input_id_paths: Vec<(String, std::path::PathBuf)> =
+            view.sstable_ids.iter().cloned().collect();
+        drop(view);
+        assert_eq!(input_id_paths.len(), 3);
+        let removed_gens: Vec<String> = input_id_paths.iter().map(|(g, _)| g.clone()).collect();
+        for gen in &removed_gens {
+            assert!(
+                store.pool_contains_gen(gen),
+                "input gen {gen} must be resident in the pool before swap"
+            );
+        }
+
+        // Build a real file-backed compaction output that merges all three
+        // inputs into one partition-per-key with a NEWER timestamp, so a stale
+        // read of a removed gen would be detectably different from the output.
+        // The output is materialised on disk by a standalone FileFlushTarget
+        // (its own directory + generation counter), exactly as the compaction
+        // executor produces a brand-new SSTable that is NOT yet in the view.
+        let mut merged = vec![
+            make_partition("k0", b"merged0", 9000),
+            make_partition("k1", b"merged1", 9001),
+            make_partition("k2", b"merged2", 9002),
+        ];
+        // The SSTable writer requires partitions in decorated-key (token) order.
+        merged.sort_by(|a, b| a.key.cmp(&b.key));
+        let output = {
+            let schema = store.schema();
+            let header = crate::flush::build_serialization_header(schema.as_ref(), &merged);
+            let mut w = ferrosa_sstable::writer::SSTableWriter::new(
+                WriteOptions {
+                    compression: None,
+                    ..WriteOptions::default()
+                },
+                header,
+            );
+            for p in &merged {
+                w.add_partition(p).unwrap();
+            }
+            w.finish().unwrap()
+        };
+        let out_dir = dir.path().join("compacted-out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let out_target = crate::flush::FileFlushTarget::new_starting_at(out_dir.clone()).unwrap();
+        let out_reader = {
+            use crate::flush::FlushTarget;
+            Arc::new(out_target.flush(output).unwrap())
+        };
+        // Synthetic output id, distinct from any numeric input gen (its pool key
+        // lives in the high-bit synthetic space — no collision with inputs).
+        let out_gen = "compacted".to_string();
+
+        store
+            .swap_compacted_sstables(
+                &input_id_paths,
+                out_gen.clone(),
+                out_dir.clone(),
+                out_reader,
+                HashMap::new(),
+            )
+            .unwrap();
+        // 3 inputs removed, 1 compacted output inserted → exactly 1 remaining.
+        assert_eq!(store.sstable_count(), 1, "3 inputs - 3 + 1 output = 1");
+
+        // Every removed gen is evicted from the pool (FMEA #4 — no stale reopen).
+        for gen in &removed_gens {
+            assert!(
+                !store.pool_contains_gen(gen),
+                "removed input gen {gen} must be evicted from the pool after swap"
+            );
+        }
+        // The output gen is seeded and resident.
+        assert!(
+            store.pool_contains_gen(&out_gen),
+            "compacted output gen must be seeded into the pool"
+        );
+
+        // Reads now return POST-COMPACTION data from the output SSTable, and the
+        // removed gens are never reopened (a reopen would re-add their pool key).
+        for i in 0..3 {
+            let part = store
+                .read(&make_key(&format!("k{i}")))
+                .unwrap()
+                .unwrap_or_else(|| panic!("k{i} must be served from the compacted output"));
+            let cell = &part.rows[0].cells[0].1;
+            assert_eq!(
+                cell.value.as_deref(),
+                Some(format!("merged{i}").as_bytes()),
+                "k{i} must return post-compaction value, not stale input"
+            );
+        }
+        for gen in &removed_gens {
+            assert!(
+                !store.pool_contains_gen(gen),
+                "removed gen {gen} must never be reopened by post-swap reads"
+            );
+        }
+        // Only the output reader is resident — no stale input reader lingers.
+        assert_eq!(
+            store.resident_reader_count(),
+            1,
+            "only the compacted output reader should be resident after the swap + reads"
+        );
+    }
+
+    /// FMEA #10/#11: a reader `Arc` obtained before a swap/eviction must remain
+    /// valid and return complete, correct data for the whole scan even though
+    /// the pool entry for its gen was removed. The `Arc` keeps the reader alive;
+    /// `pool.remove` only drops the pool's reference, never the in-flight one.
+    #[test]
+    fn held_reader_survives_concurrent_swap_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = file_backed_test_store(dir.path());
+        reset_pool(&mut store, 64);
+
+        // One input SSTable with several rows under one partition so a scan over
+        // it is non-trivial (truncation/use-after-free would be observable).
+        let key = make_key("scan-pk");
+        for ck in 0..16i32 {
+            store
+                .write(
+                    &key,
+                    make_row_with_ck(ck, format!("c{ck}").as_bytes(), 1000 + ck as i64),
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.sstable_count(), 1);
+
+        // Acquire the reader Arc the way a live scan does, and snapshot its gen.
+        let view = store.view.load();
+        let desc = view.sstables[0].clone();
+        let (input_gen, _) = view.sstable_ids[0].clone();
+        drop(view);
+        let held: Arc<SSTableReader<ferrosa_sstable::io::FileReadAt>> =
+            store.open_reader(&desc).unwrap();
+        assert!(store.pool_contains_gen(&input_gen));
+
+        // Read the full partition through the held reader BEFORE eviction to get
+        // the ground-truth row set.
+        let before: Vec<Row> = held.get_partition(&key).unwrap().unwrap().rows;
+        assert_eq!(
+            before.len(),
+            16,
+            "all 16 clustering rows present pre-eviction"
+        );
+
+        // Now evict that exact gen from the pool (simulating a concurrent swap
+        // that removed the input). The pool drops its reference; `held` keeps the
+        // reader alive.
+        store.reader_pool.remove(&store.pool_key(&desc));
+        assert!(
+            !store.pool_contains_gen(&input_gen),
+            "gen must be gone from the pool after eviction"
+        );
+
+        // The held Arc must still read the COMPLETE, correct partition — no
+        // panic, no truncation, no use-after-evict. Re-read mid/post eviction.
+        let after: Vec<Row> = held.get_partition(&key).unwrap().unwrap().rows;
+        assert_eq!(
+            after, before,
+            "held reader must yield identical, complete results across eviction"
+        );
+
+        // Strong count proves the pool is no longer one of the holders; the scan
+        // owns the only live reference and it is still valid.
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "after eviction the held Arc is the sole owner — reader still alive"
+        );
+
+        // A fresh read through the store reopens the gen (it is in the view), and
+        // it returns the same rows — the eviction did not corrupt on-disk state.
+        let reopened = store.read(&key).unwrap().unwrap();
+        assert_eq!(
+            reopened.rows, before,
+            "reopened reader (post-eviction) returns the same complete partition"
         );
     }
 }

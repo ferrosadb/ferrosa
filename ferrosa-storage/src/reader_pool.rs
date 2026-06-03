@@ -201,6 +201,17 @@ impl<K: Eq + Hash + Clone, V> ReaderPool<K, V> {
             .expect("reader pool mutex poisoned")
             .remove(key);
     }
+
+    /// True if `key` currently has a resident entry. Test-only: lets swap
+    /// correctness tests assert that a removed generation's key is gone from
+    /// the pool (FMEA #4 — no stale-gen reopen).
+    #[cfg(test)]
+    pub fn contains(&self, key: &K) -> bool {
+        self.inner
+            .lock()
+            .expect("reader pool mutex poisoned")
+            .contains_key(key)
+    }
 }
 
 #[cfg(test)]

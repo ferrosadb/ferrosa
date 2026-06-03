@@ -55,11 +55,14 @@
 - [x] test: startup over N≫cap SSTables → resident ≤ cap — `engine::tests::startup_build_table_state_holds_resident_readers_within_cap` (N=40, cap=4; asserts `resident_reader_count() <= cap` AND `peak_resident_readers() <= cap`). Proven RED→GREEN: holding the Arcs makes peak = N = 40 and the test fails. Corrupt-exclusion regression covered by `startup_warn_mode_excludes_corrupt_sstable_but_keeps_healthy_sstables_queryable` plus pool-eviction asserts added to the warn/quarantine smoke-test tests.
 - [x] full lib suite green — 786 passed (was 785 + 1 new), 0 failed, 0 ignored; cluster `repair` 54 passed; clippy/fmt clean.
 
-## Phase 6 — Swap correctness — FMEA #4, #11
+## Phase 6 — Swap correctness — FMEA #4, #11 — DONE
 
-- [ ] evict `(table, gen)` from pool on every compaction/flush swap removing the gen
-- [ ] test: swap then read → no stale-gen reopen, no use-after-evict mid-scan
-- [ ] (optional) route compaction input opens through pool / cap concurrent compactions
+- [x] evict `(table, gen)` from pool on every compaction/flush swap removing the gen — already implemented in `swap_compacted_sstables` (`store.rs`): removed input gens are `reader_pool.remove(pool_key(desc))`'d before the new view is published; the new output gen is seeded via `seed_reader`. Verified by the new tests below (no production fix was needed — the swap path was correct; Phase 6 proves it).
+- [x] test: swap then read → no stale-gen reopen, no use-after-evict mid-scan
+  - `store::tests::swap_evicts_removed_gens_no_stale_reopen` (FileFlushTarget; 3 input SSTables primed into the pool, real file-backed compaction output via a standalone `FileFlushTarget`, swap removes all 3 inputs): asserts each removed gen's pool key is gone (`pool_contains_gen == false`), the output gen is seeded resident, post-swap reads return the post-compaction values (`merged{i}`, never stale input rows), removed gens are never reopened by reads, and only the 1 output reader stays resident.
+  - `store::tests::held_reader_survives_concurrent_swap_eviction` (FileFlushTarget; 16-row partition): a reader `Arc` taken before eviction reads the full 16 rows, then `reader_pool.remove` evicts that gen, and the held `Arc` still yields identical complete rows (no panic / truncation / use-after-evict; `Arc::strong_count == 1` proves the pool released its ref while the scan keeps the reader alive). A fresh post-eviction store read reopens the gen and returns the same rows.
+  - Added test-only `ReaderPool::contains(key)` + `TableStore::pool_contains_gen(gen)` (keys identically to the live path via `SstableDescriptor::gen_num_for`).
+- [ ] (optional) route compaction input opens through pool / cap concurrent compactions — deferred (FMEA #11, lower priority; compaction planning already opens through the pool via `open_reader`).
 
 ## Phase 7 — End-to-end verification
 
