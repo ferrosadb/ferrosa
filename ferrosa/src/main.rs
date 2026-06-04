@@ -709,6 +709,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ferrosa_storage::StorageEngine::spawn_time_series_materialization_worker(storage.clone());
 
+    // Self-healing controller: deterministic autonomous repair of corrupt
+    // SSTables. Gated by FERROSA_SELFHEAL_ENABLED (default on). Until the
+    // cluster-aware replica-health view is wired (a follow-up), it runs with a
+    // single-node view, which means corruption escalates-degraded and is never
+    // quarantined (FMEA #1: never lose the only copy). Startup smoke-test
+    // warnings fire independently of this controller.
+    {
+        let selfheal_cfg = ferrosa_storage::self_heal::SelfHealConfig::from_env();
+        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
+            std::sync::Arc::new(ferrosa_storage::self_heal::SingleNodeClusterView::default());
+        ferrosa_storage::self_heal::SelfHealController::spawn(
+            storage.clone(),
+            cluster_view,
+            selfheal_cfg,
+        );
+    }
+
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
 

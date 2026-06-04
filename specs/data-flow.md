@@ -211,8 +211,8 @@ sequenceDiagram
             Note over Exec,Peer: Phase 2-3: Per-span chunked Fetch + streaming diff
             loop For each merged span — until both cursors exhaust
                 par Fetch chunks
-                    Exec->>Local: read_range_chunked(span, cursor, REPAIR_FETCH_CHUNK_PARTITIONS=64)
-                    Exec->>Peer: RepairFetchRequest { cursor, limit: 64 } (Lane::Bulk)
+                    Exec->>Local: read_range_chunked(span, cursor, limit=64, max_bytes=32MiB)
+                    Exec->>Peer: RepairFetchRequest { cursor, limit: 64, max_bytes: 32MiB } (Lane::Bulk)
                     Peer-->>Exec: RepairFetchResponse { partitions, next_cursor }
                 end
                 Exec->>Exec: diff_partition_sets_streaming → push into per-direction apply queues
@@ -238,8 +238,8 @@ sequenceDiagram
 
 **Bounded memory invariants** (per session):
 
-- Local fetch chunk: ≤ `REPAIR_FETCH_CHUNK_PARTITIONS` partitions
-- Remote fetch chunk: ≤ `REPAIR_FETCH_CHUNK_PARTITIONS` partitions
+- Local fetch chunk: ≤ `REPAIR_FETCH_CHUNK_PARTITIONS` partitions and ≤ `REPAIR_FETCH_CHUNK_BYTES`
+- Remote fetch chunk: ≤ `REPAIR_FETCH_CHUNK_PARTITIONS` partitions and ≤ `REPAIR_FETCH_CHUNK_BYTES`
 - A→B apply queue: ≤ `REPAIR_APPLY_CHUNK_PARTITIONS` partitions
 - B→A apply queue: ≤ `REPAIR_APPLY_CHUNK_PARTITIONS` partitions
 - Merkle build page: ≤ `MERKLE_BUILD_BATCH` partitions decoded at a time

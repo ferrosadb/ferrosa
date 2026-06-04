@@ -1,11 +1,11 @@
 # Storage Engine
 
-> Last updated: 2026-03-30 (NVMe table pinning, FTI sidecar integration, observability metrics)
+> Last updated: 2026-06-04 (bounded SSTable reader memory and compaction concurrency)
 > Status: Approved
 
 ## Overview
 
-`ferrosa-storage` is the single-node storage engine. It accepts writes into an in-memory buffer (memtable), flushes to SSTables, and merges reads across all sources. The read path is entirely wait-free via lock-free atomic pointer swaps.
+`ferrosa-storage` is the single-node storage engine. It accepts writes into an in-memory buffer (memtable), flushes to SSTables, and merges reads across all sources. The read path is centered on lock-free `ArcSwap` snapshots that stay lightweight by storing SSTable descriptors and opening readers on demand through an engine-wide LRU reader pool.
 
 The crate is implemented in three parts, all complete:
 
@@ -23,7 +23,8 @@ graph TB
     subgraph "StorageEngine"
         CL["CommitLog<br/>CAS-based WAL"]
         Tables["RwLock&lt;HashMap&lt;TableId, TableStore&gt;&gt;"]
-        Compact["CompactionExecutor<br/>Background std::thread"]
+        Compact["CompactionExecutor<br/>Background std::thread + global gate"]
+        ReaderPool["ReaderPool<br/>engine-wide LRU of open SSTableReader handles"]
         Upload["UploadManager<br/>tokio task + bounded mpsc"]
         Cache["LocalCache<br/>LRU eviction"]
         Manifest["Manifest<br/>JSON + etag CAS"]
@@ -33,7 +34,7 @@ graph TB
         View["StoreView (immutable snapshot)"]
         Active["Active Memtable<br/>ShardedBTreeMemtable"]
         Flushing["Flushing Memtable<br/>(read-only during flush)"]
-        SSTables["Flushed SSTables<br/>Vec&lt;Arc&lt;SSTableReader&gt;&gt;"]
+        SSTables["Flushed SSTables<br/>Vec&lt;SstableDescriptor&gt;"]
     end
 
     subgraph "Write Path"
@@ -47,6 +48,7 @@ graph TB
         View --> Active
         View --> Flushing
         View --> SSTables
+        SSTables --> ReaderPool
         Merge[merge_partitions<br/>cell-level LWW]
     end
 
@@ -55,7 +57,7 @@ graph TB
         FlushGuard -->|1. atomic swap| View
         FlushGuard -->|2. snapshot| Flushing
         FlushGuard -->|3. SSTableWriter| FT[FileFlushTarget]
-        FT --> NewSST[New SSTableReader]
+        FT --> NewSST[New SstableDescriptor + seeded reader]
         FlushGuard -->|4. atomic swap| SSTables
         FlushGuard -->|5. maybe_compact| Compact
         FlushGuard -.->|6. submit upload| Upload
@@ -63,6 +65,7 @@ graph TB
 
     Upload -.->|update| Manifest
     Cache -->|track files| SSTables
+    Compact --> ReaderPool
 ```
 
 ## Crate Structure
@@ -80,6 +83,7 @@ ferrosa-storage/
       mod.rs              # Memtable trait
       sharded.rs          # ShardedBTreeMemtable (64 shards)
     flush.rs              # FlushTarget trait + InMemory/File impls
+    reader_pool.rs        # Engine-wide capped LRU for open SSTableReader handles
     store.rs              # TableStore — lock-free ArcSwap composition
     merge.rs              # Read-path merge (cell-level LWW)
     commitlog/
@@ -241,18 +245,37 @@ Two implementations:
 ```rust
 pub struct TableStore<F: FlushTarget> {
     schema: TableSchema,
-    view: ArcSwap<StoreView<F::Reader>>,
+    view: ArcSwap<StoreView>,
     flush_guard: Mutex<()>,
     flush_target: F,
+    reader_pool: SharedReaderPool<F::Reader>,
     options: ferrosa_sstable::WriteOptions,
 }
 
-struct StoreView<R: ReadAt + Send + Sync + 'static> {
+struct StoreView {
     active: Arc<dyn Memtable>,
     flushing: Option<Arc<dyn Memtable>>,
-    sstables: Arc<Vec<Arc<SSTableReader<R>>>>,  // newest first
+    sstables: Arc<Vec<SstableDescriptor>>,  // newest first
+    sstable_ids: Arc<Vec<SstableId>>,
+    sidecar_indexes: Arc<Vec<SidecarIndexSet>>,
+}
+
+struct SstableDescriptor {
+    gen: String,
+    dir: PathBuf,
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
+    min_token: i64,
+    max_token: i64,
 }
 ```
+
+`StoreView` intentionally does not hold one fully-open `SSTableReader` per
+SSTable. Descriptors preserve generation identity and pruning bounds while
+keeping the immutable snapshot cheap. Reads, validation, compaction inputs, and
+repair walks open readers on demand through the engine-wide pool. The existing
+parallel-length invariant remains: descriptors, SSTable ids, and sidecar index
+sets must describe the same generations in the same order.
 
 **Public API** — all methods take `&self`:
 
@@ -263,10 +286,33 @@ impl<F: FlushTarget> TableStore<F> {
     pub fn read(&self, key: &DecoratedKey) -> Result<Option<Partition>>;
     pub fn flush(&self) -> Result<()>;
     pub fn sstable_count(&self) -> usize;
+    pub fn resident_reader_count(&self) -> usize;
+    pub fn peak_resident_readers(&self) -> usize;
     pub fn memtable_size(&self) -> usize;
     pub fn memtable_partition_count(&self) -> usize;
 }
 ```
+
+### ReaderPool
+
+`reader_pool.rs` provides an engine-wide capped LRU of open `SSTableReader`
+handles. The default cap is `256`, configurable with
+`FERROSA_SSTABLE_READER_CACHE_CAP`.
+
+Key properties:
+
+- `get_or_open` uses double-checked locking and never performs file I/O while
+  holding the LRU mutex.
+- Eviction skips entries with live external `Arc` references, so an active scan
+  cannot lose its reader. If every reader is in use, the pool soft-exceeds the
+  cap, logs/meters the breach, and preserves correctness.
+- Pool keys include table identity plus generation, preventing collisions after
+  compaction creates a replacement generation.
+- Flush and compaction swaps remove obsolete generations from the pool before
+  publishing the replacement view.
+- Startup validation opens, checks, and drops one SSTable at a time, then builds
+  descriptors; it no longer accumulates all readers before the table becomes
+  queryable.
 
 ### Read-Path Merge
 
@@ -375,10 +421,20 @@ pub struct CompactionExecutor {
     result_rx: Mutex<std::sync::mpsc::Receiver<CompactionResult>>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
     stop_flag: Arc<AtomicBool>,
+    reader_pool: Option<SharedReaderPool<FileReadAt>>,
+    gate: CompactionGate,
 }
 ```
 
-Runs on a dedicated `std::thread` (not async — compaction is CPU+IO bound). Submit tasks via channel, poll results non-blocking.
+Runs on dedicated `std::thread` workers (not async — compaction is CPU+IO bound). Submit tasks via channel, poll results non-blocking.
+
+Production compactions open input SSTables through the same engine-wide reader
+pool as read/startup paths and acquire a global
+`CompactionGate` permit before merging. This prevents the old multiplication of
+`worker_count × input fan-in` private readers under the 2 GiB fmem cgroup. The
+default merge cap is `2`, exposed as `FERROSA_MAX_CONCURRENT_COMPACTIONS`;
+`ferrosa_storage_compaction_pool_input_opens_total` and
+`ferrosa_storage_compaction_running_max` provide the observable evidence surface.
 
 ### S3 Upload Manager (Part C)
 
@@ -522,6 +578,8 @@ impl StorageEngine {
 | `flush_max_age_secs` | `FERROSA_FLUSH_MAX_AGE_SECS` | 30 | Time-based flush for low-write tables |
 | `memtable_num_shards` | `FERROSA_MEMTABLE_NUM_SHARDS` | 64 | Per-table memtable shard count |
 | `write_verify` | `FERROSA_WRITE_VERIFY` | true | Defensive SSTable-writer self-readback after flush |
+| `sstable_reader_cache_cap` | `FERROSA_SSTABLE_READER_CACHE_CAP` | 256 | Engine-wide cap for resident open SSTable readers |
+| `max_concurrent_compactions` | `FERROSA_MAX_CONCURRENT_COMPACTIONS` | 2 | Global cap for simultaneously executing compaction merges |
 
 `StorageEngineConfig::test_config` overrides `memtable_backpressure_bytes` to `u64::MAX`, effectively disabling backpressure in tests by default (tests that pick intentionally tiny `flush_threshold_bytes` would otherwise deadlock). One regression test opts in explicitly: `write_triggers_inline_flush_when_backpressure_exceeded`.
 
@@ -596,18 +654,29 @@ FTI sidecar files are uploaded to S3 as part of the SSTable component set (`Uplo
 1. `ArcSwap::load()` — wait-free, get immutable snapshot
 1. Check active memtable → `Option<Arc<Partition>>`
 1. Check flushing memtable (if mid-flush) → `Option<Arc<Partition>>`
-1. Check flushed SSTables newest-first — `SSTableReader::get_partition()` handles bloom filter internally
+1. Prune flushed SSTable descriptors by key/token bounds
+1. Open only candidate readers through `ReaderPool::get_or_open`
+1. Check candidate SSTables newest-first — `SSTableReader::get_partition()` handles bloom filter internally
 1. `merge_partitions()` — cell-level LWW across all sources
 
 ### Read Range Path (StorageEngine)
 
-`read_range()` returns all partitions within a token range, merging data from both the memtable and flushed SSTables. Previously this was memtable-only; it now includes SSTable data for complete range query results.
+`read_range()` and token-range repair walks return partitions within a token range, merging data from both the memtable and flushed SSTables. They load a descriptor snapshot, prune candidates by token bounds, and stream data from pooled readers.
 
 1. `ArcSwap::load()` — wait-free snapshot
 1. Scan active memtable for partitions in token range
 1. Scan flushing memtable (if mid-flush) for partitions in token range
-1. Scan flushed SSTables for partitions in token range
+1. Scan candidate flushed SSTables through pooled streaming readers
 1. `merge_partitions()` — cell-level LWW across all matching sources, grouped by partition key
+
+The repair/range design streams one partition per source at a time and avoids the
+intermediate tier materialization path that collected whole tables into
+`Vec<Partition>` during full-range repair digests. Peak partition data is
+bounded by open sources plus the explicit byte/count budget, not by table size.
+Under full token overlap, strict reader-count bounding is handled as a separate
+repair fan-in acceptance gate; the storage engine itself bounds resident
+readers, startup validation, compaction inputs, and partition data
+materialization.
 
 ### DELETE and Tombstone Merge
 
@@ -626,8 +695,8 @@ Mutations that exceed the active segment's remaining capacity are handled gracef
 1. Snapshot flushing memtable, sort by key
 1. `build_serialization_header()` — scan partitions for min_timestamp etc.
 1. `SSTableWriter::new().add_partition()...finish()` — produce `SSTableOutput`
-1. `flush_target.flush(output)` — write files, open reader
-1. Atomic swap: prepend new `SSTableReader`, clear `flushing`
+1. `flush_target.flush(output)` — write files, derive descriptor, seed reader pool
+1. Atomic swap: prepend new `SstableDescriptor`, clear `flushing`
 1. `maybe_compact()` — evaluate STCS, submit compaction tasks if buckets are full
 
 ## Concurrency Model
@@ -639,7 +708,7 @@ Mutations that exceed the active segment's remaining capacity are handled gracef
 | `flush()` | Per-table `Mutex`; `ArcSwap::store()` for view transitions | Flushes only; reads/writes unaffected |
 | `size_bytes()` | `AtomicUsize::load(Relaxed)` | Zero (wait-free) |
 | Commit log alloc | `AtomicU64` CAS + in-flight writer counter | CAS contention under heavy write load |
-| Compaction | Background `std::thread`, channel-based submit/poll | None (isolated thread) |
+| Compaction | Background `std::thread`, channel-based submit/poll, global `CompactionGate` | Bounded by `FERROSA_MAX_CONCURRENT_COMPACTIONS`; isolated from Tokio |
 | Upload | tokio task, bounded `mpsc` channel | Backpressure when queue full |
 
 ### Concurrency Primitive Selection
@@ -650,7 +719,7 @@ Mutations that exceed the active segment's remaining capacity are handled gracef
 | Shard locks | `parking_lot::RwLock` | `std::sync::RwLock` is multi-word, no adaptive spinning, no HLE, poisoning overhead. `DashMap` lacks ordered iteration. |
 | Commit log allocation | `AtomicU64` CAS loop | Lock-based allocation would serialize all writers. CAS allows truly concurrent appends to the same segment. |
 | In-flight tracking | `AtomicU64` counter | Ensures `flush_to_disk()` waits for all writers to finish writing their allocated bytes before reading the buffer. |
-| Compaction thread | `std::thread` + `std::sync::mpsc` | CPU+IO bound work. Async would waste a tokio runtime thread on blocking I/O. |
+| Compaction thread | `std::thread` + `std::sync::mpsc` + `CompactionGate` | CPU+IO bound work. Async would waste a tokio runtime thread on blocking I/O. The gate prevents multiple workers from multiplying pooled input-reader memory. |
 | Upload task | `tokio::spawn` + `tokio::sync::mpsc` | Network I/O is async-native. Caller provides runtime handle. |
 | Stats counters | `AtomicUsize` | Any lock would add contention to every `put()` call for a stat update. |
 | Flush serialization | `Mutex<()>` | CAS loop on ArcSwap would be complex and fragile. Single flush at a time is correct — Cassandra also serializes flushes per table. |
@@ -833,16 +902,19 @@ pub struct StorageStats {
 | `ferrosa_compaction_s3_uploads_total` | Counter | SSTable components uploaded to S3 after compaction |
 | `ferrosa_compaction_s3_deletes_total` | Counter | Superseded SSTable components deleted from S3 after grace period |
 | `ferrosa_compaction_input_bytes_reclaimed` | Counter | Total bytes reclaimed by compaction (sum of input SSTable sizes minus output) |
+| `ferrosa_storage_compaction_pool_input_opens_total` | Counter | Compaction input SSTables opened through the shared reader pool |
+| `ferrosa_storage_compaction_running_max` | Gauge | Highest number of concurrently executing compaction merges observed under the global gate |
 
 ## Follow-on Work
 
-### Not Yet Implemented
+### Remaining Gaps
 
 | Area | Description | Depends On |
 |------|-------------|------------|
-| **Compaction execution** | `CompactionExecutor` has a placeholder `execute_task()` — needs to read input SSTables, merge, write output SSTable | SSTableReader merge iterator |
-| **SSTable metadata collection** | `collect_sstable_metadata()` returns empty — needs to iterate SSTableReader list and extract stats for STCS evaluation | SSTableReader stats API |
-| **S3 upload wiring** | `StorageEngine.flush()` doesn't yet submit uploaded files to `UploadManager` — the upload path is built but not wired into flush | Compaction execution |
+| **Repair reader fan-in under full token overlap** | Partition data is streamed and resident readers are pooled, but strict open-reader fan-in for fully overlapping repair digests remains an acceptance gate | Bounded reader pool, byte-bounded repair fetch |
+| **Repair fuzz harness** | Shared proptest generators and cross-crate repair fuzz tests are being added to keep anti-entropy fetch/apply bounded and convergence-safe | `test-generators` feature |
+| **Self-healing controller** | Autonomous repair remains proposed; all remediation primitives must stay bounded before this can run without an operator | Repair fan-in gate, repair history |
+| **S3 upload wiring** | `StorageEngine.flush()` doesn't yet submit uploaded files to `UploadManager` — the upload path is built but not wired into flush | UploadManager integration |
 | **Manifest CAS loop** | Manifest load/save is implemented, but the retry loop on conflict isn't wired into the flush/upload pipeline | S3 upload wiring |
 | **Recovery (`open()`)** | Load manifest from S3, ensure local cache has SSTables, replay commit log into memtables | Manifest, upload wiring |
 | **Commit log S3 shipping** | Segments are flushed to local disk but not yet uploaded to S3 | UploadManager integration |

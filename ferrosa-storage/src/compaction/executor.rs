@@ -10,11 +10,86 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
+use crate::store::SharedReaderPool;
 use crate::upload::manager::SstableComponentBytes;
 
 use super::metadata::{CompactionTask, SSTableMetadata};
+
+/// Reader pool used to obtain compaction input SSTable readers so they count
+/// against the engine-wide resident-reader bound (FMEA #11). Keyed identically
+/// to the live read path: `(table_id, gen_num)` over `FileReadAt` readers.
+type CompactionReaderPool = SharedReaderPool<ferrosa_sstable::io::FileReadAt>;
+
+/// Default cap on the number of compaction tasks allowed to run their merge
+/// concurrently. Bounds (concurrent tasks × per-task input readers) so
+/// compaction memory cannot grow without limit on a bloated node. Override with
+/// `FERROSA_MAX_CONCURRENT_COMPACTIONS`.
+const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 2;
+
+/// Resolve the configured concurrent-compaction cap (env override, sane
+/// default, never zero).
+fn configured_max_concurrent_compactions() -> usize {
+    std::env::var("FERROSA_MAX_CONCURRENT_COMPACTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_COMPACTIONS)
+}
+
+/// A counting semaphore that caps the number of compaction merges running at
+/// once across all worker threads. A worker acquires a permit before running
+/// `execute_task` and releases it (via the `CompactionPermit` guard) when the
+/// task finishes, so at most `cap` tasks ever execute concurrently regardless
+/// of how many worker threads exist.
+struct CompactionGate {
+    cap: usize,
+    available: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl CompactionGate {
+    fn new(cap: usize) -> Self {
+        let cap = cap.max(1);
+        Self {
+            cap,
+            available: Mutex::new(cap),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until a permit is available, then take it. Returns a guard that
+    /// returns the permit on drop. `stop` is polled so a shutting-down executor
+    /// does not deadlock waiting on a permit that never frees.
+    fn acquire<'a>(&'a self, stop: &AtomicBool) -> Option<CompactionPermit<'a>> {
+        let mut available = self.available.lock();
+        while *available == 0 {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            // Bounded wait so shutdown is observed promptly even if no permit
+            // frees up (Rule 2: no unbounded blocking).
+            self.cv
+                .wait_for(&mut available, std::time::Duration::from_millis(100));
+        }
+        *available -= 1;
+        Some(CompactionPermit { gate: self })
+    }
+}
+
+/// RAII permit: returns its slot to the [`CompactionGate`] on drop.
+struct CompactionPermit<'a> {
+    gate: &'a CompactionGate,
+}
+
+impl Drop for CompactionPermit<'_> {
+    fn drop(&mut self) {
+        let mut available = self.gate.available.lock();
+        *available = (*available + 1).min(self.gate.cap);
+        self.gate.cv.notify_one();
+    }
+}
 
 struct QueuedCompactionTask {
     task: CompactionTask,
@@ -162,8 +237,24 @@ impl Default for CompactionExecutor {
 }
 
 impl CompactionExecutor {
-    /// Creates and starts the compaction executor background thread.
+    /// Creates and starts the compaction executor without a reader pool.
+    ///
+    /// Input SSTables are opened directly. Used by tests and the compaction
+    /// validator that drive `execute_task` synchronously. Production engines use
+    /// [`Self::with_reader_pool`] so input readers count against the
+    /// engine-wide resident-reader bound (FMEA #11).
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Creates and starts the executor routing input opens through the
+    /// engine-wide reader pool, so compaction's resident input readers are
+    /// shared with and bounded by the same pool as the read/startup paths.
+    pub fn with_reader_pool(pool: CompactionReaderPool) -> Self {
+        Self::build(Some(pool))
+    }
+
+    fn build(reader_pool: Option<CompactionReaderPool>) -> Self {
         let worker_count = std::env::var("FERROSA_COMPACTION_WORKERS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -177,6 +268,8 @@ impl CompactionExecutor {
         let (result_tx, result_rx) = std::sync::mpsc::channel::<CompactionResult>();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let in_flight_inputs = Arc::new(Mutex::new(HashSet::new()));
+        let gate = Arc::new(CompactionGate::new(configured_max_concurrent_compactions()));
+        // `reader_pool` is already an `Arc`, so each worker gets a cheap clone.
         let mut task_txs = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
 
@@ -186,6 +279,8 @@ impl CompactionExecutor {
             let result_tx = result_tx.clone();
             let stop = Arc::clone(&stop_flag);
             let in_flight_inputs = Arc::clone(&in_flight_inputs);
+            let gate = Arc::clone(&gate);
+            let reader_pool = reader_pool.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("compaction-executor-{worker_idx}"))
@@ -198,12 +293,31 @@ impl CompactionExecutor {
                                     crate::metrics::CompactionPhase::QueueWait,
                                     queued.queued_at.elapsed(),
                                 );
+                                let task = queued.task;
+                                // Cap concurrent merges across all workers
+                                // (FMEA #11): hold a permit for the duration of
+                                // the merge. The running gauge is bumped only
+                                // *after* the permit is taken, so
+                                // `compaction_running_max` reflects tasks
+                                // actually executing, never those blocked at the
+                                // gate.
+                                let permit = match gate.acquire(&stop) {
+                                    Some(permit) => permit,
+                                    None => {
+                                        // Shutting down before a permit freed:
+                                        // requeued inputs are released so a
+                                        // restart can reschedule them.
+                                        Self::release_in_flight_inputs(&in_flight_inputs, &task);
+                                        break;
+                                    }
+                                };
                                 crate::metrics::inc_compaction_running();
                                 let task_start = Instant::now();
-                                let task = queued.task;
-                                match Self::execute_task(&task) {
+                                let result = Self::execute_task_routed(&task, reader_pool.as_ref());
+                                crate::metrics::dec_compaction_running();
+                                drop(permit);
+                                match result {
                                     Ok(output) => {
-                                        crate::metrics::dec_compaction_running();
                                         let _ = result_tx.send(CompactionResult {
                                             task,
                                             output: output.metadata,
@@ -217,7 +331,6 @@ impl CompactionExecutor {
                                             task_start.elapsed(),
                                         );
                                         crate::metrics::inc_compaction_failed();
-                                        crate::metrics::dec_compaction_running();
                                         tracing::error!(%e, "compaction: task failed");
                                     }
                                 }
@@ -344,7 +457,16 @@ impl CompactionExecutor {
     where
         F: FnMut(usize),
     {
-        Self::execute_task_inner(task, observe_group_width)
+        Self::execute_task_inner(task, None, observe_group_width)
+    }
+
+    /// Execute a task with input opens routed through the engine-wide reader
+    /// pool when one is configured (FMEA #11). Used by the worker threads.
+    fn execute_task_routed(
+        task: &CompactionTask,
+        reader_pool: Option<&CompactionReaderPool>,
+    ) -> std::result::Result<ExecutedCompaction, String> {
+        Self::execute_task_inner(task, reader_pool, |_| {})
     }
 
     /// Execute a single compaction task by merging input SSTables into one output.
@@ -360,15 +482,19 @@ impl CompactionExecutor {
     /// header is built from the inputs' headers (bounded compute) rather
     /// than from a full data scan.
     // `pub(crate)` so the compaction validator can drive a real compaction
-    // synchronously and diff the output against its oracle.
+    // synchronously and diff the output against its oracle. Production worker
+    // threads use [`Self::execute_task_routed`] (pool-routed); this direct-open
+    // entry point exists only for tests and the validator harness.
+    #[cfg(any(test, feature = "compaction-validator"))]
     pub(crate) fn execute_task(
         task: &CompactionTask,
     ) -> std::result::Result<ExecutedCompaction, String> {
-        Self::execute_task_inner(task, |_| {})
+        Self::execute_task_inner(task, None, |_| {})
     }
 
     fn execute_task_inner<F>(
         task: &CompactionTask,
+        reader_pool: Option<&CompactionReaderPool>,
         mut observe_group_width: F,
     ) -> std::result::Result<ExecutedCompaction, String>
     where
@@ -394,8 +520,19 @@ impl CompactionExecutor {
         // 1. Open every input SSTable.  ANY missing/corrupt input aborts the
         //    whole compaction — silent skipping previously caused data loss
         //    because swap_compacted_sstables removes all inputs.
+        //
+        //    When `reader_pool` is set (production), the opened reader is
+        //    obtained through the engine-wide bounded reader pool so
+        //    compaction's resident input readers count against — and are
+        //    shared/evictable with — the same global bound as the read and
+        //    startup paths (FMEA #11). The strict validation below still runs
+        //    on every input regardless of cache state, so abort-on-corrupt is
+        //    unchanged. Readers are held as `Arc` for the duration of the
+        //    merge; the pool never evicts an in-use reader (soft cap).
         let open_start = Instant::now();
-        let mut readers: Vec<SSTableReader<FileReadAt>> = Vec::with_capacity(task.inputs.len());
+        let mut readers: Vec<Arc<SSTableReader<FileReadAt>>> =
+            Vec::with_capacity(task.inputs.len());
+        let pool_table_key = task.table_id.to_string();
         for input in &task.inputs {
             let gen = &input.id;
             let dir = &input.path;
@@ -446,6 +583,8 @@ impl CompactionExecutor {
                     .unwrap_or(0),
             );
 
+            // Strict open: validates and aborts on corruption regardless of
+            // whether the pool already has this generation cached.
             let reader = SSTableReader::open(SSTableComponents {
                 data,
                 partitions: partitions_file,
@@ -455,6 +594,24 @@ impl CompactionExecutor {
                 statistics,
             })
             .map_err(|e| format!("aborting compaction: SSTable {gen} corrupt: {e}"))?;
+
+            let reader = match reader_pool {
+                Some(pool) => {
+                    // Key identically to the live read/startup path so a
+                    // generation opened for reads and one opened for compaction
+                    // share a single resident reader.
+                    let key = (
+                        pool_table_key.clone(),
+                        crate::store::SstableDescriptor::gen_num_for(gen),
+                    );
+                    crate::metrics::inc_compaction_pool_input_opens();
+                    // Reader is already validated; the closure runs only on a
+                    // cache miss (the just-opened reader is cached), otherwise
+                    // the cached reader is returned and this one is dropped.
+                    pool.get_or_open(key, move || Ok::<_, String>(reader))?
+                }
+                None => Arc::new(reader),
+            };
 
             readers.push(reader);
         }
@@ -830,7 +987,7 @@ pub(crate) struct ExecutedCompaction {
 /// flush path used to use via `flush::build_serialization_header`.
 fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
     schema: &ferrosa_common::schema::TableSchema,
-    readers: &[ferrosa_sstable::reader::SSTableReader<R>],
+    readers: &[Arc<ferrosa_sstable::reader::SSTableReader<R>>],
 ) -> ferrosa_sstable::statistics::SerializationHeader {
     use ferrosa_common::{NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
     use ferrosa_sstable::statistics::SerializationHeader;
@@ -1534,5 +1691,165 @@ mod tests {
         };
 
         validate_partition_writable(&partition, &header).unwrap();
+    }
+
+    // ---- FMEA #11: bounded compaction memory ----
+
+    /// The concurrency gate must never let more than `cap` permits be held at
+    /// once, no matter how many worker threads contend for them. This is the
+    /// invariant `compaction_running_max <= cap` relies on.
+    #[test]
+    fn compaction_gate_caps_concurrent_holders() {
+        use std::sync::atomic::AtomicUsize;
+
+        const CAP: usize = 2;
+        const WORKERS: usize = 8;
+        const ITERS: usize = 50;
+
+        let gate = Arc::new(CompactionGate::new(CAP));
+        let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicUsize::new(0));
+        let max_live = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let gate = Arc::clone(&gate);
+            let stop = Arc::clone(&stop);
+            let live = Arc::clone(&live);
+            let max_live = Arc::clone(&max_live);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    let permit = gate.acquire(&stop).expect("permit while not stopped");
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_live.fetch_max(now, Ordering::SeqCst);
+                    // Hold the permit briefly so contention is real.
+                    std::thread::yield_now();
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            max_live.load(Ordering::SeqCst) <= CAP,
+            "compaction gate allowed {} concurrent holders, cap was {CAP}",
+            max_live.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A shutting-down executor must not deadlock a worker blocked on the gate:
+    /// `acquire` returns `None` once `stop` is set.
+    #[test]
+    fn compaction_gate_unblocks_on_shutdown() {
+        let gate = Arc::new(CompactionGate::new(1));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Exhaust the single permit and hold it.
+        let held = gate.acquire(&stop).expect("first permit");
+
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || gate.acquire(&stop).is_none())
+        };
+        // Give the waiter time to block on the unavailable permit.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.store(true, Ordering::Release);
+        let returned_none = waiter.join().unwrap();
+        assert!(
+            returned_none,
+            "waiter must observe shutdown and stop blocking, not wait forever"
+        );
+        drop(held);
+    }
+
+    /// FMEA #11 fix #1: compaction input readers are obtained through the
+    /// engine-wide reader pool. After a pool-routed compaction the input
+    /// generations are resident in the pool (shared/evictable with the read
+    /// path), the pool-routed-open counter advanced, and the merged output
+    /// still contains every input partition (correctness unchanged).
+    #[test]
+    fn compaction_inputs_routed_through_reader_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+        let table_id = test_table_id();
+
+        // Two non-overlapping input SSTables, 5 partitions each.
+        let dir_a = tmp.path().join("sstable_a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let partitions_a: Vec<_> = (0..5)
+            .map(|i| make_test_partition(&format!("a_key_{i:02}"), "va", 1000))
+            .collect();
+        let meta_a = write_sstable_to_dir(&dir_a, &partitions_a, &schema);
+
+        let dir_b = tmp.path().join("sstable_b");
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let partitions_b: Vec<_> = (0..5)
+            .map(|i| make_test_partition(&format!("b_key_{i:02}"), "vb", 1000))
+            .collect();
+        let meta_b = write_sstable_to_dir(&dir_b, &partitions_b, &schema);
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: vec![meta_a.clone(), meta_b.clone()],
+            output_dir,
+            schema,
+            table_id: table_id.clone(),
+        };
+
+        let pool: CompactionReaderPool = Arc::new(crate::reader_pool::ReaderPool::new(256));
+        assert_eq!(pool.resident(), 0, "pool starts empty");
+        let opens_before = crate::metrics::compaction_pool_input_opens_total();
+
+        let result =
+            CompactionExecutor::execute_task_inner(&task, Some(&pool), |_| {}).expect("compaction");
+
+        // The pool-routed open counter advanced once per input.
+        assert_eq!(
+            crate::metrics::compaction_pool_input_opens_total() - opens_before,
+            task.inputs.len() as u64,
+            "every input open must be pool-routed"
+        );
+
+        // Both input generations are resident in the pool, keyed exactly as the
+        // read path keys them — proving the readers are shared, not opened on a
+        // private path outside the bound.
+        for input in &task.inputs {
+            let key = (
+                table_id.to_string(),
+                crate::store::SstableDescriptor::gen_num_for(&input.id),
+            );
+            assert!(
+                pool.get_or_open(key, || Err::<
+                    ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>,
+                    String,
+                >("must already be cached".into()))
+                    .is_ok(),
+                "input generation {} must be resident in the pool after compaction",
+                input.id
+            );
+        }
+
+        // Correctness: every input partition survives the merge.
+        let meta = result.metadata;
+        assert_eq!(
+            meta.partition_count,
+            (partitions_a.len() + partitions_b.len()) as u64,
+            "all input partitions must appear in the compacted output"
+        );
+    }
+
+    /// `FERROSA_MAX_CONCURRENT_COMPACTIONS` parses to a positive cap and falls
+    /// back to a small default when unset/invalid (memory-bound default).
+    #[test]
+    fn concurrent_compaction_cap_default_is_small_and_positive() {
+        // Unset path → small default. (Other tests in this process may set the
+        // var; only assert the parsing contract on explicit inputs.)
+        assert_eq!(DEFAULT_MAX_CONCURRENT_COMPACTIONS, 2);
+        assert!(configured_max_concurrent_compactions() >= 1);
     }
 }

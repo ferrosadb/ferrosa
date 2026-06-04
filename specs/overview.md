@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-04-05
+> Last updated: 2026-06-04
 > Status: Approved
 
 ## Overview
@@ -119,9 +119,24 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: Ferrosa is a developer-preview 18-crate workspace. Core storage/CQL, Raft metadata, graph/SPARQL experiments, index paths, PITR building blocks, and Accord transaction components exist in source and specs. Public production-readiness, Jepsen-verified behavior, complete observability backing, arbitrary `SUBSCRIBE` delivery, and full CQL/query conformance remain verification or open work. Current public docs should describe supported developer-preview paths and link unsupported topics to `todo/`, `proposed/`, or `verified-test-plan/` instead of presenting them as guarantees.
+**Current progress**: Ferrosa is a developer-preview 18-crate workspace. Core storage/CQL, Raft metadata, graph/SPARQL experiments, index paths, PITR building blocks, Accord transaction components, anti-entropy repair, and several memory-bound storage hardening paths exist in source and specs. Public production-readiness, Jepsen-verified behavior, complete observability backing, arbitrary `SUBSCRIBE` delivery, full CQL/query conformance, and full repair convergence under all SSTable-overlap shapes remain verification or open work. Current public docs should describe supported developer-preview paths and link unsupported topics to `todo/`, `proposed/`, or `verified-test-plan/` instead of presenting them as guarantees.
 
-**Anti-entropy repair** (operator-initiated) is available as of v0.11.0. The Merkle-then-stream design exchanges 32 768-leaf hashes between replicas, then fetches and applies only the divergent partitions in fixed-size chunks (64 partitions per RPC). Peak per-session memory is bounded by chunk size × max-partition-size rather than table size, so repair runs in the 2 GiB fmem cgroup against multi-GB replicas. The path is **operator-triggered** via `POST /api/cluster/repair?keyspace=&table=&rf=` or `ferrosa-ctl repair` — there is no scheduled / continuous-repair loop yet, no per-keyspace policy, and no Jepsen-verified convergence story. See [anti-entropy-repair-architecture.md](anti-entropy-repair-architecture.md). The companion write-path memtable backpressure that protects the receiver during the apply phase is documented in [memtable-backpressure.md](memtable-backpressure.md).
+**Anti-entropy repair** (operator-initiated) is available as of v0.11.0 and now
+runs on top of the bounded-storage memory model. The Merkle-then-stream design
+exchanges 32 768-leaf hashes between replicas, then fetches and applies only the
+divergent partitions in byte/partition-bounded chunks. The OOM-hardening set
+bounds length-prefixed SSTable allocations, anti-entropy fetches by bytes,
+startup reader residency, large-range partition materialization, and compaction
+input residency/concurrency. The remaining acceptance gate is end-to-end
+verification on a bloated fmem cluster plus strict repair reader fan-in under
+full token overlap. The path is **operator-triggered** via
+`POST /api/cluster/repair?keyspace=&table=&rf=` or `ferrosa-ctl repair` — there
+is no scheduled / continuous-repair loop yet, no per-keyspace policy, and no
+Jepsen-verified convergence story. See
+[anti-entropy-repair-architecture.md](anti-entropy-repair-architecture.md) and
+[p0-bounded-sstable-reader-checklist.md](todo/p0-bounded-sstable-reader-checklist.md).
+The companion write-path memtable backpressure that protects the receiver
+during the apply phase is documented in [memtable-backpressure.md](memtable-backpressure.md).
 
 ## Key Architectural Decisions
 
