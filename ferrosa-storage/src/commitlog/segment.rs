@@ -60,16 +60,6 @@ use super::config::{CommitLogPosition, TableId};
 use super::descriptor::{SegmentDescriptor, HEADER_SIZE};
 use super::mutation::Mutation;
 
-#[cfg(all(
-    target_os = "macos",
-    not(any(feature = "macos-fullfsync", feature = "macos-standard-sync"))
-))]
-compile_error!(
-    "macOS commitlog durability requires an explicit choice: enable \
-     ferrosa-storage/macos-fullfsync for F_FULLFSYNC, or \
-     ferrosa-storage/macos-standard-sync to accept standard fsync semantics."
-);
-
 /// Entry overhead in bytes: entry_size (4) + size_crc (4) + payload_crc (4).
 pub const ENTRY_OVERHEAD: usize = 12;
 
@@ -171,7 +161,10 @@ fn observe_phase(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
     update_max_u64(max, micros);
 }
 
-#[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+#[cfg(all(
+    target_os = "macos",
+    any(feature = "macos-fullfsync", not(feature = "macos-standard-sync"))
+))]
 fn full_sync_file(file: &fs::File) -> ferrosa_common::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -184,14 +177,21 @@ fn full_sync_file(file: &fs::File) -> ferrosa_common::Result<()> {
 }
 
 fn sync_commitlog_file(file: &fs::File) -> ferrosa_common::Result<()> {
-    #[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+    #[cfg(all(
+        target_os = "macos",
+        any(feature = "macos-fullfsync", not(feature = "macos-standard-sync"))
+    ))]
     {
         return full_sync_file(file);
     }
 
     #[cfg(any(
         not(target_os = "macos"),
-        all(target_os = "macos", feature = "macos-standard-sync")
+        all(
+            target_os = "macos",
+            feature = "macos-standard-sync",
+            not(feature = "macos-fullfsync")
+        )
     ))]
     {
         file.sync_data()?;
@@ -202,7 +202,10 @@ fn sync_commitlog_file(file: &fs::File) -> ferrosa_common::Result<()> {
 fn sync_parent_dir(path: &Path) -> ferrosa_common::Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent)?;
-        #[cfg(all(target_os = "macos", feature = "macos-fullfsync"))]
+        #[cfg(all(
+            target_os = "macos",
+            any(feature = "macos-fullfsync", not(feature = "macos-standard-sync"))
+        ))]
         {
             if full_sync_file(&dir).is_err() {
                 dir.sync_all()?;
@@ -210,7 +213,11 @@ fn sync_parent_dir(path: &Path) -> ferrosa_common::Result<()> {
         }
         #[cfg(any(
             not(target_os = "macos"),
-            all(target_os = "macos", feature = "macos-standard-sync")
+            all(
+                target_os = "macos",
+                feature = "macos-standard-sync",
+                not(feature = "macos-fullfsync")
+            )
         ))]
         {
             dir.sync_all()?;

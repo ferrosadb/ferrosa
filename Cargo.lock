@@ -2124,6 +2124,7 @@ dependencies = [
  "ferrosa-index",
  "ferrosa-schema",
  "ferrosa-sstable",
+ "ferrosa-storage",
  "fs2",
  "futures",
  "hex",
