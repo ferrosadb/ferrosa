@@ -62,7 +62,9 @@ pub async fn get_metrics(
     [(axum::http::header::HeaderName, &'static str); 1],
     String,
 ) {
-    let body = ferrosa_cql::prometheus::render_metrics(&registry);
+    let mut body = ferrosa_cql::prometheus::render_metrics(&registry);
+    // Automatic-repair scheduler counters (ferrosa_auto_repair_*).
+    body.push_str(&ferrosa_cluster::repair::scheduler::render_prometheus());
     (
         StatusCode::OK,
         [(
