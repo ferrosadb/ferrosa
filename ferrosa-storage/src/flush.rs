@@ -217,6 +217,25 @@ pub trait FlushTarget {
         Ok(None)
     }
 
+    /// Materialise an **ephemeral** SSTable reader from freshly-written
+    /// component bytes WITHOUT registering it as a durable generation.
+    ///
+    /// Used by the bounded multi-pass merge in the read/digest paths: when a
+    /// token range overlaps more SSTables than the per-operation fan-in budget,
+    /// batches of inputs are stream-merged into temporary sorted runs that are
+    /// re-read in a later pass and then discarded. These runs must NEVER enter
+    /// the `StoreView`, the durable generation namespace, or the shared reader
+    /// pool — they exist only for the lifetime of one merge.
+    ///
+    /// Returns the reader plus an optional temp directory the caller must
+    /// remove once the reader is dropped (file targets stage component files
+    /// there; in-memory targets return `None`). The default in-memory
+    /// implementation opens directly from the byte buffers.
+    fn open_ephemeral_reader(
+        &self,
+        output: SSTableOutput,
+    ) -> Result<(SSTableReader<Self::Reader>, Option<PathBuf>)>;
+
     /// Promote or consume SSTable component files and open a reader.
     ///
     /// The default path is intended for tests and non-file targets: it reads
@@ -449,6 +468,24 @@ impl FlushTarget for InMemoryFlushTarget {
                 "InMemoryFlushTarget has no retained components for generation {gen}"
             ))),
         }
+    }
+
+    fn open_ephemeral_reader(
+        &self,
+        output: SSTableOutput,
+    ) -> Result<(SSTableReader<Vec<u8>>, Option<PathBuf>)> {
+        // In-memory: open straight from the component buffers. The reader owns
+        // its bytes, so there is nothing to clean up and no generation is
+        // registered — the run never becomes visible to the store or pool.
+        let reader = SSTableReader::open(SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })?;
+        Ok((reader, None))
     }
 
     fn last_generation(&self) -> u64 {
@@ -756,6 +793,74 @@ impl FlushTarget for FileFlushTarget {
             dir
         };
         open_file_sstable(resolved, &gen.to_string())
+    }
+
+    fn open_ephemeral_reader(
+        &self,
+        output: SSTableOutput,
+    ) -> Result<(SSTableReader<FileReadAt>, Option<PathBuf>)> {
+        // Stage the run under a dedicated `.merge-spill` root with generation
+        // `0`, so its file names (`0-Data.db`, ...) can never collide with a
+        // real generation (which are timestamp-derived and always > 0) and the
+        // directory is never scanned by `scan_max_generation`. The returned
+        // PathBuf is the unique run directory; the caller removes it when the
+        // reader is dropped.
+        let spill_root = self.base_dir.join(".merge-spill");
+        std::fs::create_dir_all(&spill_root)?;
+        let run_dir = (0..32u32)
+            .find_map(|attempt| {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let path = spill_root.join(format!("{}-{}-{attempt}", std::process::id(), ts));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => Some(Ok(path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(
+                    "failed to allocate unique merge-spill directory".into(),
+                )
+            })?;
+
+        let has_compression_info = output.compression_info.is_some();
+        let paths = FileComponentPaths {
+            data: run_dir.join("0-Data.db"),
+            partitions: run_dir.join("0-Partitions.db"),
+            rows: run_dir.join("0-Rows.db"),
+            filter: run_dir.join("0-Filter.db"),
+            statistics: run_dir.join("0-Statistics.db"),
+            toc: run_dir.join("0-TOC.txt"),
+            compression_info: run_dir.join("0-CompressionInfo.db"),
+        };
+        // Write components; on any failure remove the run dir so we never leak.
+        let write_all = || -> Result<()> {
+            std::fs::write(&paths.data, &output.data)?;
+            std::fs::write(&paths.partitions, &output.partitions)?;
+            std::fs::write(&paths.rows, &output.rows)?;
+            std::fs::write(&paths.filter, &output.filter)?;
+            std::fs::write(&paths.statistics, &output.statistics)?;
+            std::fs::write(&paths.toc, &output.toc)?;
+            if let Some(ref ci) = output.compression_info {
+                std::fs::write(&paths.compression_info, ci)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = write_all() {
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(e);
+        }
+        match Self::open_reader_from_paths(&paths, has_compression_info) {
+            Ok(reader) => Ok((reader, Some(run_dir))),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&run_dir);
+                Err(e)
+            }
+        }
     }
 
     fn file_output_staging_dir(&self) -> Result<Option<PathBuf>> {

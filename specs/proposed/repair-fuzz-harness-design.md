@@ -70,7 +70,7 @@ seeded multi-node repair under `nemesis` faults (corruption, divergence, node lo
 | Compaction concurrency / unpooled inputs OOM | `compaction_gate_caps_concurrent_*`, `compaction_inputs_routed_through_reader_pool` | ✅ |
 | Streaming == single-pass | `streaming_*_byte_identical_to_single_pass`, fuzz `streaming_equals_single_pass` + `bounded_fetch_reassembles_to_single_pass` (added) | ✅ |
 | Repair convergence / idempotence / quarantine | cluster fuzz `divergent_replicas_converge_and_repair_is_idempotent`, `quarantined_partitions_recovered_from_healthy_replica` (added) | ✅ |
-| **Repair full-overlap reader-count OOM (node1)** — DIGEST path (`walk_token_range_for_digest`, used by `repair::build_tree_for_range`) holds O(sstable_count) readers under full overlap | `digest_walk_reader_count_bounded_under_full_overlap` (`store.rs`, gated behind `repair-fuzz-known-failures`) | ❌ **CONFIRMED by fuzz** — drives repair-fan-in fix. Min repro: cap=fanin=4, n_sstables=8, distinct_keys=6, full overlap → peak readers 8, soft-cap breaches 4 (expected ≤4 / 0). `read_token_range` over the same fixture stays bounded. |
+| **Repair full-overlap reader-count OOM (node1)** — DIGEST path (`walk_token_range_for_digest`, used by `repair::build_tree_for_range`) held O(sstable_count) readers under full overlap; `walk_token_range` shared the flaw | `digest_walk_reader_count_bounded_under_full_overlap` + `walk_token_range_reader_count_bounded_under_full_overlap` (`store.rs`, un-gated — run in the default `test-generators` set); reader-count half of `property_digest_walk_data_bounded_under_full_overlap` also un-gated | ✅ **FIXED** via bounded multi-pass merge cascade (`bounded_overlap_readers`/`spill_one_level`/`spill_batch` in `store.rs` + `FlushTarget::open_ephemeral_reader` in `flush.rs`). Inputs beyond `min(FERROSA_READ_MERGE_FANIN, pool_cap)` are stream-merged into ephemeral sorted runs in batches of ≤ budget, so peak open readers and peak materialised partitions both stay bounded; digest XOR is byte-identical (associative LWW). Min repro now passes: cap=4, n_sstables=8 → peak ≤4, 0 breaches. |
 
 ## Process
 
@@ -96,9 +96,10 @@ Harness implemented and committed on `fix/p0-sstable-memory-bounding`.
   arbitrary + corrupt SSTable bytes, #2 (reader half) peak resident ≤ cap, #3
   streaming==single-pass + bounded-fetch reassembly, #5 read-merge LWW no-data-loss,
   #6 digest determinism.
-- **In-crate** (`store.rs`): #2 materialised-partition half
-  (`property_digest_walk_data_bounded_under_full_overlap`) + the new green
-  `read_token_range` reader-count regression, plus the gated known-failure.
+- **In-crate** (`store.rs`): #2 BOTH halves of
+  `property_digest_walk_data_bounded_under_full_overlap` (materialised-partition
+  AND reader-count, now un-gated) + the `read_token_range`, `walk_token_range`,
+  and `walk_token_range_for_digest` reader-count regressions (all green).
 - **Cluster harness** (`ferrosa-cluster/tests/repair_fuzz.rs`): #4 convergence +
   idempotence, #7 quarantine-safety.
 - **Convergence oracle note**: shipped repair is *whole-partition* max-timestamp
@@ -107,6 +108,8 @@ Harness implemented and committed on `fix/p0-sstable-memory-bounding`.
   is documented, not a bug.
 - **Not built**: the `ferrosa-sim` cluster-level nemesis scenario (proptest level
   covers the same seams; sim scenario deferred).
-- **Confirmed failure**: property #2 reader-count half on the DIGEST path under
-  full overlap (see matrix). Gated behind `repair-fuzz-known-failures` so CI stays
-  green. This is the repair-fan-in wall RED; fix is the lead's TDD follow-up.
+- **Resolved (was: confirmed failure)**: property #2 reader-count half on the
+  DIGEST path under full overlap (the repair-fan-in wall). Fixed by the bounded
+  multi-pass merge cascade (see matrix). The `repair-fuzz-known-failures` feature
+  no longer gates any test — the regressions run in the default `test-generators`
+  set; the feature is retained as a no-op alias for harness invocation continuity.
