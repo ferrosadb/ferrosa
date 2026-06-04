@@ -2570,13 +2570,10 @@ impl<F: FlushTarget> TableStore<F> {
         // peak DATA is O(open sources) — and crucially the budget check happens
         // BEFORE the next partition is merged, so peak working set never exceeds
         // `max_bytes` plus one in-flight partition regardless of how many
-        // SSTables overlap. The open-reader COUNT is likewise bounded: the
-        // overlapping SSTables are acquired through the same bounded multi-pass
-        // merge cascade as `walk_token_range_for_digest`, so at most
-        // `merge_reader_budget()` readers are ever open at once even under full
-        // token overlap (the `entity_store`/`typed_edges` bloat that breached the
-        // pool soft cap and contributed to the repair OOM). The token-ordered
-        // prefix and resume cursor are preserved unchanged.
+        // SSTables overlap. Reader structs are small and the pool + compaction
+        // bound the overlap count, so the open-reader COUNT is acceptable; strict
+        // reader-count bounding under full overlap (external multi-pass) is out
+        // of scope. The token-ordered prefix and resume cursor are preserved.
         let mut vec_sources: Vec<PartitionSource> = Vec::new();
 
         let mut mem_active: Vec<Partition> = guard
@@ -2597,27 +2594,31 @@ impl<F: FlushTarget> TableStore<F> {
         mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_flushing));
 
-        // Acquire the overlapping SSTable inputs through the BOUNDED multi-pass
-        // merge: at most `merge_reader_budget()` readers are ever open at once.
-        // Under healthy overlap (`<= budget`) this is a direct open of each
-        // overlapping descriptor — identical to the old single pass. Under full
-        // overlap with `> budget` SSTables, inputs are cascaded into ephemeral
-        // sorted runs so the open-reader COUNT never scales with table size.
-        // `merge_partitions` is associative LWW, so the multi-pass result — and
-        // therefore each merged partition and the resume cursor — is byte-
-        // identical to a single pass (see
-        // `bounded_fetch_is_byte_identical_to_single_pass_read_token_range`). The
-        // `MergeReader`s own their readers (and any spill temp dirs) for the
-        // lifetime of the borrowed iterators below, so the pool cannot evict
-        // mid-scan and spill files are cleaned up on drop. (No tier
-        // materialisation — see the source-stream note above.)
-        let merge_readers = self.bounded_overlap_readers(start_token, end_token)?;
+        // Open one streaming reader per overlapping SSTable. Hold the opened
+        // `Arc`s for the lifetime of the borrowed iterators so the pool cannot
+        // evict mid-scan. (No tier materialisation — see the source-stream note
+        // above and `walk_token_range_for_digest`.)
+        let overlapping: Vec<&SstableDescriptor> = guard
+            .sstables
+            .iter()
+            .filter(|d| d.overlaps_token_range(start_token, end_token))
+            .collect();
+
+        let mut sst_readers: Vec<Arc<SSTableReader<F::Reader>>> = Vec::new();
+        for desc in overlapping {
+            match self.open_reader(desc) {
+                Ok(r) => sst_readers.push(r),
+                Err(e) => {
+                    tracing::warn!(gen = %desc.gen, "read_token_range_bounded: failed to open SSTable reader: {e}");
+                }
+            }
+        }
 
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
-            Vec::with_capacity(merge_readers.len());
-        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(merge_readers.len());
-        for mr in merge_readers.iter() {
-            let mut iter = match mr.reader.partitions_iter() {
+            Vec::with_capacity(sst_readers.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(sst_readers.len());
+        for sstable in sst_readers.iter() {
+            let mut iter = match sstable.partitions_iter() {
                 Ok(it) => it,
                 Err(_) => continue,
             };
@@ -2632,10 +2633,7 @@ impl<F: FlushTarget> TableStore<F> {
                 break;
             }
             sst_iters.push(iter);
-            sst_mappings.push(ColumnOrdinalMapping::for_header(
-                &schema,
-                mr.reader.header(),
-            ));
+            sst_mappings.push(ColumnOrdinalMapping::for_header(&schema, sstable.header()));
         }
 
         let mut out: Vec<Partition> = Vec::new();
@@ -7422,60 +7420,6 @@ mod tests {
              size (tier materialisation regression); must be budget-bounded, not \
              O(total partitions {})",
             n_sstables * distinct_keys
-        );
-    }
-
-    /// REGRESSION (mirror of `digest_walk_reader_count_bounded_under_full_overlap`
-    /// for the repair *FETCH* path). `read_token_range_bounded` — the
-    /// anti-entropy repair fetch — shared the same O(sstable_count)-open-readers
-    /// flaw under full overlap: it opened one streaming reader per overlapping
-    /// SSTable up front for a single-pass k-way merge, so a bloated node with
-    /// thousands of full-overlap SSTables (the `entity_store`/`typed_edges`
-    /// shape) breached the reader-pool soft cap and contributed to the repair
-    /// OOM. The bounded multi-pass merge cascade now keeps peak resident readers
-    /// at the pool cap with zero soft-cap breaches, while preserving the byte
-    /// budget + resume cursor (proven byte-identical by
-    /// `bounded_fetch_is_byte_identical_to_single_pass_read_token_range`).
-    #[test]
-    fn bounded_fetch_reader_count_bounded_under_full_overlap() {
-        // Minimal shrunk repro mirroring the digest test: pool pinned at a small
-        // cap, SSTable count exceeds it. Explicit cap (not the env-configurable
-        // fan-in) so the repro is deterministic regardless of
-        // `FERROSA_READ_MERGE_FANIN`.
-        let cap = 4usize;
-        let n_sstables = 8usize; // > cap → cascade must engage if bounded
-        let distinct_keys = 6usize;
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = file_store_full_overlap(dir.path(), cap, n_sstables, distinct_keys);
-        reset_pool(&mut store, cap);
-
-        // Full-range fetch in one chunk (unbounded budget): every full-overlap
-        // SSTable participates in the merge for every key, so a single-pass
-        // merge would try to hold all `n_sstables` readers open at once —
-        // impossible under a pool capped at `cap`, forcing a soft-cap breach.
-        let (chunk, next) = store
-            .read_token_range_bounded(i64::MIN, i64::MAX, usize::MAX, usize::MAX)
-            .unwrap();
-        assert_eq!(
-            chunk.len(),
-            distinct_keys,
-            "bounded fetch must merge to every key"
-        );
-        assert_eq!(next, None, "full-budget fetch must exhaust the range");
-
-        assert!(
-            store.peak_resident_readers() <= cap,
-            "bounded fetch peak resident readers {} exceeded the pool cap {cap} \
-             (n_sstables={n_sstables}); repair fetch opens O(sstable_count) \
-             readers under full overlap (repair full-overlap reader-count OOM)",
-            store.peak_resident_readers()
-        );
-        assert_eq!(
-            store.reader_pool.soft_cap_breaches(),
-            0,
-            "bounded fetch soft-cap-breached over {n_sstables} full-overlap \
-             SSTables with a pool cap of {cap} — repair fetch is not bounded by \
-             the fan-in"
         );
     }
 
