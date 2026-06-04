@@ -20,8 +20,10 @@ pub mod coordinator;
 pub mod executor;
 pub mod merkle;
 pub mod rpc;
+pub mod scheduler;
 
 pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
+pub use scheduler::{select_initiated_ranges, InitiatedRange};
 pub use executor::{
     InMemoryRepairStore, LocalRepairExecutor, RepairStore, StorageEngineRepairStore,
 };
