@@ -1,6 +1,6 @@
 # Ferrosa Specs
 
-> Last updated: 2026-05-13
+> Last updated: 2026-06-04
 > Status: Internal evidence index, not public release guarantees
 
 These documents separate implemented evidence from proposals, active work, and
@@ -58,11 +58,14 @@ Keep unsupported engineering topics in `proposed/`, `todo/`, or
 |------|-------------|--------|
 | [Secondary Index Pipeline](secondary-index-pipeline.md) | Query integration, sidecar persistence, vector indexes | Implemented evidence |
 | [Full-Text Indexing](fulltext-index-architecture.md) | Inverted index sidecars, analyzer pipeline, BM25, `fts_match()` | Implemented evidence |
-| [Anti-Entropy Repair](anti-entropy-repair-architecture.md) | Merkle-then-stream repair with bounded-memory streaming digest | Implemented evidence (v0.11.0, operator-initiated) |
+| [Anti-Entropy Repair](anti-entropy-repair-architecture.md) | Merkle-then-stream repair with byte+partition-bounded fetch and bounded-storage memory model | Implemented evidence (v0.13.0, operator-initiated) |
 | [Remote Index Build Backend](remote-index-build-backend.md) | Standalone `ferrosa-index-builder` binary and backend modes | Design / open work tracked in `todo/` |
 | [Hierarchical Vector Quantization](proposed/hierarchical-vector-quantization.md) | Quantized NVMe-resident ANN design with CockroachDB C-SPANN lessons and scope outlines | Proposed; current HNSW/IVFFlat sidecars are JSON |
 | [HVQ / C-SPANN Implementation Blueprint](in-process/hvq-cspann-implementation-blueprint.md) | Multi-agent implementation blueprint and TDD acceptance spec for quantized prefix-scoped ANN | In-process blueprint pending owner decisions |
 | [HVQ C-SPANN Implementation Plan](plans/hvq-cspann-implementation-plan.md) | Work-packet DAG for Kanban/worktree implementation | Plan pending owner decisions |
+| [Bounded SSTable Reader Memory](proposed/p0-bounded-sstable-reader-design.md) | Descriptor-backed views, engine-wide reader pool, streaming range/repair reads, compaction gate | Implemented in 0.13 hardening set; repair full-overlap fan-in remains a gate |
+| [Repair Fuzz Harness](proposed/repair-fuzz-harness-design.md) | Shared generators and proptest harness for repair/storage convergence and memory bounds | Proposed; integration and CI wiring pending |
+| [Self-Healing Controller](proposed/self-healing-controller-design.md) | Deterministic autonomous repair controller over bounded remediation primitives | Proposed; depends on repair fan-in hardening |
 | [UCS Compaction](ucs-compaction-architecture.md) | Unified Compaction Strategy | Active design/implementation |
 | [Cluster Formation](cluster-formation-architecture.md) | Cluster formation state machine and protocol | Active hardening |
 | [Observability](observability-architecture.md) | Metrics, tracing, telemetry pipeline | Active; not complete public claim |

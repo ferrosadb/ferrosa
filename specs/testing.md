@@ -380,6 +380,7 @@ Required before declaring production readiness:
 | **Distributed** | Hinted handoff | Accumulation during downtime, replay on return, storage limits |
 | | Read repair verification | Intentional divergence, verify repair corrects it |
 | | Anti-entropy repair | Full and incremental repair under load |
+| | Repair fuzz harness | Proptest-generated replica divergence, corruption, byte/partition budgets, and convergence checks using `ferrosa-storage` `test-generators` |
 | | Range queries & pagination | Token range scans, paging, coordinator changes mid-page |
 | **S3 Failure Modes** | Throttling (HTTP 429) | Backpressure, exponential retry, local writes continue |
 | | LIST eventual consistency | Manifest-based tracking must not depend on LIST |

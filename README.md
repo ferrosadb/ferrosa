@@ -131,6 +131,12 @@ Data durability during the async upload window is protected by:
 Reads check memtable first, then local SSTable cache, falling back to S3 on cache miss.
 Bloom filters and partition indices are always cached locally.
 
+Ferrosa 0.13 changes the in-memory shape of flushed SSTables: table views carry
+lightweight descriptors, open `SSTableReader` handles are routed through an
+engine-wide capped pool, large range/repair reads stream partition data instead
+of materializing tiers, and compaction inputs are pool-routed behind a global
+concurrency gate.
+
 ### SSTable Compatibility
 
 Ferrosa implements Cassandra's SSTable formats in phases:
@@ -181,11 +187,12 @@ cargo fmt --all -- --check
 
 Ferrosa is a developer-preview workspace with 18 Rust crates. Core single-node
 CQL/storage paths, graph/query experiments, secondary indexes, Raft-backed metadata
-coordination, and PITR building blocks are implemented, but the public release is not
-yet production-hardened. Cluster bootstrap/rebalance, end-to-end Jepsen verification,
-full CQL/query conformance, arbitrary query CDC, complete observability backing
-tables, and binary vector sidecars remain tracked as proposed/open or verification
-work in [the specs](specs/README.md).
+coordination, anti-entropy repair, and PITR building blocks are implemented, but the
+public release is not yet production-hardened. Cluster bootstrap/rebalance,
+end-to-end Jepsen verification, full CQL/query conformance, arbitrary query CDC,
+complete observability backing tables, strict repair memory bounds under every
+SSTable-overlap shape, and binary vector sidecars remain tracked as proposed/open
+or verification work in [the specs](specs/README.md).
 
 ## Contributing
 
