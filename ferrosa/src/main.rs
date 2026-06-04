@@ -49,6 +49,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
+mod repair_wiring;
 mod runtime;
 mod web;
 
@@ -721,9 +722,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ferrosa_storage::StorageEngine::spawn_time_series_materialization_worker(storage.clone());
 
-    // Self-healing controller is spawned later (step 6c), once the PeerManager
-    // exists, so its replica-health view reflects real cluster membership
-    // instead of the old single-node placeholder.
+    // Self-healing controller + automatic-repair scheduler are spawned later,
+    // after the ModeController is wired (they need the live ring / peer manager
+    // for the verified-healthy-replica ClusterView and the repair executor).
+    // See `repair_wiring` + the "automatic repair" block below.
 
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
@@ -1371,6 +1373,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a shutdown watch channel for services that need graceful shutdown
     // notification (e.g. the Bolt server).
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // ── Automatic repair: self-heal controller (verified-replica quarantine +
+    // refill) + periodic anti-entropy repair scheduler ──────────────────────
+    //
+    // Wired here (after the ModeController + shutdown channel) because both need
+    // the live ring / peer manager. See `repair_wiring` and
+    // `specs/proposed/automatic-repair-scheduler-design.md`.
+    {
+        let auto_cfg = ferrosa_cluster::AutoRepairConfig::from_env();
+        // Platform-default RF for the per-table replica-health probe (the gate
+        // only needs to find SOME verified healthy peer); per-keyspace RF is
+        // used by the scheduler's repair path via the schema (FMEA #11).
+        const DEFAULT_RF: usize = 3;
+
+        // Shared production RepairContext (scheduler + refill trigger).
+        let repair_ctx = std::sync::Arc::new(crate::repair_wiring::BinaryRepairContext::new(
+            mode_controller.clone(),
+            storage.clone(),
+            schema.clone(),
+            auto_cfg.skip_keyspaces.clone(),
+            DEFAULT_RF,
+        ));
+
+        // Self-heal controller with the REAL verified-healthy-replica view
+        // (replaces the single-node stub) + a refill trigger so a quarantine
+        // schedules a prompt targeted repair.
+        let self_host = mode_controller.host_id();
+        let ring_snapshot = {
+            let mc = mode_controller.clone();
+            move || {
+                mc.token_ring()
+                    .map(|r| (*r).clone())
+                    .unwrap_or_else(ferrosa_cluster::ring::TokenRing::new)
+            }
+        };
+        let topology =
+            std::sync::Arc::new(ferrosa_cluster::repair::cluster_view::RingTopology::new(
+                self_host,
+                DEFAULT_RF,
+                ring_snapshot,
+            ));
+        let probe =
+            std::sync::Arc::new(ferrosa_cluster::repair::cluster_view::RpcRepairProbe::new(
+                peer_manager.clone(),
+                runtimes.data.handle().clone(),
+            ));
+        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
+            std::sync::Arc::new(
+                ferrosa_cluster::repair::cluster_view::ClusterRepairView::new(topology, probe),
+            );
+        let refill_trigger: std::sync::Arc<dyn ferrosa_storage::self_heal::RepairTrigger> =
+            std::sync::Arc::new(crate::repair_wiring::BinaryRepairTrigger::new(
+                repair_ctx.clone(),
+                runtimes.data.handle().clone(),
+            ));
+        ferrosa_storage::self_heal::SelfHealController::spawn_with_trigger(
+            storage.clone(),
+            cluster_view,
+            ferrosa_storage::self_heal::SelfHealConfig::from_env(),
+            refill_trigger,
+        );
+
+        // Periodic anti-entropy repair scheduler (deterministic single-initiator,
+        // round-robin, enabled by default). Stops on the shutdown signal.
+        let scheduler = ferrosa_cluster::AutoRepairScheduler::new(
+            ferrosa_cluster::RepairCoordinator::default(),
+            repair_ctx as std::sync::Arc<dyn ferrosa_cluster::RepairContext>,
+            auto_cfg,
+        );
+        ferrosa_cluster::AutoRepairScheduler::spawn(scheduler, shutdown_rx.clone());
+    }
 
     if graph_enabled {
         let graph_config = ferrosa_graph::engine::GraphConfig {
