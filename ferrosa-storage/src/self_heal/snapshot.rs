@@ -13,7 +13,7 @@
 //! The controller lives in `ferrosa-storage`, which sits *below* the cluster
 //! layer in the dependency graph, so it cannot call cluster APIs directly.
 //! Instead, replica health is modelled as plain data on the snapshot
-//! ([`RangeReplicaHealth`]) that an upstream layer (cluster wiring, a
+//! ([`ReplicaPosture`]) that an upstream layer (cluster wiring, a
 //! follow-up) populates. A single-node engine simply reports
 //! [`ReplicaPosture::SingleNode`], which the quarantine rail treats as
 //! "no healthy replica → never quarantine".

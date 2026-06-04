@@ -4016,7 +4016,7 @@ impl StorageEngine {
     }
 
     /// Smoke-test one generation in a table directory the same way startup
-    /// does — open it and run [`validate_sstable_for_startup_repair`]. Returns
+    /// does — open it and run `validate_sstable_for_startup_repair`. Returns
     /// `Ok(())` if healthy, `Err` with the failure reason if corrupt.
     ///
     /// This is the single source of corruption-detection truth, reused by the
