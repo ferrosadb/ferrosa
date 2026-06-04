@@ -71,6 +71,13 @@ pub struct RepairFetchRequestPayload {
     /// this to `REPAIR_FETCH_CHUNK_PARTITIONS`.
     #[serde(default = "default_fetch_limit")]
     pub limit: u32,
+    /// Hard cap on estimated partition *bytes* returned in this chunk.
+    /// Complements `limit` so a span of wide partitions can't blow the peer's
+    /// memory: the server stops early (reporting `next_cursor`) once either
+    /// bound is reached. Defaults — for peers that don't send one — to
+    /// `REPAIR_FETCH_CHUNK_BYTES`.
+    #[serde(default = "default_fetch_max_bytes")]
+    pub max_bytes: u64,
 }
 
 /// Backwards-compatible default for the `limit` field on payloads
@@ -78,6 +85,12 @@ pub struct RepairFetchRequestPayload {
 /// `RepairStore::READ_RANGE_CHUNK_DEFAULT`.
 fn default_fetch_limit() -> u32 {
     super::executor::REPAIR_FETCH_CHUNK_PARTITIONS as u32
+}
+
+/// Backwards-compatible default for the `max_bytes` field on payloads from
+/// peers that predate the byte budget.
+fn default_fetch_max_bytes() -> u64 {
+    super::executor::REPAIR_FETCH_CHUNK_BYTES as u64
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,38 +215,25 @@ impl RpcHandler for RepairFetchHandler {
         // partitions in flight so per-RPC memory is bounded.
         let chunk_start = req.cursor.unwrap_or(req.range_start);
         let limit = req.limit.max(1) as usize;
-        // Ask for one more than `limit` so we can detect "more
-        // remaining" without an extra round-trip: if the storage
-        // engine returns `limit+1` matches, the (limit+1)th
-        // partition's token becomes the next cursor and is dropped
-        // from the response.
-        let probe = limit.saturating_add(1);
-        let mut in_range_partitions = match StorageEngine::read_token_range(
+        let max_bytes = (req.max_bytes as usize).max(1);
+        // Token-ordered, byte-bounded read: the engine stops at `limit`
+        // partitions or `max_bytes` of content (whichever comes first) and
+        // returns the token-ordered resume cursor directly, so each chunk's
+        // working set is bounded by bytes regardless of partition width. The
+        // client loops on `next_cursor` until it is `None`.
+        let (in_range_partitions, next_cursor) = match StorageEngine::read_token_range_bounded(
             &self.storage,
             &table_id,
             chunk_start,
             req.range_end,
-            probe,
+            limit,
+            max_bytes,
         ) {
-            Ok(ps) => ps,
+            Ok(v) => v,
             Err(e) => {
-                tracing::warn!(%e, ?table_id, "RepairFetchHandler: read_token_range failed");
+                tracing::warn!(%e, ?table_id, "RepairFetchHandler: read_token_range_bounded failed");
                 return None;
             }
-        };
-        // Sort by token so chunked iteration is well-defined even
-        // if the storage layer returns out-of-order on a multi-
-        // source merge path.
-        in_range_partitions.sort_by_key(|p| p.key.token.0);
-        let next_cursor: Option<i64> = if in_range_partitions.len() > limit {
-            // The (limit+1)th partition reveals where the next
-            // chunk should resume — keep the first `limit`,
-            // capture the cursor, drop the rest of the probe.
-            let next = in_range_partitions[limit].key.token.0;
-            in_range_partitions.truncate(limit);
-            Some(next)
-        } else {
-            None
         };
         let in_range: Vec<PartitionWire> = in_range_partitions
             .into_iter()
@@ -381,6 +381,7 @@ impl RepairStore for RemoteRepairStore {
             range_end,
             cursor,
             limit: limit.min(u32::MAX as usize) as u32,
+            max_bytes: super::executor::REPAIR_FETCH_CHUNK_BYTES as u64,
         };
         let body = bincode::serialize(&req).map_err(|e| format!("serialize: {e}"))?;
         // Lane::Bulk: chunked responses are still bulk (each

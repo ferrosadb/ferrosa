@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use ferrosa_index::{IndexKey, RowPosition};
 
@@ -187,6 +188,26 @@ pub trait FlushTarget {
     /// Write SSTable component bytes to the target and open a reader.
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Self::Reader>>;
 
+    /// Open (or re-open) a reader for the SSTable generation `gen` living in
+    /// `dir`, on demand.
+    ///
+    /// This is the opener used by the bounded [`crate::reader_pool::ReaderPool`]:
+    /// `StoreView` holds only lightweight descriptors, and a reader is
+    /// materialised through this method when a read path needs it, then evicted
+    /// when idle. File-backed targets re-read the component files from disk
+    /// (`gen` is the numeric generation, `dir` the directory holding the
+    /// `{gen}-*.db` components). In-memory targets return the components they
+    /// retained at flush time.
+    ///
+    /// The default fails loud: a target that participates in the bounded-reader
+    /// pool must provide a real opener (fail-loud rule — never fake a reader).
+    fn open_reader(&self, _dir: &Path, gen: u64) -> Result<SSTableReader<Self::Reader>> {
+        Err(ferrosa_common::Error::InvalidFormat(format!(
+            "FlushTarget::open_reader not implemented for this target (gen {gen}); \
+             the bounded SSTable reader pool requires an opener"
+        )))
+    }
+
     /// Return a staging directory for file-backed SSTable output.
     ///
     /// Targets that return `Some` from this method can receive
@@ -195,6 +216,25 @@ pub trait FlushTarget {
     fn file_output_staging_dir(&self) -> Result<Option<PathBuf>> {
         Ok(None)
     }
+
+    /// Materialise an **ephemeral** SSTable reader from freshly-written
+    /// component bytes WITHOUT registering it as a durable generation.
+    ///
+    /// Used by the bounded multi-pass merge in the read/digest paths: when a
+    /// token range overlaps more SSTables than the per-operation fan-in budget,
+    /// batches of inputs are stream-merged into temporary sorted runs that are
+    /// re-read in a later pass and then discarded. These runs must NEVER enter
+    /// the `StoreView`, the durable generation namespace, or the shared reader
+    /// pool — they exist only for the lifetime of one merge.
+    ///
+    /// Returns the reader plus an optional temp directory the caller must
+    /// remove once the reader is dropped (file targets stage component files
+    /// there; in-memory targets return `None`). The default in-memory
+    /// implementation opens directly from the byte buffers.
+    fn open_ephemeral_reader(
+        &self,
+        output: SSTableOutput,
+    ) -> Result<(SSTableReader<Self::Reader>, Option<PathBuf>)>;
 
     /// Promote or consume SSTable component files and open a reader.
     ///
@@ -323,6 +363,10 @@ pub trait FlushTarget {
 /// touching the filesystem.
 pub struct InMemoryFlushTarget {
     generation: std::sync::atomic::AtomicU64,
+    /// Retained component bytes keyed by generation, so [`FlushTarget::open_reader`]
+    /// can re-open a reader on demand for the bounded reader pool. In-memory
+    /// targets have nothing on disk, so the bytes must be held here instead.
+    components: std::sync::Mutex<HashMap<u64, Arc<RetainedComponents>>>,
     /// Vector sidecar bytes keyed by `(generation, index_name)`.
     vector_sidecars: std::sync::Mutex<HashMap<(u64, String), Vec<u8>>>,
     /// Quantized vector sidecar bytes keyed by `(generation, index_name)`.
@@ -330,11 +374,36 @@ pub struct InMemoryFlushTarget {
     vector_sidecar_bytes_read: std::sync::atomic::AtomicU64,
 }
 
+/// Component bytes retained by [`InMemoryFlushTarget`] so a reader can be
+/// re-opened on demand (the in-memory analogue of on-disk component files).
+struct RetainedComponents {
+    data: Vec<u8>,
+    partitions: Vec<u8>,
+    rows: Vec<u8>,
+    filter: Vec<u8>,
+    compression_info: Option<Vec<u8>>,
+    statistics: Vec<u8>,
+}
+
+impl RetainedComponents {
+    fn open(&self) -> Result<SSTableReader<Vec<u8>>> {
+        SSTableReader::open(SSTableComponents {
+            data: self.data.clone(),
+            partitions: self.partitions.clone(),
+            rows: self.rows.clone(),
+            filter: self.filter.clone(),
+            compression_info: self.compression_info.clone(),
+            statistics: self.statistics.clone(),
+        })
+    }
+}
+
 impl InMemoryFlushTarget {
     /// Create a new in-memory flush target with the generation counter at 0.
     pub fn new() -> Self {
         Self {
             generation: std::sync::atomic::AtomicU64::new(0),
+            components: std::sync::Mutex::new(HashMap::new()),
             vector_sidecars: std::sync::Mutex::new(HashMap::new()),
             quantized_vector_sidecars: std::sync::Mutex::new(HashMap::new()),
             vector_sidecar_bytes_read: std::sync::atomic::AtomicU64::new(0),
@@ -362,16 +431,61 @@ impl FlushTarget for InMemoryFlushTarget {
     type Reader = Vec<u8>;
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Vec<u8>>> {
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        SSTableReader::open(SSTableComponents {
+        // `fetch_add` returns the previous value; the new generation (matching
+        // `last_generation()` after this call) is `prev + 1`.
+        let gen = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let retained = Arc::new(RetainedComponents {
             data: output.data,
             partitions: output.partitions,
             rows: output.rows,
             filter: output.filter,
             compression_info: output.compression_info,
             statistics: output.statistics,
-        })
+        });
+        let reader = retained.open()?;
+        // Retain the component bytes so the reader pool can re-open this gen on
+        // demand after eviction (in-memory targets have no on-disk fallback).
+        self.components
+            .lock()
+            .expect("in-memory components poisoned")
+            .insert(gen, retained);
+        Ok(reader)
+    }
+
+    fn open_reader(&self, _dir: &Path, gen: u64) -> Result<SSTableReader<Vec<u8>>> {
+        let retained = self
+            .components
+            .lock()
+            .expect("in-memory components poisoned")
+            .get(&gen)
+            .cloned();
+        match retained {
+            Some(c) => c.open(),
+            None => Err(ferrosa_common::Error::InvalidFormat(format!(
+                "InMemoryFlushTarget has no retained components for generation {gen}"
+            ))),
+        }
+    }
+
+    fn open_ephemeral_reader(
+        &self,
+        output: SSTableOutput,
+    ) -> Result<(SSTableReader<Vec<u8>>, Option<PathBuf>)> {
+        // In-memory: open straight from the component buffers. The reader owns
+        // its bytes, so there is nothing to clean up and no generation is
+        // registered — the run never becomes visible to the store or pool.
+        let reader = SSTableReader::open(SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })?;
+        Ok((reader, None))
     }
 
     fn last_generation(&self) -> u64 {
@@ -629,8 +743,125 @@ struct FileComponentPaths {
     compression_info: PathBuf,
 }
 
+/// Open a file-backed SSTable reader from component files for generation `gen`
+/// in `dir`. Shared by [`FileFlushTarget::open_reader`] and the engine's
+/// startup/load path so on-demand reopens go through one code path.
+///
+/// Required components (`Data.db`, `Partitions.db`, `Rows.db`) must exist;
+/// optional components (`Filter.db`, `Statistics.db`, `CompressionInfo.db`)
+/// default to empty/absent when missing, matching the historical engine loader.
+pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
+    let required = |suffix: &str| -> Result<PathBuf> {
+        let p = dir.join(format!("{gen}-{suffix}"));
+        if p.exists() {
+            Ok(p)
+        } else {
+            Err(ferrosa_common::Error::InvalidFormat(format!(
+                "missing required {suffix} for sstable generation {gen} in {}",
+                dir.display()
+            )))
+        }
+    };
+
+    let data = FileReadAt::open(required("Data.db")?)?;
+    let partitions = FileReadAt::open(required("Partitions.db")?)?;
+    let rows = FileReadAt::open(required("Rows.db")?)?;
+
+    let filter = std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap_or_default();
+    let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap_or_default();
+    let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+
+    SSTableReader::open(SSTableComponents {
+        data,
+        partitions,
+        rows,
+        filter,
+        compression_info,
+        statistics,
+    })
+}
+
 impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
+
+    fn open_reader(&self, dir: &Path, gen: u64) -> Result<SSTableReader<FileReadAt>> {
+        // A descriptor may carry an empty dir (legacy flush rows) — fall back
+        // to this target's base dir, mirroring the store's path-resolution rule.
+        let resolved = if dir.as_os_str().is_empty() {
+            self.base_dir.as_path()
+        } else {
+            dir
+        };
+        open_file_sstable(resolved, &gen.to_string())
+    }
+
+    fn open_ephemeral_reader(
+        &self,
+        output: SSTableOutput,
+    ) -> Result<(SSTableReader<FileReadAt>, Option<PathBuf>)> {
+        // Stage the run under a dedicated `.merge-spill` root with generation
+        // `0`, so its file names (`0-Data.db`, ...) can never collide with a
+        // real generation (which are timestamp-derived and always > 0) and the
+        // directory is never scanned by `scan_max_generation`. The returned
+        // PathBuf is the unique run directory; the caller removes it when the
+        // reader is dropped.
+        let spill_root = self.base_dir.join(".merge-spill");
+        std::fs::create_dir_all(&spill_root)?;
+        let run_dir = (0..32u32)
+            .find_map(|attempt| {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let path = spill_root.join(format!("{}-{}-{attempt}", std::process::id(), ts));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => Some(Ok(path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(
+                    "failed to allocate unique merge-spill directory".into(),
+                )
+            })?;
+
+        let has_compression_info = output.compression_info.is_some();
+        let paths = FileComponentPaths {
+            data: run_dir.join("0-Data.db"),
+            partitions: run_dir.join("0-Partitions.db"),
+            rows: run_dir.join("0-Rows.db"),
+            filter: run_dir.join("0-Filter.db"),
+            statistics: run_dir.join("0-Statistics.db"),
+            toc: run_dir.join("0-TOC.txt"),
+            compression_info: run_dir.join("0-CompressionInfo.db"),
+        };
+        // Write components; on any failure remove the run dir so we never leak.
+        let write_all = || -> Result<()> {
+            std::fs::write(&paths.data, &output.data)?;
+            std::fs::write(&paths.partitions, &output.partitions)?;
+            std::fs::write(&paths.rows, &output.rows)?;
+            std::fs::write(&paths.filter, &output.filter)?;
+            std::fs::write(&paths.statistics, &output.statistics)?;
+            std::fs::write(&paths.toc, &output.toc)?;
+            if let Some(ref ci) = output.compression_info {
+                std::fs::write(&paths.compression_info, ci)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = write_all() {
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(e);
+        }
+        match Self::open_reader_from_paths(&paths, has_compression_info) {
+            Ok(reader) => Ok((reader, Some(run_dir))),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&run_dir);
+                Err(e)
+            }
+        }
+    }
 
     fn file_output_staging_dir(&self) -> Result<Option<PathBuf>> {
         let staging_root = self.base_dir.join(".sstable-staging");

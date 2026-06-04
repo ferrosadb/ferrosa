@@ -32,10 +32,14 @@ pub mod pin_config;
 pub mod quantized_range_cache;
 pub mod quarantine;
 pub mod range_merger;
+pub mod reader_pool;
 pub mod restore;
+pub mod self_heal;
 pub mod snapshot;
 pub mod store;
 pub mod subscription_observer;
+#[cfg(feature = "test-generators")]
+pub mod test_support;
 pub mod timeseries;
 pub mod upload;
 pub mod virtual_tables;

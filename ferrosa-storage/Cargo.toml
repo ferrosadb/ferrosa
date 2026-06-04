@@ -30,6 +30,7 @@ hex = "0.4"
 smallvec = "1"
 tracing = "0.1"
 ureq = { version = "3", features = ["json"] }
+proptest = { version = "1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -50,14 +51,41 @@ live-infra-tests = []
 # to this crate's own tests regardless of this feature.
 compaction-validator = []
 # macOS does not treat ordinary fsync/fdatasync as a hardware-cache flush.
-# Force macOS builders to choose explicitly so the commitlog durability policy
-# cannot be forgotten when running storage locally on Darwin.
+# Local macOS builds default to F_FULLFSYNC for correctness. Enable
+# macos-standard-sync only for explicit fast/dev runs that accept weaker
+# durability semantics.
 macos-fullfsync = []
 macos-standard-sync = []
+# Shared proptest generators + test-support fixtures for the repair/storage
+# fuzz harness (`arb_partition`, `arb_table_content`, `arb_replica_set`,
+# `arb_sstable_layout`, `arb_corruption`, `arb_config`). Off by default; enabled
+# as a dev-dependency self-reference so the `tests/` harness and consuming
+# crates (ferrosa-cluster) can reuse the generators without pulling proptest
+# into the production build.
+test-generators = ["dep:proptest", "ferrosa-common/test-generators"]
+# Gates the file-IO-heavy fuzz properties (`tests/repair_fuzz.rs`): each case
+# flushes many real on-disk SSTables, so at a high `PROPTEST_CASES` they run for
+# minutes. Off by default so the local default (`cargo test --features
+# test-generators`) and the per-PR CI gate stay fast — the deep file-IO fuzz
+# runs in the nightly-fuzz workflow (`--features fuzz-fileio`, moderate
+# `PROPTEST_CASES`). Pulls in `test-generators` (the harness needs the
+# generators). The in-crate, single-case file-IO regressions in `store.rs` are
+# NOT gated — only the multi-case proptest harness is.
+fuzz-fileio = ["test-generators"]
+# Historical no-op alias. Once gated a digest-path (`walk_token_range_for_digest`)
+# reader-count bound under full token overlap that was a known RED; that bug was
+# fixed by the multi-pass spill cascade (commit ba6eaacd) and the regressions now
+# run in the default `test-generators` set. Retained so existing invocations
+# (`--features test-generators,repair-fuzz-known-failures`) keep working.
+repair-fuzz-known-failures = ["test-generators"]
 
 [dev-dependencies]
 async-trait = "0.1"
 ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
+# Self-reference enables the `test-generators` feature for this crate's own
+# `tests/` integration harness (`repair_fuzz.rs`) without exporting the
+# generators into the production build.
+ferrosa-storage = { path = ".", features = ["test-generators"] }
 futures = "0.3"
 hex = "0.4"
 proptest = "1"

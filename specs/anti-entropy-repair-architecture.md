@@ -88,9 +88,10 @@ span and materialise the whole replica per session.
 
 For each merged span, the executor walks parallel cursors on local and
 remote via `RepairStore::read_range_chunked(table, span_start, span_end,
-cursor, REPAIR_FETCH_CHUNK_PARTITIONS)`. Each call returns at most
-`REPAIR_FETCH_CHUNK_PARTITIONS = 64` partitions plus a `next_cursor` for
-the follow-up chunk.
+cursor, REPAIR_FETCH_CHUNK_PARTITIONS, REPAIR_FETCH_CHUNK_BYTES)`. Each call
+returns at most `REPAIR_FETCH_CHUNK_PARTITIONS = 64` partitions and at most
+`REPAIR_FETCH_CHUNK_BYTES = 32 MiB` of encoded partition content, plus a
+`next_cursor` for the follow-up chunk.
 
 The two per-side chunks are clipped to a common `sub_end` cursor frontier,
 sorted by `(token, key_bytes)`, then fed into
@@ -133,17 +134,15 @@ session** is the sum of four bounded buffers:
 
 | Buffer | Bound | Source |
 |--------|-------|--------|
-| Local Fetch chunk | `REPAIR_FETCH_CHUNK_PARTITIONS` partitions (64) | `executor.rs` |
-| Remote Fetch chunk | `REPAIR_FETCH_CHUNK_PARTITIONS` partitions (64) | `executor.rs` |
+| Local Fetch chunk | `REPAIR_FETCH_CHUNK_PARTITIONS` partitions (64) or `REPAIR_FETCH_CHUNK_BYTES` (32 MiB), whichever comes first | `executor.rs` |
+| Remote Fetch chunk | `REPAIR_FETCH_CHUNK_PARTITIONS` partitions (64) or `REPAIR_FETCH_CHUNK_BYTES` (32 MiB), whichever comes first | `executor.rs` / `rpc.rs` |
 | A→B apply queue | `REPAIR_APPLY_CHUNK_PARTITIONS` partitions (64) | `executor.rs` |
 | B→A apply queue | `REPAIR_APPLY_CHUNK_PARTITIONS` partitions (64) | `executor.rs` |
 
-So the worst-case per-session in-flight working set is `≈ 256 ×
-max_partition_size`. With the largest fmem partitions at ~4 MB this caps
-out around 1 GiB per session in the absolute worst case (every partition
-divergent, every partition maximal); typical real-world repair runs hold
-a small fraction of that because diffs are sparse and partitions average
-well below the maximum.
+So the worst-case per-session in-flight working set is governed by the fetch
+byte budget and apply queue count, not by table size. With defaults, each
+side's fetch response is capped at 32 MiB even when a divergent range contains
+many large partitions; apply queues are still partition-count bounded.
 
 The Merkle-build path has its own, independent bound:
 
@@ -173,16 +172,15 @@ Coordinator-level concurrency is capped by
 absolute upper bound on a single node's repair working set is roughly:
 
 ```
-peak_repair_rss ≈ max_concurrent_sessions × 4 × REPAIR_FETCH_CHUNK_PARTITIONS × max_partition_size
+peak_repair_rss ≈ max_concurrent_sessions × (2 × REPAIR_FETCH_CHUNK_BYTES
+                + 2 × REPAIR_APPLY_CHUNK_PARTITIONS × max_partition_size)
                 + REPAIR_BUILD_CONCURRENCY × MERKLE_BUILD_BATCH × max_partition_size
 ```
 
-With the defaults and an fmem-shaped 4 MB max partition: `≈ 4 × 256 × 4 MB
-+ 2 × 16 × 4 MB = 4 GiB + 128 MiB`. In practice the per-session bound is
-dominated by *actual* divergence (chunks empty out quickly on converged
-replicas) and the working set rarely approaches this limit; the bound
-exists so a worst-case run cannot OOM the container in a way that hides
-the symptom.
+In practice the per-session bound is dominated by *actual* divergence (chunks
+empty out quickly on converged replicas) and the working set rarely approaches
+this limit; the bound exists so a worst-case run cannot OOM the container in a
+way that hides the symptom.
 
 ## RPC types
 
@@ -193,12 +191,13 @@ serialised with bincode (matching the existing `ReadRequest` /
 | Request | Response | Purpose |
 |---------|----------|---------|
 | `RepairMerkleRequest` | `RepairMerkleResponse` | Build Merkle tree for `(keyspace, table, range_start, range_end)` |
-| `RepairFetchRequest` | `RepairFetchResponse` | Fetch ≤`limit` partitions in `[cursor, range_end)`, return `next_cursor` |
+| `RepairFetchRequest` | `RepairFetchResponse` | Fetch ≤`limit` partitions and ≤`max_bytes` in `[cursor, range_end)`, return `next_cursor` |
 | `RepairApplyRequest` | `RepairApplyResponse` | Apply received `Vec<PartitionWire>`, return `applied` + optional per-row error |
 
 `RepairFetchRequestPayload` carries the chunked-iteration fields `cursor:
-Option<i64>` and `limit: u32` (default
-`REPAIR_FETCH_CHUNK_PARTITIONS`). `RepairFetchResponsePayload` returns
+Option<i64>`, `limit: u32` (default `REPAIR_FETCH_CHUNK_PARTITIONS`), and
+`max_bytes: u64` (default `REPAIR_FETCH_CHUNK_BYTES` for older callers).
+`RepairFetchResponsePayload` returns
 `next_cursor: Option<i64>` — `None` indicates the server returned every
 remaining partition in `[cursor, range_end)`. The server probes for
 `limit + 1` partitions and uses the extra match's token as the next
@@ -303,6 +302,7 @@ All constants live in `ferrosa-cluster/src/repair/`:
 | `MERKLE_BUILD_BATCH` | 16 | partitions decoded per `read_token_range` page during a build |
 | `REPAIR_BUILD_CONCURRENCY` | 2 | concurrent Merkle builds per node (initiator + responder share this budget) |
 | `REPAIR_FETCH_CHUNK_PARTITIONS` | 64 | partitions per `RepairFetchRequest` chunk |
+| `REPAIR_FETCH_CHUNK_BYTES` | 32 MiB | encoded partition bytes per `RepairFetchRequest` chunk |
 | `REPAIR_APPLY_CHUNK_PARTITIONS` | 64 | partitions per `RepairApplyRequest` chunk |
 | `MERGED_SPAN_MAX_LEAVES` | 8 | cap on adjacent divergent leaves coalesced into one span |
 | `RepairCoordinator::max_concurrent_sessions` | 4 | sessions in flight per node |

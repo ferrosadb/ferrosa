@@ -31,6 +31,16 @@ use super::coordinator::{SessionExecutor, SessionStats};
 /// regardless of how big the diff is.
 pub const REPAIR_FETCH_CHUNK_PARTITIONS: usize = 64;
 
+/// Maximum estimated partition bytes materialised in a single fetch chunk.
+/// A partition-*count* cap alone does not bound memory: 64 multi-MB
+/// partitions can still blow the per-node cgroup. The byte budget makes the
+/// fetch stop early (returning a resume cursor) once this much content has
+/// accumulated, so peak working set is bounded by bytes regardless of
+/// partition width. Enforced on both the local read and the wire fetch
+/// handler. 32 MiB leaves ample headroom under the fmem 2 GiB node cap even
+/// with the local + remote fetch and both apply queues in flight.
+pub const REPAIR_FETCH_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
 /// Maximum number of partitions sent in a single Apply RPC body.
 /// On the sender side the executor splits the diff into batches
 /// of this size before calling `apply_partitions`, so the wire
@@ -172,35 +182,29 @@ impl RepairStore for StorageEngineRepairStore {
         cursor: Option<i64>,
         limit: usize,
     ) -> Result<(Vec<Partition>, Option<i64>), String> {
-        // Chunked local read: only pull `limit` partitions per
-        // call, probe for one extra to detect "more remaining"
-        // without an extra round trip. This is the local-side
-        // analogue of RepairFetchHandler's chunking on the wire —
-        // matters when the executor walks a span on the *local*
-        // side: a wide span on a 1 GB replica can't fit through
-        // the 2 GiB cgroup if it materialises every partition in
-        // one shot, even if every partition is small.
+        // Token-ordered, byte-bounded chunked read: stop at `limit`
+        // partitions *or* `REPAIR_FETCH_CHUNK_BYTES`, whichever comes first,
+        // so a span of wide partitions can't materialise more than the byte
+        // budget on the local side (the wire analogue lives in
+        // `RepairFetchHandler`). The engine returns the resume cursor directly
+        // in token order, so no probe/sort/truncate is needed here.
         let engine = self.engine.clone();
         let table = table.clone();
         let chunk_start = cursor.unwrap_or(range_start);
-        let probe = limit.saturating_add(1);
-        let result: Result<Vec<Partition>, String> = TaskPool::current("repair-read")
+        TaskPool::current("repair-read")
             .spawn_blocking(move || {
-                StorageEngine::read_token_range(&engine, &table, chunk_start, range_end, probe)
-                    .map_err(|e| format!("read_token_range: {e}"))
+                StorageEngine::read_token_range_bounded(
+                    &engine,
+                    &table,
+                    chunk_start,
+                    range_end,
+                    limit,
+                    REPAIR_FETCH_CHUNK_BYTES,
+                )
+                .map_err(|e| format!("read_token_range_bounded: {e}"))
             })
             .await
-            .map_err(|e| format!("read_range_chunked join: {e}"))?;
-        let mut got = result?;
-        got.sort_by_key(|p| p.key.token.0);
-        let next_cursor = if got.len() > limit {
-            let n = got[limit].key.token.0;
-            got.truncate(limit);
-            Some(n)
-        } else {
-            None
-        };
-        Ok((got, next_cursor))
+            .map_err(|e| format!("read_range_chunked join: {e}"))?
     }
 
     async fn apply_partitions(

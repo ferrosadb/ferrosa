@@ -4,6 +4,41 @@ All notable changes to Ferrosa are documented in this file. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-06-04
+
+### Added
+
+- Engine-wide capped SSTable reader pool with descriptor-backed table views, so
+  flushed SSTable metadata stays lightweight and open reader residency is bounded
+  by `FERROSA_SSTABLE_READER_CACHE_CAP`.
+- Byte-bounded anti-entropy repair fetches. Repair fetch requests now cap both
+  partition count and bytes so a single wide partition or broad divergent range
+  cannot exceed the configured response budget.
+- Compaction input reader routing through the shared reader pool plus a global
+  `FERROSA_MAX_CONCURRENT_COMPACTIONS` gate.
+- Storage metrics for pooled compaction input opens and max concurrently running
+  compactions.
+- Shared repair/storage fuzz generator scaffolding for the repair hardening
+  test harness.
+
+### Changed
+
+- Startup SSTable validation opens, checks, and drops readers one at a time,
+  then publishes descriptors instead of keeping all readers resident.
+- Large range and repair digest walks stream partition data one source step at a
+  time instead of materializing intermediate tiers.
+- Length-prefixed SSTable value decoding now enforces allocation bounds before
+  reserving buffers.
+- Ferrosa Memory-facing repair and compaction paths are documented as part of
+  the bounded-storage memory model.
+
+### Known Limitations
+
+- Strict repair reader fan-in under full token overlap remains an explicit
+  acceptance gate for the next repair-hardening pass.
+- Automated/self-healing repair remains proposed; `ferrosa-ctl repair` and the
+  HTTP repair endpoint are still operator-triggered.
+
 ## [0.12.0] - 2026-05-22
 
 ### Added
@@ -65,6 +100,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - Shipped config templates and source defaults updated to `:17000` internode
   port and current auth role names (`ferrosa_admin`, `ferrosa_user`).
 
+[0.13.0]: https://github.com/ferrosadb/ferrosa/compare/v0.12.2...v0.13.0
 [0.12.0]: https://github.com/ferrosadb/ferrosa/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ferrosadb/ferrosa/compare/v0.10.0...v0.11.0
 
