@@ -249,7 +249,14 @@ pub struct RingTopology<F>
 where
     F: Fn() -> crate::ring::TokenRing + Send + Sync,
 {
-    this_node_id: u64,
+    /// This node's **durable** identity (stable across restarts). The `u64`
+    /// ring id is resolved from this against the *current* snapshot on every
+    /// call rather than captured once — at startup the node may not be placed
+    /// in the ring yet, and a stale/wrong `u64` would fail to exclude self from
+    /// the probe set, risking a verify-against-our-own-corrupt-copy and an
+    /// unsafe quarantine (FMEA #1). Resolving by `host_id` guarantees self is
+    /// always excluded once placed.
+    this_host_id: Uuid,
     /// Replication factor used to scope the replica set. The binary passes the
     /// keyspace RF (per FMEA #11 — not a hardcoded constant).
     rf: usize,
@@ -260,14 +267,24 @@ impl<F> RingTopology<F>
 where
     F: Fn() -> crate::ring::TokenRing + Send + Sync,
 {
-    /// Construct from this node's ring id, the replication factor, and a
-    /// closure that snapshots the current ring.
-    pub fn new(this_node_id: u64, rf: usize, snapshot: F) -> Self {
+    /// Construct from this node's durable `host_id`, the replication factor, and
+    /// a closure that snapshots the current ring. The `u64` ring id is resolved
+    /// dynamically from `this_host_id` against each snapshot (never captured).
+    pub fn new(this_host_id: Uuid, rf: usize, snapshot: F) -> Self {
         Self {
-            this_node_id,
+            this_host_id,
             rf,
             snapshot,
         }
+    }
+
+    /// Resolve this node's `u64` ring id from its durable `host_id` against
+    /// `ring`. `None` when the node is not (yet) placed in the ring.
+    fn resolved_self_id(&self, ring: &crate::ring::TokenRing) -> Option<u64> {
+        ring.node_ids().into_iter().find(|&n| {
+            ring.get_node(n)
+                .is_some_and(|info| info.host_id == self.this_host_id)
+        })
     }
 }
 
@@ -276,7 +293,11 @@ where
     F: Fn() -> crate::ring::TokenRing + Send + Sync,
 {
     fn this_node_id(&self) -> u64 {
-        self.this_node_id
+        // Resolve against the current ring; u64::MAX is a sentinel meaning
+        // "not placed yet" that matches no real ring id (so it never wrongly
+        // excludes a peer as self).
+        let ring = (self.snapshot)();
+        self.resolved_self_id(&ring).unwrap_or(u64::MAX)
     }
 
     fn owners(&self, _table: &TableKey) -> Option<Vec<u64>> {
@@ -306,13 +327,18 @@ where
 
     fn replica_peers(&self, _table: &TableKey) -> Vec<(u64, Uuid)> {
         let ring = (self.snapshot)();
+        // Resolve self by host_id against THIS snapshot so self is always
+        // excluded once placed (u64::MAX sentinel when unplaced excludes
+        // nothing, which is correct — self isn't in the ring yet). Never probe
+        // our own copy (FMEA #1: it may be the corrupt one we want to refill).
+        let self_id = self.resolved_self_id(&ring).unwrap_or(u64::MAX);
         // Eligible replica nodes other than self, in ascending ring-id order.
         // We treat the table's replica set as the eligible nodes up to RF;
         // probing any one that verifies a non-empty copy satisfies FMEA #1.
         let mut peers: Vec<(u64, Uuid)> = ring
             .node_ids()
             .into_iter()
-            .filter(|&n| n != self.this_node_id)
+            .filter(|&n| n != self_id)
             .filter_map(|n| {
                 ring.get_node(n).and_then(|info| {
                     let eligible = match info.state {
@@ -513,7 +539,7 @@ mod tests {
 
     #[test]
     fn ring_topology_returns_other_eligible_peers_capped_by_rf() {
-        let (_h1, n1) = node("10.0.0.1:7000", NodeState::Normal);
+        let (h1, n1) = node("10.0.0.1:7000", NodeState::Normal);
         let (h2, n2) = node("10.0.0.2:7000", NodeState::Normal);
         let (h3, n3) = node("10.0.0.3:7000", NodeState::Normal);
         let (_h4, n4) = node("10.0.0.4:7000", NodeState::Learner { owns_tokens: false });
@@ -523,7 +549,9 @@ mod tests {
         ring.add_node(3, n3);
         ring.add_node(4, n4);
 
-        let topo = RingTopology::new(1, 3, move || ring.clone());
+        let topo = RingTopology::new(h1, 3, move || ring.clone());
+        // self resolves from host_id h1 → ring id 1.
+        assert_eq!(topo.this_node_id(), 1);
         let peers = topo.replica_peers(&TableKey::new("ks", "t"));
         // self (1) excluded, learner-without-tokens (4) excluded, RF=3 → 2 peers.
         assert_eq!(peers, vec![(2, h2), (3, h3)]);
@@ -535,10 +563,66 @@ mod tests {
 
     #[test]
     fn ring_topology_single_node_has_no_peers() {
-        let (_h1, n1) = node("10.0.0.1:7000", NodeState::Normal);
+        let (h1, n1) = node("10.0.0.1:7000", NodeState::Normal);
         let mut ring = TokenRing::new();
         ring.add_node(1, n1);
-        let topo = RingTopology::new(1, 1, move || ring.clone());
+        let topo = RingTopology::new(h1, 1, move || ring.clone());
         assert!(topo.replica_peers(&TableKey::new("ks", "t")).is_empty());
+    }
+
+    /// FMEA #1 safety: self is excluded from the probe peer set by durable
+    /// host_id even if its ring id differs from a naive guess — so the probe can
+    /// never verify against this node's own (possibly corrupt) copy. Also: a node
+    /// not yet placed in the ring resolves to the u64::MAX sentinel (this_node_id)
+    /// and excludes nothing (there is no self in the ring to wrongly include).
+    #[test]
+    fn ring_topology_excludes_self_by_host_id_and_handles_unplaced() {
+        let (h1, n1) = node("10.0.0.1:7000", NodeState::Normal);
+        let (h2, n2) = node("10.0.0.2:7000", NodeState::Normal);
+        // This node (h1) is placed at a NON-1 ring id (10), proving resolution
+        // is by host_id, not a positional guess.
+        let mut ring = TokenRing::new();
+        ring.add_node(10, n1);
+        ring.add_node(2, n2);
+
+        let topo = RingTopology::new(h1, 2, || {
+            let mut r = TokenRing::new();
+            r.add_node(
+                10,
+                NodeInfo {
+                    host_id: h1,
+                    addr: "10.0.0.1:7000".into(),
+                    data_center: "dc1".into(),
+                    rack: "rack1".into(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                },
+            );
+            r.add_node(
+                2,
+                NodeInfo {
+                    host_id: h2,
+                    addr: "10.0.0.2:7000".into(),
+                    data_center: "dc1".into(),
+                    rack: "rack1".into(),
+                    state: NodeState::Normal,
+                    cql_broadcast: None,
+                },
+            );
+            r
+        });
+        assert_eq!(topo.this_node_id(), 10, "resolved by host_id, not assumed");
+        let peers = topo.replica_peers(&TableKey::new("ks", "t"));
+        // self (ring id 10) excluded; only peer 2 remains — never self.
+        assert_eq!(peers, vec![(2, h2)]);
+        assert!(
+            !peers.iter().any(|(id, _)| *id == 10),
+            "self must never be a probe peer"
+        );
+
+        // Unplaced node (host_id not in the ring) → sentinel, excludes nothing.
+        let unknown = Uuid::new_v4();
+        let topo_unplaced = RingTopology::new(unknown, 3, move || ring.clone());
+        assert_eq!(topo_unplaced.this_node_id(), u64::MAX);
     }
 }
