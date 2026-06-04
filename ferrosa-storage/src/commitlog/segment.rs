@@ -182,7 +182,7 @@ fn sync_commitlog_file(file: &fs::File) -> ferrosa_common::Result<()> {
         any(feature = "macos-fullfsync", not(feature = "macos-standard-sync"))
     ))]
     {
-        return full_sync_file(file);
+        full_sync_file(file)
     }
 
     #[cfg(any(
