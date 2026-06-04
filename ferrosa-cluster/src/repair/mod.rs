@@ -23,7 +23,10 @@ pub mod rpc;
 pub mod scheduler;
 
 pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
-pub use scheduler::{select_initiated_ranges, InitiatedRange};
+pub use scheduler::{
+    select_initiated_ranges, select_tables_for_tick, AutoRepairConfig, AutoRepairScheduler,
+    InitiatedRange, RepairContext,
+};
 pub use executor::{
     InMemoryRepairStore, LocalRepairExecutor, RepairStore, StorageEngineRepairStore,
 };
