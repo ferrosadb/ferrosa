@@ -6618,6 +6618,203 @@ mod tests {
     }
 
     #[test]
+    fn peak_open_readers_stays_within_fanin_during_staged_merge() {
+        // REGRESSION (read-merge reader-count unbounded): a single token-range
+        // READ over N >> fanin FULL-OVERLAP SSTables must hold at most
+        // `fanin_cap` readers concurrently. We prove this by capping the shared
+        // pool at EXACTLY `fanin_cap`: if any single read needed more than
+        // `fanin_cap` readers open at once, an in-use reader could not be
+        // evicted and the pool would record a SOFT-CAP BREACH (and peak resident
+        // would exceed the cap). `read_token_range` processes one source to
+        // completion and drops it before opening the next, so even with the
+        // pool pinned at the fan-in cap it never breaches.
+        //
+        // NOTE: the *digest* path (`walk_token_range_for_digest`) does NOT hold
+        // this bound under full overlap today — see
+        // `digest_walk_reader_count_bounded_under_full_overlap` (gated behind
+        // `repair-fuzz-known-failures`).
+        let fanin = crate::reader_pool::configured_read_merge_fanin();
+        let n_sstables = fanin * 3 + 7; // comfortably above fanin
+        let cap = fanin; // pool pinned at the fan-in cap
+        let distinct_keys = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = file_store_full_overlap(dir.path(), cap, n_sstables, distinct_keys);
+        reset_pool(&mut store, cap);
+
+        // Full-range read: every full-overlap SSTable participates in the merge
+        // for every key, so a non-staged merge would try to hold all
+        // `n_sstables` readers open at once — impossible under a pool capped at
+        // `fanin`, forcing a soft-cap breach.
+        let merged = store
+            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            merged.len(),
+            distinct_keys,
+            "fixture must merge to all keys"
+        );
+
+        assert!(
+            store.peak_resident_readers() <= fanin,
+            "read_token_range peak resident readers {} exceeded the fan-in cap \
+             {fanin} (n_sstables={n_sstables})",
+            store.peak_resident_readers()
+        );
+        assert_eq!(
+            store.reader_pool.soft_cap_breaches(),
+            0,
+            "a single read_token_range needed more than fanin={fanin} readers \
+             open at once (soft-cap breached) over {n_sstables} full-overlap \
+             SSTables — read-merge reader-count is not bounded by the fan-in"
+        );
+    }
+
+    /// KNOWN-FAILURE (gated behind `repair-fuzz-known-failures`) — the predicted
+    /// "repair full-overlap reader-count OOM (node1)" RED, property #2 of
+    /// `specs/proposed/repair-fuzz-harness-design.md`.
+    ///
+    /// The digest walk used by the repair Merkle build
+    /// (`repair::build_tree_for_range` -> `walk_token_range_for_digest`) holds
+    /// **O(sstable_count)** SSTable readers open simultaneously under FULL token
+    /// overlap, not **O(fan-in)** — even with the reader pool pinned at the
+    /// fan-in cap. The fuzz harness shrank this to a tiny deterministic repro:
+    ///
+    ///   cap = fanin = 4, n_sstables = 8, distinct_keys = 6, full overlap
+    ///     -> digest peak resident readers = 8 (== n_sstables), soft-cap
+    ///        breaches = 4. Expected: peak <= 4, breaches == 0.
+    ///
+    /// Scales linearly: n_sstables=40 -> peak 40 / 36 breaches; n_sstables=103
+    /// -> peak 103 / 71 breaches. This is the repair-fan-in wall: on a node
+    /// bloated with thousands of full-overlap SSTables (the `entity_store`
+    /// shape), a single repair Merkle build opens every reader at once and
+    /// OOM-kills the node under its cgroup. `read_token_range` over the SAME
+    /// fixture stays bounded (peak == cap, 0 breaches), so the bug is specific
+    /// to the digest staged-merge path, not the read path.
+    ///
+    /// Drives the already-approved repair-fan-in bound (TDD follow-up by the
+    /// lead). The companion regression `large_range_digest_is_data_bounded_*`
+    /// only checks the *materialised-partition* gauge, not reader residency,
+    /// which is why this dimension slipped through.
+    #[cfg(feature = "repair-fuzz-known-failures")]
+    #[test]
+    fn digest_walk_reader_count_bounded_under_full_overlap() {
+        // Minimal shrunk repro from the harness. The pool is pinned at a small
+        // cap and the SSTable count exceeds it — a fan-in-bounded merge would
+        // keep peak resident at `cap` with zero soft-cap breaches; the digest
+        // walk instead opens all `n_sstables` readers at once. Uses an explicit
+        // cap (not the env-configurable fan-in) so the repro is deterministic
+        // regardless of `FERROSA_READ_MERGE_FANIN`.
+        let cap = 4usize;
+        let n_sstables = 8usize; // > cap → eviction must engage if bounded
+        let distinct_keys = 6usize;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = file_store_full_overlap(dir.path(), cap, n_sstables, distinct_keys);
+        reset_pool(&mut store, cap);
+
+        let mut visited = 0usize;
+        store
+            .walk_token_range_for_digest(i64::MIN, i64::MAX, |_k, _d, _s, emit| {
+                visited += 1;
+                emit(&mut |_row| Ok(()))
+            })
+            .unwrap();
+        assert_eq!(visited, distinct_keys, "digest must visit every merged key");
+
+        assert!(
+            store.peak_resident_readers() <= cap,
+            "digest walk peak resident readers {} exceeded the pool cap {cap} \
+             (n_sstables={n_sstables}); repair Merkle build opens O(sstable_count) \
+             readers under full overlap (repair full-overlap reader-count OOM)",
+            store.peak_resident_readers()
+        );
+        assert_eq!(
+            store.reader_pool.soft_cap_breaches(),
+            0,
+            "digest walk soft-cap-breached over {n_sstables} full-overlap SSTables \
+             with a pool cap of {cap} — repair Merkle build is not bounded by \
+             the fan-in"
+        );
+    }
+
+    proptest::proptest! {
+        // File-IO-heavy (each case flushes `n_sstables` real SSTables), so a
+        // bounded case count keeps the in-crate lib suite fast. `PROPTEST_CASES`
+        // overrides for a deep run.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+
+        /// PROPERTY #2 (spec §"Invariant properties") — bounded memory under
+        /// FULL token overlap, MATERIALISED-PARTITION half. For randomly-sized
+        /// full-overlap tables (every SSTable spans the ring and shares the key
+        /// set), the digest walk must keep peak materialised partitions within
+        /// O(open sources) and visit every merged key — regardless of SSTable
+        /// count or data volume. Asserts the `#[cfg(test)]`-only
+        /// materialised-partition gauge (`inflight`) that an integration test
+        /// cannot reach. This half PASSES on this branch (the staged digest walk
+        /// streams rows without materialising tiers).
+        ///
+        /// The READER-COUNT half of property #2 does NOT hold for the digest
+        /// path under full overlap — it is asserted separately in
+        /// `digest_walk_reader_count_bounded_under_full_overlap`, gated behind
+        /// `repair-fuzz-known-failures` so CI stays green while the failure is
+        /// documented (the repair-fan-in wall).
+        #[test]
+        fn property_digest_walk_data_bounded_under_full_overlap(
+            n_sstables in 1usize..16,
+            distinct_keys in 1usize..8,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            // Small fixed cap so the reader-count half (gated) reliably exceeds
+            // it once n_sstables > cap; the materialised-partition half below is
+            // cap-independent.
+            let cap = 4usize;
+            let mut store =
+                file_store_full_overlap(dir.path(), cap, n_sstables, distinct_keys);
+            reset_pool(&mut store, cap);
+
+            inflight::reset();
+            let mut visited = 0usize;
+            store
+                .walk_token_range_for_digest(i64::MIN, i64::MAX, |_k, _d, _s, emit| {
+                    visited += 1;
+                    emit(&mut |_row| Ok(()))
+                })
+                .unwrap();
+
+            proptest::prop_assert_eq!(
+                visited, distinct_keys,
+                "digest must visit every merged key (data loss)"
+            );
+            let mat_peak = inflight::peak();
+            proptest::prop_assert!(
+                mat_peak <= distinct_keys,
+                "materialised-partition peak {} scaled with table size under full \
+                 overlap (n_sstables={}, distinct_keys={}); must be O(open sources), \
+                 not O(total partitions {})",
+                mat_peak, n_sstables, distinct_keys, n_sstables * distinct_keys
+            );
+
+            // READER-COUNT half — only asserted when the known-failure feature
+            // is on (the digest path violates this under full overlap today).
+            #[cfg(feature = "repair-fuzz-known-failures")]
+            {
+                let reader_peak = store.peak_resident_readers();
+                proptest::prop_assert!(
+                    reader_peak <= cap,
+                    "peak open readers {} exceeded pool cap {} during full-overlap \
+                     digest walk (n_sstables={})",
+                    reader_peak, cap, n_sstables
+                );
+                proptest::prop_assert_eq!(
+                    store.reader_pool.soft_cap_breaches(), 0u64,
+                    "digest walk soft-cap-breached over {} full-overlap SSTables \
+                     with pool cap {}",
+                    n_sstables, cap
+                );
+            }
+        }
+    }
+
+    #[test]
     fn streaming_token_range_read_is_byte_identical_to_single_pass() {
         // GOLDEN EQUIVALENCE (FMEA #2/#3): the streaming k-way merge in
         // `walk_token_range` must return exactly the same partitions as the

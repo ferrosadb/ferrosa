@@ -30,6 +30,7 @@ hex = "0.4"
 smallvec = "1"
 tracing = "0.1"
 ureq = { version = "3", features = ["json"] }
+proptest = { version = "1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -50,14 +51,35 @@ live-infra-tests = []
 # to this crate's own tests regardless of this feature.
 compaction-validator = []
 # macOS does not treat ordinary fsync/fdatasync as a hardware-cache flush.
-# Force macOS builders to choose explicitly so the commitlog durability policy
-# cannot be forgotten when running storage locally on Darwin.
+# Local macOS builds default to F_FULLFSYNC for correctness. Enable
+# macos-standard-sync only for explicit fast/dev runs that accept weaker
+# durability semantics.
 macos-fullfsync = []
 macos-standard-sync = []
+# Shared proptest generators + test-support fixtures for the repair/storage
+# fuzz harness (`arb_partition`, `arb_table_content`, `arb_replica_set`,
+# `arb_sstable_layout`, `arb_corruption`, `arb_config`). Off by default; enabled
+# as a dev-dependency self-reference so the `tests/` harness and consuming
+# crates (ferrosa-cluster) can reuse the generators without pulling proptest
+# into the production build.
+test-generators = ["dep:proptest", "ferrosa-common/test-generators"]
+# Enables the fuzz-harness assertions that currently expose an UNFIXED product
+# bug, so CI's default `cargo test` stays green while the failure is documented
+# and reproducible on demand. Off by default. Currently gates: the digest-path
+# (`walk_token_range_for_digest`) reader-count bound under full token overlap —
+# the repair Merkle build holds O(sstable_count) readers open at once instead of
+# O(fan-in), the predicted "repair full-overlap reader-count OOM (node1)" RED.
+# Run the known failures with:
+#   cargo test -p ferrosa-storage --features test-generators,repair-fuzz-known-failures
+repair-fuzz-known-failures = ["test-generators"]
 
 [dev-dependencies]
 async-trait = "0.1"
 ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
+# Self-reference enables the `test-generators` feature for this crate's own
+# `tests/` integration harness (`repair_fuzz.rs`) without exporting the
+# generators into the production build.
+ferrosa-storage = { path = ".", features = ["test-generators"] }
 futures = "0.3"
 hex = "0.4"
 proptest = "1"
