@@ -34,6 +34,7 @@ pub mod quarantine;
 pub mod range_merger;
 pub mod reader_pool;
 pub mod restore;
+pub mod self_heal;
 pub mod snapshot;
 pub mod store;
 pub mod subscription_observer;

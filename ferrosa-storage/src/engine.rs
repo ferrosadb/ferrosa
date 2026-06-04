@@ -3955,6 +3955,124 @@ impl StorageEngine {
         self.tables.read().len()
     }
 
+    /// The `TableId`s currently registered with this engine. Used by the
+    /// self-heal controller to enumerate scan targets.
+    pub fn registered_table_ids(&self) -> Vec<TableId> {
+        self.tables.read().keys().cloned().collect()
+    }
+
+    /// Filesystem directory holding a table's SSTables:
+    /// `<data_dir>/sstables/<keyspace>.<table>`. Used by the self-heal
+    /// detector to scan for corrupt generations.
+    pub fn table_sstable_dir(&self, table: &TableId) -> std::path::PathBuf {
+        self.config
+            .data_dir
+            .join("sstables")
+            .join(table.to_string())
+    }
+
+    /// Test-only accessor for the private `generation_component_path` so
+    /// self-heal fixtures can locate a generation's component file.
+    #[cfg(test)]
+    pub(crate) fn generation_component_path_for_test(
+        table_dir: &std::path::Path,
+        gen: u64,
+        component: &str,
+    ) -> Option<std::path::PathBuf> {
+        Self::generation_component_path(table_dir, &gen.to_string(), component)
+    }
+
+    /// Enumerate the SSTable generations present in a table directory.
+    ///
+    /// Mirrors the discovery logic in
+    /// `load_existing_sstables_and_sidecars_with_repair_mode`: a generation is
+    /// either a flat `<gen>-Data.db` in `table_dir` or a `<gen>/<gen>-Data.db`
+    /// subdir. Returned descending (newest first) for stable iteration.
+    pub fn list_generations_in_dir(table_dir: &std::path::Path) -> Vec<u64> {
+        let mut values = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stripped) = name.strip_suffix("-Data.db") {
+                if let Ok(gen) = stripped.parse::<u64>() {
+                    values.insert(gen);
+                }
+            }
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                if let Ok(gen) = name.parse::<u64>() {
+                    if table_dir
+                        .join(gen.to_string())
+                        .join(format!("{gen}-Data.db"))
+                        .exists()
+                    {
+                        values.insert(gen);
+                    }
+                }
+            }
+        }
+        let mut out: Vec<u64> = values.into_iter().collect();
+        out.sort_by(|a, b| b.cmp(a));
+        out
+    }
+
+    /// Smoke-test one generation in a table directory the same way startup
+    /// does — open it and run [`validate_sstable_for_startup_repair`]. Returns
+    /// `Ok(())` if healthy, `Err` with the failure reason if corrupt.
+    ///
+    /// This is the single source of corruption-detection truth, reused by the
+    /// self-heal detector so it never diverges from the startup smoke test.
+    pub fn smoke_test_generation(
+        table_dir: &std::path::Path,
+        gen: u64,
+    ) -> ferrosa_common::Result<()> {
+        let gen_str = gen.to_string();
+        // Zero-byte critical components are corruption (same rule as startup).
+        for comp in ["Data.db", "Partitions.db"] {
+            let path = Self::generation_component_path(table_dir, &gen_str, comp)
+                .unwrap_or_else(|| table_dir.join(format!("{gen_str}-{comp}")));
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() == 0 {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "generation {gen}: zero-byte critical component {comp}"
+                    )));
+                }
+            }
+        }
+        let reader = Self::open_sstable_from_dir(table_dir, &gen_str)?;
+        Self::validate_sstable_for_startup_repair(&reader)
+    }
+
+    /// Scan a table directory and return the generations that fail the startup
+    /// smoke test, paired with the failure reason. The healthy gens are left
+    /// untouched. Pure read — moves no files.
+    pub fn scan_table_dir_for_corrupt(table_dir: &std::path::Path) -> Vec<(u64, String)> {
+        let mut corrupt = Vec::new();
+        for gen in Self::list_generations_in_dir(table_dir) {
+            if let Err(e) = Self::smoke_test_generation(table_dir, gen) {
+                corrupt.push((gen, e.to_string()));
+            }
+        }
+        corrupt
+    }
+
+    /// Move a corrupt generation's files into the table's `quarantine/`
+    /// subdirectory. Files are **moved, never deleted** (FMEA never-worse).
+    /// The quarantine dir is created if absent.
+    pub fn quarantine_corrupt_generation(
+        table_dir: &std::path::Path,
+        gen: u64,
+    ) -> ferrosa_common::Result<std::path::PathBuf> {
+        let quarantine_dir = table_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidData(format!(
+                "self-heal quarantine: failed to create {}: {e}",
+                quarantine_dir.display()
+            ))
+        })?;
+        Self::quarantine_generation(table_dir, gen, &quarantine_dir)?;
+        Ok(quarantine_dir)
+    }
+
     /// Total buffer bytes held by closed commit log segments.
     ///
     /// After the P0 OOM fix, this should be 0 — closed segments release
