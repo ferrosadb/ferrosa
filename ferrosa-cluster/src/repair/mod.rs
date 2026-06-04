@@ -16,12 +16,16 @@
 //! - **RepairScheduler**: Background task that periodically triggers repair
 //!   sessions for all locally-owned token ranges.
 
+pub mod cluster_view;
 pub mod coordinator;
 pub mod executor;
 pub mod merkle;
 pub mod rpc;
 pub mod scheduler;
 
+pub use cluster_view::{
+    ClusterRepairView, ClusterTopology, ProbeOutcome, RepairProbe, RingTopology, RpcRepairProbe,
+};
 pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
 pub use scheduler::{
     select_initiated_ranges, select_tables_for_tick, AutoRepairConfig, AutoRepairScheduler,

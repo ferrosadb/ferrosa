@@ -30,6 +30,7 @@ pub mod config;
 pub mod decide;
 pub mod detector;
 pub mod metrics;
+pub mod refill;
 pub mod snapshot;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -44,6 +45,7 @@ use crate::TableId;
 pub use config::SelfHealConfig;
 pub use decide::{Action, EscalateReason};
 pub use metrics::{self_heal_health, self_heal_metrics, SelfHealHealth, SelfHealMetrics};
+pub use refill::{NoopRepairTrigger, RepairTrigger};
 pub use snapshot::{
     AttemptState, CorruptSstable, HealthSnapshot, IssueKind, ReplicaPosture, RingView, TableIssue,
     TableKey,
@@ -171,10 +173,16 @@ pub struct SelfHealController {
     /// Logical tick counter — the snapshot's deterministic clock.
     tick: u64,
     refill: Box<dyn RefillScheduler + Send + Sync>,
+    /// Port that schedules a prompt targeted refill after a successful
+    /// quarantine (FMEA #10). Defaults to [`NoopRepairTrigger`]; the binary
+    /// supplies a cluster-backed trigger on a real cluster.
+    repair_trigger: Arc<dyn RepairTrigger>,
 }
 
 impl SelfHealController {
-    /// Construct a controller. `cluster` supplies replica-health facts.
+    /// Construct a controller. `cluster` supplies replica-health facts. The
+    /// refill trigger defaults to [`NoopRepairTrigger`]; use
+    /// [`Self::with_repair_trigger`] to supply a cluster-backed one.
     pub fn new(
         engine: Arc<StorageEngine>,
         cluster: Arc<dyn ClusterView>,
@@ -187,7 +195,17 @@ impl SelfHealController {
             ledger: BTreeMap::new(),
             tick: 0,
             refill: Box::new(LoggingRefillScheduler),
+            repair_trigger: Arc::new(NoopRepairTrigger),
         }
+    }
+
+    /// Supply the cluster-backed [`RepairTrigger`] used to schedule a prompt
+    /// targeted refill after a successful quarantine (FMEA #10). Builder form
+    /// so the default [`Self::new`] / [`Self::spawn`] signatures stay
+    /// no-cluster-dependency for single-node and existing tests.
+    pub fn with_repair_trigger(mut self, trigger: Arc<dyn RepairTrigger>) -> Self {
+        self.repair_trigger = trigger;
+        self
     }
 
     /// Spawn the controller on its own tokio task, gated by the master switch.
@@ -198,6 +216,17 @@ impl SelfHealController {
         engine: Arc<StorageEngine>,
         cluster: Arc<dyn ClusterView>,
         config: SelfHealConfig,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        Self::spawn_with_trigger(engine, cluster, config, Arc::new(NoopRepairTrigger))
+    }
+
+    /// Like [`Self::spawn`] but with a cluster-backed [`RepairTrigger`] so a
+    /// successful quarantine schedules a prompt targeted refill (FMEA #10).
+    pub fn spawn_with_trigger(
+        engine: Arc<StorageEngine>,
+        cluster: Arc<dyn ClusterView>,
+        config: SelfHealConfig,
+        repair_trigger: Arc<dyn RepairTrigger>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         if !config.enabled {
             tracing::info!(
@@ -210,7 +239,8 @@ impl SelfHealController {
             return None;
         }
         let interval = config.tick_interval;
-        let mut controller = SelfHealController::new(engine, cluster, config);
+        let mut controller =
+            SelfHealController::new(engine, cluster, config).with_repair_trigger(repair_trigger);
         tracing::info!(
             tick_secs = interval.as_secs(),
             "self-heal: controller starting"
@@ -308,11 +338,24 @@ impl SelfHealController {
         // Ledger update — deterministic bookkeeping (FMEA #5 escalate-and-stop).
         let entry = self.ledger.entry((table, kind)).or_default();
         match &outcome {
-            ActionOutcome::Quarantined { .. } => {
+            ActionOutcome::Quarantined {
+                table: quarantined_table,
+                ..
+            } => {
                 entry.attempts = entry.attempts.saturating_add(1);
                 entry.last_attempt_tick = Some(snapshot.tick);
                 // Not escalated: next tick re-runs the detector to verify the
                 // issue cleared (verify-by-re-detection, FMEA #11).
+                //
+                // FMEA #10: schedule a prompt targeted refill of the affected
+                // ranges from a healthy replica so the quarantined data is
+                // restored before the next full repair cycle. We don't track
+                // per-generation token bounds here, so the affected range is
+                // the table's full ring span — the cluster-side trigger
+                // intersects it with this node's owned ranges.
+                let table_id = TableId::new(&quarantined_table.keyspace, &quarantined_table.table);
+                self.repair_trigger
+                    .request_refill(&table_id, &[(i64::MIN, i64::MAX)]);
             }
             ActionOutcome::Escalated { .. } => {
                 entry.attempts = entry.attempts.saturating_add(1);
@@ -555,6 +598,106 @@ mod controller_tests {
             before,
             "issue resolved → no further quarantine"
         );
+    }
+
+    /// Recorded `(table, ranges)` of the most recent refill request.
+    type RecordedRefill = Option<(TableId, Vec<(i64, i64)>)>;
+
+    /// A recording [`RepairTrigger`] for asserting the quarantine→refill
+    /// coupling.
+    #[derive(Default)]
+    struct RecordingTrigger {
+        calls: std::sync::atomic::AtomicUsize,
+        last: std::sync::Mutex<RecordedRefill>,
+    }
+    impl RepairTrigger for RecordingTrigger {
+        fn request_refill(&self, table: &TableId, ranges: &[(i64, i64)]) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last.lock().unwrap() = Some((table.clone(), ranges.to_vec()));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn successful_quarantine_invokes_repair_trigger_with_table() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let engine = table_dir_with_n_generations_engine(2);
+        let table_dir = engine.table_sstable_dir(&TableId::new("test_ks", "test_table"));
+        corrupt_one_generation(&table_dir);
+
+        let cluster = Arc::new(PinnedCluster {
+            host: 0,
+            posture: ReplicaPosture::HealthyReplicaAvailable,
+            owners: None,
+        });
+        let trigger = Arc::new(RecordingTrigger::default());
+        let mut c = SelfHealController::new(engine, cluster, SelfHealConfig::default())
+            .with_repair_trigger(trigger.clone());
+        c.run_one_tick();
+
+        assert_eq!(
+            trigger.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a successful quarantine must request exactly one refill"
+        );
+        let (table, ranges) = trigger.last.lock().unwrap().clone().unwrap();
+        assert_eq!(table, TableId::new("test_ks", "test_table"));
+        assert_eq!(
+            ranges,
+            vec![(i64::MIN, i64::MAX)],
+            "refill targets the table's affected ranges"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn escalation_does_not_invoke_repair_trigger() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let engine = table_dir_with_n_generations_engine(2);
+        let table_dir = engine.table_sstable_dir(&TableId::new("test_ks", "test_table"));
+        corrupt_one_generation(&table_dir);
+
+        // SingleNode → escalate, never quarantine → no refill request.
+        let cluster = Arc::new(PinnedCluster {
+            host: 0,
+            posture: ReplicaPosture::SingleNode,
+            owners: None,
+        });
+        let trigger = Arc::new(RecordingTrigger::default());
+        let mut c = SelfHealController::new(engine, cluster, SelfHealConfig::default())
+            .with_repair_trigger(trigger.clone());
+        c.run_one_tick();
+
+        assert_eq!(
+            trigger.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "escalation (no healthy replica) must NOT request a refill"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn default_noop_trigger_still_quarantines() {
+        // Controller built via plain `new` (no-op trigger) must still
+        // quarantine successfully — the trigger is fire-and-forget.
+        metrics::_reset_self_heal_metrics_for_tests();
+        let engine = table_dir_with_n_generations_engine(2);
+        let table_dir = engine.table_sstable_dir(&TableId::new("test_ks", "test_table"));
+        corrupt_one_generation(&table_dir);
+
+        let cluster = Arc::new(PinnedCluster {
+            host: 0,
+            posture: ReplicaPosture::HealthyReplicaAvailable,
+            owners: None,
+        });
+        let mut c = SelfHealController::new(engine, cluster, SelfHealConfig::default());
+        c.run_one_tick();
+
+        assert_eq!(
+            metrics::self_heal_metrics().quarantined_generations_total,
+            1
+        );
+        assert!(table_dir.join("quarantine").exists());
     }
 
     #[test]
