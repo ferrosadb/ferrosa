@@ -155,6 +155,44 @@ impl RepairCoordinator {
             }
         }
 
+        self.run_session_tasks(executor, table, tasks).await
+    }
+
+    /// Repair **only the token ranges this node is the deterministic initiator
+    /// for** (lowest live host_id among the range's replicas — see
+    /// [`select_initiated_ranges`](super::scheduler::select_initiated_ranges)),
+    /// against that range's live peers.
+    ///
+    /// This is the entry point the automatic-repair scheduler uses: unlike
+    /// [`Self::repair_table`] (which repairs *every* owned range and is meant to
+    /// be triggered on a single node), this is safe to run on **every** node
+    /// simultaneously — each range is initiated exactly once (FMEA #1, no herd).
+    pub async fn repair_initiated(
+        &self,
+        executor: Arc<dyn SessionExecutor>,
+        ring: &TokenRing,
+        local_node_id: u64,
+        rf: usize,
+        table: &TableId,
+    ) -> Vec<SessionResult> {
+        let mut tasks: Vec<(i64, i64, u64)> = Vec::new();
+        for r in super::scheduler::select_initiated_ranges(ring, local_node_id, rf) {
+            for peer in r.peers {
+                tasks.push((r.start, r.end, peer));
+            }
+        }
+        self.run_session_tasks(executor, table, tasks).await
+    }
+
+    /// Fan out one repair session per `(range_start, range_end, peer)` task,
+    /// bounded by `max_concurrent_sessions`. Shared by [`Self::repair_table`]
+    /// and [`Self::repair_initiated`].
+    async fn run_session_tasks(
+        &self,
+        executor: Arc<dyn SessionExecutor>,
+        table: &TableId,
+        tasks: Vec<(i64, i64, u64)>,
+    ) -> Vec<SessionResult> {
         // Bound parallelism with a semaphore.
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_sessions));
         let mut handles = Vec::with_capacity(tasks.len());
@@ -300,6 +338,33 @@ mod tests {
         ring.assign_tokens(2, &[200, 500, 800]);
         ring.assign_tokens(3, &[300, 600, 900]);
         ring
+    }
+
+    /// FMEA #1 at the coordinator level: when every node runs `repair_initiated`
+    /// (the automatic path), each token range is repaired by exactly ONE
+    /// initiator — not RF times. So exactly one of the three nodes schedules
+    /// sessions; the other two schedule none.
+    #[tokio::test]
+    async fn repair_initiated_runs_each_range_once_across_all_nodes() {
+        let ring = three_node_ring();
+        let table = TableId::new("ks", "tbl");
+        let coord = RepairCoordinator {
+            max_concurrent_sessions: 4,
+        };
+        let mut nonempty = 0usize;
+        let mut total = 0usize;
+        for node in [1u64, 2, 3] {
+            let exec = Arc::new(MockExecutor::new());
+            let results = coord
+                .repair_initiated(exec.clone(), &ring, node, 3, &table)
+                .await;
+            if !results.is_empty() {
+                nonempty += 1;
+            }
+            total += results.len();
+        }
+        assert_eq!(nonempty, 1, "exactly one node initiates each range (no herd)");
+        assert!(total > 0, "the sole initiator scheduled its sessions");
     }
 
     #[tokio::test]
