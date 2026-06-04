@@ -60,6 +60,10 @@ jobs:
         env:
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
         run: |
+          # The trailing `--skip <fuzz prop>` flags exclude the file-IO-heavy
+          # repair fuzz harness (ferrosa-storage `fuzz-fileio` feature, on under
+          # --all-features) from the per-PR gate; it runs deeply in
+          # nightly-fuzz.yml. Add new tests/repair_fuzz.rs properties to both.
           cargo test --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
@@ -70,6 +74,11 @@ jobs:
                --skip binary_ \
                --skip concurrent_write --skip many_flushes \
                --skip flush_2000 --skip single_writer --skip write_flush_compact \
+               --skip reads_never_panic_on_arbitrary_content \
+               --skip corrupt_sstable_bytes_never_panic_never_oom \
+               --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
+               --skip bounded_fetch_reassembles_to_single_pass \
+               --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
 
   # ── Stage 2b: Musl static build ───────────────────────────────────
   musl:

@@ -113,3 +113,27 @@ Harness implemented and committed on `fix/p0-sstable-memory-bounding`.
   multi-pass merge cascade (see matrix). The `repair-fuzz-known-failures` feature
   no longer gates any test — the regressions run in the default `test-generators`
   set; the feature is retained as a no-op alias for harness invocation continuity.
+
+## CI cadence (2026-06-04)
+
+The storage `tests/repair_fuzz.rs` properties each flush many real on-disk
+SSTables per case, so at a high `PROPTEST_CASES` they are filesystem-bound and
+run for minutes. They are therefore gated behind the ferrosa-storage
+`fuzz-fileio` feature (`= ["test-generators"]`, off by default):
+
+- **Local default / per-PR `ci.yml`**: excluded. The local default
+  (`cargo test --features test-generators`) compiles the harness out entirely;
+  `ci.yml` runs `--all-features` (which turns `fuzz-fileio` on) but `--skip`s the
+  property names so the per-PR gate stays fast.
+- **`nightly-fuzz.yml`**: runs deeply. The 45-min session now runs
+  `--all-features` (previously it omitted feature-gated tests, so the whole
+  harness — behind `test-generators` — was **silently skipped** in nightly); the
+  file-IO properties are excluded from that 50000-case blast and run in a
+  dedicated step at a bounded `PROPTEST_CASES=512`.
+- Run on demand:
+  `cargo test -p ferrosa-storage --features fuzz-fileio --test repair_fuzz`.
+
+The in-crate, single-case file-IO regressions in `store.rs` are **not** gated —
+only the multi-case proptest harness is. The cluster harness
+(`ferrosa-cluster/tests/repair_fuzz.rs`) is in-memory (not file-IO) and stays in
+the default gate.

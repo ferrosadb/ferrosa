@@ -26,6 +26,17 @@
 //! deep fuzz run with `PROPTEST_CASES=512` (or more) — the env var overrides the
 //! `with_cases()` default. The discovery runs for this harness used
 //! `PROPTEST_CASES=512` across every property.
+//!
+//! Gated behind the `fuzz-fileio` feature. Because every case flushes many real
+//! on-disk SSTables, a cranked `PROPTEST_CASES` makes these run for minutes — so
+//! they are excluded from the local default (`cargo test --features
+//! test-generators`) and from the per-PR CI gate, and run deeply in the
+//! nightly-fuzz workflow (`--features fuzz-fileio`, moderate `PROPTEST_CASES`).
+//! Under `--all-features` the binary compiles, so CI keeps them out by name with
+//! `--skip` (see `.github/workflows/ci.yml`); when adding a new property here,
+//! add its name to that skip list. Run locally on demand with:
+//!   cargo test -p ferrosa-storage --features fuzz-fileio --test repair_fuzz
+#![cfg(feature = "fuzz-fileio")]
 
 use std::path::Path;
 use std::sync::Arc;

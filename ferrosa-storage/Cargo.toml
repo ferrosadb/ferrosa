@@ -63,14 +63,20 @@ macos-standard-sync = []
 # crates (ferrosa-cluster) can reuse the generators without pulling proptest
 # into the production build.
 test-generators = ["dep:proptest", "ferrosa-common/test-generators"]
-# Enables the fuzz-harness assertions that currently expose an UNFIXED product
-# bug, so CI's default `cargo test` stays green while the failure is documented
-# and reproducible on demand. Off by default. Currently gates: the digest-path
-# (`walk_token_range_for_digest`) reader-count bound under full token overlap —
-# the repair Merkle build holds O(sstable_count) readers open at once instead of
-# O(fan-in), the predicted "repair full-overlap reader-count OOM (node1)" RED.
-# Run the known failures with:
-#   cargo test -p ferrosa-storage --features test-generators,repair-fuzz-known-failures
+# Gates the file-IO-heavy fuzz properties (`tests/repair_fuzz.rs`): each case
+# flushes many real on-disk SSTables, so at a high `PROPTEST_CASES` they run for
+# minutes. Off by default so the local default (`cargo test --features
+# test-generators`) and the per-PR CI gate stay fast — the deep file-IO fuzz
+# runs in the nightly-fuzz workflow (`--features fuzz-fileio`, moderate
+# `PROPTEST_CASES`). Pulls in `test-generators` (the harness needs the
+# generators). The in-crate, single-case file-IO regressions in `store.rs` are
+# NOT gated — only the multi-case proptest harness is.
+fuzz-fileio = ["test-generators"]
+# Historical no-op alias. Once gated a digest-path (`walk_token_range_for_digest`)
+# reader-count bound under full token overlap that was a known RED; that bug was
+# fixed by the multi-pass spill cascade (commit ba6eaacd) and the regressions now
+# run in the default `test-generators` set. Retained so existing invocations
+# (`--features test-generators,repair-fuzz-known-failures`) keep working.
 repair-fuzz-known-failures = ["test-generators"]
 
 [dev-dependencies]

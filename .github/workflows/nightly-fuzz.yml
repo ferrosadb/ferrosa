@@ -29,24 +29,64 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Build AssemblyScript UDF toolchain bundle
+        # --all-features enables `asc-udf` + `live-infra-tests`, which run the
+        # inline-AssemblyScript UDF tests for real against this bundle. Build it
+        # (pinned asc version) so those tests run and pass rather than fail.
+        run: bash ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
+
       - name: Run property tests (45-minute fuzz session)
         timeout-minutes: 45
         env:
           PROPTEST_CASES: 50000
+          FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
         run: |
           set +e
-          cargo test --workspace \
-            --exclude ferrosa-jepsen \
+          # --all-features so feature-gated property tests (e.g. the whole
+          # `repair_fuzz` harness behind `test-generators`) are actually fuzzed
+          # — without it they were silently skipped here. The trailing skips
+          # mirror ci.yml's heavy/live-infra exclusions (they would never finish
+          # at 50000 cases) and exclude the file-IO-heavy repair fuzz
+          # (`fuzz-fileio`), which gets its own bounded step below.
+          # Crate excludes + skip list mirror ci.yml's proven --all-features run
+          # (jepsen/loadgen excluded; live-infra + heavy tests skipped by name);
+          # the file-IO repair fuzz is skipped here and run in the step below.
+          cargo test --all-features --workspace --lib --tests \
+            --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering --skip disk_fail_no_phantom \
                --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
                --skip clock_skew_large_preaccept \
-               --skip binary_ --skip ucs_load_s3_ \
-               --skip ucs_load_read_heavy --skip ucs_load_balanced --skip ucs_load_write_heavy \
+               --skip binary_ \
+               --skip concurrent_write --skip many_flushes \
+               --skip flush_2000 --skip single_writer --skip write_flush_compact \
+               --skip reads_never_panic_on_arbitrary_content \
+               --skip corrupt_sstable_bytes_never_panic_never_oom \
+               --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
+               --skip bounded_fetch_reassembles_to_single_pass \
+               --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           echo "$status" > cargo-test-status
+          exit 0
+        continue-on-error: true
+
+      - name: Run file-IO repair fuzz (bounded cases)
+        timeout-minutes: 30
+        env:
+          # Each case flushes many real on-disk SSTables, so this harness is
+          # filesystem-bound — run it at a moderate case count, not 50000.
+          PROPTEST_CASES: 512
+        run: |
+          set +e
+          cargo test -p ferrosa-storage --features fuzz-fileio --test repair_fuzz \
+            2>&1 | tee -a test-output.log
+          status=${PIPESTATUS[0]}
+          # Fold this run's status into the aggregate so a file-IO regression is
+          # not lost; non-zero from either fuzz step marks the session failed.
+          prev=$(cat cargo-test-status 2>/dev/null || echo 0)
+          if [ "$status" != "0" ]; then echo "$status" > cargo-test-status; else echo "$prev" > cargo-test-status; fi
           exit 0
         continue-on-error: true
 
