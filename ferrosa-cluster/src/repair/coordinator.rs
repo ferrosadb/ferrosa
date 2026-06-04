@@ -209,7 +209,7 @@ impl RepairCoordinator {
 /// replica set for `rf`. For the wrap-around segment (last token → first
 /// token via i64::MIN/MAX), we emit TWO ranges so callers don't have to
 /// special-case it.
-fn owned_token_ranges(ring: &TokenRing, local_node_id: u64, rf: usize) -> Vec<(i64, i64)> {
+pub(crate) fn owned_token_ranges(ring: &TokenRing, local_node_id: u64, rf: usize) -> Vec<(i64, i64)> {
     let mut all_tokens: Vec<i64> = ring
         .node_ids()
         .iter()
