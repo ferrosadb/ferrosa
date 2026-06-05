@@ -28,6 +28,7 @@ pub(super) enum PeerEventAction {
         host_id: Uuid,
         addr: SocketAddr,
         cql_broadcast: Option<String>,
+        internode_broadcast: Option<String>,
     },
     SendClusterInvite {
         host_id: Uuid,
@@ -51,6 +52,7 @@ pub(super) struct PeerConnectPlanInput {
     pub(super) last_invite_sent: Option<Instant>,
     pub(super) now: Instant,
     pub(super) cql_broadcast: Option<String>,
+    pub(super) internode_broadcast: Option<String>,
 }
 
 #[cfg(test)]
@@ -64,6 +66,7 @@ pub(super) struct ConnectedPeerInput {
     pub(super) join_enqueued: bool,
     pub(super) last_reconnect_invite_sent: Option<Instant>,
     pub(super) cql_broadcast: Option<String>,
+    pub(super) internode_broadcast: Option<String>,
     pub(super) now: Instant,
 }
 
@@ -100,6 +103,7 @@ pub(super) fn plan_connected_peer(input: ConnectedPeerInput) -> ConnectedPeerPla
             last_invite_sent: input.last_reconnect_invite_sent,
             now: input.now,
             cql_broadcast: input.cql_broadcast,
+            internode_broadcast: input.internode_broadcast,
         })
         .into_iter()
         .filter(|action| !matches!(action, PeerEventAction::TrackPeer { .. }))
@@ -129,6 +133,7 @@ pub(super) fn plan_peer_connected(input: PeerConnectPlanInput) -> Vec<PeerEventA
                 host_id: input.host_id,
                 addr: input.addr,
                 cql_broadcast: input.cql_broadcast,
+                internode_broadcast: input.internode_broadcast,
             });
             if should_send_cluster_invite(input.join_enqueued, input.last_invite_sent, input.now) {
                 actions.push(PeerEventAction::SendClusterInvite {
@@ -229,6 +234,7 @@ mod tests {
             last_invite_sent: None,
             now,
             cql_broadcast: Some("127.0.0.1:9043".to_string()),
+            internode_broadcast: Some("peer-node:7001".to_string()),
         });
 
         assert_eq!(
@@ -242,6 +248,7 @@ mod tests {
                     host_id: peer,
                     addr: addr(7001),
                     cql_broadcast: Some("127.0.0.1:9043".to_string()),
+                    internode_broadcast: Some("peer-node:7001".to_string()),
                 },
                 PeerEventAction::SendClusterInvite {
                     host_id: peer,
@@ -267,12 +274,14 @@ mod tests {
             last_invite_sent: Some(now),
             now,
             cql_broadcast: None,
+            internode_broadcast: None,
         });
 
         assert!(actions.contains(&PeerEventAction::TriggerClusterJoin {
             host_id: peer,
             addr: addr(7001),
             cql_broadcast: None,
+            internode_broadcast: None,
         }));
         assert!(
             !actions.iter().any(|action| matches!(
@@ -301,6 +310,7 @@ mod tests {
             last_invite_sent: None,
             now,
             cql_broadcast: None,
+            internode_broadcast: None,
         });
         assert!(!no_quorum.contains(&PeerEventAction::RestoreClusterMode));
 
@@ -315,6 +325,7 @@ mod tests {
             last_invite_sent: None,
             now,
             cql_broadcast: None,
+            internode_broadcast: None,
         });
         assert!(quorum.contains(&PeerEventAction::RestoreClusterMode));
     }

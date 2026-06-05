@@ -459,7 +459,13 @@ impl PeerEventListener for NoopPeerListener {
 }
 
 impl InboundPeerCallback for NoopPeerListener {
-    fn on_inbound_peer(&self, _peer_id: PeerId, _cql_broadcast: Option<String>) {}
+    fn on_inbound_peer(
+        &self,
+        _peer_id: PeerId,
+        _cql_broadcast: Option<String>,
+        _internode_broadcast: Option<String>,
+    ) {
+    }
 }
 
 struct RemoteAnchorHandler {

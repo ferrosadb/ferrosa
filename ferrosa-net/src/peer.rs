@@ -32,6 +32,9 @@ pub struct PeerManager {
     listener: Arc<dyn PeerEventListener>,
     /// CQL broadcast addresses learned from peer handshakes.
     peer_cql_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
+    /// Internode broadcast hostnames learned from peer handshakes. Used so the
+    /// committed `NodeInfo.addr` is a re-resolvable hostname, not a frozen IP.
+    peer_internode_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
     raft_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
     data_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
     started_at: tokio::time::Instant,
@@ -76,6 +79,7 @@ impl PeerManager {
             peers: RwLock::new(HashMap::new()),
             listener,
             peer_cql_broadcasts: RwLock::new(HashMap::new()),
+            peer_internode_broadcasts: RwLock::new(HashMap::new()),
             raft_runtime: OnceLock::new(),
             data_runtime: OnceLock::new(),
             started_at: tokio::time::Instant::now(),
@@ -128,6 +132,14 @@ impl PeerManager {
         // Extract the peer's CQL broadcast from the handshake before wrapping in Arc.
         if let Some(broadcast) = pool.peer_cql_broadcast() {
             self.peer_cql_broadcasts
+                .write()
+                .await
+                .insert(host_id, broadcast.to_string());
+        }
+        // Same for the internode broadcast hostname — committed into NodeInfo.addr
+        // so the address re-resolves across container IP churn.
+        if let Some(broadcast) = pool.peer_internode_broadcast() {
+            self.peer_internode_broadcasts
                 .write()
                 .await
                 .insert(host_id, broadcast.to_string());
@@ -403,6 +415,10 @@ impl PeerManager {
     pub async fn remove_peer(&self, host_id: uuid::Uuid) {
         let removed = self.peers.write().await.remove(&host_id);
         self.peer_cql_broadcasts.write().await.remove(&host_id);
+        self.peer_internode_broadcasts
+            .write()
+            .await
+            .remove(&host_id);
         if let Some(state) = removed {
             self.listener.on_peer_disconnected(state.peer_id);
         }
@@ -422,6 +438,32 @@ impl PeerManager {
     /// Returns None if the lock is contended.
     pub fn get_peer_cql_broadcast_sync(&self, host_id: uuid::Uuid) -> Option<String> {
         self.peer_cql_broadcasts
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.get(&host_id).cloned())
+    }
+
+    /// Store a peer's internode broadcast hostname learned during handshake.
+    pub async fn set_peer_internode_broadcast(&self, host_id: uuid::Uuid, addr: String) {
+        self.peer_internode_broadcasts
+            .write()
+            .await
+            .insert(host_id, addr);
+    }
+
+    /// Retrieve a peer's internode broadcast hostname (if known from handshake).
+    pub async fn get_peer_internode_broadcast(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_internode_broadcasts
+            .read()
+            .await
+            .get(&host_id)
+            .cloned()
+    }
+
+    /// Non-blocking version for synchronous contexts (e.g., the cluster-mode
+    /// peer-connected planner). Returns None if the lock is contended.
+    pub fn get_peer_internode_broadcast_sync(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_internode_broadcasts
             .try_read()
             .ok()
             .and_then(|guard| guard.get(&host_id).cloned())

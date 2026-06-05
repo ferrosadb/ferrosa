@@ -18,7 +18,12 @@ use crate::task_pool::TaskPool;
 
 /// Callback invoked when the server accepts an inbound peer connection.
 pub trait InboundPeerCallback: Send + Sync {
-    fn on_inbound_peer(&self, peer_id: PeerId, cql_broadcast: Option<String>);
+    fn on_inbound_peer(
+        &self,
+        peer_id: PeerId,
+        cql_broadcast: Option<String>,
+        internode_broadcast: Option<String>,
+    );
 }
 
 pub struct RpcServer {
@@ -253,6 +258,7 @@ impl RpcServer {
                             accepted: false,
                             reason: "overloaded".to_string(),
                             cql_broadcast: None,
+                            internode_broadcast: None,
                         };
                         let mut body = bytes::BytesMut::new();
                         if ack.encode(&mut body).is_ok() {
@@ -315,19 +321,19 @@ impl RpcServer {
         let mut framed = Framed::new(stream, InternodeCodec::new(self.config.max_frame_body_size));
 
         // Handshake with timeout (T5)
-        let (peer_host_id, peer_cql_broadcast) = tokio::time::timeout(
+        let peer = tokio::time::timeout(
             self.config.handshake_timeout,
             accept_handshake(&mut framed, &self.config, self.local_host_id),
         )
         .await
         .map_err(|_| NetError::Timeout("handshake".into()))??;
 
-        let peer_id = (peer_host_id, peer_addr);
+        let peer_id = (peer.host_id, peer_addr);
         tracing::info!(?peer_id, "peer connected (inbound)");
 
         // Notify callback about inbound peer
         if let Some(cb) = &self.inbound_callback {
-            cb.on_inbound_peer(peer_id, peer_cql_broadcast);
+            cb.on_inbound_peer(peer_id, peer.cql_broadcast, peer.internode_broadcast);
         }
 
         // Concurrent frame handling: split read/write, dispatch handlers
@@ -461,10 +467,10 @@ mod tests {
         let client_id = uuid::Uuid::new_v4();
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
-        let (peer, _cql_broadcast) = initiate_handshake(&mut framed, &config, client_id)
+        let peer = initiate_handshake(&mut framed, &config, client_id)
             .await
             .unwrap();
-        assert_eq!(peer, server_id);
+        assert_eq!(peer.host_id, server_id);
     }
 
     #[tokio::test]
