@@ -110,6 +110,39 @@ podman compose version        # full Podman stack only</code></pre>
 ollama list | grep nomic-embed-text-v2-moe</code></pre>
   <div class="warn">If embeddings are skipped, lexical/phonetic search still works, but semantic/vector search quality is degraded.</div>
 
+  <h2>0.13 retrieval defaults</h2>
+  <p>The 0.13 preview keeps live agent turns compact while eval runs use wider candidate generation.</p>
+  <pre><code>[retrieval]
+default_limit = 10
+
+[embeddings]
+provider = "ollama"
+model = "nomic-embed-text-v2-moe"
+dimensions = 768
+
+[eval]
+retrieval_k = 25</code></pre>
+  <p><code>default_limit = 10</code> is used when an agent omits <code>limit</code> or <code>k</code>. Lower it with the <code>config</code> MCP tool if memory results are consuming too much context. Eval runs should widen candidate generation in the harness instead of raising the live default.</p>
+  <p>Best-known BRIGHT-Pro support-doc-closed MCP slice profile for 0.13:</p>
+  <pre><code>candidate_limit=50
+fusion_profile=all
+query_decomposition=llm
+query_task=bright_pro
+query_variant_limit=5
+query_embed_variants=true
+chunk_expansion=none
+rerank=false</code></pre>
+  <p>On the 200-document biology support-closed slice this measured alpha_nDCG <code>0.816</code>, NDCG <code>0.799</code>, aspect_recall <code>0.940</code>, and recall <code>0.796</code>. These are preview slice numbers; full-corpus paper comparisons require the full corpus to be ingested through the same MCP path.</p>
+
+  <h3>Optional live judge/reranker</h3>
+  <pre><code>[judge]
+enabled = false
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+timeout_seconds = 60</code></pre>
+  <p>Keep live judge disabled unless a local or remote model endpoint is available. Judge failures and no-decisions are recorded as abstentions, while agent/user feedback can use compact <code>+1</code> and <code>-1</code> item scores to tune future rankings by workspace, query shape, and retrieval channel.</p>
+
   <h3>3. Clone the public repositories, if contributing from source</h3>
   <pre><code>mkdir -p ~/src/ferrosa-suite
 cd ~/src/ferrosa-suite
@@ -204,6 +237,27 @@ curl -sS -u ferrosa_user:ferrosa_user \
     "expand": {"prev": 1, "next": 1, "max_tokens": 2000}
   }
 }</code></pre>
+
+  <h2>Workbench, hooks, and evals</h2>
+  <p>The workbench at <code>http://127.0.0.1:18765/</code> includes CQL, SPARQL, Datalog, graph/viz, aliases, rules, approvals, explanations, and Judge Config pages. Use the separate viz page at <code>http://127.0.0.1:18766/viz</code> to inspect linked entities and graph neighborhoods.</p>
+  <p>The onboarding flow can install Codex, Claude, and Hermes hooks. Hooks capture session turns, working directory metadata, and compact retrieval feedback so memories learned in a repository can be preferred when future agents work from the same directory.</p>
+  <pre><code>cd ~/src/ferrosa-suite/ferrosa-memory
+./setup.sh --harness auto
+
+# or run only hook installation
+python3 scripts/install-agent-hooks.py --harness auto --verify</code></pre>
+  <p>Agents should call <code>feedback</code> after retrieval when they can judge returned items: <code>1</code> for useful, <code>-1</code> for irrelevant or wrong, <code>0</code> for neutral, and <code>"-"</code> when a judge abstains or fails.</p>
+  <pre><code># deterministic harness smoke test
+scripts/run-official-evals.sh --self-test
+
+# tune MCP fusion/decomposition profiles
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_EMBED_VARIANTS=true \
+scripts/run-fusion-ablations.sh
+
+# start a resumable full-corpus BRIGHT-Pro MCP ingest
+scripts/start-bright-pro-full-load.sh</code></pre>
+  <p>The full-corpus loader writes <code>heartbeat.json</code>, <code>progress.json</code>, and <code>load.log</code> under <code>diagnostics/eval-runs/...</code> so long runs can be monitored or resumed without attaching to a terminal.</p>
 
   <h2>Operate safely</h2>
   <p>Stop and start without deleting data:</p>
