@@ -46,6 +46,8 @@ pub struct PriorityPool {
     resolved_addr: SocketAddr,
     /// Peer's CQL broadcast address from handshake (if provided).
     peer_cql_broadcast: Option<String>,
+    /// Peer's internode broadcast hostname from handshake (if provided).
+    peer_internode_broadcast: Option<String>,
     raft: LaneHandle,
     data: LaneHandle,
     bulk: LaneHandle,
@@ -147,6 +149,7 @@ impl PriorityPool {
 
         let peer_host_id = raft_client.peer_host_id();
         let peer_cql_broadcast = raft_client.peer_cql_broadcast().map(String::from);
+        let peer_internode_broadcast = raft_client.peer_internode_broadcast().map(String::from);
         let peer_host = peer_host.to_owned();
 
         // Spawn a lane actor for each connection.  The ctx_builder closure
@@ -221,6 +224,7 @@ impl PriorityPool {
             peer_host_id,
             resolved_addr: peer_addr,
             peer_cql_broadcast,
+            peer_internode_broadcast,
             raft,
             data,
             bulk,
@@ -235,6 +239,11 @@ impl PriorityPool {
     /// Peer's CQL broadcast address from the handshake, if provided.
     pub fn peer_cql_broadcast(&self) -> Option<&str> {
         self.peer_cql_broadcast.as_deref()
+    }
+
+    /// Peer's internode broadcast hostname from the handshake, if provided.
+    pub fn peer_internode_broadcast(&self) -> Option<&str> {
+        self.peer_internode_broadcast.as_deref()
     }
 
     /// The socket address resolved during the initial connection.

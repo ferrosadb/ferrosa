@@ -48,6 +48,12 @@ pub struct NetConfig {
     /// CQL broadcast address advertised to peers during handshake.
     /// Peers use this for `system.peers.native_address`.
     pub cql_broadcast: Option<String>,
+    /// Raw, unresolved internode broadcast target (hostname:port) advertised to
+    /// peers during the handshake. Unlike [`Self::broadcast_addr`], this preserves
+    /// the configured `FERROSA_INTERNODE_BROADCAST` hostname so peers store the
+    /// hostname (not a startup-frozen IP) in `NodeInfo.addr` and re-resolve it on
+    /// every reconnect — handling container IP churn without stale membership.
+    pub internode_broadcast: Option<String>,
 }
 
 impl Default for NetConfig {
@@ -76,6 +82,7 @@ impl Default for NetConfig {
             tls_ca_path: None,
             require_tls: false,
             cql_broadcast: None,
+            internode_broadcast: None,
         }
     }
 }
@@ -105,6 +112,18 @@ impl NetConfig {
             .map(Duration::from_millis)
     }
 
+    /// The internode address this node advertises to peers for `NodeInfo.addr`.
+    ///
+    /// Prefers the raw, re-resolvable [`Self::internode_broadcast`] hostname when
+    /// configured; otherwise falls back to the resolved [`Self::broadcast_addr`].
+    /// Storing the hostname lets peers re-resolve it on every reconnect, so a
+    /// container IP change is handled without stale committed membership.
+    pub fn advertised_internode_addr(&self) -> String {
+        self.internode_broadcast
+            .clone()
+            .unwrap_or_else(|| self.broadcast_addr.to_string())
+    }
+
     pub fn lane_timeout(&self, lane: Lane) -> Duration {
         match lane {
             Lane::Raft => self.raft_lane_timeout,
@@ -125,6 +144,13 @@ impl NetConfig {
         if let Ok(v) = std::env::var("FERROSA_INTERNODE_BROADCAST") {
             if let Some(addr) = Self::parse_socket_addr(&v) {
                 cfg.broadcast_addr = addr;
+            }
+            // Preserve the RAW (unresolved) hostname:port so it can be advertised
+            // to peers and re-resolved on every reconnect. We keep it even for IP
+            // literals — harmless, since re-resolving an IP is a no-op.
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                cfg.internode_broadcast = Some(trimmed.to_string());
             }
         }
         if let Ok(v) = std::env::var("FERROSA_SEED") {

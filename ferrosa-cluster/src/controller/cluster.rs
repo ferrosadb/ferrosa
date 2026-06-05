@@ -252,6 +252,7 @@ pub fn partition_peers_by_dc(
     (local, others)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_recovered_topology_refresh_plan(
     local_host_id: uuid::Uuid,
     local_addr: String,
@@ -260,6 +261,7 @@ pub(super) fn build_recovered_topology_refresh_plan(
     rack: &str,
     peers: &[(uuid::Uuid, SocketAddr)],
     peer_cql_broadcasts: &std::collections::HashMap<uuid::Uuid, Option<String>>,
+    peer_internode_broadcasts: &std::collections::HashMap<uuid::Uuid, Option<String>>,
 ) -> Vec<crate::raft::NodeInfo> {
     let mut plan = Vec::with_capacity(peers.len() + 1);
     plan.push(crate::raft::NodeInfo {
@@ -271,9 +273,14 @@ pub(super) fn build_recovered_topology_refresh_plan(
         cql_broadcast: local_cql_broadcast,
     });
     for (peer_uuid, addr) in peers {
+        // Prefer the re-resolvable advertised internode hostname; fall back to
+        // the observed connection IP only when no hostname was advertised.
+        let peer_internode_broadcast = peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
+        let node_addr =
+            super::membership::node_info_addr(*addr, peer_internode_broadcast.as_deref());
         plan.push(crate::raft::NodeInfo {
             host_id: *peer_uuid,
-            addr: addr.to_string(),
+            addr: node_addr,
             data_center: data_center.to_string(),
             rack: rack.to_string(),
             state: crate::raft::NodeState::Normal,
@@ -528,6 +535,18 @@ impl ModeController {
                 )
             })
             .collect();
+        // Parallel map of advertised internode-broadcast hostnames so the
+        // recovered-topology refresh commits re-resolvable hostnames (not frozen
+        // IPs) for peers, matching what trigger_cluster_join commits on join.
+        let peer_internode_broadcasts: std::collections::HashMap<Uuid, Option<String>> = peers
+            .iter()
+            .map(|(peer_uuid, _)| {
+                (
+                    *peer_uuid,
+                    peer_manager.get_peer_internode_broadcast_sync(*peer_uuid),
+                )
+            })
+            .collect();
 
         // Determine whether this node is the seed (responsible for calling
         // raft.initialize()). The seed is the node with the highest UUID among
@@ -710,7 +729,10 @@ impl ModeController {
         let peer_manager_for_ddl = peer_manager.clone();
         let peer_manager_for_bootstrap = peer_manager.clone();
         let local_host_id_for_refresh = self.local_host_id;
-        let local_addr_for_refresh = self.net_config.broadcast_addr.to_string();
+        // Advertise the re-resolvable internode-broadcast HOSTNAME (when configured)
+        // as this node's own NodeInfo.addr, so the seed/self membership entry is not
+        // frozen to the startup IP and re-resolves across container IP churn.
+        let local_addr_for_refresh = self.net_config.advertised_internode_addr();
         let local_raft_addr_for_init = self.net_config.broadcast_addr;
         let local_cql_broadcast_for_refresh = self.config.cql_broadcast.clone();
 
@@ -732,8 +754,9 @@ impl ModeController {
         } else {
             let mut ring = TokenRing::new();
 
-            // Add local node
-            let broadcast = self.net_config.broadcast_addr.to_string();
+            // Add local node — use the re-resolvable internode-broadcast hostname
+            // (when configured) so the seed entry survives container IP churn.
+            let broadcast = self.net_config.advertised_internode_addr();
             ring.add_node(
                 local_node_id,
                 NodeInfo {
@@ -749,11 +772,16 @@ impl ModeController {
             // Add peers
             for (peer_uuid, addr) in &peers {
                 let peer_node_id = uuid_to_node_id(*peer_uuid);
+                let peer_internode_broadcast =
+                    peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
                 ring.add_node(
                     peer_node_id,
                     NodeInfo {
                         host_id: *peer_uuid,
-                        addr: addr.to_string(),
+                        addr: super::membership::node_info_addr(
+                            *addr,
+                            peer_internode_broadcast.as_deref(),
+                        ),
                         data_center: self.config.data_center.clone(),
                         rack: self.config.rack.clone(),
                         state: NodeState::Normal,
@@ -1574,6 +1602,7 @@ impl ModeController {
                             &config_for_promotion.rack,
                             &peers,
                             &peer_cql_broadcasts,
+                            &peer_internode_broadcasts,
                         );
                         let desired_raft_members = build_raft_members_from_node_info(&refresh_plan);
                         let raft_for_membership_repair = raft_arc.clone();
@@ -1637,6 +1666,7 @@ impl ModeController {
                             &config_for_promotion.rack,
                             &peers,
                             &peer_cql_broadcasts,
+                            &peer_internode_broadcasts,
                         );
                         let token_repair_plan = build_recovered_topology_token_repair_plan(
                             &refresh_plan,
@@ -1735,9 +1765,14 @@ impl ModeController {
 
                         for (peer_uuid, addr) in &peers {
                             let peer_node_id = uuid_to_node_id(*peer_uuid);
+                            let peer_internode_broadcast =
+                                peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
                             let node_info = crate::raft::NodeInfo {
                                 host_id: *peer_uuid,
-                                addr: addr.to_string(),
+                                addr: super::membership::node_info_addr(
+                                    *addr,
+                                    peer_internode_broadcast.as_deref(),
+                                ),
                                 data_center: config_for_promotion.data_center.clone(),
                                 rack: config_for_promotion.rack.clone(),
                                 state: crate::raft::NodeState::Normal,

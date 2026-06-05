@@ -14,6 +14,18 @@ type HmacSha256 = Hmac<Sha256>;
 /// Current protocol version.
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Peer metadata learned from a completed handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakePeer {
+    /// The peer's stable host UUID.
+    pub host_id: Uuid,
+    /// The peer's advertised CQL broadcast address (host:port), if any.
+    pub cql_broadcast: Option<String>,
+    /// The peer's advertised internode broadcast hostname (host:port), if any.
+    /// When present, this is the re-resolvable target stored in `NodeInfo.addr`.
+    pub internode_broadcast: Option<String>,
+}
+
 /// Compute PSK auth token: HMAC-SHA256(key=psk, data=cluster_name|host_id|nonce).
 pub fn compute_auth_token(cluster_name: &str, host_id: &Uuid, nonce: u64, psk: &str) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(psk.as_bytes()).expect("HMAC accepts any key length");
@@ -40,12 +52,12 @@ pub fn verify_auth_token(
 
 /// Run initiator side of handshake over a framed connection.
 ///
-/// Returns `(peer_host_id, peer_cql_broadcast)` on success.
+/// Returns the peer's [`HandshakePeer`] metadata on success.
 pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     framed: &mut Framed<T, InternodeCodec>,
     config: &NetConfig,
     local_host_id: Uuid,
-) -> Result<(Uuid, Option<String>)> {
+) -> Result<HandshakePeer> {
     use futures::{SinkExt, StreamExt};
 
     let nonce: u64 = rand::random();
@@ -66,6 +78,7 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         supported_compression: vec![0],
         auth_token,
         cql_broadcast: config.cql_broadcast.clone(),
+        internode_broadcast: config.internode_broadcast.clone(),
     };
     let mut body = BytesMut::new();
     handshake.encode(&mut body)?;
@@ -93,10 +106,15 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             accepted,
             reason,
             cql_broadcast,
+            internode_broadcast,
             ..
         } => {
             if accepted {
-                Ok((host_id, cql_broadcast))
+                Ok(HandshakePeer {
+                    host_id,
+                    cql_broadcast,
+                    internode_broadcast,
+                })
             } else {
                 Err(NetError::HandshakeFailed(reason))
             }
@@ -107,12 +125,12 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
 
 /// Run acceptor side of handshake over a framed connection.
 ///
-/// Returns `(peer_host_id, peer_cql_broadcast)` on success.
+/// Returns the peer's [`HandshakePeer`] metadata on success.
 pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     framed: &mut Framed<T, InternodeCodec>,
     config: &NetConfig,
     local_host_id: Uuid,
-) -> Result<(Uuid, Option<String>)> {
+) -> Result<HandshakePeer> {
     use futures::StreamExt;
 
     let hs_frame = framed
@@ -121,13 +139,21 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
         .ok_or_else(|| NetError::HandshakeFailed("connection closed".into()))??;
     let hs = Message::decode(hs_frame.header.msg_type, &mut hs_frame.body.clone())?;
 
-    let (peer_host_id, peer_cluster, peer_version, peer_token, peer_cql_broadcast) = match hs {
+    let (
+        peer_host_id,
+        peer_cluster,
+        peer_version,
+        peer_token,
+        peer_cql_broadcast,
+        peer_internode_broadcast,
+    ) = match hs {
         Message::Handshake {
             cluster_name,
             host_id,
             protocol_version,
             auth_token,
             cql_broadcast,
+            internode_broadcast,
             ..
         } => (
             host_id,
@@ -135,6 +161,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             protocol_version,
             auth_token,
             cql_broadcast,
+            internode_broadcast,
         ),
         _ => return Err(NetError::Protocol("expected Handshake".into())),
     };
@@ -144,21 +171,44 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             "cluster mismatch: expected '{}', got '{}'",
             config.cluster_name, peer_cluster
         );
-        send_handshake_ack(framed, local_host_id, false, &reason, &config.cql_broadcast).await?;
+        send_handshake_ack(
+            framed,
+            local_host_id,
+            false,
+            &reason,
+            &config.cql_broadcast,
+            &config.internode_broadcast,
+        )
+        .await?;
         return Err(NetError::HandshakeFailed(reason));
     }
 
     if peer_version != PROTOCOL_VERSION {
         let reason = format!("unsupported protocol version: {}", peer_version);
-        send_handshake_ack(framed, local_host_id, false, &reason, &config.cql_broadcast).await?;
+        send_handshake_ack(
+            framed,
+            local_host_id,
+            false,
+            &reason,
+            &config.cql_broadcast,
+            &config.internode_broadcast,
+        )
+        .await?;
         return Err(NetError::HandshakeFailed(reason));
     }
 
     if let Some(psk) = &config.psk {
         if peer_token.len() < 40 {
             let reason = "auth token too short".to_string();
-            send_handshake_ack(framed, local_host_id, false, &reason, &config.cql_broadcast)
-                .await?;
+            send_handshake_ack(
+                framed,
+                local_host_id,
+                false,
+                &reason,
+                &config.cql_broadcast,
+                &config.internode_broadcast,
+            )
+            .await?;
             return Err(NetError::HandshakeFailed(reason));
         }
         let nonce = u64::from_be_bytes(peer_token[..8].try_into().unwrap());
@@ -170,14 +220,33 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             &peer_token[8..],
         ) {
             let reason = "PSK authentication failed".to_string();
-            send_handshake_ack(framed, local_host_id, false, &reason, &config.cql_broadcast)
-                .await?;
+            send_handshake_ack(
+                framed,
+                local_host_id,
+                false,
+                &reason,
+                &config.cql_broadcast,
+                &config.internode_broadcast,
+            )
+            .await?;
             return Err(NetError::HandshakeFailed(reason));
         }
     }
 
-    send_handshake_ack(framed, local_host_id, true, "", &config.cql_broadcast).await?;
-    Ok((peer_host_id, peer_cql_broadcast))
+    send_handshake_ack(
+        framed,
+        local_host_id,
+        true,
+        "",
+        &config.cql_broadcast,
+        &config.internode_broadcast,
+    )
+    .await?;
+    Ok(HandshakePeer {
+        host_id: peer_host_id,
+        cql_broadcast: peer_cql_broadcast,
+        internode_broadcast: peer_internode_broadcast,
+    })
 }
 
 async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
@@ -186,6 +255,7 @@ async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     accepted: bool,
     reason: &str,
     cql_broadcast: &Option<String>,
+    internode_broadcast: &Option<String>,
 ) -> Result<()> {
     use futures::SinkExt;
     let ack = Message::HandshakeAck {
@@ -195,6 +265,7 @@ async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
         accepted,
         reason: reason.to_string(),
         cql_broadcast: cql_broadcast.clone(),
+        internode_broadcast: internode_broadcast.clone(),
     };
     let mut body = BytesMut::new();
     ack.encode(&mut body)?;
@@ -245,8 +316,8 @@ mod tests {
         let server_fut = accept_handshake(&mut server_framed, &config, server_id);
 
         let (client_res, server_res) = tokio::join!(client_fut, server_fut);
-        assert_eq!(client_res.unwrap().0, server_id);
-        assert_eq!(server_res.unwrap().0, client_id);
+        assert_eq!(client_res.unwrap().host_id, server_id);
+        assert_eq!(server_res.unwrap().host_id, client_id);
     }
 
     #[tokio::test]
@@ -309,8 +380,8 @@ mod tests {
         let server_fut = accept_handshake(&mut server_framed, &config, server_id);
 
         let (client_res, server_res) = tokio::join!(client_fut, server_fut);
-        assert_eq!(client_res.unwrap().0, server_id);
-        assert_eq!(server_res.unwrap().0, client_id);
+        assert_eq!(client_res.unwrap().host_id, server_id);
+        assert_eq!(server_res.unwrap().host_id, client_id);
     }
 
     #[tokio::test]
@@ -337,13 +408,52 @@ mod tests {
         let server_fut = accept_handshake(&mut server_framed, &server_config, server_id);
 
         let (client_res, server_res) = tokio::join!(client_fut, server_fut);
-        let (peer_id, peer_broadcast) = client_res.unwrap();
-        assert_eq!(peer_id, server_id);
-        assert_eq!(peer_broadcast, Some("server-host:19042".into()));
+        let client_peer = client_res.unwrap();
+        assert_eq!(client_peer.host_id, server_id);
+        assert_eq!(client_peer.cql_broadcast, Some("server-host:19042".into()));
 
-        let (peer_id, peer_broadcast) = server_res.unwrap();
-        assert_eq!(peer_id, client_id);
-        assert_eq!(peer_broadcast, Some("client-host:19042".into()));
+        let server_peer = server_res.unwrap();
+        assert_eq!(server_peer.host_id, client_id);
+        assert_eq!(server_peer.cql_broadcast, Some("client-host:19042".into()));
+    }
+
+    #[tokio::test]
+    async fn handshake_exchanges_internode_broadcast() {
+        let (client_io, server_io) = duplex(8192);
+        let mut client_config = test_config("ferrosa", None);
+        client_config.internode_broadcast = Some("client-node:17000".into());
+        let mut server_config = test_config("ferrosa", None);
+        server_config.internode_broadcast = Some("server-node:17000".into());
+
+        let client_id = Uuid::new_v4();
+        let server_id = Uuid::new_v4();
+
+        let mut client_framed = Framed::new(
+            client_io,
+            InternodeCodec::new(client_config.max_frame_body_size),
+        );
+        let mut server_framed = Framed::new(
+            server_io,
+            InternodeCodec::new(server_config.max_frame_body_size),
+        );
+
+        let client_fut = initiate_handshake(&mut client_framed, &client_config, client_id);
+        let server_fut = accept_handshake(&mut server_framed, &server_config, server_id);
+
+        let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+        let client_peer = client_res.unwrap();
+        assert_eq!(client_peer.host_id, server_id);
+        assert_eq!(
+            client_peer.internode_broadcast,
+            Some("server-node:17000".into())
+        );
+
+        let server_peer = server_res.unwrap();
+        assert_eq!(server_peer.host_id, client_id);
+        assert_eq!(
+            server_peer.internode_broadcast,
+            Some("client-node:17000".into())
+        );
     }
 
     #[tokio::test]
@@ -363,13 +473,15 @@ mod tests {
         let server_fut = accept_handshake(&mut server_framed, &config, server_id);
 
         let (client_res, server_res) = tokio::join!(client_fut, server_fut);
-        let (peer_id, peer_broadcast) = client_res.unwrap();
-        assert_eq!(peer_id, server_id);
-        assert_eq!(peer_broadcast, None);
+        let client_peer = client_res.unwrap();
+        assert_eq!(client_peer.host_id, server_id);
+        assert_eq!(client_peer.cql_broadcast, None);
+        assert_eq!(client_peer.internode_broadcast, None);
 
-        let (peer_id, peer_broadcast) = server_res.unwrap();
-        assert_eq!(peer_id, client_id);
-        assert_eq!(peer_broadcast, None);
+        let server_peer = server_res.unwrap();
+        assert_eq!(server_peer.host_id, client_id);
+        assert_eq!(server_peer.cql_broadcast, None);
+        assert_eq!(server_peer.internode_broadcast, None);
     }
 
     #[tokio::test]
@@ -386,6 +498,7 @@ mod tests {
             supported_compression: vec![0],
             auth_token: vec![],
             cql_broadcast: None,
+            internode_broadcast: None,
         };
         use futures::SinkExt;
         let mut body = BytesMut::new();

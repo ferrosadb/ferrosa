@@ -20,12 +20,28 @@ fn clear_pending_join(pending_joins: &Arc<Mutex<Vec<Uuid>>>, host_id: Uuid) {
     pending.retain(|id| *id != host_id);
 }
 
+/// Resolve the value stored in `NodeInfo.addr` for a peer.
+///
+/// Prefers the peer's advertised internode-broadcast HOSTNAME so the committed
+/// membership/token-ring entry re-resolves on every reconnect (handling
+/// container IP churn). Falls back to the observed connection `SocketAddr` (a
+/// resolved IP literal) only when no hostname was advertised.
+pub(super) fn node_info_addr(
+    addr: std::net::SocketAddr,
+    internode_broadcast: Option<&str>,
+) -> String {
+    match internode_broadcast {
+        Some(host) if !host.trim().is_empty() => host.to_string(),
+        _ => addr.to_string(),
+    }
+}
+
 fn cluster_member_metadata_changed(
     current: &NodeInfo,
-    addr: std::net::SocketAddr,
+    desired_addr: &str,
     cql_broadcast: Option<&str>,
 ) -> bool {
-    if current.addr != addr.to_string() {
+    if current.addr != desired_addr {
         return true;
     }
 
@@ -36,6 +52,7 @@ fn cluster_member_metadata_changed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_existing_member_metadata_to_ring(
     ring_holder: &Arc<ArcSwap<Option<Arc<TokenRing>>>>,
     peer_node_id: u64,
@@ -43,10 +60,11 @@ fn apply_existing_member_metadata_to_ring(
     host_id: Uuid,
     addr: std::net::SocketAddr,
     cql_broadcast: Option<String>,
+    internode_broadcast: Option<String>,
 ) -> bool {
-    let desired_addr = addr.to_string();
+    let desired_addr = node_info_addr(addr, internode_broadcast.as_deref());
     let desired_cql_broadcast = cql_broadcast.or_else(|| existing.cql_broadcast.clone());
-    if !cluster_member_metadata_changed(existing, addr, desired_cql_broadcast.as_deref()) {
+    if !cluster_member_metadata_changed(existing, &desired_addr, desired_cql_broadcast.as_deref()) {
         return false;
     }
 
@@ -312,7 +330,12 @@ impl ModeController {
         host_id: Uuid,
         addr: std::net::SocketAddr,
         cql_broadcast: Option<String>,
+        internode_broadcast: Option<String>,
     ) -> bool {
+        // The address committed to membership/the ring is the advertised
+        // internode-broadcast HOSTNAME when present (re-resolvable across IP
+        // churn), else the observed connection IP.
+        let desired_addr = node_info_addr(addr, internode_broadcast.as_deref());
         let peer_manager = self.peer_manager.load().as_ref().as_ref().cloned();
         let has_outbound_peer = peer_manager
             .as_ref()
@@ -325,7 +348,7 @@ impl ModeController {
             .and_then(|ring| ring.get_node(peer_node_id).cloned());
 
         if let Some(existing) = existing_member.as_ref() {
-            if !cluster_member_metadata_changed(existing, addr, cql_broadcast.as_deref())
+            if !cluster_member_metadata_changed(existing, &desired_addr, cql_broadcast.as_deref())
                 && has_outbound_peer
             {
                 tracing::debug!(
@@ -372,6 +395,7 @@ impl ModeController {
         let config_clone = self.config.clone();
         let existing_member = existing_member.clone();
         let cql_broadcast = cql_broadcast.clone();
+        let internode_broadcast = internode_broadcast.clone();
         let peer_manager = peer_manager.clone();
         let net_config = self.net_config.clone();
         let local_host_id = self.local_host_id;
@@ -430,6 +454,7 @@ impl ModeController {
                     host_id,
                     addr,
                     cql_broadcast.clone(),
+                    internode_broadcast.clone(),
                 ) {
                     tracing::info!(
                         peer = %host_id,
@@ -491,7 +516,7 @@ impl ModeController {
                 let refresh_cmd = RaftCommand {
                     op: RaftOp::UpdateNodeInfo(NodeInfo {
                         host_id,
-                        addr: addr.to_string(),
+                        addr: desired_addr.clone(),
                         data_center: existing.data_center,
                         rack: existing.rack,
                         state: existing.state,
@@ -576,7 +601,7 @@ impl ModeController {
             // Propose JoinNode via Raft.
             let node_info = NodeInfo {
                 host_id,
-                addr: addr.to_string(),
+                addr: desired_addr.clone(),
                 data_center: config_clone.data_center.clone(),
                 rack: config_clone.rack.clone(),
                 state: NodeState::Normal,
@@ -649,6 +674,88 @@ mod streaming_contract_tests {
     }
 
     #[test]
+    fn node_info_addr_prefers_advertised_internode_hostname_over_resolved_ip() {
+        // When a peer advertises an internode-broadcast hostname, the committed
+        // NodeInfo.addr must be that re-resolvable hostname, NOT the startup-frozen
+        // IP literal observed on the connection. This is the core fix for stale
+        // membership after container IP churn.
+        let observed: std::net::SocketAddr = "10.89.1.176:7000".parse().unwrap();
+        assert_eq!(
+            super::node_info_addr(observed, Some("node1:7000")),
+            "node1:7000",
+            "advertised internode hostname must win over the resolved connection IP"
+        );
+    }
+
+    #[test]
+    fn node_info_addr_falls_back_to_socket_addr_without_advertised_hostname() {
+        let observed: std::net::SocketAddr = "10.89.1.176:7000".parse().unwrap();
+        assert_eq!(super::node_info_addr(observed, None), "10.89.1.176:7000");
+        assert_eq!(
+            super::node_info_addr(observed, Some("  ")),
+            "10.89.1.176:7000"
+        );
+    }
+
+    #[test]
+    fn existing_member_metadata_refresh_commits_hostname_when_internode_broadcast_present() {
+        // The ring update path must store the hostname (not the resolved IP) so
+        // re-resolution at connect time tracks the live container IP.
+        let host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let node_id = uuid_to_node_id(host_id);
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            node_id,
+            NodeInfo {
+                host_id,
+                addr: "10.89.1.151:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+        ring.assign_tokens(node_id, &[100, 200]);
+        let existing = ring.get_node(node_id).unwrap().clone();
+        let ring_holder = Arc::new(ArcSwap::from_pointee(Some(Arc::new(ring))));
+
+        let changed = super::apply_existing_member_metadata_to_ring(
+            &ring_holder,
+            node_id,
+            &existing,
+            host_id,
+            // Observed connection IP differs from the previous committed IP…
+            "10.89.1.201:7000".parse().unwrap(),
+            None,
+            // …but the peer advertises a stable hostname, which must be stored.
+            Some("node1:7000".to_string()),
+        );
+
+        assert!(changed);
+        let updated = ring_holder
+            .load()
+            .as_ref()
+            .as_ref()
+            .unwrap()
+            .get_node(node_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            updated.addr, "node1:7000",
+            "committed NodeInfo.addr must be the advertised hostname, not the resolved IP"
+        );
+        assert_eq!(
+            ring_holder
+                .load()
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .tokens_for_node(node_id),
+            vec![100, 200]
+        );
+    }
+
+    #[test]
     fn existing_member_metadata_refresh_updates_local_ring_snapshot_without_losing_tokens() {
         let host_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let node_id = uuid_to_node_id(host_id);
@@ -675,6 +782,7 @@ mod streaming_contract_tests {
             host_id,
             "10.89.1.201:17000".parse().unwrap(),
             Some("127.0.0.1:19045".to_string()),
+            None,
         );
 
         assert!(changed);

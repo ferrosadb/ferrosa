@@ -47,6 +47,37 @@ fn put_bytes(buf: &mut BytesMut, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Encode an optional, length-prefixed string as a presence marker byte
+/// (`1` = present, `0` = absent) followed by the string when present.
+fn put_optional_string(buf: &mut BytesMut, value: &Option<String>) -> Result<()> {
+    match value {
+        Some(s) => {
+            buf.put_u8(1);
+            put_string(buf, s)?;
+        }
+        None => {
+            buf.put_u8(0);
+        }
+    }
+    Ok(())
+}
+
+/// Decode an optional, length-prefixed string written by [`put_optional_string`].
+///
+/// Returns `None` when the buffer is exhausted (a pre-extension peer that did
+/// not write this trailing field), preserving backward compatibility.
+fn get_optional_string(buf: &mut Bytes) -> Result<Option<String>> {
+    if buf.remaining() == 0 {
+        return Ok(None);
+    }
+    let marker = buf.get_u8();
+    if marker == 1 {
+        Ok(Some(get_string(buf)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn get_bytes(buf: &mut Bytes) -> Result<Vec<u8>> {
     if buf.remaining() < 4 {
         return Err(NetError::Protocol("truncated bytes length".into()));
@@ -69,6 +100,9 @@ pub enum Message {
         supported_compression: Vec<u8>, // 0=none, 1=lz4, 2=snappy
         auth_token: Vec<u8>,
         cql_broadcast: Option<String>,
+        /// Raw internode broadcast hostname:port (re-resolvable). Peers store
+        /// this in `NodeInfo.addr` so they can re-resolve it across IP churn.
+        internode_broadcast: Option<String>,
     },
     HandshakeAck {
         host_id: Uuid,
@@ -77,6 +111,9 @@ pub enum Message {
         accepted: bool,
         reason: String,
         cql_broadcast: Option<String>,
+        /// Raw internode broadcast hostname:port (re-resolvable). Peers store
+        /// this in `NodeInfo.addr` so they can re-resolve it across IP churn.
+        internode_broadcast: Option<String>,
     },
     Ping {
         nonce: u64,
@@ -347,6 +384,7 @@ impl Message {
                 supported_compression,
                 auth_token,
                 cql_broadcast,
+                internode_broadcast,
             } => {
                 put_string(buf, cluster_name)?;
                 put_uuid(buf, host_id);
@@ -357,15 +395,10 @@ impl Message {
                 buf.put_slice(supported_compression);
                 put_bytes(buf, auth_token)?;
                 // Optional CQL broadcast address (v1 extension — safe to add after auth_token)
-                match cql_broadcast {
-                    Some(addr) => {
-                        buf.put_u8(1);
-                        put_string(buf, addr)?;
-                    }
-                    None => {
-                        buf.put_u8(0);
-                    }
-                }
+                put_optional_string(buf, cql_broadcast)?;
+                // Optional internode broadcast hostname (v1 extension — appended
+                // after cql_broadcast; absent on pre-extension peers)
+                put_optional_string(buf, internode_broadcast)?;
             }
             Self::HandshakeAck {
                 host_id,
@@ -374,6 +407,7 @@ impl Message {
                 accepted,
                 reason,
                 cql_broadcast,
+                internode_broadcast,
             } => {
                 put_uuid(buf, host_id);
                 buf.put_u8(*protocol_version);
@@ -381,15 +415,9 @@ impl Message {
                 buf.put_u8(if *accepted { 1 } else { 0 });
                 put_string(buf, reason)?;
                 // Optional CQL broadcast address (v1 extension)
-                match cql_broadcast {
-                    Some(addr) => {
-                        buf.put_u8(1);
-                        put_string(buf, addr)?;
-                    }
-                    None => {
-                        buf.put_u8(0);
-                    }
-                }
+                put_optional_string(buf, cql_broadcast)?;
+                // Optional internode broadcast hostname (v1 extension)
+                put_optional_string(buf, internode_broadcast)?;
             }
             Self::Ping { nonce, sent_at } => {
                 buf.put_u64(*nonce);
@@ -518,16 +546,9 @@ impl Message {
                 let supported_compression = body.split_to(comp_len).to_vec();
                 let auth_token = get_bytes(body)?;
                 // Optional CQL broadcast address (v1 extension)
-                let cql_broadcast = if body.remaining() > 0 {
-                    let marker = body.get_u8();
-                    if marker == 1 {
-                        Some(get_string(body)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None // pre-extension peer — no broadcast field
-                };
+                let cql_broadcast = get_optional_string(body)?;
+                // Optional internode broadcast hostname (v1 extension)
+                let internode_broadcast = get_optional_string(body)?;
                 Self::Handshake {
                     cluster_name,
                     host_id,
@@ -535,6 +556,7 @@ impl Message {
                     supported_compression,
                     auth_token,
                     cql_broadcast,
+                    internode_broadcast,
                 }
             }
             MsgType::HandshakeAck => {
@@ -547,16 +569,9 @@ impl Message {
                 let accepted = body.get_u8() != 0;
                 let reason = get_string(body)?;
                 // Optional CQL broadcast address (v1 extension)
-                let cql_broadcast = if body.remaining() > 0 {
-                    let marker = body.get_u8();
-                    if marker == 1 {
-                        Some(get_string(body)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None // pre-extension peer — no broadcast field
-                };
+                let cql_broadcast = get_optional_string(body)?;
+                // Optional internode broadcast hostname (v1 extension)
+                let internode_broadcast = get_optional_string(body)?;
                 Self::HandshakeAck {
                     host_id,
                     protocol_version,
@@ -564,6 +579,7 @@ impl Message {
                     accepted,
                     reason,
                     cql_broadcast,
+                    internode_broadcast,
                 }
             }
             MsgType::Ping => {
@@ -774,6 +790,7 @@ mod tests {
             supported_compression: vec![0, 1], // none + lz4
             auth_token: vec![0xAB; 32],
             cql_broadcast: Some("host:19042".into()),
+            internode_broadcast: Some("host:17000".into()),
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -790,6 +807,7 @@ mod tests {
             supported_compression: vec![0],
             auth_token: vec![],
             cql_broadcast: None,
+            internode_broadcast: None,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -806,6 +824,7 @@ mod tests {
             accepted: true,
             reason: String::new(),
             cql_broadcast: Some("192.168.1.5:19042".into()),
+            internode_broadcast: Some("192.168.1.5:17000".into()),
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -831,6 +850,7 @@ mod tests {
         match decoded {
             Message::Handshake {
                 cql_broadcast,
+                internode_broadcast,
                 cluster_name,
                 host_id: decoded_id,
                 ..
@@ -838,6 +858,38 @@ mod tests {
                 assert_eq!(cluster_name, "ferrosa");
                 assert_eq!(decoded_id, host_id);
                 assert_eq!(cql_broadcast, None);
+                assert_eq!(internode_broadcast, None);
+            }
+            other => panic!("expected Handshake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handshake_backward_compat_cql_present_internode_absent() {
+        // A peer that advertises cql_broadcast but predates the
+        // internode_broadcast field: the trailing internode marker is missing.
+        // Decode must yield the cql_broadcast and a None internode_broadcast.
+        let host_id = Uuid::new_v4();
+        let mut buf = BytesMut::new();
+        put_string(&mut buf, "ferrosa").unwrap();
+        put_uuid(&mut buf, &host_id);
+        buf.put_u8(1); // protocol_version
+        buf.put_u8(1); // compression list length
+        buf.put_u8(0); // supported_compression[0] = none
+        put_bytes(&mut buf, &[]).unwrap(); // auth_token (empty)
+        buf.put_u8(1); // cql_broadcast present
+        put_string(&mut buf, "10.0.0.1:19042").unwrap();
+        // No trailing internode_broadcast marker.
+
+        let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
+        match decoded {
+            Message::Handshake {
+                cql_broadcast,
+                internode_broadcast,
+                ..
+            } => {
+                assert_eq!(cql_broadcast.as_deref(), Some("10.0.0.1:19042"));
+                assert_eq!(internode_broadcast, None);
             }
             other => panic!("expected Handshake, got {other:?}"),
         }

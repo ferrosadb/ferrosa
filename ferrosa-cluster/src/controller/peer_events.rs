@@ -169,9 +169,11 @@ impl ModeController {
                     host_id,
                     addr,
                     cql_broadcast,
+                    internode_broadcast,
                 } => {
                     tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
-                    if self.trigger_cluster_join(host_id, addr, cql_broadcast) {
+                    if self.trigger_cluster_join(host_id, addr, cql_broadcast, internode_broadcast)
+                    {
                         join_enqueued_invite = Some(host_id);
                     }
                 }
@@ -232,15 +234,17 @@ impl PeerEventListener for ModeController {
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
         let all_peers = self.connected_peers.lock().clone();
-        let cql_broadcast = if matches!(current_mode, DeploymentMode::Cluster) {
-            self.peer_manager
-                .load()
-                .as_ref()
-                .as_ref()
-                .and_then(|pm| pm.get_peer_cql_broadcast_sync(host_id))
-        } else {
-            None
-        };
+        let (cql_broadcast, internode_broadcast) =
+            if matches!(current_mode, DeploymentMode::Cluster) {
+                let pm = self.peer_manager.load();
+                let pm = pm.as_ref().as_ref();
+                (
+                    pm.and_then(|pm| pm.get_peer_cql_broadcast_sync(host_id)),
+                    pm.and_then(|pm| pm.get_peer_internode_broadcast_sync(host_id)),
+                )
+            } else {
+                (None, None)
+            };
         let plan = peer_plan::plan_peer_connected(PeerConnectPlanInput {
             mode: current_mode,
             host_id,
@@ -254,6 +258,7 @@ impl PeerEventListener for ModeController {
             last_invite_sent: self.recent_reconnect_invites.lock().get(&host_id).copied(),
             now: std::time::Instant::now(),
             cql_broadcast,
+            internode_broadcast,
         });
         self.execute_peer_event_plan(plan, &all_peers, false);
 
@@ -340,10 +345,15 @@ impl PeerEventListener for ModeController {
 }
 
 impl InboundPeerCallback for ModeController {
-    fn on_inbound_peer(&self, peer_id: PeerId, cql_broadcast: Option<String>) {
+    fn on_inbound_peer(
+        &self,
+        peer_id: PeerId,
+        cql_broadcast: Option<String>,
+        internode_broadcast: Option<String>,
+    ) {
         let (host_id, addr) = peer_id;
         let reverse_addr = std::net::SocketAddr::new(addr.ip(), self.net_config.bind_addr.port());
-        tracing::info!(peer = %host_id, %addr, ?cql_broadcast, "inbound peer connected");
+        tracing::info!(peer = %host_id, %addr, ?cql_broadcast, ?internode_broadcast, "inbound peer connected");
 
         // Store the peer's CQL broadcast address (from handshake) in PeerManager
         // so system.peers can return it instead of the container-internal IP.
@@ -355,6 +365,22 @@ impl InboundPeerCallback for ModeController {
                 ferrosa_net::task_pool::TaskPool::current("peer-cql-broadcast").spawn(async move {
                     pm.set_peer_cql_broadcast(hid, broadcast).await;
                 });
+            }
+        }
+
+        // Store the peer's internode broadcast hostname so the outbound
+        // on_peer_connected path (which reads it back) and committed membership
+        // use the re-resolvable hostname instead of a frozen IP.
+        if let Some(ref broadcast) = internode_broadcast {
+            if let Some(pm) = &**self.peer_manager.load() {
+                let pm = pm.clone();
+                let hid = host_id;
+                let broadcast = broadcast.clone();
+                ferrosa_net::task_pool::TaskPool::current("peer-internode-broadcast").spawn(
+                    async move {
+                        pm.set_peer_internode_broadcast(hid, broadcast).await;
+                    },
+                );
             }
         }
         if let Some(pm) = &**self.peer_manager.load() {
@@ -405,6 +431,7 @@ impl InboundPeerCallback for ModeController {
             last_invite_sent: self.recent_reconnect_invites.lock().get(&host_id).copied(),
             now: std::time::Instant::now(),
             cql_broadcast,
+            internode_broadcast,
         });
         self.execute_peer_event_plan(plan, &all_peers, true);
     }
