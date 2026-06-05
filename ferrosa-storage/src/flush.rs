@@ -578,6 +578,58 @@ pub struct FileFlushTarget {
     generation: AtomicU64,
 }
 
+/// Test-only durability observation seam.
+///
+/// Records the set of file paths and directory paths that were fsynced during
+/// flush/promote so tests can assert the durability barrier actually fired on
+/// every component and on the containing directory. Not compiled into release.
+#[cfg(test)]
+pub(crate) mod fsync_probe {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static SYNCED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static SYNCED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn reset() {
+        SYNCED_FILES.lock().expect("fsync probe poisoned").clear();
+        SYNCED_DIRS.lock().expect("fsync probe poisoned").clear();
+    }
+
+    pub(crate) fn note_file(path: &Path) {
+        SYNCED_FILES
+            .lock()
+            .expect("fsync probe poisoned")
+            .push(path.to_path_buf());
+    }
+
+    pub(crate) fn note_dir(path: &Path) {
+        SYNCED_DIRS
+            .lock()
+            .expect("fsync probe poisoned")
+            .push(path.to_path_buf());
+    }
+
+    pub(crate) fn synced_files() -> HashSet<PathBuf> {
+        SYNCED_FILES
+            .lock()
+            .expect("fsync probe poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn synced_dirs() -> HashSet<PathBuf> {
+        SYNCED_DIRS
+            .lock()
+            .expect("fsync probe poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
 impl FileFlushTarget {
     /// Create a new file flush target writing to the given directory.
     ///
@@ -705,6 +757,93 @@ impl FileFlushTarget {
             Some("txt") => path.with_extension("txt.tmp"),
             _ => path.with_extension("db.tmp"),
         }
+    }
+
+    /// fsync a single file so its bytes are durable on the underlying device.
+    ///
+    /// Opens the file read-only and calls `sync_all()` (flushes data + metadata).
+    /// This MUST be called on the *final* component path after rename so the
+    /// promoted file's contents survive a power loss / SIGKILL. A missing file
+    /// is a hard error — every component we promote must exist when we claim
+    /// the SSTable is durable.
+    fn fsync_path(path: &Path) -> std::io::Result<()> {
+        let f = std::fs::File::open(path)?;
+        f.sync_all()?;
+        #[cfg(test)]
+        Self::record_fsync(path);
+        Ok(())
+    }
+
+    /// fsync the directory `dir` so that rename directory entries are durable.
+    ///
+    /// On POSIX a `rename(2)` updates the directory; that update lives in the
+    /// page cache until the directory inode is fsynced. Without this, a crash
+    /// after rename but before writeback can lose the final-named entry (or,
+    /// symmetrically, leave a final-named file whose data blocks were never
+    /// flushed). Opening the directory and calling `sync_all()` flushes those
+    /// entries. This is the single barrier that makes the temp→rename→final
+    /// sequence crash-atomic.
+    fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+        let f = std::fs::File::open(dir)?;
+        f.sync_all()?;
+        #[cfg(test)]
+        Self::record_dir_fsync(dir);
+        Ok(())
+    }
+
+    /// fsync every component file that exists for this generation, then fsync
+    /// the containing directory once. Returns Ok only when all component bytes
+    /// AND their directory entries are durable on disk.
+    ///
+    /// Crash-safety ordering: callers rename each component to its final name
+    /// first, then call this. We fsync the final files (their data blocks),
+    /// then fsync `base_dir` (the rename entries). Doing the file fsyncs before
+    /// the directory fsync guarantees that once the directory entry is durable,
+    /// the data it points at is already durable too.
+    fn fsync_components(
+        &self,
+        paths: &FileComponentPaths,
+        has_compression_info: bool,
+    ) -> Result<()> {
+        // Required + always-written components for a generation.
+        let mut components: Vec<&Path> = vec![
+            &paths.data,
+            &paths.partitions,
+            &paths.rows,
+            &paths.filter,
+            &paths.statistics,
+            &paths.toc,
+        ];
+        if has_compression_info {
+            components.push(&paths.compression_info);
+        }
+        for component in components {
+            Self::fsync_path(component).map_err(|e| {
+                ferrosa_common::Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("fsync of component {} failed: {e}", component.display()),
+                ))
+            })?;
+        }
+        // One directory fsync after all component fsyncs makes the rename
+        // entries durable. This is the most important step in the barrier.
+        Self::fsync_dir(&self.base_dir).map_err(|e| {
+            ferrosa_common::Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("fsync of base dir {} failed: {e}", self.base_dir.display()),
+            ))
+        })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn record_fsync(path: &Path) {
+        fsync_probe::note_file(path);
+    }
+
+    #[cfg(test)]
+    fn record_dir_fsync(dir: &Path) {
+        fsync_probe::note_dir(dir);
     }
 
     fn open_reader_from_paths(
@@ -899,9 +1038,17 @@ impl FlushTarget for FileFlushTarget {
 
         let has_compression_info = output.compression_info.is_some();
 
-        // Write to .tmp files first, then atomically rename.
-        // If the process crashes mid-flush, only .tmp files exist — no corrupt
-        // final SSTables. Stale .tmp files are cleaned up on next startup.
+        // Write to .tmp files first, then rename to final names, then fsync.
+        //
+        // temp+rename alone is NOT crash-atomic: rename makes the *name* visible
+        // but neither the file's data blocks nor the directory entry are durable
+        // until fsynced. A SIGKILL after rename but before writeback can leave a
+        // final-named, truncated Data.db (the production corruption this fixes).
+        // The durability barrier below (fsync every component, then fsync the
+        // directory once) is what makes the sequence crash-atomic: this function
+        // returns Ok only after all component bytes AND their directory entries
+        // are durable. Stale .tmp files from a pre-fsync crash are cleaned up on
+        // next startup.
         let tmp = Self::tmp_component_path;
         let toc_tmp = tmp(&paths.toc);
 
@@ -974,11 +1121,17 @@ impl FlushTarget for FileFlushTarget {
             }
         }
 
+        // Durability barrier: fsync every promoted component, then fsync the
+        // directory once. Only after this returns Ok are the bytes and the
+        // rename directory entries durable. The engine relies on this so it can
+        // safely discard the WAL copy after flush() returns.
+        self.fsync_components(&paths, has_compression_info)?;
+
         tracing::info!(
             gen,
             data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
             path = %paths.data.display(),
-            "flush: Data.db verified on disk"
+            "flush: Data.db verified and fsynced on disk"
         );
 
         Self::open_reader_from_paths(&paths, has_compression_info)
@@ -1028,6 +1181,14 @@ impl FlushTarget for FileFlushTarget {
             std::fs::rename(tmp(&paths.compression_info), &paths.compression_info)?;
         }
 
+        // Durability barrier: fsync every promoted component, then fsync the
+        // directory once, BEFORE cleaning up staging or returning. This path is
+        // shared by compaction output promotion (compaction/executor.rs), so
+        // compaction inherits the same crash-atomic guarantee: the local output
+        // SSTable is durable before any caller deletes inputs or swaps the
+        // manifest.
+        self.fsync_components(&paths, has_compression_info)?;
+
         let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
         let _ = std::fs::remove_dir(&output.staging_dir);
         if let Some(parent) = staging_parent {
@@ -1038,7 +1199,7 @@ impl FlushTarget for FileFlushTarget {
             gen,
             data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
             path = %paths.data.display(),
-            "flush: staged Data.db promoted"
+            "flush: staged Data.db promoted and fsynced"
         );
 
         Self::open_reader_from_paths(&paths, has_compression_info)
@@ -1508,6 +1669,111 @@ mod tests {
         assert!(
             tmp_files.is_empty(),
             "no .tmp files should remain after successful flush, found: {tmp_files:?}"
+        );
+    }
+
+    #[test]
+    fn flush_fsyncs_every_component_and_directory() {
+        // Durability barrier: after flush(), every promoted component file AND
+        // the containing directory must have been fsynced. Without the barrier
+        // a SIGKILL after rename can leave a truncated, final-named Data.db.
+        fsync_probe::reset();
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![make_partition("k1", b"v1", 5000)];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let _reader = target.flush(output).unwrap();
+        let gen = target.generation();
+
+        let synced = fsync_probe::synced_files();
+        for suffix in [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ] {
+            let path = dir.path().join(format!("{gen}-{suffix}"));
+            assert!(
+                synced.contains(&path),
+                "component {suffix} was not fsynced; synced={synced:?}"
+            );
+        }
+        // No compression in this test → CompressionInfo.db not written/synced.
+        assert!(
+            fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
+            "containing directory was not fsynced"
+        );
+    }
+
+    #[test]
+    fn flush_files_fsyncs_every_component_and_directory() {
+        // The staged-promotion path (used by compaction) must apply the same
+        // durability barrier as flush().
+        fsync_probe::reset();
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions::default();
+        let mut writer =
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let has_ci = output.compression_info.is_some();
+
+        let _reader = target.flush_files(output).unwrap();
+        let gen = target.generation();
+
+        let synced = fsync_probe::synced_files();
+        let mut expected = vec![
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ];
+        if has_ci {
+            expected.push("CompressionInfo.db");
+        }
+        for suffix in expected {
+            let path = dir.path().join(format!("{gen}-{suffix}"));
+            assert!(
+                synced.contains(&path),
+                "component {suffix} was not fsynced; synced={synced:?}"
+            );
+        }
+        assert!(
+            fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
+            "containing directory was not fsynced"
         );
     }
 
