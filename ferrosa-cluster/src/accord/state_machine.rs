@@ -307,27 +307,39 @@ impl AccordStateMachine {
         t: Timestamp,
         deps: Vec<TxnId>,
     ) -> SmResponse {
-        let state = self
-            .txn_states
-            .entry(txn_id)
-            .or_insert_with(|| TxnState::new(txn_id, t0));
+        {
+            let state = self
+                .txn_states
+                .entry(txn_id)
+                .or_insert_with(|| TxnState::new(txn_id, t0));
 
-        // Idempotent: if already committed or applied, no-op.
-        if state.phase == TxnPhase::Committed || state.phase == TxnPhase::Applied {
+            // Idempotent: if already committed or applied, no-op.
+            if state.phase == TxnPhase::Committed || state.phase == TxnPhase::Applied {
+                return SmResponse::None;
+            }
+        }
+
+        // Persist the commit BEFORE advancing committed-visible state. Mirrors
+        // `handle_apply`: the durable write must succeed before the txn becomes
+        // observable as Committed and before its dependency waiters are woken.
+        // If fsync fails we send no reply and leave the txn un-committed — the
+        // coordinator gets no ack and the commit can be recovered/retried. The
+        // old code mutated state (state.commit + committed_txns + woke deps)
+        // before the fsync and only logged on failure, so a non-durable commit
+        // could unblock dependents (phantom-commit hazard on the commit path).
+        let data = format!("Committed:{}:{}", txn_id.0.time, t.time);
+        if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
+            tracing::error!(
+                "accord: sync_writer failed during commit — not advancing to Committed"
+            );
             return SmResponse::None;
         }
 
+        // Durable — now safe to advance committed state and wake dependents.
         let deps_set: HashSet<TxnId> = deps.into_iter().collect();
-        state.commit(t, deps_set);
-
-        // Persist commit.
-        let data = format!("Committed:{}:{}", txn_id.0.time, t.time);
-        let sync_result = self.sync_writer.write_and_sync(data.as_bytes());
-        if !sync_result.is_ok() {
-            tracing::error!("accord: sync_writer failed during commit — state may not be durable");
+        if let Some(state) = self.txn_states.get_mut(&txn_id) {
+            state.commit(t, deps_set);
         }
-
-        // Track committed transaction.
         self.committed_txns.insert(txn_id);
 
         // Wake dep waiters.
@@ -1177,6 +1189,69 @@ mod tests {
             state.phase,
             TxnPhase::Applied,
             "replay after crash must successfully apply"
+        );
+    }
+
+    /// Commit must persist (fsync) BEFORE advancing committed-visible state.
+    /// A disk failure during commit must NOT mark the txn Committed, must NOT
+    /// add it to the committed set, and must NOT wake its dependency waiters —
+    /// otherwise a non-durable commit could unblock dependents, a phantom-commit
+    /// hazard on the commit path. Mirrors `sm_crash_between_persist_and_flag`
+    /// for the apply path.
+    #[test]
+    fn sm_crash_during_commit_fsync_does_not_advance() {
+        let (mut sm, writer) = make_sm(1);
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+
+        // Advance to Accepted (ready to commit).
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_accept(txn_id, t0, ts(1001), vec![], BallotNumber(1));
+
+        // A dependency waiter parked on this txn must NOT be woken by a
+        // non-durable commit.
+        sm.dep_waiters.insert(txn_id, vec![txn(2, 2000)]);
+
+        // Inject disk failure for the commit's durable write.
+        writer.set_fsync_failure(true);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+
+        // Commit must NOT have advanced: not durable => not observable.
+        let state = sm.get_state(&txn_id).unwrap();
+        assert_ne!(
+            state.phase,
+            TxnPhase::Committed,
+            "fsync failed during commit: phase must NOT be Committed (non-durable)"
+        );
+        assert_eq!(
+            sm.committed_count(),
+            0,
+            "fsync failed during commit: committed set must be empty"
+        );
+        assert!(
+            sm.last_notified.is_empty(),
+            "fsync failed during commit: dependency waiters must NOT be woken"
+        );
+
+        // On recovery: re-enable fsync and retry commit.
+        writer.set_fsync_failure(false);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+
+        let state = sm.get_state(&txn_id).unwrap();
+        assert_eq!(
+            state.phase,
+            TxnPhase::Committed,
+            "retry after disk heal must commit"
+        );
+        assert_eq!(
+            sm.committed_count(),
+            1,
+            "healed commit must be in committed set"
+        );
+        assert_eq!(
+            sm.last_notified,
+            vec![txn(2, 2000)],
+            "healed commit must wake the parked dependency waiter"
         );
     }
 
