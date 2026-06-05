@@ -21,16 +21,17 @@
 //!   rounds.  After each nemesis-inject/heal cycle it verifies that no batch is
 //!   partially visible (all-or-nothing assertion on the state machine).
 //!
-//! - **disk_fail_no_phantom_commits**: Requires a live cluster with FERROSA_TEST_CLUSTER_NODES
-//!   or FERROSA_TEST_FIRECRACKER set (disk fault injection needs real disk I/O).
-//!   Without those env vars the test panics with clear setup instructions.
+//! - **disk_fail_no_phantom_commits**: Hermetic, in-process test of Accord's
+//!   fsync-before-ack durability invariant. A `MockSyncWriter` injects
+//!   `FsyncFailed` on a quorum of replicas; the coordinator must then be unable
+//!   to commit (no durable quorum), and no committed/durable row may
+//!   materialize for the key (no phantom commit). After the disk heals the LWT
+//!   converges to exactly one durable row. No live cluster, disk, or
+//!   network-fault tooling required.
 //!
-//! # Running with real infrastructure
+//! # Running
 //!
-//!   FERROSA_TEST_CLUSTER_NODES=127.0.0.1:30042 \
-//!     cargo test -p ferrosa-jepsen --test nemesis_correctness
-//!
-//!   # In-process variants (no infra needed):
+//!   # All in-process variants (no infra needed):
 //!   cargo test -p ferrosa-cluster --test accord_nemesis
 
 use std::sync::Arc;
@@ -39,13 +40,13 @@ use std::time::Duration;
 use ferrosa_cluster::accord::handlers::{AccordHandler, AccordState};
 use ferrosa_cluster::accord::state_machine::AccordStateMachine;
 use ferrosa_cluster::accord::{AccordCoordinatorDriver, AccordDriverError};
-use ferrosa_common::accord::HybridLogicalClock;
+use ferrosa_common::accord::{HybridLogicalClock, TxnPhase};
 use ferrosa_net::codec::MsgType;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
 use ferrosa_net::rpc::handler::{HandlerRegistry, PeerId};
 use ferrosa_net::rpc::server::RpcServer;
-use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+use ferrosa_storage::accord::sync_writer::{MockSyncWriter, SyncWriteCall};
 
 // ---------------------------------------------------------------------------
 // Shared node setup (mirrors accord_lwt_concurrent.rs)
@@ -69,6 +70,12 @@ struct TestNode {
     server: Arc<RpcServer>,
     #[allow(dead_code)]
     accord_state: AccordState,
+    /// The `MockSyncWriter` backing this node's `AccordStateMachine`. Tests
+    /// inject fsync failures here to exercise the fsync-before-ack durability
+    /// invariant (a replica must not ack a protocol message it could not
+    /// durably persist).
+    #[allow(dead_code)]
+    sync_writer: Arc<MockSyncWriter>,
     local_addr: std::net::SocketAddr,
 }
 
@@ -85,7 +92,7 @@ async fn start_test_node(host_id: uuid::Uuid) -> TestNode {
     let sync_writer = Arc::new(MockSyncWriter::new());
     let accord_state: AccordState = Arc::new(parking_lot::Mutex::new(AccordStateMachine::new(
         node_id,
-        sync_writer,
+        sync_writer.clone(),
     )));
 
     let registry = Arc::new(HandlerRegistry::new());
@@ -119,6 +126,7 @@ async fn start_test_node(host_id: uuid::Uuid) -> TestNode {
         peer_manager,
         server,
         accord_state,
+        sync_writer,
         local_addr,
     }
 }
@@ -479,60 +487,209 @@ async fn run_batch_atomicity_round(nemesis_name: &str) {
 // Disk fail — no phantom commits
 // ---------------------------------------------------------------------------
 
-/// Disk failure nemesis: no phantom commits after disk error + recovery.
+/// Bounded timeout for a single `run_transaction()` round. A correct run
+/// completes in well under a second over in-process loopback. If a regression
+/// ever causes the driver to block (e.g. waiting forever on an ack quorum that
+/// can never form), this timeout converts the hang into a clean test failure
+/// so CI can never stall.
+const TXN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// disk_fail_no_phantom_commits — hermetic, in-process test of Accord's
+/// fsync-before-ack durability invariant.
 ///
-/// # Environment required
+/// # Property under test
 ///
-/// This test requires a pre-provisioned cluster with real disk I/O because
-/// phantom commit detection requires verifying storage state across a real
-/// crash boundary.  Set one of:
-///   - `FERROSA_TEST_CLUSTER_NODES=host:port` — pre-provisioned CQL cluster
-///   - `FERROSA_TEST_FIRECRACKER=1` — Firecracker-provisioned cluster
+/// A replica must durably `write_and_sync` (fsync) its commit-log entry BEFORE
+/// it sends a protocol ack. If fsync fails, the replica must NOT ack. Therefore
+/// a disk/fsync failure can never produce a *phantom commit*: a transaction
+/// that reports applied/committed without durable backing, or a row that
+/// materializes without a durable quorum behind it.
 ///
-/// Without these the test panics with setup instructions.
+/// # Methodology (no live cluster, no real disk, no fault-injection tooling)
 ///
-/// For in-process disk fault injection, a future P0 follow-up will implement
-/// a `RustfsErrorInjector` that proxies `object_store::ObjectStore` and
-/// returns a configurable error rate. Tracked in:
-///   `ferrosa_docs/specs/todo/p0-09-jepsen-tests-todo.md` (disk_fail residual).
+/// Three in-process nodes (RF=3, slow-quorum=2) are cross-connected over the
+/// loopback `RpcServer` the harness already provides. Each node's
+/// `AccordStateMachine` is backed by a `MockSyncWriter` whose
+/// `set_fsync_failure(true)` makes `write_and_sync` return `FsyncFailed`.
+///
+/// When a `PreAccept` handler's fsync fails, the state machine returns
+/// `SmResponse::None`, which the `AccordHandler` encodes as an *empty*
+/// `AccordPreAcceptOK`. The coordinator treats an empty body as a non-vote, so
+/// a fsync-failing replica contributes no durable ack — exactly the
+/// fsync-before-ack contract.
+///
+/// The coordinator (node_a) runs as leaseholder: its own implicit PreAccept
+/// vote does not require a remote durable ack, so with RF=3 it needs both
+/// remote replicas (node_b, node_c) to durably ack to reach a fast quorum of 3.
+/// Failing fsync on those two remotes removes the durable quorum.
+///
+/// # Phases
+///
+/// 1. **Disk-failure nemesis**: fail fsync on a quorum of replicas (node_b and
+///    node_c). Drive `INSERT IF NOT EXISTS`. Assert the transaction does NOT
+///    report a successful apply, and that no committed/durable row exists for
+///    the key on any replica. Prove via `calls()` that both failing replicas
+///    recorded `FsyncFailed` (the disk-failure path was actually exercised — the
+///    assertion is not vacuous).
+/// 2. **Heal + converge**: clear the fsync failure on all nodes, re-run the
+///    LWT on the same key, and assert it now applies with exactly one durable
+///    row for the key (no double-insert, no spurious row for a not-applied op).
+///
+/// # How this catches a fsync-before-ack regression
+///
+/// If a replica were changed to ack BEFORE (or without) a successful fsync, the
+/// fsync-failing remotes would emit non-empty `PreAcceptOK`/`ApplyOK`, the
+/// coordinator would reach quorum and return `Ok`, and an Applied row would
+/// materialize on the replicas. Phase 1's "must not apply" and "no durable row"
+/// assertions would then fail — flagging the lost durability invariant.
 #[tokio::test]
 async fn disk_fail_no_phantom_commits() {
-    let cluster_nodes = std::env::var("FERROSA_TEST_CLUSTER_NODES").ok();
-    let firecracker = std::env::var("FERROSA_TEST_FIRECRACKER").ok();
+    // Three nodes — RF=3 ensures slow_quorum_size=2.
+    let id_a = uuid::Uuid::from_bytes([0xA1; 16]);
+    let id_b = uuid::Uuid::from_bytes([0xB2; 16]);
+    let id_c = uuid::Uuid::from_bytes([0xC3; 16]);
 
-    if cluster_nodes.is_none() && firecracker.is_none() {
-        panic!(
-            "disk_fail_no_phantom_commits requires a live cluster.\n\
-             Set one of:\n\
-             - FERROSA_TEST_CLUSTER_NODES=127.0.0.1:30042 (Wave 3 test cluster)\n\
-             - FERROSA_TEST_FIRECRACKER=1 (Firecracker VM cluster)\n\
-             \n\
-             Full test: cargo test -p ferrosa-jepsen --test nemesis_correctness -- disk_fail_no_phantom_commits\n\
-             \n\
-             For in-process disk fault injection, see:\n\
-             ferrosa_docs/specs/todo/p0-09-jepsen-tests-todo.md (disk_fail residual)"
+    let node_a = start_test_node(id_a).await;
+    let node_b = start_test_node(id_b).await;
+    let node_c = start_test_node(id_c).await;
+
+    cross_connect(&node_a, id_a, &node_b, id_b).await;
+    cross_connect(&node_a, id_a, &node_c, id_c).await;
+    cross_connect(&node_b, id_b, &node_c, id_c).await;
+
+    let replica_ids = vec![id_a, id_b, id_c];
+    let key = b"disk-fail-phantom-key".to_vec();
+
+    // -----------------------------------------------------------------------
+    // Phase 1: disk-failure nemesis — fail fsync on a quorum of replicas.
+    //
+    // node_a is the coordinator/leaseholder. node_b and node_c are the two
+    // remote replicas whose durable acks are required for a fast quorum of 3.
+    // Failing fsync on both removes any reachable durable quorum.
+    // -----------------------------------------------------------------------
+    node_b.sync_writer.set_fsync_failure(true);
+    node_c.sync_writer.set_fsync_failure(true);
+
+    let clock = HybridLogicalClock::new(node_a.node_id, 500_000_000);
+    let mut driver = AccordCoordinatorDriver::new(
+        node_a.node_id,
+        replica_ids.clone(),
+        Arc::clone(&node_a.peer_manager),
+        true, // leaseholder — implicit local PreAccept vote
+        &clock,
+        key.clone(),
+    );
+
+    let failed_result = tokio::time::timeout(TXN_TIMEOUT, driver.run_transaction())
+        .await
+        .expect("disk-fail transaction must not hang — bounded by TXN_TIMEOUT");
+
+    // No phantom commit: the transaction must NOT report a successful apply.
+    assert!(
+        failed_result.is_err(),
+        "PHANTOM COMMIT: transaction reported success while a quorum of replicas \
+         could not durably fsync — fsync-before-ack invariant violated. \
+         result={failed_result:?}"
+    );
+
+    // Prove the disk-failure path was actually exercised (non-vacuous): both
+    // failing replicas must have recorded a FsyncFailed for this key's PreAccept.
+    let b_failed = node_b
+        .sync_writer
+        .calls()
+        .contains(&SyncWriteCall::FsyncFailed);
+    let c_failed = node_c
+        .sync_writer
+        .calls()
+        .contains(&SyncWriteCall::FsyncFailed);
+    assert!(
+        b_failed && c_failed,
+        "test is vacuous: expected both failing replicas to record FsyncFailed, \
+         got node_b={b_failed} node_c={c_failed} \
+         (node_b calls={:?}, node_c calls={:?})",
+        node_b.sync_writer.calls(),
+        node_c.sync_writer.calls(),
+    );
+
+    // No durable/committed row for the key on any replica: with fsync failing,
+    // no replica may have committed or applied this transaction, and the read
+    // condition (row absent) must still hold everywhere.
+    let failed_txn = driver.txn_id();
+    for (name, node) in [("a", &node_a), ("b", &node_b), ("c", &node_c)] {
+        let sm = node.accord_state.lock();
+        assert_eq!(
+            sm.committed_count(),
+            0,
+            "PHANTOM COMMIT: node_{name} committed a transaction under disk failure \
+             (committed_count={})",
+            sm.committed_count()
+        );
+        // The failing replicas must not have advanced the txn to Committed/Applied.
+        if let Some(state) = sm.get_state(&failed_txn) {
+            assert!(
+                state.phase != TxnPhase::Committed && state.phase != TxnPhase::Applied,
+                "PHANTOM COMMIT: node_{name} advanced txn to {:?} despite fsync failure",
+                state.phase
+            );
+        }
+        assert!(
+            sm.read_condition_holds_at(&key, &failed_txn.0),
+            "PHANTOM ROW: node_{name} shows a durable row for the key under disk \
+             failure (INSERT IF NOT EXISTS condition no longer holds)"
         );
     }
 
-    // When cluster env IS set, the full test runs via ferrosa-jepsen.
-    // This stub documents the expected assertions:
+    // -----------------------------------------------------------------------
+    // Phase 2: heal the disk and converge.
     //
-    // 1. Create `jepsen.cas` table.
-    // 2. Issue 10 LWT INSERT IF NOT EXISTS ops.
-    // 3. Inject disk-slow nemesis (slow all disk I/O on node 1 to 100ms/op).
-    // 4. Issue 10 more LWT ops — some may timeout.
-    // 5. Heal disk.
-    // 6. Wait for convergence (30s).
-    // 7. Read all rows.
-    // 8. Assert: for every pk where [applied]=true was returned,
-    //    exactly one row exists in the table (no phantom commits).
-    //    For every pk where [applied]=false was returned,
-    //    no row exists (no spurious row insertion).
-    //
-    // Run the full version:
-    // cargo test -p ferrosa-jepsen --test nemesis_correctness -- disk_fail_no_phantom_commits
-    eprintln!(
-        "disk_fail_no_phantom_commits: cluster env detected — \
-         full test runs via ferrosa-jepsen::nemesis_correctness"
+    // After the failure clears, the same LWT must apply and produce exactly one
+    // durable row for the key — no double-insert, no spurious row from Phase 1.
+    // -----------------------------------------------------------------------
+    node_a.sync_writer.set_fsync_failure(false);
+    node_b.sync_writer.set_fsync_failure(false);
+    node_c.sync_writer.set_fsync_failure(false);
+
+    let clock2 = HybridLogicalClock::new(node_a.node_id, 500_000_000);
+    let mut driver2 = AccordCoordinatorDriver::new(
+        node_a.node_id,
+        replica_ids.clone(),
+        Arc::clone(&node_a.peer_manager),
+        true,
+        &clock2,
+        key.clone(),
     );
+
+    let healed_result = tokio::time::timeout(TXN_TIMEOUT, driver2.run_transaction())
+        .await
+        .expect("healed transaction must not hang — bounded by TXN_TIMEOUT");
+
+    assert!(
+        healed_result.is_ok(),
+        "after healing the disk, the INSERT IF NOT EXISTS must apply; got {:?}",
+        healed_result.err()
+    );
+
+    // Exactly one durable row for the key: the remote replicas (which durably
+    // applied this transaction) must each hold exactly one committed txn for the
+    // key, and that txn must have reached the Applied phase (durable write).
+    let healed_txn = driver2.txn_id();
+    for (name, node) in [("b", &node_b), ("c", &node_c)] {
+        let sm = node.accord_state.lock();
+        assert_eq!(
+            sm.committed_count(),
+            1,
+            "node_{name} must hold exactly one committed transaction after heal, \
+             got committed_count={} (double-insert or spurious row?)",
+            sm.committed_count()
+        );
+        let state = sm.get_state(&healed_txn).unwrap_or_else(|| {
+            panic!("node_{name} has no state for the healed txn — apply never reached it")
+        });
+        assert_eq!(
+            state.phase,
+            TxnPhase::Applied,
+            "node_{name}: healed txn must be durably Applied, got {:?}",
+            state.phase
+        );
+    }
 }
