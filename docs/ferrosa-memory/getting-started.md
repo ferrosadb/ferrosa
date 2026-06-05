@@ -94,6 +94,53 @@ If you skip this step, warn users and test with lexical/phonetic queries first:
 Nomic embeddings disabled; semantic/vector search is degraded.
 ```
 
+## 0.13 retrieval defaults
+
+The 0.13 preview defaults keep normal agent turns compact while leaving evals enough depth to measure recall:
+
+```toml
+[retrieval]
+default_limit = 10
+
+[embeddings]
+provider = "ollama"
+model = "nomic-embed-text-v2-moe"
+dimensions = 768
+
+[eval]
+retrieval_k = 25
+```
+
+Live retrieval uses `default_limit = 10` when an agent omits `limit` or `k`. Agents and users can lower this with the `config` MCP tool if a session is spending too many tokens on memory. Benchmarks should widen candidate generation in the eval runner rather than increasing the live default.
+
+The best-known BRIGHT-Pro support-doc-closed MCP slice profile for 0.13 is:
+
+```text
+candidate_limit=50
+fusion_profile=all
+query_decomposition=llm
+query_task=bright_pro
+query_variant_limit=5
+query_embed_variants=true
+chunk_expansion=none
+rerank=false
+```
+
+On the 200-document biology support-closed slice this measured alpha_nDCG `0.816`, NDCG `0.799`, aspect_recall `0.940`, and recall `0.796`. These are preview slice numbers; full-corpus paper comparisons require the full corpus to be ingested through the same MCP path.
+
+Optional live judge/reranking is configured separately:
+
+```toml
+[judge]
+enabled = false
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+timeout_seconds = 60
+```
+
+Keep it disabled unless a local or remote model endpoint is available. If the judge fails or abstains, Ferrosa Memory records an abstention rather than a positive or negative judgment. Agent and user feedback can still use compact `+1` and `-1` item feedback to tune future rankings by workspace, query shape, and retrieval channel.
+
 ## Manual source setup
 
 ```bash
@@ -318,10 +365,49 @@ Use the workbench to inspect:
 
 - CQL tables and counts;
 - memory summaries;
-- graph and Datalog query surfaces;
+- graph, CQL, SPARQL, and Datalog query surfaces;
+- the Judge Config page for optional local/remote model provider settings;
 - aliases, rules, approvals, and explanations when enabled.
 
 Use the viz page to inspect graph neighborhoods and entity links. Wait for graph queries to finish before taking screenshots or drawing conclusions from an empty view.
+
+## Agent hooks and feedback
+
+The onboarding flow can install Codex, Claude, and Hermes hooks. Those hooks capture session turns, working directory metadata, and compact retrieval feedback so memories learned in a repository can be preferred when future agents work from the same directory.
+
+From a source checkout:
+
+```bash
+cd ~/src/ferrosa-suite/ferrosa-memory
+./setup.sh --harness auto
+```
+
+or run the hook installer directly:
+
+```bash
+python3 scripts/install-agent-hooks.py --harness auto --verify
+```
+
+Agents should call `feedback` after retrieval when they can judge returned items. Use scores in result order: `1` for useful, `-1` for irrelevant or wrong, `0` for neutral, and `"-"` when a judge abstains or fails.
+
+## Evaluation helpers
+
+Ferrosa Memory includes helper scripts for BRIGHT-Pro and long-memory eval development:
+
+```bash
+# deterministic harness smoke test
+scripts/run-official-evals.sh --self-test
+
+# tune MCP fusion/decomposition profiles
+FMEM_EVAL_QUERY_DECOMPOSITION=llm \
+FMEM_EVAL_QUERY_EMBED_VARIANTS=true \
+scripts/run-fusion-ablations.sh
+
+# start a resumable full-corpus BRIGHT-Pro MCP ingest
+scripts/start-bright-pro-full-load.sh
+```
+
+The full-corpus loader writes `heartbeat.json`, `progress.json`, and `load.log` under `diagnostics/eval-runs/...` so long runs can be monitored or resumed without attaching to a terminal.
 
 ## Safe stop and restart
 

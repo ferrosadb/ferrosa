@@ -5,7 +5,7 @@ Public developer-preview documentation for Ferrosa Database and Ferrosa Memory. 
 ## Products
 
 - [Ferrosa Database](database/) — developer-preview database docs, examples, CQL/Cypher/SPARQL notes, and migration guidance.
-- [Ferrosa Memory](ferrosa-memory/) — developer-preview long-context linked memory for agents.
+- [Ferrosa Memory](ferrosa-memory/) — developer-preview long-context linked memory for agents, including 0.13 document/chunk retrieval, task-aware query decomposition, feedback-aware reranking, and Codex/Claude/Hermes hook onboarding.
 - [Ferrosa Memory Getting Started](ferrosa-memory/getting-started.html) — run the local stack, connect MCP clients, and try memory examples.
 
 ## Database Docs
