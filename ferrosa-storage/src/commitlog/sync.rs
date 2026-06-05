@@ -361,11 +361,11 @@ impl GroupSync {
     }
 
     fn stop_inner(&self, flush_final: bool) {
-        self.stop_flag.store(true, Ordering::Release);
-
         {
-            let (_lock, cvar) = &self.state.writer_signal;
-            cvar.notify_one();
+            let (lock, cvar) = &self.state.writer_signal;
+            let _guard = lock.lock();
+            self.stop_flag.store(true, Ordering::Release);
+            cvar.notify_all();
         }
 
         if let Some(handle) = self.handle.lock().take() {
@@ -449,14 +449,24 @@ impl SyncStrategy for GroupSync {
                         // Wait only if there are no pending writes.
                         if state.pending.load(Ordering::Acquire) == 0 {
                             let result = cvar.wait_for(&mut guard, max_wait);
+                            if stop_flag.load(Ordering::Acquire) {
+                                break;
+                            }
                             if result.timed_out() && state.pending.load(Ordering::Acquire) == 0 {
                                 // Timed out with no pending writes; loop back.
+                                continue;
+                            }
+                            if state.pending.load(Ordering::Acquire) == 0 {
+                                // Spurious wake or stop notification without writes.
                                 continue;
                             }
                         }
 
                         opened_at = Instant::now();
                         while state.pending_bytes.load(Ordering::Acquire) < batch.target_bytes {
+                            if stop_flag.load(Ordering::Acquire) {
+                                break;
+                            }
                             let elapsed = opened_at.elapsed();
                             if elapsed >= batch.max_delay {
                                 break;
