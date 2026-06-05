@@ -2784,6 +2784,9 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<()> {
         use ferrosa_common::NO_TIMESTAMP;
 
+        // Note: the Data.db-truncation extent check (validate_data_extent) runs
+        // mode-independently in the caller's load loop, BEFORE this smoke test,
+        // so a truncated SSTable is already excluded by the time we get here.
         let partitions = reader.read_all_partitions()?;
         for partition in &partitions {
             if let Some(static_row) = &partition.static_row {
@@ -2965,6 +2968,39 @@ impl StorageEngine {
             });
             match open_result {
                 Ok(reader) => {
+                    // MODE-INDEPENDENT truncation gate (P0 crash-atomic-flush
+                    // defense-in-depth): a Data.db shorter than the extent its
+                    // own index claims is corrupt regardless of repair mode and
+                    // must never be served. We do not move files when mode==Off
+                    // (no destructive action without an explicit repair mode),
+                    // but we always exclude the truncated generation from active
+                    // readers so queries fail loud-at-load instead of returning
+                    // truncated/garbage rows. Conservative: passes every healthy
+                    // SSTable (see SSTableReader::validate_data_extent).
+                    if let Err(e) = reader.validate_data_extent() {
+                        tracing::error!(
+                            %e,
+                            gen,
+                            dir = %table_dir.display(),
+                            mode = ?repair_mode,
+                            "storage-engine: SSTable Data.db is shorter than its index claims (truncated); excluding from active readers"
+                        );
+                        drop(reader);
+                        reader_pool.remove(&(pool_table_key.to_string(), gen_num));
+                        if repair_mode == StartupSstableRepairMode::Quarantine {
+                            let quarantine_dir = table_dir.join("quarantine");
+                            let _ = std::fs::create_dir_all(&quarantine_dir);
+                            if let Err(qe) =
+                                Self::quarantine_generation(table_dir, gen, &quarantine_dir)
+                            {
+                                tracing::warn!(%qe, gen, "storage-engine: failed to quarantine truncated SSTable");
+                            }
+                            quarantined_count += 1;
+                        } else {
+                            excluded_count += 1;
+                        }
+                        continue;
+                    }
                     if repair_mode != StartupSstableRepairMode::Off {
                         smoke_tested_count += 1;
                         if let Err(e) = Self::validate_sstable_for_startup_repair(&reader) {
@@ -5210,6 +5246,16 @@ impl StorageEngine {
             // up to this position are in the memtable we're about to flush.
             let cl_position = **state.last_commit_log_position.load();
 
+            // DURABILITY BARRIER (do not reorder): `store.flush()` only returns
+            // Ok after the SSTable's component files AND their directory entries
+            // are fsynced (see flush.rs `fsync_components`). This is the barrier
+            // that makes the later `commit_log.discard_completed(cl_position)`
+            // safe: we must NOT advance the WAL checkpoint / delete segments
+            // until the SSTable copy of those mutations is durable on disk. If
+            // flush() fails, we return here and the WAL is left intact so replay
+            // can rebuild the memtable. Removing the fsync from flush(), or
+            // moving discard_completed before this line, reintroduces the P0
+            // "kill mid-flush loses both the torn SSTable and the WAL copy" bug.
             state.store.flush()?;
 
             // Reset the unflushed-write timestamp so the next write starts a
@@ -9445,6 +9491,117 @@ mod tests {
         );
     }
 
+    /// P0 crash-non-atomic-flush defense-in-depth: a Data.db truncated below
+    /// the extent its own partition index claims must be EXCLUDED from the live
+    /// view even when startup repair is fully OFF (no smoke test). This is the
+    /// exact production scenario: a SIGKILL mid-flush left a final-named, nonzero
+    /// but truncated Data.db that previously loaded silently and only failed at
+    /// query time. The mode-independent extent gate converts that into a
+    /// loud-at-load exclusion.
+    #[test]
+    fn startup_off_mode_excludes_sstable_with_truncated_data_below_index_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "truncated_extent".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("test_ks", "truncated_extent");
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+            // Multiple partitions so the last partition starts at a non-zero
+            // Data.db offset — required for the extent check to have a positive
+            // bound to compare against.
+            for i in 0..16i32 {
+                let pk = DecoratedKey::new(PartitionKey::new(i.to_be_bytes().to_vec()));
+                let row = Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(format!("value-{i}").into_bytes(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                };
+                engine.write(&tid, &pk, row, 1000).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+        }
+
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let data_file = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("-Data.db")
+            })
+            .expect("flush must produce a Data.db");
+        let original_len = std::fs::metadata(&data_file).unwrap().len();
+        assert!(
+            original_len > 16,
+            "test needs a Data.db with multiple partitions to truncate"
+        );
+        // Truncate hard — to a single byte — so the file is nonzero (escapes the
+        // zero-byte critical-component check) yet far shorter than the last
+        // partition's indexed offset.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_file)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&data_file).unwrap().len(),
+            1,
+            "Data.db must be nonzero so the zero-byte check does not fire"
+        );
+
+        let pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> =
+            Arc::new(crate::reader_pool::ReaderPool::new(8));
+        // Repair OFF: no smoke test runs. The mode-independent extent gate must
+        // still exclude the truncated generation.
+        let (descriptors, _sidecars, ids) =
+            StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode(
+                &table_dir,
+                &pool,
+                "extent-off",
+                StartupSstableRepairMode::Off,
+            );
+        assert!(
+            ids.is_empty(),
+            "repair-OFF startup must not admit a Data.db truncated below its index extent"
+        );
+        assert!(
+            descriptors.is_empty(),
+            "repair-OFF startup must not produce a descriptor for the truncated SSTable"
+        );
+        assert_eq!(
+            pool.resident(),
+            0,
+            "the excluded truncated SSTable must be evicted from the pool"
+        );
+        // OFF mode is non-destructive: files stay in place for salvage.
+        assert!(
+            data_file.exists(),
+            "repair-OFF must leave truncated components in place for salvage"
+        );
+        assert!(
+            !table_dir.join("quarantine").exists(),
+            "repair-OFF must not move files to quarantine"
+        );
+    }
+
     /// Given a table with one healthy SSTable and one corrupt SSTable, restart
     /// must keep the healthy generation queryable while retaining the corrupt
     /// generation on disk for salvage. This is the production recovery contract:
@@ -11241,6 +11398,77 @@ mod tests {
         assert!(
             after > before,
             "commit_log_position should advance after write"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// Gap 2 (WAL discarded before durability): `engine.flush()` must NOT
+    /// advance the commit-log checkpoint / discard segments when the SSTable
+    /// flush fails. The WAL is the only other copy of those mutations; if flush
+    /// tears or fails, replay must still be able to rebuild them. We induce a
+    /// flush failure by making the table's SSTable directory read-only, then
+    /// assert (a) flush returns Err and (b) no closed segment was discarded.
+    #[cfg(unix)]
+    #[test]
+    fn flush_failure_does_not_discard_commit_log_before_durability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 512, // tiny: forces rotation so there are closed segments
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        for i in 0..20 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"value", 1000 + i),
+                    1000 + i,
+                )
+                .unwrap();
+        }
+
+        let closed_before = engine.commit_log.closed_segment_count();
+        assert!(
+            closed_before >= 2,
+            "need multiple closed segments for this test, got {closed_before}"
+        );
+
+        // Make the table's SSTable directory read-only so the flush write/rename
+        // fails. The directory already exists (created on first flush attempt or
+        // table registration); ensure it exists, then strip write perms.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let mut perms = std::fs::metadata(&table_dir).unwrap().permissions();
+        perms.set_mode(0o500); // r-x: no write
+        std::fs::set_permissions(&table_dir, perms).unwrap();
+
+        let flush_result = engine.flush(&tid);
+
+        // Restore perms so the tempdir can be cleaned up regardless of outcome.
+        let mut restore = std::fs::metadata(&table_dir).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&table_dir, restore).unwrap();
+
+        assert!(
+            flush_result.is_err(),
+            "flush into a read-only SSTable dir must fail, not silently succeed"
+        );
+
+        let closed_after = engine.commit_log.closed_segment_count();
+        assert_eq!(
+            closed_after, closed_before,
+            "commit log segments must NOT be discarded when flush fails: \
+             before={closed_before}, after={closed_after}"
         );
 
         engine.shutdown().unwrap();

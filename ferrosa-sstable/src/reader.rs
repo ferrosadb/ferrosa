@@ -553,6 +553,55 @@ impl<R: ReadAt> SSTableReader<R> {
         self.data.len()
     }
 
+    /// Number of partitions reachable by walking `Data.db` from byte 0, using
+    /// the partition-count fast path (no cell decode). On a healthy SSTable this
+    /// equals [`key_count`](Self::key_count). On a `Data.db` truncated mid-file
+    /// the walk stops early and this is strictly less than `key_count`.
+    ///
+    /// Cheap: one streaming pass over partition headers (the same machinery the
+    /// merger's dedup path already uses via `partition_offsets`).
+    pub fn walkable_partition_count(&self) -> u64 {
+        // `partition_offsets()` walks Data.db with `read_partition_count`,
+        // pushing one offset per successfully decoded partition and stopping at
+        // the first read error or clean EOF. Its length is the number of
+        // partitions whose headers are fully present in Data.db.
+        self.partition_offsets().len() as u64
+    }
+
+    /// Reject an SSTable whose `Data.db` is shorter than what its own partition
+    /// index claims. Converts a silent query-time truncation (the P0
+    /// crash-non-atomic-flush corruption) into a loud load-time error.
+    ///
+    /// Detection: the partition index footer records `key_count` (the number of
+    /// partitions written). We walk `Data.db` and count how many partition
+    /// headers are actually reachable. A truncated `Data.db` yields fewer
+    /// reachable partitions than the index claims.
+    ///
+    /// Conservative by construction:
+    /// - An empty index (`key_count == 0`) passes.
+    /// - A zero-byte `Data.db` for a non-empty index is already caught by the
+    ///   startup zero-byte critical-component check; here it would also fail
+    ///   (0 reachable < key_count), which is correct.
+    /// - It does NOT depend on offset arithmetic, Rows.db contents, or
+    ///   byte-comparable key bounds, so it never false-positives on healthy
+    ///   small-partition SSTables (the regression an offset-based check hit).
+    pub fn validate_data_extent(&self) -> Result<()> {
+        let expected = self.key_count();
+        if expected == 0 {
+            return Ok(());
+        }
+        let reachable = self.walkable_partition_count();
+        if reachable < expected {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "Data.db truncated: index claims {expected} partitions but only {reachable} \
+                 are reachable by walking Data.db (length {}); the SSTable's data was lost \
+                 (likely a non-crash-atomic flush killed mid-write)",
+                self.data_file_length().unwrap_or(0)
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns the approximate total size of this SSTable in bytes.
     ///
     /// Sums the sizes of the data file and the partition index. For
@@ -1235,6 +1284,91 @@ mod tests {
         assert_eq!(row.primary_key_liveness.timestamp, 1_000_042);
         assert_eq!(row.cells.len(), 1);
         assert_eq!(row.cells[0].1.value.as_deref(), Some(b"hello-0".as_slice()));
+    }
+
+    #[test]
+    fn validate_data_extent_passes_for_healthy_sstable() {
+        let header = test_header();
+        let dk1 = DecoratedKey::new(PartitionKey::from(b"k1".as_slice()));
+        let dk2 = DecoratedKey::new(PartitionKey::from(b"k2".as_slice()));
+
+        let mut data_bytes = Vec::new();
+        let pos1 = data_bytes.len() as u64;
+        data_bytes.extend_from_slice(&build_data_blob_with_rows(b"k1", 3));
+        let pos2 = data_bytes.len() as u64;
+        data_bytes.extend_from_slice(&build_data_blob_with_rows(b"k2", 2));
+
+        let partitions_bytes = build_partition_index(&[(&dk1, pos1), (&dk2, pos2)]);
+        let filter_bytes = build_bloom_filter(&[&dk1, &dk2]);
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+        assert_eq!(reader.key_count(), 2);
+        assert_eq!(
+            reader.walkable_partition_count(),
+            2,
+            "all partitions must be reachable in a healthy Data.db"
+        );
+        reader
+            .validate_data_extent()
+            .expect("healthy SSTable must pass extent check");
+    }
+
+    #[test]
+    fn validate_data_extent_rejects_truncated_data_db() {
+        let header = test_header();
+        let dk1 = DecoratedKey::new(PartitionKey::from(b"k1".as_slice()));
+        let dk2 = DecoratedKey::new(PartitionKey::from(b"k2".as_slice()));
+
+        let mut data_bytes = Vec::new();
+        let pos1 = data_bytes.len() as u64;
+        data_bytes.extend_from_slice(&build_data_blob_with_rows(b"k1", 3));
+        let pos2 = data_bytes.len() as u64;
+        data_bytes.extend_from_slice(&build_data_blob_with_rows(b"k2", 2));
+
+        let partitions_bytes = build_partition_index(&[(&dk1, pos1), (&dk2, pos2)]);
+        let filter_bytes = build_bloom_filter(&[&dk1, &dk2]);
+        let stats_bytes = build_statistics(header);
+
+        // Simulate a crash-truncated Data.db: drop the entire second partition
+        // so only one of the two indexed partitions is reachable. Non-zero, but
+        // missing data the index claims exists.
+        let mut truncated = data_bytes.clone();
+        truncated.truncate(pos2 as usize);
+        assert!(!truncated.is_empty(), "fixture must be nonzero");
+
+        let components = SSTableComponents {
+            data: truncated,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        assert_eq!(reader.key_count(), 2, "index must claim 2 partitions");
+        assert_eq!(
+            reader.walkable_partition_count(),
+            1,
+            "only the first partition should be reachable after truncation"
+        );
+
+        let err = reader
+            .validate_data_extent()
+            .expect_err("truncated Data.db must be rejected");
+        assert!(
+            err.to_string().contains("truncated"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
