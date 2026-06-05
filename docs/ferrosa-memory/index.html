@@ -863,7 +863,7 @@
 <section class="hero">
   <div class="hero-badge"><span class="dot"></span> Ferrosa Memory · Developer Preview</div>
   <h1>Linked memory for <span class="gradient">long-running agents.</span></h1>
-  <p>Ferrosa Memory gives agents a developer-preview memory layer: context segments, entities, temporal facts, graph edges, retrieval, Datalog-style derived facts, and operator UIs for query and visualization.</p>
+  <p>Ferrosa Memory gives agents a developer-preview memory layer: context segments, documents, entities, temporal facts, graph edges, hybrid retrieval, feedback-aware reranking, Datalog-style derived facts, and operator UIs for query, judge configuration, and visualization.</p>
   <div class="hero-actions">
     <a href="getting-started.html" class="btn-primary">Quickstart</a>
     <a href="#workbench" class="btn-secondary">Explore the UI</a>
@@ -875,9 +875,20 @@
   <div class="doc-grid">
     <div class="doc-card"><h3>Temporal facts</h3><p>Record what changed over time instead of overwriting history. Current facts stay easy to retrieve, while superseded facts remain inspectable for audit and debugging.</p></div>
     <div class="doc-card"><h3>Graph links</h3><p>Entities, folds, facts, skills, and tags are connected with typed edges so an agent can follow relationships rather than only search text.</p></div>
-    <div class="doc-card"><h3>Retrieval + context windows</h3><p>Hybrid retrieval is designed to find relevant memories, then expand around raw context segments to recover nearby conversation or artifact context.</p></div>
+    <div class="doc-card"><h3>Retrieval + context windows</h3><p>Hybrid retrieval uses lexical, vector, phonetic, graph, workspace, and recency signals, then can expand around raw context or document chunks to recover neighboring evidence.</p></div>
     <div class="doc-card"><h3>Datalog-style materialization</h3><p>Rules can derive and explain higher-level facts from graph state, making memory behavior easier to inspect than opaque summaries alone.</p></div>
   </div>
+</section>
+<section id="release-notes">
+  <div class="section-label cool">0.13 preview highlights</div>
+  <h2>Long-recall work is now wired into the memory service.</h2>
+  <div class="doc-grid">
+    <div class="doc-card"><h3>Document retrieval plane</h3><p>Documents, sections, chunks, and adjacency links can be stored as typed memory so answers that span neighboring chunks can be traversed instead of relying on a single ranked hit.</p></div>
+    <div class="doc-card"><h3>Candidate fanout + fusion</h3><p>Hybrid search can gather candidates from exact/document IDs, BM25, semantic vectors, phonetic matches, workspace boosts, graph neighbors, and recent session context before fusion.</p></div>
+    <div class="doc-card"><h3>Task-aware decomposition</h3><p>BRIGHT-Pro-style queries can generate task-native subqueries and merge candidate pools before final ranking, improving the support-doc-closed eval slice.</p></div>
+    <div class="doc-card"><h3>Feedback learning loop</h3><p>Agents, users, and optional judge models can send compact item feedback. Abstentions are tracked separately, and future ranking can account for workspace-specific relevance.</p></div>
+  </div>
+  <div class="note">Best known 0.13 BRIGHT-Pro support-doc-closed MCP slice settings: retrieval_k=25, candidate_limit=50, fusion_profile=all, query_decomposition=llm, query_embed_variants=true, chunk_expansion=none, rerank=false. On the 200-document biology slice this measured alpha_nDCG 0.816, NDCG 0.799, aspect_recall 0.940, and recall 0.796.</div>
 </section>
 <section id="architecture">
   <div class="section-label">Architecture</div>
@@ -905,7 +916,7 @@ Ferrosa Database storage + graph</code></pre></div>
   <div class="section-label cool">Workbench and visualization</div>
   <h2>Query memory directly, then inspect what was linked.</h2>
   <div class="doc-grid">
-    <div class="doc-card"><h3>Workbench</h3><p>The browser workbench includes Home, Viz, CQL Explorer, SPARQL Explorer, Datalog Explorer, Aliases, Rules, Approvals, and Explanations.</p></div>
+    <div class="doc-card"><h3>Workbench</h3><p>The browser workbench includes Home, Viz, CQL Explorer, SPARQL Explorer, Datalog Explorer, Judge Config, Aliases, Rules, Approvals, and Explanations.</p></div>
     <div class="doc-card"><h3>Query APIs</h3><p>Use <code>/workbench/api/cql/query</code>, <code>/workbench/api/sparql/query</code>, and <code>/workbench/api/datalog/query</code> while evaluating storage, graph, and derived-memory behavior.</p></div>
     <div class="doc-card"><h3>Visualization</h3><p>The viz surface is served separately from the main memory API. In local developer preview, it is available at <code>http://localhost:18766/viz</code>.</p></div>
   </div>
@@ -924,7 +935,7 @@ Ferrosa Database storage + graph</code></pre></div>
 <section id="quickstart">
   <div class="section-label">Quickstart</div>
   <h2>Local developer preview configuration.</h2>
-  <p style="color:var(--text-secondary); max-width:780px;">For the shortest path, run the hosted memory setup script. It downloads the onboarding prompt, optionally clones or updates the public repositories, offers to pull <code>nomic-embed-text-v2-moe</code>, and hands the user to Hermes, Claude, Codex, or another LLM harness. Minimal native mode can use local filesystem storage with no S3/MinIO; the full Compose mode adds a three-node cluster and MinIO for operator testing.</p>
+  <p style="color:var(--text-secondary); max-width:780px;">For the shortest path, run the hosted memory setup script. It downloads the onboarding prompt, optionally clones or updates the public repositories, offers to pull <code>nomic-embed-text-v2-moe</code>, installs Hermes/Claude/Codex hooks when requested, and hands the user to an LLM harness. Minimal native mode can use local filesystem storage with no S3/MinIO; the full Compose mode adds a three-node cluster and MinIO for operator testing.</p>
   <div class="code-block"><pre><code>curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 
 # Optional semantic/vector search layer:
@@ -942,6 +953,14 @@ keyspace = "agent_memory"
 [viz]
 enabled = true
 bind = "127.0.0.1:18766"
+
+[retrieval]
+default_limit = 10
+
+[embeddings]
+provider = "ollama"
+model = "nomic-embed-text-v2-moe"
+dimensions = 768
 
 [security]
 # For local preview only. Use TLS + auth mapping for shared deployment.
