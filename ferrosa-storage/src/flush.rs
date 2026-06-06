@@ -587,12 +587,31 @@ pub struct FileFlushTarget {
 pub(crate) mod fsync_probe {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
     static SYNCED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SYNCED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-    pub(crate) fn reset() {
+    pub(crate) struct ExclusiveGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn exclusive() -> ExclusiveGuard {
+        let guard = EXCLUSIVE
+            .lock()
+            .expect("fsync probe exclusive lock poisoned");
+        reset();
+        ExclusiveGuard { _guard: guard }
+    }
+
+    impl Drop for ExclusiveGuard {
+        fn drop(&mut self) {
+            reset();
+        }
+    }
+
+    fn reset() {
         SYNCED_FILES.lock().expect("fsync probe poisoned").clear();
         SYNCED_DIRS.lock().expect("fsync probe poisoned").clear();
     }
@@ -1677,7 +1696,7 @@ mod tests {
         // Durability barrier: after flush(), every promoted component file AND
         // the containing directory must have been fsynced. Without the barrier
         // a SIGKILL after rename can leave a truncated, final-named Data.db.
-        fsync_probe::reset();
+        let _fsync_probe = fsync_probe::exclusive();
 
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
@@ -1724,7 +1743,7 @@ mod tests {
     fn flush_files_fsyncs_every_component_and_directory() {
         // The staged-promotion path (used by compaction) must apply the same
         // durability barrier as flush().
-        fsync_probe::reset();
+        let _fsync_probe = fsync_probe::exclusive();
 
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
