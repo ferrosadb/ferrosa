@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -342,4 +343,4 @@ jobs:
           gh release create "v${VERSION}" dist/* \
             --title "Ferrosa v${VERSION}" \
             --notes "$NOTES" \
-            --draft
+            --latest

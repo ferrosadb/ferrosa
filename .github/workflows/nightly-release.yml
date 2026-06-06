@@ -1,0 +1,90 @@
+name: Nightly Release
+
+on:
+  schedule:
+    # Run once per night in UTC. The workflow skips itself when no commits have
+    # landed since the latest stable vX.Y.Z tag.
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'SemVer bump override. auto uses Conventional Commit history.'
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+      force:
+        description: 'Create the next release even when there are no commits since the latest stable tag.'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: nightly-release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Bump version, tag, and dispatch release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - name: Compute next SemVer release
+        id: next
+        run: |
+          bump='${{ github.event.inputs.bump || 'auto' }}'
+          force='${{ github.event.inputs.force || 'false' }}'
+          bash .github/scripts/next-release-version.sh "$bump" "$force"
+
+      - name: Stop when there is nothing new to release
+        if: steps.next.outputs.should_release != 'true'
+        run: echo "No commits since ${{ steps.next.outputs.base_tag }}; skipping nightly release."
+
+      - name: Update workspace version
+        if: steps.next.outputs.should_release == 'true'
+        env:
+          VERSION: ${{ steps.next.outputs.next_version }}
+        run: |
+          perl -0pi -e 's/(\[workspace\.package\]\s+version\s*=\s*)"[^"]+"/${1}"'"${VERSION}"'"/s' Cargo.toml
+          cargo update -w
+          git diff -- Cargo.toml Cargo.lock
+
+      - name: Commit release bump and create tag
+        if: steps.next.outputs.should_release == 'true'
+        env:
+          NEXT_VERSION: ${{ steps.next.outputs.next_version }}
+          NEXT_TAG: ${{ steps.next.outputs.next_tag }}
+          BASE_TAG: ${{ steps.next.outputs.base_tag }}
+          BUMP: ${{ steps.next.outputs.bump }}
+          COMMIT_COUNT: ${{ steps.next.outputs.commit_count }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${NEXT_TAG}"
+          git tag -a "${NEXT_TAG}" -m "${NEXT_TAG} nightly release" -m "${BUMP} bump from ${BASE_TAG} after ${COMMIT_COUNT} commits."
+          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin "${NEXT_TAG}"
+
+      - name: Dispatch release build
+        if: steps.next.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_TAG: ${{ steps.next.outputs.next_tag }}
+        run: gh workflow run release.yml --ref "${NEXT_TAG}"
