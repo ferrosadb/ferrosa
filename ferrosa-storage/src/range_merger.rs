@@ -50,7 +50,7 @@ pub fn rows_per_fragment() -> usize {
     }
 }
 
-/// One bounded slice of a merged partition emitted by [`FragmentMerger`].
+/// One bounded slice of a merged partition emitted by [`RangeMerger`].
 ///
 /// A wide partition is delivered as a SEQUENCE of fragments that all share
 /// the same `key`, in clustering order, with non-overlapping row ranges.
@@ -224,7 +224,7 @@ struct PoppedHeader {
     deletion: ferrosa_sstable::types::DeletionTime,
     static_row: Option<Row>,
     /// `Some` for `Memtable` sources: the partition's rows, already sorted
-    /// by clustering key, to be drained by the `FragmentMerger`. `None` for
+    /// by clustering key, to be drained by the `RangeMerger`. `None` for
     /// SSTable-backed sources, whose rows stream via
     /// [`MergeSource::next_fragment_row`].
     mem_body: Option<Vec<Row>>,
@@ -240,7 +240,7 @@ pub enum MergeSource<'a, R: ReadAt> {
         peeked: Option<Partition>,
     },
     // NOTE: fragment-row streaming state for the Memtable variant lives
-    // in `FragmentMerger` (see `MemRowSource`) rather than here, so the
+    // in `RangeMerger` (see `MemRowSource`) rather than here, so the
     // whole-partition `RangeMerger` path is untouched.
     /// Single SSTable streaming reader. `mode` controls per-cell
     /// decoding on `pop_partition`. `peek_key` reads only the
@@ -383,7 +383,7 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
     ///
     /// For `Memtable` sources the partition body is already in memory,
     /// so the header carries the whole partition out as
-    /// `MemPartitionBody` (the `FragmentMerger` drains its rows in
+    /// `MemPartitionBody` (the `RangeMerger` drains its rows in
     /// clustering order). For `SsTable` / `SsTableRun` sources only
     /// the ~10-byte header is decoded here; rows arrive lazily.
     ///
