@@ -4755,6 +4755,46 @@ impl StorageEngine {
         }
     }
 
+    /// Intra-partition streaming variant of [`Self::range_iter`]. Wide
+    /// partitions are delivered as a sequence of `<= K`-row `Partition`
+    /// fragments (see [`crate::store::TableStore::range_iter_fragmented`]),
+    /// so the producer holds `O(num_sources + K)` rows resident regardless
+    /// of partition width — the OOM fix for full-table `SELECT *`.
+    pub fn range_iter_fragmented(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.range_iter_fragmented(start, end),
+            None => Box::pin(futures::stream::empty()),
+        }
+    }
+
+    /// Projection-aware intra-partition streaming variant of
+    /// [`Self::range_iter_projected`].
+    pub fn range_iter_projected_fragmented(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state
+                .store
+                .range_iter_projected_fragmented(wanted, start, end),
+            None => Box::pin(futures::stream::empty()),
+        }
+    }
+
     /// Query by secondary index across memtable and SSTable sidecar indexes.
     ///
     /// Delegates to [`TableStore::read_by_index`] which merges results from

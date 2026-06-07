@@ -26,6 +26,73 @@ use ferrosa_sstable::ReadAt;
 
 use crate::merge;
 
+/// Default number of clustered rows carried in one [`PartitionFragment`].
+/// Bounds the merger's resident working set to `O(num_sources + K)`
+/// rows regardless of how wide a single partition is — an inverted-index
+/// partition (one hot term ⇒ millions of rows in one `Vec<Row>`) is the
+/// shape that OOM-killed replicas on a full-table `SELECT *`.
+///
+/// Tunable via `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT`. Picked at a few
+/// thousand so the per-fragment frame amortises message overhead while
+/// keeping resident memory comfortably under any sane cgroup cap.
+pub const DEFAULT_ROWS_PER_FRAGMENT: usize = 4_096;
+
+/// Resolve the fragment row cap `K` from the environment, falling back to
+/// [`DEFAULT_ROWS_PER_FRAGMENT`]. A value of `0` or an unparseable value is
+/// treated as the default (never zero — a zero cap would loop forever).
+pub fn rows_per_fragment() -> usize {
+    match std::env::var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => DEFAULT_ROWS_PER_FRAGMENT,
+        },
+        Err(_) => DEFAULT_ROWS_PER_FRAGMENT,
+    }
+}
+
+/// One bounded slice of a merged partition emitted by [`FragmentMerger`].
+///
+/// A wide partition is delivered as a SEQUENCE of fragments that all share
+/// the same `key`, in clustering order, with non-overlapping row ranges.
+/// Reassembly contract (relied on by the cluster stream handler, the
+/// coordinator merge, and the CQL row bridge):
+///
+/// - The FIRST fragment of a key (`first == true`) carries the partition's
+///   real `deletion` and `static_row`. Every later fragment carries
+///   `deletion = LIVE` and `static_row = None`, so a consumer that flattens
+///   fragments into rows never double-counts the static row nor re-applies
+///   the partition tombstone.
+/// - `rows` are already cell-merged across sources (LWW), deletion-suppressed,
+///   and sorted by clustering key, with `rows.len() <= K`.
+/// - `last == true` marks the final fragment for the key.
+///
+/// A consumer can therefore treat each fragment exactly like a small
+/// `Partition` and append its rows; the concatenation is byte-identical to
+/// the single whole-partition merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionFragment {
+    pub key: DecoratedKey,
+    pub deletion: ferrosa_sstable::types::DeletionTime,
+    pub static_row: Option<Row>,
+    pub rows: Vec<Row>,
+    pub first: bool,
+    pub last: bool,
+}
+
+impl PartitionFragment {
+    /// View this fragment as a standalone `Partition`. Because non-first
+    /// fragments carry `deletion = LIVE` / `static_row = None`, flattening
+    /// the fragment sequence of one key reproduces the merged partition.
+    pub fn into_partition(self) -> Partition {
+        Partition {
+            key: self.key,
+            deletion: self.deletion,
+            static_row: self.static_row,
+            rows: self.rows,
+        }
+    }
+}
+
 /// Per-SSTable translation from the physical column ordinals in an
 /// SSTable's SerializationHeader to the current table schema ordinals.
 #[derive(Clone, Debug)]
@@ -150,6 +217,19 @@ fn remap_cells(cells: &mut Vec<(u16, ferrosa_common::cell::CellValue)>, mapping:
 /// there is no cheap "peek key" primitive — so peek reads + caches
 /// the whole partition. That's still free in practice (memtables are
 /// in-memory) and pop takes the cached partition.
+/// Header (and, for in-memory sources, the body) of a partition popped
+/// for fragment streaming. See [`MergeSource::pop_partition_header`].
+struct PoppedHeader {
+    key: DecoratedKey,
+    deletion: ferrosa_sstable::types::DeletionTime,
+    static_row: Option<Row>,
+    /// `Some` for `Memtable` sources: the partition's rows, already sorted
+    /// by clustering key, to be drained by the `FragmentMerger`. `None` for
+    /// SSTable-backed sources, whose rows stream via
+    /// [`MergeSource::next_fragment_row`].
+    mem_body: Option<Vec<Row>>,
+}
+
 pub enum MergeSource<'a, R: ReadAt> {
     /// Memtable / flushing memtable: infallible per-partition yield.
     /// `peeked` caches the result of the most recent `peek_key()`
@@ -159,6 +239,9 @@ pub enum MergeSource<'a, R: ReadAt> {
         iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
         peeked: Option<Partition>,
     },
+    // NOTE: fragment-row streaming state for the Memtable variant lives
+    // in `FragmentMerger` (see `MemRowSource`) rather than here, so the
+    // whole-partition `RangeMerger` path is untouched.
     /// Single SSTable streaming reader. `mode` controls per-cell
     /// decoding on `pop_partition`. `peek_key` reads only the
     /// partition header (~10 bytes) via `PartitionIter::peek_partition_key`
@@ -288,6 +371,145 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                 peeked_key.take();
                 run.next_partition()
             }
+        }
+    }
+
+    /// Fragment-streaming counterpart of [`Self::pop_partition`].
+    /// Pops the next partition's HEADER (key + partition deletion +
+    /// optional static row) for the most-recently-peeked key,
+    /// **parking the source at the first clustered row** so the body
+    /// can be streamed via [`Self::next_fragment_row`] without ever
+    /// materialising the whole partition.
+    ///
+    /// For `Memtable` sources the partition body is already in memory,
+    /// so the header carries the whole partition out as
+    /// `MemPartitionBody` (the `FragmentMerger` drains its rows in
+    /// clustering order). For `SsTable` / `SsTableRun` sources only
+    /// the ~10-byte header is decoded here; rows arrive lazily.
+    ///
+    /// Returns `Ok(None)` if the source was exhausted between peek and
+    /// pop (race-free here — sources are not shared across threads).
+    fn pop_partition_header(&mut self) -> Result<Option<PoppedHeader>> {
+        match self {
+            Self::Memtable { iter, peeked } => {
+                let partition = match peeked.take() {
+                    Some(p) => p,
+                    None => match iter.next() {
+                        Some(p) => p,
+                        None => return Ok(None),
+                    },
+                };
+                let key = partition.key.clone();
+                let deletion = partition.deletion;
+                let static_row = partition.static_row.clone();
+                let mut rows = partition.rows;
+                rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
+                Ok(Some(PoppedHeader {
+                    key,
+                    deletion,
+                    static_row,
+                    mem_body: Some(rows),
+                }))
+            }
+            Self::SsTable {
+                iter,
+                mode,
+                mapping,
+                peeked_key,
+                failed,
+            } => {
+                if *failed {
+                    return Ok(None);
+                }
+                peeked_key.take();
+                let header = match iter.next_partition_header_only() {
+                    Ok(Some(h)) => h,
+                    Ok(None) => return Ok(None),
+                    Err(e) if mode.is_fail_soft() => {
+                        tracing::warn!(
+                            %e,
+                            mode = mode.label(),
+                            "range scan: skipping SSTable whose partition header failed to decode"
+                        );
+                        *failed = true;
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
+                let (key, deletion, mut static_row) = header;
+                if let (Some(mapping), Some(sr)) = (*mapping, static_row.as_mut()) {
+                    mapping.remap_static_row(sr);
+                }
+                Ok(Some(PoppedHeader {
+                    key,
+                    deletion,
+                    static_row,
+                    mem_body: None,
+                }))
+            }
+            Self::SsTableRun { run, peeked_key } => {
+                peeked_key.take();
+                match run.next_partition_header_only()? {
+                    Some((key, deletion, static_row)) => Ok(Some(PoppedHeader {
+                        key,
+                        deletion,
+                        static_row,
+                        mem_body: None,
+                    })),
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Pull one clustered row from the partition opened by the most
+    /// recent [`Self::pop_partition_header`] on this source. Returns
+    /// `Ok(None)` at end-of-partition. Only valid for SSTable-backed
+    /// sources; `Memtable` rows are drained from the `MemPartitionBody`
+    /// the header carried out, so this is `Ok(None)` for them.
+    fn next_fragment_row(&mut self) -> Result<Option<Row>> {
+        match self {
+            Self::Memtable { .. } => Ok(None),
+            Self::SsTable {
+                iter,
+                mode,
+                mapping,
+                failed,
+                ..
+            } => {
+                if *failed {
+                    return Ok(None);
+                }
+                let mode = *mode;
+                let mapping = *mapping;
+                let row = match mode {
+                    RunMode::Projected(wanted) => {
+                        let source_wanted = mapping
+                            .map(|m| m.source_regular_ordinals_for_projection(wanted))
+                            .unwrap_or_else(|| wanted.to_vec());
+                        iter.next_clustered_row_projected(&source_wanted)
+                    }
+                    RunMode::Full | RunMode::Metadata => iter.next_clustered_row(),
+                };
+                let mut row = match row {
+                    Ok(r) => r,
+                    Err(e) if mode.is_fail_soft() => {
+                        tracing::warn!(
+                            %e,
+                            mode = mode.label(),
+                            "range scan: skipping SSTable whose row failed to decode"
+                        );
+                        *failed = true;
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let (Some(mapping), Some(r)) = (mapping, row.as_mut()) {
+                    mapping.remap_regular_row(r);
+                }
+                Ok(row)
+            }
+            Self::SsTableRun { run, .. } => run.next_fragment_row(),
         }
     }
 
@@ -510,6 +732,55 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// Fragment-row streaming: read the current partition's HEADER
+    /// (key + deletion + optional static row) from the run's current
+    /// SSTable, parking that SSTable's `PartitionIter` at the first
+    /// clustered row. The follow-up is [`Self::next_fragment_row`].
+    /// Because runs are token-disjoint, every key appears in exactly
+    /// one SSTable of the run, so the header always comes from the
+    /// `current` iterator. Returns `Ok(None)` at end-of-run.
+    fn next_partition_header_only(
+        &mut self,
+    ) -> Result<
+        Option<(
+            DecoratedKey,
+            ferrosa_sstable::types::DeletionTime,
+            Option<Row>,
+        )>,
+    > {
+        loop {
+            if self.current.is_none() {
+                if self.cursor >= self.sstables.len() {
+                    return Ok(None);
+                }
+                self.current = Some(self.sstables[self.cursor].partitions_iter()?);
+            }
+            let it = self.current.as_mut().expect("just initialised");
+            match it.next_partition_header_only()? {
+                Some(header) => return Ok(Some(header)),
+                None => {
+                    self.current = None;
+                    self.cursor += 1;
+                }
+            }
+        }
+    }
+
+    /// Pull the next clustered row of the partition most recently
+    /// opened by [`Self::next_partition_header_only`], honoring the
+    /// run's projection `mode`. Returns `Ok(None)` at
+    /// end-of-partition. Does NOT advance to the next SSTable — that
+    /// happens on the following `next_partition_header_only`.
+    fn next_fragment_row(&mut self) -> Result<Option<Row>> {
+        let Some(it) = self.current.as_mut() else {
+            return Ok(None);
+        };
+        match self.mode {
+            RunMode::Full | RunMode::Metadata => it.next_clustered_row(),
+            RunMode::Projected(wanted) => it.next_clustered_row_projected(wanted),
         }
     }
 }
@@ -896,12 +1167,45 @@ pub struct RangeMerger<'a, R: ReadAt> {
     end: Option<DecoratedKey>,
     /// Set once a key > end is observed so we stop pulling sources.
     exhausted: bool,
+    /// In-progress partition for the fragment-streaming path
+    /// ([`Self::next_fragment`]). `None` between partitions (the
+    /// whole-partition `next_merged_partition` path never sets it).
+    active: Option<ActivePartition>,
     /// Leaked allocation backing the per-run `Vec<Arc<SSTableReader>>`
     /// slices that `SsTableRunIter`s borrow from. `Some` only when
     /// the merger was built via `build_merger_with_runs`; freed by
     /// the `Drop` impl below. `*const` rather than `Box` because
     /// `Box::leak`'s output has to be re-wrapped manually.
     runs_arena: Option<*const [Vec<Arc<SSTableReader<R>>>]>,
+}
+
+/// One source's current row head while a partition is being streamed
+/// in fragments.
+enum RowCursor {
+    /// In-memory rows (memtable source), pre-sorted by clustering key.
+    Mem(std::vec::IntoIter<Row>),
+    /// SSTable-backed source — rows pulled lazily via
+    /// `MergeSource::next_fragment_row`, identified by source index.
+    Sst { src: usize },
+}
+
+/// Streaming state for the partition currently being emitted as
+/// [`PartitionFragment`]s. Holds at most one row per participating
+/// source ("head") plus the merged partition header.
+struct ActivePartition {
+    key: DecoratedKey,
+    deletion: ferrosa_sstable::types::DeletionTime,
+    /// Carried out on the FIRST fragment, then `None`.
+    pending_static_row: Option<Row>,
+    first: bool,
+    cursors: Vec<RowCursor>,
+    /// `heads[i]` is the next unconsumed row from `cursors[i]`, or
+    /// `None` if that cursor is exhausted. Peak resident rows for the
+    /// merge proper is `cursors.len()` (one head each).
+    heads: Vec<Option<Row>>,
+    /// Source indices to refill back onto the heap once this partition
+    /// is fully drained.
+    refill_srcs: Vec<usize>,
 }
 
 // SAFETY: `runs_arena` is a leaked allocation that contains only
@@ -941,6 +1245,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
             start,
             end,
             exhausted: false,
+            active: None,
             runs_arena: None,
         };
         // Prime the heap with one partition per non-empty source.
@@ -1043,6 +1348,337 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         merge::apply_deletions(&mut merged);
         Ok(Some(merged))
     }
+
+    /// Pull the next [`PartitionFragment`]. Drives the **intra-partition
+    /// streaming k-way row merge**: a single (possibly multi-million-row)
+    /// partition is delivered as a sequence of fragments each holding
+    /// `<= k` clustered rows, so resident memory is `O(num_sources + k)`
+    /// rows regardless of partition width. Returns `Ok(None)` when every
+    /// source is exhausted.
+    ///
+    /// Correctness — byte-identical to `next_merged_partition` flattened:
+    ///
+    /// 1. **Key selection / dedup** is the SAME heap discipline as
+    ///    `next_merged_partition`: pop the smallest key, then pop every
+    ///    other source whose head matches it.
+    /// 2. **Header merge** mirrors `merge::merge_partitions`'s header step:
+    ///    partition deletion is the max `marked_for_delete_at` across
+    ///    sources; the static row is cell-merged via `merge::merge_rows`,
+    ///    then partition-deletion-suppressed once (carried on the first
+    ///    fragment only).
+    /// 3. **Row merge** is a k-way merge by clustering key across all
+    ///    sources' heads; rows sharing a clustering key are folded with
+    ///    `merge::merge_rows` (cell-level LWW) — identical to
+    ///    `merge_partitions`'s `pop/merge/push` over the clustering-sorted
+    ///    concatenation.
+    /// 4. **Deletion suppression** is applied per row exactly as
+    ///    `merge::apply_deletions`: a row whose `primary_key_liveness`
+    ///    predates the partition tombstone is dropped; surviving rows have
+    ///    cells older than their own row tombstone dropped. Because both
+    ///    rules are row-local they fragment without changing the result.
+    pub fn next_fragment(&mut self, k: usize) -> Result<Option<PartitionFragment>> {
+        debug_assert!(k >= 1, "next_fragment k must be >= 1");
+        loop {
+            if self.active.is_none() && !self.begin_active_partition()? {
+                return Ok(None);
+            }
+            // Build one fragment (<= k rows) from the active partition.
+            match self.emit_fragment(k)? {
+                Some(fragment) => return Ok(Some(fragment)),
+                // Active partition produced no fragment (all its rows were
+                // deletion-suppressed and it was not the first fragment):
+                // drop it and advance to the next key.
+                None => continue,
+            }
+        }
+    }
+
+    /// Select the next key via the heap (respecting `end`), pop every
+    /// source holding it, merge the header, and install the per-source
+    /// row cursors into `self.active`. Returns `Ok(false)` at end-of-scan.
+    fn begin_active_partition(&mut self) -> Result<bool> {
+        if self.exhausted {
+            return Ok(false);
+        }
+        let first = match self.heap.pop() {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        if let Some(ref e) = self.end {
+            if first.key > *e {
+                self.exhausted = true;
+                return Ok(false);
+            }
+        }
+        let key = first.key.clone();
+
+        // Collect every source holding this key (heap-popped).
+        let mut srcs: Vec<usize> = vec![first.src];
+        while let Some(top) = self.heap.peek() {
+            if top.key != key {
+                break;
+            }
+            let entry = self.heap.pop().expect("peek succeeded");
+            srcs.push(entry.src);
+        }
+
+        // Pop each source's header (and, for memtables, its sorted body).
+        // Merge header: max-timestamp partition deletion, cell-merged
+        // static row.
+        let mut merged_deletion = ferrosa_sstable::types::DeletionTime::LIVE;
+        let mut merged_static: Option<Row> = None;
+        let mut cursors: Vec<RowCursor> = Vec::with_capacity(srcs.len());
+        let mut refill_srcs: Vec<usize> = Vec::with_capacity(srcs.len());
+
+        for &src in &srcs {
+            let header = match self.sources[src].pop_partition_header()? {
+                Some(h) => h,
+                // Source ended between peek and pop — refill (it is now
+                // exhausted) and skip. Mirrors next_merged_partition's
+                // Ok(None) branch.
+                None => {
+                    refill_srcs.push(src);
+                    continue;
+                }
+            };
+            debug_assert_eq!(
+                header.key, key,
+                "popped header key must match the heap-selected key"
+            );
+            if header.deletion.marked_for_delete_at > merged_deletion.marked_for_delete_at {
+                merged_deletion = header.deletion;
+            }
+            if let Some(sr) = header.static_row {
+                merged_static = match merged_static.take() {
+                    Some(prev) => Some(merge::merge_rows(prev, sr)),
+                    None => Some(sr),
+                };
+            }
+            match header.mem_body {
+                Some(rows) => cursors.push(RowCursor::Mem(rows.into_iter())),
+                None => cursors.push(RowCursor::Sst { src }),
+            }
+            refill_srcs.push(src);
+        }
+
+        // Partition-deletion suppression of the static row (mirrors
+        // `apply_deletions`: drop cells older than the partition tombstone,
+        // and drop the static row entirely if it has no surviving cells).
+        if !merged_deletion.is_live() {
+            if let Some(sr) = merged_static.as_mut() {
+                let cut = merged_deletion.marked_for_delete_at;
+                sr.cells.retain(|(_col, cell)| cell.timestamp >= cut);
+                if sr.cells.is_empty() {
+                    merged_static = None;
+                }
+            }
+        }
+
+        let cursor_count = cursors.len();
+        self.active = Some(ActivePartition {
+            key,
+            deletion: merged_deletion,
+            pending_static_row: merged_static,
+            first: true,
+            cursors,
+            heads: vec![None; cursor_count],
+            refill_srcs,
+        });
+        // Prime each cursor's head.
+        self.prime_active_heads()?;
+        Ok(true)
+    }
+
+    /// Load the first row of any cursor whose head is `None` and is not yet
+    /// exhausted. Called after `begin_active_partition` and after each
+    /// head is consumed.
+    fn prime_active_heads(&mut self) -> Result<()> {
+        // We split the borrow: read cursor descriptors, then fetch rows.
+        let n = self.active.as_ref().map(|a| a.cursors.len()).unwrap_or(0);
+        for i in 0..n {
+            let needs = self
+                .active
+                .as_ref()
+                .map(|a| a.heads[i].is_none())
+                .unwrap_or(false);
+            if !needs {
+                continue;
+            }
+            let next = self.next_cursor_row(i)?;
+            if let Some(active) = self.active.as_mut() {
+                active.heads[i] = next;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pull one row from cursor `i` of the active partition.
+    fn next_cursor_row(&mut self, i: usize) -> Result<Option<Row>> {
+        // Determine the cursor kind without holding an active borrow over
+        // the source fetch.
+        enum Kind {
+            Mem,
+            Sst(usize),
+            Done,
+        }
+        let kind = match self.active.as_ref().and_then(|a| a.cursors.get(i)) {
+            Some(RowCursor::Mem(_)) => Kind::Mem,
+            Some(RowCursor::Sst { src }) => Kind::Sst(*src),
+            None => Kind::Done,
+        };
+        match kind {
+            Kind::Mem => Ok(self.active.as_mut().and_then(|a| match &mut a.cursors[i] {
+                RowCursor::Mem(it) => it.next(),
+                RowCursor::Sst { .. } => None,
+            })),
+            Kind::Sst(src) => self.sources[src].next_fragment_row(),
+            Kind::Done => Ok(None),
+        }
+    }
+
+    /// Emit one fragment of up to `k` deletion-suppressed, cell-merged rows
+    /// from the active partition. Returns `Ok(None)` only when the active
+    /// partition is fully drained AND nothing needs emitting (no rows and
+    /// not the first fragment) — in which case the active partition has
+    /// been retired and its sources refilled.
+    fn emit_fragment(&mut self, k: usize) -> Result<Option<PartitionFragment>> {
+        let mut out: Vec<Row> = Vec::with_capacity(k);
+        let partition_delete_at = self
+            .active
+            .as_ref()
+            .map(|a| a.deletion.marked_for_delete_at)
+            .unwrap_or(i64::MIN);
+        let partition_deleted = self
+            .active
+            .as_ref()
+            .map(|a| !a.deletion.is_live())
+            .unwrap_or(false);
+
+        while out.len() < k {
+            // Pick the smallest clustering key across all live heads.
+            let smallest = {
+                let active = self.active.as_ref().expect("active set");
+                let mut sk: Option<&[u8]> = None;
+                for head in active.heads.iter().flatten() {
+                    if sk.map(|c| head.clustering.as_slice() < c).unwrap_or(true) {
+                        sk = Some(head.clustering.as_slice());
+                    }
+                }
+                sk.map(|c| c.to_vec())
+            };
+            let Some(ck) = smallest else {
+                break; // partition exhausted
+            };
+
+            // Fold every head at that clustering key (cell-level LWW),
+            // advancing each consumed cursor by one row.
+            let mut merged_row: Option<Row> = None;
+            let n = self.active.as_ref().expect("active set").cursors.len();
+            for i in 0..n {
+                let matches = self
+                    .active
+                    .as_ref()
+                    .and_then(|a| a.heads[i].as_ref())
+                    .map(|r| r.clustering == ck)
+                    .unwrap_or(false);
+                if !matches {
+                    continue;
+                }
+                let row = self
+                    .active
+                    .as_mut()
+                    .and_then(|a| a.heads[i].take())
+                    .expect("matched head present");
+                merged_row = Some(match merged_row.take() {
+                    Some(prev) => merge::merge_rows(prev, row),
+                    None => row,
+                });
+                // Advance this cursor's head.
+                let next = self.next_cursor_row(i)?;
+                if let Some(a) = self.active.as_mut() {
+                    a.heads[i] = next;
+                }
+            }
+
+            let mut row = merged_row.expect("at least one head matched the smallest key");
+
+            // Deletion suppression (mirrors merge::apply_deletions):
+            // partition-level drop of rows older than the partition
+            // tombstone, then row-level cell suppression.
+            if partition_deleted && row.primary_key_liveness.timestamp < partition_delete_at {
+                continue;
+            }
+            if !row.deletion.is_live() {
+                let cut = row.deletion.marked_for_delete_at;
+                row.cells.retain(|(_col, cell)| cell.timestamp >= cut);
+            }
+            out.push(row);
+        }
+
+        // Did we exhaust the partition?
+        let exhausted = self
+            .active
+            .as_ref()
+            .map(|a| a.heads.iter().all(Option::is_none))
+            .unwrap_or(true);
+
+        let is_first = self.active.as_ref().map(|a| a.first).unwrap_or(false);
+
+        // Nothing to emit: no rows and not the first fragment. Retire the
+        // active partition (refill its sources) and signal the caller to
+        // advance to the next key.
+        if out.is_empty() && !is_first {
+            self.retire_active_partition()?;
+            return Ok(None);
+        }
+
+        // Build the fragment. The first fragment carries the header
+        // (deletion + static row); subsequent ones carry LIVE/None so a
+        // flattening consumer never double-applies them.
+        let (key, deletion, static_row) = {
+            let active = self.active.as_mut().expect("active set");
+            if active.first {
+                active.first = false;
+                (
+                    active.key.clone(),
+                    active.deletion,
+                    active.pending_static_row.take(),
+                )
+            } else {
+                (
+                    active.key.clone(),
+                    ferrosa_sstable::types::DeletionTime::LIVE,
+                    None,
+                )
+            }
+        };
+
+        if exhausted {
+            self.retire_active_partition()?;
+        }
+
+        Ok(Some(PartitionFragment {
+            key,
+            deletion,
+            static_row,
+            rows: out,
+            first: is_first,
+            last: exhausted,
+        }))
+    }
+
+    /// Refill the active partition's sources back onto the heap and clear
+    /// the active state.
+    fn retire_active_partition(&mut self) -> Result<()> {
+        let refill = match self.active.take() {
+            Some(a) => a.refill_srcs,
+            None => return Ok(()),
+        };
+        for src in refill {
+            self.refill_source(src)?;
+        }
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1136,6 +1772,345 @@ mod tests {
             statistics: output.statistics,
         })
         .unwrap()
+    }
+
+    // ---- Intra-partition fragment streaming (P0 row-OOM fix) ----
+
+    /// All fixture timestamps must be `>= test_header().min_timestamp`
+    /// (1_000_000) or the SSTable writer's delta encoding underflows and
+    /// silently corrupts the file. Base everything off this.
+    const TS_BASE: i64 = 2_000_000;
+
+    /// `ts` is a small relative offset; it is shifted by `TS_BASE` so the
+    /// absolute timestamp clears `min_timestamp`. Relative ordering between
+    /// rows is preserved (so LWW conflicts behave as written).
+    fn row(clustering: i32, col: u16, value: &[u8], ts: i64) -> Row {
+        let ts = TS_BASE + ts;
+        Row {
+            clustering: clustering.to_be_bytes().to_vec(),
+            cells: vec![(col, CellValue::live(value.to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        }
+    }
+
+    fn partition_with_rows(key: &[u8], rows: Vec<Row>) -> Partition {
+        Partition {
+            key: DecoratedKey::new(PartitionKey::from(key)),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        }
+    }
+
+    /// Drain a fragment merger built over `sstables` into the flattened
+    /// `Vec<Partition>` it represents (one merged Partition per key, with
+    /// all fragments of a key concatenated), while asserting the
+    /// per-fragment + resident-row invariants. Returns `(partitions, max_resident_rows)`.
+    fn drain_fragments(
+        sstables: &[Arc<SSTableReader<Vec<u8>>>],
+        k: usize,
+    ) -> (Vec<Partition>, usize) {
+        let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
+        let mut merger = merger_for_sources(empty_active, None, sstables, None, None).unwrap();
+
+        let mut out: Vec<Partition> = Vec::new();
+        let mut cur: Option<Partition> = None;
+        // The merger holds, at most, one row per source ("heads") plus the
+        // fragment being built (<= k). We do not have direct access to the
+        // internal heads count here, so we bound the *fragment* size and
+        // additionally assert no single fragment ever exceeds k.
+        let mut max_fragment = 0usize;
+        loop {
+            let frag = merger.next_fragment(k).unwrap();
+            let Some(frag) = frag else { break };
+            assert!(
+                frag.rows.len() <= k,
+                "fragment {} exceeds k={k}",
+                frag.rows.len()
+            );
+            max_fragment = max_fragment.max(frag.rows.len());
+            if frag.first {
+                if let Some(p) = cur.take() {
+                    out.push(p);
+                }
+                cur = Some(Partition {
+                    key: frag.key.clone(),
+                    deletion: frag.deletion,
+                    static_row: frag.static_row.clone(),
+                    rows: Vec::new(),
+                });
+            } else {
+                // Non-first fragments must carry no header.
+                assert!(
+                    frag.deletion.is_live(),
+                    "non-first fragment carried a deletion"
+                );
+                assert!(
+                    frag.static_row.is_none(),
+                    "non-first fragment carried a static row"
+                );
+            }
+            cur.as_mut()
+                .expect("first fragment seen before continuation")
+                .rows
+                .extend(frag.rows.clone());
+            if frag.last {
+                if let Some(p) = cur.take() {
+                    out.push(p);
+                }
+            }
+        }
+        if let Some(p) = cur.take() {
+            out.push(p);
+        }
+        (out, max_fragment)
+    }
+
+    /// Whole-partition reference: drive `next_merged_partition` to
+    /// completion. This is the byte-identical oracle the fragment path
+    /// must reproduce.
+    fn drain_whole(sstables: &[Arc<SSTableReader<Vec<u8>>>]) -> Vec<Partition> {
+        let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
+        let mut merger = merger_for_sources(empty_active, None, sstables, None, None).unwrap();
+        let mut out = Vec::new();
+        while let Some(p) = merger.next_merged_partition().unwrap() {
+            out.push(p);
+        }
+        out
+    }
+
+    /// MEMORY-BOUND (RED before the fix): one partition with N rows must
+    /// stream as ceil(N/k) fragments each holding <= k rows. The
+    /// whole-partition path materialises all N rows in one `Vec<Row>`; the
+    /// fragment path never holds more than k rows of the partition body at
+    /// once. We assert the resident-row watermark (max fragment size) stays
+    /// <= k even though the partition has N >> k rows.
+    #[test]
+    fn single_wide_partition_streams_in_bounded_fragments() {
+        let n: i32 = 5_000;
+        let k = 64;
+        let rows: Vec<Row> = (0..n)
+            .map(|c| row(c, 0, format!("v{c}").as_bytes(), 1000))
+            .collect();
+        let reader = Arc::new(reader_from_partitions(&[partition_with_rows(b"hot", rows)]));
+
+        let (partitions, max_fragment) = drain_fragments(std::slice::from_ref(&reader), k);
+        assert_eq!(partitions.len(), 1, "one partition");
+        assert_eq!(partitions[0].rows.len(), n as usize, "all rows reassembled");
+        // The resident-row watermark: no fragment ever exceeds k. With the
+        // pre-fix whole-partition path this would be N (5000) in one Vec.
+        assert!(
+            max_fragment <= k,
+            "resident fragment rows {max_fragment} exceeded k={k} — partition was materialised whole"
+        );
+        // And it actually fragmented (proves the path isn't a single big chunk).
+        assert!(n as usize > k, "fixture must force fragmentation");
+        assert!(
+            max_fragment == k,
+            "expected fragments to fill to k; got max {max_fragment}"
+        );
+
+        // Equivalence with the whole-partition merge.
+        let whole = drain_whole(std::slice::from_ref(&reader));
+        assert_eq!(
+            partitions, whole,
+            "fragment-flattened != whole-partition merge"
+        );
+    }
+
+    /// CORRECTNESS ORACLE: a single wide partition spread across MULTIPLE
+    /// overlapping SSTables with LWW conflicts (newer timestamp wins per
+    /// clustering key) must be byte-identical whether read whole or
+    /// fragmented, for several values of k (forcing different batch
+    /// boundaries).
+    #[test]
+    fn wide_partition_lww_conflicts_fragment_equiv_whole() {
+        // SSTable A: rows 0..100 at ts=1000 (value "a{c}").
+        // SSTable B: even rows at ts=2000 (value "b{c}") — newer, must win.
+        // SSTable C: rows 50..150 at ts=1500 (value "c{c}").
+        let a: Vec<Row> = (0..100)
+            .map(|c| row(c, 0, format!("a{c}").as_bytes(), 1000))
+            .collect();
+        let b: Vec<Row> = (0..100)
+            .filter(|c| c % 2 == 0)
+            .map(|c| row(c, 0, format!("b{c}").as_bytes(), 2000))
+            .collect();
+        let c: Vec<Row> = (50..150)
+            .map(|c| row(c, 0, format!("c{c}").as_bytes(), 1500))
+            .collect();
+        let ra = Arc::new(reader_from_partitions(&[partition_with_rows(b"wide", a)]));
+        let rb = Arc::new(reader_from_partitions(&[partition_with_rows(b"wide", b)]));
+        let rc = Arc::new(reader_from_partitions(&[partition_with_rows(b"wide", c)]));
+        let sstables = vec![ra, rb, rc];
+
+        let whole = drain_whole(&sstables);
+        for k in [1usize, 2, 3, 7, 31, 1024] {
+            let (frag, _) = drain_fragments(&sstables, k);
+            assert_eq!(
+                frag, whole,
+                "fragment(k={k}) diverged from whole-partition merge"
+            );
+        }
+    }
+
+    /// CORRECTNESS ORACLE: tombstones / row deletes within a wide partition.
+    /// Row-level tombstones (newer ts) must suppress older cells; a
+    /// partition-level tombstone must suppress older rows — identically
+    /// across fragment boundaries.
+    #[test]
+    fn wide_partition_tombstones_fragment_equiv_whole() {
+        // Base rows 0..40 at ts=1000.
+        let base: Vec<Row> = (0..40)
+            .map(|c| row(c, 0, format!("v{c}").as_bytes(), 1000))
+            .collect();
+        // Tombstone source: row-level deletes for clustering 5,15,25 at ts=2000.
+        let deletes: Vec<Row> = [5i32, 15, 25]
+            .into_iter()
+            .map(|c| Row {
+                clustering: c.to_be_bytes().to_vec(),
+                cells: vec![],
+                deletion: DeletionTime::new(TS_BASE + 2000, 100),
+                primary_key_liveness: LivenessInfo::NONE,
+            })
+            .collect();
+        let rb = Arc::new(reader_from_partitions(&[partition_with_rows(
+            b"wide", base,
+        )]));
+        let rd = Arc::new(reader_from_partitions(&[partition_with_rows(
+            b"wide", deletes,
+        )]));
+        let sstables = vec![rb, rd];
+
+        let whole = drain_whole(&sstables);
+        for k in [1usize, 2, 4, 8, 1024] {
+            let (frag, _) = drain_fragments(&sstables, k);
+            assert_eq!(frag, whole, "tombstone fragment(k={k}) diverged from whole");
+        }
+    }
+
+    /// CORRECTNESS ORACLE: a partition-level tombstone suppresses rows older
+    /// than it across fragment boundaries, and keeps newer rows.
+    #[test]
+    fn wide_partition_partition_tombstone_fragment_equiv_whole() {
+        // Old rows 0..30 at ts=1000 (suppressed); new rows 30..60 at ts=3000 (kept).
+        let mut rows: Vec<Row> = (0..30)
+            .map(|c| row(c, 0, format!("old{c}").as_bytes(), 1000))
+            .collect();
+        rows.extend((30..60).map(|c| row(c, 0, format!("new{c}").as_bytes(), 3000)));
+        let mut p = partition_with_rows(b"wide", rows);
+        p.deletion = DeletionTime::new(TS_BASE + 2000, 100);
+        let rp = Arc::new(reader_from_partitions(&[p]));
+        let sstables = vec![rp];
+
+        let whole = drain_whole(&sstables);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].rows.len(), 30, "only the 30 newer rows survive");
+        for k in [1usize, 4, 7, 1024] {
+            let (frag, _) = drain_fragments(&sstables, k);
+            assert_eq!(frag, whole, "partition-tombstone fragment(k={k}) diverged");
+        }
+    }
+
+    /// Header with one static column (`s`), so a static-row cell at
+    /// ordinal 0 is in range for the SSTable writer.
+    fn static_header() -> SerializationHeader {
+        let mut h = test_header();
+        h.static_columns = vec![(
+            b"s".to_vec(),
+            "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        )];
+        h
+    }
+
+    fn reader_from_partitions_with_header(
+        partitions: &[Partition],
+        header: SerializationHeader,
+    ) -> SSTableReader<Vec<u8>> {
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                verify_output: false,
+                ..WriteOptions::default()
+            },
+            header,
+        );
+        for partition in partitions {
+            writer.add_partition(partition).unwrap();
+        }
+        let output = writer.finish().unwrap();
+        SSTableReader::open(SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })
+        .unwrap()
+    }
+
+    /// CORRECTNESS ORACLE: a static row + clustering rows. The static row
+    /// rides the FIRST fragment only; clustering rows fragment underneath.
+    #[test]
+    fn wide_partition_static_row_fragment_equiv_whole() {
+        let mut rows: Vec<Row> = (0..50)
+            .map(|c| row(c, 0, format!("v{c}").as_bytes(), 1000))
+            .collect();
+        rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
+        let mut p = partition_with_rows(b"wide", rows);
+        p.static_row = Some(Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"static".to_vec(), TS_BASE + 1234))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        });
+        let rp = Arc::new(reader_from_partitions_with_header(&[p], static_header()));
+        let sstables = vec![rp];
+
+        let whole = drain_whole(&sstables);
+        for k in [1usize, 3, 8, 1024] {
+            let (frag, _) = drain_fragments(&sstables, k);
+            assert_eq!(frag, whole, "static-row fragment(k={k}) diverged");
+            assert!(
+                frag[0].static_row.is_some(),
+                "static row must be reassembled"
+            );
+        }
+    }
+
+    /// Many partitions interleaved with one wide partition: the merger must
+    /// stream the wide one in fragments and the narrow ones whole, in token
+    /// order, byte-identical to the whole-partition path.
+    #[test]
+    fn mixed_narrow_and_wide_partitions_fragment_equiv_whole() {
+        let mut partitions = Vec::new();
+        for i in 0..20u32 {
+            let key = format!("k{i:03}");
+            if i == 10 {
+                let rows: Vec<Row> = (0..500)
+                    .map(|c| row(c, 0, format!("w{c}").as_bytes(), 1000))
+                    .collect();
+                partitions.push(partition_with_rows(key.as_bytes(), rows));
+            } else {
+                partitions.push(partition_with_rows(
+                    key.as_bytes(),
+                    vec![row(0, 0, format!("n{i}").as_bytes(), 1000)],
+                ));
+            }
+        }
+        // SSTable writer requires partitions in token (DecoratedKey) order.
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let reader = Arc::new(reader_from_partitions(&partitions));
+        let sstables = vec![reader];
+
+        let whole = drain_whole(&sstables);
+        let (frag, max_fragment) = drain_fragments(&sstables, 16);
+        assert!(max_fragment <= 16, "fragment exceeded k");
+        assert_eq!(
+            frag, whole,
+            "mixed-width fragment stream diverged from whole"
+        );
     }
 
     /// Token-disjoint SSTables in input order collapse into a
