@@ -1177,6 +1177,34 @@ pub fn partition_to_rows_with_storage_mapping(
     ck_columns: &[usize],
     storage_to_table: &[usize],
 ) -> Vec<Vec<Option<CqlValue>>> {
+    partition_to_rows_with_clustering(
+        partition,
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        storage_to_table,
+    )
+    .into_iter()
+    .map(|(_clustering, row)| row)
+    .collect()
+}
+
+/// Like [`partition_to_rows_with_storage_mapping`] but pairs each produced
+/// output row with the raw clustering-key bytes of the source row.
+///
+/// The coordinator-side paging cursor needs the clustering bytes of the last
+/// row emitted on a page to resume mid-partition without skipping or
+/// duplicating rows. Tombstone/TTL skipping logic lives here once so the
+/// paired and unpaired variants stay byte-identical.
+pub fn partition_to_rows_with_clustering(
+    partition: &ferrosa_sstable::types::Partition,
+    column_names: &[String],
+    column_types: &[CqlType],
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+    storage_to_table: &[usize],
+) -> Vec<(Vec<u8>, Vec<Option<CqlValue>>)> {
     let mut result = Vec::new();
 
     // Wall-clock seconds for TTL expiry, evaluated once per call. Expiry is
@@ -1266,7 +1294,7 @@ pub fn partition_to_rows_with_storage_mapping(
             }
         }
 
-        result.push(output_row);
+        result.push((row.clustering.clone(), output_row));
     }
 
     result

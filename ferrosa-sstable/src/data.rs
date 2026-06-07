@@ -280,6 +280,50 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         }
     }
 
+    /// Projection-aware companion to [`Self::read_next_clustered_row`].
+    /// Decodes only the cells whose ordinals are in `wanted`
+    /// (byte-skipping the rest via `read_cell_skip`), matching
+    /// [`Self::read_partition_projected`]. An empty `wanted` yields
+    /// rows with empty `cells`. Returns `Ok(None)` at
+    /// end-of-partition (or a range-tombstone marker).
+    ///
+    /// Must be preceded by [`Self::read_partition_header_only`].
+    pub fn read_next_clustered_row_projected(&mut self, wanted: &[u16]) -> Result<Option<Row>> {
+        loop {
+            let file_len = self.reader.len()?;
+            if self.pos >= file_len {
+                return Ok(None);
+            }
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+            if flags & END_OF_PARTITION != 0 {
+                return Ok(None);
+            }
+            if flags & IS_MARKER != 0 {
+                return Ok(None);
+            }
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            if is_static {
+                // Defensively skip stray static rows (header_only
+                // already consumed the leading one).
+                self.skip_row_body(flags, true)?;
+                continue;
+            }
+            let row = self.read_row_projected(flags, false, wanted)?;
+            return Ok(Some(row));
+        }
+    }
+
     /// 2-phase streaming continuation: read clustered rows until
     /// `END_OF_PARTITION` (or a range-tombstone marker), invoking
     /// `on_row` once per row. Each row is dropped before the

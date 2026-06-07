@@ -800,6 +800,55 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         }
     }
 
+    /// Projection-aware companion to [`Self::next_clustered_row`].
+    /// Decodes only the cells whose ordinals are in `wanted`,
+    /// byte-skipping the rest (matching [`Self::next_partition_projected`]).
+    /// Must be preceded by [`Self::next_partition_header_only`].
+    pub fn next_clustered_row_projected(
+        &mut self,
+        wanted: &[u16],
+    ) -> Result<Option<crate::types::Row>> {
+        let header = &self.sst.header;
+        if let Some(ref data) = self.compressed {
+            let mut reader = crate::data::DataReader::new(data, header, self.pos);
+            let result = reader.read_next_clustered_row_projected(wanted)?;
+            self.pos = reader.position();
+            Ok(result)
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
+            let result = reader.read_next_clustered_row_projected(wanted)?;
+            self.pos = reader.position();
+            Ok(result)
+        }
+    }
+
+    /// Bounded-batch companion to [`Self::next_clustered_row`]. Pulls
+    /// at most `limit` clustered rows (in clustering/storage order)
+    /// from the partition the iterator is currently parked inside,
+    /// returning fewer than `limit` (possibly zero) at
+    /// end-of-partition. Must be preceded by
+    /// [`Self::next_partition_header_only`].
+    ///
+    /// This is the intra-partition streaming primitive used by the
+    /// range merger's fragment path: a single multi-million-row
+    /// partition is read in `limit`-sized batches so peak working set
+    /// is `O(limit)` rows, never the whole partition. `limit` must be
+    /// `>= 1`. The returned `Vec` has capacity `limit` but length
+    /// `<= limit`; an empty `Vec` means the partition is exhausted
+    /// (the next [`Self::next_partition_header_only`] advances to the
+    /// following partition).
+    pub fn next_partition_rows(&mut self, limit: usize) -> Result<Vec<crate::types::Row>> {
+        debug_assert!(limit >= 1, "next_partition_rows limit must be >= 1");
+        let mut rows = Vec::with_capacity(limit);
+        while rows.len() < limit {
+            match self.next_clustered_row()? {
+                Some(row) => rows.push(row),
+                None => break,
+            }
+        }
+        Ok(rows)
+    }
+
     /// Phase 2 of the row-streamed partition read: walk clustered
     /// rows until end-of-partition, invoking `on_row` once per row
     /// in storage order. Each row is decoded into a fresh `Row`,
@@ -2196,6 +2245,73 @@ mod tests {
                 assert_eq!(a, b);
             }
         }
+    }
+
+    /// `next_partition_rows(limit)` yields the SAME clustered rows,
+    /// in the same order, as the whole-partition `next_partition`
+    /// path — only chunked into `limit`-sized batches. Each batch is
+    /// `<= limit`; concatenating all batches reproduces the partition
+    /// body byte-for-byte. This is the intra-partition streaming
+    /// primitive that lets a multi-million-row partition be read in
+    /// `O(limit)` resident rows.
+    #[test]
+    fn next_partition_rows_batches_match_whole_partition() {
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"wide".as_slice()));
+        let mut data_bytes = Vec::new();
+        let pos = data_bytes.len() as u64;
+        // 7 rows so a limit of 3 forces batches of 3, 3, 1.
+        data_bytes.extend_from_slice(&build_data_blob_with_rows(dk.key.as_bytes(), 7));
+        let partitions_bytes = build_partition_index(&[(&dk, pos)]);
+        let filter_bytes = build_bloom_filter(&[&dk]);
+        let stats_bytes = build_statistics(header);
+
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Baseline: the whole partition in one shot.
+        let whole = reader
+            .partitions_iter()
+            .unwrap()
+            .next_partition()
+            .unwrap()
+            .unwrap();
+
+        // Batched: header_only + next_partition_rows(3).
+        let mut iter = reader.partitions_iter().unwrap();
+        let (key, deletion, static_row) = iter.next_partition_header_only().unwrap().unwrap();
+        assert_eq!(key, whole.key);
+        assert_eq!(deletion, whole.deletion);
+        assert_eq!(static_row, whole.static_row);
+
+        let limit = 3;
+        let mut batched: Vec<crate::types::Row> = Vec::new();
+        let mut batch_sizes = Vec::new();
+        loop {
+            let batch = iter.next_partition_rows(limit).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(
+                batch.len() <= limit,
+                "batch {} exceeds limit {limit}",
+                batch.len()
+            );
+            batch_sizes.push(batch.len());
+            batched.extend(batch);
+        }
+        assert_eq!(batch_sizes, vec![3, 3, 1], "expected 7 rows chunked 3/3/1");
+        assert_eq!(
+            batched, whole.rows,
+            "batched rows must equal whole-partition rows"
+        );
     }
 
     /// `next_partition_streaming` yields the same partition
