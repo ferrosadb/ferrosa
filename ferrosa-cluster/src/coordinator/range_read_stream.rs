@@ -62,6 +62,11 @@ pub const STREAMING_CHUNK_PARTITIONS: usize = 64;
 pub type ClusterPartitionStream =
     Pin<Box<dyn Stream<Item = crate::error::Result<Partition>> + Send>>;
 
+/// Type-erased fragment stream, so heterogeneous sources (the local engine
+/// stream and N remote replica receivers) can share one
+/// `FragmentCursor<BoxedFragmentStream>` type inside the N-way merge.
+type BoxedFragmentStream = Pin<Box<dyn Stream<Item = Result<Partition, ClusterError>> + Send>>;
+
 impl ClusterCoordinator {
     /// COUNT(*) fast path. Returns the local replica's row count
     /// for `[start, end]` on `table_id`. Bypasses the streaming
@@ -469,6 +474,30 @@ where
         Ok(())
     }
 
+    /// Box the underlying stream into a type-erased `FragmentCursor`, so
+    /// heterogeneous sources (local engine stream + remote receivers) can be
+    /// collected into a single `Vec<FragmentCursor<BoxedFragmentStream>>` and
+    /// fed to [`run_fragment_merge_nway`].
+    ///
+    /// The cursor must be freshly constructed (un-primed): boxing a cursor that
+    /// already holds a peeked fragment would silently drop it. All call sites
+    /// box right after [`FragmentCursor::new`].
+    fn boxed(self) -> FragmentCursor<BoxedFragmentStream>
+    where
+        S: Send + 'static,
+    {
+        debug_assert!(
+            !self.primed && self.peeked.is_none() && !self.done,
+            "FragmentCursor::boxed requires an un-primed cursor"
+        );
+        FragmentCursor {
+            stream: Box::pin(self.stream),
+            peeked: None,
+            primed: false,
+            done: false,
+        }
+    }
+
     /// Token of the next fragment, or `None` at end-of-stream.
     async fn peek_token(&mut self) -> Result<Option<i64>, ClusterError> {
         self.ensure_peeked().await?;
@@ -617,17 +646,81 @@ async fn merge_local_and_single_remote_fragmented(
     run_fragment_merge(local, remote, k, out_tx).await;
 }
 
-/// 2-way fragment-aware streaming merge core, generic over the two fragment
-/// stream cursors so it can be unit-tested with in-memory streams. See
-/// [`merge_local_and_single_remote_fragmented`] for the correctness contract.
-async fn run_fragment_merge<L, R>(
-    mut local: FragmentCursor<L>,
-    mut remote: FragmentCursor<R>,
+/// Fold one source's partition header (`deletion` + `static_row`) into the
+/// running merged header for a token. Mirrors the per-token header merge in
+/// [`merge_partitions`](ferrosa_storage::merge::merge_partitions): partition
+/// deletion is the max `marked_for_delete_at`, the static row is cell-merged
+/// via [`merge::merge_rows`](ferrosa_storage::merge::merge_rows).
+fn fold_token_header(dst: &mut Option<TokenHeader>, src: Option<TokenHeader>) {
+    let Some(src) = src else { return };
+    match dst {
+        None => *dst = Some(src),
+        Some(d) => {
+            if src.deletion.marked_for_delete_at > d.deletion.marked_for_delete_at {
+                d.deletion = src.deletion;
+            }
+            d.static_row = match (d.static_row.take(), src.static_row) {
+                (None, None) => None,
+                (Some(r), None) | (None, Some(r)) => Some(r),
+                (Some(a), Some(b)) => Some(ferrosa_storage::merge::merge_rows(a, b)),
+            };
+        }
+    }
+}
+
+/// Apply partition-deletion suppression to the merged static row, exactly as
+/// `ferrosa_storage::merge::apply_deletions`: when the partition is deleted,
+/// static cells older than the deletion are dropped and an emptied static row
+/// collapses to `None`.
+fn suppress_static_under_partition_deletion(header: &mut TokenHeader) {
+    if header.deletion.is_live() {
+        return;
+    }
+    if let Some(sr) = header.static_row.as_mut() {
+        let cut = header.deletion.marked_for_delete_at;
+        sr.cells.retain(|(_c, cell)| cell.timestamp >= cut);
+        if sr.cells.is_empty() {
+            header.static_row = None;
+        }
+    }
+}
+
+/// Apply per-row deletion suppression, mirroring
+/// `ferrosa_storage::merge::apply_deletions`. Returns `true` if the row survives
+/// (caller emits it), `false` if it is suppressed by the partition tombstone.
+fn suppress_row_deletions(
+    row: &mut ferrosa_sstable::types::Row,
+    partition_deleted: bool,
+    partition_cut: i64,
+) -> bool {
+    if partition_deleted && row.primary_key_liveness.timestamp < partition_cut {
+        return false;
+    }
+    if !row.deletion.is_live() {
+        let cut = row.deletion.marked_for_delete_at;
+        row.cells.retain(|(_c, cell)| cell.timestamp >= cut);
+    }
+    true
+}
+
+/// N-way fragment-aware streaming merge core, generalising
+/// [`run_fragment_merge`] to an arbitrary number of homogeneous fragment-stream
+/// cursors (one per replica). See [`merge_local_and_single_remote_fragmented`]
+/// for the per-token correctness contract; the same rules hold across N sources
+/// because [`merge::merge_rows`](ferrosa_storage::merge::merge_rows) is an
+/// order-independent cell-level LWW fold, so folding same-clustering rows from
+/// any subset of sources in any order yields the byte-identical result as
+/// [`merge_partitions`](ferrosa_storage::merge::merge_partitions).
+///
+/// Resident set is `O(num_sources + k)`: each cursor holds at most one peeked
+/// `<= k`-row fragment, and the merge buffers at most `k` output rows plus one
+/// head row per live source before emitting a bounded fragment.
+async fn run_fragment_merge_nway<S>(
+    cursors: Vec<FragmentCursor<S>>,
     k: usize,
     out_tx: mpsc::Sender<crate::error::Result<Partition>>,
 ) where
-    L: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin,
-    R: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin,
+    S: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin,
 {
     macro_rules! send_or_abort {
         ($item:expr) => {
@@ -648,135 +741,98 @@ async fn run_fragment_merge<L, R>(
         };
     }
 
+    let mut cursors = cursors;
+
     loop {
-        let lt = try_or_forward!(local.peek_token().await);
-        let rt = try_or_forward!(remote.peek_token().await);
-        let (token, use_local, use_remote) = match (lt, rt) {
-            (None, None) => return,
-            (Some(t), None) => (t, true, false),
-            (None, Some(t)) => (t, false, true),
-            (Some(a), Some(b)) => {
-                if a < b {
-                    (a, true, false)
-                } else if b < a {
-                    (b, false, true)
-                } else {
-                    (a, true, true)
-                }
+        // Smallest token across all live sources, and which sources hold it.
+        let mut min_token: Option<i64> = None;
+        for c in cursors.iter_mut() {
+            let t = try_or_forward!(c.peek_token().await);
+            if let Some(t) = t {
+                min_token = Some(match min_token {
+                    Some(m) => m.min(t),
+                    None => t,
+                });
             }
+        }
+        let Some(token) = min_token else {
+            return;
         };
 
-        // Begin per-side pullers for this token (each consumes the side's
-        // first fragment and captures its header).
-        let mut l_puller = if use_local {
-            Some(try_or_forward!(
-                TokenRowPuller::begin(&mut local, token).await
-            ))
-        } else {
-            None
-        };
-        let mut r_puller = if use_remote {
-            Some(try_or_forward!(
-                TokenRowPuller::begin(&mut remote, token).await
-            ))
-        } else {
-            None
-        };
+        // Begin a row puller for every source holding `token`. The puller
+        // consumes the source's first fragment for the token and captures its
+        // header. Sources without the token are skipped (puller is `None`).
+        let mut pullers: Vec<Option<TokenRowPuller<'_, S>>> = Vec::with_capacity(cursors.len());
+        for c in cursors.iter_mut() {
+            let has = try_or_forward!(c.peek_token().await) == Some(token);
+            if has {
+                pullers.push(Some(try_or_forward!(TokenRowPuller::begin(c, token).await)));
+            } else {
+                pullers.push(None);
+            }
+        }
 
-        // Merge the header(s).
+        // Merge the headers across all participating sources.
         let mut header: Option<TokenHeader> = None;
-        let mut merge_header = |src: Option<TokenHeader>| {
-            let Some(src) = src else { return };
-            match &mut header {
-                None => header = Some(src),
-                Some(d) => {
-                    if src.deletion.marked_for_delete_at > d.deletion.marked_for_delete_at {
-                        d.deletion = src.deletion;
-                    }
-                    d.static_row = match (d.static_row.take(), src.static_row) {
-                        (None, None) => None,
-                        (Some(r), None) | (None, Some(r)) => Some(r),
-                        (Some(a), Some(b)) => Some(ferrosa_storage::merge::merge_rows(a, b)),
-                    };
-                }
-            }
-        };
-        if let Some(p) = l_puller.as_mut() {
-            merge_header(p.take_header());
+        for p in pullers.iter_mut().flatten() {
+            fold_token_header(&mut header, p.take_header());
         }
-        if let Some(p) = r_puller.as_mut() {
-            merge_header(p.take_header());
-        }
-        let mut header = header.expect("token present implies a header");
+        let mut header = header.expect("token present implies at least one header");
 
-        // Partition-deletion suppression of the static row.
-        if !header.deletion.is_live() {
-            if let Some(sr) = header.static_row.as_mut() {
-                let cut = header.deletion.marked_for_delete_at;
-                sr.cells.retain(|(_c, cell)| cell.timestamp >= cut);
-                if sr.cells.is_empty() {
-                    header.static_row = None;
-                }
-            }
-        }
+        suppress_static_under_partition_deletion(&mut header);
         let partition_deleted = !header.deletion.is_live();
         let partition_cut = header.deletion.marked_for_delete_at;
 
-        // Prime one head per side.
-        let mut l_head = match l_puller.as_mut() {
-            Some(p) => try_or_forward!(p.next_row().await),
-            None => None,
-        };
-        let mut r_head = match r_puller.as_mut() {
-            Some(p) => try_or_forward!(p.next_row().await),
-            None => None,
-        };
+        // Prime one head row per live source.
+        let mut heads: Vec<Option<ferrosa_sstable::types::Row>> = Vec::with_capacity(pullers.len());
+        for p in pullers.iter_mut() {
+            let head = match p {
+                Some(puller) => try_or_forward!(puller.next_row().await),
+                None => None,
+            };
+            heads.push(head);
+        }
 
         let mut out_rows: Vec<ferrosa_sstable::types::Row> = Vec::with_capacity(k);
         let mut first_fragment = true;
 
         loop {
-            // Smallest clustering across live heads.
-            let smallest: Option<Vec<u8>> = {
-                let mut sk: Option<&[u8]> = None;
-                if let Some(r) = l_head.as_ref() {
-                    sk = Some(r.clustering.as_slice());
-                }
-                if let Some(r) = r_head.as_ref() {
-                    if sk.map(|c| r.clustering.as_slice() < c).unwrap_or(true) {
-                        sk = Some(r.clustering.as_slice());
+            // Smallest clustering across all live heads.
+            let mut smallest: Option<&[u8]> = None;
+            for h in heads.iter() {
+                if let Some(r) = h.as_ref() {
+                    if smallest
+                        .map(|c| r.clustering.as_slice() < c)
+                        .unwrap_or(true)
+                    {
+                        smallest = Some(r.clustering.as_slice());
                     }
                 }
-                sk.map(|c| c.to_vec())
-            };
-            let Some(ck) = smallest else { break };
-
-            let mut merged: Option<ferrosa_sstable::types::Row> = None;
-            if l_head.as_ref().map(|r| r.clustering == ck).unwrap_or(false) {
-                merged = l_head.take();
-                if let Some(p) = l_puller.as_mut() {
-                    l_head = try_or_forward!(p.next_row().await);
-                }
             }
-            if r_head.as_ref().map(|r| r.clustering == ck).unwrap_or(false) {
-                let row = r_head.take().expect("matched remote head");
-                merged = Some(match merged.take() {
-                    Some(prev) => ferrosa_storage::merge::merge_rows(prev, row),
-                    None => row,
-                });
-                if let Some(p) = r_puller.as_mut() {
-                    r_head = try_or_forward!(p.next_row().await);
+            let Some(ck) = smallest.map(|c| c.to_vec()) else {
+                break;
+            };
+
+            // Fold every source whose head matches `ck`, advancing those
+            // sources. `merge_rows` is order-independent, so left-fold across
+            // the participating sources reproduces `merge_partitions`.
+            let mut merged: Option<ferrosa_sstable::types::Row> = None;
+            for (i, head) in heads.iter_mut().enumerate() {
+                if head.as_ref().map(|r| r.clustering == ck).unwrap_or(false) {
+                    let row = head.take().expect("matched head");
+                    merged = Some(match merged.take() {
+                        Some(prev) => ferrosa_storage::merge::merge_rows(prev, row),
+                        None => row,
+                    });
+                    if let Some(puller) = pullers[i].as_mut() {
+                        *head = try_or_forward!(puller.next_row().await);
+                    }
                 }
             }
             let mut row = merged.expect("a head matched the smallest clustering");
 
-            // Deletion suppression (mirrors merge::apply_deletions).
-            if partition_deleted && row.primary_key_liveness.timestamp < partition_cut {
+            if !suppress_row_deletions(&mut row, partition_deleted, partition_cut) {
                 continue;
-            }
-            if !row.deletion.is_live() {
-                let cut = row.deletion.marked_for_delete_at;
-                row.cells.retain(|(_c, cell)| cell.timestamp >= cut);
             }
             out_rows.push(row);
 
@@ -786,12 +842,32 @@ async fn run_fragment_merge<L, R>(
             }
         }
 
-        // Final fragment for this token (always emitted, so an empty
-        // partition / a partition whose rows were all suppressed still
-        // yields its header exactly once).
+        // Final fragment for this token — always emitted so an empty / fully
+        // suppressed partition still yields its header exactly once.
         let frag = build_out_fragment(&mut header, &mut first_fragment, &mut out_rows);
         send_or_abort!(Ok(frag));
     }
+}
+
+/// 2-way fragment-aware streaming merge core, generic over the two fragment
+/// stream cursors so it can be unit-tested with in-memory streams. See
+/// [`merge_local_and_single_remote_fragmented`] for the correctness contract.
+///
+/// This is exactly the `N == 2` case of [`run_fragment_merge_nway`]: both
+/// cursors are type-erased via [`FragmentCursor::boxed`] and merged through the
+/// shared N-way core, so the 2-way and N-way paths share identical semantics by
+/// construction. The cursors must be freshly constructed (un-primed) — every
+/// call site boxes right after [`FragmentCursor::new`].
+async fn run_fragment_merge<L, R>(
+    local: FragmentCursor<L>,
+    remote: FragmentCursor<R>,
+    k: usize,
+    out_tx: mpsc::Sender<crate::error::Result<Partition>>,
+) where
+    L: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin + Send + 'static,
+    R: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin + Send + 'static,
+{
+    run_fragment_merge_nway(vec![local.boxed(), remote.boxed()], k, out_tx).await;
 }
 
 /// Adapter so an `mpsc::Receiver` of partition results drives the same
@@ -836,6 +912,131 @@ fn build_out_fragment(
             rows,
         }
     }
+}
+
+/// Fan out a `RangeReadStreamRequest` to each remote replica in `remotes`,
+/// spawning one forwarder task per replica that drains the StreamRouter
+/// receiver into a bounded per-replica `mpsc` channel. Returns one boxed
+/// fragment stream per replica that was successfully fired to, plus the count
+/// of fire failures. Each returned stream is memory-bounded by
+/// `STREAM_RECEIVER_BUFFER` (back-pressures the inbound dispatch).
+///
+/// `start_key`, when `Some`, is shipped as the inclusive lower bound so each
+/// remote streams only the resumed suffix of the range (see
+/// [`RangeReadStreamRequestPayload::start_key`]).
+///
+/// At least one returned stream is required by the caller for a multi-replica
+/// merge; if every fire fails the caller surfaces an error rather than
+/// returning a partial scan.
+struct RemoteFanout {
+    streams: Vec<ClusterPartitionStream>,
+    fire_failures: usize,
+}
+
+impl ClusterCoordinator {
+    async fn fan_out_remote_fragment_streams(
+        &self,
+        table_id: &TableId,
+        remotes: &[(uuid::Uuid, String)],
+        projected_regular_ordinals: Option<&[u16]>,
+        start_key: Option<&ferrosa_common::key::DecoratedKey>,
+    ) -> crate::error::Result<RemoteFanout> {
+        let mut streams: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len());
+        let mut fire_failures = 0usize;
+
+        for (host_id, _addr) in remotes {
+            let request_id = self.next_stream_request_id();
+            let receiver = self
+                .stream_router
+                .register(request_id, STREAM_RECEIVER_BUFFER);
+
+            let req_payload = RangeReadStreamRequestPayload {
+                request_id,
+                keyspace: table_id.keyspace.clone(),
+                table: table_id.table.clone(),
+                projected_regular_ordinals: projected_regular_ordinals.map(|w| w.to_vec()),
+                start_key: start_key.map(|k| k.key.as_bytes().to_vec()),
+            };
+            let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
+                ClusterError::Internal(format!("streaming range read: encode request: {e}"))
+            })?);
+
+            if let Err(e) = self
+                .peer_manager
+                .fire(
+                    *host_id,
+                    Message::RangeReadStreamRequest(req_body),
+                    Lane::Bulk,
+                )
+                .await
+            {
+                tracing::warn!(
+                    request_id,
+                    peer = %host_id,
+                    "streaming range read: failed to fire request: {e}"
+                );
+                self.stream_router.unregister(request_id);
+                fire_failures += 1;
+                continue;
+            }
+
+            let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+            let router = self.stream_router.clone();
+            TaskPool::current("range-read-forward").spawn(async move {
+                forward_remote_range_stream(receiver, request_id, 1, remote_tx).await;
+                router.unregister(request_id);
+            });
+
+            let stream = futures::stream::unfold(remote_rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            streams.push(Box::pin(stream));
+        }
+
+        Ok(RemoteFanout {
+            streams,
+            fire_failures,
+        })
+    }
+}
+
+/// Drive a token-aware N-way fragment merge of the LOCAL fragmented stream and
+/// one or more REMOTE replica fragment streams, emitting `<= k`-row fragments
+/// into `out_tx`. The local stream is start-bounded by `start` (the resume
+/// cursor); the remote streams are already start-bounded at their producers.
+/// Resident set is `O(num_sources + k)` — every cursor holds at most one peeked
+/// fragment and the merge buffers at most `k` output rows.
+async fn merge_local_and_remotes_fragmented(
+    storage: std::sync::Arc<ferrosa_storage::StorageEngine>,
+    table_id: TableId,
+    projected_regular_ordinals: Option<Vec<u16>>,
+    start: Option<ferrosa_common::key::DecoratedKey>,
+    remote_streams: Vec<ClusterPartitionStream>,
+    out_tx: mpsc::Sender<crate::error::Result<Partition>>,
+) {
+    let local_stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals {
+        Box::pin(
+            storage
+                .range_iter_projected_fragmented(&table_id, wanted, start.as_ref(), None)
+                .map(|item| item.map_err(ClusterError::Storage)),
+        )
+    } else {
+        Box::pin(
+            storage
+                .range_iter_fragmented(&table_id, start.as_ref(), None)
+                .map(|item| item.map_err(ClusterError::Storage)),
+        )
+    };
+
+    let mut cursors: Vec<FragmentCursor<BoxedFragmentStream>> =
+        Vec::with_capacity(1 + remote_streams.len());
+    cursors.push(FragmentCursor::new(local_stream).boxed());
+    for rs in remote_streams {
+        cursors.push(FragmentCursor::new(rs).boxed());
+    }
+
+    let k = super::stream_request_handler::stream_chunk_row_cap();
+    run_fragment_merge_nway(cursors, k, out_tx).await;
 }
 
 impl ClusterCoordinator {
@@ -896,13 +1097,93 @@ impl ClusterCoordinator {
         .await
     }
 
+    /// Compute the CL-selected remote replica set for a range scan: the ordered
+    /// remote `(host_id, addr)` list truncated to the count
+    /// [`remote_count_for_cl`] demands beyond the local read.
+    fn range_read_remotes(
+        &self,
+        cl: crate::consistency::ConsistencyLevel,
+        replication_factor: usize,
+    ) -> Vec<(uuid::Uuid, String)> {
+        let ring = self.ring.load();
+        let node_ids = ring.node_ids();
+        let local_id = self.local_node_id;
+        let node_count = node_ids.len();
+        let all_remotes: Vec<(uuid::Uuid, String)> = node_ids
+            .iter()
+            .filter(|&&id| id != local_id)
+            .filter_map(|&id| ring.get_node(id).map(|n| (n.host_id, n.addr.clone())))
+            .collect();
+        drop(ring);
+
+        let cl_remote_count =
+            remote_count_for_cl(cl, replication_factor, node_count, all_remotes.len());
+        all_remotes.into_iter().take(cl_remote_count).collect()
+    }
+
+    /// Drive the local-start-bounded fragmented stream + the CL-selected remote
+    /// replica fragment streams (each start-bounded at its producer) through the
+    /// token-aware N-way merge, returning the merged partition stream. Shared by
+    /// the paged (`*_stream_from`) variants. `start` is the inclusive resume
+    /// cursor (`None` on the first page).
+    async fn paged_multi_replica_stream(
+        &self,
+        table_id: &TableId,
+        wanted: Option<Vec<u16>>,
+        start: Option<&ferrosa_common::key::DecoratedKey>,
+        remotes: &[(uuid::Uuid, String)],
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        let fanout = self
+            .fan_out_remote_fragment_streams(table_id, remotes, wanted.as_deref(), start)
+            .await?;
+        if fanout.streams.is_empty() {
+            return Err(ClusterError::Internal(format!(
+                "paged streaming range read: every replica fire failed ({} of {})",
+                fanout.fire_failures,
+                remotes.len()
+            )));
+        }
+        if fanout.fire_failures > 0 {
+            tracing::warn!(
+                failed = fanout.fire_failures,
+                succeeded = fanout.streams.len(),
+                "paged streaming range read: partial fan-out — some replicas could not be reached"
+            );
+        }
+
+        let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let storage = self.storage.clone();
+        let table_id = table_id.clone();
+        let start = start.cloned();
+        TaskPool::current("range-read-merge-nway-paged").spawn(async move {
+            merge_local_and_remotes_fragmented(
+                storage,
+                table_id,
+                wanted,
+                start,
+                fanout.streams,
+                out_tx,
+            )
+            .await;
+        });
+        let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Ok(Box::pin(stream))
+    }
+
     /// Resume-capable streaming range scan with an inclusive lower-bound key.
     ///
     /// Backs `WritePath::range_read_stream_all_from` (the coordinator-side
-    /// paging cursor). Only the local-only fan-out shape (CL=ONE with the
-    /// keyspace RF spanning the ring, i.e. no remote replica must be consulted)
-    /// is supported; any shape requiring a cross-replica merge is refused
-    /// rather than returning a partial scan, matching the unbounded scan guard.
+    /// paging cursor). The local-only fan-out shape (CL=ONE with the keyspace RF
+    /// spanning the ring) streams the local fragmented iterator directly; a
+    /// multi-replica shape fans out a start-bounded fragment stream to each
+    /// CL-selected replica and merges them with the local stream through the
+    /// token-aware N-way fragment merge (`run_fragment_merge_nway`). The
+    /// resume cursor (`start`) is shipped to every replica so a resumed page
+    /// never re-streams the already-emitted prefix; the CQL paging collector
+    /// applies the exact skip-≤-last semantics on top, so the merged page is
+    /// gap- and duplicate-free even mid-wide-partition.
     pub async fn coordinate_range_read_stream_from(
         &self,
         table_id: &TableId,
@@ -910,34 +1191,24 @@ impl ClusterCoordinator {
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
-        let ring = self.ring.load();
-        let node_ids = ring.node_ids();
-        let node_count = node_ids.len();
-        let all_remotes_len = node_ids
-            .iter()
-            .filter(|&&id| id != self.local_node_id)
-            .count();
-        drop(ring);
+        let remotes = self.range_read_remotes(cl, replication_factor);
 
-        let cl_remote_count =
-            remote_count_for_cl(cl, replication_factor, node_count, all_remotes_len);
-
-        if cl_remote_count > 0 {
-            return Err(ClusterError::Internal(
-                "paged cluster range scan with a resume key requires token-aware k-way stream merge across replicas; refusing to return a partial scan".into(),
+        if remotes.is_empty() {
+            return Ok(Box::pin(
+                self.storage
+                    .range_iter_fragmented(table_id, start, None)
+                    .map(|item| item.map_err(ClusterError::Storage)),
             ));
         }
 
-        Ok(Box::pin(
-            self.storage
-                .range_iter_fragmented(table_id, start, None)
-                .map(|item| item.map_err(ClusterError::Storage)),
-        ))
+        self.paged_multi_replica_stream(table_id, None, start, &remotes)
+            .await
     }
 
     /// Projection-aware resume-capable streaming range scan. See
-    /// [`Self::coordinate_range_read_stream_from`]; refuses any cross-replica
-    /// shape.
+    /// [`Self::coordinate_range_read_stream_from`]; serves the multi-replica
+    /// shape via the same start-bounded N-way fragment merge, byte-skipping
+    /// unprojected cells at every replica.
     pub async fn coordinate_range_read_projected_stream_from(
         &self,
         table_id: &TableId,
@@ -946,29 +1217,18 @@ impl ClusterCoordinator {
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
-        let ring = self.ring.load();
-        let node_ids = ring.node_ids();
-        let node_count = node_ids.len();
-        let all_remotes_len = node_ids
-            .iter()
-            .filter(|&&id| id != self.local_node_id)
-            .count();
-        drop(ring);
+        let remotes = self.range_read_remotes(cl, replication_factor);
 
-        let cl_remote_count =
-            remote_count_for_cl(cl, replication_factor, node_count, all_remotes_len);
-
-        if cl_remote_count > 0 {
-            return Err(ClusterError::Internal(
-                "paged projected cluster range scan with a resume key requires token-aware k-way stream merge across replicas; refusing to return a partial scan".into(),
+        if remotes.is_empty() {
+            return Ok(Box::pin(
+                self.storage
+                    .range_iter_projected_fragmented(table_id, wanted, start, None)
+                    .map(|item| item.map_err(ClusterError::Storage)),
             ));
         }
 
-        Ok(Box::pin(
-            self.storage
-                .range_iter_projected_fragmented(table_id, wanted, start, None)
-                .map(|item| item.map_err(ClusterError::Storage)),
-        ))
+        self.paged_multi_replica_stream(table_id, Some(wanted), start, &remotes)
+            .await
     }
 
     async fn coordinate_range_read_stream_all_with_projection(
@@ -1000,10 +1260,63 @@ impl ClusterCoordinator {
             all_remotes.into_iter().take(cl_remote_count).collect();
         let expected_done = remotes.len();
 
+        // Multiple remote replicas: token-aware N-way streaming merge of the
+        // local fragmented stream + one fragment stream per remote replica.
+        // Bounded memory (`O(num_sources + k)`), no materialization.
+        //
+        // Only the `row_limit == 0` full-scan shape takes this path: the N-way
+        // merge re-emits `<= k`-row fragments, so a per-FRAGMENT row cap (what
+        // `row_limit > 0` would need) cannot be expressed without buffering the
+        // whole partition. `row_limit > 0` only arises for `LIMIT N` queries
+        // with partition-key equality predicates targeting bounded specific
+        // partitions; that capped multi-replica shape keeps the loud refusal
+        // rather than risk an incorrect per-fragment cap.
         if expected_done > 1 {
-            return Err(ClusterError::Internal(
-                "unbounded cluster range scan with multiple remote replicas requires token-aware k-way stream merge; refusing to materialize full results".into(),
-            ));
+            if row_limit != 0 {
+                return Err(ClusterError::Internal(
+                    "capped (row_limit>0) cluster range scan with multiple remote replicas is unsupported by the fragment merge; refusing to return a partial scan".into(),
+                ));
+            }
+            let fanout = self
+                .fan_out_remote_fragment_streams(
+                    table_id,
+                    &remotes,
+                    projected_regular_ordinals.as_deref(),
+                    None,
+                )
+                .await?;
+            if fanout.streams.is_empty() {
+                return Err(ClusterError::Internal(format!(
+                    "streaming range read: every replica fire failed ({} of {})",
+                    fanout.fire_failures, expected_done
+                )));
+            }
+            if fanout.fire_failures > 0 {
+                tracing::warn!(
+                    failed = fanout.fire_failures,
+                    succeeded = fanout.streams.len(),
+                    "streaming range read: partial fan-out — some replicas could not be reached"
+                );
+            }
+
+            let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+            let storage = self.storage.clone();
+            let table_id = table_id.clone();
+            TaskPool::current("range-read-merge-nway").spawn(async move {
+                merge_local_and_remotes_fragmented(
+                    storage,
+                    table_id,
+                    projected_regular_ordinals,
+                    None,
+                    fanout.streams,
+                    out_tx,
+                )
+                .await;
+            });
+            let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            return Ok(Box::pin(stream));
         }
 
         if expected_done == 0 {
@@ -1062,6 +1375,7 @@ impl ClusterCoordinator {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
             projected_regular_ordinals: projected_regular_ordinals.clone(),
+            start_key: None,
         };
         let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
             ClusterError::Internal(format!("streaming range read: encode request: {e}"))
@@ -1205,6 +1519,7 @@ impl ClusterCoordinator {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
             projected_regular_ordinals: None,
+            start_key: None,
         };
         let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
             ClusterError::Internal(format!("streaming range read: encode request: {e}"))
@@ -1496,6 +1811,307 @@ mod tests {
         }
     }
 
+    /// Drive an N-way fragment merge over several in-memory fragment streams
+    /// and collect the emitted fragments. Mirrors `drive_merge` for the 2-way
+    /// case; the N-way merge core is `run_fragment_merge_nway`.
+    async fn drive_merge_nway(sources: Vec<Vec<Partition>>, k: usize) -> Vec<Partition> {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let cursors: Vec<FragmentCursor<_>> = sources
+            .into_iter()
+            .map(|s| FragmentCursor::new(stream_of(s)))
+            .collect();
+        let driver = tokio::spawn(async move { run_fragment_merge_nway(cursors, k, tx).await });
+        let mut out = Vec::new();
+        while let Some(item) = rx.recv().await {
+            out.push(item.expect("nway merge produced an error"));
+        }
+        driver.await.unwrap();
+        out
+    }
+
+    /// The N-way (multi-replica) fragment merge must reproduce, per token, the
+    /// whole-partition `merge_partitions(vec![s0, s1, s2])` result —
+    /// byte-identical after flattening — for LWW across THREE replicas,
+    /// tombstones, static rows, and disjoint tokens, across several `k`, while
+    /// no emitted fragment exceeds `k` rows (bounded memory across all sources).
+    #[tokio::test]
+    async fn fragment_nway_replica_merge_equiv_whole_partition_merge() {
+        let mut keys = [dk(b"alpha"), dk(b"bravo"), dk(b"charlie"), dk(b"delta")];
+        keys.sort();
+
+        // key0: 3-way LWW — s2 newest wins on its keys, s1 beats s0 on overlap.
+        let s0k0 = Partition {
+            key: keys[0].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..30)
+                .map(|c| trow(c, format!("a{c}").as_bytes(), 1000))
+                .collect(),
+        };
+        let s1k0 = Partition {
+            key: keys[0].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..30)
+                .filter(|c| c % 2 == 0)
+                .map(|c| trow(c, format!("b{c}").as_bytes(), 2000))
+                .collect(),
+        };
+        let s2k0 = Partition {
+            key: keys[0].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..30)
+                .filter(|c| c % 3 == 0)
+                .map(|c| trow(c, format!("c{c}").as_bytes(), 3000))
+                .collect(),
+        };
+        // key1: only s1 has it (disjoint).
+        let s1k1 = Partition {
+            key: keys[1].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..9)
+                .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .collect(),
+        };
+        // key2: s0 + s2, with a partition tombstone on s2 suppressing s0's old rows.
+        let s0k2 = Partition {
+            key: keys[2].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: Some(Row {
+                clustering: vec![],
+                cells: vec![(0, ferrosa_common::CellValue::live(b"st".to_vec(), 9000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::NONE,
+            }),
+            rows: (0..20)
+                .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .collect(),
+        };
+        let s2k2 = Partition {
+            key: keys[2].clone(),
+            deletion: DeletionTime::new(1500, 100),
+            static_row: None,
+            rows: (20..36)
+                .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .collect(),
+        };
+
+        let reference = {
+            let mut r = vec![
+                ferrosa_storage::merge::merge_partitions(vec![
+                    s0k0.clone(),
+                    s1k0.clone(),
+                    s2k0.clone(),
+                ]),
+                s1k1.clone(),
+                ferrosa_storage::merge::merge_partitions(vec![s0k2.clone(), s2k2.clone()]),
+            ];
+            r.sort_by(|a, b| a.key.cmp(&b.key));
+            r
+        };
+
+        let mut s0 = [s0k0, s0k2];
+        s0.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut s1 = [s1k0, s1k1];
+        s1.sort_by(|a, b| a.key.cmp(&b.key));
+        let s2 = [s2k0, s2k2]; // already key-sorted (keys[0] < keys[2])
+
+        for k in [1usize, 2, 3, 7, 8, 1024] {
+            let frag = |ps: &[Partition]| -> Vec<Partition> {
+                ps.iter().flat_map(|p| fragment_partition(p, k)).collect()
+            };
+            let emitted = drive_merge_nway(vec![frag(&s0), frag(&s1), frag(&s2)], k).await;
+            for f in &emitted {
+                assert!(
+                    f.rows.len() <= k,
+                    "emitted fragment {} exceeds k={k}",
+                    f.rows.len()
+                );
+            }
+            let merged = flatten(emitted);
+            assert_eq!(
+                merged, reference,
+                "N-way fragment merge(k={k}) diverged from whole-partition merge"
+            );
+        }
+    }
+
+    /// A merged row, flattened to (decorated_key, clustering, row) so the paging
+    /// simulation can compare against the whole-merge reference and apply the
+    /// skip-≤-last cursor in true (token, clustering) order, exactly as the CQL
+    /// paging collector does.
+    fn flatten_to_rows(parts: &[Partition]) -> Vec<(DecoratedKey, Vec<u8>, Row)> {
+        let mut out = Vec::new();
+        for p in parts {
+            for r in &p.rows {
+                out.push((p.key.clone(), r.clustering.clone(), r.clone()));
+            }
+        }
+        out
+    }
+
+    /// Start-bound a whole partition source at the inclusive resume cursor,
+    /// mirroring the producer-side `range_iter_fragmented(start, ..)` (which is
+    /// bounded in TOKEN order, since `start` is a `DecoratedKey`): keep
+    /// partitions with key >= cursor key in token order; in the cursor's own
+    /// partition keep only rows with clustering > cursor.ck.
+    fn resume_source(
+        src: &[Partition],
+        cursor: &Option<(DecoratedKey, Vec<u8>)>,
+    ) -> Vec<Partition> {
+        let Some((ckey, ck)) = cursor else {
+            return src.to_vec();
+        };
+        let mut out = Vec::new();
+        for p in src {
+            if p.key < *ckey {
+                continue;
+            }
+            let mut p2 = p.clone();
+            if p.key == *ckey {
+                // Inclusive re-seek lands on the cursor partition; drop rows
+                // already past the cursor's clustering.
+                p2.rows.retain(|r| r.clustering > *ck);
+            }
+            out.push(p2);
+        }
+        out
+    }
+
+    /// Paged N-way traversal must equal the whole N-way merge — no gaps, no
+    /// duplicates — including a wide partition replicated across ALL sources and
+    /// spanning multiple pages. The simulation drives the real
+    /// `run_fragment_merge_nway` once per page over start-bounded sources, takes
+    /// `page_size` merged rows, advances an inclusive (partition_key, clustering)
+    /// cursor, and concatenates the pages. This is exactly the resume contract
+    /// the CQL paging collector applies on top of the coordinator stream.
+    #[tokio::test]
+    async fn paged_nway_traversal_equals_whole_nway_merge() {
+        let mut keys = [dk(b"alpha"), dk(b"bravo"), dk(b"charlie"), dk(b"delta")];
+        keys.sort();
+
+        // keys[0]: WIDE partition replicated across all 3 sources, with 3-way
+        // LWW overlap, so a page boundary can fall mid-partition.
+        let wide = |tag: char, modulo: i32, ts: i64| Partition {
+            key: keys[0].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..50)
+                .filter(|c| c % modulo == 0)
+                .map(|c| trow(c, format!("{tag}{c}").as_bytes(), ts))
+                .collect(),
+        };
+        let s0w = wide('a', 1, 1000); // every clustering
+        let s1w = wide('b', 2, 2000); // evens, newer
+        let s2w = wide('c', 3, 3000); // multiples of 3, newest
+
+        // keys[1]: only s1. keys[2]: s0 + s2 with a partition tombstone on s2.
+        let s1k1 = Partition {
+            key: keys[1].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..9)
+                .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .collect(),
+        };
+        let s0k2 = Partition {
+            key: keys[2].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: Some(Row {
+                clustering: vec![],
+                cells: vec![(0, ferrosa_common::CellValue::live(b"st".to_vec(), 9000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::NONE,
+            }),
+            rows: (0..20)
+                .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .collect(),
+        };
+        let s2k2 = Partition {
+            key: keys[2].clone(),
+            deletion: DeletionTime::new(1500, 100),
+            static_row: None,
+            rows: (20..36)
+                .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .collect(),
+        };
+
+        let mut s0 = vec![s0w.clone(), s0k2.clone()];
+        s0.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut s1 = vec![s1w.clone(), s1k1.clone()];
+        s1.sort_by(|a, b| a.key.cmp(&b.key));
+        let s2 = vec![s2w.clone(), s2k2.clone()];
+
+        // Whole-merge reference: rows in (token, clustering) order, post-LWW.
+        let k_ref = 8usize;
+        let whole = {
+            let frag = |ps: &[Partition]| -> Vec<Partition> {
+                ps.iter()
+                    .flat_map(|p| fragment_partition(p, k_ref))
+                    .collect()
+            };
+            let emitted = drive_merge_nway(vec![frag(&s0), frag(&s1), frag(&s2)], k_ref).await;
+            flatten_to_rows(&flatten(emitted))
+        };
+
+        // Page across several page sizes and fragment caps. The fragment cap k
+        // is independent of page_size — both must be respected.
+        for page_size in [1usize, 3, 7, 50] {
+            for k in [1usize, 4, 8] {
+                let mut cursor: Option<(DecoratedKey, Vec<u8>)> = None;
+                let mut paged: Vec<(DecoratedKey, Vec<u8>, Row)> = Vec::new();
+
+                // Hard iteration cap: at most one page per reference row, plus a
+                // final empty page. Guards against a paging bug looping forever.
+                let max_pages = whole.len() + 2;
+                let mut pages = 0usize;
+                loop {
+                    pages += 1;
+                    assert!(pages <= max_pages, "paging did not terminate");
+
+                    let frag = |ps: &[Partition]| -> Vec<Partition> {
+                        resume_source(ps, &cursor)
+                            .iter()
+                            .flat_map(|p| fragment_partition(p, k))
+                            .collect()
+                    };
+                    let emitted = drive_merge_nway(vec![frag(&s0), frag(&s1), frag(&s2)], k).await;
+                    for f in &emitted {
+                        assert!(f.rows.len() <= k, "fragment {} exceeds k={k}", f.rows.len());
+                    }
+                    let merged = flatten_to_rows(&flatten(emitted));
+
+                    // Skip rows already emitted (<= cursor) in (token,
+                    // clustering) order, then take a page.
+                    let mut took = 0usize;
+                    for (pk, ck, row) in merged.into_iter() {
+                        if let Some((cpk, cck)) = cursor.as_ref() {
+                            if (&pk, &ck) <= (cpk, cck) {
+                                continue;
+                            }
+                        }
+                        paged.push((pk.clone(), ck.clone(), row));
+                        cursor = Some((pk, ck));
+                        took += 1;
+                        if took == page_size {
+                            break;
+                        }
+                    }
+                    if took == 0 {
+                        break; // drained
+                    }
+                }
+
+                assert_eq!(
+                    paged, whole,
+                    "paged N-way traversal (page_size={page_size}, k={k}) diverged from whole merge"
+                );
+            }
+        }
+    }
+
     /// RF=cluster_size: local replica owns every partition, so
     /// CL=ONE / LOCAL_ONE needs zero remote replicas. QUORUM needs
     /// floor(RF/2)+1 total responses → that count minus 1 (local)
@@ -1576,8 +2192,13 @@ mod tests {
             "unbounded streaming range reads must not accumulate local and remote partitions before returning"
         );
         assert!(
-            body.contains("refusing to materialize full results"),
-            "remote unbounded scans that need replica merge must fail clearly instead of falling back to materialization"
+            body.contains("run_fragment_merge_nway")
+                || body.contains("merge_local_and_remotes_fragmented"),
+            "multi-replica unbounded scans must stream through the token-aware N-way fragment merge, not materialize"
+        );
+        assert!(
+            body.contains("refusing to return a partial scan"),
+            "capped (row_limit>0) multi-replica scans must still fail loudly rather than return a partial/incorrect scan"
         );
     }
 }
