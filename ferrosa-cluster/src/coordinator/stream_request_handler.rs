@@ -46,6 +46,23 @@ use crate::raft::handlers::{
 /// stall.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Default ceiling on the number of clustered rows packed into one stream
+/// chunk frame. Matches `ferrosa_storage::range_merger`'s default fragment
+/// cap so a single full fragment flushes as one chunk. Env-tunable through
+/// the same `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` knob that bounds the
+/// producer, keeping the wire frame and the producer fragment aligned.
+const DEFAULT_STREAM_CHUNK_ROW_CAP: usize = 4_096;
+
+pub(crate) fn stream_chunk_row_cap() -> usize {
+    match std::env::var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => DEFAULT_STREAM_CHUNK_ROW_CAP,
+        },
+        Err(_) => DEFAULT_STREAM_CHUNK_ROW_CAP,
+    }
+}
+
 /// Type alias for the per-partition async stream returned by
 /// [`StreamRangeReader::range_iter`]. Each item is either a
 /// successfully-decoded partition or a (recoverable) per-partition
@@ -80,24 +97,29 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
         table_id: &TableId,
         projected_regular_ordinals: Option<&'a [u16]>,
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
-        // ADR-020 Phase 2 backing: StorageEngine::range_iter returns
-        // a Stream backed by crate::range_merger::RangeMerger — a
-        // k-way merge across memtable + flushing memtable + per-SSTable
-        // iterators, yielding one merged-and-deletion-suppressed
-        // partition at a time. Memory at every layer is bounded by
-        // num_sources, not table size; no Vec<Partition> exists for
-        // the whole table at any point in the pipeline.
+        // ADR-020 Phase 2 backing: the FRAGMENTED range iterators back the
+        // replica stream. They k-way merge across memtable + flushing
+        // memtable + per-SSTable iterators AND, crucially, stream a single
+        // wide partition's rows in bounded fragments (<= K rows each), so
+        // resident memory is `O(num_sources + K)` rows regardless of
+        // partition width — not `O(widest_partition_rows)`. A single
+        // multi-million-row inverted-index partition (one hot term) is what
+        // OOM-killed replicas on a full-table `SELECT *`; this is the fix.
+        // The fragments carry the partition header only on the first
+        // fragment, so the coordinator's per-partition row bridge reproduces
+        // the merged partition byte-for-byte.
         if let Some(wanted) = projected_regular_ordinals {
-            Ok(ferrosa_storage::StorageEngine::range_iter_projected(
-                self.as_ref(),
-                table_id,
-                wanted.to_vec(),
-                None,
-                None,
-                None,
-            ))
+            Ok(
+                ferrosa_storage::StorageEngine::range_iter_projected_fragmented(
+                    self.as_ref(),
+                    table_id,
+                    wanted.to_vec(),
+                    None,
+                    None,
+                ),
+            )
         } else {
-            Ok(ferrosa_storage::StorageEngine::range_iter(
+            Ok(ferrosa_storage::StorageEngine::range_iter_fragmented(
                 self.as_ref(),
                 table_id,
                 None,
@@ -166,9 +188,18 @@ pub async fn handle_stream_request_with_cancel<R, S>(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await;
 
+    // Bound each emitted chunk by TOTAL ROWS, not just partition/fragment
+    // count. The fragmented range iterator already splits a wide partition
+    // into `<= K`-row items, but `chunk_size` of them would still be
+    // `chunk_size * K` rows in one wire frame. Flushing on a row threshold
+    // keeps each chunk frame inside the Bulk lane envelope regardless of how
+    // the fragments fall. The threshold is the per-fragment cap K (mirrored
+    // from storage's default) so a single full fragment flushes promptly.
+    let row_chunk_cap: usize = stream_chunk_row_cap();
     let mut heartbeat_seq: u32 = 0;
     let mut chunk_seq: u32 = 0;
     let mut batch: Vec<Partition> = Vec::with_capacity(chunk_size);
+    let mut batch_rows: usize = 0;
     let mut total_chunks_emitted: u32 = 0;
     let mut any_decode_error = false;
 
@@ -185,9 +216,11 @@ pub async fn handle_stream_request_with_cancel<R, S>(
             }
             next = stream.next() => match next {
                 Some(Ok(partition)) => {
+                    batch_rows = batch_rows.saturating_add(partition.rows.len());
                     batch.push(partition);
-                    if batch.len() >= chunk_size {
+                    if batch.len() >= chunk_size || batch_rows >= row_chunk_cap {
                         emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+                        batch_rows = 0;
                         chunk_seq = chunk_seq.saturating_add(1);
                         total_chunks_emitted = total_chunks_emitted.saturating_add(1);
                     }

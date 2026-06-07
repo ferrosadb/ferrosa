@@ -2341,6 +2341,176 @@ impl<F: FlushTarget> TableStore<F> {
         }))
     }
 
+    /// Intra-partition streaming variant of [`Self::range_iter`]. A single
+    /// (possibly multi-million-row) partition is delivered as a SEQUENCE of
+    /// `Partition` items each holding `<= K` clustered rows (K =
+    /// [`crate::range_merger::rows_per_fragment`]), so the producer's
+    /// resident memory is `O(num_sources + K)` rows regardless of how wide
+    /// the partition is.
+    ///
+    /// Reassembly contract: every item for one partition key shares the
+    /// same `key`; the FIRST item carries the real `deletion` + `static_row`
+    /// and later items carry `LIVE` / `None`. A consumer that flattens
+    /// `Partition.rows` independently (the CQL row bridge, the cluster
+    /// stream handler) therefore reproduces the merged partition exactly —
+    /// the row sequence is byte-identical to [`Self::range_iter`]'s
+    /// whole-partition output. This is the OOM fix for full-table
+    /// `SELECT *` over inverted-index-shaped tables.
+    pub fn range_iter_fragmented(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+        const STREAM_BUFFER: usize = 4;
+        let view = self.view.load_full();
+        let schema = self.schema.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+
+        let sst_readers = match self.open_readers_for_key_range(
+            &view.sstables,
+            start_owned.as_ref(),
+            end_owned.as_ref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.try_send(Err(e));
+                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }));
+            }
+        };
+        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
+
+        TaskPool::current("table-store-stream").spawn_blocking(move || {
+            let active_iter = view
+                .active
+                .range_iter(start_owned.as_ref(), end_owned.as_ref());
+            let flushing_iter = view
+                .flushing
+                .as_ref()
+                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            let sstables_slice = &sst_readers[..];
+
+            let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
+                active_iter,
+                flushing_iter,
+                sstables_slice,
+                &column_mappings,
+                start_owned,
+                end_owned,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+
+            let k = crate::range_merger::rows_per_fragment();
+            loop {
+                match merger.next_fragment(k) {
+                    Ok(Some(fragment)) => {
+                        if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+
+    /// Projection-aware intra-partition streaming variant of
+    /// [`Self::range_iter_projected`]. Same fragment reassembly contract as
+    /// [`Self::range_iter_fragmented`]; SSTable cells outside `wanted` are
+    /// byte-skipped per row.
+    pub fn range_iter_projected_fragmented(
+        &self,
+        wanted: Vec<u16>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+        const STREAM_BUFFER: usize = 4;
+        let view = self.view.load_full();
+        let schema = self.schema.load_full();
+        let start_owned = start.cloned();
+        let end_owned = end.cloned();
+        let wanted_owned = wanted;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+
+        let sst_readers = match self.open_readers_for_key_range(
+            &view.sstables,
+            start_owned.as_ref(),
+            end_owned.as_ref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.try_send(Err(e));
+                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }));
+            }
+        };
+        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
+
+        TaskPool::current("table-store-stream").spawn_blocking(move || {
+            let active_iter = view
+                .active
+                .range_iter(start_owned.as_ref(), end_owned.as_ref());
+            let flushing_iter = view
+                .flushing
+                .as_ref()
+                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            let sstables_slice = &sst_readers[..];
+
+            let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
+                active_iter,
+                flushing_iter,
+                sstables_slice,
+                &column_mappings,
+                &wanted_owned,
+                start_owned,
+                end_owned,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+
+            let k = crate::range_merger::rows_per_fragment();
+            loop {
+                match merger.next_fragment(k) {
+                    Ok(Some(fragment)) => {
+                        if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+
     /// Read all partitions whose tokens fall in `[start_token, end_token)`,
     /// up to `limit` matching partitions.
     ///
@@ -4549,6 +4719,80 @@ mod tests {
             futures::StreamExt::next(&mut stream).await.is_none(),
             "expected exactly one partition"
         );
+    }
+
+    /// End-to-end engine wiring: `range_iter_fragmented` must reassemble
+    /// (flatten per key) to byte-identical output vs the whole-partition
+    /// `range_iter`, while bounding each emitted fragment to `<= K` rows —
+    /// across memtable + flushed-SSTable sources for one WIDE partition.
+    /// This is the storage-level OOM-bound + equivalence oracle.
+    #[tokio::test]
+    async fn range_iter_fragmented_flattens_to_range_iter_across_sources() {
+        std::env::set_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT", "16");
+        let store = test_store();
+
+        // One wide partition "hot": half its rows flushed to an SSTable, half
+        // still in the active memtable, plus a couple of narrow partitions so
+        // the k-way merge has neighbours. Each write is a distinct clustering
+        // row in the same partition.
+        for ck in 0..40i32 {
+            store
+                .write(
+                    &make_key("hot"),
+                    make_row_with_ck(ck, format!("flushed{ck}").as_bytes(), 1000 + ck as i64),
+                )
+                .unwrap();
+        }
+        store.write(&make_key("aaa"), make_row(b"a", 1000)).unwrap();
+        store.flush().unwrap();
+        // Memtable half (newer ts on even cks — LWW must keep these).
+        for ck in (0..40i32).filter(|c| c % 2 == 0) {
+            store
+                .write(
+                    &make_key("hot"),
+                    make_row_with_ck(ck, format!("memtable{ck}").as_bytes(), 5000 + ck as i64),
+                )
+                .unwrap();
+        }
+        store.write(&make_key("zzz"), make_row(b"z", 1000)).unwrap();
+
+        // Whole-partition reference.
+        let mut whole_stream = store.range_iter(None, None);
+        let mut whole: Vec<Partition> = Vec::new();
+        while let Some(p) = futures::StreamExt::next(&mut whole_stream).await {
+            whole.push(p.unwrap());
+        }
+
+        // Fragmented.
+        let mut frag_stream = store.range_iter_fragmented(None, None);
+        let mut frags: Vec<Partition> = Vec::new();
+        while let Some(p) = futures::StreamExt::next(&mut frag_stream).await {
+            let p = p.unwrap();
+            assert!(
+                p.rows.len() <= 16,
+                "fragment {} exceeded K=16",
+                p.rows.len()
+            );
+            frags.push(p);
+        }
+
+        // Flatten fragments per key.
+        let mut flat: Vec<Partition> = Vec::new();
+        for f in frags {
+            match flat.last_mut() {
+                Some(p) if p.key == f.key => p.rows.extend(f.rows),
+                _ => flat.push(f),
+            }
+        }
+
+        assert_eq!(
+            flat, whole,
+            "fragmented flatten != whole-partition range_iter"
+        );
+        // The hot partition must have fragmented (40 distinct cks > K=16).
+        let hot = whole.iter().find(|p| p.key == make_key("hot")).unwrap();
+        assert!(hot.rows.len() > 16, "fixture must produce a wide partition");
+        std::env::remove_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT");
     }
 
     #[test]
