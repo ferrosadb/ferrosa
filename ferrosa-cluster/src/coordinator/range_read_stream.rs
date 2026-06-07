@@ -186,6 +186,62 @@ fn apply_row_limit(mut partition: Partition, row_limit: usize) -> Partition {
     partition
 }
 
+/// Apply a per-partition row cap to a MERGED fragment stream (the output of
+/// `run_fragment_merge_nway`), forwarding capped fragments to `out_tx`.
+///
+/// A partition arrives as a contiguous run of fragments sharing one `key` (the
+/// header — partition deletion + static row — rides on the first fragment).
+/// We count emitted clustering rows per key and truncate at `row_limit`,
+/// dropping the fully-capped tail fragments. The result is byte-identical to
+/// running [`apply_row_limit`] on the whole merged partition — but streaming,
+/// so memory stays `O(num_sources + k)`. `row_limit == 0` means "no cap" and
+/// forwards everything unchanged.
+///
+/// Used for capped (`LIMIT N` + partition-key equality) multi-replica range
+/// scans, which target bounded partitions; this replaces the former loud
+/// refusal of that shape.
+async fn apply_per_partition_row_limit(
+    mut in_rx: mpsc::Receiver<crate::error::Result<Partition>>,
+    row_limit: usize,
+    out_tx: mpsc::Sender<crate::error::Result<Partition>>,
+) {
+    let mut cur_key: Option<ferrosa_common::DecoratedKey> = None;
+    let mut emitted: usize = 0;
+    while let Some(item) = in_rx.recv().await {
+        let mut p = match item {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = out_tx.send(Err(e)).await;
+                return;
+            }
+        };
+        if row_limit == 0 {
+            if out_tx.send(Ok(p)).await.is_err() {
+                return;
+            }
+            continue;
+        }
+        if cur_key.as_ref() != Some(&p.key) {
+            cur_key = Some(p.key.clone());
+            emitted = 0;
+        }
+        let remaining = row_limit.saturating_sub(emitted);
+        if p.rows.len() > remaining {
+            p.rows.truncate(remaining);
+        }
+        emitted += p.rows.len();
+        // Forward when the fragment still carries rows, or it is the
+        // header-bearing first fragment of a partition (partition deletion or a
+        // static row must survive a row cap). Otherwise it is a fully-capped
+        // tail fragment — drop it.
+        let carries_header =
+            p.static_row.is_some() || p.deletion != ferrosa_sstable::types::DeletionTime::LIVE;
+        if (!p.rows.is_empty() || carries_header) && out_tx.send(Ok(p)).await.is_err() {
+            return;
+        }
+    }
+}
+
 fn next_remote_error(err: StreamConsumeError) -> crate::error::Result<Partition> {
     Err(ClusterError::Internal(format!(
         "streaming range read: {err:?}"
@@ -1264,19 +1320,13 @@ impl ClusterCoordinator {
         // local fragmented stream + one fragment stream per remote replica.
         // Bounded memory (`O(num_sources + k)`), no materialization.
         //
-        // Only the `row_limit == 0` full-scan shape takes this path: the N-way
-        // merge re-emits `<= k`-row fragments, so a per-FRAGMENT row cap (what
-        // `row_limit > 0` would need) cannot be expressed without buffering the
-        // whole partition. `row_limit > 0` only arises for `LIMIT N` queries
-        // with partition-key equality predicates targeting bounded specific
-        // partitions; that capped multi-replica shape keeps the loud refusal
-        // rather than risk an incorrect per-fragment cap.
+        // `row_limit == 0` (full scan) forwards the merged fragments directly.
+        // `row_limit > 0` (a `LIMIT N` query with partition-key equality
+        // predicates, targeting bounded specific partitions) streams a
+        // per-partition row cap over the merged output via
+        // `apply_per_partition_row_limit` — byte-identical to capping the whole
+        // merged partition, but without buffering it.
         if expected_done > 1 {
-            if row_limit != 0 {
-                return Err(ClusterError::Internal(
-                    "capped (row_limit>0) cluster range scan with multiple remote replicas is unsupported by the fragment merge; refusing to return a partial scan".into(),
-                ));
-            }
             let fanout = self
                 .fan_out_remote_fragment_streams(
                     table_id,
@@ -1299,20 +1349,32 @@ impl ClusterCoordinator {
                 );
             }
 
-            let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+            // N-way merge -> merge_rx.
+            let (merge_tx, merge_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
             let storage = self.storage.clone();
-            let table_id = table_id.clone();
+            let merge_table_id = table_id.clone();
             TaskPool::current("range-read-merge-nway").spawn(async move {
                 merge_local_and_remotes_fragmented(
                     storage,
-                    table_id,
+                    merge_table_id,
                     projected_regular_ordinals,
                     None,
                     fanout.streams,
-                    out_tx,
+                    merge_tx,
                 )
                 .await;
             });
+
+            // Apply the per-partition row cap as a streaming stage when capped.
+            let out_rx = if row_limit > 0 {
+                let (cap_tx, cap_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+                TaskPool::current("range-read-merge-nway-cap").spawn(async move {
+                    apply_per_partition_row_limit(merge_rx, row_limit, cap_tx).await;
+                });
+                cap_rx
+            } else {
+                merge_rx
+            };
             let stream = futures::stream::unfold(out_rx, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
             });
@@ -2112,6 +2174,123 @@ mod tests {
         }
     }
 
+    /// Drive an N-way merge then the streaming per-partition row cap, collecting
+    /// the capped fragments — mirrors the coordinator's capped multi-replica path.
+    async fn drive_merge_nway_capped(
+        sources: Vec<Vec<Partition>>,
+        k: usize,
+        row_limit: usize,
+    ) -> Vec<Partition> {
+        let (mid_tx, mid_rx) = mpsc::channel(1024);
+        let cursors: Vec<FragmentCursor<_>> = sources
+            .into_iter()
+            .map(|s| FragmentCursor::new(stream_of(s)))
+            .collect();
+        let driver = tokio::spawn(async move { run_fragment_merge_nway(cursors, k, mid_tx).await });
+        let (out_tx, mut out_rx) = mpsc::channel(1024);
+        let capper =
+            tokio::spawn(
+                async move { apply_per_partition_row_limit(mid_rx, row_limit, out_tx).await },
+            );
+        let mut out = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            out.push(item.expect("capped nway merge produced an error"));
+        }
+        driver.await.unwrap();
+        capper.await.unwrap();
+        out
+    }
+
+    /// Capped (`LIMIT N` + PK-equality) multi-replica scans: the streaming
+    /// per-partition row cap over the N-way merge must be byte-identical to
+    /// `apply_row_limit` on the whole merged partition — for several `k` and
+    /// `row_limit`, preserving static rows / partition headers, and never
+    /// emitting more than `row_limit` rows for any partition.
+    #[tokio::test]
+    async fn nway_capped_per_partition_row_limit_equiv_whole_capped() {
+        let mut keys = [dk(b"alpha"), dk(b"bravo"), dk(b"charlie")];
+        keys.sort();
+
+        // key0: 2-source overlap (wide). key1: s1 only. key2: s0 only, static row.
+        let s0k0 = Partition {
+            key: keys[0].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..40)
+                .map(|c| trow(c, format!("a{c}").as_bytes(), 1000))
+                .collect(),
+        };
+        let s1k0 = Partition {
+            key: keys[0].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..40)
+                .filter(|c| c % 2 == 0)
+                .map(|c| trow(c, format!("b{c}").as_bytes(), 2000))
+                .collect(),
+        };
+        let s1k1 = Partition {
+            key: keys[1].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..15)
+                .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .collect(),
+        };
+        let s0k2 = Partition {
+            key: keys[2].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: Some(Row {
+                clustering: vec![],
+                cells: vec![(0, ferrosa_common::CellValue::live(b"st".to_vec(), 9000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::NONE,
+            }),
+            rows: (0..10)
+                .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .collect(),
+        };
+
+        let whole = {
+            let mut r = vec![
+                ferrosa_storage::merge::merge_partitions(vec![s0k0.clone(), s1k0.clone()]),
+                s1k1.clone(),
+                s0k2.clone(),
+            ];
+            r.sort_by(|a, b| a.key.cmp(&b.key));
+            r
+        };
+        let mut s0 = [s0k0, s0k2];
+        s0.sort_by(|a, b| a.key.cmp(&b.key));
+        let s1 = [s1k0, s1k1]; // keys[0] < keys[1]
+
+        for k in [1usize, 3, 8] {
+            for limit in [1usize, 5, 1000] {
+                let reference: Vec<Partition> = whole
+                    .iter()
+                    .cloned()
+                    .map(|p| apply_row_limit(p, limit))
+                    .collect();
+                let frag = |ps: &[Partition]| -> Vec<Partition> {
+                    ps.iter().flat_map(|p| fragment_partition(p, k)).collect()
+                };
+                let capped = drive_merge_nway_capped(vec![frag(&s0), frag(&s1)], k, limit).await;
+                let merged = flatten(capped);
+                for p in &merged {
+                    assert!(
+                        p.rows.len() <= limit,
+                        "capped partition has {} rows > limit {limit}",
+                        p.rows.len()
+                    );
+                }
+                assert_eq!(
+                    merged, reference,
+                    "capped N-way merge(k={k},limit={limit}) diverged from whole-then-cap"
+                );
+            }
+        }
+    }
+
     /// RF=cluster_size: local replica owns every partition, so
     /// CL=ONE / LOCAL_ONE needs zero remote replicas. QUORUM needs
     /// floor(RF/2)+1 total responses → that count minus 1 (local)
@@ -2197,8 +2376,8 @@ mod tests {
             "multi-replica unbounded scans must stream through the token-aware N-way fragment merge, not materialize"
         );
         assert!(
-            body.contains("refusing to return a partial scan"),
-            "capped (row_limit>0) multi-replica scans must still fail loudly rather than return a partial/incorrect scan"
+            body.contains("apply_per_partition_row_limit"),
+            "capped (row_limit>0) multi-replica scans must stream a per-partition row cap over the N-way merge (no longer a loud refusal)"
         );
     }
 }
