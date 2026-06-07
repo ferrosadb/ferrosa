@@ -92,6 +92,29 @@ impl PagingState {
     }
 }
 
+/// Default page size applied to unbounded range/full scans when the client
+/// supplies no `page_size` on the wire.
+///
+/// Without this, a full-table `SELECT *` with no client page_size accumulates
+/// the entire result into the coordinator's `all_rows` buffer, which OOM-kills
+/// the coordinator on large tables. Bounding the page guarantees the scan
+/// returns at most this many rows per response with a continuation token.
+///
+/// Tunable via `FERROSA_CQL_DEFAULT_PAGE_SIZE`. A non-positive or unparseable
+/// value falls back to [`DEFAULT_SCAN_PAGE_SIZE`].
+pub const DEFAULT_SCAN_PAGE_SIZE: usize = 5_000;
+
+/// Resolve the default scan page size from the environment, falling back to
+/// [`DEFAULT_SCAN_PAGE_SIZE`]. The python driver's default `fetch_size` is
+/// 5000, so an unpaged client query gets the same effective bound.
+pub fn default_scan_page_size() -> usize {
+    std::env::var("FERROSA_CQL_DEFAULT_PAGE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SCAN_PAGE_SIZE)
+}
+
 /// Parameters for pagination extracted from the QUERY/EXECUTE frame.
 #[derive(Debug, Clone, Default)]
 pub struct PagingParams {

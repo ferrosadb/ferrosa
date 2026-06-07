@@ -896,6 +896,81 @@ impl ClusterCoordinator {
         .await
     }
 
+    /// Resume-capable streaming range scan with an inclusive lower-bound key.
+    ///
+    /// Backs `WritePath::range_read_stream_all_from` (the coordinator-side
+    /// paging cursor). Only the local-only fan-out shape (CL=ONE with the
+    /// keyspace RF spanning the ring, i.e. no remote replica must be consulted)
+    /// is supported; any shape requiring a cross-replica merge is refused
+    /// rather than returning a partial scan, matching the unbounded scan guard.
+    pub async fn coordinate_range_read_stream_from(
+        &self,
+        table_id: &TableId,
+        start: Option<&ferrosa_common::key::DecoratedKey>,
+        cl: crate::consistency::ConsistencyLevel,
+        replication_factor: usize,
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        let ring = self.ring.load();
+        let node_ids = ring.node_ids();
+        let node_count = node_ids.len();
+        let all_remotes_len = node_ids
+            .iter()
+            .filter(|&&id| id != self.local_node_id)
+            .count();
+        drop(ring);
+
+        let cl_remote_count =
+            remote_count_for_cl(cl, replication_factor, node_count, all_remotes_len);
+
+        if cl_remote_count > 0 {
+            return Err(ClusterError::Internal(
+                "paged cluster range scan with a resume key requires token-aware k-way stream merge across replicas; refusing to return a partial scan".into(),
+            ));
+        }
+
+        Ok(Box::pin(
+            self.storage
+                .range_iter_fragmented(table_id, start, None)
+                .map(|item| item.map_err(ClusterError::Storage)),
+        ))
+    }
+
+    /// Projection-aware resume-capable streaming range scan. See
+    /// [`Self::coordinate_range_read_stream_from`]; refuses any cross-replica
+    /// shape.
+    pub async fn coordinate_range_read_projected_stream_from(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        start: Option<&ferrosa_common::key::DecoratedKey>,
+        cl: crate::consistency::ConsistencyLevel,
+        replication_factor: usize,
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        let ring = self.ring.load();
+        let node_ids = ring.node_ids();
+        let node_count = node_ids.len();
+        let all_remotes_len = node_ids
+            .iter()
+            .filter(|&&id| id != self.local_node_id)
+            .count();
+        drop(ring);
+
+        let cl_remote_count =
+            remote_count_for_cl(cl, replication_factor, node_count, all_remotes_len);
+
+        if cl_remote_count > 0 {
+            return Err(ClusterError::Internal(
+                "paged projected cluster range scan with a resume key requires token-aware k-way stream merge across replicas; refusing to return a partial scan".into(),
+            ));
+        }
+
+        Ok(Box::pin(
+            self.storage
+                .range_iter_projected_fragmented(table_id, wanted, start, None)
+                .map(|item| item.map_err(ClusterError::Storage)),
+        ))
+    }
+
     async fn coordinate_range_read_stream_all_with_projection(
         &self,
         table_id: &TableId,

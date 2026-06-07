@@ -44,6 +44,34 @@ fn local_range_stream(
     Box::pin(stream)
 }
 
+/// Fragmented (intra-partition streaming) range stream with an optional
+/// inclusive lower-bound key. Used by the coordinator-side paging cursor to
+/// resume an unbounded `SELECT *` scan at the last partition key without
+/// materializing the whole table. `row_limit == 0` (the unbounded scan shape)
+/// is the only caller, so wide partitions stream as bounded fragments.
+fn local_range_stream_from(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    start: Option<&DecoratedKey>,
+) -> PartitionResultStream {
+    let stream = engine
+        .range_iter_fragmented(table_id, start, None)
+        .map(|item| item.map_err(crate::error::ClusterError::Storage));
+    Box::pin(stream)
+}
+
+fn local_projected_range_stream_from(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    wanted: Vec<u16>,
+    start: Option<&DecoratedKey>,
+) -> PartitionResultStream {
+    let stream = engine
+        .range_iter_projected_fragmented(table_id, wanted, start, None)
+        .map(|item| item.map_err(crate::error::ClusterError::Storage));
+    Box::pin(stream)
+}
+
 fn local_projected_range_stream(
     engine: Arc<StorageEngine>,
     table_id: &TableId,
@@ -381,6 +409,100 @@ impl WritePath {
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "range read unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
+    /// Stream every partition starting at an inclusive lower-bound key, using
+    /// the fragmented (intra-partition streaming) iterators.
+    ///
+    /// This backs the coordinator-side paging cursor for unbounded `SELECT *`
+    /// scans: the previous page's continuation token is decoded into a `start`
+    /// key, the scan resumes there, and the consumer drops rows already emitted
+    /// within that partition. `start == None` is the first page.
+    ///
+    /// In cluster mode this requires the local-only fan-out (CL=ONE with the
+    /// keyspace RF spanning the ring); multi-replica token-aware merge with a
+    /// resume key is not yet implemented and is refused rather than returning a
+    /// partial scan.
+    pub async fn range_read_stream_all_from(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<PartitionResultStream> {
+        match self {
+            Self::Direct(engine) => Ok(local_range_stream_from(engine.clone(), table_id, start)),
+            Self::Pair(coordinator) => Ok(local_range_stream_from(
+                coordinator.local_storage().clone(),
+                table_id,
+                start,
+            )),
+            Self::Cluster(coordinator) => {
+                if !coordinator.streaming_range_reads {
+                    return Err(crate::error::ClusterError::Internal(
+                        "uncapped range_read is unavailable because FERROSA_BULK_STREAMING_RANGE_READ=0 selected the legacy capped range RPC; refusing to return a partial scan".into(),
+                    ));
+                }
+                coordinator
+                    .coordinate_range_read_stream_from(
+                        table_id,
+                        start,
+                        cl,
+                        strategy.replication_factor(),
+                    )
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range read unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
+    /// Projection-aware resume-capable streaming range read with an inclusive
+    /// lower-bound key. Mirrors [`Self::range_read_stream_all_from`] for the
+    /// `SELECT col1, col2 FROM t` (no WHERE) paged scan shape, byte-skipping
+    /// unprojected cells in the SSTable layer.
+    pub async fn range_read_projected_stream_all_from(
+        &self,
+        table_id: &TableId,
+        wanted: Vec<u16>,
+        start: Option<&DecoratedKey>,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<PartitionResultStream> {
+        match self {
+            Self::Direct(engine) => Ok(local_projected_range_stream_from(
+                engine.clone(),
+                table_id,
+                wanted,
+                start,
+            )),
+            Self::Pair(coordinator) => Ok(local_projected_range_stream_from(
+                coordinator.local_storage().clone(),
+                table_id,
+                wanted,
+                start,
+            )),
+            Self::Cluster(coordinator) => {
+                if !coordinator.streaming_range_reads {
+                    return Err(crate::error::ClusterError::Internal(
+                        "uncapped range_read is unavailable because FERROSA_BULK_STREAMING_RANGE_READ=0 selected the legacy capped range RPC; refusing to return a partial scan".into(),
+                    ));
+                }
+                coordinator
+                    .coordinate_range_read_projected_stream_from(
+                        table_id,
+                        wanted,
+                        start,
+                        cl,
+                        strategy.replication_factor(),
+                    )
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range_read_projected unavailable: write path is in degraded mode".into(),
             )),
         }
     }

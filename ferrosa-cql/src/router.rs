@@ -622,6 +622,134 @@ async fn extend_rows_from_partition_stream(
     Ok(())
 }
 
+/// Resume cursor decoded from the wire `paging_state` for a streaming scan.
+///
+/// `partition_key` / `clustering_key` are the raw serialized bytes of the last
+/// row returned on the previous page. Resume re-enters the scan at the last
+/// partition key (inclusive) and skips every row in that partition whose
+/// clustering bytes are `<= clustering_key`, so an exactly-once continuation
+/// holds whether the previous page ended on a partition boundary or mid-way
+/// through a wide partition.
+struct StreamResumeCursor {
+    partition_key: Vec<u8>,
+    clustering_key: Vec<u8>,
+}
+
+impl StreamResumeCursor {
+    fn from_paging_state(paging_state: Option<&[u8]>) -> Result<Option<Self>, CqlError> {
+        match paging_state {
+            None => Ok(None),
+            Some(bytes) => {
+                let state = crate::paging::PagingState::decode(bytes)?;
+                Ok(Some(Self {
+                    partition_key: state.partition_key,
+                    clustering_key: state.clustering_key,
+                }))
+            }
+        }
+    }
+}
+
+/// One bounded page collected from a partition stream.
+struct StreamedPage {
+    rows: Vec<Vec<Option<CqlValue>>>,
+    /// Continuation token for the next page, `None` when the scan is exhausted.
+    next_paging_state: Option<Vec<u8>>,
+}
+
+/// Collect at most `page_size` rows from a partition stream, encoding a
+/// `PagingState` continuation when more rows remain.
+///
+/// This is the coordinator-side OOM bound for unbounded `SELECT *`-shaped
+/// scans: the stream is fragmented (intra-partition streaming), so the
+/// producer holds `O(num_sources + K)` rows resident, and this consumer never
+/// retains more than `page_size` output rows. The previous behavior buffered
+/// the entire table into `all_rows` before returning.
+///
+/// Correctness: partitions arrive in token order and rows in clustering order.
+/// `resume` re-enters at the last partition key (inclusive) and drops rows
+/// already emitted (`clustering <= resume.clustering_key` within that key), so
+/// the union of all pages equals the whole scan with no gaps or duplicates,
+/// including a wide partition that spans pages.
+async fn collect_page_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    page_size: usize,
+    resume: Option<StreamResumeCursor>,
+    row_context: PartitionRowContext<'_>,
+) -> Result<StreamedPage, CqlError> {
+    debug_assert!(page_size > 0, "page_size must be positive");
+
+    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(page_size);
+    // Cursor bytes for the most recently accepted row.
+    let mut last_pk: Vec<u8> = Vec::new();
+    let mut last_ck: Vec<u8> = Vec::new();
+    // Set once we have a full page and then observe one more row — that extra
+    // row proves a continuation is needed.
+    let mut more_rows_remain = false;
+    let mut processed_partitions = 0usize;
+
+    'outer: while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let pk_bytes = partition.key.key.as_bytes().to_vec();
+        let paired = bridge::partition_to_rows_with_clustering(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        );
+
+        for (clustering, output_row) in paired {
+            // Skip rows already returned on a previous page. Only applies to
+            // the partition the cursor stopped in; once we pass it (or land in
+            // a later partition), nothing is skipped.
+            if let Some(ref cur) = resume {
+                if pk_bytes == cur.partition_key && clustering <= cur.clustering_key {
+                    continue;
+                }
+            }
+
+            if rows.len() == page_size {
+                // We already have a full page and just found another row — a
+                // continuation is required. Stop without consuming further.
+                more_rows_remain = true;
+                break 'outer;
+            }
+
+            rows.push(output_row);
+            last_pk = pk_bytes.clone();
+            last_ck = clustering;
+        }
+
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let next_paging_state = if more_rows_remain {
+        Some(
+            crate::paging::PagingState {
+                partition_key: last_pk,
+                clustering_key: last_ck,
+                remaining_in_partition: false,
+            }
+            .encode(),
+        )
+    } else {
+        None
+    };
+
+    Ok(StreamedPage {
+        rows,
+        next_paging_state,
+    })
+}
+
 fn storage_to_table_indices(table_meta: &TableMetadata) -> Vec<usize> {
     let mut pairs: Vec<(u16, usize)> = table_meta
         .columns
@@ -2689,6 +2817,12 @@ async fn route_select_user_table(
         });
     }
 
+    // Set by the streaming full-scan page path when it has already applied
+    // page bounds + the continuation cursor. `Some(state)` (which may itself be
+    // `None` for the final page) means the generic `apply_pagination` tail must
+    // be skipped — the rows are already exactly one bounded page.
+    let mut streamed_paging_state: Option<Option<Vec<u8>>> = None;
+
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
         let pk_types: Vec<CqlType> = table_meta
@@ -3090,18 +3224,113 @@ async fn route_select_user_table(
                     ));
                 }
 
-                // Use a bounded upstream partition cap for unordered,
-                // non-aggregate scans so first pages do not wait behind an
-                // unbounded table materialization. When ALLOW FILTERING has
-                // post-filter predicates, no upstream partition cap is safe:
-                // LIMIT 1 may need to inspect many non-matching partitions
-                // before finding the first matching row, and a fixed cap would
-                // silently drop later matches. In that shape, stream the full
-                // table and apply LIMIT/page semantics after filtering.
-                // Ordered and aggregate queries still materialize their scan
-                // window before sorting/counting.
-                let scan_bound =
-                    if s.order_by.is_empty() && s.ann_of.is_none() && !count_only_select {
+                // Coordinator-side OOM bound (P0): an unbounded full-table scan
+                // with no WHERE/ORDER BY/ANN/DISTINCT/LIMIT used to accumulate
+                // the ENTIRE result into `all_rows` before returning, OOM-killing
+                // the coordinator on large tables. Stream at most one bounded
+                // page instead and return a `PagingState` continuation. A
+                // default page applies when the client sends no `page_size`, so
+                // even an un-paged `SELECT *` cannot accumulate unbounded rows.
+                //
+                // Other shapes (predicates, ORDER BY, ANN, DISTINCT, LIMIT,
+                // COUNT) keep their existing materialize-bounded behavior, where
+                // the scan window is already bounded by LIMIT/sort/count needs.
+                // Exclude any function-call projection: aggregates
+                // (COUNT/AVG/MIN/MAX/SUM) and UDAs fold over the WHOLE result,
+                // so paging the scan would compute them over a single page.
+                // Scalar UDFs/toJson are per-row and safe, but excluding all
+                // function calls keeps the streaming gate to plain column/star
+                // projections — exactly the unbounded `SELECT *` OOM shape.
+                let has_function_projection = s
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
+                let unbounded_scan_shape = s.where_clauses.is_empty()
+                    && s.order_by.is_empty()
+                    && s.ann_of.is_none()
+                    && !s.distinct
+                    && s.limit.is_none()
+                    && !count_only_select
+                    && !has_function_projection;
+                if unbounded_scan_shape {
+                    let page_size = ctx
+                        .paging
+                        .page_size
+                        .and_then(|ps| (ps > 0).then_some(ps as usize))
+                        .unwrap_or_else(crate::paging::default_scan_page_size);
+
+                    let resume =
+                        StreamResumeCursor::from_paging_state(ctx.paging.paging_state.as_deref())?;
+                    // Resume the scan at the last partition key (inclusive); the
+                    // collector drops rows already emitted within that key.
+                    let start_key = resume.as_ref().map(|cur| {
+                        ferrosa_common::key::DecoratedKey::new(
+                            ferrosa_common::key::PartitionKey::from(cur.partition_key.as_slice()),
+                        )
+                    });
+
+                    // The gate above guarantees `where_clauses.is_empty()`, so a
+                    // column projection is always safe here (no predicate reads
+                    // an unprojected cell).
+                    let scan_projection =
+                        projection_storage_ordinals_for_select_scan(s, table_meta);
+
+                    let stream = if let Some(wanted) = scan_projection {
+                        state
+                            .write_path
+                            .load()
+                            .range_read_projected_stream_all_from(
+                                &table_id,
+                                wanted,
+                                start_key.as_ref(),
+                                ctx.consistency,
+                                &table_strategy,
+                            )
+                            .await?
+                    } else {
+                        state
+                            .write_path
+                            .load()
+                            .range_read_stream_all_from(
+                                &table_id,
+                                start_key.as_ref(),
+                                ctx.consistency,
+                                &table_strategy,
+                            )
+                            .await?
+                    };
+
+                    let page = collect_page_from_partition_stream(
+                        stream,
+                        page_size,
+                        resume,
+                        PartitionRowContext {
+                            all_col_names: &all_col_names,
+                            all_col_types: &all_col_types,
+                            pk_indices: &pk_indices,
+                            ck_indices: &ck_indices,
+                            storage_to_table: &storage_to_table,
+                        },
+                    )
+                    .await?;
+
+                    streamed_paging_state = Some(page.next_paging_state);
+                    page.rows
+                } else {
+                    // Use a bounded upstream partition cap for unordered,
+                    // non-aggregate scans so first pages do not wait behind an
+                    // unbounded table materialization. When ALLOW FILTERING has
+                    // post-filter predicates, no upstream partition cap is safe:
+                    // LIMIT 1 may need to inspect many non-matching partitions
+                    // before finding the first matching row, and a fixed cap would
+                    // silently drop later matches. In that shape, stream the full
+                    // table and apply LIMIT/page semantics after filtering.
+                    // Ordered and aggregate queries still materialize their scan
+                    // window before sorting/counting.
+                    let scan_bound = if s.order_by.is_empty()
+                        && s.ann_of.is_none()
+                        && !count_only_select
+                    {
                         let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
                         if has_post_filter {
                             None
@@ -3139,95 +3368,133 @@ async fn route_select_user_table(
                     } else {
                         None
                     };
-                let row_limit =
-                    safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
-                        .unwrap_or(0);
-                // ADR-020 projection fast path. Route through
-                // range_read_projected whenever the query only needs a subset
-                // of regular cells, so the SSTable layer byte-skips bulky
-                // unneeded payloads. Big win on wide tables with bulky cells
-                // (e.g. entity_store's entity_embedding column).
-                //
-                // Non-count SELECT requires no WHERE because predicates over
-                // unprojected regular columns would evaluate against NULL.
-                let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
-                    projection_storage_ordinals_for_select_scan(s, table_meta)
-                } else {
-                    None
-                };
-                // Count-only filtered scans project predicate columns only and
-                // fold over a partition stream, so COUNT(*) avoids decoding
-                // unrelated cells without first collecting partitions in a Vec.
-                let count_projection_wanted = if count_only_select {
-                    projection_storage_ordinals_for_count_predicates(&s.where_clauses, table_meta)
-                } else {
-                    None
-                };
-                let partitions = if let Some(wanted) = projection_wanted {
-                    // Push partition-count cap down to the merger so
-                    // `LIMIT N` stops the scan after N partitions
-                    // rather than walking every SSTable.
-                    Some(
-                        state
-                            .write_path
-                            .load()
-                            .range_read_projected(&table_id, wanted, scan_bound)
-                            .await?,
-                    )
-                } else if let Some(bound) = scan_bound {
-                    Some(
-                        state
-                            .write_path
-                            .load()
-                            .range_read_limited_rows(&table_id, bound, row_limit)
-                            .await?,
-                    )
-                } else if row_limit > 0 {
-                    Some(
-                        state
-                            .write_path
-                            .load()
-                            .range_read_limited_rows(
-                                &table_id,
-                                ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
-                                row_limit,
-                            )
-                            .await?,
-                    )
-                } else {
-                    None
-                };
-                if count_only_select {
-                    let row_context = PartitionRowContext {
-                        all_col_names: &all_col_names,
-                        all_col_types: &all_col_types,
-                        pk_indices: &pk_indices,
-                        ck_indices: &ck_indices,
-                        storage_to_table: &storage_to_table,
+                    let row_limit =
+                        safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
+                            .unwrap_or(0);
+                    // ADR-020 projection fast path. Route through
+                    // range_read_projected whenever the query only needs a subset
+                    // of regular cells, so the SSTable layer byte-skips bulky
+                    // unneeded payloads. Big win on wide tables with bulky cells
+                    // (e.g. entity_store's entity_embedding column).
+                    //
+                    // Non-count SELECT requires no WHERE because predicates over
+                    // unprojected regular columns would evaluate against NULL.
+                    let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
+                        projection_storage_ordinals_for_select_scan(s, table_meta)
+                    } else {
+                        None
                     };
-                    let predicate_context = SelectPredicateContext {
-                        statement: s,
-                        table_meta,
-                        keyspace: ks,
-                        state,
+                    // Count-only filtered scans project predicate columns only and
+                    // fold over a partition stream, so COUNT(*) avoids decoding
+                    // unrelated cells without first collecting partitions in a Vec.
+                    let count_projection_wanted = if count_only_select {
+                        projection_storage_ordinals_for_count_predicates(
+                            &s.where_clauses,
+                            table_meta,
+                        )
+                    } else {
+                        None
                     };
-                    let count = if let Some(partitions) = partitions.as_ref() {
-                        count_rows_from_partitions(partitions, row_context, predicate_context)
-                            .await?
-                    } else if let Some(wanted) = count_projection_wanted {
-                        let stream = state
-                            .write_path
-                            .load()
-                            .range_read_projected_stream_all_with(
-                                &table_id,
-                                wanted,
-                                scan_bound,
-                                ctx.consistency,
-                                &table_strategy,
-                            )
-                            .await?;
-                        count_rows_from_partition_stream(stream, row_context, predicate_context)
-                            .await?
+                    let partitions = if let Some(wanted) = projection_wanted {
+                        // Push partition-count cap down to the merger so
+                        // `LIMIT N` stops the scan after N partitions
+                        // rather than walking every SSTable.
+                        Some(
+                            state
+                                .write_path
+                                .load()
+                                .range_read_projected(&table_id, wanted, scan_bound)
+                                .await?,
+                        )
+                    } else if let Some(bound) = scan_bound {
+                        Some(
+                            state
+                                .write_path
+                                .load()
+                                .range_read_limited_rows(&table_id, bound, row_limit)
+                                .await?,
+                        )
+                    } else if row_limit > 0 {
+                        Some(
+                            state
+                                .write_path
+                                .load()
+                                .range_read_limited_rows(
+                                    &table_id,
+                                    ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
+                                    row_limit,
+                                )
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    if count_only_select {
+                        let row_context = PartitionRowContext {
+                            all_col_names: &all_col_names,
+                            all_col_types: &all_col_types,
+                            pk_indices: &pk_indices,
+                            ck_indices: &ck_indices,
+                            storage_to_table: &storage_to_table,
+                        };
+                        let predicate_context = SelectPredicateContext {
+                            statement: s,
+                            table_meta,
+                            keyspace: ks,
+                            state,
+                        };
+                        let count = if let Some(partitions) = partitions.as_ref() {
+                            count_rows_from_partitions(partitions, row_context, predicate_context)
+                                .await?
+                        } else if let Some(wanted) = count_projection_wanted {
+                            let stream = state
+                                .write_path
+                                .load()
+                                .range_read_projected_stream_all_with(
+                                    &table_id,
+                                    wanted,
+                                    scan_bound,
+                                    ctx.consistency,
+                                    &table_strategy,
+                                )
+                                .await?;
+                            count_rows_from_partition_stream(stream, row_context, predicate_context)
+                                .await?
+                        } else {
+                            let stream = state
+                                .write_path
+                                .load()
+                                .range_read_stream_all_with(
+                                    &table_id,
+                                    row_limit,
+                                    ctx.consistency,
+                                    &table_strategy,
+                                )
+                                .await?;
+                            count_rows_from_partition_stream(stream, row_context, predicate_context)
+                                .await?
+                        };
+                        return Ok(SelectRawResult {
+                            column_names: col_names.to_vec(),
+                            column_types: col_types.to_vec(),
+                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                            keyspace: ks.to_string(),
+                            table: s.table.clone(),
+                            paging_state: None,
+                        });
+                    }
+                    let mut all_rows = Vec::new();
+                    if let Some(partitions) = partitions.as_ref() {
+                        extend_rows_from_partitions(
+                            partitions,
+                            &mut all_rows,
+                            &all_col_names,
+                            &all_col_types,
+                            &pk_indices,
+                            &ck_indices,
+                            &storage_to_table,
+                        )
+                        .await;
                     } else {
                         let stream = state
                             .write_path
@@ -3239,62 +3506,28 @@ async fn route_select_user_table(
                                 &table_strategy,
                             )
                             .await?;
-                        count_rows_from_partition_stream(stream, row_context, predicate_context)
-                            .await?
-                    };
-                    return Ok(SelectRawResult {
-                        column_names: col_names.to_vec(),
-                        column_types: col_types.to_vec(),
-                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                        keyspace: ks.to_string(),
-                        table: s.table.clone(),
-                        paging_state: None,
-                    });
-                }
-                let mut all_rows = Vec::new();
-                if let Some(partitions) = partitions.as_ref() {
-                    extend_rows_from_partitions(
-                        partitions,
-                        &mut all_rows,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                        &storage_to_table,
-                    )
-                    .await;
-                } else {
-                    let stream = state
-                        .write_path
-                        .load()
-                        .range_read_stream_all_with(
-                            &table_id,
-                            row_limit,
-                            ctx.consistency,
-                            &table_strategy,
+                        extend_rows_from_partition_stream(
+                            stream,
+                            &mut all_rows,
+                            &all_col_names,
+                            &all_col_types,
+                            &pk_indices,
+                            &ck_indices,
+                            &storage_to_table,
                         )
                         .await?;
-                    extend_rows_from_partition_stream(
-                        stream,
+                    }
+                    filter_rows_by_select_predicates(
                         &mut all_rows,
+                        s,
                         &all_col_names,
                         &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                        &storage_to_table,
-                    )
-                    .await?;
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+                    all_rows
                 }
-                filter_rows_by_select_predicates(
-                    &mut all_rows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-                all_rows
             }
         }
     };
@@ -3544,23 +3777,33 @@ async fn route_select_user_table(
         (None, _) => None,
     };
 
-    let paged = crate::paging::apply_pagination(
-        limited.len(),
-        effective_page_size,
-        ctx.paging.paging_state.as_deref(),
-    )?;
-
-    let page_rows = &limited[paged.start..paged.end];
+    // When the streaming full-scan page path already produced exactly one
+    // bounded page and its cursor, skip the generic offset-based pagination:
+    // the rows ARE the page and the continuation is the stream cursor.
+    let (page_rows, next_paging_state): (Vec<Vec<Option<CqlValue>>>, Option<Vec<u8>>) =
+        if let Some(stream_cursor) = streamed_paging_state {
+            (limited.to_vec(), stream_cursor)
+        } else {
+            let paged = crate::paging::apply_pagination(
+                limited.len(),
+                effective_page_size,
+                ctx.paging.paging_state.as_deref(),
+            )?;
+            (
+                limited[paged.start..paged.end].to_vec(),
+                paged.next_paging_state,
+            )
+        };
 
     // Return raw result; callers that need an encoded frame call .encode()
     // or result::encode_rows_paged directly. Delta subscriptions use the raw rows.
     Ok(SelectRawResult {
         column_names: col_names.to_vec(),
         column_types: col_types.to_vec(),
-        rows: page_rows.to_vec(),
+        rows: page_rows,
         keyspace: ks.to_string(),
         table: s.table.clone(),
-        paging_state: paged.next_paging_state,
+        paging_state: next_paging_state,
     })
 }
 
@@ -18128,6 +18371,264 @@ mod tests {
         assert!(
             planner_fallback.contains("range_read_with(&table_id, ctx.consistency, &table_strategy)"),
             "planner fallback range reads must carry request consistency and keyspace replication strategy"
+        );
+    }
+
+    // ── Coordinator-side range-scan paging / OOM bound ────────────────────
+    //
+    // These tests pin the coordinator-side behavior that a full-table scan
+    // streams at most one bounded page and returns a `next_paging_state`
+    // continuation, rather than accumulating the entire result into
+    // `all_rows`. The bound must hold even when the client sends no
+    // `page_size` (a sane default applies), and paged traversal must equal
+    // the whole-scan result with no skipped or duplicated rows — including
+    // when a single wide partition spans multiple pages.
+
+    async fn run_ddl(state: &SharedState, ctx: &RequestContext<'_>, cql: &str) {
+        route(state, ctx, crate::parser::parse(cql).unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("DDL failed [{cql}]: {e}"));
+    }
+
+    fn paging_ctx<'a>(
+        auth: &'a AuthContext,
+        ks: &'a Option<String>,
+        page_size: Option<i32>,
+        paging_state: Option<Vec<u8>>,
+    ) -> RequestContext<'a> {
+        RequestContext {
+            auth,
+            current_keyspace: ks,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams {
+                page_size,
+                paging_state,
+            },
+            client_address: String::new(),
+        }
+    }
+
+    /// Walk every page of `select_cql` with the given `page_size` (None means
+    /// the client sent no page_size at all) and return the concatenated rows
+    /// in page order plus the number of pages observed.
+    async fn collect_all_pages(
+        state: &SharedState,
+        auth: &AuthContext,
+        ks: &Option<String>,
+        select_cql: &str,
+        page_size: Option<i32>,
+    ) -> (Vec<Vec<Option<CqlValue>>>, usize) {
+        let select = match crate::parser::parse(select_cql).unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let mut collected: Vec<Vec<Option<CqlValue>>> = Vec::new();
+        let mut paging_state: Option<Vec<u8>> = None;
+        let mut pages = 0usize;
+        // Hard cap so a broken cursor can never loop forever in tests.
+        for _ in 0..100_000 {
+            let ctx = paging_ctx(auth, ks, page_size, paging_state.clone());
+            let res = route_select_raw(state, &ctx, &select).await.unwrap();
+            if let Some(ps) = page_size {
+                if ps > 0 {
+                    assert!(
+                        res.rows.len() <= ps as usize,
+                        "page returned {} rows, exceeds page_size {ps}",
+                        res.rows.len()
+                    );
+                }
+            }
+            let empty_page = res.rows.is_empty();
+            collected.extend(res.rows);
+            if !empty_page {
+                pages += 1;
+            }
+            match res.paging_state {
+                Some(ns) => paging_state = Some(ns),
+                None => return (collected, pages),
+            }
+        }
+        panic!("paging did not terminate within 100k pages — cursor is not advancing");
+    }
+
+    /// Setup: keyspace + a narrow-partition table with `n` rows (id is the PK).
+    async fn setup_wide_scan_table(n: i64) -> (SharedState, TempDir, AuthContext, Option<String>) {
+        let (state, dir) = setup();
+        let auth = dev_auth();
+        let ks = Some("pageks".to_string());
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE KEYSPACE pageks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        )
+        .await;
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE TABLE pageks.t (id int PRIMARY KEY, v int)",
+        )
+        .await;
+        for i in 0..n {
+            run_ddl(
+                &state,
+                &ctx,
+                &format!("INSERT INTO pageks.t (id, v) VALUES ({i}, {})", i * 10),
+            )
+            .await;
+        }
+        (state, dir, auth, ks)
+    }
+
+    #[tokio::test]
+    async fn range_scan_first_page_is_bounded_by_page_size() {
+        // N >> page_size. First page must return exactly page_size rows and a
+        // non-None continuation. Fail-before: the scan accumulated all N rows.
+        let n = 5_000;
+        let page_size = 200;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let select = match crate::parser::parse("SELECT * FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, Some(page_size), None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert_eq!(
+            res.rows.len(),
+            page_size as usize,
+            "first page must return exactly page_size rows, not the whole table"
+        );
+        assert!(
+            res.paging_state.is_some(),
+            "a scan with more rows than page_size must return a continuation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_scan_paged_traversal_equals_whole_scan_no_gaps_or_dupes() {
+        // Paged traversal (page_size << N) must equal the unpaged scan exactly,
+        // in order, with no gaps and no duplicates.
+        let n = 3_000;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // Whole scan in one shot (no paging).
+        let (whole, _) =
+            collect_all_pages(&state, &auth, &ks, "SELECT * FROM pageks.t", None).await;
+        // Sort by id so we compare row sets independent of token order.
+        let mut whole_sorted = whole.clone();
+        whole_sorted.sort_by(|a, b| a[0].cmp(&b[0]));
+        assert_eq!(
+            whole_sorted.len(),
+            n as usize,
+            "whole scan must see every row"
+        );
+
+        let (paged, pages) =
+            collect_all_pages(&state, &auth, &ks, "SELECT * FROM pageks.t", Some(137)).await;
+        assert!(pages > 1, "expected multiple pages, got {pages}");
+
+        let mut paged_sorted = paged.clone();
+        paged_sorted.sort_by(|a, b| a[0].cmp(&b[0]));
+
+        assert_eq!(
+            paged_sorted.len(),
+            whole_sorted.len(),
+            "paged traversal must yield the same row count as the whole scan"
+        );
+        assert_eq!(
+            paged_sorted, whole_sorted,
+            "paged union must equal the whole scan byte-for-byte (no gaps, no dupes)"
+        );
+
+        // Explicit duplicate check on the partition key.
+        let mut ids: Vec<_> = paged.iter().map(|r| r[0].clone()).collect();
+        ids.sort();
+        let unique = {
+            let mut u = ids.clone();
+            u.dedup();
+            u.len()
+        };
+        assert_eq!(unique, ids.len(), "paged traversal emitted duplicate rows");
+    }
+
+    #[tokio::test]
+    async fn range_scan_with_no_page_size_applies_default_bounded_page() {
+        // A SELECT with NO client page_size must still return a bounded first
+        // page plus a continuation rather than pulling the whole table.
+        // Fail-before: with no page_size, the scan returned every row.
+        let default = crate::paging::default_scan_page_size();
+        let n = (default as i64) * 2 + 17; // safely exceeds one default page
+
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+        let select = match crate::parser::parse("SELECT * FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert!(
+            res.rows.len() <= default,
+            "no-page-size scan returned {} rows, exceeds default page {default}",
+            res.rows.len()
+        );
+        assert!(
+            res.paging_state.is_some(),
+            "no-page-size scan over a large table must return a continuation token"
+        );
+
+        // And the full paged traversal (default page applied each call) still
+        // returns every row exactly once.
+        let (paged, _) =
+            collect_all_pages(&state, &auth, &ks, "SELECT * FROM pageks.t", None).await;
+        let mut ids: Vec<_> = paged.iter().map(|r| r[0].clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            n as usize,
+            "default-paged traversal must still visit every row exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_query_unaffected_by_default_paging() {
+        // LIMIT N must still cap the result and not be silently re-paged into
+        // multiple pages when the client did not request paging.
+        let n = 1_000;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+        let select = match crate::parser::parse("SELECT * FROM pageks.t LIMIT 5").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(res.rows.len(), 5, "LIMIT 5 must return exactly 5 rows");
+        assert!(
+            res.paging_state.is_none(),
+            "a LIMIT smaller than the default page must not return a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_read_unaffected_by_paging() {
+        // PK-equality (point read) must behave unchanged with default paging.
+        let n = 100;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+        let select = match crate::parser::parse("SELECT * FROM pageks.t WHERE id = 42").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(res.rows.len(), 1, "point read must return exactly one row");
+        assert_eq!(res.rows[0][0], Some(CqlValue::Int(42)));
+        assert!(
+            res.paging_state.is_none(),
+            "point read needs no continuation"
         );
     }
 }
