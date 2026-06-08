@@ -88,6 +88,7 @@ pub trait StreamRangeReader: Send + Sync {
         &'a self,
         table_id: &TableId,
         projected_regular_ordinals: Option<&'a [u16]>,
+        start: Option<&'a ferrosa_common::key::DecoratedKey>,
     ) -> ferrosa_common::Result<PartitionStream<'a>>;
 }
 
@@ -96,6 +97,7 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
         &'a self,
         table_id: &TableId,
         projected_regular_ordinals: Option<&'a [u16]>,
+        start: Option<&'a ferrosa_common::key::DecoratedKey>,
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
         // ADR-020 Phase 2 backing: the FRAGMENTED range iterators back the
         // replica stream. They k-way merge across memtable + flushing
@@ -114,7 +116,7 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
                     self.as_ref(),
                     table_id,
                     wanted.to_vec(),
-                    None,
+                    start,
                     None,
                 ),
             )
@@ -122,7 +124,7 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
             Ok(ferrosa_storage::StorageEngine::range_iter_fragmented(
                 self.as_ref(),
                 table_id,
-                None,
+                start,
                 None,
             ))
         }
@@ -163,9 +165,23 @@ pub async fn handle_stream_request_with_cancel<R, S>(
 
     let table_id = TableId::new(&req.keyspace, &req.table);
 
+    // Inclusive lower-bound key for a resumed page (`None` on the first page).
+    // Rebuild the DecoratedKey from the raw partition-key bytes so the remote
+    // replica starts its fragmented iterator at the same token+key the
+    // coordinator's resume cursor encodes.
+    let start_key = req.start_key.as_ref().map(|bytes| {
+        ferrosa_common::key::DecoratedKey::new(ferrosa_common::key::PartitionKey::from(
+            bytes.as_slice(),
+        ))
+    });
+
     // Open the lazy partition stream. Errors here are open-time
     // (table not found, etc.) — emit a truncated Done and bail.
-    let mut stream = match reader.range_iter(&table_id, req.projected_regular_ordinals.as_deref()) {
+    let mut stream = match reader.range_iter(
+        &table_id,
+        req.projected_regular_ordinals.as_deref(),
+        start_key.as_ref(),
+    ) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -482,6 +498,7 @@ mod tests {
             keyspace: "ks".into(),
             table: "tbl".into(),
             projected_regular_ordinals: None,
+            start_key: None,
         }
     }
 
@@ -495,11 +512,52 @@ mod tests {
             &'a self,
             _table_id: &TableId,
             _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             let items: Vec<ferrosa_common::Result<Partition>> =
                 self.partitions.iter().cloned().map(Ok).collect();
             Ok(Box::pin(futures::stream::iter(items)))
         }
+    }
+
+    /// Test reader that records the `start` key passed to `range_iter`, so the
+    /// handler's `start_key` → `DecoratedKey` plumbing can be asserted.
+    struct StartCapturingReader {
+        captured: Arc<Mutex<Option<Option<Vec<u8>>>>>,
+    }
+    impl StreamRangeReader for StartCapturingReader {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
+            start: Option<&'a ferrosa_common::key::DecoratedKey>,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            *self.captured.lock().unwrap() = Some(start.map(|k| k.key.as_bytes().to_vec()));
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    /// The wire `start_key` must reach the storage reader as the inclusive
+    /// `DecoratedKey` lower bound, so a resumed multi-replica page does not
+    /// re-stream the already-emitted prefix at each replica.
+    #[tokio::test]
+    async fn handler_forwards_start_key_to_reader() {
+        let captured = Arc::new(Mutex::new(None));
+        let reader = Arc::new(StartCapturingReader {
+            captured: captured.clone(),
+        });
+        let sink = VecSink::new();
+        let mut request = req(99);
+        request.start_key = Some(b"resume-key".to_vec());
+
+        handle_stream_request(request, reader, &sink, 4).await;
+
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            Some(Some(b"resume-key".to_vec())),
+            "handler must forward the wire start_key to the reader as the range lower bound"
+        );
     }
 
     /// Test reader that always fails at open time — exercises the
@@ -510,6 +568,7 @@ mod tests {
             &'a self,
             _table_id: &TableId,
             _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             Err(ferrosa_common::Error::InvalidData("simulated".into()))
         }
@@ -521,6 +580,7 @@ mod tests {
             &'a self,
             _table_id: &TableId,
             _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             let items = vec![
                 Ok(make_partition(1)),
@@ -733,6 +793,7 @@ mod tests {
             &'a self,
             _table_id: &TableId,
             _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             let ps = self.partitions.lock().unwrap().take().unwrap_or_default();
             let counter = self.partitions_yielded.clone();

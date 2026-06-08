@@ -96,6 +96,7 @@ impl StreamRangeReader for StaticReader {
         &'a self,
         _table_id: &TableId,
         _projected_regular_ordinals: Option<&'a [u16]>,
+        _start: Option<&'a ferrosa_common::key::DecoratedKey>,
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
         let items: Vec<ferrosa_common::Result<Partition>> =
             self.partitions.iter().cloned().map(Ok).collect();
@@ -124,6 +125,7 @@ async fn end_to_end_single_replica_streams_all_partitions() {
         keyspace: "ks".into(),
         table: "tbl".into(),
         projected_regular_ordinals: None,
+        start_key: None,
     };
 
     // Producer runs concurrently with the consumer. In production
@@ -162,6 +164,7 @@ async fn end_to_end_two_replicas_aggregates_both_streams() {
         keyspace: "ks".into(),
         table: "tbl".into(),
         projected_regular_ordinals: None,
+        start_key: None,
     };
 
     let from_a: PeerId = (Uuid::from_u128(1), "127.0.0.1:7001".parse().unwrap());
