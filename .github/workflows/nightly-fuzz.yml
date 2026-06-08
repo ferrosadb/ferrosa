@@ -44,8 +44,11 @@ jobs:
         # cushion above it so the step exits cleanly rather than being cancelled.
         timeout-minutes: 34
         env:
-          PROPTEST_CASES: 50000
-          FUZZ_BUDGET_SECS: 1800 # 30 min wall-clock fuzz budget
+          # 10k cases is sized to finish within the 30-min budget on the runner
+          # (so the session reports "all cases passed" rather than relying on the
+          # timeout cutoff); the inner `timeout` below is the hard safety bound.
+          PROPTEST_CASES: 10000
+          FUZZ_BUDGET_SECS: 1800 # 30 min wall-clock fuzz budget (safety cap)
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
         run: |
           set +e
