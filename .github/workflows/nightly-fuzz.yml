@@ -50,6 +50,11 @@ jobs:
           PROPTEST_CASES: 10000
           FUZZ_BUDGET_SECS: 1800 # 30 min wall-clock fuzz budget (safety cap)
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
+          # Enables libtest's `--report-time` on the stable toolchain so the
+          # uploaded test-output.log ranks every test by wall-clock duration
+          # (`ok <1.234s>`). Only permits the unstable libtest flag; the code
+          # uses no nightly features, so this does not change what is compiled.
+          RUSTC_BOOTSTRAP: 1
         run: |
           set +e
           # --all-features so feature-gated property tests (e.g. the whole
@@ -69,7 +74,8 @@ jobs:
           timeout --kill-after=30s "${FUZZ_BUDGET_SECS}" \
             cargo test --all-features --workspace --lib --tests \
               --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-              -- --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
+              -- -Z unstable-options --report-time \
+                 --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                  --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                  --skip dep_wait_ordering --skip disk_fail_no_phantom \
                  --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
