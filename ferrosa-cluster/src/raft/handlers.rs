@@ -1155,6 +1155,18 @@ pub struct RangeReadStreamRequestPayload {
     /// wide cells not needed by the query are byte-skipped on remote replicas.
     #[serde(default)]
     pub projected_regular_ordinals: Option<Vec<u16>>,
+    /// Optional inclusive lower-bound partition-key bytes for a paged
+    /// (resume-capable) scan. `None` streams the whole range from the start;
+    /// `Some(bytes)` makes the remote replica start its fragmented iterator at
+    /// `DecoratedKey::new(PartitionKey::from(bytes))`, so a resumed page does
+    /// not re-stream the already-emitted prefix. The coordinator's k-way merge
+    /// and the CQL paging collector still apply the exact skip-≤-last semantics
+    /// on top, so an off-by-one at the bound can never drop or duplicate rows.
+    ///
+    /// `#[serde(default)]` keeps the frame wire-compatible with peers that
+    /// predate this field (they decode it as `None`).
+    #[serde(default)]
+    pub start_key: Option<Vec<u8>>,
 }
 
 /// Handler → coordinator: one batch of partitions belonging to a
@@ -1882,6 +1894,7 @@ mod tests {
             keyspace: "agent_memory".into(),
             table: "entity_store".into(),
             projected_regular_ordinals: None,
+            start_key: Some(b"resume-here".to_vec()),
         };
         let encoded = bincode::serialize(&req).expect("encode request");
         let decoded: RangeReadStreamRequestPayload =

@@ -421,10 +421,13 @@ impl WritePath {
     /// key, the scan resumes there, and the consumer drops rows already emitted
     /// within that partition. `start == None` is the first page.
     ///
-    /// In cluster mode this requires the local-only fan-out (CL=ONE with the
-    /// keyspace RF spanning the ring); multi-replica token-aware merge with a
-    /// resume key is not yet implemented and is refused rather than returning a
-    /// partial scan.
+    /// In cluster mode the local-only fan-out (CL=ONE with the keyspace RF
+    /// spanning the ring) streams the local fragmented iterator directly; a
+    /// multi-replica shape fans out a start-bounded fragment stream to each
+    /// CL-selected replica and merges them with the local stream through the
+    /// coordinator's token-aware N-way fragment merge. The resume key is shipped
+    /// to every replica so a resumed page never re-streams the already-emitted
+    /// prefix.
     pub async fn range_read_stream_all_from(
         &self,
         table_id: &TableId,

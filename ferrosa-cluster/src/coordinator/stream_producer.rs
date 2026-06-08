@@ -175,6 +175,7 @@ mod tests {
             keyspace: "ks".into(),
             table: "tbl".into(),
             projected_regular_ordinals: None,
+            start_key: None,
         }
     }
 
