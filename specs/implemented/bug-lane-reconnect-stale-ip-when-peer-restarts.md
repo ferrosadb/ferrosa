@@ -3,9 +3,9 @@ type: bug
 priority: P3
 reported-by: ferrosa-memory launch debugging
 implemented-by: "codex"
-verified-by: ""
+verified-by: "unit (pool::tests::reconnect_*); live-cluster verification pending"
 created: 2026-04-18
-updated: 2026-05-22
+updated: 2026-06-08
 ---
 
 # Lane reconnect may use stale IP when peer container restarts with new IP
@@ -31,6 +31,29 @@ The cluster controller should pass the container hostname (from the
 compose service name or Raft node configuration) instead of the resolved
 IP. Alternatively, the PeerManager could maintain a mapping from host_id
 to current hostname and update it when peers reconnect from new IPs.
+
+## Resolution (2026-06-08)
+
+Fixed at the `ferrosa-net` pool layer rather than chasing every controller call
+site (`cluster.rs`, `pair.rs`, `membership.rs`, `peer_events.rs` all pass
+`SocketAddr::to_string()`). `PriorityPool::connect` already learns the peer's
+advertised, re-resolvable `internode_broadcast` hostname from the handshake
+(`raft_client.peer_internode_broadcast()`). It now wires that hostname — not the
+connect-time address — into each lane's `ActorReconnectContext.peer_host` via
+`pick_reconnect_host()`, falling back to the connect-time host when the peer
+advertised no usable broadcast. So a reconnect re-resolves the hostname and
+follows the peer to its new IP, regardless of which caller initiated the pool.
+
+This depends on peers advertising a hostname (not an IP) as
+`FERROSA_INTERNODE_BROADCAST` — which the ferrosa-memory compose already does
+(`node1:7000`). A peer that advertises an IP (or nothing) keeps the prior
+behavior.
+
+- Code: `ferrosa-net/src/pool.rs` (`pick_reconnect_host` + `connect` wiring).
+- Tests: `pool::tests::reconnect_prefers_advertised_broadcast_hostname_over_connect_ip`,
+  `pool::tests::reconnect_falls_back_to_connect_host_without_usable_broadcast`.
+- Live verification still pending: restart one node so its container IP changes
+  and confirm peers reconnect without a stale `:7000` `Bulk lane timeout`.
 
 ## Impact
 
