@@ -1,0 +1,43 @@
+name: Promote Release to Stable
+
+# Blesses an existing (nightly/prerelease) release as the stable channel:
+# marks it --latest and clears the prerelease flag. This is the only path by
+# which a release leaves the "nightly" channel and becomes "stable".
+#
+# Releases are cut nightly as prereleases (see nightly-release.yml +
+# release.yml). When a build has been validated, promote its tag here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to promote to stable (e.g. v0.14.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: promote-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Mark ${{ github.event.inputs.tag }} as stable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Promote tag to stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          # Fail loudly if the tag has no release to promote.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "error: no release found for tag ${TAG} in ${REPO}" >&2
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$REPO" \
+            --draft=false --prerelease=false --latest
+          echo "Promoted ${TAG} to stable (latest, not prerelease)."
