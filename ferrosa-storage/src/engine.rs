@@ -4009,7 +4009,7 @@ impl StorageEngine {
 
     /// Test-only accessor for the private `generation_component_path` so
     /// self-heal fixtures can locate a generation's component file.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn generation_component_path_for_test(
         table_dir: &std::path::Path,
         gen: u64,

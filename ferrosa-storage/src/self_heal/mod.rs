@@ -32,8 +32,8 @@ pub mod detector;
 pub mod metrics;
 pub mod snapshot;
 
-#[cfg(test)]
-mod test_fixtures;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_fixtures;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
