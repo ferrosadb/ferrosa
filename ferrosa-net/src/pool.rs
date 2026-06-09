@@ -152,12 +152,20 @@ impl PriorityPool {
         let peer_internode_broadcast = raft_client.peer_internode_broadcast().map(String::from);
         let peer_host = peer_host.to_owned();
 
+        // For *reconnects*, prefer the peer's advertised, re-resolvable internode
+        // broadcast hostname over the connect-time address. Callers frequently
+        // pass an already-resolved IP (e.g. `SocketAddr::to_string()` from Raft
+        // membership); re-resolving an IP is a no-op, so a peer that restarts with
+        // a new IP would be retried at its dead address forever.
+        // Fixes P3: lane reconnect uses stale IP when peer restarts with a new IP.
+        let reconnect_host = pick_reconnect_host(&peer_host, peer_internode_broadcast.as_deref());
+
         // Spawn a lane actor for each connection.  The ctx_builder closure
         // captures the shared config/TLS state and wires up the reconnect
         // context with a handle back to the actor itself.
         let peer_label = format!("{}", peer_host_id.as_fields().0);
         let raft_config = Arc::clone(&config);
-        let raft_peer_host = peer_host.clone();
+        let raft_peer_host = reconnect_host.clone();
         let raft_tls = tls_connector.clone();
         let raft_task_pool_for_ctx = raft_task_pool.clone();
         let raft = spawn_raft_lane_actor_with_timeout(
@@ -177,7 +185,7 @@ impl PriorityPool {
             },
         );
         let data_config = Arc::clone(&config);
-        let data_peer_host = peer_host.clone();
+        let data_peer_host = reconnect_host.clone();
         let data_tls = tls_connector.clone();
         let data_task_pool_for_ctx = data_task_pool.clone();
         let data_ctx = move |h: LaneHandle| ActorReconnectContext {
@@ -199,7 +207,7 @@ impl PriorityPool {
         );
 
         let bulk_config = Arc::clone(&config);
-        let bulk_peer_host = peer_host;
+        let bulk_peer_host = reconnect_host;
         let bulk_tls = tls_connector.clone();
         let bulk_task_pool_for_ctx = bulk_task_pool.clone();
         let bulk_ctx = move |h: LaneHandle| ActorReconnectContext {
@@ -336,6 +344,22 @@ impl PriorityPool {
     }
 }
 
+/// Choose the host string a lane uses for *reconnects*.
+///
+/// Prefers the peer's advertised, re-resolvable internode broadcast hostname
+/// (learned during the handshake) over the connect-time address, which callers
+/// frequently pass as an already-resolved IP. Because re-resolving a literal IP
+/// is a no-op, pinning the reconnect host to an IP means a peer that restarts
+/// with a new IP is retried at its dead address forever
+/// (P3: lane-reconnect-stale-ip). A blank/whitespace broadcast is ignored.
+fn pick_reconnect_host(connect_host: &str, peer_internode_broadcast: Option<&str>) -> String {
+    peer_internode_broadcast
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or(connect_host)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +388,31 @@ mod tests {
                 _ => None,
             }
         }
+    }
+
+    // --- P3 lane-reconnect-stale-ip: reconnect host selection ---
+
+    #[test]
+    fn reconnect_prefers_advertised_broadcast_hostname_over_connect_ip() {
+        // Connect-time address is an already-resolved IP (e.g. a
+        // `SocketAddr::to_string()` from Raft membership). The peer advertised a
+        // re-resolvable hostname during the handshake, so reconnects must use it
+        // — otherwise an IP change on peer restart strands the lane forever.
+        assert_eq!(
+            pick_reconnect_host("10.89.0.4:7000", Some("node1:7000")),
+            "node1:7000",
+        );
+    }
+
+    #[test]
+    fn reconnect_falls_back_to_connect_host_without_usable_broadcast() {
+        // No broadcast advertised: keep the connect-time host.
+        assert_eq!(
+            pick_reconnect_host("10.89.0.4:7000", None),
+            "10.89.0.4:7000",
+        );
+        // Blank/whitespace broadcast is ignored, not used as a host.
+        assert_eq!(pick_reconnect_host("node1:7000", Some("   ")), "node1:7000");
     }
 
     #[tokio::test]
