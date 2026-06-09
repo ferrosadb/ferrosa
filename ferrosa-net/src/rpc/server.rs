@@ -409,7 +409,22 @@ impl RpcServer {
                 }
             };
 
-            if msg_type.is_raft() {
+            if msg_type.is_ordered_stream_response() {
+                // Frames of one streaming range-read response (chunk /
+                // heartbeat / done) form a single ordered, per-request
+                // stream. The coordinator's StreamFrameRouter enforces a
+                // strict, contiguous chunk `seq` and closes the route on
+                // the first gap — so spawning one task per frame here lets
+                // chunk seq=N+1 overtake seq=N under tokio scheduling and
+                // trips that check mid-stream (ChannelClosedBeforeDone),
+                // which a wide-partition scan reliably hits once the
+                // response spans many row-capped chunks. Run the handler
+                // inline to preserve wire order. It is non-blocking
+                // (decode + StreamRouter::route via try_send), so it
+                // cannot stall frame reading the way the producer-side
+                // RangeReadStreamRequest storage read would.
+                handler.await;
+            } else if msg_type.is_raft() {
                 self.raft_task_pool().spawn(handler);
             } else {
                 self.data_task_pool().spawn(handler);
@@ -863,5 +878,96 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(resp, Message::Pong { nonce: 2, .. }));
+    }
+
+    /// Regression (range-stream chunk reorder closes route): frames of a
+    /// single streaming range-read response must be dispatched in wire
+    /// order. The coordinator's `StreamFrameRouter` enforces a strict,
+    /// contiguous chunk `seq` and closes the route on the first gap, so a
+    /// reorder here surfaces downstream as `ChannelClosedBeforeDone` — the
+    /// fault a wide-partition scan (many row-capped chunks) reliably hits.
+    ///
+    /// This handler sleeps LONGER for earlier markers. Under the old
+    /// one-task-per-frame dispatch the later (shorter-sleep) frames finish
+    /// first, recording `[2, 1, 0]`. In-order inline dispatch makes the
+    /// reader await each stream-response handler before reading the next
+    /// frame, so the recorded order is exactly the wire order `[0, 1, 2]`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stream_response_frames_dispatch_in_wire_order() {
+        use futures::SinkExt;
+
+        struct OrderRecorder {
+            order: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for OrderRecorder {
+            async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+                if let Message::RangeReadStreamChunk(body) = msg {
+                    let marker = body.first().copied().unwrap_or(0);
+                    // Earlier markers sleep longer: any concurrency would
+                    // let later frames record ahead of earlier ones.
+                    tokio::time::sleep(Duration::from_millis(50 * (3 - marker as u64))).await;
+                    self.order.lock().unwrap().push(marker);
+                }
+                None
+            }
+        }
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(
+            MsgType::RangeReadStreamChunk,
+            Arc::new(OrderRecorder {
+                order: order.clone(),
+            }),
+        );
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+
+        let addr = server.start_and_get_addr().await.unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
+        initiate_handshake(&mut framed, &config, uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+
+        // Three chunk frames, markers 0,1,2, sent back-to-back in order.
+        for marker in 0u8..3 {
+            let body = bytes::Bytes::copy_from_slice(&[marker]);
+            let frame = Frame {
+                header: FrameHeader::new(
+                    MsgType::RangeReadStreamChunk,
+                    Lane::Bulk,
+                    1,
+                    u32::try_from(body.len()).unwrap(),
+                ),
+                body,
+            };
+            framed.send(frame).await.unwrap();
+        }
+
+        // Wait until all three frames have been recorded (bounded).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if order.lock().unwrap().len() == 3 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "handler did not observe all three chunk frames within the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![0, 1, 2],
+            "stream-response frames must be dispatched in wire order; a reorder \
+             closes the StreamFrameRouter route mid-stream (ChannelClosedBeforeDone)"
+        );
     }
 }
