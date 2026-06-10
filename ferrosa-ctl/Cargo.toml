@@ -21,6 +21,10 @@ ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-common = { path = "../ferrosa-common" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+# Object-store cleanup (`sstable s3-clean`) — delete corrupt-gen objects from S3
+# so cold restarts can't re-download and re-detect them.
+object_store = { version = "0.11", features = ["aws"] }
+futures = "0.3"
 tabled = "0.20"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

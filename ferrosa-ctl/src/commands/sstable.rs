@@ -25,6 +25,7 @@ use tabled::settings::Style;
 use ferrosa_common::{DecoratedKey, NO_TIMESTAMP};
 use ferrosa_cql::client::{CqlClient, PreparedStatement};
 use ferrosa_sstable::io::FileReadAt;
+use ferrosa_sstable::marshal::value_length_if_fixed;
 use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
 use ferrosa_sstable::statistics::SerializationHeader;
 use ferrosa_sstable::types::Row;
@@ -645,6 +646,15 @@ fn reconstruct_row(
         return None;
     }
 
+    // Reject the whole row if any key component's byte-length doesn't match its
+    // fixed-length type. A bad key length is drift garbage — inserting it would
+    // misfile data under a wrong/partial key, the worst possible outcome.
+    if !key_lengths_valid(&pk, &pk_component_types(&header.key_type))
+        || !key_lengths_valid(&ck, &header.clustering_types)
+    {
+        return None;
+    }
+
     let static_count = header.static_columns.len();
     let mut columns: Vec<String> = Vec::new();
     let mut values: Vec<Option<Vec<u8>>> = Vec::new();
@@ -673,9 +683,18 @@ fn reconstruct_row(
         } else {
             header.regular_columns.get(idx - static_count)
         };
-        let Some((name_bytes, _ty)) = column else {
+        let Some((name_bytes, ty)) = column else {
             continue;
         };
+        // Skip a cell whose value byte-length doesn't match its fixed-length
+        // type (drift garbage, or an empty value for a fixed column) — the
+        // server would reject it. Variable-length types (text/blob/vector) pass
+        // and are caught by the resilient per-row execute if still invalid.
+        if let Some(n) = value_length_if_fixed(ty) {
+            if value.len() != n {
+                continue;
+            }
+        }
         columns.push(String::from_utf8_lossy(name_bytes).into_owned());
         values.push(Some(value.clone()));
         regular_cells += 1;
@@ -692,6 +711,55 @@ fn reconstruct_row(
         values,
         timestamp,
     })
+}
+
+/// True if every component whose type is fixed-length has the exact expected
+/// byte-length. Variable-length components always pass.
+fn key_lengths_valid(components: &[Vec<u8>], types: &[String]) -> bool {
+    for (val, ty) in components.iter().zip(types.iter()) {
+        if let Some(n) = value_length_if_fixed(ty) {
+            if val.len() != n {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The per-component marshal type names of a partition key. A `CompositeType(..)`
+/// key splits into its inner types; a single-column key is one type.
+fn pk_component_types(key_type: &str) -> Vec<String> {
+    if let Some(start) = key_type.find("CompositeType(") {
+        let inner = &key_type[start + "CompositeType(".len()..];
+        let inner = inner.strip_suffix(')').unwrap_or(inner);
+        split_top_level(inner)
+    } else {
+        vec![key_type.to_string()]
+    }
+}
+
+/// Split a comma-separated type list at depth-0 commas so nested generic types
+/// (e.g. `ReversedType(...)`) stay intact.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
 }
 
 /// Build the `INSERT` CQL text (with `?` markers and an optional
@@ -827,6 +895,7 @@ pub async fn sstable_reingest(
     let mut corrupt_gens = 0u64;
     let mut reconstructed = 0u64;
     let mut inserted = 0u64;
+    let mut failed = 0u64;
     let mut prepared: std::collections::HashMap<(String, bool), PreparedStatement> =
         std::collections::HashMap::new();
 
@@ -858,8 +927,15 @@ pub async fn sstable_reingest(
                             break;
                         }
                     }
-                    execute_row_insert(&mut client, &keyspace, &table, ins, &mut prepared).await?;
-                    inserted += 1;
+                    // Resilient: a single row the server rejects (e.g. a
+                    // variable-length cell that is still drift garbage) must not
+                    // abort recovery of the rest. Skip it and keep going.
+                    match execute_row_insert(&mut client, &keyspace, &table, ins, &mut prepared)
+                        .await
+                    {
+                        Ok(()) => inserted += 1,
+                        Err(_) => failed += 1,
+                    }
                 }
             }
         }
@@ -873,7 +949,7 @@ pub async fn sstable_reingest(
     if apply {
         println!(
             "{}.{}: re-ingested {inserted} row(s) from {corrupt_gens} corrupt generation(s) \
-             via the live write path.",
+             via the live write path ({failed} row(s) skipped as unrecoverable).",
             keyspace, table
         );
     } else {
@@ -910,6 +986,84 @@ async fn execute_row_insert(
         values.push(Some(ts.to_be_bytes().to_vec()));
     }
     client.execute(stmt, &values, 1).await?;
+    Ok(())
+}
+
+// ── s3-clean (remove corrupt gens from the object store) ────────────────────────
+
+/// Delete every CORRUPT generation's objects from the object store so a cold
+/// restart cannot re-download and re-detect them (the S3-reseed loop). Reuses
+/// the engine's S3 config (`FERROSA_S3_*` env) and the canonical object-key
+/// layout. **Dry-run by default** — `apply` performs the deletes. Only corrupt
+/// generations are touched; healthy ones are never deleted.
+pub async fn sstable_s3_clean(table_dir: &Path, apply: bool) -> Result<(), CtlError> {
+    use futures::StreamExt;
+    use object_store::ObjectStore;
+
+    if !table_dir.is_dir() {
+        return Err(format!("not a directory: {}", table_dir.display()).into());
+    }
+    let (keyspace, table) = parse_keyspace_table(table_dir)?;
+    let table_id = format!("{keyspace}.{table}");
+
+    let config = ferrosa_storage::ObjectStoreConfig::from_env()
+        .map_err(|e| format!("S3 config (set FERROSA_S3_* env vars): {e}"))?;
+    let store = config
+        .build_object_store()
+        .map_err(|e| format!("build object store: {e}"))?;
+
+    // Corrupt generations in the live dir and the quarantine subdir.
+    let mut gens: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for dir in [table_dir.to_path_buf(), table_dir.join("quarantine")] {
+        if !dir.is_dir() {
+            continue;
+        }
+        for gen in StorageEngine::list_generations_in_dir(&dir) {
+            if StorageEngine::smoke_test_generation(&dir, gen).is_err() {
+                gens.insert(gen);
+            }
+        }
+    }
+
+    let mut listed = 0usize;
+    let mut deleted = 0usize;
+    for gen in &gens {
+        let hex = ferrosa_storage::upload::hex_prefix_for(&gen.to_string());
+        let prefix =
+            object_store::path::Path::from(format!("{}/{hex}/{table_id}/{gen}", config.prefix));
+        let mut stream = store.list(Some(&prefix));
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| format!("list under {prefix}: {e}"))?;
+            keys.push(meta.location);
+        }
+        listed += keys.len();
+        if apply {
+            for k in &keys {
+                store
+                    .delete(k)
+                    .await
+                    .map_err(|e| format!("delete {k}: {e}"))?;
+                deleted += 1;
+            }
+        }
+    }
+
+    if apply {
+        println!(
+            "{table_id}: deleted {deleted} S3 object(s) across {} corrupt generation(s) under \
+             prefix '{}/' — they will not be re-downloaded on cold restart.",
+            gens.len(),
+            config.prefix
+        );
+    } else {
+        println!(
+            "{table_id}: DRY RUN — would delete {listed} S3 object(s) across {} corrupt \
+             generation(s) under '{}/.../{table_id}/'. Re-run with --apply.",
+            gens.len(),
+            config.prefix
+        );
+    }
     Ok(())
 }
 
@@ -1322,9 +1476,13 @@ mod tests {
             clustering: vec!["entity_id".into()],
         };
         let header = entity_store_header();
-        let key = DecoratedKey::new(PartitionKey::new(composite_pk(&[b"AAAA", b"BBBB"])));
+        // Realistic 16-byte UUIDs for the composite PK + clustering.
+        let tenant = vec![0xAA; 16];
+        let session = vec![0xBB; 16];
+        let entity = vec![0xCC; 16];
+        let key = DecoratedKey::new(PartitionKey::new(composite_pk(&[&tenant, &session])));
         let row = Row {
-            clustering: b"CCCC".to_vec(),
+            clustering: entity.clone(),
             cells: vec![
                 (0, CellValue::live(b"Ada".to_vec(), 1234)),
                 (1, CellValue::live(b"\x01\x02\x03".to_vec(), 1240)),
@@ -1347,9 +1505,9 @@ mod tests {
         assert_eq!(
             ins.values,
             vec![
-                Some(b"AAAA".to_vec()),
-                Some(b"BBBB".to_vec()),
-                Some(b"CCCC".to_vec()),
+                Some(tenant),
+                Some(session),
+                Some(entity),
                 Some(b"Ada".to_vec()),
                 Some(b"\x01\x02\x03".to_vec()),
             ]
@@ -1370,10 +1528,10 @@ mod tests {
             clustering: vec!["entity_id".into()],
         };
         let header = entity_store_header();
-        let key = DecoratedKey::new(PartitionKey::new(composite_pk(&[b"AAAA", b"BBBB"])));
+        let key = DecoratedKey::new(PartitionKey::new(composite_pk(&[&[0xAA; 16], &[0xBB; 16]])));
         // Only a tombstone cell (value None) → nothing to recover.
         let row = Row {
-            clustering: b"CCCC".to_vec(),
+            clustering: vec![0xCC; 16],
             cells: vec![(
                 0,
                 CellValue {
@@ -1389,6 +1547,97 @@ mod tests {
         assert!(
             reconstruct_row(&layout, &header, &key, &row).is_none(),
             "a tombstone-only row yields no insert"
+        );
+    }
+
+    #[test]
+    fn reconstruct_row_rejects_bad_length_key_component() {
+        let layout = TableLayout {
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+            partition_key: vec!["tenant_id".into(), "session_id".into()],
+            clustering: vec!["entity_id".into()],
+        };
+        let header = entity_store_header(); // UUID PK + UUID clustering (16 bytes each)
+                                            // 4-byte components for 16-byte UUID columns → drift garbage.
+        let key = DecoratedKey::new(PartitionKey::new(composite_pk(&[b"AAAA", b"BBBB"])));
+        let row = Row {
+            clustering: vec![0xCC; 16],
+            cells: vec![(0, CellValue::live(b"Ada".to_vec(), 1))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1),
+        };
+        assert!(
+            reconstruct_row(&layout, &header, &key, &row).is_none(),
+            "a wrong-length UUID key component is rejected (never misfiled)"
+        );
+    }
+
+    #[test]
+    fn reconstruct_row_skips_wrong_length_fixed_cell_but_keeps_good() {
+        let layout = TableLayout {
+            keyspace: "agent_memory".into(),
+            table: "entity_warmth".into(),
+            partition_key: vec!["tenant_id".into()],
+            clustering: vec![],
+        };
+        let header = SerializationHeader {
+            min_timestamp: 0,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UUIDType".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"label".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"score".to_vec(),
+                    "org.apache.cassandra.db.marshal.DoubleType".into(),
+                ),
+            ],
+        };
+        let key = DecoratedKey::new(PartitionKey::new(vec![0xAB; 16]));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(b"hot".to_vec(), 5)), // text, any length OK
+                (1, CellValue::live(vec![0u8; 3], 6)),    // double needs 8 bytes → skip
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(5),
+        };
+        let ins = reconstruct_row(&layout, &header, &key, &row).expect("good cell remains");
+        assert_eq!(
+            ins.columns,
+            vec!["tenant_id", "label"],
+            "bad double cell dropped"
+        );
+        assert_eq!(
+            ins.values,
+            vec![Some(vec![0xAB; 16]), Some(b"hot".to_vec())]
+        );
+    }
+
+    #[test]
+    fn pk_component_types_parses_composite_and_single() {
+        assert_eq!(
+            pk_component_types(
+                "org.apache.cassandra.db.marshal.CompositeType(\
+                 org.apache.cassandra.db.marshal.UUIDType,\
+                 org.apache.cassandra.db.marshal.Int32Type)"
+            ),
+            vec![
+                "org.apache.cassandra.db.marshal.UUIDType",
+                "org.apache.cassandra.db.marshal.Int32Type"
+            ]
+        );
+        assert_eq!(
+            pk_component_types("org.apache.cassandra.db.marshal.UUIDType"),
+            vec!["org.apache.cassandra.db.marshal.UUIDType"]
         );
     }
 

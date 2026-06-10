@@ -1880,6 +1880,8 @@ dependencies = [
  "ferrosa-sstable",
  "ferrosa-storage",
  "ferrosa-udf",
+ "futures",
+ "object_store",
  "ratatui",
  "reqwest",
  "rpassword",

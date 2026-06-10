@@ -264,6 +264,18 @@ enum SstableAction {
         #[arg(long)]
         limit: Option<u64>,
     },
+
+    /// Delete CORRUPT generations' objects from the object store (S3/MinIO) so a
+    /// cold restart cannot re-download and re-detect them. Reuses the engine's
+    /// `FERROSA_S3_*` env config. Dry-run by default — pass `--apply` to delete.
+    S3Clean {
+        /// Path to a table's SSTable directory (named `<keyspace>.<table>`).
+        dir: std::path::PathBuf,
+
+        /// Actually delete the objects. Without this, only the plan is printed.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 /// Raft administration sub-actions.
@@ -593,6 +605,9 @@ async fn main() {
                     limit,
                 )
                 .await
+            }
+            SstableAction::S3Clean { dir, apply } => {
+                commands::sstable::sstable_s3_clean(&dir, apply).await
             }
         },
     };
@@ -1245,6 +1260,29 @@ mod tests {
                 );
                 assert!(!apply, "reingest must default to dry-run");
                 assert!(!include_quarantine);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_s3_clean_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "s3-clean",
+            "/data/agent_memory.entity_store",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action: SstableAction::S3Clean { dir, apply },
+            } => {
+                assert_eq!(
+                    dir,
+                    std::path::PathBuf::from("/data/agent_memory.entity_store")
+                );
+                assert!(!apply, "s3-clean must default to dry-run");
             }
             other => panic!("unexpected command: {other:?}"),
         }
