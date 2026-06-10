@@ -233,6 +233,37 @@ enum SstableAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Salvage rows from this table's CORRUPT generations and re-insert them
+    /// through the live cluster (`--host`) via the fixed write path (proper RF
+    /// replication, original timestamps preserved). Dry-run by default — pass
+    /// `--apply` to write. Connects to the node at the global `--host`.
+    Reingest {
+        /// Path to a table's SSTable directory (named `<keyspace>.<table>`).
+        dir: std::path::PathBuf,
+
+        /// CQL role to authenticate as.
+        #[arg(long, default_value = "ferrosa_admin")]
+        user: String,
+
+        /// Environment variable holding the CQL password. If unset, the seed
+        /// default password is tried.
+        #[arg(long)]
+        password_env: Option<String>,
+
+        /// Actually execute the INSERTs. Without this, only the plan is printed.
+        #[arg(long)]
+        apply: bool,
+
+        /// Also salvage generations from the `quarantine/` subdirectory.
+        #[arg(long)]
+        include_quarantine: bool,
+
+        /// Cap the number of rows re-ingested (for a controlled first run /
+        /// correctness check before a full recovery).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
 }
 
 /// Raft administration sub-actions.
@@ -541,6 +572,28 @@ async fn main() {
                 include_quarantine,
                 json,
             } => commands::sstable::sstable_salvage(&dir, include_quarantine, json),
+            SstableAction::Reingest {
+                dir,
+                user,
+                password_env,
+                apply,
+                include_quarantine,
+                limit,
+            } => {
+                let password = password_env
+                    .and_then(|v| std::env::var(v).ok())
+                    .unwrap_or_else(|| "ferrosa_admin".to_string());
+                commands::sstable::sstable_reingest(
+                    &dir,
+                    addr,
+                    &user,
+                    &password,
+                    apply,
+                    include_quarantine,
+                    limit,
+                )
+                .await
+            }
         },
     };
 
@@ -1162,6 +1215,36 @@ mod tests {
                 assert_eq!(dir, std::path::PathBuf::from("/data/ks.t"));
                 assert!(include_quarantine);
                 assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_reingest_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "reingest",
+            "/data/agent_memory.entity_store",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action:
+                    SstableAction::Reingest {
+                        dir,
+                        apply,
+                        include_quarantine,
+                        ..
+                    },
+            } => {
+                assert_eq!(
+                    dir,
+                    std::path::PathBuf::from("/data/agent_memory.entity_store")
+                );
+                assert!(!apply, "reingest must default to dry-run");
+                assert!(!include_quarantine);
             }
             other => panic!("unexpected command: {other:?}"),
         }

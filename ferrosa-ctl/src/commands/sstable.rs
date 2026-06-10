@@ -15,14 +15,19 @@
 //! All commands here are **read-only** except the recovery action, which only
 //! ever moves files (never deletes) and defaults to a dry run.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tabled::builder::Builder;
 use tabled::settings::Style;
 
+use ferrosa_common::{DecoratedKey, NO_TIMESTAMP};
+use ferrosa_cql::client::{CqlClient, PreparedStatement};
 use ferrosa_sstable::io::FileReadAt;
 use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
+use ferrosa_sstable::statistics::SerializationHeader;
+use ferrosa_sstable::types::Row;
 use ferrosa_storage::engine::StorageEngine;
 
 /// Error type shared with `main`'s unified result.
@@ -596,6 +601,318 @@ fn print_salvage_summary(reports: &[GenSalvage], table_dir: &Path) {
     );
 }
 
+// ── reingest (recover salvaged rows through the live write path) ─────────────────
+
+/// A table's partition-key and clustering column names, in position order,
+/// read from `system_schema.columns`. Regular column names come from the
+/// SSTable header (which carries them), so only the key columns — which the
+/// header does NOT name — need the live schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableLayout {
+    pub keyspace: String,
+    pub table: String,
+    pub partition_key: Vec<String>,
+    pub clustering: Vec<String>,
+}
+
+/// One salvaged row reconstructed into the column names + bound value bytes for
+/// a prepared INSERT, plus the write timestamp to preserve (LWW correctness).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowInsert {
+    pub columns: Vec<String>,
+    /// Raw serialized value bytes, positional with `columns`. The on-disk cell
+    /// bytes are already the CQL-wire value form, so they bind directly.
+    pub values: Vec<Option<Vec<u8>>>,
+    /// `USING TIMESTAMP` to apply, or `None` to let the server assign.
+    pub timestamp: Option<i64>,
+}
+
+/// Reconstruct an INSERT for one salvaged row. Returns `None` when there is no
+/// live regular cell to recover (pure tombstone, or a key-only row), or when
+/// the key/clustering does not split into the expected component count.
+fn reconstruct_row(
+    layout: &TableLayout,
+    header: &SerializationHeader,
+    key: &DecoratedKey,
+    row: &Row,
+) -> Option<RowInsert> {
+    let pk = ferrosa_cql::bridge::decode_pk(key, layout.partition_key.len());
+    if pk.len() != layout.partition_key.len() {
+        return None;
+    }
+    let ck = ferrosa_cql::bridge::decode_clustering(&row.clustering, layout.clustering.len());
+    if ck.len() != layout.clustering.len() {
+        return None;
+    }
+
+    let static_count = header.static_columns.len();
+    let mut columns: Vec<String> = Vec::new();
+    let mut values: Vec<Option<Vec<u8>>> = Vec::new();
+
+    for (name, val) in layout.partition_key.iter().zip(pk) {
+        columns.push(name.clone());
+        values.push(Some(val));
+    }
+    for (name, val) in layout.clustering.iter().zip(ck) {
+        columns.push(name.clone());
+        values.push(Some(val));
+    }
+
+    let mut timestamp = if row.primary_key_liveness.has_timestamp() {
+        Some(row.primary_key_liveness.timestamp)
+    } else {
+        None
+    };
+    let mut regular_cells = 0usize;
+    for (col_idx, cell) in &row.cells {
+        // Skip tombstones — a cell with no value is a deletion, not data.
+        let Some(value) = &cell.value else { continue };
+        let idx = *col_idx as usize;
+        let column = if idx < static_count {
+            header.static_columns.get(idx)
+        } else {
+            header.regular_columns.get(idx - static_count)
+        };
+        let Some((name_bytes, _ty)) = column else {
+            continue;
+        };
+        columns.push(String::from_utf8_lossy(name_bytes).into_owned());
+        values.push(Some(value.clone()));
+        regular_cells += 1;
+        if cell.timestamp != NO_TIMESTAMP {
+            timestamp = Some(timestamp.map_or(cell.timestamp, |t| t.max(cell.timestamp)));
+        }
+    }
+
+    if regular_cells == 0 {
+        return None;
+    }
+    Some(RowInsert {
+        columns,
+        values,
+        timestamp,
+    })
+}
+
+/// Build the `INSERT` CQL text (with `?` markers and an optional
+/// `USING TIMESTAMP ?`) for a given ordered column set. Identity-quoted to
+/// tolerate reserved words / case. The timestamp marker, when present, is the
+/// LAST bind position.
+fn insert_cql(keyspace: &str, table: &str, columns: &[String], with_timestamp: bool) -> String {
+    let cols = columns
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let markers = vec!["?"; columns.len()].join(", ");
+    let mut cql = format!("INSERT INTO \"{keyspace}\".\"{table}\" ({cols}) VALUES ({markers})");
+    if with_timestamp {
+        cql.push_str(" USING TIMESTAMP ?");
+    }
+    cql
+}
+
+/// Parse `keyspace.table` from a table SSTable directory name.
+fn parse_keyspace_table(table_dir: &Path) -> Result<(String, String), CtlError> {
+    let name = table_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("cannot read table dir name from {}", table_dir.display()))?;
+    let (ks, tbl) = name
+        .split_once('.')
+        .ok_or_else(|| format!("table dir '{name}' is not in <keyspace>.<table> form"))?;
+    Ok((ks.to_string(), tbl.to_string()))
+}
+
+/// Build a [`TableLayout`] from a `system_schema.columns` query result. Pure —
+/// unit-tested with a synthetic result, no live node required.
+fn parse_layout_from_result(
+    keyspace: &str,
+    table: &str,
+    res: &ferrosa_cql::client::QueryResult,
+) -> Result<TableLayout, CtlError> {
+    let col = |n: &str| res.column_names.iter().position(|c| c == n);
+    let (ni, ki, pi) = match (col("column_name"), col("kind"), col("position")) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return Err("system_schema.columns result missing expected columns".into()),
+    };
+    let mut pk: Vec<(i32, String)> = Vec::new();
+    let mut ck: Vec<(i32, String)> = Vec::new();
+    for row in &res.rows {
+        let Some(name) = row_text(row, ni) else {
+            continue;
+        };
+        let Some(kind) = row_text(row, ki) else {
+            continue;
+        };
+        let position = row_i32(row, pi).unwrap_or(0);
+        match kind.as_str() {
+            "partition_key" => pk.push((position, name)),
+            "clustering" => ck.push((position, name)),
+            _ => {}
+        }
+    }
+    if pk.is_empty() {
+        return Err(format!("no partition-key columns found for {keyspace}.{table}").into());
+    }
+    pk.sort_by_key(|(p, _)| *p);
+    ck.sort_by_key(|(p, _)| *p);
+    Ok(TableLayout {
+        keyspace: keyspace.to_string(),
+        table: table.to_string(),
+        partition_key: pk.into_iter().map(|(_, n)| n).collect(),
+        clustering: ck.into_iter().map(|(_, n)| n).collect(),
+    })
+}
+
+fn row_text(row: &ferrosa_cql::client::ResultRow, i: usize) -> Option<String> {
+    row.columns
+        .get(i)
+        .and_then(|o| o.as_ref())
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+}
+
+fn row_i32(row: &ferrosa_cql::client::ResultRow, i: usize) -> Option<i32> {
+    row.columns
+        .get(i)
+        .and_then(|o| o.as_ref())
+        .filter(|b| b.len() == 4)
+        .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Fetch a table's key-column layout from the live node's `system_schema.columns`.
+async fn fetch_table_layout(
+    client: &mut CqlClient,
+    keyspace: &str,
+    table: &str,
+) -> Result<TableLayout, CtlError> {
+    let q = format!(
+        "SELECT column_name, kind, position FROM system_schema.columns \
+         WHERE keyspace_name = '{keyspace}' AND table_name = '{table}'"
+    );
+    let res = client.query(&q).await?;
+    parse_layout_from_result(keyspace, table, &res)
+}
+
+/// `ferrosa-ctl sstable reingest` entry point. Salvages rows from this table's
+/// CORRUPT generations and re-inserts them through the live write path (the
+/// fixed writer + proper RF replication). **Dry-run by default**: connects only
+/// to read schema, reports how many rows would be re-ingested, and writes
+/// nothing. With `apply`, executes prepared INSERTs preserving each row's
+/// original `USING TIMESTAMP`.
+pub async fn sstable_reingest(
+    table_dir: &Path,
+    host: SocketAddr,
+    user: &str,
+    password: &str,
+    apply: bool,
+    include_quarantine: bool,
+    limit: Option<u64>,
+) -> Result<(), CtlError> {
+    if !table_dir.is_dir() {
+        return Err(format!("not a directory: {}", table_dir.display()).into());
+    }
+    let (keyspace, table) = parse_keyspace_table(table_dir)?;
+    let mut client = CqlClient::connect_with_credentials(host, user, password).await?;
+    let layout = fetch_table_layout(&mut client, &keyspace, &table).await?;
+
+    let mut dirs: Vec<PathBuf> = vec![table_dir.to_path_buf()];
+    if include_quarantine {
+        let q = table_dir.join("quarantine");
+        if q.is_dir() {
+            dirs.push(q);
+        }
+    }
+
+    let mut corrupt_gens = 0u64;
+    let mut reconstructed = 0u64;
+    let mut inserted = 0u64;
+    let mut prepared: std::collections::HashMap<(String, bool), PreparedStatement> =
+        std::collections::HashMap::new();
+
+    for dir in &dirs {
+        for gen in StorageEngine::list_generations_in_dir(dir) {
+            // Only CORRUPT generations need salvage; healthy ones are already served.
+            if StorageEngine::smoke_test_generation(dir, gen).is_ok() {
+                continue;
+            }
+            let reader = match open_reader(dir, gen) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            corrupt_gens += 1;
+            let header = reader.header().clone();
+            let mut row_inserts: Vec<RowInsert> = Vec::new();
+            let _ = reader.salvage(|p| {
+                for row in &p.rows {
+                    if let Some(ins) = reconstruct_row(&layout, &header, &p.key, row) {
+                        row_inserts.push(ins);
+                    }
+                }
+            });
+            reconstructed += row_inserts.len() as u64;
+            if apply {
+                for ins in &row_inserts {
+                    if let Some(cap) = limit {
+                        if inserted >= cap {
+                            break;
+                        }
+                    }
+                    execute_row_insert(&mut client, &keyspace, &table, ins, &mut prepared).await?;
+                    inserted += 1;
+                }
+            }
+        }
+        if let Some(cap) = limit {
+            if inserted >= cap {
+                break;
+            }
+        }
+    }
+
+    if apply {
+        println!(
+            "{}.{}: re-ingested {inserted} row(s) from {corrupt_gens} corrupt generation(s) \
+             via the live write path.",
+            keyspace, table
+        );
+    } else {
+        println!(
+            "{}.{}: DRY RUN — {reconstructed} row(s) reconstructable from {corrupt_gens} corrupt \
+             generation(s) would be re-ingested. PK={:?} CK={:?}. Re-run with --apply to write \
+             (data goes through the fixed writer + RF replication).",
+            keyspace, table, layout.partition_key, layout.clustering
+        );
+    }
+    Ok(())
+}
+
+/// Prepare (cached) and execute one reconstructed row's INSERT.
+async fn execute_row_insert(
+    client: &mut CqlClient,
+    keyspace: &str,
+    table: &str,
+    ins: &RowInsert,
+    cache: &mut std::collections::HashMap<(String, bool), PreparedStatement>,
+) -> Result<(), CtlError> {
+    let with_ts = ins.timestamp.is_some();
+    let key = (ins.columns.join(","), with_ts);
+    if !cache.contains_key(&key) {
+        let cql = insert_cql(keyspace, table, &ins.columns, with_ts);
+        let stmt = client.prepare(&cql).await?;
+        cache.insert(key.clone(), stmt);
+    }
+    let stmt = cache.get(&key).expect("just inserted");
+
+    let mut values = ins.values.clone();
+    if let Some(ts) = ins.timestamp {
+        // USING TIMESTAMP ? binds a bigint (8-byte big-endian) in the final slot.
+        values.push(Some(ts.to_be_bytes().to_vec()));
+    }
+    client.execute(stmt, &values, 1).await?;
+    Ok(())
+}
+
 // ── shared helpers ──────────────────────────────────────────────────────────────
 
 /// Locate a generation: the table dir itself (flat or nested), else its
@@ -951,5 +1268,201 @@ mod tests {
                 .any(|r| r.gen != bad && r.verdict == "OK" && r.rows_recovered == 1),
             "healthy sibling recovers fully alongside the corrupt gen"
         );
+    }
+
+    // ── reingest reconstruction tests ────────────────────────────────────────
+
+    use ferrosa_common::cell::CellValue;
+    use ferrosa_common::key::PartitionKey;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+
+    /// Encode a composite partition key the way the storage layer does:
+    /// `[u16 len][value][0x00]` per component.
+    fn composite_pk(components: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in components {
+            out.extend_from_slice(&(c.len() as u16).to_be_bytes());
+            out.extend_from_slice(c);
+            out.push(0x00);
+        }
+        out
+    }
+
+    fn entity_store_header() -> SerializationHeader {
+        SerializationHeader {
+            min_timestamp: 0,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.UUIDType".into()],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"entity_name".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"embedding".to_vec(),
+                    "org.apache.cassandra.db.marshal.BytesType".into(),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn reconstruct_row_maps_composite_pk_clustering_and_regular_cells() {
+        let layout = TableLayout {
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+            partition_key: vec!["tenant_id".into(), "session_id".into()],
+            clustering: vec!["entity_id".into()],
+        };
+        let header = entity_store_header();
+        let key = DecoratedKey::new(PartitionKey::new(composite_pk(&[b"AAAA", b"BBBB"])));
+        let row = Row {
+            clustering: b"CCCC".to_vec(),
+            cells: vec![
+                (0, CellValue::live(b"Ada".to_vec(), 1234)),
+                (1, CellValue::live(b"\x01\x02\x03".to_vec(), 1240)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1234),
+        };
+
+        let ins = reconstruct_row(&layout, &header, &key, &row).expect("row reconstructs");
+        assert_eq!(
+            ins.columns,
+            vec![
+                "tenant_id",
+                "session_id",
+                "entity_id",
+                "entity_name",
+                "embedding"
+            ]
+        );
+        assert_eq!(
+            ins.values,
+            vec![
+                Some(b"AAAA".to_vec()),
+                Some(b"BBBB".to_vec()),
+                Some(b"CCCC".to_vec()),
+                Some(b"Ada".to_vec()),
+                Some(b"\x01\x02\x03".to_vec()),
+            ]
+        );
+        assert_eq!(
+            ins.timestamp,
+            Some(1240),
+            "uses the max cell timestamp (LWW)"
+        );
+    }
+
+    #[test]
+    fn reconstruct_row_skips_tombstone_cells_and_keyonly_rows() {
+        let layout = TableLayout {
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+            partition_key: vec!["tenant_id".into(), "session_id".into()],
+            clustering: vec!["entity_id".into()],
+        };
+        let header = entity_store_header();
+        let key = DecoratedKey::new(PartitionKey::new(composite_pk(&[b"AAAA", b"BBBB"])));
+        // Only a tombstone cell (value None) → nothing to recover.
+        let row = Row {
+            clustering: b"CCCC".to_vec(),
+            cells: vec![(
+                0,
+                CellValue {
+                    value: None,
+                    timestamp: 1234,
+                    ttl: 0,
+                    local_deletion_time: 5,
+                },
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1234),
+        };
+        assert!(
+            reconstruct_row(&layout, &header, &key, &row).is_none(),
+            "a tombstone-only row yields no insert"
+        );
+    }
+
+    #[test]
+    fn insert_cql_quotes_columns_and_appends_timestamp_marker() {
+        let cql = insert_cql(
+            "agent_memory",
+            "entity_store",
+            &["tenant_id".into(), "entity_name".into()],
+            true,
+        );
+        assert_eq!(
+            cql,
+            "INSERT INTO \"agent_memory\".\"entity_store\" (\"tenant_id\", \"entity_name\") \
+             VALUES (?, ?) USING TIMESTAMP ?"
+        );
+        let no_ts = insert_cql("ks", "t", &["a".into()], false);
+        assert_eq!(no_ts, "INSERT INTO \"ks\".\"t\" (\"a\") VALUES (?)");
+    }
+
+    #[test]
+    fn parse_keyspace_table_splits_dir_name() {
+        let dir = std::path::Path::new("/var/lib/ferrosa/sstables/agent_memory.entity_store");
+        let (ks, t) = parse_keyspace_table(dir).unwrap();
+        assert_eq!(ks, "agent_memory");
+        assert_eq!(t, "entity_store");
+        assert!(parse_keyspace_table(std::path::Path::new("/x/nodotdir")).is_err());
+    }
+
+    #[test]
+    fn parse_layout_from_result_orders_keys_by_position() {
+        use ferrosa_cql::client::{QueryResult, ResultRow};
+        let text = |s: &str| Some(s.as_bytes().to_vec());
+        let int = |n: i32| Some(n.to_be_bytes().to_vec());
+        // Rows deliberately out of position order; regular column included.
+        let res = QueryResult {
+            column_names: vec!["column_name".into(), "kind".into(), "position".into()],
+            rows: vec![
+                ResultRow {
+                    columns: vec![text("session_id"), text("partition_key"), int(1)],
+                },
+                ResultRow {
+                    columns: vec![text("entity_name"), text("regular"), int(-1)],
+                },
+                ResultRow {
+                    columns: vec![text("tenant_id"), text("partition_key"), int(0)],
+                },
+                ResultRow {
+                    columns: vec![text("entity_id"), text("clustering"), int(0)],
+                },
+            ],
+        };
+        let layout = parse_layout_from_result("agent_memory", "entity_store", &res).unwrap();
+        assert_eq!(
+            layout.partition_key,
+            vec!["tenant_id", "session_id"],
+            "PK ordered by position"
+        );
+        assert_eq!(layout.clustering, vec!["entity_id"]);
+    }
+
+    #[test]
+    fn parse_layout_from_result_errors_without_partition_key() {
+        use ferrosa_cql::client::{QueryResult, ResultRow};
+        let res = QueryResult {
+            column_names: vec!["column_name".into(), "kind".into(), "position".into()],
+            rows: vec![ResultRow {
+                columns: vec![
+                    Some(b"c".to_vec()),
+                    Some(b"regular".to_vec()),
+                    Some((-1i32).to_be_bytes().to_vec()),
+                ],
+            }],
+        };
+        assert!(parse_layout_from_result("ks", "t", &res).is_err());
     }
 }

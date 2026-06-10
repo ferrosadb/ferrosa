@@ -1535,7 +1535,11 @@ pub(crate) fn build_clustering_key(values: &[CqlValue]) -> Vec<u8> {
 ///
 /// Single PK: the whole byte slice is the single component.
 /// Composite PK: `[2-byte len][value bytes][0x00]` per component.
-fn decode_pk(dk: &DecoratedKey, num_components: usize) -> Vec<Vec<u8>> {
+///
+/// Public so offline tooling (e.g. ferrosa-ctl salvage re-ingest) can split a
+/// stored partition key back into the per-column values needed to bind a
+/// prepared INSERT.
+pub fn decode_pk(dk: &DecoratedKey, num_components: usize) -> Vec<Vec<u8>> {
     let bytes = dk.key.as_bytes();
     if num_components <= 1 {
         return vec![bytes.to_vec()];
@@ -1564,7 +1568,10 @@ fn decode_pk(dk: &DecoratedKey, num_components: usize) -> Vec<Vec<u8>> {
 ///
 /// Single CK: the whole byte slice is the single component.
 /// Multiple: `[2-byte len][value bytes]` per component.
-fn decode_clustering(bytes: &[u8], num_components: usize) -> Vec<Vec<u8>> {
+///
+/// Public so offline tooling (e.g. ferrosa-ctl salvage re-ingest) can split a
+/// stored clustering key back into the per-column values for a prepared INSERT.
+pub fn decode_clustering(bytes: &[u8], num_components: usize) -> Vec<Vec<u8>> {
     if bytes.is_empty() || num_components == 0 {
         return vec![];
     }
