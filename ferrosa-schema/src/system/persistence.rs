@@ -69,11 +69,26 @@ pub const ROLES_COL_SALTED_HASH: u16 = 2;
 pub const PERMISSIONS_COL_PERMISSIONS: u16 = 0;
 
 // ---------------------------------------------------------------------------
+// system_schema.indexes column indices
+// ---------------------------------------------------------------------------
+// Partition key: keyspace_name (text)
+// Clustering key: table_name (text), index_name (text) -- composite
+// Regular columns:
+
+/// `kind` text (index type kind, e.g. "btree", "phonetic").
+pub const INDEXES_COL_KIND: u16 = 0;
+/// `target` text (target columns joined with ", ").
+pub const INDEXES_COL_TARGET: u16 = 1;
+/// `options` text (index options stored as JSON bytes).
+pub const INDEXES_COL_OPTIONS: u16 = 2;
+
+// ---------------------------------------------------------------------------
 // SystemTableMutation enum
 // ---------------------------------------------------------------------------
 
 use crate::auth::permission::{GrantEntry, Permission, Resource};
 use crate::auth::role::RoleMetadata;
+use crate::metadata::index::IndexMetadata;
 use crate::metadata::keyspace::KeyspaceMetadata;
 use crate::metadata::table::TableMetadata;
 
@@ -108,6 +123,19 @@ pub enum SystemTableMutation {
         role: String,
         resource: Resource,
         permission: Permission,
+    },
+
+    // ---- system_schema.indexes ----
+    /// A secondary index was created or altered (upsert row).
+    IndexCreated(IndexMetadata),
+    /// A secondary index was dropped (tombstone row).
+    IndexDropped {
+        /// Keyspace owning the indexed table.
+        keyspace: String,
+        /// Table the index was built on.
+        table: String,
+        /// Name of the dropped index.
+        name: String,
     },
 }
 
@@ -331,6 +359,57 @@ pub fn grant_to_row(grant: &GrantEntry) -> (DecoratedKey, Row, i64) {
     (key, row, ts)
 }
 
+/// Map an `IndexType` to its persisted `kind` string for `system_schema.indexes`.
+pub fn index_type_kind(index_type: &ferrosa_index::IndexType) -> &'static str {
+    use ferrosa_index::IndexType;
+    match index_type {
+        IndexType::BTree => "btree",
+        IndexType::Hash => "hash",
+        IndexType::Composite => "composite",
+        IndexType::Phonetic => "phonetic",
+        IndexType::Filtered => "filtered",
+        IndexType::Vector => "vector",
+        IndexType::FullText => "fulltext",
+    }
+}
+
+/// Convert an `IndexMetadata` into a storage row for `system_schema.indexes`.
+///
+/// Partition key = `keyspace_name`; composite clustering =
+/// `[u16 len][table_name][u16 len][index_name]`; cells = kind, target, options.
+pub fn index_to_rows(index: &IndexMetadata) -> SystemRow {
+    let ts = now_micros();
+    let key = DecoratedKey::new(PartitionKey::new(index.keyspace.as_bytes().to_vec()));
+
+    // Composite clustering: [u16 len][table_name][u16 len][index_name].
+    let mut clustering = Vec::new();
+    clustering.extend_from_slice(&(index.table.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(index.table.as_bytes());
+    clustering.extend_from_slice(&(index.name.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(index.name.as_bytes());
+
+    let kind = index_type_kind(&index.index_type);
+    let target = index.target_columns.join(", ");
+    let options_json = serde_json::to_vec(&index.options).unwrap_or_default();
+
+    SystemRow {
+        key,
+        row: Row {
+            clustering,
+            cells: vec![
+                (
+                    INDEXES_COL_KIND,
+                    CellValue::live(kind.as_bytes().to_vec(), ts),
+                ),
+                (INDEXES_COL_TARGET, CellValue::live(target.into_bytes(), ts)),
+                (INDEXES_COL_OPTIONS, CellValue::live(options_json, ts)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // System table TableSchema builders
 // ---------------------------------------------------------------------------
@@ -478,12 +557,48 @@ pub fn role_permissions_table_schema() -> TableSchema {
     }
 }
 
+/// Returns `TableSchema` for `system_schema.indexes`.
+pub fn indexes_table_schema() -> TableSchema {
+    TableSchema {
+        keyspace: "system_schema".to_string(),
+        table: "indexes".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![
+            ColumnDefinition {
+                name: "table_name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "index_name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+        ],
+        static_columns: vec![],
+        regular_columns: vec![
+            ColumnDefinition {
+                name: "kind".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "target".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "options".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+        ],
+        extensions: Default::default(),
+    }
+}
+
 /// Returns all system table schemas for registration at bootstrap.
 pub fn all_system_table_schemas() -> Vec<TableSchema> {
     let mut schemas = vec![
         keyspaces_table_schema(),
         tables_table_schema(),
         columns_table_schema(),
+        indexes_table_schema(),
         roles_table_schema(),
         role_members_table_schema(),
         role_permissions_table_schema(),
@@ -580,10 +695,11 @@ mod tests {
     }
 
     #[test]
-    fn all_system_table_schemas_returns_nine() {
+    fn all_system_table_schemas_returns_ten() {
         let schemas = all_system_table_schemas();
-        assert_eq!(schemas.len(), 9);
+        assert_eq!(schemas.len(), 10);
         let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
+        assert!(names.contains(&(&"system_schema".to_string(), &"indexes".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"keyspaces".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"tables".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"columns".to_string())));
@@ -821,5 +937,109 @@ mod tests {
         assert_eq!(row.cells.len(), 1);
         let (idx, _cell) = &row.cells[0];
         assert_eq!(*idx, PERMISSIONS_COL_PERMISSIONS);
+    }
+
+    // -- index column index tests --
+
+    #[test]
+    fn indexes_column_indices_are_sequential() {
+        assert_eq!(INDEXES_COL_KIND, 0);
+        assert_eq!(INDEXES_COL_TARGET, 1);
+        assert_eq!(INDEXES_COL_OPTIONS, 2);
+    }
+
+    // -- index_to_rows tests --
+
+    #[test]
+    fn index_mutation_produces_row() {
+        use crate::metadata::index::IndexMetadata;
+        use ferrosa_index::IndexType;
+
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("threshold".to_string(), "0.8".to_string());
+        let idx = IndexMetadata {
+            keyspace: "ks".to_string(),
+            table: "people".to_string(),
+            name: "idx_phonetic_lastname".to_string(),
+            index_type: IndexType::Phonetic,
+            target_columns: vec!["last_name".to_string()],
+            filter_predicate: None,
+            options: opts.clone(),
+        };
+
+        let row = index_to_rows(&idx);
+
+        // Partition key = keyspace_name.
+        assert_eq!(row.key.key.as_bytes(), b"ks");
+
+        // Composite clustering: [u16 len][table][u16 len][index_name].
+        let mut expected_clustering = Vec::new();
+        expected_clustering.extend_from_slice(&("people".len() as u16).to_be_bytes());
+        expected_clustering.extend_from_slice(b"people");
+        expected_clustering
+            .extend_from_slice(&("idx_phonetic_lastname".len() as u16).to_be_bytes());
+        expected_clustering.extend_from_slice(b"idx_phonetic_lastname");
+        assert_eq!(row.row.clustering, expected_clustering);
+
+        // Three cells: kind, target, options.
+        assert_eq!(row.row.cells.len(), 3);
+
+        let (kind_idx, kind_cell) = &row.row.cells[0];
+        assert_eq!(*kind_idx, INDEXES_COL_KIND);
+        assert_eq!(kind_cell.value.as_deref(), Some(&b"phonetic"[..]));
+
+        let (target_idx, target_cell) = &row.row.cells[1];
+        assert_eq!(*target_idx, INDEXES_COL_TARGET);
+        assert_eq!(target_cell.value.as_deref(), Some(&b"last_name"[..]));
+
+        let (options_idx, options_cell) = &row.row.cells[2];
+        assert_eq!(*options_idx, INDEXES_COL_OPTIONS);
+        let stored: std::collections::HashMap<String, String> =
+            serde_json::from_slice(options_cell.value.as_deref().unwrap()).unwrap();
+        assert_eq!(stored, opts);
+
+        // Row is live (not a tombstone).
+        assert_eq!(row.row.deletion, DeletionTime::LIVE);
+    }
+
+    #[test]
+    fn index_to_rows_joins_multiple_targets() {
+        use crate::metadata::index::IndexMetadata;
+        use ferrosa_index::IndexType;
+
+        let idx = IndexMetadata {
+            keyspace: "ks".to_string(),
+            table: "t".to_string(),
+            name: "idx_comp".to_string(),
+            index_type: IndexType::Composite,
+            target_columns: vec!["a".to_string(), "b".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+
+        let row = index_to_rows(&idx);
+        let (_, target_cell) = &row.row.cells[1];
+        assert_eq!(target_cell.value.as_deref(), Some(&b"a, b"[..]));
+    }
+
+    #[test]
+    fn indexes_table_schema_layout() {
+        let schema = indexes_table_schema();
+        assert_eq!(schema.keyspace, "system_schema");
+        assert_eq!(schema.table, "indexes");
+        assert_eq!(schema.clustering_columns.len(), 2);
+        assert_eq!(schema.clustering_columns[0].name, "table_name");
+        assert_eq!(schema.clustering_columns[1].name, "index_name");
+        assert_eq!(schema.regular_columns.len(), 3);
+        assert_eq!(schema.regular_columns[0].name, "kind");
+        assert_eq!(schema.regular_columns[1].name, "target");
+        assert_eq!(schema.regular_columns[2].name, "options");
+    }
+
+    #[test]
+    fn all_system_table_schemas_includes_indexes() {
+        let schemas = all_system_table_schemas();
+        let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
+        assert!(names.contains(&(&"system_schema".to_string(), &"indexes".to_string())));
     }
 }
