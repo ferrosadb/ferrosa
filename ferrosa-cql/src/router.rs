@@ -6274,7 +6274,9 @@ async fn route_create_index(
                 // the generic add_index() only builds a BTree.
                 state.engine.add_fulltext_index(&table_id, &index_name, pos)
             } else {
-                state.engine.add_index(&table_id, &index_name, pos)
+                state
+                    .engine
+                    .add_index(&table_id, &index_name, pos, index_type)
             };
 
             if let Err(e) = wire_result {

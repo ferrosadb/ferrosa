@@ -2485,6 +2485,7 @@ impl StorageEngine {
         table_id: &TableId,
         index_name: &str,
         column_position: usize,
+        index_type: ferrosa_index::IndexType,
     ) -> ferrosa_common::Result<()> {
         // Register with the tracker.
         self.index_tracker
@@ -2496,7 +2497,7 @@ impl StorageEngine {
         })?;
         state
             .store
-            .add_index(index_name.to_string(), column_position);
+            .add_index(index_name.to_string(), column_position, index_type);
 
         // Submit rebuild jobs for all existing SSTables.
         if let Some(ref scheduler) = self.index_scheduler {
@@ -2505,7 +2506,7 @@ impl StorageEngine {
                 let job = crate::index::IndexBuildJob {
                     sstable_id: sst_id,
                     index_name: index_name.to_string(),
-                    index_type: ferrosa_index::IndexType::BTree,
+                    index_type,
                     table: (
                         table_id.keyspace().to_string(),
                         table_id.table().to_string(),
@@ -5321,7 +5322,7 @@ impl StorageEngine {
                             let job = crate::index::IndexBuildJob {
                                 sstable_id: format!("{gen}"),
                                 index_name: index_name.clone(),
-                                index_type: ferrosa_index::IndexType::BTree,
+                                index_type: state.store.index_type_for(index_name),
                                 table: (
                                     table_id.keyspace().to_string(),
                                     table_id.table().to_string(),

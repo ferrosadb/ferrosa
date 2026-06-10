@@ -23,7 +23,7 @@ use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
 use ferrosa_common::task_pool::TaskPool;
 use ferrosa_common::Result;
-use ferrosa_index::{IndexKey, RowPosition};
+use ferrosa_index::{IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
 use ferrosa_sstable::reader::SSTableReader;
 use ferrosa_sstable::types::{Partition, Row};
@@ -430,6 +430,10 @@ pub struct TableStore<F: FlushTarget> {
     /// Column position is the index into `Row.cells` by column ordinal
     /// (matching the `u16` tag in each cell tuple).
     indexed_columns: Vec<(String, usize)>,
+    /// Per-index type, keyed by index name. Threaded from the schema so eager /
+    /// backfill / compaction index-build jobs carry the correct `IndexType`
+    /// instead of a hardcoded `BTree`. Missing entries default to `BTree`.
+    index_types: HashMap<String, IndexType>,
     /// Full-text index declarations: `(index_name, column_position)` pairs.
     /// Built as FTI sidecar files during flush.
     fulltext_indexes: Vec<(String, usize)>,
@@ -465,6 +469,16 @@ fn new_indexes(indexed_columns: &[(String, usize)]) -> Arc<HashMap<String, Arc<M
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
         .collect();
     Arc::new(map)
+}
+
+/// Default per-index types for a freshly-declared set of secondary indexes.
+/// Defaults every declaration to `BTree`; the true type is supplied later via
+/// [`TableStore::add_index`] (or by reload from persisted schema metadata).
+fn default_index_types(indexed_columns: &[(String, usize)]) -> HashMap<String, IndexType> {
+    indexed_columns
+        .iter()
+        .map(|(name, _)| (name.clone(), IndexType::BTree))
+        .collect()
 }
 
 /// Build a fresh `HashMap` of empty `VectorMemtableIndex` instances, one per
@@ -714,6 +728,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
+            index_types: default_index_types(&indexed_columns),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
@@ -915,6 +930,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
+            index_types: default_index_types(&indexed_columns),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
@@ -988,6 +1004,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
+            index_types: default_index_types(&indexed_columns),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
@@ -3802,9 +3819,10 @@ impl<F: FlushTarget> TableStore<F> {
     ///
     /// Returns `None` if no index with the given name was declared at
     /// Dynamically adds a secondary index. Future writes will be indexed.
-    pub fn add_index(&mut self, index_name: String, column_position: usize) {
+    pub fn add_index(&mut self, index_name: String, column_position: usize, index_type: IndexType) {
         self.indexed_columns
             .push((index_name.clone(), column_position));
+        self.index_types.insert(index_name.clone(), index_type);
         let current = self.view.load();
         let mut new_indexes = (*current.indexes).clone();
         new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
@@ -3834,6 +3852,16 @@ impl<F: FlushTarget> TableStore<F> {
     /// Returns the current secondary index declarations.
     pub fn indexed_columns(&self) -> &[(String, usize)] {
         &self.indexed_columns
+    }
+
+    /// The declared [`IndexType`] for a named secondary index, defaulting to
+    /// `BTree` when unknown. Used by the eager / backfill / compaction index
+    /// build paths so a job carries the index's real type.
+    pub fn index_type_for(&self, index_name: &str) -> IndexType {
+        self.index_types
+            .get(index_name)
+            .copied()
+            .unwrap_or(IndexType::BTree)
     }
 
     /// Returns the current full-text index declarations.
@@ -4537,6 +4565,27 @@ mod tests {
                 ..WriteOptions::default()
             },
         )
+    }
+
+    /// Phase 0 (index-type threading): `add_index` records the declared
+    /// `IndexType` so eager/backfill/compaction build jobs carry the real type
+    /// instead of a hardcoded `BTree`. Unknown indexes default to `BTree`.
+    #[test]
+    fn add_index_threads_declared_index_type() {
+        let mut store = test_store();
+        assert_eq!(
+            store.index_type_for("missing"),
+            IndexType::BTree,
+            "unknown index defaults to BTree"
+        );
+        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        store.add_index("emb_idx".to_string(), 1, IndexType::Vector);
+        assert_eq!(store.index_type_for("name_idx"), IndexType::Phonetic);
+        assert_eq!(
+            store.index_type_for("emb_idx"),
+            IndexType::Vector,
+            "a vector index is no longer mis-stamped as BTree"
+        );
     }
 
     fn file_backed_test_store(dir: &std::path::Path) -> TableStore<crate::flush::FileFlushTarget> {
