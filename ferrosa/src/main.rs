@@ -278,6 +278,18 @@ fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     load_or_generate_host_id_with(data_dir, std::env::var("FERROSA_HOST_ID").ok())
 }
 
+/// Adapts the live [`PeerManager`](ferrosa_net::peer::PeerManager) into the
+/// self-heal [`PeerHealthProbe`](ferrosa_storage::self_heal::PeerHealthProbe) so
+/// the controller's replica posture reflects currently-reachable peers at each
+/// tick (a healthy peer present ⇒ corrupt SSTables may be quarantined).
+struct LivePeerHealth(std::sync::Arc<ferrosa_net::peer::PeerManager>);
+
+impl ferrosa_storage::self_heal::PeerHealthProbe for LivePeerHealth {
+    fn healthy_peer_count(&self) -> usize {
+        self.0.live_peer_ids().len()
+    }
+}
+
 /// Core implementation that accepts an explicit host_id override.
 /// Avoids process-global env var mutation in tests.
 fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) -> Uuid {
@@ -709,22 +721,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ferrosa_storage::StorageEngine::spawn_time_series_materialization_worker(storage.clone());
 
-    // Self-healing controller: deterministic autonomous repair of corrupt
-    // SSTables. Gated by FERROSA_SELFHEAL_ENABLED (default on). Until the
-    // cluster-aware replica-health view is wired (a follow-up), it runs with a
-    // single-node view, which means corruption escalates-degraded and is never
-    // quarantined (FMEA #1: never lose the only copy). Startup smoke-test
-    // warnings fire independently of this controller.
-    {
-        let selfheal_cfg = ferrosa_storage::self_heal::SelfHealConfig::from_env();
-        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
-            std::sync::Arc::new(ferrosa_storage::self_heal::SingleNodeClusterView::default());
-        ferrosa_storage::self_heal::SelfHealController::spawn(
-            storage.clone(),
-            cluster_view,
-            selfheal_cfg,
-        );
-    }
+    // Self-healing controller is spawned later (step 6c), once the PeerManager
+    // exists, so its replica-health view reflects real cluster membership
+    // instead of the old single-node placeholder.
 
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
@@ -956,6 +955,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtimes.raft.spawn(async move {
         heartbeat_pm.run_heartbeat_loop().await;
     });
+
+    // 6c. Self-healing controller: deterministic autonomous quarantine of
+    // corrupt SSTables. Spawned here (after the PeerManager) so the replica
+    // posture reflects LIVE membership: with a healthy peer reachable, a node
+    // quarantines its OWN local corrupt generations — moving them out of the
+    // active set so they stop being re-detected (and re-logged) every tick;
+    // isolated, it leaves them in place (FMEA #1: never quarantine a possibly-
+    // only copy). Quarantine only moves files, never deletes. Gated by
+    // FERROSA_SELFHEAL_ENABLED (default on). Startup smoke-test warnings fire
+    // independently of this controller.
+    {
+        let selfheal_cfg = ferrosa_storage::self_heal::SelfHealConfig::from_env();
+        let peer_probe: std::sync::Arc<dyn ferrosa_storage::self_heal::PeerHealthProbe> =
+            std::sync::Arc::new(LivePeerHealth(peer_manager.clone()));
+        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
+            std::sync::Arc::new(ferrosa_storage::self_heal::ReplicaAwareClusterView::new(
+                ferrosa_cluster::raft::uuid_to_node_id(host_id),
+                peer_probe,
+            ));
+        ferrosa_storage::self_heal::SelfHealController::spawn(
+            storage.clone(),
+            cluster_view,
+            selfheal_cfg,
+        );
+    }
 
     // 7. Start internode RPC server with inbound peer callback
     let rpc_server = Arc::new(
