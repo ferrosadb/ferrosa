@@ -301,6 +301,13 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
             schema
                 .create_index_internal(idx.clone())
                 .map_err(|e| ClusterError::Internal(format!("create_index: {e}")))?;
+            SystemTableWriter::new(Arc::clone(engine))
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::IndexCreated(
+                        idx.clone(),
+                    ),
+                )
+                .map_err(ClusterError::Storage)?;
         }
         DdlOperation::DropIndex {
             keyspace,
@@ -310,6 +317,15 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
             schema
                 .drop_index_internal(keyspace, table, index)
                 .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
+            SystemTableWriter::new(Arc::clone(engine))
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::IndexDropped {
+                        keyspace: keyspace.clone(),
+                        table: table.clone(),
+                        name: index.clone(),
+                    },
+                )
+                .map_err(ClusterError::Storage)?;
         }
         DdlOperation::CreateType(ref udt) => {
             schema
@@ -1141,6 +1157,129 @@ mod tests {
         engine
             .write(&table_id, &key, row, 1)
             .expect("storage should accept write after table registered");
+    }
+
+    fn simple_index(ks: &str, table: &str, name: &str) -> ferrosa_schema::IndexMetadata {
+        ferrosa_schema::IndexMetadata {
+            keyspace: ks.to_string(),
+            table: table.to_string(),
+            name: name.to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["col".to_string()],
+            filter_predicate: None,
+            options: HashMap::new(),
+        }
+    }
+
+    /// After a CREATE INDEX through the Direct DDL path, a row must be
+    /// persisted to `system_schema.indexes` and survive a flush — exactly
+    /// like the auth-table dogfooding (`GrantUpdated`/`RoleCreated`).
+    #[tokio::test]
+    async fn direct_create_index_persists_row_to_system_schema_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+        // `system_schema.indexes` must be a registered table before its
+        // rows can be written (bootstrap ordering).
+        engine.register_system_tables().unwrap();
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        };
+
+        let idx = simple_index("ks", "users", "idx_col");
+        ddl.execute(DdlOperation::CreateIndex(idx.clone()))
+            .await
+            .unwrap();
+
+        // The Registry holds the index in memory.
+        assert!(
+            schema.snapshot().indexes.contains_key(&(
+                "ks".into(),
+                "users".into(),
+                "idx_col".into()
+            )),
+            "index should be visible in the Registry"
+        );
+
+        // A stored row must exist in system_schema.indexes, keyed by keyspace.
+        let tid = ferrosa_storage::TableId::new("system_schema", "indexes");
+        let key = ferrosa_common::key::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"ks".to_vec(),
+        ));
+        let before = engine
+            .read(&tid, &key)
+            .expect("read should succeed")
+            .expect("system_schema.indexes partition should exist after CREATE INDEX");
+        assert!(
+            !before.rows.is_empty(),
+            "stored partition should contain the index row"
+        );
+
+        // Survive a flush: the row must still be readable from the SSTable.
+        engine.flush(&tid).expect("flush should succeed");
+        let after = engine
+            .read(&tid, &key)
+            .expect("read should succeed")
+            .expect("system_schema.indexes partition should survive a flush");
+        assert!(
+            !after.rows.is_empty(),
+            "stored index row should survive a flush"
+        );
+    }
+
+    /// After a DROP INDEX through the Direct DDL path, the stored row in
+    /// `system_schema.indexes` must be tombstoned (no live rows remain).
+    #[tokio::test]
+    async fn direct_drop_index_tombstones_row_in_system_schema_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        };
+
+        ddl.execute(DdlOperation::CreateIndex(simple_index(
+            "ks", "users", "idx_col",
+        )))
+        .await
+        .unwrap();
+
+        ddl.execute(DdlOperation::DropIndex {
+            keyspace: "ks".into(),
+            table: "users".into(),
+            index: "idx_col".into(),
+        })
+        .await
+        .unwrap();
+
+        // The Registry no longer holds the index.
+        assert!(
+            !schema.snapshot().indexes.contains_key(&(
+                "ks".into(),
+                "users".into(),
+                "idx_col".into()
+            )),
+            "index should be removed from the Registry"
+        );
+
+        // The stored partition must have no live index rows after the tombstone.
+        let tid = ferrosa_storage::TableId::new("system_schema", "indexes");
+        let key = ferrosa_common::key::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"ks".to_vec(),
+        ));
+        let partition = engine.read(&tid, &key).expect("read should succeed");
+        let live_rows = partition
+            .map(|p| p.rows.iter().filter(|r| !r.cells.is_empty()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            live_rows, 0,
+            "dropped index should leave no live rows in system_schema.indexes"
+        );
     }
 
     #[tokio::test]
