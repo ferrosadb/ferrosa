@@ -448,6 +448,16 @@ pub struct TableStore<F: FlushTarget> {
     /// Incremented on each flush. Used by compaction swap to identify
     /// exactly which SSTables to remove.
     next_gen: std::sync::atomic::AtomicU64,
+    /// Partition-key scopes observed per vector index, accumulated at flush.
+    ///
+    /// Persisted vector sidecars store only a placeholder `RowPosition::offset`
+    /// and do **not** record the partition key, so a flushed global-sidecar
+    /// `IndexResult` cannot be mapped back to a base-table row on its own. The
+    /// scoped per-prefix sidecars written at flush time *are* keyed by scope,
+    /// so remembering which scopes were flushed lets the index-consult path in
+    /// [`ann_search_partitions`] enumerate those scoped sidecars and recover the
+    /// actual partition keys without a full table scan.
+    vector_index_scopes: parking_lot::Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
 }
 
 fn new_memtable() -> Arc<dyn Memtable> {
@@ -734,6 +744,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
@@ -936,6 +947,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
@@ -1010,6 +1022,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
@@ -1995,6 +2008,14 @@ impl<F: FlushTarget> TableStore<F> {
                 }
 
                 for (scope, scoped_entries) in by_scope {
+                    // Remember this scope so `ann_search_partitions` can later
+                    // enumerate the scoped sidecar and recover partition keys
+                    // (the global sidecar drops the scope on write).
+                    self.vector_index_scopes
+                        .lock()
+                        .entry(cfg.index_name.clone())
+                        .or_default()
+                        .insert(scope.clone());
                     let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
                     match ferrosa_index::vector::hnsw::build_and_serialize(
                         cfg.m,
@@ -4149,6 +4170,124 @@ impl<F: FlushTarget> TableStore<F> {
         });
         all.truncate(k);
         Ok(all.into_iter().map(|(_, result)| result).collect())
+    }
+
+    /// Consult the vector index for the `k` nearest rows and return their
+    /// **base-table partitions** in ascending-score (nearest-first) order.
+    ///
+    /// Unlike [`ann_search`], which returns placeholder `IndexResult`s whose
+    /// `RowPosition::offset` cannot address a row, this method recovers the
+    /// partition-key scope captured at insert time and fetches each row via the
+    /// normal read path — so the router can serve `ORDER BY col ANN OF [...]
+    /// LIMIT k` straight from the index without a full table scan.
+    ///
+    /// Sources and scope availability (Fail Loud, Never Fake):
+    /// - **Active/flushing memtable**: the partition key is carried inline by
+    ///   [`VectorMemtableIndex::search_with_scopes`]; rows are recovered exactly.
+    /// - **Flushed scoped sidecars**: written per partition-key prefix at flush
+    ///   time and remembered in `vector_index_scopes`, so each is probed under
+    ///   its own scope and the partition key is recovered from that scope.
+    /// - **Flushed *global* HNSW sidecar / quantized `.qvec`**: these persist
+    ///   only a placeholder offset and therefore carry **no** partition key. A
+    ///   result that arrives only from such a scope-less source cannot be mapped
+    ///   to a row; rather than fabricate one, this method **logs a loud warning
+    ///   and skips it**. (In practice every flushed vector also lands in a
+    ///   scoped sidecar, so scope recovery succeeds; the warning fires only for
+    ///   legacy/external artifacts that predate scoped sidecars.)
+    ///
+    /// The result is bounded by `k`: at most `k` partitions are ever fetched.
+    pub fn ann_search_partitions(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<Partition>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Best (lowest) score per partition-key scope. Deduping by scope keeps
+        // one entry per partition and lets us bound the fetch by k.
+        let mut best_by_scope: HashMap<Vec<u8>, f32> = HashMap::new();
+        let mut consider = |scope: Vec<u8>, score: f32| {
+            best_by_scope
+                .entry(scope)
+                .and_modify(|existing| {
+                    if score < *existing {
+                        *existing = score;
+                    }
+                })
+                .or_insert(score);
+        };
+
+        // Source (a): active memtable — scope carried inline.
+        let guard = self.view.load();
+        let mut scopeless_memtable_hits = 0usize;
+        if let Some(vi) = guard.vector_indexes.get(index_name) {
+            let results = vi.search_with_scopes(query, k, ef_search).map_err(|e| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "ann_search_partitions memtable failed: {e}"
+                ))
+            })?;
+            for (result, scope) in results {
+                match scope {
+                    Some(scope) => consider(scope, result.score),
+                    None => scopeless_memtable_hits += 1,
+                }
+            }
+        }
+        if scopeless_memtable_hits > 0 {
+            tracing::warn!(
+                index_name,
+                scopeless_memtable_hits,
+                "ann_search_partitions: skipping memtable vector results without a \
+                 partition-key scope — cannot recover the base row, falling back loudly \
+                 (these rows will not appear in index-consult results)"
+            );
+        }
+
+        // Source (b): flushed scoped sidecars — probe each remembered scope.
+        let scopes: Vec<Vec<u8>> = self
+            .vector_index_scopes
+            .lock()
+            .get(index_name)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        for scope in scopes {
+            let scoped =
+                self.ann_search_in_partition_scope(index_name, &scope, query, k, ef_search)?;
+            for result in scoped {
+                consider(scope.clone(), result.score);
+            }
+        }
+
+        // Rank scopes by best score, take the k nearest, then fetch their rows.
+        let mut ranked: Vec<(Vec<u8>, f32)> = best_by_scope.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(k);
+
+        let mut partitions = Vec::with_capacity(ranked.len());
+        for (scope, _score) in ranked {
+            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(scope.clone()));
+            match self.read(&dk) {
+                Ok(Some(partition)) => partitions.push(partition),
+                Ok(None) => {
+                    tracing::warn!(
+                        index_name,
+                        "ann_search_partitions: vector index referenced a partition that no \
+                         longer exists in the base table; skipping (index/base drift)"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(partitions)
     }
 
     /// Returns the generation number of the most recently flushed SSTable.
@@ -7009,6 +7148,94 @@ mod tests {
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
         );
+    }
+
+    #[test]
+    fn ann_search_partitions_returns_nearest_rows_with_pk_in_score_order() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        // k0 is the exact match for the query, k1 close, k2 far.
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .unwrap();
+        store
+            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .unwrap();
+
+        let partitions = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .expect("ann_search_partitions must not fail");
+
+        // k < N: only the two nearest partitions come back.
+        assert_eq!(
+            partitions.len(),
+            2,
+            "k=2 must yield exactly two partitions, got {partitions:?}"
+        );
+        // Nearest-first: k0 then k1. The partition key is recovered from scope.
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
+        assert_eq!(partitions[1].key.key.as_bytes(), b"k1");
+        // The recovered partition actually carries the row payload.
+        assert!(
+            !partitions[0].rows.is_empty(),
+            "recovered partition must contain its row(s)"
+        );
+    }
+
+    #[test]
+    fn ann_search_partitions_recovers_rows_after_flush() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .unwrap();
+        // Flush moves the vectors into the persisted (scoped) sidecars; the row
+        // payloads live in the SSTable. The index-consult path must still recover
+        // the nearest partition by partition key.
+        store.flush().unwrap();
+
+        let partitions = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .expect("ann_search_partitions must not fail after flush");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
+        assert!(!partitions[0].rows.is_empty());
     }
 
     #[test]

@@ -2909,6 +2909,30 @@ impl StorageEngine {
         state.store.ann_search(index_name, query, k, ef_search)
     }
 
+    /// Consult the vector index and return the `k` nearest base-table
+    /// partitions in nearest-first score order.
+    ///
+    /// Thin wrapper over [`TableStore::ann_search_partitions`]; see its docs for
+    /// the per-source scope-recovery and fail-loud behavior. Lets the CQL router
+    /// serve `ORDER BY col ANN OF [...] LIMIT k` from the index instead of a full
+    /// table scan + post-filter.
+    pub fn ann_search_partitions(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state
+            .store
+            .ann_search_partitions(index_name, query, k, ef_search)
+    }
+
     /// Run an ANN search bounded to partition keys with `partition_scope`.
     pub fn ann_search_in_partition_scope(
         &self,
