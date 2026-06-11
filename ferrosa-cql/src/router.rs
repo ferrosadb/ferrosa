@@ -2853,9 +2853,13 @@ async fn route_geo_select(
                             .to_string(),
                     ));
                 }
-                // Cover the polygon's bounding box, then refine each candidate
-                // with the exact point-in-polygon test. A degenerate polygon has
-                // no bbox and matches nothing.
+                // Cover the polygon's bounding box, then refine each candidate.
+                // The cell cover is coarse, so the fetched rows over-approximate
+                // the polygon's bbox. We bulk-load the candidate points into an
+                // R-tree and query it with the polygon's exact bbox: that prunes
+                // off-bbox candidates in O(log n) before running the expensive
+                // point-in-polygon ray-cast only on the survivors. A degenerate
+                // polygon has no bbox and matches nothing.
                 match geo::polygon_bbox(&polygon) {
                     Some((sw, ne)) => {
                         let ranges = cover_ranges_to_pairs(&geo::cover_bbox(
@@ -2864,13 +2868,21 @@ async fn route_geo_select(
                             geo::DEFAULT_COVER_LEVEL,
                         ));
                         let rows = fetch_rows(ranges)?;
-                        rows.into_iter()
-                            .filter(|row| {
-                                row_geo_point(row, geo_col_idx)
-                                    .map(|(la, lo)| geo::point_in_polygon(la, lo, &polygon))
-                                    .unwrap_or(false)
-                            })
-                            .collect()
+                        // Each candidate carries its row index as the opaque id so
+                        // the R-tree survivors map straight back to source rows.
+                        let candidates: Vec<geo::GeoPoint<usize>> =
+                            rows.iter()
+                                .enumerate()
+                                .filter_map(|(i, row)| {
+                                    row_geo_point(row, geo_col_idx)
+                                        .map(|(lat, lon)| geo::GeoPoint { id: i, lat, lon })
+                                })
+                                .collect();
+                        let mut kept = geo::points_in_polygon_rtree(&candidates, &polygon);
+                        // Stable, deterministic output order (R-tree traversal is
+                        // not input order).
+                        kept.sort_unstable();
+                        kept.into_iter().map(|i| rows[i].clone()).collect()
                     }
                     None => Vec::new(),
                 }
