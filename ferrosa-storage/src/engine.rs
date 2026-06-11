@@ -733,6 +733,51 @@ fn cell_text(row: &Row, col_index: u16) -> Option<String> {
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// A decoded row of the persisted `system_schema.indexes` table.
+///
+/// Returned by [`StorageEngine::read_persisted_indexes`] so the CQL router can
+/// serve `SELECT * FROM system_schema.indexes` from storage. Field order
+/// mirrors the persisted layout: PK `keyspace_name`, clustering
+/// `(table_name, index_name)`, regular cells `kind`/`target`/`options`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedIndexRow {
+    /// Partition key — the keyspace the index belongs to.
+    pub keyspace_name: String,
+    /// First clustering column — the indexed table.
+    pub table_name: String,
+    /// Second clustering column — the index name.
+    pub index_name: String,
+    /// Index kind string (`btree`, `hash`, …).
+    pub kind: String,
+    /// Target column(s), comma-joined.
+    pub target: String,
+    /// Index options serialized as JSON.
+    pub options: String,
+}
+
+/// Decode one stored `system_schema.indexes` row into a [`PersistedIndexRow`].
+///
+/// Returns `None` for tombstones or rows whose clustering / required cells are
+/// missing or malformed, so callers surface only well-formed index metadata.
+fn decode_persisted_index_row(keyspace: &str, row: &Row) -> Option<PersistedIndexRow> {
+    let (table_name, index_name) = decode_index_clustering(&row.clustering)?;
+    let kind = cell_text(row, ferrosa_schema::system::persistence::INDEXES_COL_KIND)?;
+    let target = cell_text(row, ferrosa_schema::system::persistence::INDEXES_COL_TARGET)?;
+    let options = cell_text(
+        row,
+        ferrosa_schema::system::persistence::INDEXES_COL_OPTIONS,
+    )
+    .unwrap_or_else(|| "{}".to_string());
+    Some(PersistedIndexRow {
+        keyspace_name: keyspace.to_string(),
+        table_name,
+        index_name,
+        kind,
+        target,
+        options,
+    })
+}
+
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
 type SSTableSidecarMap = Arc<HashMap<String, crate::index::sidecar::SidecarReader>>;
 
@@ -2553,6 +2598,71 @@ impl StorageEngine {
             );
         }
         Ok(restored)
+    }
+
+    /// Reads every live row of the persisted `system_schema.indexes` table and
+    /// decodes it into [`PersistedIndexRow`]s.
+    ///
+    /// This is the storage-backed source for `SELECT * FROM
+    /// system_schema.indexes` (dogfooding step 4): the CQL router serves the
+    /// query from these stored rows rather than recomputing from the in-memory
+    /// Registry or the retired virtual table. Tombstoned/unresolvable rows are
+    /// skipped. Returns an empty vector when the table is not registered.
+    pub fn read_persisted_indexes(&self) -> ferrosa_common::Result<Vec<PersistedIndexRow>> {
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        if !self.tables.read().contains_key(&indexes_tid) {
+            return Ok(Vec::new());
+        }
+
+        const MAX_INDEXES_TO_READ: usize = 10_000;
+        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_READ)?;
+
+        let mut out = Vec::new();
+        for partition in &partitions {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
+            for row in &partition.rows {
+                if let Some(decoded) = decode_persisted_index_row(&keyspace, row) {
+                    out.push(decoded);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Tombstones a `system_schema.indexes` row (DROP INDEX) using the same
+    /// composite-clustering encoding as the create path.
+    ///
+    /// Shares the dogfooded layout with
+    /// `ferrosa_schema::system::persistence::index_to_rows` so a tombstone
+    /// written here masks the matching live row. Used by the standalone (Direct)
+    /// DDL path; the cluster/pair paths tombstone via `SystemTableWriter`.
+    pub fn write_index_tombstone(
+        &self,
+        keyspace: &str,
+        table: &str,
+        index_name: &str,
+    ) -> ferrosa_common::Result<()> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let key = DecoratedKey::new(PartitionKey::new(keyspace.as_bytes().to_vec()));
+
+        // Composite clustering: [u16 len][table][u16 len][index_name].
+        let mut clustering = Vec::new();
+        clustering.extend_from_slice(&(table.len() as u16).to_be_bytes());
+        clustering.extend_from_slice(table.as_bytes());
+        clustering.extend_from_slice(&(index_name.len() as u16).to_be_bytes());
+        clustering.extend_from_slice(index_name.as_bytes());
+
+        let row = Row {
+            clustering,
+            cells: vec![],
+            deletion: ferrosa_sstable::types::DeletionTime::new(ts, (ts / 1_000_000) as u32),
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+        };
+        let tid = TableId::new("system_schema", "indexes");
+        self.write(&tid, &key, row, ts)
     }
 
     /// Re-registers a single index from a decoded `system_schema.indexes` row.

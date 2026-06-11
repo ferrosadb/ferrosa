@@ -228,10 +228,13 @@ impl Schema {
             virtual_table_registry: Arc::new(VirtualTableRegistry::new()),
         };
 
-        // Register built-in virtual tables
-        schema.virtual_table_registry.register(Arc::new(
-            crate::system::index_tables::SystemSchemaIndexesTable::new(schema.snapshot_handle()),
-        ));
+        // Register built-in virtual tables.
+        //
+        // `system_schema.indexes` is no longer a virtual table: it is now a
+        // real, persisted, storage-served table (dogfooding step 4). The CQL
+        // router reads it via `StorageEngine::read_persisted_indexes`; the
+        // Registry remains only the in-memory cache, rebuilt from those rows at
+        // boot.
         schema.virtual_table_registry.register(Arc::new(
             crate::system::type_tables::SystemSchemaTypesTable::new(schema.snapshot_handle()),
         ));

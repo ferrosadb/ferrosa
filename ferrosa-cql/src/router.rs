@@ -2074,7 +2074,10 @@ async fn route_select(
             ))
         }
         ("system_schema", "indexes") => {
-            let snap = state.schema.snapshot();
+            // Dogfooding step 4: serve from the persisted `system_schema.indexes`
+            // storage table (not the in-memory Registry or the retired virtual
+            // table). The Registry remains the live in-memory cache, rebuilt from
+            // these same rows at boot.
             let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
                 "table_name".into(),
@@ -2089,58 +2092,20 @@ async fn route_select(
                 CqlType::Varchar,
                 CqlType::Varchar,
             ];
-            // Apply WHERE equality filters.
-            let filtered: Vec<_> = snap
-                .indexes
-                .iter()
-                .filter(|((ks, tbl, name), _)| {
-                    s.where_clauses.iter().all(|wc| {
-                        if wc.op != crate::ast::ComparisonOp::Eq {
-                            return true;
-                        }
-                        let val = match &wc.value {
-                            crate::ast::Term::StringLiteral(s) => s.as_str(),
-                            _ => return true,
-                        };
-                        match wc.column.as_str() {
-                            "keyspace_name" => ks.as_str() == val,
-                            "table_name" => tbl.as_str() == val,
-                            "index_name" => name.as_str() == val,
-                            _ => true,
-                        }
-                    })
-                })
-                .collect();
-            let rows: Vec<Vec<Option<CqlValue>>> = filtered
-                .iter()
-                .map(|((ks, tbl, name), idx)| {
-                    let kind = match idx.index_type {
-                        IndexType::BTree => "COMPOSITES",
-                        IndexType::Hash => "CUSTOM",
-                        IndexType::Composite => "COMPOSITES",
-                        IndexType::Phonetic => "CUSTOM",
-                        IndexType::Filtered => "CUSTOM",
-                        IndexType::Vector => "CUSTOM",
-                        IndexType::FullText => "CUSTOM",
-                    };
-                    // Format options as a simple comma-separated key=value string
-                    // (avoiding a serde_json dependency in this crate).
-                    let options_json = if idx.options.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        let pairs: Vec<String> = idx
-                            .options
-                            .iter()
-                            .map(|(k, v)| format!("\"{k}\":\"{v}\""))
-                            .collect();
-                        format!("{{{}}}", pairs.join(","))
-                    };
+            let stored = state
+                .engine
+                .read_persisted_indexes()
+                .map_err(|e| CqlError::ServerError(format!("read system_schema.indexes: {e}")))?;
+            let rows: Vec<Vec<Option<CqlValue>>> = stored
+                .into_iter()
+                .filter(|r| index_row_matches_where(r, &s.where_clauses))
+                .map(|r| {
                     vec![
-                        Some(CqlValue::Text(ks.clone())),
-                        Some(CqlValue::Text(tbl.clone())),
-                        Some(CqlValue::Text(name.clone())),
-                        Some(CqlValue::Text(kind.to_string())),
-                        Some(CqlValue::Text(options_json)),
+                        Some(CqlValue::Text(r.keyspace_name)),
+                        Some(CqlValue::Text(r.table_name)),
+                        Some(CqlValue::Text(r.index_name)),
+                        Some(CqlValue::Text(cassandra_index_kind(&r.kind).to_string())),
+                        Some(CqlValue::Text(r.options)),
                     ]
                 })
                 .collect();
@@ -6210,6 +6175,10 @@ async fn route_create_index(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            // Dogfood: persist the system_schema.indexes row so the storage-backed
+            // SELECT path returns it. The cluster/pair DDL paths persist this via
+            // SystemTableWriter on the leader; standalone Direct mode writes it here.
+            persist_index_row_direct(&state.engine, &index_meta);
             state.schema.create_index(index_meta, ctx.auth)?;
         }
         DdlPath::Pair(coordinator) => {
@@ -6347,6 +6316,9 @@ async fn route_drop_index(
             state
                 .schema
                 .drop_index(ks, &table_name, &s.name, ctx.auth)?;
+            // Tombstone the dogfooded system_schema.indexes row (cluster/pair
+            // paths do this via SystemTableWriter; Direct mode does it here).
+            tombstone_index_row_direct(&state.engine, ks, &table_name, &s.name);
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropIndex {
@@ -7704,6 +7676,82 @@ mod like_match_tests {
 /// projects down to the columns requested in the `SELECT` list. If the
 /// `SELECT` list contains `toJson(col)`, the column value is serialized to
 /// a JSON string using [`bridge::cql_value_to_json`].
+/// Persist a `system_schema.indexes` row for standalone (Direct) DDL.
+///
+/// The cluster/pair DDL paths dogfood this via `SystemTableWriter` on the Raft
+/// leader; standalone mode has no such path, so the CQL router writes the row
+/// directly. A failure here (e.g. the system table is not registered in a
+/// schema-only deployment) is logged loudly but does not fail CREATE INDEX —
+/// the index is still live in the Registry and is repersisted at next boot.
+fn persist_index_row_direct(engine: &StorageEngine, index: &IndexMetadata) {
+    let row = ferrosa_schema::system::persistence::index_to_rows(index);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let tid = TableId::new("system_schema", "indexes");
+    if let Err(e) = engine.write(&tid, &row.key, row.row, ts) {
+        tracing::warn!(
+            %e,
+            keyspace = %index.keyspace,
+            table = %index.table,
+            index = %index.name,
+            "router: failed to persist system_schema.indexes row (Direct DDL)"
+        );
+    }
+}
+
+/// Tombstone a `system_schema.indexes` row for standalone (Direct) DROP INDEX.
+///
+/// Mirrors [`persist_index_row_direct`] on the drop side. Failures are logged
+/// loudly but do not fail DROP INDEX — the Registry already dropped the index.
+fn tombstone_index_row_direct(engine: &StorageEngine, keyspace: &str, table: &str, name: &str) {
+    if let Err(e) = engine.write_index_tombstone(keyspace, table, name) {
+        tracing::warn!(
+            %e,
+            keyspace,
+            table,
+            index = name,
+            "router: failed to tombstone system_schema.indexes row (Direct DDL)"
+        );
+    }
+}
+
+/// Map a persisted `system_schema.indexes` kind string (`btree`, `hash`, …)
+/// to the Cassandra-faithful kind value (`COMPOSITES`/`CUSTOM`) that CQL
+/// drivers expect when introspecting `system_schema.indexes`.
+fn cassandra_index_kind(stored_kind: &str) -> &'static str {
+    match stored_kind {
+        "btree" | "composite" => "COMPOSITES",
+        _ => "CUSTOM",
+    }
+}
+
+/// Apply `SELECT ... WHERE col = '...'` equality predicates to a persisted
+/// `system_schema.indexes` row. Non-equality / non-string predicates and
+/// unknown columns are ignored (treated as matching), mirroring the prior
+/// best-effort virtual-table filter.
+fn index_row_matches_where(
+    row: &ferrosa_storage::PersistedIndexRow,
+    where_clauses: &[crate::ast::WhereClause],
+) -> bool {
+    where_clauses.iter().all(|wc| {
+        if wc.op != crate::ast::ComparisonOp::Eq {
+            return true;
+        }
+        let val = match &wc.value {
+            crate::ast::Term::StringLiteral(s) => s.as_str(),
+            _ => return true,
+        };
+        match wc.column.as_str() {
+            "keyspace_name" => row.keyspace_name == val,
+            "table_name" => row.table_name == val,
+            "index_name" => row.index_name == val,
+            _ => true,
+        }
+    })
+}
+
 fn apply_system_select(
     select_columns_ast: &[SelectColumn],
     all_col_names: &[String],
@@ -10787,6 +10835,127 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Step 4 (dogfood system_schema.indexes): `CREATE INDEX` then
+    /// `SELECT * FROM system_schema.indexes` must return the index — served
+    /// from the persisted `system_schema.indexes` storage table, not the
+    /// retired virtual table or the in-memory Registry computation.
+    #[tokio::test]
+    async fn select_system_schema_indexes_reads_from_storage() {
+        let (state, _dir) = setup();
+        // Boot order parity: system_schema.* tables are registered with the
+        // engine before any DDL runs (real boot does this at engine startup).
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE sysidx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE sysidx.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE INDEX sysidx_email ON sysidx.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT * — the row must come from the stored table.
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.indexes").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "CREATE INDEX must persist exactly one system_schema.indexes row"
+        );
+
+        // WHERE filter on the clustering index_name must still match.
+        let stmt = crate::parser::parse(
+            "SELECT * FROM system_schema.indexes WHERE index_name = 'sysidx_email'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "WHERE index_name filter must match the persisted row"
+        );
+    }
+
+    /// Proves the `system_schema.indexes` read path is backed by *storage*, not
+    /// the in-memory Registry: a row written directly to the stored table (with
+    /// no corresponding Registry entry) is still returned by the SELECT.
+    #[tokio::test]
+    async fn system_schema_indexes_served_from_storage_not_registry() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Write a system_schema.indexes row straight to storage, bypassing the
+        // Registry entirely.
+        let idx = ferrosa_schema::IndexMetadata {
+            keyspace: "ghost_ks".to_string(),
+            table: "ghost_tbl".to_string(),
+            name: "ghost_idx".to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["col".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        let row = ferrosa_schema::system::persistence::index_to_rows(&idx);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let tid = TableId::new("system_schema", "indexes");
+        state.engine.write(&tid, &row.key, row.row, ts).unwrap();
+
+        // The Registry has no such index, yet the SELECT returns it.
+        assert!(
+            !state.schema.snapshot().indexes.contains_key(&(
+                "ghost_ks".into(),
+                "ghost_tbl".into(),
+                "ghost_idx".into()
+            )),
+            "precondition: Registry must NOT contain the ghost index"
+        );
+
+        let stmt = crate::parser::parse(
+            "SELECT * FROM system_schema.indexes WHERE keyspace_name = 'ghost_ks'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "row written only to storage must be returned by the SELECT"
+        );
     }
 
     /// Regression: PR#21 (Gap 7) hardcoded the 10-col Cassandra-5.0 shape

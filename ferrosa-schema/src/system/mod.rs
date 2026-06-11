@@ -6,7 +6,6 @@
 pub mod aggregate_tables;
 pub mod auth_tables;
 pub mod function_tables;
-pub mod index_tables;
 pub mod local;
 pub mod observability;
 pub mod peers;
@@ -28,7 +27,6 @@ pub enum TopologyView {
 pub use aggregate_tables::SystemSchemaAggregatesTable;
 pub use auth_tables::{RoleMemberRow, RolePermissionRow, RoleRow};
 pub use function_tables::SystemSchemaFunctionsTable;
-pub use index_tables::SystemSchemaIndexesTable;
 pub use persistence::all_system_table_schemas;
 pub use schema_tables::{ColumnRow, KeyspaceRow, TableRow};
 pub use type_tables::SystemSchemaTypesTable;
