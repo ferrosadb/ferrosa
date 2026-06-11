@@ -76,6 +76,9 @@ pub trait IndexBuildBackend: Send + Sync {
 pub struct IndexBuildResult {
     /// SSTable that was indexed.
     pub sstable_id: String,
+    /// Type of the index that was built. Lets the scheduler and reader
+    /// selection stay type-correct after the build completes.
+    pub index_type: IndexType,
     /// Per-index sidecar entries: index_name -> [(key, position)].
     pub sidecar_entries:
         HashMap<String, Vec<(ferrosa_index::IndexKey, ferrosa_index::RowPosition)>>,
@@ -106,13 +109,101 @@ impl LocalBackend {
     }
 }
 
+/// Encode a raw cell value into a sidecar key according to the index type.
+///
+/// `BTree`/`Hash`/`Composite`/`Filtered` use the raw value verbatim.
+/// `Phonetic` returns the metaphone code of the UTF-8 text; non-UTF-8 or
+/// empty-code values yield `None` (the row is skipped). `Vector`/`FullText`
+/// are flush-built and must never reach this path.
+pub(crate) fn encode_index_key(
+    index_type: IndexType,
+    value: &[u8],
+) -> std::result::Result<Option<ferrosa_index::IndexKey>, String> {
+    use ferrosa_index::phonetic::metaphone::MetaphoneEncoder;
+    use ferrosa_index::phonetic::PhoneticEncoder;
+    use ferrosa_index::IndexKey;
+
+    match index_type {
+        IndexType::BTree | IndexType::Hash | IndexType::Composite | IndexType::Filtered => {
+            Ok(Some(IndexKey(value.to_vec())))
+        }
+        IndexType::Phonetic => {
+            let text = match std::str::from_utf8(value) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
+            if text.is_empty() {
+                return Ok(None);
+            }
+            let code = MetaphoneEncoder.encode(text);
+            if code.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(IndexKey(code.into_bytes())))
+            }
+        }
+        IndexType::Geo => match decode_geo_point(value) {
+            Some((lat, lon)) => Ok(Some(IndexKey(
+                ferrosa_index::geo::cell_id_key(lat, lon).to_vec(),
+            ))),
+            None => Ok(None),
+        },
+        IndexType::Vector | IndexType::FullText => Err(format!(
+            "{index_type:?} indexes are flush-built and must not be scheduler-built"
+        )),
+    }
+}
+
+/// Decode a CQL `frozen<tuple<double,double>>` cell into `(lat, lon)`.
+///
+/// The wire layout is two elements, each `[i32 big-endian length][value]`.
+/// A geo point therefore is `[0,0,0,8][8-byte f64 lat][0,0,0,8][8-byte f64 lon]`.
+/// Returns `None` (skip the row) if the bytes are not a well-formed pair of
+/// f64s rather than guessing — a malformed point must not silently index to a
+/// wrong cell.
+pub(crate) fn decode_geo_point(value: &[u8]) -> Option<(f64, f64)> {
+    let lat = read_tuple_f64(value, 0)?;
+    let lon = read_tuple_f64(value, 12)?;
+    Some((lat, lon))
+}
+
+/// Read the f64 element at byte `at` of a CQL tuple body (4-byte length prefix
+/// followed by an 8-byte big-endian f64).
+fn read_tuple_f64(value: &[u8], at: usize) -> Option<f64> {
+    let len_end = at.checked_add(4)?;
+    let body_end = len_end.checked_add(8)?;
+    if value.len() < body_end {
+        return None;
+    }
+    let len = i32::from_be_bytes(value[at..len_end].try_into().ok()?);
+    if len != 8 {
+        return None;
+    }
+    let bytes: [u8; 8] = value[len_end..body_end].try_into().ok()?;
+    Some(f64::from_be_bytes(bytes))
+}
+
 impl IndexBuildBackend for LocalBackend {
     fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
-        use ferrosa_index::{IndexKey, RowPosition};
+        use ferrosa_index::RowPosition;
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
 
         let start = Instant::now();
+
+        // Vector and FullText indexes are built on the flush path, not by the
+        // scheduler. Skip them here so no garbage sidecar is produced.
+        if matches!(job.index_type, IndexType::Vector | IndexType::FullText) {
+            return Ok(IndexBuildResult {
+                sstable_id: job.sstable_id.clone(),
+                index_type: job.index_type,
+                sidecar_entries: HashMap::new(),
+                build_duration: start.elapsed(),
+                sidecar_written_to_s3: false,
+                artifact_manifest_entries: Vec::new(),
+            });
+        }
+
         let gen = &job.sstable_id;
         let dir = &self.data_dir;
 
@@ -139,14 +230,26 @@ impl IndexBuildBackend for LocalBackend {
         })
         .map_err(|e| format!("open sstable: {e}"))?;
 
-        // Read all partitions and build sidecar entries.
-        let all_partitions = reader
-            .read_all_partitions()
-            .map_err(|e| format!("read partitions: {e}"))?;
+        // Stream partitions one at a time rather than materializing the whole
+        // SSTable. `read_all_partitions()` would hold every decoded partition —
+        // all cell values of all columns — in memory at once; on a large
+        // SSTable that is an OOM hazard. `partitions_iter()` keeps a single
+        // partition live plus the (much smaller) extracted index entries:
+        // O(1) memory for uncompressed SSTables, O(decompressed chunk) for
+        // compressed, independent of partition count. The index `entries` Vec
+        // is inherently O(indexed rows) — a sidecar must index every row, so it
+        // is not capped here (dropping entries would silently corrupt the
+        // index); the win is not holding the full row payloads alongside it.
+        let mut iter = reader
+            .partitions_iter()
+            .map_err(|e| format!("open partition iterator: {e}"))?;
 
-        let mut entries: Vec<(IndexKey, RowPosition)> = Vec::new();
+        let mut entries: Vec<(ferrosa_index::IndexKey, RowPosition)> = Vec::new();
 
-        for partition in &all_partitions {
+        while let Some(partition) = iter
+            .next_partition()
+            .map_err(|e| format!("read partition: {e}"))?
+        {
             let pk_bytes = partition.key.key.as_bytes().to_vec();
             for row in &partition.rows {
                 // Find the cell at the declared column position.
@@ -156,13 +259,15 @@ impl IndexBuildBackend for LocalBackend {
                     .find(|(pos, _)| *pos == job.column_position as u16);
                 if let Some((_col_pos, cell)) = cell_opt {
                     if let Some(ref value) = cell.value {
-                        entries.push((
-                            IndexKey(value.clone()),
-                            RowPosition {
-                                partition_key: pk_bytes.clone(),
-                                clustering_key: row.clustering.clone(),
-                            },
-                        ));
+                        if let Some(key) = encode_index_key(job.index_type, value)? {
+                            entries.push((
+                                key,
+                                RowPosition {
+                                    partition_key: pk_bytes.clone(),
+                                    clustering_key: row.clustering.clone(),
+                                },
+                            ));
+                        }
                     }
                 }
             }
@@ -175,6 +280,7 @@ impl IndexBuildBackend for LocalBackend {
 
         Ok(IndexBuildResult {
             sstable_id: job.sstable_id.clone(),
+            index_type: job.index_type,
             sidecar_entries,
             build_duration: start.elapsed(),
             sidecar_written_to_s3: false,
@@ -214,6 +320,7 @@ impl IndexBuildScheduler {
             fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
                 Ok(IndexBuildResult {
                     sstable_id: job.sstable_id.clone(),
+                    index_type: job.index_type,
                     sidecar_entries: HashMap::new(),
                     build_duration: std::time::Duration::from_millis(0),
                     sidecar_written_to_s3: false,
@@ -515,6 +622,53 @@ mod tests {
     use crate::index::IndexStatus;
     use std::time::Duration;
 
+    /// Build a CQL `frozen<tuple<double,double>>` wire body for a point.
+    fn geo_tuple_bytes(lat: f64, lon: f64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24);
+        for f in [lat, lon] {
+            v.extend_from_slice(&8i32.to_be_bytes());
+            v.extend_from_slice(&f.to_be_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn geo_index_encodes_cell_id_key() {
+        let bytes = geo_tuple_bytes(37.7749, -122.4194);
+        let key = encode_index_key(IndexType::Geo, &bytes)
+            .expect("geo encode must not error")
+            .expect("well-formed point yields a key");
+        let expected = ferrosa_index::geo::cell_id_key(37.7749, -122.4194);
+        assert_eq!(key.0, expected.to_vec());
+    }
+
+    #[test]
+    fn geo_keys_are_sortable_by_proximity_prefix() {
+        let near_a = encode_index_key(IndexType::Geo, &geo_tuple_bytes(37.7749, -122.4194))
+            .unwrap()
+            .unwrap();
+        let near_b = encode_index_key(IndexType::Geo, &geo_tuple_bytes(37.7750, -122.4195))
+            .unwrap()
+            .unwrap();
+        // Adjacent points share a long big-endian key prefix.
+        assert_eq!(near_a.0[..3], near_b.0[..3]);
+    }
+
+    #[test]
+    fn geo_index_skips_malformed_point() {
+        // Too short / wrong length prefix => skip the row rather than mis-index.
+        let result = encode_index_key(IndexType::Geo, &[0, 0, 0, 4, 1, 2, 3, 4]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decode_geo_point_round_trips() {
+        let bytes = geo_tuple_bytes(-12.5, 178.25);
+        let (lat, lon) = decode_geo_point(&bytes).expect("valid tuple decodes");
+        assert!((lat - (-12.5)).abs() < 1e-12);
+        assert!((lon - 178.25).abs() < 1e-12);
+    }
+
     #[test]
     fn scheduler_processes_jobs() {
         let tracker = Arc::new(IndexStateTracker::new());
@@ -615,6 +769,7 @@ mod tests {
 
         let result = IndexBuildResult {
             sstable_id: "sst-001".to_string(),
+            index_type: IndexType::BTree,
             sidecar_entries,
             build_duration: Duration::from_millis(42),
             sidecar_written_to_s3: false,
@@ -635,6 +790,7 @@ mod tests {
             fn build(&self, _job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
                 Ok(IndexBuildResult {
                     sstable_id: "mock".to_string(),
+                    index_type: IndexType::BTree,
                     sidecar_entries: std::collections::HashMap::new(),
                     build_duration: Duration::from_millis(0),
                     sidecar_written_to_s3: false,
@@ -824,6 +980,7 @@ mod tests {
                 BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
                 Ok(IndexBuildResult {
                     sstable_id: job.sstable_id.clone(),
+                    index_type: job.index_type,
                     sidecar_entries: std::collections::HashMap::new(),
                     build_duration: Duration::from_millis(1),
                     sidecar_written_to_s3: false,
@@ -915,6 +1072,7 @@ mod tests {
                 COMPLETED.fetch_add(1, Ordering::Relaxed);
                 Ok(IndexBuildResult {
                     sstable_id: job.sstable_id.clone(),
+                    index_type: job.index_type,
                     sidecar_entries: HashMap::new(),
                     build_duration: Duration::from_millis(200),
                     sidecar_written_to_s3: false,
@@ -960,6 +1118,7 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(30));
                 Ok(IndexBuildResult {
                     sstable_id: job.sstable_id.clone(),
+                    index_type: job.index_type,
                     sidecar_entries: HashMap::new(),
                     build_duration: Duration::from_secs(30),
                     sidecar_written_to_s3: false,
@@ -1019,6 +1178,7 @@ mod tests {
                 );
                 Ok(IndexBuildResult {
                     sstable_id: job.sstable_id.clone(),
+                    index_type: job.index_type,
                     sidecar_entries,
                     build_duration: Duration::from_millis(1),
                     sidecar_written_to_s3: false,
@@ -1129,6 +1289,237 @@ mod tests {
         scheduler.shutdown();
 
         assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Build a single-column SSTable with one UTF-8 text value per partition and
+    /// return its data directory and generation id. The column to index is at
+    /// position 0 (the lone regular column).
+    fn write_text_sstable(values: &[(&[u8], &[u8])]) -> (tempfile::TempDir, String) {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+        use ferrosa_sstable::writer::SSTableWriter;
+        use ferrosa_sstable::WriteOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sstable_dir = dir.path().to_path_buf();
+
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+
+        let mut partitions: Vec<Partition> = values
+            .iter()
+            .enumerate()
+            .map(|(i, (pk, val))| Partition {
+                key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: (i as u32 + 1).to_be_bytes().to_vec(),
+                    cells: vec![(0, CellValue::live(val.to_vec(), 1000 + i as i64))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
+                }],
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let header = crate::flush::build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let flush_target = crate::flush::FileFlushTarget::new(sstable_dir).unwrap();
+        let _reader = flush_target.flush(output).unwrap();
+        let gen = flush_target.generation();
+        (dir, format!("{gen}"))
+    }
+
+    #[test]
+    fn local_backend_phonetic_emits_metaphone_keys() {
+        use ferrosa_index::phonetic::metaphone::MetaphoneEncoder;
+        use ferrosa_index::phonetic::PhoneticEncoder;
+        use ferrosa_index::IndexKey;
+
+        let (dir, gen) = write_text_sstable(&[(b"pk1", b"Smith"), (b"pk2", b"Jones")]);
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: gen,
+            index_name: "name_phon".to_string(),
+            index_type: IndexType::Phonetic,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+        };
+
+        let result = backend.build(&job).unwrap();
+        assert_eq!(result.index_type, IndexType::Phonetic);
+
+        let entries = result
+            .sidecar_entries
+            .get("name_phon")
+            .expect("phonetic build should produce sidecar entries");
+
+        let enc = MetaphoneEncoder;
+        let raw_keys: Vec<IndexKey> = [b"Smith".to_vec(), b"Jones".to_vec()]
+            .into_iter()
+            .map(IndexKey)
+            .collect();
+        for (key, _pos) in entries {
+            // Keys must be metaphone-encoded, never the raw column value.
+            assert!(
+                !raw_keys.contains(key),
+                "phonetic key {key:?} is a raw value, not metaphone-encoded"
+            );
+            let text = std::str::from_utf8(&key.0).unwrap();
+            assert!(
+                text == enc.encode("Smith") || text == enc.encode("Jones"),
+                "phonetic key {text:?} is not a known metaphone code"
+            );
+        }
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn local_backend_vector_produces_no_sidecar() {
+        let (dir, gen) = write_text_sstable(&[(b"pk1", b"alice"), (b"pk2", b"bob")]);
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: gen,
+            index_name: "vec_idx".to_string(),
+            index_type: IndexType::Vector,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+        };
+
+        let result = backend.build(&job).unwrap();
+        assert_eq!(result.index_type, IndexType::Vector);
+        assert!(
+            result.sidecar_entries.is_empty(),
+            "vector columns are flush-built; scheduler must not emit a sidecar, got {:?}",
+            result.sidecar_entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn local_backend_fulltext_produces_no_sidecar() {
+        let (dir, gen) = write_text_sstable(&[(b"pk1", b"hello world")]);
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: gen,
+            index_name: "ft_idx".to_string(),
+            index_type: IndexType::FullText,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+        };
+
+        let result = backend.build(&job).unwrap();
+        assert_eq!(result.index_type, IndexType::FullText);
+        assert!(
+            result.sidecar_entries.is_empty(),
+            "fulltext is flush-built; scheduler must not emit a sidecar"
+        );
+    }
+
+    #[test]
+    fn local_backend_btree_emits_raw_value_keys() {
+        use ferrosa_index::IndexKey;
+
+        let (dir, gen) = write_text_sstable(&[(b"pk1", b"alice"), (b"pk2", b"bob")]);
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: gen,
+            index_name: "name_idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+        };
+
+        let result = backend.build(&job).unwrap();
+        assert_eq!(result.index_type, IndexType::BTree);
+
+        let entries = result.sidecar_entries.get("name_idx").unwrap();
+        let keys: Vec<IndexKey> = entries.iter().map(|(k, _)| k.clone()).collect();
+        // BTree keeps raw column values, unchanged from before.
+        assert!(keys.contains(&IndexKey(b"alice".to_vec())));
+        assert!(keys.contains(&IndexKey(b"bob".to_vec())));
+        assert_eq!(entries.len(), 2);
+    }
+
+    /// Regression guard for the streaming build path: building over many
+    /// partitions must emit exactly one index entry per indexed row — proving
+    /// the streaming `partitions_iter()` visits every partition with nothing
+    /// dropped or truncated, while never materializing the whole SSTable.
+    #[test]
+    fn local_backend_build_streams_all_rows_across_partitions() {
+        let values: Vec<(Vec<u8>, Vec<u8>)> = (0..50u32)
+            .map(|i| {
+                (
+                    format!("pk{i:03}").into_bytes(),
+                    format!("val{i:03}").into_bytes(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = values
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let (dir, gen) = write_text_sstable(&refs);
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: gen,
+            index_name: "name_idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+        };
+
+        let result = backend.build(&job).unwrap();
+        let entries = result
+            .sidecar_entries
+            .get("name_idx")
+            .expect("btree build should produce sidecar entries");
+        // Exactly one entry per row across all 50 partitions — nothing dropped.
+        assert_eq!(
+            entries.len(),
+            50,
+            "streaming build must visit every partition"
+        );
+        // Boundary partitions (first and last in token order) are indexed.
+        let has = |v: &[u8]| entries.iter().any(|(k, _)| k.0 == v);
+        assert!(
+            has(b"val000") && has(b"val049"),
+            "first and last partitions must both produce entries"
+        );
     }
 
     #[test]

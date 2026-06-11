@@ -7,7 +7,7 @@
 //! quarantine action are exercised against genuine SSTables, not hand-rolled
 //! files that could drift from the real format.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -32,8 +32,8 @@ pub mod detector;
 pub mod metrics;
 pub mod snapshot;
 
-#[cfg(test)]
-mod test_fixtures;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_fixtures;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -55,11 +55,12 @@ use metrics::{HealthEntry, SelfHealHealth as Health};
 /// Supplies the cluster-level facts the controller cannot read from the
 /// storage engine directly (the storage crate sits below the cluster crate).
 ///
-/// **This is the integration seam the lead asked about.** A follow-up wires a
-/// `ferrosa-cluster` implementation that answers replica health from the ring
-/// and peer reachability. Until then [`SingleNodeClusterView`] is used, which
-/// reports [`ReplicaPosture::SingleNode`] (the safe, never-quarantine posture;
-/// FMEA #1: a single-node engine must never quarantine).
+/// Production multi-node deployments wire [`ReplicaAwareClusterView`] (backed by
+/// a live [`PeerHealthProbe`] over the binary's `PeerManager`), so the posture
+/// reflects real peer reachability each tick. [`SingleNodeClusterView`] remains
+/// for genuine single-node deployments, reporting the safe never-quarantine
+/// [`ReplicaPosture::SingleNode`] (FMEA #1: a single-node engine must never
+/// quarantine its only copy).
 pub trait ClusterView: Send + Sync {
     /// This node's host-id (for deterministic initiator selection).
     fn this_host(&self) -> u64;
@@ -89,6 +90,60 @@ impl ClusterView for SingleNodeClusterView {
     }
     fn replica_posture(&self, _table: &TableKey) -> ReplicaPosture {
         ReplicaPosture::SingleNode
+    }
+}
+
+/// Runtime probe for the number of currently-healthy peer replicas (excluding
+/// this node). Implemented by the binary against the live `PeerManager` so the
+/// self-heal controller's replica posture reflects real cluster membership at
+/// each tick — not a stale startup snapshot.
+pub trait PeerHealthProbe: Send + Sync {
+    /// Count of reachable peer nodes right now. `0` means this node currently
+    /// sees no peers (a genuine single-node deployment, or an isolating
+    /// partition).
+    fn healthy_peer_count(&self) -> usize;
+}
+
+/// A cluster-aware [`ClusterView`] for multi-node deployments, replacing the
+/// [`SingleNodeClusterView`] placeholder.
+///
+/// When at least one healthy peer is reachable it reports
+/// [`ReplicaPosture::HealthyReplicaAvailable`], which lets the controller
+/// **quarantine** corrupt SSTables — moving them out of the live set so they
+/// stop being re-detected (and re-logged) every tick. Quarantine only *moves*
+/// files (never deletes) and a corrupt generation is already excluded from
+/// reads, so this never reduces availability. When no peer is reachable it
+/// reports [`ReplicaPosture::NoHealthyReplica`] so an isolated node never
+/// quarantines what might still be its only copy (FMEA #1).
+///
+/// `owners` is intentionally `None`: each node owns the generations on its own
+/// disk, so every node is its own initiator (see `RingView::initiator_for`) and
+/// quarantines ITS OWN local corrupt generations — exactly what's needed since
+/// quarantine is a node-local file move.
+pub struct ReplicaAwareClusterView {
+    host_id: u64,
+    peers: Arc<dyn PeerHealthProbe>,
+}
+
+impl ReplicaAwareClusterView {
+    pub fn new(host_id: u64, peers: Arc<dyn PeerHealthProbe>) -> Self {
+        Self { host_id, peers }
+    }
+}
+
+impl ClusterView for ReplicaAwareClusterView {
+    fn this_host(&self) -> u64 {
+        self.host_id
+    }
+    fn owners(&self, _table: &TableKey) -> Option<Vec<u64>> {
+        None
+    }
+    fn replica_posture(&self, _table: &TableKey) -> ReplicaPosture {
+        if self.peers.healthy_peer_count() > 0 {
+            ReplicaPosture::HealthyReplicaAvailable
+        } else {
+            ReplicaPosture::NoHealthyReplica
+        }
     }
 }
 
@@ -393,6 +448,74 @@ mod controller_tests {
         c.run_one_tick();
         let after = metrics::self_heal_metrics().quarantine_refused_no_replica_total;
         assert_eq!(before, after, "escalated issue must not loop / re-act");
+    }
+
+    struct FakePeers(usize);
+    impl PeerHealthProbe for FakePeers {
+        fn healthy_peer_count(&self) -> usize {
+            self.0
+        }
+    }
+
+    #[test]
+    fn replica_aware_view_posture_reflects_peer_health() {
+        let t = TableKey::new("k", "t");
+
+        let with_peers = ReplicaAwareClusterView::new(9, Arc::new(FakePeers(2)));
+        assert_eq!(with_peers.this_host(), 9);
+        assert_eq!(
+            with_peers.owners(&t),
+            None,
+            "owners unknown → every node is its own initiator"
+        );
+        assert_eq!(
+            with_peers.replica_posture(&t),
+            ReplicaPosture::HealthyReplicaAvailable
+        );
+        assert!(with_peers.replica_posture(&t).can_refill());
+
+        let isolated = ReplicaAwareClusterView::new(9, Arc::new(FakePeers(0)));
+        assert_eq!(
+            isolated.replica_posture(&t),
+            ReplicaPosture::NoHealthyReplica,
+            "no peers → do not quarantine the possibly-only copy"
+        );
+        assert!(!isolated.replica_posture(&t).can_refill());
+    }
+
+    /// End-to-end: with the real `ReplicaAwareClusterView` reporting a live peer,
+    /// the controller quarantines this node's local corrupt generation (the fix
+    /// for the SingleNode placeholder that left corrupt gens re-detected forever).
+    #[test]
+    #[serial]
+    fn replica_aware_view_quarantines_local_corrupt_gen() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let engine = table_dir_with_n_generations_engine(2);
+        let table_dir = engine.table_sstable_dir(&TableId::new("test_ks", "test_table"));
+        let gen = corrupt_one_generation(&table_dir);
+
+        let cluster = Arc::new(ReplicaAwareClusterView::new(0, Arc::new(FakePeers(1))));
+        let mut c = SelfHealController::new(engine, cluster, SelfHealConfig::default());
+        c.run_one_tick();
+
+        let quarantine_dir = table_dir.join("quarantine");
+        assert!(
+            quarantine_dir.exists(),
+            "live peer → corrupt gen quarantined"
+        );
+        let moved: Vec<String> = std::fs::read_dir(&quarantine_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            moved.iter().any(|n| n.starts_with(&format!("{gen}-"))),
+            "the corrupt generation's files were moved aside"
+        );
+        assert_eq!(
+            metrics::self_heal_metrics().quarantined_generations_total,
+            1
+        );
     }
 
     #[test]

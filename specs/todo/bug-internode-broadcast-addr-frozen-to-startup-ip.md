@@ -1,6 +1,6 @@
 # BUG: Internode broadcast address frozen to startup IP — stale Raft membership after container IP churn
 
-**Status**: Fixed on branch `fix/internode-broadcast-hostname-resolution` (awaiting verification on a real cluster). See "Suggested fix" — implemented option 1 (advertise + re-resolve the broadcast hostname).
+**Status**: Broadcast-hostname fix **merged** (PR #86, advertise + re-resolve the broadcast hostname — option 1). Follow-up for the lane-reconnect path — lanes reconnecting to a stale resolved IP instead of the advertised hostname — fixed in **PR #94** (`ferrosa-net` `pick_reconnect_host`, unit-tested). **Live-cluster verification still pending** on a real podman cluster; should move to `specs/verified-test-plan/` once verified, then to `archive/`. (2026-06-09)
 **Component**: `ferrosa-net` (config), `ferrosa-cluster` (Raft membership / internode routing)
 **Severity**: High — silent read-path degradation in any environment where node IPs change across restarts (podman/docker default networking, k8s pods, DHCP).
 **Found**: 2026-06-05, debugging a live `ferrosa-memory` 3-node dev cluster.

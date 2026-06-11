@@ -31,6 +31,11 @@ smallvec = "1"
 tracing = "0.1"
 ureq = { version = "3", features = ["json"] }
 proptest = { version = "1", optional = true }
+# Optional normal dep so `self_heal::test_fixtures` (behind `test-support`) can
+# build temp data dirs when this crate is consumed as a dependency by sibling
+# crates (their dev-deps don't activate our dev-deps). Also a dev-dep below for
+# this crate's own tests, mirroring how `proptest` is declared.
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -50,6 +55,12 @@ live-infra-tests = []
 # crates (ferrosa-loadgen soak) can reuse it. The validator is always available
 # to this crate's own tests regardless of this feature.
 compaction-validator = []
+# Exposes `self_heal::test_fixtures` (table_dir_with_n_generations /
+# corrupt_one_generation) so sibling crates — notably ferrosa-ctl's offline
+# `sstable` analysis/recovery tests — can build genuine on-disk BTI SSTables via
+# the production write path instead of hand-rolling files that could drift from
+# the real format. Off by default; pulled in only as a dev-dependency.
+test-support = ["dep:tempfile"]
 # macOS does not treat ordinary fsync/fdatasync as a hardware-cache flush.
 # Local macOS builds default to F_FULLFSYNC for correctness. Enable
 # macos-standard-sync only for explicit fast/dev runs that accept weaker

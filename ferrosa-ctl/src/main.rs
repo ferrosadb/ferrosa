@@ -155,6 +155,127 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Offline SSTable analysis and recovery (operates on a data directory; no
+    /// live node connection required).
+    Sstable {
+        #[command(subcommand)]
+        action: SstableAction,
+    },
+}
+
+/// SSTable analysis / recovery sub-actions (offline, filesystem-only).
+#[derive(Debug, Subcommand)]
+enum SstableAction {
+    /// Classify every generation in a table directory (OK vs CORRUPT) using the
+    /// engine's own startup smoke test — the exact check the self-heal detector
+    /// runs to decide what to quarantine.
+    Scan {
+        /// Path to a table's SSTable directory
+        /// (e.g. `/var/lib/ferrosa/sstables/agent_memory.entity_store`).
+        dir: std::path::PathBuf,
+
+        /// Also scan the `quarantine/` subdirectory.
+        #[arg(long)]
+        include_quarantine: bool,
+
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Deep single-generation report: component sizes, partition counts,
+    /// Data.db extent, timestamps, and a likely-corruption-class hint. Searches
+    /// the table dir then its `quarantine/` subdir.
+    Inspect {
+        /// Path to a table's SSTable directory.
+        dir: std::path::PathBuf,
+
+        /// Generation number to inspect.
+        gen: u64,
+
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Move every CORRUPT live generation into the `quarantine/` subdir so the
+    /// engine stops re-detecting and re-pulling them every self-heal cycle.
+    /// Healthy generations are never touched; files are moved, never deleted.
+    /// Dry-run by default — pass `--apply` (with the node STOPPED) to act.
+    Quarantine {
+        /// Path to a table's SSTable directory.
+        dir: std::path::PathBuf,
+
+        /// Actually move the files. Without this flag the command only prints
+        /// the plan. The node MUST be stopped before applying.
+        #[arg(long)]
+        apply: bool,
+
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Measure how many rows are recoverable from each generation using the
+    /// resilient salvage reader (recovers a partition's header + leading rows
+    /// even when a later row fails to decode). Pure read — recovers nothing to
+    /// disk; reports the yield so you can decide whether salvage is worthwhile.
+    Salvage {
+        /// Path to a table's SSTable directory.
+        dir: std::path::PathBuf,
+
+        /// Also measure generations in the `quarantine/` subdirectory.
+        #[arg(long)]
+        include_quarantine: bool,
+
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Salvage rows from this table's CORRUPT generations and re-insert them
+    /// through the live cluster (`--host`) via the fixed write path (proper RF
+    /// replication, original timestamps preserved). Dry-run by default — pass
+    /// `--apply` to write. Connects to the node at the global `--host`.
+    Reingest {
+        /// Path to a table's SSTable directory (named `<keyspace>.<table>`).
+        dir: std::path::PathBuf,
+
+        /// CQL role to authenticate as.
+        #[arg(long, default_value = "ferrosa_admin")]
+        user: String,
+
+        /// Environment variable holding the CQL password. If unset, the seed
+        /// default password is tried.
+        #[arg(long)]
+        password_env: Option<String>,
+
+        /// Actually execute the INSERTs. Without this, only the plan is printed.
+        #[arg(long)]
+        apply: bool,
+
+        /// Also salvage generations from the `quarantine/` subdirectory.
+        #[arg(long)]
+        include_quarantine: bool,
+
+        /// Cap the number of rows re-ingested (for a controlled first run /
+        /// correctness check before a full recovery).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+
+    /// Delete CORRUPT generations' objects from the object store (S3/MinIO) so a
+    /// cold restart cannot re-download and re-detect them. Reuses the engine's
+    /// `FERROSA_S3_*` env config. Dry-run by default — pass `--apply` to delete.
+    S3Clean {
+        /// Path to a table's SSTable directory (named `<keyspace>.<table>`).
+        dir: std::path::PathBuf,
+
+        /// Actually delete the objects. Without this, only the plan is printed.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 /// Raft administration sub-actions.
@@ -446,6 +567,49 @@ async fn main() {
             )
             .await
         }
+        Commands::Sstable { action } => match action {
+            SstableAction::Scan {
+                dir,
+                include_quarantine,
+                json,
+            } => commands::sstable::sstable_scan(&dir, include_quarantine, json),
+            SstableAction::Inspect { dir, gen, json } => {
+                commands::sstable::sstable_inspect(&dir, gen, json)
+            }
+            SstableAction::Quarantine { dir, apply, json } => {
+                commands::sstable::sstable_quarantine(&dir, apply, json)
+            }
+            SstableAction::Salvage {
+                dir,
+                include_quarantine,
+                json,
+            } => commands::sstable::sstable_salvage(&dir, include_quarantine, json),
+            SstableAction::Reingest {
+                dir,
+                user,
+                password_env,
+                apply,
+                include_quarantine,
+                limit,
+            } => {
+                let password = password_env
+                    .and_then(|v| std::env::var(v).ok())
+                    .unwrap_or_else(|| "ferrosa_admin".to_string());
+                commands::sstable::sstable_reingest(
+                    &dir,
+                    addr,
+                    &user,
+                    &password,
+                    apply,
+                    include_quarantine,
+                    limit,
+                )
+                .await
+            }
+            SstableAction::S3Clean { dir, apply } => {
+                commands::sstable::sstable_s3_clean(&dir, apply).await
+            }
+        },
     };
 
     if let Err(e) = result {
@@ -924,6 +1088,201 @@ mod tests {
                 action: RaftAction::TransferLeader { to },
             } => {
                 assert_eq!(to, "host-uuid-abc");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    // ── sstable analysis/recovery CLI tests ──────────────────────────────────
+
+    #[test]
+    fn parse_sstable_scan_minimal() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "scan",
+            "/var/lib/ferrosa/sstables/ks.t",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action:
+                    SstableAction::Scan {
+                        dir,
+                        include_quarantine,
+                        json,
+                    },
+            } => {
+                assert_eq!(
+                    dir,
+                    std::path::PathBuf::from("/var/lib/ferrosa/sstables/ks.t")
+                );
+                assert!(!include_quarantine, "include_quarantine defaults off");
+                assert!(!json, "json defaults off");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_scan_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "scan",
+            "/data/ks.t",
+            "--include-quarantine",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action:
+                    SstableAction::Scan {
+                        include_quarantine,
+                        json,
+                        ..
+                    },
+            } => {
+                assert!(include_quarantine);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_inspect_parses_gen_as_u64() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "inspect",
+            "/data/ks.t",
+            "1776452472754713",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action: SstableAction::Inspect { dir, gen, json },
+            } => {
+                assert_eq!(dir, std::path::PathBuf::from("/data/ks.t"));
+                assert_eq!(gen, 1776452472754713);
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_quarantine_defaults_to_dry_run() {
+        let cli =
+            Cli::try_parse_from(["ferrosa-ctl", "sstable", "quarantine", "/data/ks.t"]).unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action: SstableAction::Quarantine { dir, apply, json },
+            } => {
+                assert_eq!(dir, std::path::PathBuf::from("/data/ks.t"));
+                assert!(!apply, "quarantine must default to dry-run (apply=false)");
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_quarantine_apply_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "quarantine",
+            "/data/ks.t",
+            "--apply",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action: SstableAction::Quarantine { apply, .. },
+            } => assert!(apply),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_salvage_flags() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "salvage",
+            "/data/ks.t",
+            "--include-quarantine",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action:
+                    SstableAction::Salvage {
+                        dir,
+                        include_quarantine,
+                        json,
+                    },
+            } => {
+                assert_eq!(dir, std::path::PathBuf::from("/data/ks.t"));
+                assert!(include_quarantine);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_reingest_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "reingest",
+            "/data/agent_memory.entity_store",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action:
+                    SstableAction::Reingest {
+                        dir,
+                        apply,
+                        include_quarantine,
+                        ..
+                    },
+            } => {
+                assert_eq!(
+                    dir,
+                    std::path::PathBuf::from("/data/agent_memory.entity_store")
+                );
+                assert!(!apply, "reingest must default to dry-run");
+                assert!(!include_quarantine);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_s3_clean_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "s3-clean",
+            "/data/agent_memory.entity_store",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action: SstableAction::S3Clean { dir, apply },
+            } => {
+                assert_eq!(
+                    dir,
+                    std::path::PathBuf::from("/data/agent_memory.entity_store")
+                );
+                assert!(!apply, "s3-clean must default to dry-run");
             }
             other => panic!("unexpected command: {other:?}"),
         }

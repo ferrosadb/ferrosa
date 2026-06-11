@@ -332,6 +332,13 @@ impl DdlCoordinator {
                 self.schema
                     .create_index_internal(idx.clone())
                     .map_err(|e| ClusterError::Internal(format!("create_index: {e}")))?;
+                crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::IndexCreated(
+                            idx.clone(),
+                        ),
+                    )
+                    .map_err(ClusterError::Storage)?;
             }
             DdlOperation::DropIndex {
                 ref keyspace,
@@ -341,6 +348,15 @@ impl DdlCoordinator {
                 self.schema
                     .drop_index_internal(keyspace, table, index)
                     .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
+                crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::IndexDropped {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                            name: index.clone(),
+                        },
+                    )
+                    .map_err(ClusterError::Storage)?;
             }
             DdlOperation::CreateType(ref udt) => {
                 self.schema

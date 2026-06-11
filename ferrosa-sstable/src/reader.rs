@@ -704,6 +704,101 @@ impl<R: ReadAt> SSTableReader<R> {
         }
         Ok(partitions)
     }
+
+    /// Best-effort salvage of every partition, recovering each partition's
+    /// header and leading rows even when a later row fails to decode.
+    ///
+    /// Partition boundaries come from the index walk ([`Self::partition_offsets`]),
+    /// so an intra-partition parse drift (the writer-bitmap-under-count
+    /// corruption signature) does NOT cascade into the next partition — each
+    /// partition is decoded independently at its indexed offset. Calls
+    /// `on_partition` for every partition that yields at least a header and
+    /// returns aggregate [`SalvageStats`].
+    ///
+    /// Memory is bounded: only the current partition is materialized.
+    pub fn salvage<F>(&self, mut on_partition: F) -> Result<SalvageStats>
+    where
+        F: FnMut(SalvagedPartition),
+    {
+        let offsets = self.partition_offsets();
+        let mut stats = SalvageStats::default();
+        if let Some(ref ci) = self.compression_info {
+            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
+            for &off in offsets.iter() {
+                Self::salvage_one(&chunked, &self.header, off, &mut stats, &mut on_partition);
+            }
+        } else {
+            for &off in offsets.iter() {
+                Self::salvage_one(&self.data, &self.header, off, &mut stats, &mut on_partition);
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Salvage one partition at `offset`, updating `stats` and invoking
+    /// `on_partition` on success. Generic over the (possibly decompressed)
+    /// data source so compressed and uncompressed SSTables share one path.
+    fn salvage_one<D: ReadAt, F: FnMut(SalvagedPartition)>(
+        data: &D,
+        header: &crate::statistics::SerializationHeader,
+        offset: u64,
+        stats: &mut SalvageStats,
+        on_partition: &mut F,
+    ) {
+        stats.partitions_total += 1;
+        let mut reader = crate::data::DataReader::new(data, header, offset);
+        match reader.salvage_partition() {
+            Ok(Some((key, deletion, static_row, rows, complete))) => {
+                if complete {
+                    stats.partitions_complete += 1;
+                } else {
+                    stats.partitions_partial += 1;
+                }
+                stats.rows_recovered += rows.len() as u64;
+                if static_row.is_some() {
+                    stats.static_rows_recovered += 1;
+                }
+                on_partition(SalvagedPartition {
+                    key,
+                    deletion,
+                    static_row,
+                    rows,
+                    complete,
+                });
+            }
+            Ok(None) => {}
+            Err(_) => stats.partitions_failed += 1,
+        }
+    }
+}
+
+/// One partition recovered (possibly partially) by [`SSTableReader::salvage`].
+#[derive(Debug, Clone)]
+pub struct SalvagedPartition {
+    pub key: ferrosa_common::key::DecoratedKey,
+    pub deletion: crate::types::DeletionTime,
+    pub static_row: Option<crate::types::Row>,
+    pub rows: Vec<crate::types::Row>,
+    /// `true` if the partition ended on a clean `END_OF_PARTITION`; `false` if
+    /// recovery stopped early at a parse drift or truncation.
+    pub complete: bool,
+}
+
+/// Aggregate outcome of a [`SSTableReader::salvage`] pass.
+#[derive(Debug, Clone, Default)]
+pub struct SalvageStats {
+    /// Partition offsets attempted (from the partition-index walk).
+    pub partitions_total: u64,
+    /// Partitions recovered fully (ended on `END_OF_PARTITION`).
+    pub partitions_complete: u64,
+    /// Partitions recovered partially (header + leading rows, then drift).
+    pub partitions_partial: u64,
+    /// Partitions whose header could not be read (nothing recovered).
+    pub partitions_failed: u64,
+    /// Total clustered rows recovered across all partitions.
+    pub rows_recovered: u64,
+    /// Total static rows recovered.
+    pub static_rows_recovered: u64,
 }
 
 /// Streaming partition iterator over an SSTable.
@@ -2763,5 +2858,126 @@ mod tests {
         assert!(partition.rows.is_empty());
         assert!(partition.static_row.is_none());
         assert!(iter.next_partition_projected(&[]).unwrap().is_none());
+    }
+
+    // ── salvage ──────────────────────────────────────────────────────────────
+
+    /// Build an uncompressed SSTable with `n` partitions × `rows_each` rows.
+    /// Returns the components-ready output and the total row count.
+    fn build_multi_partition_output(
+        n: usize,
+        rows_each: usize,
+    ) -> (crate::writer::SSTableOutput, usize) {
+        use crate::types::{DeletionTime, LivenessInfo, Row};
+        use crate::writer::{SSTableWriter, WriteOptions};
+        use ferrosa_common::CellValue;
+
+        let mut keys: Vec<DecoratedKey> = (0..n)
+            .map(|i| {
+                DecoratedKey::new(PartitionKey::from(format!("pk{i}").into_bytes().as_slice()))
+            })
+            .collect();
+        keys.sort_by_key(|k| k.token.0);
+
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                bloom_fp_chance: 0.01,
+                chunk_size: 65_536,
+                verify_output: true,
+            },
+            test_header(),
+        );
+        let mut total_rows = 0;
+        for k in &keys {
+            let rows: Vec<Row> = (0..rows_each)
+                .map(|c| {
+                    let ts = 1_000_000 + c as i64;
+                    Row {
+                        clustering: ((c as i32) + 1).to_be_bytes().to_vec(),
+                        cells: vec![(0, CellValue::live(format!("v{c}").into_bytes(), ts))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                    }
+                })
+                .collect();
+            total_rows += rows.len();
+            writer
+                .add_partition(&Partition {
+                    key: k.clone(),
+                    deletion: DeletionTime::LIVE,
+                    static_row: None,
+                    rows,
+                })
+                .unwrap();
+        }
+        (writer.finish().unwrap(), total_rows)
+    }
+
+    fn components_from(output: crate::writer::SSTableOutput) -> SSTableComponents<CountingReadAt> {
+        SSTableComponents {
+            data: CountingReadAt::new(output.data),
+            partitions: CountingReadAt::new(output.partitions),
+            rows: CountingReadAt::new(output.rows),
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        }
+    }
+
+    #[test]
+    fn salvage_recovers_all_rows_from_healthy_sstable() {
+        let (output, total_rows) = build_multi_partition_output(3, 2);
+        let reader = SSTableReader::open(components_from(output)).unwrap();
+
+        let mut got = Vec::new();
+        let stats = reader.salvage(|p| got.push(p)).unwrap();
+
+        assert_eq!(stats.partitions_total, 3);
+        assert_eq!(
+            stats.partitions_complete, 3,
+            "healthy: every partition complete"
+        );
+        assert_eq!(stats.partitions_partial, 0);
+        assert_eq!(stats.partitions_failed, 0);
+        assert_eq!(stats.rows_recovered, total_rows as u64);
+        assert_eq!(got.iter().map(|p| p.rows.len()).sum::<usize>(), total_rows);
+        assert!(got.iter().all(|p| p.complete));
+    }
+
+    /// Salvage must never error or panic on a truncated Data.db, and must
+    /// recover the partitions/rows that are intact before the cut.
+    #[test]
+    fn salvage_is_resilient_to_truncated_data() {
+        let (output, total_rows) = build_multi_partition_output(4, 2);
+        let mut data = output.data.clone();
+        // Cut the Data.db in half — drops the tail partitions / mid-partition.
+        data.truncate(data.len() / 2);
+        let components = SSTableComponents {
+            data: CountingReadAt::new(data),
+            partitions: CountingReadAt::new(output.partitions),
+            rows: CountingReadAt::new(output.rows),
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        let mut got = Vec::new();
+        // Must return Ok (never propagate a per-partition failure).
+        let stats = reader.salvage(|p| got.push(p)).unwrap();
+
+        assert!(stats.rows_recovered > 0, "leading partitions recover");
+        assert!(
+            stats.rows_recovered < total_rows as u64,
+            "truncation loses tail rows: recovered {} of {}",
+            stats.rows_recovered,
+            total_rows
+        );
+        assert_eq!(
+            stats.rows_recovered,
+            got.iter().map(|p| p.rows.len()).sum::<usize>() as u64,
+            "stats agree with delivered partitions"
+        );
     }
 }

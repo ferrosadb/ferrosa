@@ -22,6 +22,7 @@ pub mod btree;
 pub mod composite;
 pub mod filtered;
 pub mod fulltext;
+pub mod geo;
 pub mod hash;
 pub mod phonetic;
 pub mod vector;
@@ -104,6 +105,7 @@ pub enum IndexType {
     Filtered,
     Vector,
     FullText,
+    Geo,
 }
 
 impl fmt::Display for IndexType {
@@ -116,6 +118,7 @@ impl fmt::Display for IndexType {
             IndexType::Vector => write!(f, "vector"),
             IndexType::Filtered => write!(f, "filtered"),
             IndexType::FullText => write!(f, "fulltext"),
+            IndexType::Geo => write!(f, "geo"),
         }
     }
 }
@@ -285,7 +288,12 @@ pub struct FilterPredicate {
 
 // ── Vector helpers ───────────────────────────────────────────────────────────
 
-/// Decode a byte slice into a vector of f32 values (little-endian).
+/// Decode a byte slice into a vector of f32 values.
+///
+/// Bytes are **big-endian**, matching the CQL native-protocol encoding of
+/// `vector<float, N>` cells (`ferrosa_cql::types::encode_value`). Vector index
+/// cells are populated straight from those stored cell bytes, so the codec must
+/// agree with CQL or the index ranks byte-swapped garbage.
 pub fn bytes_to_vec_f32(bytes: &[u8]) -> Result<Vec<f32>, IndexError> {
     if !bytes.len().is_multiple_of(4) {
         return Err(IndexError::Format(format!(
@@ -295,13 +303,14 @@ pub fn bytes_to_vec_f32(bytes: &[u8]) -> Result<Vec<f32>, IndexError> {
     }
     Ok(bytes
         .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .map(|chunk| f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())
 }
 
-/// Encode a vector of f32 values into bytes (little-endian).
+/// Encode a vector of f32 values into **big-endian** bytes, matching the CQL
+/// native-protocol `vector<float, N>` cell encoding (see [`bytes_to_vec_f32`]).
 pub fn vec_f32_to_bytes(vec: &[f32]) -> Vec<u8> {
-    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
+    vec.iter().flat_map(|f| f.to_be_bytes()).collect()
 }
 
 #[cfg(test)]
@@ -320,5 +329,32 @@ mod tests {
     fn bytes_to_vec_f32_bad_length() {
         let bytes = vec![0u8, 1, 2]; // 3 bytes, not multiple of 4
         assert!(bytes_to_vec_f32(&bytes).is_err());
+    }
+
+    #[test]
+    fn bytes_to_vec_f32_decodes_cql_big_endian_cell_bytes() {
+        // CQL `vector<float, N>` cells are stored big-endian (CQL native
+        // protocol order), exactly as `ferrosa_cql::types::encode_value`
+        // produces them. The index codec MUST agree, otherwise the memtable
+        // vector index is populated with byte-swapped garbage and ANN ranking
+        // is wrong. Build the cell bytes the way CQL does and confirm we
+        // recover the original floats.
+        let original = [1.0_f32, 0.0, -2.5];
+        let mut cql_cell = Vec::new();
+        for f in original {
+            cql_cell.extend_from_slice(&f.to_be_bytes());
+        }
+        let decoded = bytes_to_vec_f32(&cql_cell).unwrap();
+        assert_eq!(decoded, original.to_vec());
+    }
+
+    #[test]
+    fn vec_f32_to_bytes_matches_cql_big_endian_encoding() {
+        let v = [1.0_f32, 0.0, -2.5];
+        let mut cql_cell = Vec::new();
+        for f in v {
+            cql_cell.extend_from_slice(&f.to_be_bytes());
+        }
+        assert_eq!(vec_f32_to_bytes(&v), cql_cell);
     }
 }

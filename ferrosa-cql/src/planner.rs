@@ -34,6 +34,27 @@ pub enum ScanPlan {
         indexes: Vec<(String, String)>, // (index_name, index_column) pairs
     },
 
+    /// `ORDER BY col ANN OF [...] LIMIT k` against a registered vector index.
+    /// The router consults the vector index for the k nearest rows instead of
+    /// full-scanning the table and post-filtering.
+    VectorAnn {
+        index_name: String,
+        index_column: String,
+    },
+
+    /// A geospatial query (`GEO_NEAREST OF`, `GEO_WITHIN_RADIUS`,
+    /// `GEO_WITHIN_BBOX`) served by a geo cell-id index. The geo predicate is a
+    /// function over the indexed column, not a scalar `=`, so it does not flow
+    /// through the generic single-/multi-index matching above; the router builds
+    /// this variant directly so EXPLAIN reports the geo index rather than a
+    /// FullScan. `op` is the geo operation name (`GeoNearest` / `GeoWithinRadius`
+    /// / `GeoWithinBbox`).
+    GeoIndex {
+        index_name: String,
+        index_column: String,
+        op: String,
+    },
+
     /// No indexes match. Requires ALLOW FILTERING.
     FullScan,
 }
@@ -62,6 +83,15 @@ impl fmt::Display for ScanPlan {
                     indexes.iter().map(|(n, c)| format!("{n} on {c}")).collect();
                 write!(f, "IndexIntersection({})", pairs.join(", "))
             }
+            ScanPlan::VectorAnn {
+                index_name,
+                index_column,
+            } => write!(f, "VectorAnn({index_name} on {index_column})"),
+            ScanPlan::GeoIndex {
+                index_name,
+                index_column,
+                op,
+            } => write!(f, "GeoIndex({index_name} on {index_column}, {op})"),
             ScanPlan::FullScan => write!(f, "FullScan"),
         }
     }
@@ -288,6 +318,18 @@ mod tests {
     }
 
     #[test]
+    fn vector_ann_plan_displays_index_and_column() {
+        let plan = ScanPlan::VectorAnn {
+            index_name: "paper_ann".to_string(),
+            index_column: "embedding".to_string(),
+        };
+        assert_eq!(format!("{plan}"), "VectorAnn(paper_ann on embedding)");
+        // It must be distinct from a full scan so EXPLAIN does not report
+        // FullScan for an index-consulted ANN query.
+        assert_ne!(plan, ScanPlan::FullScan);
+    }
+
+    #[test]
     fn full_scan_index_exists_but_wrong_column() {
         let plan = plan(
             &[wc("email", ComparisonOp::Eq)],
@@ -381,6 +423,19 @@ mod tests {
     #[test]
     fn display_full_scan() {
         assert_eq!(format!("{}", ScanPlan::FullScan), "FullScan");
+    }
+
+    #[test]
+    fn display_geo_index() {
+        let plan = ScanPlan::GeoIndex {
+            index_name: "places_location_geo".to_string(),
+            index_column: "location".to_string(),
+            op: "GeoWithinRadius".to_string(),
+        };
+        assert_eq!(
+            format!("{plan}"),
+            "GeoIndex(places_location_geo on location, GeoWithinRadius)"
+        );
     }
 
     #[test]

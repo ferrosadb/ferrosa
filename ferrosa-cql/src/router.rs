@@ -289,6 +289,35 @@ fn apply_ann_of_ordering(
     Ok(())
 }
 
+/// Default `k` cap for `ANN OF` queries that omit `LIMIT`, bounding the index
+/// consult and the row fetch.
+const ANN_DEFAULT_K: usize = 100;
+
+/// `ef_search` width used for router-level ANN index consults. The brute-force
+/// memtable index ignores it; persisted HNSW sidecars use it as the search
+/// beam width. Sized comfortably above typical `k`.
+const ANN_EF_SEARCH: usize = 128;
+
+/// Resolve the registered **vector** index name for `ann_column` on
+/// `ks`.`table`, if one exists. Returns `None` when no vector index targets the
+/// column, in which case the caller falls through to the unchanged full-scan
+/// ANN ordering path.
+fn vector_index_for_ann_column(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    table: &str,
+    ann_column: &str,
+) -> Option<String> {
+    snap.indexes
+        .iter()
+        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == table)
+        .find(|(_, meta)| {
+            meta.index_type == ferrosa_index::IndexType::Vector
+                && meta.target_columns.iter().any(|c| c == ann_column)
+        })
+        .map(|(_, meta)| meta.name.clone())
+}
+
 fn projection_storage_ordinals(
     select_columns: &[SelectColumn],
     table_meta: &TableMetadata,
@@ -835,6 +864,10 @@ pub struct SharedState {
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
+    /// Records full-scan occurrences for `system_observability.full_scan_reasons`.
+    pub full_scan_tracker: Arc<crate::virtual_tables::FullScanTracker>,
+    /// Records secondary-index usage for `system_observability.index_usage`.
+    pub index_usage_tracker: Arc<crate::virtual_tables::IndexUsageTracker>,
     /// WASM UDF executor for compiling and invoking user-defined functions.
     pub udf_executor: Arc<UdfExecutor>,
     /// Broadcast channel for CQL EVENT push notifications.
@@ -2074,7 +2107,10 @@ async fn route_select(
             ))
         }
         ("system_schema", "indexes") => {
-            let snap = state.schema.snapshot();
+            // Dogfooding step 4: serve from the persisted `system_schema.indexes`
+            // storage table (not the in-memory Registry or the retired virtual
+            // table). The Registry remains the live in-memory cache, rebuilt from
+            // these same rows at boot.
             let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
                 "table_name".into(),
@@ -2089,58 +2125,20 @@ async fn route_select(
                 CqlType::Varchar,
                 CqlType::Varchar,
             ];
-            // Apply WHERE equality filters.
-            let filtered: Vec<_> = snap
-                .indexes
-                .iter()
-                .filter(|((ks, tbl, name), _)| {
-                    s.where_clauses.iter().all(|wc| {
-                        if wc.op != crate::ast::ComparisonOp::Eq {
-                            return true;
-                        }
-                        let val = match &wc.value {
-                            crate::ast::Term::StringLiteral(s) => s.as_str(),
-                            _ => return true,
-                        };
-                        match wc.column.as_str() {
-                            "keyspace_name" => ks.as_str() == val,
-                            "table_name" => tbl.as_str() == val,
-                            "index_name" => name.as_str() == val,
-                            _ => true,
-                        }
-                    })
-                })
-                .collect();
-            let rows: Vec<Vec<Option<CqlValue>>> = filtered
-                .iter()
-                .map(|((ks, tbl, name), idx)| {
-                    let kind = match idx.index_type {
-                        IndexType::BTree => "COMPOSITES",
-                        IndexType::Hash => "CUSTOM",
-                        IndexType::Composite => "COMPOSITES",
-                        IndexType::Phonetic => "CUSTOM",
-                        IndexType::Filtered => "CUSTOM",
-                        IndexType::Vector => "CUSTOM",
-                        IndexType::FullText => "CUSTOM",
-                    };
-                    // Format options as a simple comma-separated key=value string
-                    // (avoiding a serde_json dependency in this crate).
-                    let options_json = if idx.options.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        let pairs: Vec<String> = idx
-                            .options
-                            .iter()
-                            .map(|(k, v)| format!("\"{k}\":\"{v}\""))
-                            .collect();
-                        format!("{{{}}}", pairs.join(","))
-                    };
+            let stored = state
+                .engine
+                .read_persisted_indexes()
+                .map_err(|e| CqlError::ServerError(format!("read system_schema.indexes: {e}")))?;
+            let rows: Vec<Vec<Option<CqlValue>>> = stored
+                .into_iter()
+                .filter(|r| index_row_matches_where(r, &s.where_clauses))
+                .map(|r| {
                     vec![
-                        Some(CqlValue::Text(ks.clone())),
-                        Some(CqlValue::Text(tbl.clone())),
-                        Some(CqlValue::Text(name.clone())),
-                        Some(CqlValue::Text(kind.to_string())),
-                        Some(CqlValue::Text(options_json)),
+                        Some(CqlValue::Text(r.keyspace_name)),
+                        Some(CqlValue::Text(r.table_name)),
+                        Some(CqlValue::Text(r.index_name)),
+                        Some(CqlValue::Text(cassandra_index_kind(&r.kind).to_string())),
+                        Some(CqlValue::Text(r.options)),
                     ]
                 })
                 .collect();
@@ -2619,6 +2617,298 @@ pub async fn route_prepared_select_fast(
     Some(result)
 }
 
+/// Column/row metadata threaded into the geospatial select path.
+struct GeoRowContext<'a> {
+    col_names: &'a [String],
+    col_types: &'a [CqlType],
+    all_col_names: &'a [String],
+    all_col_types: &'a [CqlType],
+    pk_indices: &'a [usize],
+    ck_indices: &'a [usize],
+    storage_to_table: &'a [usize],
+}
+
+/// Resolve the geo index name for `column` from the schema snapshot, matching by
+/// keyspace, table, column, and `IndexType::Geo`.
+fn resolve_geo_index_name(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    table: &str,
+    column: &str,
+) -> Option<String> {
+    snap.indexes
+        .iter()
+        .find(|((idx_ks, idx_tbl, _), meta)| {
+            idx_ks == ks
+                && idx_tbl == table
+                && meta.index_type == IndexType::Geo
+                && meta.target_columns.iter().any(|c| c == column)
+        })
+        .map(|(_, meta)| meta.name.clone())
+}
+
+/// Extract a `(lat, lon)` point from a row's geo column, which is stored as a
+/// `CqlValue::Tuple([Double(lat), Double(lon)])`. Returns `None` if the column
+/// is null or not a well-formed two-element double tuple — such a row cannot be
+/// refined and is dropped rather than mis-located.
+fn row_geo_point(row: &[Option<CqlValue>], col_idx: usize) -> Option<(f64, f64)> {
+    match row.get(col_idx) {
+        Some(Some(CqlValue::Tuple(elems))) if elems.len() == 2 => {
+            let lat = match elems[0] {
+                Some(CqlValue::Double(bits)) => f64::from_bits(bits),
+                _ => return None,
+            };
+            let lon = match elems[1] {
+                Some(CqlValue::Double(bits)) => f64::from_bits(bits),
+                _ => return None,
+            };
+            Some((lat, lon))
+        }
+        _ => None,
+    }
+}
+
+/// Convert geo cover ranges into the `(u64, u64)` pairs the storage layer wants.
+fn cover_ranges_to_pairs(ranges: &[ferrosa_index::geo::CellRange]) -> Vec<(u64, u64)> {
+    ranges.iter().map(|r| (r.start, r.end)).collect()
+}
+
+/// Encode a full row to a stable byte key for cross-ring deduplication during
+/// k-NN. Each cell is length-prefixed (`-1` for null) so distinct rows produce
+/// distinct keys. The projected row includes the primary key, so two different
+/// base rows can never collide.
+fn encode_row_identity(row: &[Option<CqlValue>]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for cell in row {
+        match cell {
+            Some(v) => {
+                let bytes = encode_value(v);
+                key.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                key.extend_from_slice(&bytes);
+            }
+            None => key.extend_from_slice(&(-1i32).to_be_bytes()),
+        }
+    }
+    key
+}
+
+/// Execute a geospatial SELECT: `GEO_NEAREST OF`, `GEO_WITHIN_RADIUS`, or
+/// `GEO_WITHIN_BBOX`. Resolves the geo index, fetches candidate partitions by
+/// covering cell ranges, refines with exact distance / containment, then
+/// orders / bounds / projects the result. Records `index_usage` and is reported
+/// by EXPLAIN via [`ScanPlan::GeoIndex`].
+async fn route_geo_select(
+    state: &SharedState,
+    ks: &str,
+    s: &SelectStatement,
+    snap: &ferrosa_schema::SchemaSnapshot,
+    table_meta: &ferrosa_schema::metadata::table::TableMetadata,
+    table_id: &TableId,
+    rowctx: GeoRowContext<'_>,
+) -> Result<SelectRawResult, CqlError> {
+    use ferrosa_index::geo;
+
+    // Exactly one geo operation per query (parser guarantees GEO_NEAREST is the
+    // sole ordering; we take the first geo predicate when present).
+    let (geo_column, plan_kind) = if let Some(gn) = &s.geo_nearest {
+        (gn.column.clone(), "GeoNearest")
+    } else {
+        let pred = &s.geo_predicates[0];
+        let kind = match pred {
+            GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
+            GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
+            GeoPredicate::WithinPolygon { .. } => "GeoWithinPolygon",
+        };
+        (pred.column().to_string(), kind)
+    };
+
+    let index_name = resolve_geo_index_name(snap, ks, &s.table, &geo_column).ok_or_else(|| {
+        CqlError::Invalid(format!(
+            "no geo index on {}.{}({geo_column}); create one with CREATE INDEX ... USING 'geo'",
+            ks, s.table
+        ))
+    })?;
+
+    // Observability: a geo index was consulted.
+    state
+        .index_usage_tracker
+        .record(ks, &s.table, &index_name, plan_kind);
+
+    // Index of the geo column within the full (storage-order) row, for refining.
+    let geo_col_idx = rowctx
+        .all_col_names
+        .iter()
+        .position(|n| n == &geo_column)
+        .ok_or_else(|| CqlError::Invalid(format!("geo column {geo_column} not found")))?;
+
+    // Fetch candidate partitions for a set of covering cell ranges, convert to
+    // rows. Bounded by the storage layer's INDEX_RESULT_CAP (fail-loud).
+    let fetch_rows = |ranges: Vec<(u64, u64)>| -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
+        let partitions = state
+            .engine
+            .read_by_index_cell_ranges(table_id, &index_name, &ranges)
+            .map_err(|e| CqlError::Invalid(format!("geo index read failed: {e}")))?;
+        let mut rows = Vec::new();
+        for partition in &partitions {
+            let mut prows = bridge::partition_to_rows_with_storage_mapping(
+                partition,
+                rowctx.all_col_names,
+                rowctx.all_col_types,
+                rowctx.pk_indices,
+                rowctx.ck_indices,
+                rowctx.storage_to_table,
+            );
+            rows.append(&mut prows);
+        }
+        Ok(rows)
+    };
+
+    // Build the final, refined row set for the specific geo operation.
+    let mut result_rows: Vec<Vec<Option<CqlValue>>> = if let Some(gn) = &s.geo_nearest {
+        // k-NN: expanding-ring search. The ring `fetch` returns the candidate
+        // points keyed by an opaque ordinal into a side table of rows so we can
+        // reassemble the chosen rows after ranking.
+        let k = s
+            .limit
+            .as_ref()
+            .and_then(|l| l.as_literal())
+            .map(|n| n.max(0) as usize)
+            .unwrap_or(usize::MAX);
+
+        // Collect candidate rows across rings, then rank by haversine and take k.
+        // The same partition is re-fetched as the search rings expand, so each
+        // row must get a STABLE id across rings or `nearest_k`'s id-based dedup
+        // cannot drop the repeats. We key each distinct row to a stable index in
+        // `seen_rows` by its full encoded contents (the projected row includes
+        // the primary key, so distinct rows never collide).
+        let mut seen_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
+        let mut row_ids: HashMap<Vec<u8>, usize> = HashMap::new();
+        let candidates = geo::nearest_k(gn.lat, gn.lon, k, |ranges| {
+            let pairs = cover_ranges_to_pairs(ranges);
+            let rows = match fetch_rows(pairs) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            let mut out = Vec::new();
+            for row in rows {
+                if let Some((lat, lon)) = row_geo_point(&row, geo_col_idx) {
+                    let row_key = encode_row_identity(&row);
+                    let id = *row_ids.entry(row_key).or_insert_with(|| {
+                        let next = seen_rows.len();
+                        seen_rows.push(row.clone());
+                        next
+                    });
+                    out.push(geo::GeoCandidate { id, lat, lon });
+                }
+            }
+            out
+        });
+        candidates
+            .into_iter()
+            .map(|c| seen_rows[c.id].clone())
+            .collect()
+    } else {
+        match &s.geo_predicates[0] {
+            GeoPredicate::WithinRadius {
+                lat, lon, radius_m, ..
+            } => {
+                let ranges = cover_ranges_to_pairs(&geo::cover_radius(
+                    *lat,
+                    *lon,
+                    *radius_m,
+                    geo::DEFAULT_COVER_LEVEL,
+                ));
+                let rows = fetch_rows(ranges)?;
+                // Refine: keep rows whose exact haversine distance is within the
+                // radius (the cover is an over-approximation).
+                rows.into_iter()
+                    .filter(|row| {
+                        row_geo_point(row, geo_col_idx)
+                            .map(|(la, lo)| geo::within_radius(*lat, *lon, *radius_m, la, lo))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            }
+            GeoPredicate::WithinBbox { sw, ne, .. } => {
+                let ranges =
+                    cover_ranges_to_pairs(&geo::cover_bbox(*sw, *ne, geo::DEFAULT_COVER_LEVEL));
+                let rows = fetch_rows(ranges)?;
+                // Refine: exact axis-aligned (antimeridian-aware) containment.
+                rows.into_iter()
+                    .filter(|row| {
+                        row_geo_point(row, geo_col_idx)
+                            .map(|(la, lo)| geo::within_bbox(sw.0, sw.1, ne.0, ne.1, la, lo))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            }
+            GeoPredicate::WithinPolygon { vertices, .. } => {
+                let polygon = geo::Polygon::new(vertices.clone());
+                // A dateline-straddling polygon is not handled by planar ray
+                // casting; reject it loudly rather than return wrong rows.
+                if polygon.crosses_antimeridian() {
+                    return Err(CqlError::Invalid(
+                        "ST_WITHIN does not support polygons crossing the ±180° antimeridian"
+                            .to_string(),
+                    ));
+                }
+                // Cover the polygon's bounding box, then refine each candidate
+                // with the exact point-in-polygon test. A degenerate polygon has
+                // no bbox and matches nothing.
+                match geo::polygon_bbox(&polygon) {
+                    Some((sw, ne)) => {
+                        let ranges = cover_ranges_to_pairs(&geo::cover_bbox(
+                            sw,
+                            ne,
+                            geo::DEFAULT_COVER_LEVEL,
+                        ));
+                        let rows = fetch_rows(ranges)?;
+                        rows.into_iter()
+                            .filter(|row| {
+                                row_geo_point(row, geo_col_idx)
+                                    .map(|(la, lo)| geo::point_in_polygon(la, lo, &polygon))
+                                    .unwrap_or(false)
+                            })
+                            .collect()
+                    }
+                    None => Vec::new(),
+                }
+            }
+        }
+    };
+
+    // Apply any remaining scalar WHERE predicates as a post-filter (the geo
+    // predicate is handled above and not present in `where_clauses`).
+    filter_rows_by_select_predicates(
+        &mut result_rows,
+        s,
+        rowctx.all_col_names,
+        rowctx.all_col_types,
+        table_meta,
+        ks,
+        state,
+    )?;
+
+    // LIMIT for the non-nearest forms (k-NN already applied k above).
+    if s.geo_nearest.is_none() {
+        if let Some(limit) = s.limit.as_ref().and_then(|l| l.as_literal()) {
+            result_rows.truncate(limit.max(0) as usize);
+        }
+    }
+
+    // Project to the selected columns.
+    let selected_rows = select_columns(&result_rows, rowctx.all_col_names, rowctx.col_names);
+
+    Ok(SelectRawResult {
+        column_names: rowctx.col_names.to_vec(),
+        column_types: rowctx.col_types.to_vec(),
+        rows: selected_rows,
+        keyspace: ks.to_string(),
+        table: s.table.clone(),
+        paging_state: None,
+    })
+}
+
 async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -2720,6 +3010,11 @@ async fn route_select_user_table(
         // index registration exists (useful for simple single-column FTI).
         let index_name = fti_index_name.as_deref().unwrap_or(fts_column);
 
+        // Observability: record that the full-text index was consulted.
+        state
+            .index_usage_tracker
+            .record(ks, &s.table, index_name, "FullText");
+
         let matching_pks = state
             .engine
             .fulltext_search(&table_id, index_name, fts_query)
@@ -2778,6 +3073,34 @@ async fn route_select_user_table(
             table: s.table.clone(),
             paging_state: None,
         });
+    }
+
+    // ── Geospatial query surface (GEO_NEAREST / GEO_WITHIN_RADIUS / BBOX) ──────
+    //
+    // A geo predicate is a function over a geo-indexed column, not a scalar
+    // comparison, so it is handled in its own index-backed branch: resolve the
+    // geo index, ask it for covering cell ranges, fetch candidates, refine with
+    // exact distance / containment, then sort/limit and project. EXPLAIN reports
+    // the geo index and `index_usage` increments on the hit.
+    if s.geo_nearest.is_some() || !s.geo_predicates.is_empty() {
+        return route_geo_select(
+            state,
+            ks,
+            s,
+            &snap,
+            table_meta,
+            &table_id,
+            GeoRowContext {
+                col_names: &col_names,
+                col_types: &col_types,
+                all_col_names: &all_col_names,
+                all_col_types: &all_col_types,
+                pk_indices: &pk_indices,
+                ck_indices: &ck_indices,
+                storage_to_table: &storage_to_table,
+            },
+        )
+        .await;
     }
 
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
@@ -2931,535 +3254,694 @@ async fn route_select_user_table(
             &planner_indexes,
         );
 
-        match scan_plan {
-            ScanPlan::PartitionKeyLookup => {
-                // This can happen when extract_pk_values fails (e.g., bind
-                // values that can't be coerced to the PK column type) but
-                // the planner still sees Eq predicates on all PK columns.
-                // Fall through to a full scan rather than panicking.
-                let partitions = state
-                    .write_path
-                    .load()
-                    .range_read_with(&table_id, ctx.consistency, &table_strategy)
-                    .await?;
-                if count_only_select {
-                    let count = count_rows_from_partitions(
-                        &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
-                    )
-                    .await?;
-                    return Ok(SelectRawResult {
-                        column_names: col_names.to_vec(),
-                        column_types: col_types.to_vec(),
-                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                        keyspace: ks.to_string(),
-                        table: s.table.clone(),
-                        paging_state: None,
-                    });
-                }
-                let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
-                filter_rows_by_select_predicates(
-                    &mut all_rows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-                all_rows
-            }
+        // ── Vector ANN index consult ──────────────────────────────────────
+        //
+        // `ORDER BY col ANN OF [...] LIMIT k` with a vector index registered on
+        // `col`: consult the index for the k nearest partitions instead of
+        // full-scanning the table and post-filtering. The recovered rows feed
+        // the SAME downstream pipeline below (apply_ann_of_ordering re-ranks the
+        // k rows, then LIMIT + projection). When NO vector index targets the
+        // column, `ann_index` is `None` and we fall through UNCHANGED to
+        // `match scan_plan` (byte-identical fallback).
+        let ann_index = s.ann_of.as_ref().and_then(|(ann_col, _)| {
+            vector_index_for_ann_column(&snap, ks, &s.table, ann_col).map(|name| (name, ann_col))
+        });
+        if let Some((index_name, ann_col)) = ann_index {
+            let ann_query = &s
+                .ann_of
+                .as_ref()
+                .expect("ann_of present when ann_index resolved")
+                .1;
+            let col_idx = all_col_names
+                .iter()
+                .position(|name| name == ann_col)
+                .ok_or_else(|| CqlError::Invalid(format!("unknown ANN OF column {ann_col}")))?;
+            let target_type = all_col_types.get(col_idx).ok_or_else(|| {
+                CqlError::Invalid(format!("missing type for ANN OF column {ann_col}"))
+            })?;
+            let query_bits = vector_bits_from_term(ann_query, target_type)?;
+            let query: Vec<f32> = query_bits.iter().map(|b| f32::from_bits(*b)).collect();
+            let k = s
+                .limit
+                .as_ref()
+                .and_then(|l| l.as_literal())
+                .map(|n| (n.max(0) as usize).min(ANN_DEFAULT_K))
+                .filter(|n| *n > 0)
+                .unwrap_or(ANN_DEFAULT_K);
 
-            ScanPlan::SingleIndex {
-                ref index_name,
-                ref index_column,
-            }
-            | ScanPlan::IndexScanWithFilter {
-                ref index_name,
-                ref index_column,
-                ..
-            } => {
-                // IndexScanWithFilter means some WHERE columns are not covered
-                // by any index — require ALLOW FILTERING for these queries.
-                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
-                    return Err(CqlError::Invalid(
-                        "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Use ALLOW FILTERING, create a secondary index on the \
-                         filtered columns, or restructure your query to use partition keys."
+            let partitions = state
+                .engine
+                .ann_search_partitions(&table_id, &index_name, &query, k, ANN_EF_SEARCH)
+                .map_err(|e| CqlError::ServerError(format!("ANN index search failed: {e}")))?;
+
+            // Observability parity with the other index types (Phase 3): an ANN
+            // index consult is an index hit, not a full scan.
+            state
+                .index_usage_tracker
+                .record(ks, &s.table, &index_name, "VectorAnn");
+
+            tracing::debug!(
+                keyspace = ks,
+                table = %s.table,
+                index = %index_name,
+                k,
+                returned = partitions.len(),
+                "ANN OF served from vector index consult (no full scan)"
+            );
+
+            let mut ann_rows = Vec::new();
+            extend_rows_from_partitions(
+                &partitions,
+                &mut ann_rows,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+                &storage_to_table,
+            )
+            .await;
+            ann_rows
+        } else {
+            match scan_plan {
+                ScanPlan::VectorAnn { .. } => {
+                    // `planner::plan` never emits VectorAnn — the ANN index consult
+                    // is handled by the early branch above. Reaching here means the
+                    // planner contract changed without updating this dispatch; fail
+                    // loud rather than silently degrade to a full scan.
+                    return Err(CqlError::ServerError(
+                        "internal: VectorAnn scan plan reached the scan dispatch; \
+                     ANN index consult should have handled it"
                             .into(),
                     ));
                 }
-
-                // Find the WHERE clause for the indexed column.
-                let index_wc = s
-                    .where_clauses
-                    .iter()
-                    .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
-                    .ok_or_else(|| {
-                        CqlError::Invalid(
-                            "planner selected index but no matching WHERE clause found".into(),
-                        )
-                    })?;
-
-                let index_key = term_to_index_key(
-                    &index_wc.value,
-                    index_column,
-                    table_meta,
-                    ks,
-                    &state.schema,
-                )?;
-
-                // Scatter-gather index read: in cluster mode this fans out
-                // to all ring nodes so results include rows on every node.
-                let partitions = state
-                    .write_path
-                    .load()
-                    .index_read(&table_id, index_name, &index_key)
-                    .await?;
-
-                // Fallback: if the index read returns empty, the memtable index
-                // may not be wired yet (Sprint I-3). Fall back to full scan so
-                // queries still return correct results.
-                let partitions = if partitions.is_empty() {
-                    state
-                        .write_path
-                        .load()
-                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
-                        .await?
-                } else {
-                    partitions
-                };
-
-                if count_only_select {
-                    let count = count_rows_from_partitions(
-                        &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
-                    )
-                    .await?;
-                    return Ok(SelectRawResult {
-                        column_names: col_names.to_vec(),
-                        column_types: col_types.to_vec(),
-                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                        keyspace: ks.to_string(),
-                        table: s.table.clone(),
-                        paging_state: None,
-                    });
-                }
-
-                let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
-
-                // Always apply post-filter as defensive measure.
-                // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
-                filter_rows_by_select_predicates(
-                    &mut all_rows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-
-                all_rows
-            }
-
-            ScanPlan::IndexIntersection { ref indexes } => {
-                // Use first index for fetch, post-filter all WHERE predicates.
-                // Full set intersection across indexes is a future optimization.
-                let (ref first_idx_name, ref first_idx_col) = indexes[0];
-                let index_wc = s
-                    .where_clauses
-                    .iter()
-                    .find(|wc| wc.column == *first_idx_col && wc.op == ComparisonOp::Eq)
-                    .ok_or_else(|| {
-                        CqlError::Invalid(
-                            "planner selected index but no matching WHERE clause found".into(),
-                        )
-                    })?;
-
-                let index_key = term_to_index_key(
-                    &index_wc.value,
-                    first_idx_col,
-                    table_meta,
-                    ks,
-                    &state.schema,
-                )?;
-
-                let partitions = state
-                    .write_path
-                    .load()
-                    .index_read(&table_id, first_idx_name, &index_key)
-                    .await?;
-
-                let partitions = if partitions.is_empty() {
-                    state
-                        .write_path
-                        .load()
-                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
-                        .await?
-                } else {
-                    partitions
-                };
-
-                if count_only_select {
-                    let count = count_rows_from_partitions(
-                        &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
-                    )
-                    .await?;
-                    return Ok(SelectRawResult {
-                        column_names: col_names.to_vec(),
-                        column_types: col_types.to_vec(),
-                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                        keyspace: ks.to_string(),
-                        table: s.table.clone(),
-                        paging_state: None,
-                    });
-                }
-
-                let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
-                filter_rows_by_select_predicates(
-                    &mut all_rows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-
-                all_rows
-            }
-
-            ScanPlan::FullScan => {
-                // Check ALLOW FILTERING requirement.
-                let indexed_columns: Vec<String> = snap
-                    .indexes
-                    .iter()
-                    .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-                    .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
-                    .collect();
-
-                // Exclude token() predicates — they are range scan hints,
-                // not column filters that require indexing.
-                let non_token_clauses: Vec<&WhereClause> =
-                    s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
-                let all_where_columns_indexed = non_token_clauses
-                    .iter()
-                    .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
-
-                if !non_token_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering
-                {
-                    return Err(CqlError::Invalid(
-                        "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Use ALLOW FILTERING, create a secondary index on the \
-                         filtered columns, or restructure your query to use partition keys."
-                            .into(),
+                ScanPlan::GeoIndex { .. } => {
+                    // Geo queries are served by `route_geo_select` in an early
+                    // branch before the planner runs, so `planner::plan` never
+                    // returns this variant here. It exists only for EXPLAIN's
+                    // plan rendering.
+                    return Err(CqlError::ServerError(
+                        "internal: geo plan reached the scalar scan dispatch".into(),
                     ));
                 }
-
-                // Coordinator-side OOM bound (P0): an unbounded full-table scan
-                // with no WHERE/ORDER BY/ANN/DISTINCT/LIMIT used to accumulate
-                // the ENTIRE result into `all_rows` before returning, OOM-killing
-                // the coordinator on large tables. Stream at most one bounded
-                // page instead and return a `PagingState` continuation. A
-                // default page applies when the client sends no `page_size`, so
-                // even an un-paged `SELECT *` cannot accumulate unbounded rows.
-                //
-                // Other shapes (predicates, ORDER BY, ANN, DISTINCT, LIMIT,
-                // COUNT) keep their existing materialize-bounded behavior, where
-                // the scan window is already bounded by LIMIT/sort/count needs.
-                // Exclude any function-call projection: aggregates
-                // (COUNT/AVG/MIN/MAX/SUM) and UDAs fold over the WHOLE result,
-                // so paging the scan would compute them over a single page.
-                // Scalar UDFs/toJson are per-row and safe, but excluding all
-                // function calls keeps the streaming gate to plain column/star
-                // projections — exactly the unbounded `SELECT *` OOM shape.
-                let has_function_projection = s
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
-                let unbounded_scan_shape = s.where_clauses.is_empty()
-                    && s.order_by.is_empty()
-                    && s.ann_of.is_none()
-                    && !s.distinct
-                    && s.limit.is_none()
-                    && !count_only_select
-                    && !has_function_projection;
-                if unbounded_scan_shape {
-                    let page_size = ctx
-                        .paging
-                        .page_size
-                        .and_then(|ps| (ps > 0).then_some(ps as usize))
-                        .unwrap_or_else(crate::paging::default_scan_page_size);
-
-                    let resume =
-                        StreamResumeCursor::from_paging_state(ctx.paging.paging_state.as_deref())?;
-                    // Resume the scan at the last partition key (inclusive); the
-                    // collector drops rows already emitted within that key.
-                    let start_key = resume.as_ref().map(|cur| {
-                        ferrosa_common::key::DecoratedKey::new(
-                            ferrosa_common::key::PartitionKey::from(cur.partition_key.as_slice()),
-                        )
-                    });
-
-                    // The gate above guarantees `where_clauses.is_empty()`, so a
-                    // column projection is always safe here (no predicate reads
-                    // an unprojected cell).
-                    let scan_projection =
-                        projection_storage_ordinals_for_select_scan(s, table_meta);
-
-                    let stream = if let Some(wanted) = scan_projection {
-                        state
-                            .write_path
-                            .load()
-                            .range_read_projected_stream_all_from(
-                                &table_id,
-                                wanted,
-                                start_key.as_ref(),
-                                ctx.consistency,
-                                &table_strategy,
-                            )
-                            .await?
-                    } else {
-                        state
-                            .write_path
-                            .load()
-                            .range_read_stream_all_from(
-                                &table_id,
-                                start_key.as_ref(),
-                                ctx.consistency,
-                                &table_strategy,
-                            )
-                            .await?
-                    };
-
-                    let page = collect_page_from_partition_stream(
-                        stream,
-                        page_size,
-                        resume,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                    )
-                    .await?;
-
-                    streamed_paging_state = Some(page.next_paging_state);
-                    page.rows
-                } else {
-                    // Use a bounded upstream partition cap for unordered,
-                    // non-aggregate scans so first pages do not wait behind an
-                    // unbounded table materialization. When ALLOW FILTERING has
-                    // post-filter predicates, no upstream partition cap is safe:
-                    // LIMIT 1 may need to inspect many non-matching partitions
-                    // before finding the first matching row, and a fixed cap would
-                    // silently drop later matches. In that shape, stream the full
-                    // table and apply LIMIT/page semantics after filtering.
-                    // Ordered and aggregate queries still materialize their scan
-                    // window before sorting/counting.
-                    let scan_bound = if s.order_by.is_empty()
-                        && s.ann_of.is_none()
-                        && !count_only_select
-                    {
-                        let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
-                        if has_post_filter {
-                            None
-                        } else {
-                            let page_size = ctx
-                                .paging
-                                .page_size
-                                .and_then(|ps| (ps > 0).then_some(ps as usize));
-                            let limit_size = s
-                                .limit
-                                .as_ref()
-                                .and_then(|l| l.as_literal())
-                                .map(|n| n as usize);
-                            let base = match (page_size, limit_size) {
-                                (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
-                                (Some(ps), None) => Some(ps),
-                                (None, Some(lim)) => Some(lim),
-                                (None, None) => None,
-                            };
-                            let start = ctx
-                                .paging
-                                .paging_state
-                                .as_deref()
-                                .and_then(|bytes| crate::paging::PagingState::decode(bytes).ok())
-                                .and_then(|state| {
-                                    (state.partition_key.len() == 8).then(|| {
-                                        u64::from_be_bytes(
-                                            state.partition_key.as_slice().try_into().unwrap(),
-                                        ) as usize
-                                    })
-                                })
-                                .unwrap_or(0);
-                            base.map(|n| start.saturating_add(n).max(1))
-                        }
-                    } else {
-                        None
-                    };
-                    let row_limit =
-                        safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
-                            .unwrap_or(0);
-                    // ADR-020 projection fast path. Route through
-                    // range_read_projected whenever the query only needs a subset
-                    // of regular cells, so the SSTable layer byte-skips bulky
-                    // unneeded payloads. Big win on wide tables with bulky cells
-                    // (e.g. entity_store's entity_embedding column).
-                    //
-                    // Non-count SELECT requires no WHERE because predicates over
-                    // unprojected regular columns would evaluate against NULL.
-                    let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
-                        projection_storage_ordinals_for_select_scan(s, table_meta)
-                    } else {
-                        None
-                    };
-                    // Count-only filtered scans project predicate columns only and
-                    // fold over a partition stream, so COUNT(*) avoids decoding
-                    // unrelated cells without first collecting partitions in a Vec.
-                    let count_projection_wanted = if count_only_select {
-                        projection_storage_ordinals_for_count_predicates(
-                            &s.where_clauses,
-                            table_meta,
-                        )
-                    } else {
-                        None
-                    };
-                    let partitions = if let Some(wanted) = projection_wanted {
-                        // Push partition-count cap down to the merger so
-                        // `LIMIT N` stops the scan after N partitions
-                        // rather than walking every SSTable.
-                        Some(
-                            state
-                                .write_path
-                                .load()
-                                .range_read_projected(&table_id, wanted, scan_bound)
-                                .await?,
-                        )
-                    } else if let Some(bound) = scan_bound {
-                        Some(
-                            state
-                                .write_path
-                                .load()
-                                .range_read_limited_rows(&table_id, bound, row_limit)
-                                .await?,
-                        )
-                    } else if row_limit > 0 {
-                        Some(
-                            state
-                                .write_path
-                                .load()
-                                .range_read_limited_rows(
-                                    &table_id,
-                                    ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
-                                    row_limit,
-                                )
-                                .await?,
-                        )
-                    } else {
-                        None
-                    };
+                ScanPlan::PartitionKeyLookup => {
+                    // This can happen when extract_pk_values fails (e.g., bind
+                    // values that can't be coerced to the PK column type) but
+                    // the planner still sees Eq predicates on all PK columns.
+                    // Fall through to a full scan rather than panicking.
+                    let partitions = state
+                        .write_path
+                        .load()
+                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                        .await?;
                     if count_only_select {
-                        let row_context = PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        };
-                        let predicate_context = SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        };
-                        let count = if let Some(partitions) = partitions.as_ref() {
-                            count_rows_from_partitions(partitions, row_context, predicate_context)
-                                .await?
-                        } else if let Some(wanted) = count_projection_wanted {
-                            let stream = state
+                        let count = count_rows_from_partitions(
+                            &partitions,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                            SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            },
+                        )
+                        .await?;
+                        return Ok(SelectRawResult {
+                            column_names: col_names.to_vec(),
+                            column_types: col_types.to_vec(),
+                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                            keyspace: ks.to_string(),
+                            table: s.table.clone(),
+                            paging_state: None,
+                        });
+                    }
+                    let mut all_rows = Vec::new();
+                    extend_rows_from_partitions(
+                        &partitions,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await;
+                    filter_rows_by_select_predicates(
+                        &mut all_rows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+                    all_rows
+                }
+
+                ScanPlan::SingleIndex {
+                    ref index_name,
+                    ref index_column,
+                }
+                | ScanPlan::IndexScanWithFilter {
+                    ref index_name,
+                    ref index_column,
+                    ..
+                } => {
+                    // IndexScanWithFilter means some WHERE columns are not covered
+                    // by any index — require ALLOW FILTERING for these queries.
+                    if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. })
+                        && !s.allow_filtering
+                    {
+                        return Err(CqlError::Invalid(
+                            "Cannot execute this query as it requires filtering on non-indexed \
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
+                                .into(),
+                        ));
+                    }
+
+                    // Observability: record that a secondary index was consulted.
+                    let plan_kind = if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
+                        "IndexScanWithFilter"
+                    } else {
+                        "SingleIndex"
+                    };
+                    state
+                        .index_usage_tracker
+                        .record(ks, &s.table, index_name, plan_kind);
+
+                    // Find the WHERE clause for the indexed column.
+                    let index_wc = s
+                        .where_clauses
+                        .iter()
+                        .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
+                        .ok_or_else(|| {
+                            CqlError::Invalid(
+                                "planner selected index but no matching WHERE clause found".into(),
+                            )
+                        })?;
+
+                    let index_key = term_to_index_key(
+                        &index_wc.value,
+                        index_column,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )?;
+
+                    // Scatter-gather index read: in cluster mode this fans out
+                    // to all ring nodes so results include rows on every node.
+                    let partitions = state
+                        .write_path
+                        .load()
+                        .index_read(&table_id, index_name, &index_key)
+                        .await?;
+
+                    // Fallback: if the index read returns empty, the memtable index
+                    // may not be wired yet (Sprint I-3). Fall back to full scan so
+                    // queries still return correct results.
+                    let partitions = if partitions.is_empty() {
+                        state
+                            .write_path
+                            .load()
+                            .range_read_with(&table_id, ctx.consistency, &table_strategy)
+                            .await?
+                    } else {
+                        partitions
+                    };
+
+                    if count_only_select {
+                        let count = count_rows_from_partitions(
+                            &partitions,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                            SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            },
+                        )
+                        .await?;
+                        return Ok(SelectRawResult {
+                            column_names: col_names.to_vec(),
+                            column_types: col_types.to_vec(),
+                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                            keyspace: ks.to_string(),
+                            table: s.table.clone(),
+                            paging_state: None,
+                        });
+                    }
+
+                    let mut all_rows = Vec::new();
+                    extend_rows_from_partitions(
+                        &partitions,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await;
+
+                    // Always apply post-filter as defensive measure.
+                    // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
+                    filter_rows_by_select_predicates(
+                        &mut all_rows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+
+                    all_rows
+                }
+
+                ScanPlan::IndexIntersection { ref indexes } => {
+                    // Observability: record that each intersected index was consulted.
+                    for (index_name, _index_column) in indexes {
+                        state.index_usage_tracker.record(
+                            ks,
+                            &s.table,
+                            index_name,
+                            "IndexIntersection",
+                        );
+                    }
+                    // Consult ALL matched single-column indexes and intersect their
+                    // result sets on partition-key identity, so we fetch only the
+                    // partitions present in every index rather than the full result
+                    // of indexes[0] alone. The post-filter below still enforces
+                    // per-row predicate precision on clustered tables.
+                    let partitions = read_index_intersection(
+                        state,
+                        &table_id,
+                        indexes,
+                        s,
+                        table_meta,
+                        ks,
+                        ctx.consistency,
+                        &table_strategy,
+                    )
+                    .await?;
+
+                    if count_only_select {
+                        let count = count_rows_from_partitions(
+                            &partitions,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                            SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            },
+                        )
+                        .await?;
+                        return Ok(SelectRawResult {
+                            column_names: col_names.to_vec(),
+                            column_types: col_types.to_vec(),
+                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                            keyspace: ks.to_string(),
+                            table: s.table.clone(),
+                            paging_state: None,
+                        });
+                    }
+
+                    let mut all_rows = Vec::new();
+                    extend_rows_from_partitions(
+                        &partitions,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await;
+                    filter_rows_by_select_predicates(
+                        &mut all_rows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+
+                    all_rows
+                }
+
+                ScanPlan::FullScan => {
+                    // Observability: record the predicate that triggered the full
+                    // scan so operators can find queries that need an index.
+                    {
+                        let (pred_col, pred_op) = s
+                            .where_clauses
+                            .iter()
+                            .find(|wc| !wc.token_fn)
+                            .map(|wc| (wc.column.as_str(), comparison_op_str(&wc.op)))
+                            .unwrap_or(("", ""));
+                        state
+                            .full_scan_tracker
+                            .record(ks, &s.table, pred_col, pred_op);
+                    }
+
+                    // Check ALLOW FILTERING requirement.
+                    let indexed_columns: Vec<String> = snap
+                        .indexes
+                        .iter()
+                        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+                        .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
+                        .collect();
+
+                    // Exclude token() predicates — they are range scan hints,
+                    // not column filters that require indexing.
+                    let non_token_clauses: Vec<&WhereClause> =
+                        s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
+                    let all_where_columns_indexed = non_token_clauses
+                        .iter()
+                        .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
+
+                    if !non_token_clauses.is_empty()
+                        && !all_where_columns_indexed
+                        && !s.allow_filtering
+                    {
+                        return Err(CqlError::Invalid(
+                            "Cannot execute this query as it requires filtering on non-indexed \
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
+                                .into(),
+                        ));
+                    }
+
+                    // Coordinator-side OOM bound (P0): an unbounded full-table scan
+                    // with no WHERE/ORDER BY/ANN/DISTINCT/LIMIT used to accumulate
+                    // the ENTIRE result into `all_rows` before returning, OOM-killing
+                    // the coordinator on large tables. Stream at most one bounded
+                    // page instead and return a `PagingState` continuation. A
+                    // default page applies when the client sends no `page_size`, so
+                    // even an un-paged `SELECT *` cannot accumulate unbounded rows.
+                    //
+                    // Other shapes (predicates, ORDER BY, ANN, DISTINCT, LIMIT,
+                    // COUNT) keep their existing materialize-bounded behavior, where
+                    // the scan window is already bounded by LIMIT/sort/count needs.
+                    // Exclude any function-call projection: aggregates
+                    // (COUNT/AVG/MIN/MAX/SUM) and UDAs fold over the WHOLE result,
+                    // so paging the scan would compute them over a single page.
+                    // Scalar UDFs/toJson are per-row and safe, but excluding all
+                    // function calls keeps the streaming gate to plain column/star
+                    // projections — exactly the unbounded `SELECT *` OOM shape.
+                    let has_function_projection = s
+                        .columns
+                        .iter()
+                        .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
+                    let unbounded_scan_shape = s.where_clauses.is_empty()
+                        && s.order_by.is_empty()
+                        && s.ann_of.is_none()
+                        && !s.distinct
+                        && s.limit.is_none()
+                        && !count_only_select
+                        && !has_function_projection;
+                    if unbounded_scan_shape {
+                        let page_size = ctx
+                            .paging
+                            .page_size
+                            .and_then(|ps| (ps > 0).then_some(ps as usize))
+                            .unwrap_or_else(crate::paging::default_scan_page_size);
+
+                        let resume = StreamResumeCursor::from_paging_state(
+                            ctx.paging.paging_state.as_deref(),
+                        )?;
+                        // Resume the scan at the last partition key (inclusive); the
+                        // collector drops rows already emitted within that key.
+                        let start_key = resume.as_ref().map(|cur| {
+                            ferrosa_common::key::DecoratedKey::new(
+                                ferrosa_common::key::PartitionKey::from(
+                                    cur.partition_key.as_slice(),
+                                ),
+                            )
+                        });
+
+                        // The gate above guarantees `where_clauses.is_empty()`, so a
+                        // column projection is always safe here (no predicate reads
+                        // an unprojected cell).
+                        let scan_projection =
+                            projection_storage_ordinals_for_select_scan(s, table_meta);
+
+                        let stream = if let Some(wanted) = scan_projection {
+                            state
                                 .write_path
                                 .load()
-                                .range_read_projected_stream_all_with(
+                                .range_read_projected_stream_all_from(
                                     &table_id,
                                     wanted,
-                                    scan_bound,
+                                    start_key.as_ref(),
                                     ctx.consistency,
                                     &table_strategy,
                                 )
-                                .await?;
-                            count_rows_from_partition_stream(stream, row_context, predicate_context)
                                 .await?
+                        } else {
+                            state
+                                .write_path
+                                .load()
+                                .range_read_stream_all_from(
+                                    &table_id,
+                                    start_key.as_ref(),
+                                    ctx.consistency,
+                                    &table_strategy,
+                                )
+                                .await?
+                        };
+
+                        let page = collect_page_from_partition_stream(
+                            stream,
+                            page_size,
+                            resume,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                        )
+                        .await?;
+
+                        streamed_paging_state = Some(page.next_paging_state);
+                        page.rows
+                    } else {
+                        // Use a bounded upstream partition cap for unordered,
+                        // non-aggregate scans so first pages do not wait behind an
+                        // unbounded table materialization. When ALLOW FILTERING has
+                        // post-filter predicates, no upstream partition cap is safe:
+                        // LIMIT 1 may need to inspect many non-matching partitions
+                        // before finding the first matching row, and a fixed cap would
+                        // silently drop later matches. In that shape, stream the full
+                        // table and apply LIMIT/page semantics after filtering.
+                        // Ordered and aggregate queries still materialize their scan
+                        // window before sorting/counting.
+                        let scan_bound = if s.order_by.is_empty()
+                            && s.ann_of.is_none()
+                            && !count_only_select
+                        {
+                            let has_post_filter =
+                                s.allow_filtering && !non_token_clauses.is_empty();
+                            if has_post_filter {
+                                None
+                            } else {
+                                let page_size = ctx
+                                    .paging
+                                    .page_size
+                                    .and_then(|ps| (ps > 0).then_some(ps as usize));
+                                let limit_size = s
+                                    .limit
+                                    .as_ref()
+                                    .and_then(|l| l.as_literal())
+                                    .map(|n| n as usize);
+                                let base = match (page_size, limit_size) {
+                                    (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
+                                    (Some(ps), None) => Some(ps),
+                                    (None, Some(lim)) => Some(lim),
+                                    (None, None) => None,
+                                };
+                                let start = ctx
+                                    .paging
+                                    .paging_state
+                                    .as_deref()
+                                    .and_then(|bytes| {
+                                        crate::paging::PagingState::decode(bytes).ok()
+                                    })
+                                    .and_then(|state| {
+                                        (state.partition_key.len() == 8).then(|| {
+                                            u64::from_be_bytes(
+                                                state.partition_key.as_slice().try_into().unwrap(),
+                                            ) as usize
+                                        })
+                                    })
+                                    .unwrap_or(0);
+                                base.map(|n| start.saturating_add(n).max(1))
+                            }
+                        } else {
+                            None
+                        };
+                        let row_limit =
+                            safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
+                                .unwrap_or(0);
+                        // ADR-020 projection fast path. Route through
+                        // range_read_projected whenever the query only needs a subset
+                        // of regular cells, so the SSTable layer byte-skips bulky
+                        // unneeded payloads. Big win on wide tables with bulky cells
+                        // (e.g. entity_store's entity_embedding column).
+                        //
+                        // Non-count SELECT requires no WHERE because predicates over
+                        // unprojected regular columns would evaluate against NULL.
+                        let projection_wanted = if !count_only_select && s.where_clauses.is_empty()
+                        {
+                            projection_storage_ordinals_for_select_scan(s, table_meta)
+                        } else {
+                            None
+                        };
+                        // Count-only filtered scans project predicate columns only and
+                        // fold over a partition stream, so COUNT(*) avoids decoding
+                        // unrelated cells without first collecting partitions in a Vec.
+                        let count_projection_wanted = if count_only_select {
+                            projection_storage_ordinals_for_count_predicates(
+                                &s.where_clauses,
+                                table_meta,
+                            )
+                        } else {
+                            None
+                        };
+                        let partitions = if let Some(wanted) = projection_wanted {
+                            // Push partition-count cap down to the merger so
+                            // `LIMIT N` stops the scan after N partitions
+                            // rather than walking every SSTable.
+                            Some(
+                                state
+                                    .write_path
+                                    .load()
+                                    .range_read_projected(&table_id, wanted, scan_bound)
+                                    .await?,
+                            )
+                        } else if let Some(bound) = scan_bound {
+                            Some(
+                                state
+                                    .write_path
+                                    .load()
+                                    .range_read_limited_rows(&table_id, bound, row_limit)
+                                    .await?,
+                            )
+                        } else if row_limit > 0 {
+                            Some(
+                                state
+                                    .write_path
+                                    .load()
+                                    .range_read_limited_rows(
+                                        &table_id,
+                                        ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
+                                        row_limit,
+                                    )
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
+                        if count_only_select {
+                            let row_context = PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            };
+                            let predicate_context = SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            };
+                            let count = if let Some(partitions) = partitions.as_ref() {
+                                count_rows_from_partitions(
+                                    partitions,
+                                    row_context,
+                                    predicate_context,
+                                )
+                                .await?
+                            } else if let Some(wanted) = count_projection_wanted {
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_projected_stream_all_with(
+                                        &table_id,
+                                        wanted,
+                                        scan_bound,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                count_rows_from_partition_stream(
+                                    stream,
+                                    row_context,
+                                    predicate_context,
+                                )
+                                .await?
+                            } else {
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_stream_all_with(
+                                        &table_id,
+                                        row_limit,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                count_rows_from_partition_stream(
+                                    stream,
+                                    row_context,
+                                    predicate_context,
+                                )
+                                .await?
+                            };
+                            return Ok(SelectRawResult {
+                                column_names: col_names.to_vec(),
+                                column_types: col_types.to_vec(),
+                                rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                                keyspace: ks.to_string(),
+                                table: s.table.clone(),
+                                paging_state: None,
+                            });
+                        }
+                        let mut all_rows = Vec::new();
+                        if let Some(partitions) = partitions.as_ref() {
+                            extend_rows_from_partitions(
+                                partitions,
+                                &mut all_rows,
+                                &all_col_names,
+                                &all_col_types,
+                                &pk_indices,
+                                &ck_indices,
+                                &storage_to_table,
+                            )
+                            .await;
                         } else {
                             let stream = state
                                 .write_path
@@ -3471,62 +3953,28 @@ async fn route_select_user_table(
                                     &table_strategy,
                                 )
                                 .await?;
-                            count_rows_from_partition_stream(stream, row_context, predicate_context)
-                                .await?
-                        };
-                        return Ok(SelectRawResult {
-                            column_names: col_names.to_vec(),
-                            column_types: col_types.to_vec(),
-                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                            keyspace: ks.to_string(),
-                            table: s.table.clone(),
-                            paging_state: None,
-                        });
-                    }
-                    let mut all_rows = Vec::new();
-                    if let Some(partitions) = partitions.as_ref() {
-                        extend_rows_from_partitions(
-                            partitions,
-                            &mut all_rows,
-                            &all_col_names,
-                            &all_col_types,
-                            &pk_indices,
-                            &ck_indices,
-                            &storage_to_table,
-                        )
-                        .await;
-                    } else {
-                        let stream = state
-                            .write_path
-                            .load()
-                            .range_read_stream_all_with(
-                                &table_id,
-                                row_limit,
-                                ctx.consistency,
-                                &table_strategy,
+                            extend_rows_from_partition_stream(
+                                stream,
+                                &mut all_rows,
+                                &all_col_names,
+                                &all_col_types,
+                                &pk_indices,
+                                &ck_indices,
+                                &storage_to_table,
                             )
                             .await?;
-                        extend_rows_from_partition_stream(
-                            stream,
+                        }
+                        filter_rows_by_select_predicates(
                             &mut all_rows,
+                            s,
                             &all_col_names,
                             &all_col_types,
-                            &pk_indices,
-                            &ck_indices,
-                            &storage_to_table,
-                        )
-                        .await?;
+                            table_meta,
+                            ks,
+                            state,
+                        )?;
+                        all_rows
                     }
-                    filter_rows_by_select_predicates(
-                        &mut all_rows,
-                        s,
-                        &all_col_names,
-                        &all_col_types,
-                        table_meta,
-                        ks,
-                        state,
-                    )?;
-                    all_rows
                 }
             }
         }
@@ -3951,6 +4399,24 @@ fn encode_virtual_rows_streaming(
     ))
 }
 
+/// Render a `ComparisonOp` as the operator string recorded in
+/// `system_observability.full_scan_reasons`.
+fn comparison_op_str(op: &ComparisonOp) -> &'static str {
+    match op {
+        ComparisonOp::Eq => "=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Le => "<=",
+        ComparisonOp::Ge => ">=",
+        ComparisonOp::In => "IN",
+        ComparisonOp::Ne => "!=",
+        ComparisonOp::Contains => "CONTAINS",
+        ComparisonOp::ContainsKey => "CONTAINS KEY",
+        ComparisonOp::SoundsLike => "SOUNDS LIKE",
+        ComparisonOp::Like => "LIKE",
+    }
+}
+
 // ── EXPLAIN ──────────────────────────────────────────────────────────────
 
 fn route_explain(
@@ -3977,11 +4443,32 @@ fn route_explain(
         .map(|(_, meta)| (meta.name.clone(), meta.target_columns.clone()))
         .collect();
 
-    let scan_plan = planner::plan(
-        &s.where_clauses,
-        &table_meta.partition_key,
-        &planner_indexes,
-    );
+    // Geospatial queries are served by the geo index in their own branch, not by
+    // the generic planner, so report `GeoIndex` here rather than FullScan.
+    let scan_plan = if let Some(geo_plan) = geo_explain_plan(&snap, ks, &s) {
+        geo_plan
+    } else {
+        planner::plan(
+            &s.where_clauses,
+            &table_meta.partition_key,
+            &planner_indexes,
+        )
+    };
+
+    // `ORDER BY col ANN OF [...]` on a vector-indexed column is served by the
+    // index consult in `route_select_user_table`, not the WHERE-clause planner,
+    // so EXPLAIN must report the vector index rather than the planner's
+    // (FullScan) verdict for the empty WHERE clause.
+    let scan_plan = match s.ann_of.as_ref() {
+        Some((ann_col, _)) => match vector_index_for_ann_column(&snap, ks, &s.table, ann_col) {
+            Some(index_name) => ScanPlan::VectorAnn {
+                index_name,
+                index_column: ann_col.clone(),
+            },
+            None => scan_plan,
+        },
+        None => scan_plan,
+    };
 
     let plan_text = format!("{scan_plan}");
 
@@ -3991,6 +4478,34 @@ fn route_explain(
     Ok(result::encode_rows(
         &col_names, &col_types, ks, &s.table, &rows,
     ))
+}
+
+/// Build a [`ScanPlan::GeoIndex`] for EXPLAIN when `s` carries a geospatial
+/// operation backed by a registered geo index. Returns `None` when there is no
+/// geo operation (so the generic planner runs) or no matching geo index.
+fn geo_explain_plan(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    s: &SelectStatement,
+) -> Option<ScanPlan> {
+    let (column, op) = if let Some(gn) = &s.geo_nearest {
+        (gn.column.clone(), "GeoNearest")
+    } else if let Some(pred) = s.geo_predicates.first() {
+        let op = match pred {
+            GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
+            GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
+            GeoPredicate::WithinPolygon { .. } => "GeoWithinPolygon",
+        };
+        (pred.column().to_string(), op)
+    } else {
+        return None;
+    };
+    let index_name = resolve_geo_index_name(snap, ks, &s.table, &column)?;
+    Some(ScanPlan::GeoIndex {
+        index_name,
+        index_column: column,
+        op: op.to_string(),
+    })
 }
 
 // ── USING TIMESTAMP / TTL helpers (Gap 10) ───────────────────────────────
@@ -6132,6 +6647,7 @@ fn resolve_index_type(
         Some("filtered") => Ok(IndexType::Filtered),
         Some("vector") => Ok(IndexType::Vector),
         Some("fulltext") => Ok(IndexType::FullText),
+        Some("geo") => Ok(IndexType::Geo),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -6210,6 +6726,10 @@ async fn route_create_index(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            // Dogfood: persist the system_schema.indexes row so the storage-backed
+            // SELECT path returns it. The cluster/pair DDL paths persist this via
+            // SystemTableWriter on the leader; standalone Direct mode writes it here.
+            persist_index_row_direct(&state.engine, &index_meta);
             state.schema.create_index(index_meta, ctx.auth)?;
         }
         DdlPath::Pair(coordinator) => {
@@ -6239,17 +6759,16 @@ async fn route_create_index(
             .tables
             .get(&(ks.to_string(), s.table.clone()))
             .and_then(|tbl| {
-                // Collect regular columns sorted by position to determine the ordinal.
-                let mut regulars: Vec<_> = tbl
-                    .columns
-                    .values()
-                    .filter(|c| c.kind == ColumnKind::Regular)
-                    .collect();
-                regulars.sort_by_key(|c| c.position);
-                regulars
-                    .iter()
-                    .position(|c| &c.name == target_col)
-                    .map(|pos| (pos, regulars[pos].column_type.clone()))
+                // The memtable/SSTable cell position is the *storage* column
+                // index (statics then regulars, each sorted by Cassandra's
+                // column-name comparator), NOT the declaration order. The write
+                // path indexes the cell at `storage_column_index`, so the index
+                // must register that exact position or it would read the wrong
+                // cell (e.g. on a multi-regular-column table the geo tuple and a
+                // text column would swap, decoding to garbage).
+                let storage_idx = tbl.storage_column_index(target_col)? as usize;
+                let column_type = tbl.columns.get(target_col)?.column_type.clone();
+                Some((storage_idx, column_type))
             });
 
         if let Some((pos, column_type)) = col_info {
@@ -6274,7 +6793,9 @@ async fn route_create_index(
                 // the generic add_index() only builds a BTree.
                 state.engine.add_fulltext_index(&table_id, &index_name, pos)
             } else {
-                state.engine.add_index(&table_id, &index_name, pos)
+                state
+                    .engine
+                    .add_index(&table_id, &index_name, pos, index_type)
             };
 
             if let Err(e) = wire_result {
@@ -6345,6 +6866,9 @@ async fn route_drop_index(
             state
                 .schema
                 .drop_index(ks, &table_name, &s.name, ctx.auth)?;
+            // Tombstone the dogfooded system_schema.indexes row (cluster/pair
+            // paths do this via SystemTableWriter; Direct mode does it here).
+            tombstone_index_row_direct(&state.engine, ks, &table_name, &s.name);
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropIndex {
@@ -7412,6 +7936,83 @@ fn try_pk_in_lookup(
 
 /// Convert a WHERE clause `Term` for a given column into an `IndexKey` for
 /// secondary index lookup.
+/// Read and intersect the result sets of every matched single-column index.
+///
+/// Each index is point-looked-up for its `Eq` predicate; the returned
+/// partitions are intersected on partition-key identity, so the fetched set is
+/// the partitions present in *every* index rather than the (larger) result of a
+/// single index. Per-row precision on clustered tables is enforced by the
+/// caller's post-filter. Falls back to a full scan only if every index read is
+/// empty (the memtable-index-not-yet-wired fallback), preserving correctness.
+#[allow(clippy::too_many_arguments)]
+async fn read_index_intersection(
+    state: &SharedState,
+    table_id: &TableId,
+    indexes: &[(String, String)],
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+    ks: &str,
+    consistency: ConsistencyLevel,
+    table_strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+) -> Result<Vec<ferrosa_sstable::types::Partition>, CqlError> {
+    let mut per_index: Vec<Vec<ferrosa_sstable::types::Partition>> =
+        Vec::with_capacity(indexes.len());
+    for (index_name, index_column) in indexes {
+        let index_wc = s
+            .where_clauses
+            .iter()
+            .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
+            .ok_or_else(|| {
+                CqlError::Invalid(
+                    "planner selected index but no matching WHERE clause found".into(),
+                )
+            })?;
+        let index_key =
+            term_to_index_key(&index_wc.value, index_column, table_meta, ks, &state.schema)?;
+        let partitions = state
+            .write_path
+            .load()
+            .index_read(table_id, index_name, &index_key)
+            .await?;
+        per_index.push(partitions);
+    }
+
+    // Memtable-index-not-yet-wired fallback: if every index read came back
+    // empty, fall back to a full scan so results stay correct.
+    if per_index.iter().all(|p| p.is_empty()) {
+        return Ok(state
+            .write_path
+            .load()
+            .range_read_with(table_id, consistency, table_strategy)
+            .await?);
+    }
+
+    Ok(intersect_partitions_by_key(per_index))
+}
+
+/// Intersect partition lists on partition-key bytes, keeping each surviving
+/// partition once. A partition survives only if its key appears in every list.
+fn intersect_partitions_by_key(
+    mut per_index: Vec<Vec<ferrosa_sstable::types::Partition>>,
+) -> Vec<ferrosa_sstable::types::Partition> {
+    // Order lists smallest-first so the retained set starts as tight as
+    // possible, then intersect each subsequent list's key set against it.
+    per_index.sort_by_key(|p| p.len());
+    let mut iter = per_index.into_iter();
+    let mut result = match iter.next() {
+        Some(first) => first,
+        None => return Vec::new(),
+    };
+    for partitions in iter {
+        let keys: std::collections::HashSet<Vec<u8>> = partitions
+            .iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect();
+        result.retain(|p| keys.contains(p.key.key.as_bytes()));
+    }
+    result
+}
+
 fn term_to_index_key(
     term: &Term,
     column: &str,
@@ -7702,6 +8303,82 @@ mod like_match_tests {
 /// projects down to the columns requested in the `SELECT` list. If the
 /// `SELECT` list contains `toJson(col)`, the column value is serialized to
 /// a JSON string using [`bridge::cql_value_to_json`].
+/// Persist a `system_schema.indexes` row for standalone (Direct) DDL.
+///
+/// The cluster/pair DDL paths dogfood this via `SystemTableWriter` on the Raft
+/// leader; standalone mode has no such path, so the CQL router writes the row
+/// directly. A failure here (e.g. the system table is not registered in a
+/// schema-only deployment) is logged loudly but does not fail CREATE INDEX —
+/// the index is still live in the Registry and is repersisted at next boot.
+fn persist_index_row_direct(engine: &StorageEngine, index: &IndexMetadata) {
+    let row = ferrosa_schema::system::persistence::index_to_rows(index);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let tid = TableId::new("system_schema", "indexes");
+    if let Err(e) = engine.write(&tid, &row.key, row.row, ts) {
+        tracing::warn!(
+            %e,
+            keyspace = %index.keyspace,
+            table = %index.table,
+            index = %index.name,
+            "router: failed to persist system_schema.indexes row (Direct DDL)"
+        );
+    }
+}
+
+/// Tombstone a `system_schema.indexes` row for standalone (Direct) DROP INDEX.
+///
+/// Mirrors [`persist_index_row_direct`] on the drop side. Failures are logged
+/// loudly but do not fail DROP INDEX — the Registry already dropped the index.
+fn tombstone_index_row_direct(engine: &StorageEngine, keyspace: &str, table: &str, name: &str) {
+    if let Err(e) = engine.write_index_tombstone(keyspace, table, name) {
+        tracing::warn!(
+            %e,
+            keyspace,
+            table,
+            index = name,
+            "router: failed to tombstone system_schema.indexes row (Direct DDL)"
+        );
+    }
+}
+
+/// Map a persisted `system_schema.indexes` kind string (`btree`, `hash`, …)
+/// to the Cassandra-faithful kind value (`COMPOSITES`/`CUSTOM`) that CQL
+/// drivers expect when introspecting `system_schema.indexes`.
+fn cassandra_index_kind(stored_kind: &str) -> &'static str {
+    match stored_kind {
+        "btree" | "composite" => "COMPOSITES",
+        _ => "CUSTOM",
+    }
+}
+
+/// Apply `SELECT ... WHERE col = '...'` equality predicates to a persisted
+/// `system_schema.indexes` row. Non-equality / non-string predicates and
+/// unknown columns are ignored (treated as matching), mirroring the prior
+/// best-effort virtual-table filter.
+fn index_row_matches_where(
+    row: &ferrosa_storage::PersistedIndexRow,
+    where_clauses: &[crate::ast::WhereClause],
+) -> bool {
+    where_clauses.iter().all(|wc| {
+        if wc.op != crate::ast::ComparisonOp::Eq {
+            return true;
+        }
+        let val = match &wc.value {
+            crate::ast::Term::StringLiteral(s) => s.as_str(),
+            _ => return true,
+        };
+        match wc.column.as_str() {
+            "keyspace_name" => row.keyspace_name == val,
+            "table_name" => row.table_name == val,
+            "index_name" => row.index_name == val,
+            _ => true,
+        }
+    })
+}
+
 fn apply_system_select(
     select_columns_ast: &[SelectColumn],
     all_col_names: &[String],
@@ -9662,6 +10339,8 @@ mod tests {
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
+            index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
             udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,
@@ -9682,7 +10361,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn test_ctx<'a>(auth: &'a AuthContext, ks: &'a Option<String>) -> RequestContext<'a> {
         RequestContext {
             auth,
@@ -10785,6 +11463,127 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Step 4 (dogfood system_schema.indexes): `CREATE INDEX` then
+    /// `SELECT * FROM system_schema.indexes` must return the index — served
+    /// from the persisted `system_schema.indexes` storage table, not the
+    /// retired virtual table or the in-memory Registry computation.
+    #[tokio::test]
+    async fn select_system_schema_indexes_reads_from_storage() {
+        let (state, _dir) = setup();
+        // Boot order parity: system_schema.* tables are registered with the
+        // engine before any DDL runs (real boot does this at engine startup).
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE sysidx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE sysidx.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE INDEX sysidx_email ON sysidx.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT * — the row must come from the stored table.
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.indexes").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "CREATE INDEX must persist exactly one system_schema.indexes row"
+        );
+
+        // WHERE filter on the clustering index_name must still match.
+        let stmt = crate::parser::parse(
+            "SELECT * FROM system_schema.indexes WHERE index_name = 'sysidx_email'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "WHERE index_name filter must match the persisted row"
+        );
+    }
+
+    /// Proves the `system_schema.indexes` read path is backed by *storage*, not
+    /// the in-memory Registry: a row written directly to the stored table (with
+    /// no corresponding Registry entry) is still returned by the SELECT.
+    #[tokio::test]
+    async fn system_schema_indexes_served_from_storage_not_registry() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Write a system_schema.indexes row straight to storage, bypassing the
+        // Registry entirely.
+        let idx = ferrosa_schema::IndexMetadata {
+            keyspace: "ghost_ks".to_string(),
+            table: "ghost_tbl".to_string(),
+            name: "ghost_idx".to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["col".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        let row = ferrosa_schema::system::persistence::index_to_rows(&idx);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let tid = TableId::new("system_schema", "indexes");
+        state.engine.write(&tid, &row.key, row.row, ts).unwrap();
+
+        // The Registry has no such index, yet the SELECT returns it.
+        assert!(
+            !state.schema.snapshot().indexes.contains_key(&(
+                "ghost_ks".into(),
+                "ghost_tbl".into(),
+                "ghost_idx".into()
+            )),
+            "precondition: Registry must NOT contain the ghost index"
+        );
+
+        let stmt = crate::parser::parse(
+            "SELECT * FROM system_schema.indexes WHERE keyspace_name = 'ghost_ks'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "row written only to storage must be returned by the SELECT"
+        );
     }
 
     /// Regression: PR#21 (Gap 7) hardcoded the 10-col Cassandra-5.0 shape
@@ -11966,6 +12765,61 @@ mod tests {
         }
         // row_count
         i32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
+    }
+
+    /// Decode a `SELECT id, name` Rows result into `(i32, String)` pairs in
+    /// result order. Assumes the projection is exactly `(int, text)`.
+    fn decode_id_name_rows(buf: &[u8]) -> Vec<(i32, String)> {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        let row_count = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let mut rows = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            // Column 0: id int (4 bytes)
+            let id_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            assert_eq!(id_len, 4, "id column must be a 4-byte int");
+            let id = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            // Column 1: name text (variable)
+            let name_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            let name = if name_len < 0 {
+                String::new()
+            } else {
+                let n = name_len as usize;
+                let s = String::from_utf8_lossy(&buf[off..off + n]).into_owned();
+                off += n;
+                s
+            };
+            rows.push((id, name));
+        }
+        rows
     }
 
     fn extract_first_bigint_value(buf: &[u8]) -> i64 {
@@ -15198,6 +16052,645 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Phase 2 (per-type read dispatch): a phonetic `WHERE name = 'Jon'` without
+    /// a PK predicate must take the secondary-index path (`SingleIndex`), and the
+    /// index must point-look-up the phonetic sidecar/memtable by encoded code —
+    /// returning the row even after a flush, where the memtable index is empty.
+    /// This proves the index is consulted, not a full-scan + post-filter.
+    #[tokio::test]
+    async fn phonetic_select_takes_index_path_not_full_scan() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for cql in [
+            "CREATE KEYSPACE phon_idx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE phon_idx.people (id int PRIMARY KEY, name text)",
+            "CREATE INDEX phon_name ON phon_idx.people (name) USING 'phonetic'",
+            "INSERT INTO phon_idx.people (id, name) VALUES (1, 'John')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // EXPLAIN must show the planner chose the index path, not a FullScan.
+        let stmt =
+            crate::parser::parse("EXPLAIN SELECT id FROM phon_idx.people WHERE name = 'Jon'")
+                .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let haystack = String::from_utf8_lossy(&b);
+                assert!(
+                    haystack.contains("SingleIndex"),
+                    "phonetic query must plan SingleIndex, got: {haystack}"
+                );
+                assert!(
+                    !haystack.contains("FullScan"),
+                    "phonetic query must not plan FullScan, got: {haystack}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+
+        // Flush so the memtable index is empty: a correct answer here can only
+        // come from the phonetic sidecar via the index path (a full scan would
+        // be a fallback, but the planned path is SingleIndex per EXPLAIN above).
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("phon_idx", "people"))
+            .unwrap();
+
+        let stmt =
+            crate::parser::parse("SELECT id FROM phon_idx.people WHERE name = 'Jon'").unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index path must match 'Jon' to flushed 'John', got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Phase 2 (per-type read dispatch): a two-predicate `WHERE a = ? AND b = ?`
+    /// where both columns are independently indexed must plan `IndexIntersection`
+    /// and consult BOTH indexes, returning only rows present in both index
+    /// result sets. The discriminating fixture has rows matching only `a`, only
+    /// `b`, and both — a correct intersection returns exactly the both-match row.
+    #[tokio::test]
+    async fn index_intersection_consults_all_indexes() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for cql in [
+            "CREATE KEYSPACE isect WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE isect.people (id int PRIMARY KEY, city text, dept text)",
+            "CREATE INDEX isect_city ON isect.people (city)",
+            "CREATE INDEX isect_dept ON isect.people (dept)",
+            // row 1: matches both city='NYC' AND dept='eng' — the only answer.
+            "INSERT INTO isect.people (id, city, dept) VALUES (1, 'NYC', 'eng')",
+            // row 2: matches city only.
+            "INSERT INTO isect.people (id, city, dept) VALUES (2, 'NYC', 'sales')",
+            // row 3: matches dept only.
+            "INSERT INTO isect.people (id, city, dept) VALUES (3, 'LA', 'eng')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // EXPLAIN must show IndexIntersection over both indexes.
+        let stmt = crate::parser::parse(
+            "EXPLAIN SELECT id FROM isect.people WHERE city = 'NYC' AND dept = 'eng'",
+        )
+        .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let haystack = String::from_utf8_lossy(&b);
+                assert!(
+                    haystack.contains("IndexIntersection"),
+                    "two indexed Eq predicates must plan IndexIntersection, got: {haystack}"
+                );
+                assert!(
+                    haystack.contains("isect_city") && haystack.contains("isect_dept"),
+                    "IndexIntersection must reference both indexes, got: {haystack}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+
+        let stmt =
+            crate::parser::parse("SELECT id FROM isect.people WHERE city = 'NYC' AND dept = 'eng'")
+                .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "intersection of city='NYC' and dept='eng' must return exactly row 1, got {count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    // ── Phase 3: per-type index-usage observability ─────────────────────────
+    //
+    // Each of the following tests proves, for one index type, BOTH that the
+    // query returns the correct rows AND that the index was observably hit:
+    // the `system_observability.index_usage` counter increments and EXPLAIN
+    // reports a non-`FullScan` plan. The vector test asserts correct ANN
+    // ordering and that the vector index is registered (the router ANN path is
+    // a brute-force sort pending Phase 2 vector read dispatch, so it honestly
+    // does not claim an index_usage hit it cannot demonstrate).
+
+    /// Run a non-EXPLAIN query and assert the index_usage counter advanced by
+    /// exactly the expected delta, returning the decoded row count.
+    async fn assert_index_hit_and_count(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        select_cql: &str,
+        expected_delta: u64,
+    ) -> i32 {
+        let before = state.index_usage_tracker.total_index_hits();
+        let stmt = crate::parser::parse(select_cql).unwrap();
+        let row_count = match route(state, ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected Result for: {select_cql}"),
+        };
+        let after = state.index_usage_tracker.total_index_hits();
+        assert_eq!(
+            after - before,
+            expected_delta,
+            "index_usage must advance by {expected_delta} for: {select_cql} (before={before}, after={after})"
+        );
+        row_count
+    }
+
+    /// Assert that EXPLAIN of `select_cql` reports a plan that is not a
+    /// `FullScan` and contains `expected_plan`.
+    async fn assert_explain_plan(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        select_cql: &str,
+        expected_plan: &str,
+    ) {
+        let stmt = crate::parser::parse(&format!("EXPLAIN {select_cql}")).unwrap();
+        match route(state, ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let haystack = String::from_utf8_lossy(&b).into_owned();
+                assert!(
+                    haystack.contains(expected_plan),
+                    "EXPLAIN of `{select_cql}` must contain `{expected_plan}`, got: {haystack}"
+                );
+                assert!(
+                    !haystack.contains("FullScan"),
+                    "EXPLAIN of `{select_cql}` must not be FullScan, got: {haystack}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+    }
+
+    /// BTree (default) index: `WHERE col = ?` without a PK predicate plans
+    /// `SingleIndex`, returns the matching row, and increments index_usage.
+    #[tokio::test]
+    async fn btree_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE bt WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE bt.users (id int PRIMARY KEY, email text)",
+            "CREATE INDEX bt_email ON bt.users (email) USING 'btree'",
+            "INSERT INTO bt.users (id, email) VALUES (1, 'a@x.com')",
+            "INSERT INTO bt.users (id, email) VALUES (2, 'b@x.com')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM bt.users WHERE email = 'a@x.com'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "btree index lookup must return exactly 1 row");
+    }
+
+    /// Hash index: `WHERE col = ?` (POINT_LOOKUP) plans `SingleIndex`, returns
+    /// the matching row, and increments index_usage.
+    #[tokio::test]
+    async fn hash_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE hsh WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE hsh.sessions (id int PRIMARY KEY, user_id text)",
+            "CREATE INDEX hsh_user ON hsh.sessions (user_id) USING 'hash'",
+            "INSERT INTO hsh.sessions (id, user_id) VALUES (1, 'u-100')",
+            "INSERT INTO hsh.sessions (id, user_id) VALUES (2, 'u-200')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM hsh.sessions WHERE user_id = 'u-100'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "hash index lookup must return exactly 1 row");
+    }
+
+    /// Composite index: `WHERE col = ?` plans `SingleIndex`, returns the
+    /// matching row, and increments index_usage.
+    #[tokio::test]
+    async fn composite_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE cmp WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE cmp.events (id int PRIMARY KEY, region text)",
+            "CREATE INDEX cmp_region ON cmp.events (region) USING 'composite'",
+            "INSERT INTO cmp.events (id, region) VALUES (1, 'us-east')",
+            "INSERT INTO cmp.events (id, region) VALUES (2, 'eu-west')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM cmp.events WHERE region = 'us-east'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "composite index lookup must return exactly 1 row");
+    }
+
+    /// Phonetic index: `WHERE name = 'Jon'` matches 'John' via the phonetic
+    /// index path, returns the row, and increments index_usage.
+    #[tokio::test]
+    async fn phonetic_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE phu WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE phu.people (id int PRIMARY KEY, name text)",
+            "CREATE INDEX phu_name ON phu.people (name) USING 'phonetic'",
+            "INSERT INTO phu.people (id, name) VALUES (1, 'John')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM phu.people WHERE name = 'Jon'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "phonetic index must match 'Jon' to 'John'");
+    }
+
+    /// Full-text index: `WHERE body = fts_match(...)` consults the FTI, returns
+    /// the matching rows, and increments index_usage.
+    #[tokio::test]
+    async fn fulltext_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE ftu WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ftu.docs (id int PRIMARY KEY, body text)",
+            "CREATE INDEX ftu_body ON ftu.docs (body) USING 'fulltext'",
+            "INSERT INTO ftu.docs (id, body) VALUES (1, 'rust is a fast distributed database')",
+            "INSERT INTO ftu.docs (id, body) VALUES (2, 'hello world')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("ftu", "docs"))
+            .unwrap();
+        let q = "SELECT id FROM ftu.docs WHERE body = fts_match('distributed AND database')";
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "fts_match must return exactly the matching doc");
+    }
+
+    /// Set up the `geo.places` schema, the geo index, and the sample points
+    /// from `examples/geospatial.cql`. Returns the state + ctx-owning auth.
+    async fn setup_geo(state: &SharedState, ctx: &RequestContext<'_>) {
+        for cql in [
+            "CREATE KEYSPACE geo WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE geo.places (id int PRIMARY KEY, name text, location frozen<tuple<double, double>>)",
+            "CREATE INDEX places_location_geo ON geo.places (location) USING 'geo'",
+            "INSERT INTO geo.places (id, name, location) VALUES (1, 'SF Ferry Building',   (37.7955, -122.3937))",
+            "INSERT INTO geo.places (id, name, location) VALUES (2, 'SF Union Square',     (37.7880, -122.4074))",
+            "INSERT INTO geo.places (id, name, location) VALUES (3, 'SF Golden Gate Park', (37.7694, -122.4862))",
+            "INSERT INTO geo.places (id, name, location) VALUES (4, 'NYC Times Square',    (40.7580,  -73.9855))",
+            "INSERT INTO geo.places (id, name, location) VALUES (5, 'Dateline East',       (0.0000,  179.9900))",
+            "INSERT INTO geo.places (id, name, location) VALUES (6, 'Dateline West',       (0.0000, -179.9900))",
+            "INSERT INTO geo.places (id, name, location) VALUES (7, 'Near North Pole',     (89.9000,    0.0000))",
+        ] {
+            route(state, ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+    }
+
+    /// Run a SELECT and return its result rows as `(id, name)` pairs, in result
+    /// order. Panics on any non-Result outcome.
+    async fn run_geo_select(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        cql: &str,
+    ) -> Vec<(i32, String)> {
+        let stmt = crate::parser::parse(cql).unwrap();
+        let body = match route(state, ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result for `{cql}`"),
+        };
+        decode_id_name_rows(&body)
+    }
+
+    /// Geo `GEO_NEAREST OF` k-NN: the three SF places rank ahead of NYC.
+    #[tokio::test]
+    async fn geo_nearest_returns_k_nearest_in_order() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 ORDER BY location GEO_NEAREST OF (37.7880, -122.4074) LIMIT 3";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        assert_eq!(rows.len(), 3, "LIMIT 3 must bound the result");
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        // The three SF places (ids 1,2,3) are nearest to Union Square; NYC (4)
+        // and the dateline/pole points are all farther.
+        assert!(
+            ids.contains(&1) && ids.contains(&2) && ids.contains(&3),
+            "nearest 3 must be the SF cluster, got {ids:?}"
+        );
+        // Union Square itself is the closest (distance 0).
+        assert_eq!(
+            rows[0].0, 2,
+            "Union Square is the query point and ranks first"
+        );
+    }
+
+    /// Geo `GEO_WITHIN_RADIUS`: a 3km radius around the Ferry Building keeps the
+    /// downtown SF places and drops Golden Gate Park + NYC.
+    #[tokio::test]
+    async fn geo_within_radius_filters_by_exact_distance() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE GEO_WITHIN_RADIUS(location, (37.7955, -122.3937), 3000)";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "3km radius keeps Ferry Building + Union Square, drops GG Park & NYC"
+        );
+        assert_eq!(count, 2);
+    }
+
+    /// Geo `GEO_WITHIN_BBOX`: a central-SF box returns only the SF places.
+    #[tokio::test]
+    async fn geo_within_bbox_filters_to_central_sf() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE GEO_WITHIN_BBOX(location, (37.70, -122.52), (37.83, -122.35))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "central-SF bbox returns all three SF places only"
+        );
+    }
+
+    /// Geo `GEO_WITHIN_BBOX` across the antimeridian: SW lon 179, NE lon -179
+    /// must return BOTH dateline points (ids 5 and 6).
+    #[tokio::test]
+    async fn geo_within_bbox_antimeridian_returns_both_dateline_points() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE GEO_WITHIN_BBOX(location, (-1.0, 179.0), (1.0, -179.0))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![5, 6],
+            "antimeridian bbox must return both dateline points, not zero"
+        );
+    }
+
+    /// Geo `ST_WITHIN`: a polygon around central SF returns only the SF places
+    /// (ids 1, 2, 3) and excludes NYC and the dateline points. The query must
+    /// hit the geo index (EXPLAIN reports GeoIndex, not FullScan) and advance
+    /// the index_usage counter.
+    #[tokio::test]
+    async fn geo_st_within_polygon_filters_to_central_sf() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        // A quadrilateral hugging central SF: contains the three SF points,
+        // excludes NYC (≈ lon -74) and both dateline points (lon ≈ ±180).
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE ST_WITHIN(location, ((37.70, -122.52), (37.83, -122.52), \
+                 (37.83, -122.35), (37.70, -122.35)))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "central-SF polygon returns all three SF places only"
+        );
+        assert_eq!(count, 3);
+    }
+
+    /// Geo `ST_WITHIN` with a concave polygon: a point inside the bounding box
+    /// but outside the actual polygon (in a notch) must be excluded. This proves
+    /// the exact point-in-polygon refinement runs, not just the bbox cover.
+    #[tokio::test]
+    async fn geo_st_within_concave_polygon_excludes_notch_point() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        // Add two points: one squarely inside, one in the concave notch (inside
+        // the bbox but outside the polygon).
+        for cql in [
+            "INSERT INTO geo.places (id, name, location) VALUES (10, 'Body',  (0.5, 2.0))",
+            "INSERT INTO geo.places (id, name, location) VALUES (11, 'Notch', (1.5, 1.0))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // The concave "U" polygon from the geometry unit tests.
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE ST_WITHIN(location, ((0.0, 0.0), (0.0, 4.0), (4.0, 4.0), \
+                 (4.0, 0.0), (2.0, 0.0), (2.0, 3.0), (1.0, 3.0), (1.0, 0.0)))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![10],
+            "body point in, notch point excluded by refine"
+        );
+    }
+
+    /// Vector index: an `ORDER BY ... ANN OF` query returns the nearest rows in
+    /// distance order, and the vector index is registered in storage. The
+    /// router ANN path is brute-force pending Phase 2 vector read dispatch, so
+    /// this asserts correctness + index registration rather than an
+    /// index_usage hit it cannot honestly demonstrate.
+    #[tokio::test]
+    async fn vector_index_registered_and_ann_orders_correctly() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE vec WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE vec.items (id int PRIMARY KEY, embedding vector<float, 4>)",
+            "CREATE INDEX vec_ann ON vec.items (embedding) USING 'vector'",
+            "INSERT INTO vec.items (id, embedding) VALUES (1, [0.90, 0.10, 0.00, 0.00])",
+            "INSERT INTO vec.items (id, embedding) VALUES (2, [0.00, 0.00, 0.90, 0.10])",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        // The vector index must be registered with the engine (HNSW default).
+        assert_eq!(
+            state
+                .engine
+                .vector_index_method(&ferrosa_storage::TableId::new("vec", "items"), "vec_ann")
+                .unwrap(),
+            ferrosa_storage::VectorIndexMethod::Hnsw,
+            "vector index must be registered with the default HNSW method"
+        );
+        // ANN query returns the nearest row first.
+        let stmt = crate::parser::parse(
+            "SELECT id FROM vec.items ORDER BY embedding ANN OF [0.90, 0.10, 0.00, 0.00] LIMIT 1",
+        )
+        .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(count, 1, "ANN OF LIMIT 1 must return exactly 1 row");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// `ORDER BY col ANN OF [...]` on a vector-indexed column must be served by
+    /// the index consult, observable as a `VectorAnn` EXPLAIN plan AND an
+    /// `index_usage` hit — never a silent full scan. Storage-layer ordering
+    /// correctness (nearest-first by score) is covered by
+    /// `ann_search_partitions_returns_nearest_rows_with_pk_in_score_order`.
+    #[tokio::test]
+    async fn ann_query_consults_vector_index_and_is_observable() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE annobs WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE annobs.papers (id int PRIMARY KEY, embedding vector<float, 3>)",
+            "CREATE INDEX papers_ann ON annobs.papers (embedding) USING 'vector'",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (1, [1.0, 0.0, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (2, [0.9, 0.1, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (3, [0.7, 0.3, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (4, [0.5, 0.5, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (5, [0.0, 0.0, 1.0])",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM annobs.papers ORDER BY embedding ANN OF [1.0, 0.0, 0.0] LIMIT 3";
+        // EXPLAIN must report the vector index, not a full scan.
+        assert_explain_plan(&state, &ctx, q, "VectorAnn").await;
+        // Executing the query records exactly one index hit (the consult) and
+        // returns k rows — proving the index path ran, not a full scan.
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 3, "ANN OF LIMIT 3 must return exactly k=3 rows");
+    }
+
+    /// Full-scan observability: a `WHERE col = ?` with no index and ALLOW
+    /// FILTERING must plan `FullScan`, record into the full_scan_tracker (so
+    /// `system_observability.full_scan_reasons` surfaces it), and return the
+    /// correct rows. This is the negative counterpart to the index-hit tests.
+    #[tokio::test]
+    async fn full_scan_recorded_when_no_index() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE fsr WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fsr.t (id int PRIMARY KEY, color text)",
+            "INSERT INTO fsr.t (id, color) VALUES (1, 'red')",
+            "INSERT INTO fsr.t (id, color) VALUES (2, 'blue')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let before = state.full_scan_tracker.total_full_scans();
+        let stmt = crate::parser::parse("SELECT id FROM fsr.t WHERE color = 'red' ALLOW FILTERING")
+            .unwrap();
+        let count = match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(count, 1, "full scan with post-filter must return 1 row");
+        assert_eq!(
+            state.full_scan_tracker.total_full_scans() - before,
+            1,
+            "an unindexed WHERE must record exactly one full scan"
+        );
     }
 
     /// `CREATE INDEX` followed by `INSERT` then `SELECT WHERE indexed_col = ?`

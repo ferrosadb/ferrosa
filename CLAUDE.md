@@ -91,6 +91,14 @@ Always apply Rust idioms and best practices. Use the language's type system to p
 
 Agents MUST verify that all CI checks will pass locally before pushing to a remote branch or creating a PR. This means running `cargo fmt --check`, `cargo clippy --all-targets`, and `cargo test` across the full workspace — not just the crate you touched. A CI failure that could have been caught locally is a wasted round-trip. Do not push and hope.
 
+## Releases
+
+See [specs/release-process.md](specs/release-process.md). Key rules:
+
+- **Never hand-edit `[workspace.package] version` in `Cargo.toml` in a PR.** The nightly release automation owns it and derives the next SemVer from Conventional Commit history; a manual bump is ignored and overwritten.
+- Use **Conventional Commit** subjects (`feat:`, `fix:`, `feat!:`/`BREAKING CHANGE:`) — the auto-bump level is computed from them, and sloppy subjects silently degrade a release to a `patch`.
+- Releases are **tag-only** (the `main` ruleset forbids direct pushes). Nightly cuts are GitHub **prereleases** (nightly channel); a maintainer **promotes** one to **stable** via the *Promote Release to Stable* workflow.
+
 ## Test Policy
 
 Non-negotiable rules for all agents:

@@ -278,6 +278,18 @@ fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     load_or_generate_host_id_with(data_dir, std::env::var("FERROSA_HOST_ID").ok())
 }
 
+/// Adapts the live [`PeerManager`](ferrosa_net::peer::PeerManager) into the
+/// self-heal [`PeerHealthProbe`](ferrosa_storage::self_heal::PeerHealthProbe) so
+/// the controller's replica posture reflects currently-reachable peers at each
+/// tick (a healthy peer present ⇒ corrupt SSTables may be quarantined).
+struct LivePeerHealth(std::sync::Arc<ferrosa_net::peer::PeerManager>);
+
+impl ferrosa_storage::self_heal::PeerHealthProbe for LivePeerHealth {
+    fn healthy_peer_count(&self) -> usize {
+        self.0.live_peer_ids().len()
+    }
+}
+
 /// Core implementation that accepts an explicit host_id override.
 /// Avoids process-global env var mutation in tests.
 fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) -> Uuid {
@@ -709,22 +721,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ferrosa_storage::StorageEngine::spawn_time_series_materialization_worker(storage.clone());
 
-    // Self-healing controller: deterministic autonomous repair of corrupt
-    // SSTables. Gated by FERROSA_SELFHEAL_ENABLED (default on). Until the
-    // cluster-aware replica-health view is wired (a follow-up), it runs with a
-    // single-node view, which means corruption escalates-degraded and is never
-    // quarantined (FMEA #1: never lose the only copy). Startup smoke-test
-    // warnings fire independently of this controller.
-    {
-        let selfheal_cfg = ferrosa_storage::self_heal::SelfHealConfig::from_env();
-        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
-            std::sync::Arc::new(ferrosa_storage::self_heal::SingleNodeClusterView::default());
-        ferrosa_storage::self_heal::SelfHealController::spawn(
-            storage.clone(),
-            cluster_view,
-            selfheal_cfg,
-        );
-    }
+    // Self-healing controller is spawned later (step 6c), once the PeerManager
+    // exists, so its replica-health view reflects real cluster membership
+    // instead of the old single-node placeholder.
 
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
@@ -834,6 +833,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Persist the S3 schema locally so future restarts don't need S3
             persist_schema_locally(data_path, &schema);
         }
+    }
+
+    // 4b'. Re-register secondary indexes from the persisted
+    // `system_schema.indexes` table. `load_local_schema` (schema.json) restores
+    // table schemas with no indexes, so without this every secondary index is
+    // silently dropped on restart. This runs after system tables (step 3) and
+    // user tables (above) are registered so `add_index` can resolve targets.
+    match storage.reload_indexes_from_system_schema() {
+        Ok(count) if count > 0 => {
+            tracing::info!(
+                count,
+                "re-registered persisted secondary indexes after restart"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(%e, "failed to reload secondary indexes from system_schema"),
     }
 
     if storage_auth_enabled {
@@ -956,6 +971,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtimes.raft.spawn(async move {
         heartbeat_pm.run_heartbeat_loop().await;
     });
+
+    // 6c. Self-healing controller: deterministic autonomous quarantine of
+    // corrupt SSTables. Spawned here (after the PeerManager) so the replica
+    // posture reflects LIVE membership: with a healthy peer reachable, a node
+    // quarantines its OWN local corrupt generations — moving them out of the
+    // active set so they stop being re-detected (and re-logged) every tick;
+    // isolated, it leaves them in place (FMEA #1: never quarantine a possibly-
+    // only copy). Quarantine only moves files, never deletes. Gated by
+    // FERROSA_SELFHEAL_ENABLED (default on). Startup smoke-test warnings fire
+    // independently of this controller.
+    {
+        let selfheal_cfg = ferrosa_storage::self_heal::SelfHealConfig::from_env();
+        let peer_probe: std::sync::Arc<dyn ferrosa_storage::self_heal::PeerHealthProbe> =
+            std::sync::Arc::new(LivePeerHealth(peer_manager.clone()));
+        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
+            std::sync::Arc::new(ferrosa_storage::self_heal::ReplicaAwareClusterView::new(
+                ferrosa_cluster::raft::uuid_to_node_id(host_id),
+                peer_probe,
+            ));
+        ferrosa_storage::self_heal::SelfHealController::spawn(
+            storage.clone(),
+            cluster_view,
+            selfheal_cfg,
+        );
+    }
 
     // 7. Start internode RPC server with inbound peer callback
     let rpc_server = Arc::new(
@@ -1115,6 +1155,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection_tracker =
         Arc::new(ferrosa_cql::virtual_tables::connections::ConnectionTracker::new());
     let query_tracker = Arc::new(ferrosa_cql::virtual_tables::active_queries::QueryTracker::new());
+    // Index-observability trackers: shared between the router (which records
+    // full-scan and index-usage events) and the virtual tables registered
+    // below (which expose them via system_observability.*). Use one Arc each
+    // so what the router records is what operators read.
+    let full_scan_tracker = Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new());
+    let index_usage_tracker = Arc::new(ferrosa_cql::virtual_tables::IndexUsageTracker::new());
     let udf_executor = Arc::new(
         ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default())
             .expect("failed to initialize UDF executor"),
@@ -1132,6 +1178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,
+        full_scan_tracker: full_scan_tracker.clone(),
+        index_usage_tracker: index_usage_tracker.clone(),
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller: Arc::clone(&mode_controller),
@@ -1226,10 +1274,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::QueryFingerprintsTable::new(fingerprint_tracker.clone()),
     ));
-    let full_scan_tracker = Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new());
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::FullScanReasonsTable::new(full_scan_tracker.clone()),
     ));
+    schema
+        .virtual_tables()
+        .register(Arc::new(ferrosa_cql::virtual_tables::IndexUsageTable::new(
+            index_usage_tracker.clone(),
+        )));
     let table_access_tracker = Arc::new(ferrosa_cql::virtual_tables::TableAccessTracker::new());
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::TableAccessSummaryTable::new(table_access_tracker.clone()),
