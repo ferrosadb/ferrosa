@@ -68,3 +68,16 @@ SELECT id, name FROM places
 --    return BOTH dateline points (ids 5 and 6), not zero rows.
 SELECT id, name FROM places
   WHERE GEO_WITHIN_BBOX(location, (-1.0, 179.0), (1.0, -179.0));
+
+-- ── Phase 2 (foundation): arbitrary query polygon ─────────────────────────
+-- 5) ST_WITHIN finds indexed POINTS inside an arbitrary query POLYGON. The
+--    planner covers the polygon's bounding box with cell ranges (same as the
+--    bbox path), then refines each candidate with an exact point-in-polygon
+--    ray-casting test. This quadrilateral hugs central San Francisco: it
+--    contains the three SF points (ids 1, 2, 3) and excludes NYC and both
+--    dateline points. The ring is given as ((lat, lon), ...) and is closed
+--    implicitly. Polygons crossing the ±180° antimeridian are rejected (planar
+--    ray casting is not correct across the dateline).
+SELECT id, name FROM places
+  WHERE ST_WITHIN(location, ((37.70, -122.52), (37.83, -122.52),
+                             (37.83, -122.35), (37.70, -122.35)));

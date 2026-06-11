@@ -324,6 +324,17 @@ pub enum GeoPredicate {
         /// North-east corner `(lat, lon)`.
         ne: (f64, f64),
     },
+    /// `ST_WITHIN(col, ((lat1, lon1), (lat2, lon2), ...))` — points inside the
+    /// query polygon defined by its outer-ring `vertices` in `(lat, lon)`
+    /// order. The ring is implicitly closed. The planner covers the polygon's
+    /// bounding box with cell ranges, then refines candidates with an exact
+    /// point-in-polygon test.
+    WithinPolygon {
+        /// The geo-indexed column.
+        column: String,
+        /// Outer-ring vertices in `(lat, lon)` order.
+        vertices: Vec<(f64, f64)>,
+    },
 }
 
 impl GeoPredicate {
@@ -332,6 +343,7 @@ impl GeoPredicate {
         match self {
             GeoPredicate::WithinRadius { column, .. } => column,
             GeoPredicate::WithinBbox { column, .. } => column,
+            GeoPredicate::WithinPolygon { column, .. } => column,
         }
     }
 }

@@ -2717,6 +2717,7 @@ async fn route_geo_select(
         let kind = match pred {
             GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
             GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
+            GeoPredicate::WithinPolygon { .. } => "GeoWithinPolygon",
         };
         (pred.column().to_string(), kind)
     };
@@ -2840,6 +2841,38 @@ async fn route_geo_select(
                             .unwrap_or(false)
                     })
                     .collect()
+            }
+            GeoPredicate::WithinPolygon { vertices, .. } => {
+                let polygon = geo::Polygon::new(vertices.clone());
+                // A dateline-straddling polygon is not handled by planar ray
+                // casting; reject it loudly rather than return wrong rows.
+                if polygon.crosses_antimeridian() {
+                    return Err(CqlError::Invalid(
+                        "ST_WITHIN does not support polygons crossing the ±180° antimeridian"
+                            .to_string(),
+                    ));
+                }
+                // Cover the polygon's bounding box, then refine each candidate
+                // with the exact point-in-polygon test. A degenerate polygon has
+                // no bbox and matches nothing.
+                match geo::polygon_bbox(&polygon) {
+                    Some((sw, ne)) => {
+                        let ranges = cover_ranges_to_pairs(&geo::cover_bbox(
+                            sw,
+                            ne,
+                            geo::DEFAULT_COVER_LEVEL,
+                        ));
+                        let rows = fetch_rows(ranges)?;
+                        rows.into_iter()
+                            .filter(|row| {
+                                row_geo_point(row, geo_col_idx)
+                                    .map(|(la, lo)| geo::point_in_polygon(la, lo, &polygon))
+                                    .unwrap_or(false)
+                            })
+                            .collect()
+                    }
+                    None => Vec::new(),
+                }
             }
         }
     };
@@ -4461,6 +4494,7 @@ fn geo_explain_plan(
         let op = match pred {
             GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
             GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
+            GeoPredicate::WithinPolygon { .. } => "GeoWithinPolygon",
         };
         (pred.column().to_string(), op)
     } else {
@@ -16476,6 +16510,72 @@ mod tests {
             ids,
             vec![5, 6],
             "antimeridian bbox must return both dateline points, not zero"
+        );
+    }
+
+    /// Geo `ST_WITHIN`: a polygon around central SF returns only the SF places
+    /// (ids 1, 2, 3) and excludes NYC and the dateline points. The query must
+    /// hit the geo index (EXPLAIN reports GeoIndex, not FullScan) and advance
+    /// the index_usage counter.
+    #[tokio::test]
+    async fn geo_st_within_polygon_filters_to_central_sf() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        // A quadrilateral hugging central SF: contains the three SF points,
+        // excludes NYC (≈ lon -74) and both dateline points (lon ≈ ±180).
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE ST_WITHIN(location, ((37.70, -122.52), (37.83, -122.52), \
+                 (37.83, -122.35), (37.70, -122.35)))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "central-SF polygon returns all three SF places only"
+        );
+        assert_eq!(count, 3);
+    }
+
+    /// Geo `ST_WITHIN` with a concave polygon: a point inside the bounding box
+    /// but outside the actual polygon (in a notch) must be excluded. This proves
+    /// the exact point-in-polygon refinement runs, not just the bbox cover.
+    #[tokio::test]
+    async fn geo_st_within_concave_polygon_excludes_notch_point() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        // Add two points: one squarely inside, one in the concave notch (inside
+        // the bbox but outside the polygon).
+        for cql in [
+            "INSERT INTO geo.places (id, name, location) VALUES (10, 'Body',  (0.5, 2.0))",
+            "INSERT INTO geo.places (id, name, location) VALUES (11, 'Notch', (1.5, 1.0))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // The concave "U" polygon from the geometry unit tests.
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE ST_WITHIN(location, ((0.0, 0.0), (0.0, 4.0), (4.0, 4.0), \
+                 (4.0, 0.0), (2.0, 0.0), (2.0, 3.0), (1.0, 3.0), (1.0, 0.0)))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![10],
+            "body point in, notch point excluded by refine"
         );
     }
 

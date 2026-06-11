@@ -2304,6 +2304,13 @@ impl<'input> Parser<'input> {
                 }
                 continue;
             }
+            if has_lparen && column.eq_ignore_ascii_case("st_within") {
+                geo_predicates.push(self.parse_st_within()?);
+                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                    break;
+                }
+                continue;
+            }
             let actual_column = if is_token_fn {
                 let col = self.parse_ident()?;
                 self.lexer.expect(&TokenKind::RParen)?;
@@ -2347,7 +2354,7 @@ impl<'input> Parser<'input> {
         let (clauses, geo_predicates) = self.parse_where_clauses()?;
         if !geo_predicates.is_empty() {
             return Err(CqlError::SyntaxError(
-                "geospatial WHERE predicates (GEO_WITHIN_RADIUS / GEO_WITHIN_BBOX) \
+                "geospatial WHERE predicates (GEO_WITHIN_RADIUS / GEO_WITHIN_BBOX / ST_WITHIN) \
                  are only supported in SELECT statements"
                     .to_string(),
             ));
@@ -2382,6 +2389,39 @@ impl<'input> Parser<'input> {
         let ne = self.parse_lat_lon_tuple()?;
         self.lexer.expect(&TokenKind::RParen)?;
         Ok(GeoPredicate::WithinBbox { column, sw, ne })
+    }
+
+    /// Parse the body of `ST_WITHIN(col, ((lat1, lon1), (lat2, lon2), ...))`
+    /// after the function name and opening `(` have been consumed. The polygon
+    /// is the outer ring of `(lat, lon)` vertices; an explicit closing vertex is
+    /// permitted (the executor closes the ring regardless). A ring with fewer
+    /// than three vertices cannot enclose any area and is rejected here rather
+    /// than silently matching nothing.
+    fn parse_st_within(&mut self) -> Result<GeoPredicate, CqlError> {
+        let column = self.parse_ident()?;
+        self.lexer.expect(&TokenKind::Comma)?;
+        // Outer `(` of the vertex list.
+        self.lexer.expect(&TokenKind::LParen)?;
+        let mut vertices = vec![self.parse_lat_lon_tuple()?];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            vertices.push(self.parse_lat_lon_tuple()?);
+        }
+        self.lexer.expect(&TokenKind::RParen)?;
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        // A closing vertex equal to the first is allowed; count distinct ring
+        // vertices for the minimum-3 check.
+        let effective = if vertices.len() >= 2 && vertices.first() == vertices.last() {
+            vertices.len() - 1
+        } else {
+            vertices.len()
+        };
+        if effective < 3 {
+            return Err(CqlError::SyntaxError(format!(
+                "ST_WITHIN polygon needs at least 3 distinct vertices, got {effective}"
+            )));
+        }
+        Ok(GeoPredicate::WithinPolygon { column, vertices })
     }
 
     fn parse_comparison_op(&mut self) -> Result<ComparisonOp, CqlError> {
@@ -4643,6 +4683,42 @@ mod tests {
             }
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_st_within_polygon_where() {
+        let stmt = parse(
+            "SELECT id, name FROM places \
+             WHERE ST_WITHIN(location, ((37.70, -122.52), (37.83, -122.52), (37.83, -122.35), (37.70, -122.35)))",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.geo_predicates.len(), 1);
+                match &s.geo_predicates[0] {
+                    crate::ast::GeoPredicate::WithinPolygon { column, vertices } => {
+                        assert_eq!(column, "location");
+                        assert_eq!(vertices.len(), 4);
+                        assert!((vertices[0].0 - 37.70).abs() < 1e-9);
+                        assert!((vertices[0].1 - (-122.52)).abs() < 1e-9);
+                        assert!((vertices[2].0 - 37.83).abs() < 1e-9);
+                        assert!((vertices[2].1 - (-122.35)).abs() < 1e-9);
+                    }
+                    other => panic!("expected WithinPolygon, got {other:?}"),
+                }
+                assert!(s.where_clauses.is_empty());
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_st_within_requires_at_least_three_vertices() {
+        let err = parse(
+            "SELECT id FROM places \
+             WHERE ST_WITHIN(location, ((0.0, 0.0), (1.0, 1.0)))",
+        );
+        assert!(err.is_err(), "a 2-vertex polygon must be rejected");
     }
 
     #[test]
