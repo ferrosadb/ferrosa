@@ -65,6 +65,7 @@ impl EagerIndexBuilder {
                 priority: BuildPriority::High,
                 enqueued_at: std::time::Instant::now(),
                 column_position: *col_pos,
+                filter_predicate: None,
             };
             if self.scheduler.submit(job).is_ok() {
                 submitted += 1;

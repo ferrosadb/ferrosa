@@ -49,6 +49,7 @@ fn index_build_lifecycle() {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         })
         .expect("submit should succeed");
 
@@ -113,6 +114,7 @@ fn multiple_indexes_with_independent_staleness() {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         })
         .unwrap();
 

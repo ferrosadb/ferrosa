@@ -778,6 +778,29 @@ fn decode_persisted_index_row(keyspace: &str, row: &Row) -> Option<PersistedInde
     })
 }
 
+/// Reserved `system_schema.indexes` options key under which the CREATE path
+/// stores a Filtered index's fully-encoded [`ferrosa_index::FilterPredicate`]
+/// as JSON, so the predicate survives restart and reload reconstructs it
+/// without needing the CQL type system.
+pub const FILTER_PREDICATE_OPTION_KEY: &str = "__filter_predicate";
+
+/// Decode the partial-index predicate from a persisted `system_schema.indexes`
+/// row's `options` cell.
+///
+/// Returns `None` when the options cell is absent, not valid JSON, lacks the
+/// reserved [`FILTER_PREDICATE_OPTION_KEY`], or the stored predicate JSON does
+/// not deserialize — every one of which is a malformed Filtered index that the
+/// caller must reject rather than reload as an unfiltered index.
+fn decode_filter_predicate_from_options(row: &Row) -> Option<ferrosa_index::FilterPredicate> {
+    let options_json = cell_text(
+        row,
+        ferrosa_schema::system::persistence::INDEXES_COL_OPTIONS,
+    )?;
+    let options: HashMap<String, String> = serde_json::from_str(&options_json).ok()?;
+    let predicate_json = options.get(FILTER_PREDICATE_OPTION_KEY)?;
+    ferrosa_index::FilterPredicate::from_option_string(predicate_json)
+}
+
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
 type SSTableSidecarMap = Arc<HashMap<String, crate::index::sidecar::SidecarReader>>;
 
@@ -2734,7 +2757,37 @@ impl StorageEngine {
             return Ok(false);
         };
 
-        self.add_index(&table_id, &index_name, column_position, index_type)?;
+        // Reconstruct the partial-index predicate for a Filtered index. The
+        // CREATE path persisted the fully-encoded `FilterPredicate` as JSON
+        // under the reserved `__filter_predicate` options key (the value bytes
+        // are already in storage encoding, so no CQL type system is needed
+        // here). A Filtered index whose predicate is missing or malformed is
+        // unsound — it would index every row — so skip it loudly rather than
+        // silently degrade to a full index.
+        let filter_predicate = if matches!(index_type, ferrosa_index::IndexType::Filtered) {
+            match decode_filter_predicate_from_options(row) {
+                Some(pred) => Some(pred),
+                None => {
+                    tracing::warn!(
+                        keyspace,
+                        table,
+                        index_name,
+                        "filtered index row missing/invalid __filter_predicate — skipping reload to avoid an unfiltered index"
+                    );
+                    return Ok(false);
+                }
+            }
+        } else {
+            None
+        };
+
+        self.add_index_with_predicate(
+            &table_id,
+            &index_name,
+            column_position,
+            index_type,
+            filter_predicate,
+        )?;
         tracing::info!(
             keyspace,
             table,
@@ -2770,6 +2823,25 @@ impl StorageEngine {
         column_position: usize,
         index_type: ferrosa_index::IndexType,
     ) -> ferrosa_common::Result<()> {
+        self.add_index_with_predicate(table_id, index_name, column_position, index_type, None)
+    }
+
+    /// Registers a secondary index, optionally carrying a partial-index
+    /// [`FilterPredicate`].
+    ///
+    /// For [`IndexType::Filtered`] the predicate is threaded into BOTH the
+    /// memtable index (so live writes are filtered identically) and every
+    /// backfill [`IndexBuildJob`] (so the SSTable sidecars hold only matching
+    /// rows). For every other index type the predicate is `None` and this
+    /// behaves exactly like [`add_index`](Self::add_index).
+    pub fn add_index_with_predicate(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        column_position: usize,
+        index_type: ferrosa_index::IndexType,
+        filter_predicate: Option<ferrosa_index::FilterPredicate>,
+    ) -> ferrosa_common::Result<()> {
         // Register with the tracker.
         self.index_tracker
             .register_index(table_id.keyspace(), table_id.table(), index_name);
@@ -2778,9 +2850,12 @@ impl StorageEngine {
         let state = tables.get_mut(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
-        state
-            .store
-            .add_index(index_name.to_string(), column_position, index_type);
+        state.store.add_index_with_predicate(
+            index_name.to_string(),
+            column_position,
+            index_type,
+            filter_predicate.clone(),
+        );
 
         // Submit rebuild jobs for all existing SSTables.
         if let Some(ref scheduler) = self.index_scheduler {
@@ -2797,6 +2872,7 @@ impl StorageEngine {
                     priority: crate::index::BuildPriority::Initial,
                     enqueued_at: std::time::Instant::now(),
                     column_position,
+                    filter_predicate: filter_predicate.clone(),
                 };
                 if let Err(e) = scheduler.submit(job) {
                     tracing::error!(%e, "engine: failed to submit index backfill");
@@ -5657,6 +5733,7 @@ impl StorageEngine {
                                 priority: crate::index::BuildPriority::High,
                                 enqueued_at: std::time::Instant::now(),
                                 column_position: *col_pos,
+                                filter_predicate: None,
                             };
                             let _ = scheduler.submit(job);
                         }
@@ -5749,6 +5826,19 @@ impl StorageEngine {
         } else {
             None
         }
+    }
+
+    /// Test accessor: the partial-index predicate registered for `index_name`,
+    /// cloned. `Some` only for a Filtered index reloaded with its predicate.
+    #[cfg(test)]
+    pub(crate) fn filter_predicate_for_test(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> Option<ferrosa_index::FilterPredicate> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id)?;
+        state.store.filter_predicate_for(index_name).cloned()
     }
 
     /// Flushes tables that exceed the size threshold, have unflushed data older
@@ -5901,6 +5991,7 @@ impl StorageEngine {
                                 priority: crate::index::BuildPriority::High,
                                 enqueued_at: std::time::Instant::now(),
                                 column_position: *col_pos,
+                                filter_predicate: None,
                             };
                             if let Err(e) = scheduler.submit(job) {
                                 tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
@@ -15661,6 +15752,150 @@ mod tests {
             engine.index_type_for_test(&user_tid, "idx_val_phonetic"),
             Some(IndexType::Phonetic),
             "index must survive restart AND keep its real Phonetic type, not the BTree default"
+        );
+    }
+
+    /// A Filtered (partial) index — its `FilterPredicate` persisted under the
+    /// reserved `__filter_predicate` options key — must survive an engine
+    /// restart. After `reload_indexes_from_system_schema`, the index is
+    /// re-registered as Filtered, its predicate is restored exactly, and the
+    /// memtable index still filters: a write whose filter cell fails the
+    /// predicate is excluded from the index even though it is in the table.
+    #[test]
+    fn reopen_restores_filtered_index_predicate_and_still_filters() {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_index::{FilterOp, FilterPredicate, IndexType};
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let user_tid = TableId::new("test_ks", "filtered_table");
+        let indexes_tid = TableId::new("system_schema", "indexes");
+
+        // name (storage col) indexed; status (storage col) is the filter column.
+        let user_schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "filtered_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "status".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        // Storage ordinal of the filter column `status`: regular columns are
+        // stored name-sorted with no statics here, so `name`=0, `status`=1.
+        let mut regular_names: Vec<&str> = user_schema
+            .regular_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        regular_names.sort_unstable();
+        let status_pos = regular_names
+            .iter()
+            .position(|n| *n == "status")
+            .expect("status column present");
+
+        let predicate = FilterPredicate {
+            column_position: status_pos,
+            op: FilterOp::Eq,
+            value: b"active".to_vec(),
+        };
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            FILTER_PREDICATE_OPTION_KEY.to_string(),
+            predicate.to_option_string().unwrap(),
+        );
+        let idx_meta = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: "test_ks".to_string(),
+            table: "filtered_table".to_string(),
+            name: "name_active_idx".to_string(),
+            index_type: IndexType::Filtered,
+            target_columns: vec!["name".to_string()],
+            filter_predicate: Some(predicate.clone()),
+            options,
+        };
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(user_schema.clone()).unwrap();
+            engine.register_system_tables().unwrap();
+
+            let row = persistence::index_to_rows(&idx_meta);
+            engine
+                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+
+            engine.flush(&user_tid).unwrap();
+            engine.flush(&indexes_tid).unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+
+        let restored = engine.reload_indexes_from_system_schema().unwrap();
+        assert_eq!(restored, 1, "the filtered index should be restored");
+
+        assert_eq!(
+            engine.index_type_for_test(&user_tid, "name_active_idx"),
+            Some(IndexType::Filtered),
+            "index must survive restart as Filtered"
+        );
+        assert_eq!(
+            engine.filter_predicate_for_test(&user_tid, "name_active_idx"),
+            Some(predicate),
+            "the partial predicate must survive restart exactly"
+        );
+
+        // The reloaded index still filters live writes: alice/active is indexed,
+        // alice/inactive is not.
+        let storage_to_cell = |name: &str, status: &str, ts: i64| Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(name.as_bytes().to_vec(), ts)),
+                (1, CellValue::live(status.as_bytes().to_vec(), ts)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        engine
+            .write(
+                &user_tid,
+                &make_key("pk-active"),
+                storage_to_cell("alice", "active", 1000),
+                1000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &user_tid,
+                &make_key("pk-inactive"),
+                storage_to_cell("alice", "inactive", 1001),
+                1001,
+            )
+            .unwrap();
+
+        let hits = engine
+            .read_by_index(
+                &user_tid,
+                "name_active_idx",
+                &ferrosa_index::IndexKey(b"alice".to_vec()),
+            )
+            .unwrap();
+        let pks: Vec<Vec<u8>> = hits.iter().map(|p| p.key.key.as_bytes().to_vec()).collect();
+        assert_eq!(
+            pks,
+            vec![b"pk-active".to_vec()],
+            "reloaded filtered index must return only the active row, not the inactive one"
         );
     }
 

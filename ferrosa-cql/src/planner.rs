@@ -118,6 +118,25 @@ pub fn plan(
     pk_columns: &[String],
     indexes: &[(String, Vec<String>)],
 ) -> ScanPlan {
+    plan_with_covered(where_clauses, pk_columns, indexes, &[])
+}
+
+/// Like [`plan`], but treats `extra_covered` columns as already satisfied by an
+/// index even though they are not in `indexes`.
+///
+/// This is how a partial (Filtered) index makes its *filter* column count as
+/// covered: when the index is selected, the predicate on the filter column is
+/// enforced by the index itself (the sidecar holds only matching rows), so that
+/// WHERE predicate must NOT push the plan to `IndexScanWithFilter` / require
+/// ALLOW FILTERING. The router only passes a filter column here when the
+/// corresponding filtered index is implied by the query and thus offered in
+/// `indexes` (see `filtered_index_is_usable`), so coverage stays sound.
+pub fn plan_with_covered(
+    where_clauses: &[WhereClause],
+    pk_columns: &[String],
+    indexes: &[(String, Vec<String>)],
+    extra_covered: &[String],
+) -> ScanPlan {
     // Exclude token() predicates — they represent token-range scans,
     // not column-level filters.
     let non_token: Vec<&WhereClause> = where_clauses.iter().filter(|wc| !wc.token_fn).collect();
@@ -129,6 +148,13 @@ pub fn plan(
     if non_token.is_empty() {
         return ScanPlan::FullScan;
     }
+
+    let is_covered = |col: &str| {
+        indexes
+            .iter()
+            .any(|(_, cols)| cols.len() == 1 && cols[0] == col)
+            || extra_covered.iter().any(|c| c == col)
+    };
 
     // Collect all WHERE columns with Eq that have a matching single-column index.
     let matched: Vec<(String, String)> = non_token
@@ -146,15 +172,11 @@ pub fn plan(
         0 => ScanPlan::FullScan,
         1 => {
             let (index_name, index_column) = matched.into_iter().next().unwrap();
-            // Collect WHERE columns not covered by any index.
+            // Collect WHERE columns not covered by any index (or extra coverage).
             let filter_columns: Vec<String> = non_token
                 .iter()
                 .filter(|wc| wc.column != index_column)
-                .filter(|wc| {
-                    !indexes
-                        .iter()
-                        .any(|(_, cols)| cols.len() == 1 && cols[0] == wc.column)
-                })
+                .filter(|wc| !is_covered(&wc.column))
                 .map(|wc| wc.column.clone())
                 .collect();
             if filter_columns.is_empty() {
@@ -472,6 +494,41 @@ mod tests {
             ScanPlan::IndexIntersection { indexes } => assert_eq!(indexes.len(), 3),
             other => panic!("expected IndexIntersection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extra_covered_filter_column_yields_single_index_not_filtering() {
+        // A filtered index on `name` (offered in `indexes`) plus an `extra_covered`
+        // filter column `status`: a query `name = v AND status = a` must plan
+        // `SingleIndex` (the index enforces the status predicate) rather than
+        // `IndexScanWithFilter` (which would require ALLOW FILTERING).
+        let plan = plan_with_covered(
+            &[wc("name", ComparisonOp::Eq), wc("status", ComparisonOp::Eq)],
+            &pk(&["id"]),
+            &[idx("name_active_idx", &["name"])],
+            &["status".to_string()],
+        );
+        assert_eq!(
+            plan,
+            ScanPlan::SingleIndex {
+                index_name: "name_active_idx".to_string(),
+                index_column: "name".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn extra_covered_does_not_invent_an_index() {
+        // `extra_covered` only suppresses the ALLOW FILTERING requirement for a
+        // covered column; it never makes that column itself index-selectable.
+        // With no index on `name`, a query on `name` alone is still FullScan.
+        let plan = plan_with_covered(
+            &[wc("name", ComparisonOp::Eq)],
+            &pk(&["id"]),
+            &[],
+            &["name".to_string()],
+        );
+        assert_eq!(plan, ScanPlan::FullScan);
     }
 
     #[test]

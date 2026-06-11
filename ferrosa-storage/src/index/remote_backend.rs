@@ -352,6 +352,19 @@ impl RemoteBackend {
 
 impl IndexBuildBackend for RemoteBackend {
     fn build(&self, job: &IndexBuildJob) -> Result<IndexBuildResult, String> {
+        // The remote builder wire protocol does not yet carry a partial-index
+        // FilterPredicate, so dispatching a Filtered job remotely would build an
+        // UNFILTERED sidecar — a silent correctness bug. Build it locally
+        // instead (the local fallback applies the predicate the job carries).
+        if job.filter_predicate.is_some() {
+            tracing::info!(
+                sstable_id = %job.sstable_id,
+                index_name = %job.index_name,
+                "filtered index build kept local — remote builder does not carry the partial predicate"
+            );
+            return self.local_fallback.build(job);
+        }
+
         // Try each available endpoint.
         let n = self.endpoints.len();
         let start = self.next_endpoint.fetch_add(1, Ordering::Relaxed) as usize;
@@ -517,6 +530,7 @@ mod tests {
             priority: super::super::scheduler::BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         }
     }
 
@@ -557,5 +571,55 @@ mod tests {
         assert!(result.sidecar_written_to_s3);
         assert_eq!(result.artifact_manifest_entries.len(), 1);
         assert_eq!(result.artifact_manifest_entries[0].build_id, 9);
+    }
+
+    /// A Filtered job must never be dispatched to a remote endpoint (the wire
+    /// protocol carries no predicate), so `build` routes it straight to the
+    /// local fallback. With a missing SSTable the local fallback fails with an
+    /// "open data" error — proving the local path ran and the (unreachable)
+    /// remote endpoint was never contacted.
+    #[test]
+    fn filtered_job_is_built_locally_not_dispatched_remotely() {
+        use ferrosa_index::{FilterOp, FilterPredicate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = S3PathResolver {
+            bucket: "b".into(),
+            endpoint: "memory://".into(),
+            prefix: "p".into(),
+        };
+        let backend = RemoteBackend::new(
+            // An endpoint that would fail loudly if contacted.
+            vec!["http://127.0.0.1:1/never".to_string()],
+            resolver,
+            Duration::from_millis(50),
+            0,
+            3,
+            Duration::from_secs(60),
+            LocalBackend::new(dir.path().to_path_buf()),
+        );
+
+        let job = IndexBuildJob {
+            sstable_id: "missing-gen".to_string(),
+            index_name: "name_active_idx".to_string(),
+            index_type: ferrosa_index::IndexType::Filtered,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: super::super::scheduler::BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+            filter_predicate: Some(FilterPredicate {
+                column_position: 1,
+                op: FilterOp::Eq,
+                value: b"active".to_vec(),
+            }),
+        };
+
+        let err = backend.build(&job).expect_err(
+            "filtered build must reach the local fallback and fail on the missing SSTable",
+        );
+        assert!(
+            err.contains("open data"),
+            "expected a local-fallback file error, got: {err}"
+        );
     }
 }

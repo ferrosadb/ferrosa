@@ -48,6 +48,11 @@ pub struct IndexBuildJob {
     pub enqueued_at: Instant,
     /// Column position within the row to index.
     pub column_position: usize,
+    /// Partial-index predicate. `Some` only for [`IndexType::Filtered`] jobs:
+    /// the build skips any row whose filter-column cell does not satisfy this
+    /// predicate, so the sidecar holds only matching rows. `None` for every
+    /// other index type (the whole-column index).
+    pub filter_predicate: Option<ferrosa_index::FilterPredicate>,
 }
 
 /// Strategy for executing index builds.
@@ -252,6 +257,27 @@ impl IndexBuildBackend for LocalBackend {
         {
             let pk_bytes = partition.key.key.as_bytes().to_vec();
             for row in &partition.rows {
+                // Partial (filtered) index: skip rows whose filter-column cell
+                // does not satisfy the predicate. The sidecar must hold ONLY
+                // matching rows so the read path (which delegates to a plain
+                // btree point/range lookup) returns the partial result set.
+                // `evaluate_predicate` is the shared source of truth with the
+                // memtable write path, so sidecar and memtable agree.
+                if let Some(predicate) = job.filter_predicate.as_ref() {
+                    let filter_cell = row
+                        .cells
+                        .iter()
+                        .find(|(pos, _)| *pos as usize == predicate.column_position);
+                    let matches = match filter_cell.and_then(|(_, c)| c.value.as_ref()) {
+                        Some(value) => ferrosa_index::evaluate_predicate(predicate, value),
+                        // Filter column absent or tombstoned -> does not match.
+                        None => false,
+                    };
+                    if !matches {
+                        continue;
+                    }
+                }
+
                 // Find the cell at the declared column position.
                 let cell_opt = row
                     .cells
@@ -685,6 +711,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
 
         scheduler.submit(job).unwrap();
@@ -738,6 +765,7 @@ mod tests {
                     priority: BuildPriority::Initial,
                     enqueued_at: Instant::now(),
                     column_position: 0,
+                    filter_predicate: None,
                 })
                 .unwrap();
         }
@@ -808,6 +836,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
         let result = backend.build(&job).unwrap();
         assert_eq!(result.sstable_id, "mock");
@@ -826,6 +855,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
         let result = backend.build(&job);
         assert!(result.is_err());
@@ -913,6 +943,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
         let result = backend.build(&job).unwrap();
 
@@ -932,6 +963,141 @@ mod tests {
         );
     }
 
+    /// A Filtered (partial) index build must skip rows whose filter-column cell
+    /// does not satisfy the predicate, so the sidecar holds only matching rows.
+    /// Here the index is on `name` (col 0), partial on `status = 'active'`
+    /// (col 1). Two rows are active, one is inactive — the sidecar must contain
+    /// exactly the two active rows.
+    #[test]
+    fn local_backend_filtered_build_skips_non_matching_rows() {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_index::{FilterOp, FilterPredicate};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+        use ferrosa_sstable::writer::SSTableWriter;
+        use ferrosa_sstable::WriteOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sstable_dir = dir.path().to_path_buf();
+
+        // name (col 0) is indexed; status (col 1) is the filter column.
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "status".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+
+        let mut partitions = vec![
+            Partition {
+                key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![
+                        (0, CellValue::live(b"alice".to_vec(), 1000)),
+                        (1, CellValue::live(b"active".to_vec(), 1000)),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                }],
+            },
+            Partition {
+                key: DecoratedKey::new(PartitionKey::new(b"pk2".to_vec())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![
+                        (0, CellValue::live(b"bob".to_vec(), 2000)),
+                        (1, CellValue::live(b"inactive".to_vec(), 2000)),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                }],
+            },
+            Partition {
+                key: DecoratedKey::new(PartitionKey::new(b"pk3".to_vec())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![
+                        (0, CellValue::live(b"carol".to_vec(), 3000)),
+                        (1, CellValue::live(b"active".to_vec(), 3000)),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(3000),
+                }],
+            },
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let header = crate::flush::build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let flush_target = crate::flush::FileFlushTarget::new(sstable_dir.clone()).unwrap();
+        let _reader = flush_target.flush(output).unwrap();
+        let gen = flush_target.generation();
+
+        let backend = LocalBackend::new(sstable_dir.clone());
+        let job = IndexBuildJob {
+            sstable_id: format!("{gen}"),
+            index_name: "name_active_idx".to_string(),
+            index_type: IndexType::Filtered,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+            filter_predicate: Some(FilterPredicate {
+                column_position: 1,
+                op: FilterOp::Eq,
+                value: b"active".to_vec(),
+            }),
+        };
+        let result = backend.build(&job).unwrap();
+
+        let entries = result
+            .sidecar_entries
+            .get("name_active_idx")
+            .expect("filtered index must produce sidecar entries");
+        // Only the two active rows (alice, carol) are indexed; bob is skipped.
+        assert_eq!(
+            entries.len(),
+            2,
+            "filtered index must hold only the 2 active rows, got {}",
+            entries.len()
+        );
+        let mut pks: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(_, pos)| pos.partition_key.clone())
+            .collect();
+        pks.sort();
+        assert_eq!(pks, vec![b"pk1".to_vec(), b"pk3".to_vec()]);
+    }
+
     #[test]
     fn index_build_job_has_column_position() {
         let job = IndexBuildJob {
@@ -942,6 +1108,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 2,
+            filter_predicate: None,
         };
         assert_eq!(job.column_position, 2);
     }
@@ -958,6 +1125,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
         let result = backend.build(&job);
         assert!(result.is_err(), "expected error for missing SSTable");
@@ -1006,6 +1174,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                filter_predicate: None,
             })
             .unwrap();
 
@@ -1043,6 +1212,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                filter_predicate: None,
             })
             .unwrap();
 
@@ -1098,6 +1268,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                filter_predicate: None,
             })
             .unwrap();
 
@@ -1140,6 +1311,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                filter_predicate: None,
             })
             .unwrap();
 
@@ -1208,6 +1380,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                filter_predicate: None,
             })
             .unwrap();
 
@@ -1260,6 +1433,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                filter_predicate: None,
             })
             .unwrap();
 
@@ -1371,6 +1545,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
 
         let result = backend.build(&job).unwrap();
@@ -1413,6 +1588,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
 
         let result = backend.build(&job).unwrap();
@@ -1436,6 +1612,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
 
         let result = backend.build(&job).unwrap();
@@ -1460,6 +1637,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
 
         let result = backend.build(&job).unwrap();
@@ -1501,6 +1679,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            filter_predicate: None,
         };
 
         let result = backend.build(&job).unwrap();
@@ -1553,6 +1732,7 @@ mod tests {
                     priority: BuildPriority::Initial,
                     enqueued_at: Instant::now(),
                     column_position: 0,
+                    filter_predicate: None,
                 })
                 .unwrap();
         }

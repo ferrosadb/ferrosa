@@ -58,6 +58,7 @@ pub use data_store::{DataStore, LocalDataStore};
 pub use engine::{
     PersistedIndexRow, StorageEngine, StorageEngineConfig, TempSortTableReservation,
     TimeSeriesWasmAggregateExecutor, TimeSeriesWasmAggregateInvocation,
+    FILTER_PREDICATE_OPTION_KEY,
 };
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use manifest::{load_schema_snapshot, save_schema_snapshot, Manifest};
