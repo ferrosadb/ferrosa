@@ -308,6 +308,7 @@ fn parse_index_type(s: &str) -> Result<IndexType, String> {
         "phonetic" => Ok(IndexType::Phonetic),
         "vector" => Ok(IndexType::Vector),
         "fulltext" => Ok(IndexType::FullText),
+        "geo" => Ok(IndexType::Geo),
         other => Err(format!("unknown index type: {other}")),
     }
 }
@@ -332,6 +333,7 @@ mod tests {
             parse_index_type("FullText"),
             Ok(IndexType::FullText)
         ));
+        assert!(matches!(parse_index_type("GEO"), Ok(IndexType::Geo)));
         assert!(parse_index_type("unknown").is_err());
     }
 

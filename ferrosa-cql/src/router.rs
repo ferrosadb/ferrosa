@@ -6134,6 +6134,7 @@ fn resolve_index_type(
         Some("filtered") => Ok(IndexType::Filtered),
         Some("vector") => Ok(IndexType::Vector),
         Some("fulltext") => Ok(IndexType::FullText),
+        Some("geo") => Ok(IndexType::Geo),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }

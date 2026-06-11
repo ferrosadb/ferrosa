@@ -370,6 +370,7 @@ pub fn index_type_kind(index_type: &ferrosa_index::IndexType) -> &'static str {
         IndexType::Filtered => "filtered",
         IndexType::Vector => "vector",
         IndexType::FullText => "fulltext",
+        IndexType::Geo => "geo",
     }
 }
 
@@ -388,6 +389,7 @@ pub fn index_type_from_kind(kind: &str) -> Option<ferrosa_index::IndexType> {
         "filtered" => IndexType::Filtered,
         "vector" => IndexType::Vector,
         "fulltext" => IndexType::FullText,
+        "geo" => IndexType::Geo,
         _ => return None,
     };
     Some(ty)
@@ -1067,6 +1069,7 @@ mod tests {
             IndexType::Filtered,
             IndexType::Vector,
             IndexType::FullText,
+            IndexType::Geo,
         ] {
             let kind = index_type_kind(&ty);
             assert_eq!(

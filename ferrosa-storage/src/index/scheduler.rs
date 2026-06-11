@@ -142,10 +142,45 @@ pub(crate) fn encode_index_key(
                 Ok(Some(IndexKey(code.into_bytes())))
             }
         }
+        IndexType::Geo => match decode_geo_point(value) {
+            Some((lat, lon)) => Ok(Some(IndexKey(
+                ferrosa_index::geo::cell_id_key(lat, lon).to_vec(),
+            ))),
+            None => Ok(None),
+        },
         IndexType::Vector | IndexType::FullText => Err(format!(
             "{index_type:?} indexes are flush-built and must not be scheduler-built"
         )),
     }
+}
+
+/// Decode a CQL `frozen<tuple<double,double>>` cell into `(lat, lon)`.
+///
+/// The wire layout is two elements, each `[i32 big-endian length][value]`.
+/// A geo point therefore is `[0,0,0,8][8-byte f64 lat][0,0,0,8][8-byte f64 lon]`.
+/// Returns `None` (skip the row) if the bytes are not a well-formed pair of
+/// f64s rather than guessing — a malformed point must not silently index to a
+/// wrong cell.
+pub(crate) fn decode_geo_point(value: &[u8]) -> Option<(f64, f64)> {
+    let lat = read_tuple_f64(value, 0)?;
+    let lon = read_tuple_f64(value, 12)?;
+    Some((lat, lon))
+}
+
+/// Read the f64 element at byte `at` of a CQL tuple body (4-byte length prefix
+/// followed by an 8-byte big-endian f64).
+fn read_tuple_f64(value: &[u8], at: usize) -> Option<f64> {
+    let len_end = at.checked_add(4)?;
+    let body_end = len_end.checked_add(8)?;
+    if value.len() < body_end {
+        return None;
+    }
+    let len = i32::from_be_bytes(value[at..len_end].try_into().ok()?);
+    if len != 8 {
+        return None;
+    }
+    let bytes: [u8; 8] = value[len_end..body_end].try_into().ok()?;
+    Some(f64::from_be_bytes(bytes))
 }
 
 impl IndexBuildBackend for LocalBackend {
@@ -574,6 +609,53 @@ mod tests {
     use crate::flush::FlushTarget;
     use crate::index::IndexStatus;
     use std::time::Duration;
+
+    /// Build a CQL `frozen<tuple<double,double>>` wire body for a point.
+    fn geo_tuple_bytes(lat: f64, lon: f64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24);
+        for f in [lat, lon] {
+            v.extend_from_slice(&8i32.to_be_bytes());
+            v.extend_from_slice(&f.to_be_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn geo_index_encodes_cell_id_key() {
+        let bytes = geo_tuple_bytes(37.7749, -122.4194);
+        let key = encode_index_key(IndexType::Geo, &bytes)
+            .expect("geo encode must not error")
+            .expect("well-formed point yields a key");
+        let expected = ferrosa_index::geo::cell_id_key(37.7749, -122.4194);
+        assert_eq!(key.0, expected.to_vec());
+    }
+
+    #[test]
+    fn geo_keys_are_sortable_by_proximity_prefix() {
+        let near_a = encode_index_key(IndexType::Geo, &geo_tuple_bytes(37.7749, -122.4194))
+            .unwrap()
+            .unwrap();
+        let near_b = encode_index_key(IndexType::Geo, &geo_tuple_bytes(37.7750, -122.4195))
+            .unwrap()
+            .unwrap();
+        // Adjacent points share a long big-endian key prefix.
+        assert_eq!(near_a.0[..3], near_b.0[..3]);
+    }
+
+    #[test]
+    fn geo_index_skips_malformed_point() {
+        // Too short / wrong length prefix => skip the row rather than mis-index.
+        let result = encode_index_key(IndexType::Geo, &[0, 0, 0, 4, 1, 2, 3, 4]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decode_geo_point_round_trips() {
+        let bytes = geo_tuple_bytes(-12.5, 178.25);
+        let (lat, lon) = decode_geo_point(&bytes).expect("valid tuple decodes");
+        assert!((lat - (-12.5)).abs() < 1e-12);
+        assert!((lon - 178.25).abs() < 1e-12);
+    }
 
     #[test]
     fn scheduler_processes_jobs() {
