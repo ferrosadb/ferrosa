@@ -245,6 +245,7 @@ impl WorkerPool {
             priority: parse_priority(&req.priority),
             enqueued_at: Instant::now(),
             column_position: req.column_position,
+            filter_predicate: None,
         };
 
         let job_dir_clone = job_dir.clone();

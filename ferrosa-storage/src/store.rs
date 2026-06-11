@@ -23,7 +23,7 @@ use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
 use ferrosa_common::task_pool::TaskPool;
 use ferrosa_common::Result;
-use ferrosa_index::{IndexKey, IndexType, RowPosition};
+use ferrosa_index::{FilterPredicate, IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
 use ferrosa_sstable::reader::SSTableReader;
 use ferrosa_sstable::types::{Partition, Row};
@@ -434,6 +434,12 @@ pub struct TableStore<F: FlushTarget> {
     /// backfill / compaction index-build jobs carry the correct `IndexType`
     /// instead of a hardcoded `BTree`. Missing entries default to `BTree`.
     index_types: HashMap<String, IndexType>,
+    /// Partial-index predicates, keyed by index name. Present only for
+    /// [`IndexType::Filtered`] indexes. The memtable write path consults this so
+    /// a live write is added to the filtered memtable index ONLY when its
+    /// filter-column cell satisfies the predicate — matching exactly the rows
+    /// the SSTable sidecar build keeps, so memtable and sidecar agree.
+    index_filter_predicates: HashMap<String, FilterPredicate>,
     /// Full-text index declarations: `(index_name, column_position)` pairs.
     /// Built as FTI sidecar files during flush.
     fulltext_indexes: Vec<(String, usize)>,
@@ -739,6 +745,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_target,
             options,
             index_types: default_index_types(&indexed_columns),
+            index_filter_predicates: HashMap::new(),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
@@ -942,6 +949,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_target,
             options,
             index_types: default_index_types(&indexed_columns),
+            index_filter_predicates: HashMap::new(),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
@@ -1017,6 +1025,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_target,
             options,
             index_types: default_index_types(&indexed_columns),
+            index_filter_predicates: HashMap::new(),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
@@ -1084,6 +1093,26 @@ impl<F: FlushTarget> TableStore<F> {
         // before the memtable put (which consumes the row reference via move).
         if !self.indexed_columns.is_empty() {
             for (index_name, col_pos) in &self.indexed_columns {
+                // Partial (filtered) index gating: a Filtered index has a
+                // predicate on a *filter* column. Only writes whose filter-column
+                // cell satisfies the predicate belong in the index, matching the
+                // SSTable sidecar build. A row missing/tombstoning the filter
+                // column does not match. `evaluate_predicate` is shared with the
+                // build path so memtable and sidecar never disagree.
+                if let Some(predicate) = self.index_filter_predicates.get(index_name) {
+                    let filter_cell = row
+                        .cells
+                        .iter()
+                        .find(|(idx, _)| *idx as usize == predicate.column_position);
+                    let matches = match filter_cell.and_then(|(_, c)| c.value.as_ref()) {
+                        Some(v) => ferrosa_index::evaluate_predicate(predicate, v),
+                        None => false,
+                    };
+                    if !matches {
+                        continue;
+                    }
+                }
+
                 if let Some(cell) = row.cells.iter().find(|(idx, _)| *idx as usize == *col_pos) {
                     if let Some(ref value) = cell.1.value {
                         // Per-type key encoding: a phonetic index stores the
@@ -3972,9 +4001,26 @@ impl<F: FlushTarget> TableStore<F> {
     /// Returns `None` if no index with the given name was declared at
     /// Dynamically adds a secondary index. Future writes will be indexed.
     pub fn add_index(&mut self, index_name: String, column_position: usize, index_type: IndexType) {
+        self.add_index_with_predicate(index_name, column_position, index_type, None);
+    }
+
+    /// Dynamically adds a secondary index carrying an optional partial-index
+    /// [`FilterPredicate`]. Future writes will be indexed; for a Filtered index
+    /// the predicate gates which writes enter the memtable index.
+    pub fn add_index_with_predicate(
+        &mut self,
+        index_name: String,
+        column_position: usize,
+        index_type: IndexType,
+        filter_predicate: Option<FilterPredicate>,
+    ) {
         self.indexed_columns
             .push((index_name.clone(), column_position));
         self.index_types.insert(index_name.clone(), index_type);
+        if let Some(pred) = filter_predicate {
+            self.index_filter_predicates
+                .insert(index_name.clone(), pred);
+        }
         let current = self.view.load();
         let mut new_indexes = (*current.indexes).clone();
         new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
@@ -4014,6 +4060,13 @@ impl<F: FlushTarget> TableStore<F> {
             .get(index_name)
             .copied()
             .unwrap_or(IndexType::BTree)
+    }
+
+    /// The partial-index [`FilterPredicate`] for a named index, if any. `Some`
+    /// only for [`IndexType::Filtered`] indexes that were registered with a
+    /// predicate (and thus survives reload).
+    pub fn filter_predicate_for(&self, index_name: &str) -> Option<&FilterPredicate> {
+        self.index_filter_predicates.get(index_name)
     }
 
     /// Returns the current full-text index declarations.
