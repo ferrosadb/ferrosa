@@ -2617,6 +2617,265 @@ pub async fn route_prepared_select_fast(
     Some(result)
 }
 
+/// Column/row metadata threaded into the geospatial select path.
+struct GeoRowContext<'a> {
+    col_names: &'a [String],
+    col_types: &'a [CqlType],
+    all_col_names: &'a [String],
+    all_col_types: &'a [CqlType],
+    pk_indices: &'a [usize],
+    ck_indices: &'a [usize],
+    storage_to_table: &'a [usize],
+}
+
+/// Resolve the geo index name for `column` from the schema snapshot, matching by
+/// keyspace, table, column, and `IndexType::Geo`.
+fn resolve_geo_index_name(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    table: &str,
+    column: &str,
+) -> Option<String> {
+    snap.indexes
+        .iter()
+        .find(|((idx_ks, idx_tbl, _), meta)| {
+            idx_ks == ks
+                && idx_tbl == table
+                && meta.index_type == IndexType::Geo
+                && meta.target_columns.iter().any(|c| c == column)
+        })
+        .map(|(_, meta)| meta.name.clone())
+}
+
+/// Extract a `(lat, lon)` point from a row's geo column, which is stored as a
+/// `CqlValue::Tuple([Double(lat), Double(lon)])`. Returns `None` if the column
+/// is null or not a well-formed two-element double tuple — such a row cannot be
+/// refined and is dropped rather than mis-located.
+fn row_geo_point(row: &[Option<CqlValue>], col_idx: usize) -> Option<(f64, f64)> {
+    match row.get(col_idx) {
+        Some(Some(CqlValue::Tuple(elems))) if elems.len() == 2 => {
+            let lat = match elems[0] {
+                Some(CqlValue::Double(bits)) => f64::from_bits(bits),
+                _ => return None,
+            };
+            let lon = match elems[1] {
+                Some(CqlValue::Double(bits)) => f64::from_bits(bits),
+                _ => return None,
+            };
+            Some((lat, lon))
+        }
+        _ => None,
+    }
+}
+
+/// Convert geo cover ranges into the `(u64, u64)` pairs the storage layer wants.
+fn cover_ranges_to_pairs(ranges: &[ferrosa_index::geo::CellRange]) -> Vec<(u64, u64)> {
+    ranges.iter().map(|r| (r.start, r.end)).collect()
+}
+
+/// Encode a full row to a stable byte key for cross-ring deduplication during
+/// k-NN. Each cell is length-prefixed (`-1` for null) so distinct rows produce
+/// distinct keys. The projected row includes the primary key, so two different
+/// base rows can never collide.
+fn encode_row_identity(row: &[Option<CqlValue>]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for cell in row {
+        match cell {
+            Some(v) => {
+                let bytes = encode_value(v);
+                key.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                key.extend_from_slice(&bytes);
+            }
+            None => key.extend_from_slice(&(-1i32).to_be_bytes()),
+        }
+    }
+    key
+}
+
+/// Execute a geospatial SELECT: `GEO_NEAREST OF`, `GEO_WITHIN_RADIUS`, or
+/// `GEO_WITHIN_BBOX`. Resolves the geo index, fetches candidate partitions by
+/// covering cell ranges, refines with exact distance / containment, then
+/// orders / bounds / projects the result. Records `index_usage` and is reported
+/// by EXPLAIN via [`ScanPlan::GeoIndex`].
+async fn route_geo_select(
+    state: &SharedState,
+    ks: &str,
+    s: &SelectStatement,
+    snap: &ferrosa_schema::SchemaSnapshot,
+    table_meta: &ferrosa_schema::metadata::table::TableMetadata,
+    table_id: &TableId,
+    rowctx: GeoRowContext<'_>,
+) -> Result<SelectRawResult, CqlError> {
+    use ferrosa_index::geo;
+
+    // Exactly one geo operation per query (parser guarantees GEO_NEAREST is the
+    // sole ordering; we take the first geo predicate when present).
+    let (geo_column, plan_kind) = if let Some(gn) = &s.geo_nearest {
+        (gn.column.clone(), "GeoNearest")
+    } else {
+        let pred = &s.geo_predicates[0];
+        let kind = match pred {
+            GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
+            GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
+        };
+        (pred.column().to_string(), kind)
+    };
+
+    let index_name = resolve_geo_index_name(snap, ks, &s.table, &geo_column).ok_or_else(|| {
+        CqlError::Invalid(format!(
+            "no geo index on {}.{}({geo_column}); create one with CREATE INDEX ... USING 'geo'",
+            ks, s.table
+        ))
+    })?;
+
+    // Observability: a geo index was consulted.
+    state
+        .index_usage_tracker
+        .record(ks, &s.table, &index_name, plan_kind);
+
+    // Index of the geo column within the full (storage-order) row, for refining.
+    let geo_col_idx = rowctx
+        .all_col_names
+        .iter()
+        .position(|n| n == &geo_column)
+        .ok_or_else(|| CqlError::Invalid(format!("geo column {geo_column} not found")))?;
+
+    // Fetch candidate partitions for a set of covering cell ranges, convert to
+    // rows. Bounded by the storage layer's INDEX_RESULT_CAP (fail-loud).
+    let fetch_rows = |ranges: Vec<(u64, u64)>| -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
+        let partitions = state
+            .engine
+            .read_by_index_cell_ranges(table_id, &index_name, &ranges)
+            .map_err(|e| CqlError::Invalid(format!("geo index read failed: {e}")))?;
+        let mut rows = Vec::new();
+        for partition in &partitions {
+            let mut prows = bridge::partition_to_rows_with_storage_mapping(
+                partition,
+                rowctx.all_col_names,
+                rowctx.all_col_types,
+                rowctx.pk_indices,
+                rowctx.ck_indices,
+                rowctx.storage_to_table,
+            );
+            rows.append(&mut prows);
+        }
+        Ok(rows)
+    };
+
+    // Build the final, refined row set for the specific geo operation.
+    let mut result_rows: Vec<Vec<Option<CqlValue>>> = if let Some(gn) = &s.geo_nearest {
+        // k-NN: expanding-ring search. The ring `fetch` returns the candidate
+        // points keyed by an opaque ordinal into a side table of rows so we can
+        // reassemble the chosen rows after ranking.
+        let k = s
+            .limit
+            .as_ref()
+            .and_then(|l| l.as_literal())
+            .map(|n| n.max(0) as usize)
+            .unwrap_or(usize::MAX);
+
+        // Collect candidate rows across rings, then rank by haversine and take k.
+        // The same partition is re-fetched as the search rings expand, so each
+        // row must get a STABLE id across rings or `nearest_k`'s id-based dedup
+        // cannot drop the repeats. We key each distinct row to a stable index in
+        // `seen_rows` by its full encoded contents (the projected row includes
+        // the primary key, so distinct rows never collide).
+        let mut seen_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
+        let mut row_ids: HashMap<Vec<u8>, usize> = HashMap::new();
+        let candidates = geo::nearest_k(gn.lat, gn.lon, k, |ranges| {
+            let pairs = cover_ranges_to_pairs(ranges);
+            let rows = match fetch_rows(pairs) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            let mut out = Vec::new();
+            for row in rows {
+                if let Some((lat, lon)) = row_geo_point(&row, geo_col_idx) {
+                    let row_key = encode_row_identity(&row);
+                    let id = *row_ids.entry(row_key).or_insert_with(|| {
+                        let next = seen_rows.len();
+                        seen_rows.push(row.clone());
+                        next
+                    });
+                    out.push(geo::GeoCandidate { id, lat, lon });
+                }
+            }
+            out
+        });
+        candidates
+            .into_iter()
+            .map(|c| seen_rows[c.id].clone())
+            .collect()
+    } else {
+        match &s.geo_predicates[0] {
+            GeoPredicate::WithinRadius {
+                lat, lon, radius_m, ..
+            } => {
+                let ranges = cover_ranges_to_pairs(&geo::cover_radius(
+                    *lat,
+                    *lon,
+                    *radius_m,
+                    geo::DEFAULT_COVER_LEVEL,
+                ));
+                let rows = fetch_rows(ranges)?;
+                // Refine: keep rows whose exact haversine distance is within the
+                // radius (the cover is an over-approximation).
+                rows.into_iter()
+                    .filter(|row| {
+                        row_geo_point(row, geo_col_idx)
+                            .map(|(la, lo)| geo::within_radius(*lat, *lon, *radius_m, la, lo))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            }
+            GeoPredicate::WithinBbox { sw, ne, .. } => {
+                let ranges =
+                    cover_ranges_to_pairs(&geo::cover_bbox(*sw, *ne, geo::DEFAULT_COVER_LEVEL));
+                let rows = fetch_rows(ranges)?;
+                // Refine: exact axis-aligned (antimeridian-aware) containment.
+                rows.into_iter()
+                    .filter(|row| {
+                        row_geo_point(row, geo_col_idx)
+                            .map(|(la, lo)| geo::within_bbox(sw.0, sw.1, ne.0, ne.1, la, lo))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    // Apply any remaining scalar WHERE predicates as a post-filter (the geo
+    // predicate is handled above and not present in `where_clauses`).
+    filter_rows_by_select_predicates(
+        &mut result_rows,
+        s,
+        rowctx.all_col_names,
+        rowctx.all_col_types,
+        table_meta,
+        ks,
+        state,
+    )?;
+
+    // LIMIT for the non-nearest forms (k-NN already applied k above).
+    if s.geo_nearest.is_none() {
+        if let Some(limit) = s.limit.as_ref().and_then(|l| l.as_literal()) {
+            result_rows.truncate(limit.max(0) as usize);
+        }
+    }
+
+    // Project to the selected columns.
+    let selected_rows = select_columns(&result_rows, rowctx.all_col_names, rowctx.col_names);
+
+    Ok(SelectRawResult {
+        column_names: rowctx.col_names.to_vec(),
+        column_types: rowctx.col_types.to_vec(),
+        rows: selected_rows,
+        keyspace: ks.to_string(),
+        table: s.table.clone(),
+        paging_state: None,
+    })
+}
+
 async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -2781,6 +3040,34 @@ async fn route_select_user_table(
             table: s.table.clone(),
             paging_state: None,
         });
+    }
+
+    // ── Geospatial query surface (GEO_NEAREST / GEO_WITHIN_RADIUS / BBOX) ──────
+    //
+    // A geo predicate is a function over a geo-indexed column, not a scalar
+    // comparison, so it is handled in its own index-backed branch: resolve the
+    // geo index, ask it for covering cell ranges, fetch candidates, refine with
+    // exact distance / containment, then sort/limit and project. EXPLAIN reports
+    // the geo index and `index_usage` increments on the hit.
+    if s.geo_nearest.is_some() || !s.geo_predicates.is_empty() {
+        return route_geo_select(
+            state,
+            ks,
+            s,
+            &snap,
+            table_meta,
+            &table_id,
+            GeoRowContext {
+                col_names: &col_names,
+                col_types: &col_types,
+                all_col_names: &all_col_names,
+                all_col_types: &all_col_types,
+                pk_indices: &pk_indices,
+                ck_indices: &ck_indices,
+                storage_to_table: &storage_to_table,
+            },
+        )
+        .await;
     }
 
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
@@ -3012,6 +3299,15 @@ async fn route_select_user_table(
                         "internal: VectorAnn scan plan reached the scan dispatch; \
                      ANN index consult should have handled it"
                             .into(),
+                    ));
+                }
+                ScanPlan::GeoIndex { .. } => {
+                    // Geo queries are served by `route_geo_select` in an early
+                    // branch before the planner runs, so `planner::plan` never
+                    // returns this variant here. It exists only for EXPLAIN's
+                    // plan rendering.
+                    return Err(CqlError::ServerError(
+                        "internal: geo plan reached the scalar scan dispatch".into(),
                     ));
                 }
                 ScanPlan::PartitionKeyLookup => {
@@ -4114,11 +4410,17 @@ fn route_explain(
         .map(|(_, meta)| (meta.name.clone(), meta.target_columns.clone()))
         .collect();
 
-    let scan_plan = planner::plan(
-        &s.where_clauses,
-        &table_meta.partition_key,
-        &planner_indexes,
-    );
+    // Geospatial queries are served by the geo index in their own branch, not by
+    // the generic planner, so report `GeoIndex` here rather than FullScan.
+    let scan_plan = if let Some(geo_plan) = geo_explain_plan(&snap, ks, &s) {
+        geo_plan
+    } else {
+        planner::plan(
+            &s.where_clauses,
+            &table_meta.partition_key,
+            &planner_indexes,
+        )
+    };
 
     // `ORDER BY col ANN OF [...]` on a vector-indexed column is served by the
     // index consult in `route_select_user_table`, not the WHERE-clause planner,
@@ -4143,6 +4445,33 @@ fn route_explain(
     Ok(result::encode_rows(
         &col_names, &col_types, ks, &s.table, &rows,
     ))
+}
+
+/// Build a [`ScanPlan::GeoIndex`] for EXPLAIN when `s` carries a geospatial
+/// operation backed by a registered geo index. Returns `None` when there is no
+/// geo operation (so the generic planner runs) or no matching geo index.
+fn geo_explain_plan(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    s: &SelectStatement,
+) -> Option<ScanPlan> {
+    let (column, op) = if let Some(gn) = &s.geo_nearest {
+        (gn.column.clone(), "GeoNearest")
+    } else if let Some(pred) = s.geo_predicates.first() {
+        let op = match pred {
+            GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
+            GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
+        };
+        (pred.column().to_string(), op)
+    } else {
+        return None;
+    };
+    let index_name = resolve_geo_index_name(snap, ks, &s.table, &column)?;
+    Some(ScanPlan::GeoIndex {
+        index_name,
+        index_column: column,
+        op: op.to_string(),
+    })
 }
 
 // ── USING TIMESTAMP / TTL helpers (Gap 10) ───────────────────────────────
@@ -6396,17 +6725,16 @@ async fn route_create_index(
             .tables
             .get(&(ks.to_string(), s.table.clone()))
             .and_then(|tbl| {
-                // Collect regular columns sorted by position to determine the ordinal.
-                let mut regulars: Vec<_> = tbl
-                    .columns
-                    .values()
-                    .filter(|c| c.kind == ColumnKind::Regular)
-                    .collect();
-                regulars.sort_by_key(|c| c.position);
-                regulars
-                    .iter()
-                    .position(|c| &c.name == target_col)
-                    .map(|pos| (pos, regulars[pos].column_type.clone()))
+                // The memtable/SSTable cell position is the *storage* column
+                // index (statics then regulars, each sorted by Cassandra's
+                // column-name comparator), NOT the declaration order. The write
+                // path indexes the cell at `storage_column_index`, so the index
+                // must register that exact position or it would read the wrong
+                // cell (e.g. on a multi-regular-column table the geo tuple and a
+                // text column would swap, decoding to garbage).
+                let storage_idx = tbl.storage_column_index(target_col)? as usize;
+                let column_type = tbl.columns.get(target_col)?.column_type.clone();
+                Some((storage_idx, column_type))
             });
 
         if let Some((pos, column_type)) = col_info {
@@ -12405,6 +12733,61 @@ mod tests {
         i32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
     }
 
+    /// Decode a `SELECT id, name` Rows result into `(i32, String)` pairs in
+    /// result order. Assumes the projection is exactly `(int, text)`.
+    fn decode_id_name_rows(buf: &[u8]) -> Vec<(i32, String)> {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        let row_count = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let mut rows = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            // Column 0: id int (4 bytes)
+            let id_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            assert_eq!(id_len, 4, "id column must be a 4-byte int");
+            let id = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            // Column 1: name text (variable)
+            let name_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            let name = if name_len < 0 {
+                String::new()
+            } else {
+                let n = name_len as usize;
+                let s = String::from_utf8_lossy(&buf[off..off + n]).into_owned();
+                off += n;
+                s
+            };
+            rows.push((id, name));
+        }
+        rows
+    }
+
     fn extract_first_bigint_value(buf: &[u8]) -> i64 {
         assert_eq!(
             &buf[0..4],
@@ -15960,6 +16343,140 @@ mod tests {
         let q = "SELECT id FROM ftu.docs WHERE body = fts_match('distributed AND database')";
         let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
         assert_eq!(count, 1, "fts_match must return exactly the matching doc");
+    }
+
+    /// Set up the `geo.places` schema, the geo index, and the sample points
+    /// from `examples/geospatial.cql`. Returns the state + ctx-owning auth.
+    async fn setup_geo(state: &SharedState, ctx: &RequestContext<'_>) {
+        for cql in [
+            "CREATE KEYSPACE geo WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE geo.places (id int PRIMARY KEY, name text, location frozen<tuple<double, double>>)",
+            "CREATE INDEX places_location_geo ON geo.places (location) USING 'geo'",
+            "INSERT INTO geo.places (id, name, location) VALUES (1, 'SF Ferry Building',   (37.7955, -122.3937))",
+            "INSERT INTO geo.places (id, name, location) VALUES (2, 'SF Union Square',     (37.7880, -122.4074))",
+            "INSERT INTO geo.places (id, name, location) VALUES (3, 'SF Golden Gate Park', (37.7694, -122.4862))",
+            "INSERT INTO geo.places (id, name, location) VALUES (4, 'NYC Times Square',    (40.7580,  -73.9855))",
+            "INSERT INTO geo.places (id, name, location) VALUES (5, 'Dateline East',       (0.0000,  179.9900))",
+            "INSERT INTO geo.places (id, name, location) VALUES (6, 'Dateline West',       (0.0000, -179.9900))",
+            "INSERT INTO geo.places (id, name, location) VALUES (7, 'Near North Pole',     (89.9000,    0.0000))",
+        ] {
+            route(state, ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+    }
+
+    /// Run a SELECT and return its result rows as `(id, name)` pairs, in result
+    /// order. Panics on any non-Result outcome.
+    async fn run_geo_select(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        cql: &str,
+    ) -> Vec<(i32, String)> {
+        let stmt = crate::parser::parse(cql).unwrap();
+        let body = match route(state, ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result for `{cql}`"),
+        };
+        decode_id_name_rows(&body)
+    }
+
+    /// Geo `GEO_NEAREST OF` k-NN: the three SF places rank ahead of NYC.
+    #[tokio::test]
+    async fn geo_nearest_returns_k_nearest_in_order() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 ORDER BY location GEO_NEAREST OF (37.7880, -122.4074) LIMIT 3";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        assert_eq!(rows.len(), 3, "LIMIT 3 must bound the result");
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        // The three SF places (ids 1,2,3) are nearest to Union Square; NYC (4)
+        // and the dateline/pole points are all farther.
+        assert!(
+            ids.contains(&1) && ids.contains(&2) && ids.contains(&3),
+            "nearest 3 must be the SF cluster, got {ids:?}"
+        );
+        // Union Square itself is the closest (distance 0).
+        assert_eq!(
+            rows[0].0, 2,
+            "Union Square is the query point and ranks first"
+        );
+    }
+
+    /// Geo `GEO_WITHIN_RADIUS`: a 3km radius around the Ferry Building keeps the
+    /// downtown SF places and drops Golden Gate Park + NYC.
+    #[tokio::test]
+    async fn geo_within_radius_filters_by_exact_distance() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE GEO_WITHIN_RADIUS(location, (37.7955, -122.3937), 3000)";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "3km radius keeps Ferry Building + Union Square, drops GG Park & NYC"
+        );
+        assert_eq!(count, 2);
+    }
+
+    /// Geo `GEO_WITHIN_BBOX`: a central-SF box returns only the SF places.
+    #[tokio::test]
+    async fn geo_within_bbox_filters_to_central_sf() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE GEO_WITHIN_BBOX(location, (37.70, -122.52), (37.83, -122.35))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "central-SF bbox returns all three SF places only"
+        );
+    }
+
+    /// Geo `GEO_WITHIN_BBOX` across the antimeridian: SW lon 179, NE lon -179
+    /// must return BOTH dateline points (ids 5 and 6).
+    #[tokio::test]
+    async fn geo_within_bbox_antimeridian_returns_both_dateline_points() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        setup_geo(&state, &ctx).await;
+
+        let q = "SELECT id, name FROM geo.places \
+                 WHERE GEO_WITHIN_BBOX(location, (-1.0, 179.0), (1.0, -179.0))";
+        assert_explain_plan(&state, &ctx, q, "GeoIndex").await;
+        let rows = run_geo_select(&state, &ctx, q).await;
+        let mut ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![5, 6],
+            "antimeridian bbox must return both dateline points, not zero"
+        );
     }
 
     /// Vector index: an `ORDER BY ... ANN OF` query returns the nearest rows in

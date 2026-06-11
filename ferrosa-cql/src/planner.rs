@@ -42,6 +42,19 @@ pub enum ScanPlan {
         index_column: String,
     },
 
+    /// A geospatial query (`GEO_NEAREST OF`, `GEO_WITHIN_RADIUS`,
+    /// `GEO_WITHIN_BBOX`) served by a geo cell-id index. The geo predicate is a
+    /// function over the indexed column, not a scalar `=`, so it does not flow
+    /// through the generic single-/multi-index matching above; the router builds
+    /// this variant directly so EXPLAIN reports the geo index rather than a
+    /// FullScan. `op` is the geo operation name (`GeoNearest` / `GeoWithinRadius`
+    /// / `GeoWithinBbox`).
+    GeoIndex {
+        index_name: String,
+        index_column: String,
+        op: String,
+    },
+
     /// No indexes match. Requires ALLOW FILTERING.
     FullScan,
 }
@@ -74,6 +87,11 @@ impl fmt::Display for ScanPlan {
                 index_name,
                 index_column,
             } => write!(f, "VectorAnn({index_name} on {index_column})"),
+            ScanPlan::GeoIndex {
+                index_name,
+                index_column,
+                op,
+            } => write!(f, "GeoIndex({index_name} on {index_column}, {op})"),
             ScanPlan::FullScan => write!(f, "FullScan"),
         }
     }
@@ -405,6 +423,19 @@ mod tests {
     #[test]
     fn display_full_scan() {
         assert_eq!(format!("{}", ScanPlan::FullScan), "FullScan");
+    }
+
+    #[test]
+    fn display_geo_index() {
+        let plan = ScanPlan::GeoIndex {
+            index_name: "places_location_geo".to_string(),
+            index_column: "location".to_string(),
+            op: "GeoWithinRadius".to_string(),
+        };
+        assert_eq!(
+            format!("{plan}"),
+            "GeoIndex(places_location_geo on location, GeoWithinRadius)"
+        );
     }
 
     #[test]
