@@ -27,6 +27,7 @@ pub mod hash;
 pub mod phonetic;
 pub mod vector;
 
+pub use filtered::evaluate_predicate;
 pub use phonetic::PhoneticAlgorithm;
 
 use ferrosa_common::CellValue;
@@ -276,7 +277,7 @@ pub enum FilterOp {
 }
 
 /// A filter predicate applied to a specific column during index building.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterPredicate {
     /// The column position to filter on.
     pub column_position: usize,
@@ -284,6 +285,22 @@ pub struct FilterPredicate {
     pub op: FilterOp,
     /// The value to compare against.
     pub value: Vec<u8>,
+}
+
+impl FilterPredicate {
+    /// Serialize this predicate to a JSON string suitable for stashing in an
+    /// index `options` map (the `value` bytes are already in storage encoding,
+    /// so the round-trip is exact and type-system independent).
+    pub fn to_option_string(&self) -> IndexResult<String> {
+        serde_json::to_string(self).map_err(IndexError::from)
+    }
+
+    /// Reconstruct a predicate from the JSON produced by
+    /// [`to_option_string`](Self::to_option_string). Returns `None` when the
+    /// string is absent or does not deserialize, so callers can fail safe.
+    pub fn from_option_string(s: &str) -> Option<Self> {
+        serde_json::from_str(s).ok()
+    }
 }
 
 // ── Vector helpers ───────────────────────────────────────────────────────────

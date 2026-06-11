@@ -35,6 +35,7 @@ use ferrosa_schema::{
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
+use ferrosa_storage::FILTER_PREDICATE_OPTION_KEY;
 use ferrosa_udf::UdfExecutor;
 
 use crate::ast::*;
@@ -3241,17 +3242,32 @@ async fn route_select_user_table(
         filtered
     } else {
         // No PK — use the query planner to decide the access path.
-        let planner_indexes: Vec<(String, Vec<String>)> = snap
+        // A partial (Filtered) index is offered to the planner ONLY when the
+        // query implies its predicate (see `query_implies_filter_predicate`);
+        // otherwise it is withheld so the planner cannot unsoundly serve an
+        // incomplete result from it.
+        let usable_indexes: Vec<&IndexMetadata> = snap
             .indexes
             .iter()
             .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-            .map(|((_, _, _), meta)| (meta.name.clone(), meta.target_columns.clone()))
+            .map(|(_, meta)| meta)
+            .filter(|meta| {
+                filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
+            })
             .collect();
+        let planner_indexes: Vec<(String, Vec<String>)> = usable_indexes
+            .iter()
+            .map(|meta| (meta.name.clone(), meta.target_columns.clone()))
+            .collect();
+        // Filter columns of usable partial indexes are covered by the index
+        // itself, so a WHERE predicate on them must not require ALLOW FILTERING.
+        let filtered_covered_columns = filtered_index_covered_columns(&usable_indexes, table_meta);
 
-        let scan_plan = planner::plan(
+        let scan_plan = planner::plan_with_covered(
             &s.where_clauses,
             &table_meta.partition_key,
             &planner_indexes,
+            &filtered_covered_columns,
         );
 
         // ── Vector ANN index consult ──────────────────────────────────────
@@ -3426,7 +3442,18 @@ async fn route_select_user_table(
                     }
 
                     // Observability: record that a secondary index was consulted.
-                    let plan_kind = if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
+                    // A partial (Filtered) index records the "Filtered" kind so
+                    // its acceleration is distinguishable in index_usage; the
+                    // planner only reached here for it when the query implied its
+                    // predicate (see `filtered_index_is_usable`).
+                    let is_filtered = snap
+                        .indexes
+                        .get(&(ks.to_string(), s.table.clone(), index_name.clone()))
+                        .map(|m| m.index_type == IndexType::Filtered)
+                        .unwrap_or(false);
+                    let plan_kind = if is_filtered {
+                        "Filtered"
+                    } else if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
                         "IndexScanWithFilter"
                     } else {
                         "SingleIndex"
@@ -4436,10 +4463,16 @@ fn route_explain(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
+    // EXPLAIN mirrors the SELECT planner exactly: a partial (Filtered) index is
+    // offered only when the query implies its predicate, so EXPLAIN reports the
+    // filtered index when it WOULD be used and FullScan when it would not.
     let planner_indexes: Vec<(String, Vec<String>)> = snap
         .indexes
         .iter()
         .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+        .filter(|(_, meta)| {
+            filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
+        })
         .map(|(_, meta)| (meta.name.clone(), meta.target_columns.clone()))
         .collect();
 
@@ -6633,6 +6666,189 @@ async fn route_drop_table(
 
 // ── DDL: Index ───────────────────────────────────────────────────────────
 
+/// Parse a Filtered (partial) index's `filter_op` option string into a
+/// [`ferrosa_index::FilterOp`]. Fails loud on any unrecognized operator.
+fn parse_filter_op(op: &str) -> Result<ferrosa_index::FilterOp, CqlError> {
+    use ferrosa_index::FilterOp;
+    match op.trim() {
+        "=" => Ok(FilterOp::Eq),
+        "!=" => Ok(FilterOp::NotEq),
+        "<" => Ok(FilterOp::Lt),
+        ">" => Ok(FilterOp::Gt),
+        "<=" => Ok(FilterOp::LtEq),
+        ">=" => Ok(FilterOp::GtEq),
+        other => Err(CqlError::Invalid(format!(
+            "invalid filter_op '{other}' for filtered index (expected one of =, !=, <, >, <=, >=)"
+        ))),
+    }
+}
+
+/// Build a fully-encoded [`ferrosa_index::FilterPredicate`] from the WITH
+/// OPTIONS of a `CREATE INDEX ... USING 'filtered'` statement.
+///
+/// Required options: `filter_column` (the partial-predicate column),
+/// `filter_op` (one of `=`,`!=`,`<`,`>`,`<=`,`>=`), and `filter_value` (a CQL
+/// literal parsed against the filter column's type). The predicate's
+/// `column_position` is the filter column's **storage** ordinal (statics then
+/// regulars, name-sorted) so it matches the cell ordinal the build/memtable
+/// paths compare against. The `value` is encoded to storage bytes here so the
+/// storage layer never needs the CQL type system.
+///
+/// Every missing/invalid option fails loud — a partial index with a broken
+/// predicate would silently index every row, an unsound result.
+fn build_filter_predicate_from_options(
+    state: &SharedState,
+    ks: &str,
+    table: &str,
+    options: &HashMap<String, String>,
+) -> Result<ferrosa_index::FilterPredicate, CqlError> {
+    let filter_column = options.get("filter_column").ok_or_else(|| {
+        CqlError::Invalid(
+            "filtered index requires WITH OPTIONS = {'filter_column': ..., 'filter_op': ..., \
+             'filter_value': ...}; missing 'filter_column'"
+                .into(),
+        )
+    })?;
+    let filter_op_str = options.get("filter_op").ok_or_else(|| {
+        CqlError::Invalid("filtered index WITH OPTIONS missing 'filter_op'".into())
+    })?;
+    let filter_value = options.get("filter_value").ok_or_else(|| {
+        CqlError::Invalid("filtered index WITH OPTIONS missing 'filter_value'".into())
+    })?;
+
+    let op = parse_filter_op(filter_op_str)?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), table.to_string()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{table} not found")))?;
+
+    // Storage ordinal of the filter column: the cell tag the build/memtable
+    // paths compare the predicate against.
+    let column_position = table_meta
+        .storage_column_index(filter_column)
+        .ok_or_else(|| {
+            CqlError::Invalid(format!(
+                "filtered index filter_column '{filter_column}' is not a column of {ks}.{table}"
+            ))
+        })? as usize;
+
+    let col_meta = table_meta
+        .columns
+        .get(filter_column)
+        .ok_or_else(|| CqlError::Invalid(format!("filter_column '{filter_column}' not found")))?;
+    let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+    let cql_value =
+        bridge::term_to_cql_value(&Term::StringLiteral(filter_value.clone()), &cql_type)?;
+    let value = crate::types::encode_value(&cql_value);
+
+    Ok(ferrosa_index::FilterPredicate {
+        column_position,
+        op,
+        value,
+    })
+}
+
+/// Soundness gate for partial (Filtered) indexes.
+///
+/// A partial index holds ONLY rows whose filter column satisfies its predicate,
+/// so serving `WHERE indexed_col = v` from it is COMPLETE only when the query
+/// also constrains the filter column such that every qualifying row is
+/// guaranteed to be in the index. Using it otherwise drops rows that match
+/// `indexed_col = v` but fall outside the partial predicate — a silent
+/// correctness bug.
+///
+/// Conservative, sound rule: the query must carry an `Eq` predicate on the
+/// index's filter column whose encoded value SATISFIES the index predicate. For
+/// an index predicate `status = 'active'`, only a query with `status = 'active'`
+/// qualifies; every such row has `status = 'active'`, which is exactly the set
+/// the index retains, so the result is both correct and complete. A query with
+/// no `status` predicate, or `status = 'inactive'`, does not qualify and the
+/// index is withheld (the planner then falls back to FullScan / the usual
+/// unindexed-column error).
+fn query_implies_filter_predicate(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+    predicate: &ferrosa_index::FilterPredicate,
+) -> bool {
+    for wc in where_clauses {
+        if wc.op != ComparisonOp::Eq || wc.token_fn {
+            continue;
+        }
+        // Match the WHERE column to the predicate's filter column by storage
+        // ordinal — the same ordinal the predicate was built with.
+        let Some(storage_idx) = table_meta.storage_column_index(&wc.column) else {
+            continue;
+        };
+        if storage_idx as usize != predicate.column_position {
+            continue;
+        }
+        // Encode the query's literal the same way the predicate value was
+        // encoded, then check the index predicate accepts it.
+        let Ok(key) = term_to_index_key(&wc.value, &wc.column, table_meta, ks, schema) else {
+            continue;
+        };
+        if ferrosa_index::evaluate_predicate(predicate, &key.0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The set of filter-column NAMES covered by the given usable filtered
+/// indexes. Maps each filtered index predicate's storage `column_position` back
+/// to a column name so the planner can mark it covered. Non-filtered indexes
+/// and predicates whose ordinal does not resolve are ignored.
+fn filtered_index_covered_columns(
+    usable_indexes: &[&IndexMetadata],
+    table_meta: &TableMetadata,
+) -> Vec<String> {
+    let mut covered = Vec::new();
+    for meta in usable_indexes {
+        if meta.index_type != IndexType::Filtered {
+            continue;
+        }
+        let Some(pred) = meta.filter_predicate.as_ref() else {
+            continue;
+        };
+        for (name, _) in table_meta.columns.iter() {
+            if table_meta.storage_column_index(name).map(|i| i as usize)
+                == Some(pred.column_position)
+            {
+                covered.push(name.clone());
+                break;
+            }
+        }
+    }
+    covered
+}
+
+/// Whether an index may be offered to the planner for this query.
+///
+/// Non-partial indexes are always usable. A Filtered index is usable only when
+/// the query implies its partial predicate (see
+/// [`query_implies_filter_predicate`]); a Filtered index whose predicate
+/// somehow failed to persist is treated as NOT usable (fail safe — never serve
+/// from a partial index we can't prove is implied).
+fn filtered_index_is_usable(
+    meta: &IndexMetadata,
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> bool {
+    if meta.index_type != IndexType::Filtered {
+        return true;
+    }
+    match &meta.filter_predicate {
+        Some(pred) => query_implies_filter_predicate(where_clauses, table_meta, ks, schema, pred),
+        None => false,
+    }
+}
+
 /// Resolve the USING string to an IndexType.
 fn resolve_index_type(
     using: Option<&str>,
@@ -6694,7 +6910,7 @@ async fn route_create_index(
     )?;
 
     // Convert options Vec to HashMap
-    let options_map: HashMap<String, String> = s.options.iter().cloned().collect();
+    let mut options_map: HashMap<String, String> = s.options.iter().cloned().collect();
 
     // Resolve index type
     let index_type = resolve_index_type(s.using.as_deref(), &s.columns, &options_map)?;
@@ -6703,6 +6919,23 @@ async fn route_create_index(
     // unknown `method` option rejects the whole statement before any DDL runs.
     let vector_method = if index_type == IndexType::Vector {
         Some(resolve_vector_index_method(&options_map)?)
+    } else {
+        None
+    };
+
+    // For a Filtered (partial) index, parse and validate the partial predicate
+    // from WITH OPTIONS up front so a malformed spec rejects the statement
+    // before any DDL runs (fail loud). The fully-encoded predicate is also
+    // mirrored into `options` under the reserved `__filter_predicate` key so it
+    // survives restart and the storage reload path can reconstruct it without
+    // the CQL type system. Done before any DDL so persistence captures it.
+    let filter_predicate = if index_type == IndexType::Filtered {
+        let pred = build_filter_predicate_from_options(state, ks, &s.table, &options_map)?;
+        let json = pred.to_option_string().map_err(|e| {
+            CqlError::ServerError(format!("failed to serialize filter predicate: {e}"))
+        })?;
+        options_map.insert(FILTER_PREDICATE_OPTION_KEY.to_string(), json);
+        Some(pred)
     } else {
         None
     };
@@ -6718,7 +6951,7 @@ async fn route_create_index(
         name: index_name.clone(),
         index_type,
         target_columns: s.columns.clone(),
-        filter_predicate: None,
+        filter_predicate: filter_predicate.clone(),
         options: options_map,
     };
 
@@ -6792,6 +7025,17 @@ async fn route_create_index(
                 // Full-text needs its own inverted-index sidecar (built on flush);
                 // the generic add_index() only builds a BTree.
                 state.engine.add_fulltext_index(&table_id, &index_name, pos)
+            } else if index_type == IndexType::Filtered {
+                // Partial index: thread the predicate into the engine so the
+                // memtable index and the SSTable sidecar build both filter to
+                // exactly the matching rows.
+                state.engine.add_index_with_predicate(
+                    &table_id,
+                    &index_name,
+                    pos,
+                    index_type,
+                    filter_predicate.clone(),
+                )
             } else {
                 state
                     .engine
@@ -16349,6 +16593,166 @@ mod tests {
         assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
         let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
         assert_eq!(count, 1, "phonetic index must match 'Jon' to 'John'");
+    }
+
+    /// Filtered (partial) index, happy path: index `name`, partial on
+    /// `status = 'active'`. A query that implies the predicate
+    /// (`WHERE name = v AND status = 'active'`) is served by the filtered
+    /// index — EXPLAIN reports the index (not FullScan), index_usage records a
+    /// "Filtered" hit, and ONLY the matching+active row is returned.
+    #[tokio::test]
+    async fn filtered_index_used_when_query_implies_predicate() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE flt WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE flt.users (id int PRIMARY KEY, name text, status text)",
+            "CREATE INDEX flt_name_active ON flt.users (name) USING 'filtered' \
+             WITH OPTIONS = {'filter_column':'status','filter_op':'=','filter_value':'active'}",
+            // alice active, alice inactive (same name, different status), bob active.
+            "INSERT INTO flt.users (id, name, status) VALUES (1, 'alice', 'active')",
+            "INSERT INTO flt.users (id, name, status) VALUES (2, 'alice', 'inactive')",
+            "INSERT INTO flt.users (id, name, status) VALUES (3, 'bob', 'active')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let q = "SELECT id FROM flt.users WHERE name = 'alice' AND status = 'active'";
+        // EXPLAIN must report the filtered index (rendered as SingleIndex), not FullScan.
+        assert_explain_plan(&state, &ctx, q, "flt_name_active").await;
+        // The filtered index is consulted (index_usage advances by 1) and ONLY
+        // the active alice row (id=1) is returned — not the inactive alice (id=2).
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(
+            count, 1,
+            "filtered index must return only the active 'alice' row"
+        );
+    }
+
+    /// Filtered (partial) index, soundness: a query that does NOT imply the
+    /// index's predicate (`WHERE name = v`, no `status`) must NOT be served from
+    /// the partial index — that would silently drop the inactive 'alice'. EXPLAIN
+    /// must not name the filtered index, no "Filtered" index hit is recorded, and
+    /// the full-scan fallback returns BOTH alices (complete result).
+    #[tokio::test]
+    async fn filtered_index_withheld_when_query_does_not_imply_predicate() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE fls WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fls.users (id int PRIMARY KEY, name text, status text)",
+            "CREATE INDEX fls_name_active ON fls.users (name) USING 'filtered' \
+             WITH OPTIONS = {'filter_column':'status','filter_op':'=','filter_value':'active'}",
+            "INSERT INTO fls.users (id, name, status) VALUES (1, 'alice', 'active')",
+            "INSERT INTO fls.users (id, name, status) VALUES (2, 'alice', 'inactive')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // No `status` predicate => the partial index does not imply the query.
+        let q = "SELECT id FROM fls.users WHERE name = 'alice'";
+
+        // EXPLAIN must NOT report the filtered index; it falls to FullScan.
+        let stmt = crate::parser::parse(&format!("EXPLAIN {q}")).unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let haystack = String::from_utf8_lossy(&b).into_owned();
+                assert!(
+                    !haystack.contains("fls_name_active"),
+                    "partial index must not be used without an implied predicate, got: {haystack}"
+                );
+                assert!(
+                    haystack.contains("FullScan"),
+                    "query that does not imply the predicate must fall to FullScan, got: {haystack}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+
+        // The full-scan fallback must return BOTH alices (active + inactive):
+        // using the partial index here would silently drop the inactive row.
+        // No "Filtered" index hit is recorded (delta 0).
+        let count = assert_index_hit_and_count(&state, &ctx, q, 0).await;
+        assert_eq!(
+            count, 2,
+            "without the implied predicate, both 'alice' rows must be returned (completeness)"
+        );
+    }
+
+    /// CREATE INDEX ... USING 'filtered' with a missing/invalid predicate option
+    /// must fail loud at CREATE time rather than registering an unfiltered index.
+    #[tokio::test]
+    async fn filtered_index_create_rejects_invalid_options() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE flv WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE flv.users (id int PRIMARY KEY, name text, status text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // Run a CREATE that must fail and return the rendered error string.
+        async fn expect_create_err(
+            state: &SharedState,
+            ctx: &RequestContext<'_>,
+            cql: &str,
+        ) -> String {
+            match route(state, ctx, crate::parser::parse(cql).unwrap()).await {
+                Ok(_) => panic!("expected CREATE INDEX to be rejected: {cql}"),
+                Err(e) => format!("{e:?}"),
+            }
+        }
+
+        // Missing filter options entirely.
+        let err = expect_create_err(
+            &state,
+            &ctx,
+            "CREATE INDEX flv_bad ON flv.users (name) USING 'filtered'",
+        )
+        .await;
+        assert!(
+            err.contains("filter_column"),
+            "error should mention the missing filter_column option, got: {err}"
+        );
+
+        // Unknown filter_op.
+        let err = expect_create_err(
+            &state,
+            &ctx,
+            "CREATE INDEX flv_bad ON flv.users (name) USING 'filtered' \
+             WITH OPTIONS = {'filter_column':'status','filter_op':'~~','filter_value':'active'}",
+        )
+        .await;
+        assert!(
+            err.contains("filter_op"),
+            "error should mention the invalid filter_op, got: {err}"
+        );
+
+        // filter_column not a real column.
+        let err = expect_create_err(
+            &state,
+            &ctx,
+            "CREATE INDEX flv_bad ON flv.users (name) USING 'filtered' \
+             WITH OPTIONS = {'filter_column':'nope','filter_op':'=','filter_value':'active'}",
+        )
+        .await;
+        assert!(
+            err.contains("nope"),
+            "error should mention the unknown filter_column, got: {err}"
+        );
     }
 
     /// Full-text index: `WHERE body = fts_match(...)` consults the FTI, returns

@@ -15,7 +15,12 @@ use crate::{
 // ── Predicate evaluation ─────────────────────────────────────────────────────
 
 /// Evaluate a filter predicate against a cell value (raw bytes).
-fn evaluate_predicate(predicate: &FilterPredicate, cell_value: &[u8]) -> bool {
+///
+/// This is the single source of truth for partial-index predicate evaluation.
+/// The storage build path (`LocalBackend::build`) and the memtable write path
+/// both call this so a sidecar and its memtable companion agree on exactly
+/// which rows belong in a filtered index.
+pub fn evaluate_predicate(predicate: &FilterPredicate, cell_value: &[u8]) -> bool {
     match predicate.op {
         FilterOp::Eq => cell_value == predicate.value.as_slice(),
         FilterOp::NotEq => cell_value != predicate.value.as_slice(),
