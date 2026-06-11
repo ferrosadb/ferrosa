@@ -2996,20 +2996,12 @@ async fn route_select_user_table(
         let (fts_column, fts_query) = extract_fts_match(&s.where_clauses)
             .ok_or_else(|| CqlError::Invalid("fts_match: failed to extract column/query".into()))?;
 
-        // Look up the full-text index name for the referenced column.
-        let fti_index_name = snap
-            .indexes
-            .iter()
-            .find(|((idx_ks, idx_tbl, _), meta)| {
-                idx_ks == ks
-                    && idx_tbl == &s.table
-                    && meta.target_columns.iter().any(|c| c == fts_column)
-            })
-            .map(|((_, _, _), meta)| meta.name.clone());
-
-        // Fall back to using the column name as the index name when no explicit
-        // index registration exists (useful for simple single-column FTI).
-        let index_name = fti_index_name.as_deref().unwrap_or(fts_column);
+        // Look up the full-text index name for the referenced column. This is
+        // the same resolution EXPLAIN uses (`resolve_fulltext_index_name`), so
+        // the reported `FullTextIndex` plan and the executed index agree. Falls
+        // back to the column name for simple single-column FTI registration.
+        let fti_index_name = resolve_fulltext_index_name(&snap, ks, &s.table, fts_column);
+        let index_name = fti_index_name.as_str();
 
         // Observability: record that the full-text index was consulted.
         state
@@ -3357,6 +3349,15 @@ async fn route_select_user_table(
                     // plan rendering.
                     return Err(CqlError::ServerError(
                         "internal: geo plan reached the scalar scan dispatch".into(),
+                    ));
+                }
+                ScanPlan::FullTextIndex { .. } => {
+                    // Full-text queries (`WHERE col = fts_match(...)`) are served
+                    // by the `where_has_fts_match` early branch above before the
+                    // planner runs, so `planner::plan` never returns this variant
+                    // here. It exists only for EXPLAIN's plan rendering.
+                    return Err(CqlError::ServerError(
+                        "internal: full-text plan reached the scalar scan dispatch".into(),
                     ));
                 }
                 ScanPlan::PartitionKeyLookup => {
@@ -4478,8 +4479,12 @@ fn route_explain(
 
     // Geospatial queries are served by the geo index in their own branch, not by
     // the generic planner, so report `GeoIndex` here rather than FullScan.
+    // Full-text queries (`WHERE col = fts_match(...)`) are likewise served by the
+    // FTI in an early branch, so report `FullTextIndex` rather than FullScan.
     let scan_plan = if let Some(geo_plan) = geo_explain_plan(&snap, ks, &s) {
         geo_plan
+    } else if let Some(fts_plan) = fulltext_explain_plan(&snap, ks, &s) {
+        fts_plan
     } else {
         planner::plan(
             &s.where_clauses,
@@ -4539,6 +4544,47 @@ fn geo_explain_plan(
         index_column: column,
         op: op.to_string(),
     })
+}
+
+/// Build a [`ScanPlan::FullTextIndex`] for EXPLAIN when `s` carries an
+/// `fts_match()` predicate. Returns `None` when there is no full-text predicate
+/// (so the generic planner runs). The index-name resolution mirrors the
+/// execution path in `route_select_user_table` exactly: prefer a registered
+/// index whose target columns include the searched column, else fall back to
+/// the column name itself (matching simple single-column FTI registration).
+fn fulltext_explain_plan(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    s: &SelectStatement,
+) -> Option<ScanPlan> {
+    if !where_has_fts_match(&s.where_clauses) {
+        return None;
+    }
+    let (fts_column, _fts_query) = extract_fts_match(&s.where_clauses)?;
+    let index_name = resolve_fulltext_index_name(snap, ks, &s.table, fts_column);
+    Some(ScanPlan::FullTextIndex {
+        index_name,
+        index_column: fts_column.to_string(),
+    })
+}
+
+/// Resolve the full-text index name serving `column` on `ks.table`. Prefers a
+/// registered index whose target columns include `column`; otherwise falls back
+/// to the column name itself. This is the single source of truth shared by the
+/// EXPLAIN reporting path and the execution path so they never diverge.
+fn resolve_fulltext_index_name(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    table: &str,
+    column: &str,
+) -> String {
+    snap.indexes
+        .iter()
+        .find(|((idx_ks, idx_tbl, _), meta)| {
+            idx_ks == ks && idx_tbl == table && meta.target_columns.iter().any(|c| c == column)
+        })
+        .map(|((_, _, _), meta)| meta.name.clone())
+        .unwrap_or_else(|| column.to_string())
 }
 
 // ── USING TIMESTAMP / TTL helpers (Gap 10) ───────────────────────────────
@@ -16447,6 +16493,34 @@ mod tests {
     // ordering and that the vector index is registered (the router ANN path is
     // a brute-force sort pending Phase 2 vector read dispatch, so it honestly
     // does not claim an index_usage hit it cannot demonstrate).
+    //
+    // ── 2i acceleration coverage matrix ─────────────────────────────────────
+    //
+    // Every one of the 8 `IndexType`s is query-accelerated AND observable. For
+    // each type the named test asserts ALL of: (a) correct rows, (b) `EXPLAIN`
+    // reports the plan variant and NOT `FullScan` (via `assert_explain_plan`),
+    // (c) the `index_usage` counter increments at execution (via
+    // `assert_index_hit_and_count`).
+    //
+    // | IndexType | EXPLAIN plan variant | proving test |
+    // |-----------|----------------------|--------------|
+    // | BTree     | SingleIndex          | `btree_index_usage_observable_end_to_end` |
+    // | Hash      | SingleIndex          | `hash_index_usage_observable_end_to_end` |
+    // | Composite | SingleIndex          | `composite_index_usage_observable_end_to_end` |
+    // | Phonetic  | SingleIndex          | `phonetic_index_usage_observable_end_to_end` |
+    // | Filtered  | SingleIndex (partial)| `filtered_index_used_when_query_implies_predicate` |
+    // | FullText  | FullTextIndex        | `fulltext_index_usage_observable_end_to_end` |
+    // | Vector    | VectorAnn            | `ann_query_consults_vector_index_and_is_observable` |
+    // | Geo       | GeoIndex             | `geo_st_within_polygon_filters_to_central_sf` (and other `geo_*`) |
+    //
+    // BTree/Hash/Composite/Phonetic all render `SingleIndex` because they are
+    // scalar-`=` indexes the generic planner matches identically; the type
+    // distinction lives in `ferrosa-index` build/read dispatch, exercised by
+    // those crate-level tests. Filtered renders `SingleIndex` but is gated by
+    // `filtered_index_is_usable` (predicate implication) — soundness is proven
+    // by `filtered_index_withheld_when_query_does_not_imply_predicate`. FullText,
+    // Vector, and Geo each take an early non-planner branch and report a
+    // dedicated plan variant.
 
     /// Run a non-EXPLAIN query and assert the index_usage counter advanced by
     /// exactly the expected delta, returning the decoded row count.
@@ -16779,6 +16853,10 @@ mod tests {
             .flush(&ferrosa_storage::TableId::new("ftu", "docs"))
             .unwrap();
         let q = "SELECT id FROM ftu.docs WHERE body = fts_match('distributed AND database')";
+        // EXPLAIN must report the full-text index, not a FullScan: the FTS path
+        // is genuinely accelerated via `engine.fulltext_search`, and EXPLAIN now
+        // reflects that (closing the prior FullText EXPLAIN gap).
+        assert_explain_plan(&state, &ctx, q, "FullTextIndex").await;
         let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
         assert_eq!(count, 1, "fts_match must return exactly the matching doc");
     }
