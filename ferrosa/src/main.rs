@@ -1277,9 +1277,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::FullScanReasonsTable::new(full_scan_tracker.clone()),
     ));
-    schema.virtual_tables().register(Arc::new(
-        ferrosa_cql::virtual_tables::IndexUsageTable::new(index_usage_tracker.clone()),
-    ));
+    schema
+        .virtual_tables()
+        .register(Arc::new(ferrosa_cql::virtual_tables::IndexUsageTable::new(
+            index_usage_tracker.clone(),
+        )));
     let table_access_tracker = Arc::new(ferrosa_cql::virtual_tables::TableAccessTracker::new());
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::TableAccessSummaryTable::new(table_access_tracker.clone()),
