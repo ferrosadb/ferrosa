@@ -289,6 +289,35 @@ fn apply_ann_of_ordering(
     Ok(())
 }
 
+/// Default `k` cap for `ANN OF` queries that omit `LIMIT`, bounding the index
+/// consult and the row fetch.
+const ANN_DEFAULT_K: usize = 100;
+
+/// `ef_search` width used for router-level ANN index consults. The brute-force
+/// memtable index ignores it; persisted HNSW sidecars use it as the search
+/// beam width. Sized comfortably above typical `k`.
+const ANN_EF_SEARCH: usize = 128;
+
+/// Resolve the registered **vector** index name for `ann_column` on
+/// `ks`.`table`, if one exists. Returns `None` when no vector index targets the
+/// column, in which case the caller falls through to the unchanged full-scan
+/// ANN ordering path.
+fn vector_index_for_ann_column(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    table: &str,
+    ann_column: &str,
+) -> Option<String> {
+    snap.indexes
+        .iter()
+        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == table)
+        .find(|(_, meta)| {
+            meta.index_type == ferrosa_index::IndexType::Vector
+                && meta.target_columns.iter().any(|c| c == ann_column)
+        })
+        .map(|(_, meta)| meta.name.clone())
+}
+
 fn projection_storage_ordinals(
     select_columns: &[SelectColumn],
     table_meta: &TableMetadata,
@@ -2905,545 +2934,685 @@ async fn route_select_user_table(
             &planner_indexes,
         );
 
-        match scan_plan {
-            ScanPlan::PartitionKeyLookup => {
-                // This can happen when extract_pk_values fails (e.g., bind
-                // values that can't be coerced to the PK column type) but
-                // the planner still sees Eq predicates on all PK columns.
-                // Fall through to a full scan rather than panicking.
-                let partitions = state
-                    .write_path
-                    .load()
-                    .range_read_with(&table_id, ctx.consistency, &table_strategy)
-                    .await?;
-                if count_only_select {
-                    let count = count_rows_from_partitions(
-                        &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
-                    )
-                    .await?;
-                    return Ok(SelectRawResult {
-                        column_names: col_names.to_vec(),
-                        column_types: col_types.to_vec(),
-                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                        keyspace: ks.to_string(),
-                        table: s.table.clone(),
-                        paging_state: None,
-                    });
-                }
-                let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
-                filter_rows_by_select_predicates(
-                    &mut all_rows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-                all_rows
-            }
+        // ── Vector ANN index consult ──────────────────────────────────────
+        //
+        // `ORDER BY col ANN OF [...] LIMIT k` with a vector index registered on
+        // `col`: consult the index for the k nearest partitions instead of
+        // full-scanning the table and post-filtering. The recovered rows feed
+        // the SAME downstream pipeline below (apply_ann_of_ordering re-ranks the
+        // k rows, then LIMIT + projection). When NO vector index targets the
+        // column, `ann_index` is `None` and we fall through UNCHANGED to
+        // `match scan_plan` (byte-identical fallback).
+        let ann_index = s.ann_of.as_ref().and_then(|(ann_col, _)| {
+            vector_index_for_ann_column(&snap, ks, &s.table, ann_col).map(|name| (name, ann_col))
+        });
+        if let Some((index_name, ann_col)) = ann_index {
+            let ann_query = &s
+                .ann_of
+                .as_ref()
+                .expect("ann_of present when ann_index resolved")
+                .1;
+            let col_idx = all_col_names
+                .iter()
+                .position(|name| name == ann_col)
+                .ok_or_else(|| CqlError::Invalid(format!("unknown ANN OF column {ann_col}")))?;
+            let target_type = all_col_types.get(col_idx).ok_or_else(|| {
+                CqlError::Invalid(format!("missing type for ANN OF column {ann_col}"))
+            })?;
+            let query_bits = vector_bits_from_term(ann_query, target_type)?;
+            let query: Vec<f32> = query_bits.iter().map(|b| f32::from_bits(*b)).collect();
+            let k = s
+                .limit
+                .as_ref()
+                .and_then(|l| l.as_literal())
+                .map(|n| (n.max(0) as usize).min(ANN_DEFAULT_K))
+                .filter(|n| *n > 0)
+                .unwrap_or(ANN_DEFAULT_K);
 
-            ScanPlan::SingleIndex {
-                ref index_name,
-                ref index_column,
-            }
-            | ScanPlan::IndexScanWithFilter {
-                ref index_name,
-                ref index_column,
-                ..
-            } => {
-                // IndexScanWithFilter means some WHERE columns are not covered
-                // by any index — require ALLOW FILTERING for these queries.
-                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
-                    return Err(CqlError::Invalid(
-                        "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Use ALLOW FILTERING, create a secondary index on the \
-                         filtered columns, or restructure your query to use partition keys."
+            let partitions = state
+                .engine
+                .ann_search_partitions(&table_id, &index_name, &query, k, ANN_EF_SEARCH)
+                .map_err(|e| CqlError::ServerError(format!("ANN index search failed: {e}")))?;
+
+            // Observability parity with the other index types (Phase 3): an ANN
+            // index consult is an index hit, not a full scan.
+            state
+                .index_usage_tracker
+                .record(ks, &s.table, &index_name, "VectorAnn");
+
+            tracing::debug!(
+                keyspace = ks,
+                table = %s.table,
+                index = %index_name,
+                k,
+                returned = partitions.len(),
+                "ANN OF served from vector index consult (no full scan)"
+            );
+
+            let mut ann_rows = Vec::new();
+            extend_rows_from_partitions(
+                &partitions,
+                &mut ann_rows,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+                &storage_to_table,
+            )
+            .await;
+            ann_rows
+        } else {
+            match scan_plan {
+                ScanPlan::VectorAnn { .. } => {
+                    // `planner::plan` never emits VectorAnn — the ANN index consult
+                    // is handled by the early branch above. Reaching here means the
+                    // planner contract changed without updating this dispatch; fail
+                    // loud rather than silently degrade to a full scan.
+                    return Err(CqlError::ServerError(
+                        "internal: VectorAnn scan plan reached the scan dispatch; \
+                     ANN index consult should have handled it"
                             .into(),
                     ));
                 }
-
-                // Observability: record that a secondary index was consulted.
-                let plan_kind = if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
-                    "IndexScanWithFilter"
-                } else {
-                    "SingleIndex"
-                };
-                state
-                    .index_usage_tracker
-                    .record(ks, &s.table, index_name, plan_kind);
-
-                // Find the WHERE clause for the indexed column.
-                let index_wc = s
-                    .where_clauses
-                    .iter()
-                    .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
-                    .ok_or_else(|| {
-                        CqlError::Invalid(
-                            "planner selected index but no matching WHERE clause found".into(),
-                        )
-                    })?;
-
-                let index_key = term_to_index_key(
-                    &index_wc.value,
-                    index_column,
-                    table_meta,
-                    ks,
-                    &state.schema,
-                )?;
-
-                // Scatter-gather index read: in cluster mode this fans out
-                // to all ring nodes so results include rows on every node.
-                let partitions = state
-                    .write_path
-                    .load()
-                    .index_read(&table_id, index_name, &index_key)
-                    .await?;
-
-                // Fallback: if the index read returns empty, the memtable index
-                // may not be wired yet (Sprint I-3). Fall back to full scan so
-                // queries still return correct results.
-                let partitions = if partitions.is_empty() {
-                    state
+                ScanPlan::PartitionKeyLookup => {
+                    // This can happen when extract_pk_values fails (e.g., bind
+                    // values that can't be coerced to the PK column type) but
+                    // the planner still sees Eq predicates on all PK columns.
+                    // Fall through to a full scan rather than panicking.
+                    let partitions = state
                         .write_path
                         .load()
                         .range_read_with(&table_id, ctx.consistency, &table_strategy)
-                        .await?
-                } else {
-                    partitions
-                };
-
-                if count_only_select {
-                    let count = count_rows_from_partitions(
+                        .await?;
+                    if count_only_select {
+                        let count = count_rows_from_partitions(
+                            &partitions,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                            SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            },
+                        )
+                        .await?;
+                        return Ok(SelectRawResult {
+                            column_names: col_names.to_vec(),
+                            column_types: col_types.to_vec(),
+                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                            keyspace: ks.to_string(),
+                            table: s.table.clone(),
+                            paging_state: None,
+                        });
+                    }
+                    let mut all_rows = Vec::new();
+                    extend_rows_from_partitions(
                         &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
                     )
-                    .await?;
-                    return Ok(SelectRawResult {
-                        column_names: col_names.to_vec(),
-                        column_types: col_types.to_vec(),
-                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                        keyspace: ks.to_string(),
-                        table: s.table.clone(),
-                        paging_state: None,
-                    });
+                    .await;
+                    filter_rows_by_select_predicates(
+                        &mut all_rows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+                    all_rows
                 }
 
-                let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
-
-                // Always apply post-filter as defensive measure.
-                // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
-                filter_rows_by_select_predicates(
-                    &mut all_rows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-
-                all_rows
-            }
-
-            ScanPlan::IndexIntersection { ref indexes } => {
-                // Observability: record that each intersected index was consulted.
-                for (index_name, _index_column) in indexes {
-                    state
-                        .index_usage_tracker
-                        .record(ks, &s.table, index_name, "IndexIntersection");
+                ScanPlan::SingleIndex {
+                    ref index_name,
+                    ref index_column,
                 }
-                // Consult ALL matched single-column indexes and intersect their
-                // result sets on partition-key identity, so we fetch only the
-                // partitions present in every index rather than the full result
-                // of indexes[0] alone. The post-filter below still enforces
-                // per-row predicate precision on clustered tables.
-                let partitions = read_index_intersection(
-                    state,
-                    &table_id,
-                    indexes,
-                    s,
-                    table_meta,
-                    ks,
-                    ctx.consistency,
-                    &table_strategy,
-                )
-                .await?;
-
-                if count_only_select {
-                    let count = count_rows_from_partitions(
-                        &partitions,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
-                        SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        },
-                    )
-                    .await?;
-                    return Ok(SelectRawResult {
-                        column_names: col_names.to_vec(),
-                        column_types: col_types.to_vec(),
-                        rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                        keyspace: ks.to_string(),
-                        table: s.table.clone(),
-                        paging_state: None,
-                    });
-                }
-
-                let mut all_rows = Vec::new();
-                extend_rows_from_partitions(
-                    &partitions,
-                    &mut all_rows,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                )
-                .await;
-                filter_rows_by_select_predicates(
-                    &mut all_rows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-
-                all_rows
-            }
-
-            ScanPlan::FullScan => {
-                // Observability: record the predicate that triggered the full
-                // scan so operators can find queries that need an index.
-                {
-                    let (pred_col, pred_op) = s
-                        .where_clauses
-                        .iter()
-                        .find(|wc| !wc.token_fn)
-                        .map(|wc| (wc.column.as_str(), comparison_op_str(&wc.op)))
-                        .unwrap_or(("", ""));
-                    state
-                        .full_scan_tracker
-                        .record(ks, &s.table, pred_col, pred_op);
-                }
-
-                // Check ALLOW FILTERING requirement.
-                let indexed_columns: Vec<String> = snap
-                    .indexes
-                    .iter()
-                    .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-                    .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
-                    .collect();
-
-                // Exclude token() predicates — they are range scan hints,
-                // not column filters that require indexing.
-                let non_token_clauses: Vec<&WhereClause> =
-                    s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
-                let all_where_columns_indexed = non_token_clauses
-                    .iter()
-                    .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
-
-                if !non_token_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering
-                {
-                    return Err(CqlError::Invalid(
-                        "Cannot execute this query as it requires filtering on non-indexed \
+                | ScanPlan::IndexScanWithFilter {
+                    ref index_name,
+                    ref index_column,
+                    ..
+                } => {
+                    // IndexScanWithFilter means some WHERE columns are not covered
+                    // by any index — require ALLOW FILTERING for these queries.
+                    if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. })
+                        && !s.allow_filtering
+                    {
+                        return Err(CqlError::Invalid(
+                            "Cannot execute this query as it requires filtering on non-indexed \
                          columns. Use ALLOW FILTERING, create a secondary index on the \
                          filtered columns, or restructure your query to use partition keys."
-                            .into(),
-                    ));
-                }
+                                .into(),
+                        ));
+                    }
 
-                // Coordinator-side OOM bound (P0): an unbounded full-table scan
-                // with no WHERE/ORDER BY/ANN/DISTINCT/LIMIT used to accumulate
-                // the ENTIRE result into `all_rows` before returning, OOM-killing
-                // the coordinator on large tables. Stream at most one bounded
-                // page instead and return a `PagingState` continuation. A
-                // default page applies when the client sends no `page_size`, so
-                // even an un-paged `SELECT *` cannot accumulate unbounded rows.
-                //
-                // Other shapes (predicates, ORDER BY, ANN, DISTINCT, LIMIT,
-                // COUNT) keep their existing materialize-bounded behavior, where
-                // the scan window is already bounded by LIMIT/sort/count needs.
-                // Exclude any function-call projection: aggregates
-                // (COUNT/AVG/MIN/MAX/SUM) and UDAs fold over the WHOLE result,
-                // so paging the scan would compute them over a single page.
-                // Scalar UDFs/toJson are per-row and safe, but excluding all
-                // function calls keeps the streaming gate to plain column/star
-                // projections — exactly the unbounded `SELECT *` OOM shape.
-                let has_function_projection = s
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
-                let unbounded_scan_shape = s.where_clauses.is_empty()
-                    && s.order_by.is_empty()
-                    && s.ann_of.is_none()
-                    && !s.distinct
-                    && s.limit.is_none()
-                    && !count_only_select
-                    && !has_function_projection;
-                if unbounded_scan_shape {
-                    let page_size = ctx
-                        .paging
-                        .page_size
-                        .and_then(|ps| (ps > 0).then_some(ps as usize))
-                        .unwrap_or_else(crate::paging::default_scan_page_size);
+                    // Observability: record that a secondary index was consulted.
+                    let plan_kind = if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
+                        "IndexScanWithFilter"
+                    } else {
+                        "SingleIndex"
+                    };
+                    state
+                        .index_usage_tracker
+                        .record(ks, &s.table, index_name, plan_kind);
 
-                    let resume =
-                        StreamResumeCursor::from_paging_state(ctx.paging.paging_state.as_deref())?;
-                    // Resume the scan at the last partition key (inclusive); the
-                    // collector drops rows already emitted within that key.
-                    let start_key = resume.as_ref().map(|cur| {
-                        ferrosa_common::key::DecoratedKey::new(
-                            ferrosa_common::key::PartitionKey::from(cur.partition_key.as_slice()),
-                        )
-                    });
+                    // Find the WHERE clause for the indexed column.
+                    let index_wc = s
+                        .where_clauses
+                        .iter()
+                        .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
+                        .ok_or_else(|| {
+                            CqlError::Invalid(
+                                "planner selected index but no matching WHERE clause found".into(),
+                            )
+                        })?;
 
-                    // The gate above guarantees `where_clauses.is_empty()`, so a
-                    // column projection is always safe here (no predicate reads
-                    // an unprojected cell).
-                    let scan_projection =
-                        projection_storage_ordinals_for_select_scan(s, table_meta);
+                    let index_key = term_to_index_key(
+                        &index_wc.value,
+                        index_column,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )?;
 
-                    let stream = if let Some(wanted) = scan_projection {
+                    // Scatter-gather index read: in cluster mode this fans out
+                    // to all ring nodes so results include rows on every node.
+                    let partitions = state
+                        .write_path
+                        .load()
+                        .index_read(&table_id, index_name, &index_key)
+                        .await?;
+
+                    // Fallback: if the index read returns empty, the memtable index
+                    // may not be wired yet (Sprint I-3). Fall back to full scan so
+                    // queries still return correct results.
+                    let partitions = if partitions.is_empty() {
                         state
                             .write_path
                             .load()
-                            .range_read_projected_stream_all_from(
-                                &table_id,
-                                wanted,
-                                start_key.as_ref(),
-                                ctx.consistency,
-                                &table_strategy,
-                            )
+                            .range_read_with(&table_id, ctx.consistency, &table_strategy)
                             .await?
                     } else {
-                        state
-                            .write_path
-                            .load()
-                            .range_read_stream_all_from(
-                                &table_id,
-                                start_key.as_ref(),
-                                ctx.consistency,
-                                &table_strategy,
-                            )
-                            .await?
+                        partitions
                     };
 
-                    let page = collect_page_from_partition_stream(
-                        stream,
-                        page_size,
-                        resume,
-                        PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        },
+                    if count_only_select {
+                        let count = count_rows_from_partitions(
+                            &partitions,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                            SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            },
+                        )
+                        .await?;
+                        return Ok(SelectRawResult {
+                            column_names: col_names.to_vec(),
+                            column_types: col_types.to_vec(),
+                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                            keyspace: ks.to_string(),
+                            table: s.table.clone(),
+                            paging_state: None,
+                        });
+                    }
+
+                    let mut all_rows = Vec::new();
+                    extend_rows_from_partitions(
+                        &partitions,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await;
+
+                    // Always apply post-filter as defensive measure.
+                    // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
+                    filter_rows_by_select_predicates(
+                        &mut all_rows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+
+                    all_rows
+                }
+
+                ScanPlan::IndexIntersection { ref indexes } => {
+                    // Observability: record that each intersected index was consulted.
+                    for (index_name, _index_column) in indexes {
+                        state.index_usage_tracker.record(
+                            ks,
+                            &s.table,
+                            index_name,
+                            "IndexIntersection",
+                        );
+                    }
+                    // Consult ALL matched single-column indexes and intersect their
+                    // result sets on partition-key identity, so we fetch only the
+                    // partitions present in every index rather than the full result
+                    // of indexes[0] alone. The post-filter below still enforces
+                    // per-row predicate precision on clustered tables.
+                    let partitions = read_index_intersection(
+                        state,
+                        &table_id,
+                        indexes,
+                        s,
+                        table_meta,
+                        ks,
+                        ctx.consistency,
+                        &table_strategy,
                     )
                     .await?;
 
-                    streamed_paging_state = Some(page.next_paging_state);
-                    page.rows
-                } else {
-                    // Use a bounded upstream partition cap for unordered,
-                    // non-aggregate scans so first pages do not wait behind an
-                    // unbounded table materialization. When ALLOW FILTERING has
-                    // post-filter predicates, no upstream partition cap is safe:
-                    // LIMIT 1 may need to inspect many non-matching partitions
-                    // before finding the first matching row, and a fixed cap would
-                    // silently drop later matches. In that shape, stream the full
-                    // table and apply LIMIT/page semantics after filtering.
-                    // Ordered and aggregate queries still materialize their scan
-                    // window before sorting/counting.
-                    let scan_bound = if s.order_by.is_empty()
-                        && s.ann_of.is_none()
-                        && !count_only_select
-                    {
-                        let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
-                        if has_post_filter {
-                            None
-                        } else {
-                            let page_size = ctx
-                                .paging
-                                .page_size
-                                .and_then(|ps| (ps > 0).then_some(ps as usize));
-                            let limit_size = s
-                                .limit
-                                .as_ref()
-                                .and_then(|l| l.as_literal())
-                                .map(|n| n as usize);
-                            let base = match (page_size, limit_size) {
-                                (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
-                                (Some(ps), None) => Some(ps),
-                                (None, Some(lim)) => Some(lim),
-                                (None, None) => None,
-                            };
-                            let start = ctx
-                                .paging
-                                .paging_state
-                                .as_deref()
-                                .and_then(|bytes| crate::paging::PagingState::decode(bytes).ok())
-                                .and_then(|state| {
-                                    (state.partition_key.len() == 8).then(|| {
-                                        u64::from_be_bytes(
-                                            state.partition_key.as_slice().try_into().unwrap(),
-                                        ) as usize
-                                    })
-                                })
-                                .unwrap_or(0);
-                            base.map(|n| start.saturating_add(n).max(1))
-                        }
-                    } else {
-                        None
-                    };
-                    let row_limit =
-                        safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
-                            .unwrap_or(0);
-                    // ADR-020 projection fast path. Route through
-                    // range_read_projected whenever the query only needs a subset
-                    // of regular cells, so the SSTable layer byte-skips bulky
-                    // unneeded payloads. Big win on wide tables with bulky cells
-                    // (e.g. entity_store's entity_embedding column).
-                    //
-                    // Non-count SELECT requires no WHERE because predicates over
-                    // unprojected regular columns would evaluate against NULL.
-                    let projection_wanted = if !count_only_select && s.where_clauses.is_empty() {
-                        projection_storage_ordinals_for_select_scan(s, table_meta)
-                    } else {
-                        None
-                    };
-                    // Count-only filtered scans project predicate columns only and
-                    // fold over a partition stream, so COUNT(*) avoids decoding
-                    // unrelated cells without first collecting partitions in a Vec.
-                    let count_projection_wanted = if count_only_select {
-                        projection_storage_ordinals_for_count_predicates(
-                            &s.where_clauses,
-                            table_meta,
-                        )
-                    } else {
-                        None
-                    };
-                    let partitions = if let Some(wanted) = projection_wanted {
-                        // Push partition-count cap down to the merger so
-                        // `LIMIT N` stops the scan after N partitions
-                        // rather than walking every SSTable.
-                        Some(
-                            state
-                                .write_path
-                                .load()
-                                .range_read_projected(&table_id, wanted, scan_bound)
-                                .await?,
-                        )
-                    } else if let Some(bound) = scan_bound {
-                        Some(
-                            state
-                                .write_path
-                                .load()
-                                .range_read_limited_rows(&table_id, bound, row_limit)
-                                .await?,
-                        )
-                    } else if row_limit > 0 {
-                        Some(
-                            state
-                                .write_path
-                                .load()
-                                .range_read_limited_rows(
-                                    &table_id,
-                                    ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
-                                    row_limit,
-                                )
-                                .await?,
-                        )
-                    } else {
-                        None
-                    };
                     if count_only_select {
-                        let row_context = PartitionRowContext {
-                            all_col_names: &all_col_names,
-                            all_col_types: &all_col_types,
-                            pk_indices: &pk_indices,
-                            ck_indices: &ck_indices,
-                            storage_to_table: &storage_to_table,
-                        };
-                        let predicate_context = SelectPredicateContext {
-                            statement: s,
-                            table_meta,
-                            keyspace: ks,
-                            state,
-                        };
-                        let count = if let Some(partitions) = partitions.as_ref() {
-                            count_rows_from_partitions(partitions, row_context, predicate_context)
-                                .await?
-                        } else if let Some(wanted) = count_projection_wanted {
-                            let stream = state
+                        let count = count_rows_from_partitions(
+                            &partitions,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                            SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            },
+                        )
+                        .await?;
+                        return Ok(SelectRawResult {
+                            column_names: col_names.to_vec(),
+                            column_types: col_types.to_vec(),
+                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                            keyspace: ks.to_string(),
+                            table: s.table.clone(),
+                            paging_state: None,
+                        });
+                    }
+
+                    let mut all_rows = Vec::new();
+                    extend_rows_from_partitions(
+                        &partitions,
+                        &mut all_rows,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    )
+                    .await;
+                    filter_rows_by_select_predicates(
+                        &mut all_rows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+
+                    all_rows
+                }
+
+                ScanPlan::FullScan => {
+                    // Observability: record the predicate that triggered the full
+                    // scan so operators can find queries that need an index.
+                    {
+                        let (pred_col, pred_op) = s
+                            .where_clauses
+                            .iter()
+                            .find(|wc| !wc.token_fn)
+                            .map(|wc| (wc.column.as_str(), comparison_op_str(&wc.op)))
+                            .unwrap_or(("", ""));
+                        state
+                            .full_scan_tracker
+                            .record(ks, &s.table, pred_col, pred_op);
+                    }
+
+                    // Check ALLOW FILTERING requirement.
+                    let indexed_columns: Vec<String> = snap
+                        .indexes
+                        .iter()
+                        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+                        .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
+                        .collect();
+
+                    // Exclude token() predicates — they are range scan hints,
+                    // not column filters that require indexing.
+                    let non_token_clauses: Vec<&WhereClause> =
+                        s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
+                    let all_where_columns_indexed = non_token_clauses
+                        .iter()
+                        .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
+
+                    if !non_token_clauses.is_empty()
+                        && !all_where_columns_indexed
+                        && !s.allow_filtering
+                    {
+                        return Err(CqlError::Invalid(
+                            "Cannot execute this query as it requires filtering on non-indexed \
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
+                                .into(),
+                        ));
+                    }
+
+                    // Coordinator-side OOM bound (P0): an unbounded full-table scan
+                    // with no WHERE/ORDER BY/ANN/DISTINCT/LIMIT used to accumulate
+                    // the ENTIRE result into `all_rows` before returning, OOM-killing
+                    // the coordinator on large tables. Stream at most one bounded
+                    // page instead and return a `PagingState` continuation. A
+                    // default page applies when the client sends no `page_size`, so
+                    // even an un-paged `SELECT *` cannot accumulate unbounded rows.
+                    //
+                    // Other shapes (predicates, ORDER BY, ANN, DISTINCT, LIMIT,
+                    // COUNT) keep their existing materialize-bounded behavior, where
+                    // the scan window is already bounded by LIMIT/sort/count needs.
+                    // Exclude any function-call projection: aggregates
+                    // (COUNT/AVG/MIN/MAX/SUM) and UDAs fold over the WHOLE result,
+                    // so paging the scan would compute them over a single page.
+                    // Scalar UDFs/toJson are per-row and safe, but excluding all
+                    // function calls keeps the streaming gate to plain column/star
+                    // projections — exactly the unbounded `SELECT *` OOM shape.
+                    let has_function_projection = s
+                        .columns
+                        .iter()
+                        .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
+                    let unbounded_scan_shape = s.where_clauses.is_empty()
+                        && s.order_by.is_empty()
+                        && s.ann_of.is_none()
+                        && !s.distinct
+                        && s.limit.is_none()
+                        && !count_only_select
+                        && !has_function_projection;
+                    if unbounded_scan_shape {
+                        let page_size = ctx
+                            .paging
+                            .page_size
+                            .and_then(|ps| (ps > 0).then_some(ps as usize))
+                            .unwrap_or_else(crate::paging::default_scan_page_size);
+
+                        let resume = StreamResumeCursor::from_paging_state(
+                            ctx.paging.paging_state.as_deref(),
+                        )?;
+                        // Resume the scan at the last partition key (inclusive); the
+                        // collector drops rows already emitted within that key.
+                        let start_key = resume.as_ref().map(|cur| {
+                            ferrosa_common::key::DecoratedKey::new(
+                                ferrosa_common::key::PartitionKey::from(
+                                    cur.partition_key.as_slice(),
+                                ),
+                            )
+                        });
+
+                        // The gate above guarantees `where_clauses.is_empty()`, so a
+                        // column projection is always safe here (no predicate reads
+                        // an unprojected cell).
+                        let scan_projection =
+                            projection_storage_ordinals_for_select_scan(s, table_meta);
+
+                        let stream = if let Some(wanted) = scan_projection {
+                            state
                                 .write_path
                                 .load()
-                                .range_read_projected_stream_all_with(
+                                .range_read_projected_stream_all_from(
                                     &table_id,
                                     wanted,
-                                    scan_bound,
+                                    start_key.as_ref(),
                                     ctx.consistency,
                                     &table_strategy,
                                 )
-                                .await?;
-                            count_rows_from_partition_stream(stream, row_context, predicate_context)
                                 .await?
+                        } else {
+                            state
+                                .write_path
+                                .load()
+                                .range_read_stream_all_from(
+                                    &table_id,
+                                    start_key.as_ref(),
+                                    ctx.consistency,
+                                    &table_strategy,
+                                )
+                                .await?
+                        };
+
+                        let page = collect_page_from_partition_stream(
+                            stream,
+                            page_size,
+                            resume,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                        )
+                        .await?;
+
+                        streamed_paging_state = Some(page.next_paging_state);
+                        page.rows
+                    } else {
+                        // Use a bounded upstream partition cap for unordered,
+                        // non-aggregate scans so first pages do not wait behind an
+                        // unbounded table materialization. When ALLOW FILTERING has
+                        // post-filter predicates, no upstream partition cap is safe:
+                        // LIMIT 1 may need to inspect many non-matching partitions
+                        // before finding the first matching row, and a fixed cap would
+                        // silently drop later matches. In that shape, stream the full
+                        // table and apply LIMIT/page semantics after filtering.
+                        // Ordered and aggregate queries still materialize their scan
+                        // window before sorting/counting.
+                        let scan_bound = if s.order_by.is_empty()
+                            && s.ann_of.is_none()
+                            && !count_only_select
+                        {
+                            let has_post_filter =
+                                s.allow_filtering && !non_token_clauses.is_empty();
+                            if has_post_filter {
+                                None
+                            } else {
+                                let page_size = ctx
+                                    .paging
+                                    .page_size
+                                    .and_then(|ps| (ps > 0).then_some(ps as usize));
+                                let limit_size = s
+                                    .limit
+                                    .as_ref()
+                                    .and_then(|l| l.as_literal())
+                                    .map(|n| n as usize);
+                                let base = match (page_size, limit_size) {
+                                    (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
+                                    (Some(ps), None) => Some(ps),
+                                    (None, Some(lim)) => Some(lim),
+                                    (None, None) => None,
+                                };
+                                let start = ctx
+                                    .paging
+                                    .paging_state
+                                    .as_deref()
+                                    .and_then(|bytes| {
+                                        crate::paging::PagingState::decode(bytes).ok()
+                                    })
+                                    .and_then(|state| {
+                                        (state.partition_key.len() == 8).then(|| {
+                                            u64::from_be_bytes(
+                                                state.partition_key.as_slice().try_into().unwrap(),
+                                            ) as usize
+                                        })
+                                    })
+                                    .unwrap_or(0);
+                                base.map(|n| start.saturating_add(n).max(1))
+                            }
+                        } else {
+                            None
+                        };
+                        let row_limit =
+                            safe_partition_key_filter_row_limit(s, table_meta, count_only_select)
+                                .unwrap_or(0);
+                        // ADR-020 projection fast path. Route through
+                        // range_read_projected whenever the query only needs a subset
+                        // of regular cells, so the SSTable layer byte-skips bulky
+                        // unneeded payloads. Big win on wide tables with bulky cells
+                        // (e.g. entity_store's entity_embedding column).
+                        //
+                        // Non-count SELECT requires no WHERE because predicates over
+                        // unprojected regular columns would evaluate against NULL.
+                        let projection_wanted = if !count_only_select && s.where_clauses.is_empty()
+                        {
+                            projection_storage_ordinals_for_select_scan(s, table_meta)
+                        } else {
+                            None
+                        };
+                        // Count-only filtered scans project predicate columns only and
+                        // fold over a partition stream, so COUNT(*) avoids decoding
+                        // unrelated cells without first collecting partitions in a Vec.
+                        let count_projection_wanted = if count_only_select {
+                            projection_storage_ordinals_for_count_predicates(
+                                &s.where_clauses,
+                                table_meta,
+                            )
+                        } else {
+                            None
+                        };
+                        let partitions = if let Some(wanted) = projection_wanted {
+                            // Push partition-count cap down to the merger so
+                            // `LIMIT N` stops the scan after N partitions
+                            // rather than walking every SSTable.
+                            Some(
+                                state
+                                    .write_path
+                                    .load()
+                                    .range_read_projected(&table_id, wanted, scan_bound)
+                                    .await?,
+                            )
+                        } else if let Some(bound) = scan_bound {
+                            Some(
+                                state
+                                    .write_path
+                                    .load()
+                                    .range_read_limited_rows(&table_id, bound, row_limit)
+                                    .await?,
+                            )
+                        } else if row_limit > 0 {
+                            Some(
+                                state
+                                    .write_path
+                                    .load()
+                                    .range_read_limited_rows(
+                                        &table_id,
+                                        ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
+                                        row_limit,
+                                    )
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
+                        if count_only_select {
+                            let row_context = PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            };
+                            let predicate_context = SelectPredicateContext {
+                                statement: s,
+                                table_meta,
+                                keyspace: ks,
+                                state,
+                            };
+                            let count = if let Some(partitions) = partitions.as_ref() {
+                                count_rows_from_partitions(
+                                    partitions,
+                                    row_context,
+                                    predicate_context,
+                                )
+                                .await?
+                            } else if let Some(wanted) = count_projection_wanted {
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_projected_stream_all_with(
+                                        &table_id,
+                                        wanted,
+                                        scan_bound,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                count_rows_from_partition_stream(
+                                    stream,
+                                    row_context,
+                                    predicate_context,
+                                )
+                                .await?
+                            } else {
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_stream_all_with(
+                                        &table_id,
+                                        row_limit,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                count_rows_from_partition_stream(
+                                    stream,
+                                    row_context,
+                                    predicate_context,
+                                )
+                                .await?
+                            };
+                            return Ok(SelectRawResult {
+                                column_names: col_names.to_vec(),
+                                column_types: col_types.to_vec(),
+                                rows: vec![vec![Some(CqlValue::Bigint(count))]],
+                                keyspace: ks.to_string(),
+                                table: s.table.clone(),
+                                paging_state: None,
+                            });
+                        }
+                        let mut all_rows = Vec::new();
+                        if let Some(partitions) = partitions.as_ref() {
+                            extend_rows_from_partitions(
+                                partitions,
+                                &mut all_rows,
+                                &all_col_names,
+                                &all_col_types,
+                                &pk_indices,
+                                &ck_indices,
+                                &storage_to_table,
+                            )
+                            .await;
                         } else {
                             let stream = state
                                 .write_path
@@ -3455,62 +3624,28 @@ async fn route_select_user_table(
                                     &table_strategy,
                                 )
                                 .await?;
-                            count_rows_from_partition_stream(stream, row_context, predicate_context)
-                                .await?
-                        };
-                        return Ok(SelectRawResult {
-                            column_names: col_names.to_vec(),
-                            column_types: col_types.to_vec(),
-                            rows: vec![vec![Some(CqlValue::Bigint(count))]],
-                            keyspace: ks.to_string(),
-                            table: s.table.clone(),
-                            paging_state: None,
-                        });
-                    }
-                    let mut all_rows = Vec::new();
-                    if let Some(partitions) = partitions.as_ref() {
-                        extend_rows_from_partitions(
-                            partitions,
-                            &mut all_rows,
-                            &all_col_names,
-                            &all_col_types,
-                            &pk_indices,
-                            &ck_indices,
-                            &storage_to_table,
-                        )
-                        .await;
-                    } else {
-                        let stream = state
-                            .write_path
-                            .load()
-                            .range_read_stream_all_with(
-                                &table_id,
-                                row_limit,
-                                ctx.consistency,
-                                &table_strategy,
+                            extend_rows_from_partition_stream(
+                                stream,
+                                &mut all_rows,
+                                &all_col_names,
+                                &all_col_types,
+                                &pk_indices,
+                                &ck_indices,
+                                &storage_to_table,
                             )
                             .await?;
-                        extend_rows_from_partition_stream(
-                            stream,
+                        }
+                        filter_rows_by_select_predicates(
                             &mut all_rows,
+                            s,
                             &all_col_names,
                             &all_col_types,
-                            &pk_indices,
-                            &ck_indices,
-                            &storage_to_table,
-                        )
-                        .await?;
+                            table_meta,
+                            ks,
+                            state,
+                        )?;
+                        all_rows
                     }
-                    filter_rows_by_select_predicates(
-                        &mut all_rows,
-                        s,
-                        &all_col_names,
-                        &all_col_types,
-                        table_meta,
-                        ks,
-                        state,
-                    )?;
-                    all_rows
                 }
             }
         }
@@ -3984,6 +4119,21 @@ fn route_explain(
         &table_meta.partition_key,
         &planner_indexes,
     );
+
+    // `ORDER BY col ANN OF [...]` on a vector-indexed column is served by the
+    // index consult in `route_select_user_table`, not the WHERE-clause planner,
+    // so EXPLAIN must report the vector index rather than the planner's
+    // (FullScan) verdict for the empty WHERE clause.
+    let scan_plan = match s.ann_of.as_ref() {
+        Some((ann_col, _)) => match vector_index_for_ann_column(&snap, ks, &s.table, ann_col) {
+            Some(index_name) => ScanPlan::VectorAnn {
+                index_name,
+                index_column: ann_col.clone(),
+            },
+            None => scan_plan,
+        },
+        None => scan_plan,
+    };
 
     let plan_text = format!("{scan_plan}");
 
@@ -15855,6 +16005,40 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    /// `ORDER BY col ANN OF [...]` on a vector-indexed column must be served by
+    /// the index consult, observable as a `VectorAnn` EXPLAIN plan AND an
+    /// `index_usage` hit — never a silent full scan. Storage-layer ordering
+    /// correctness (nearest-first by score) is covered by
+    /// `ann_search_partitions_returns_nearest_rows_with_pk_in_score_order`.
+    #[tokio::test]
+    async fn ann_query_consults_vector_index_and_is_observable() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE annobs WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE annobs.papers (id int PRIMARY KEY, embedding vector<float, 3>)",
+            "CREATE INDEX papers_ann ON annobs.papers (embedding) USING 'vector'",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (1, [1.0, 0.0, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (2, [0.9, 0.1, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (3, [0.7, 0.3, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (4, [0.5, 0.5, 0.0])",
+            "INSERT INTO annobs.papers (id, embedding) VALUES (5, [0.0, 0.0, 1.0])",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM annobs.papers ORDER BY embedding ANN OF [1.0, 0.0, 0.0] LIMIT 3";
+        // EXPLAIN must report the vector index, not a full scan.
+        assert_explain_plan(&state, &ctx, q, "VectorAnn").await;
+        // Executing the query records exactly one index hit (the consult) and
+        // returns k rows — proving the index path ran, not a full scan.
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 3, "ANN OF LIMIT 3 must return exactly k=3 rows");
     }
 
     /// Full-scan observability: a `WHERE col = ?` with no index and ALLOW
