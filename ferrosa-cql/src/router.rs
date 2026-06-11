@@ -3073,42 +3073,22 @@ async fn route_select_user_table(
             }
 
             ScanPlan::IndexIntersection { ref indexes } => {
-                // Use first index for fetch, post-filter all WHERE predicates.
-                // Full set intersection across indexes is a future optimization.
-                let (ref first_idx_name, ref first_idx_col) = indexes[0];
-                let index_wc = s
-                    .where_clauses
-                    .iter()
-                    .find(|wc| wc.column == *first_idx_col && wc.op == ComparisonOp::Eq)
-                    .ok_or_else(|| {
-                        CqlError::Invalid(
-                            "planner selected index but no matching WHERE clause found".into(),
-                        )
-                    })?;
-
-                let index_key = term_to_index_key(
-                    &index_wc.value,
-                    first_idx_col,
+                // Consult ALL matched single-column indexes and intersect their
+                // result sets on partition-key identity, so we fetch only the
+                // partitions present in every index rather than the full result
+                // of indexes[0] alone. The post-filter below still enforces
+                // per-row predicate precision on clustered tables.
+                let partitions = read_index_intersection(
+                    state,
+                    &table_id,
+                    indexes,
+                    s,
                     table_meta,
                     ks,
-                    &state.schema,
-                )?;
-
-                let partitions = state
-                    .write_path
-                    .load()
-                    .index_read(&table_id, first_idx_name, &index_key)
-                    .await?;
-
-                let partitions = if partitions.is_empty() {
-                    state
-                        .write_path
-                        .load()
-                        .range_read_with(&table_id, ctx.consistency, &table_strategy)
-                        .await?
-                } else {
-                    partitions
-                };
+                    ctx.consistency,
+                    &table_strategy,
+                )
+                .await?;
 
                 if count_only_select {
                     let count = count_rows_from_partitions(
@@ -7386,6 +7366,83 @@ fn try_pk_in_lookup(
 
 /// Convert a WHERE clause `Term` for a given column into an `IndexKey` for
 /// secondary index lookup.
+/// Read and intersect the result sets of every matched single-column index.
+///
+/// Each index is point-looked-up for its `Eq` predicate; the returned
+/// partitions are intersected on partition-key identity, so the fetched set is
+/// the partitions present in *every* index rather than the (larger) result of a
+/// single index. Per-row precision on clustered tables is enforced by the
+/// caller's post-filter. Falls back to a full scan only if every index read is
+/// empty (the memtable-index-not-yet-wired fallback), preserving correctness.
+#[allow(clippy::too_many_arguments)]
+async fn read_index_intersection(
+    state: &SharedState,
+    table_id: &TableId,
+    indexes: &[(String, String)],
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+    ks: &str,
+    consistency: ConsistencyLevel,
+    table_strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+) -> Result<Vec<ferrosa_sstable::types::Partition>, CqlError> {
+    let mut per_index: Vec<Vec<ferrosa_sstable::types::Partition>> =
+        Vec::with_capacity(indexes.len());
+    for (index_name, index_column) in indexes {
+        let index_wc = s
+            .where_clauses
+            .iter()
+            .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
+            .ok_or_else(|| {
+                CqlError::Invalid(
+                    "planner selected index but no matching WHERE clause found".into(),
+                )
+            })?;
+        let index_key =
+            term_to_index_key(&index_wc.value, index_column, table_meta, ks, &state.schema)?;
+        let partitions = state
+            .write_path
+            .load()
+            .index_read(table_id, index_name, &index_key)
+            .await?;
+        per_index.push(partitions);
+    }
+
+    // Memtable-index-not-yet-wired fallback: if every index read came back
+    // empty, fall back to a full scan so results stay correct.
+    if per_index.iter().all(|p| p.is_empty()) {
+        return Ok(state
+            .write_path
+            .load()
+            .range_read_with(table_id, consistency, table_strategy)
+            .await?);
+    }
+
+    Ok(intersect_partitions_by_key(per_index))
+}
+
+/// Intersect partition lists on partition-key bytes, keeping each surviving
+/// partition once. A partition survives only if its key appears in every list.
+fn intersect_partitions_by_key(
+    mut per_index: Vec<Vec<ferrosa_sstable::types::Partition>>,
+) -> Vec<ferrosa_sstable::types::Partition> {
+    // Order lists smallest-first so the retained set starts as tight as
+    // possible, then intersect each subsequent list's key set against it.
+    per_index.sort_by_key(|p| p.len());
+    let mut iter = per_index.into_iter();
+    let mut result = match iter.next() {
+        Some(first) => first,
+        None => return Vec::new(),
+    };
+    for partitions in iter {
+        let keys: std::collections::HashSet<Vec<u8>> = partitions
+            .iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect();
+        result.retain(|p| keys.contains(p.key.key.as_bytes()));
+    }
+    result
+}
+
 fn term_to_index_key(
     term: &Term,
     column: &str,
@@ -15365,6 +15422,146 @@ mod tests {
                 assert_eq!(
                     count, 1,
                     "phonetic index lookup should match 'Jon Smyth' to 'John Smith', got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Phase 2 (per-type read dispatch): a phonetic `WHERE name = 'Jon'` without
+    /// a PK predicate must take the secondary-index path (`SingleIndex`), and the
+    /// index must point-look-up the phonetic sidecar/memtable by encoded code —
+    /// returning the row even after a flush, where the memtable index is empty.
+    /// This proves the index is consulted, not a full-scan + post-filter.
+    #[tokio::test]
+    async fn phonetic_select_takes_index_path_not_full_scan() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for cql in [
+            "CREATE KEYSPACE phon_idx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE phon_idx.people (id int PRIMARY KEY, name text)",
+            "CREATE INDEX phon_name ON phon_idx.people (name) USING 'phonetic'",
+            "INSERT INTO phon_idx.people (id, name) VALUES (1, 'John')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // EXPLAIN must show the planner chose the index path, not a FullScan.
+        let stmt =
+            crate::parser::parse("EXPLAIN SELECT id FROM phon_idx.people WHERE name = 'Jon'")
+                .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let haystack = String::from_utf8_lossy(&b);
+                assert!(
+                    haystack.contains("SingleIndex"),
+                    "phonetic query must plan SingleIndex, got: {haystack}"
+                );
+                assert!(
+                    !haystack.contains("FullScan"),
+                    "phonetic query must not plan FullScan, got: {haystack}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+
+        // Flush so the memtable index is empty: a correct answer here can only
+        // come from the phonetic sidecar via the index path (a full scan would
+        // be a fallback, but the planned path is SingleIndex per EXPLAIN above).
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("phon_idx", "people"))
+            .unwrap();
+
+        let stmt =
+            crate::parser::parse("SELECT id FROM phon_idx.people WHERE name = 'Jon'").unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index path must match 'Jon' to flushed 'John', got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Phase 2 (per-type read dispatch): a two-predicate `WHERE a = ? AND b = ?`
+    /// where both columns are independently indexed must plan `IndexIntersection`
+    /// and consult BOTH indexes, returning only rows present in both index
+    /// result sets. The discriminating fixture has rows matching only `a`, only
+    /// `b`, and both — a correct intersection returns exactly the both-match row.
+    #[tokio::test]
+    async fn index_intersection_consults_all_indexes() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for cql in [
+            "CREATE KEYSPACE isect WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE isect.people (id int PRIMARY KEY, city text, dept text)",
+            "CREATE INDEX isect_city ON isect.people (city)",
+            "CREATE INDEX isect_dept ON isect.people (dept)",
+            // row 1: matches both city='NYC' AND dept='eng' — the only answer.
+            "INSERT INTO isect.people (id, city, dept) VALUES (1, 'NYC', 'eng')",
+            // row 2: matches city only.
+            "INSERT INTO isect.people (id, city, dept) VALUES (2, 'NYC', 'sales')",
+            // row 3: matches dept only.
+            "INSERT INTO isect.people (id, city, dept) VALUES (3, 'LA', 'eng')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // EXPLAIN must show IndexIntersection over both indexes.
+        let stmt = crate::parser::parse(
+            "EXPLAIN SELECT id FROM isect.people WHERE city = 'NYC' AND dept = 'eng'",
+        )
+        .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let haystack = String::from_utf8_lossy(&b);
+                assert!(
+                    haystack.contains("IndexIntersection"),
+                    "two indexed Eq predicates must plan IndexIntersection, got: {haystack}"
+                );
+                assert!(
+                    haystack.contains("isect_city") && haystack.contains("isect_dept"),
+                    "IndexIntersection must reference both indexes, got: {haystack}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+
+        let stmt =
+            crate::parser::parse("SELECT id FROM isect.people WHERE city = 'NYC' AND dept = 'eng'")
+                .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "intersection of city='NYC' and dept='eng' must return exactly row 1, got {count}"
                 );
             }
             _ => panic!("expected Result"),

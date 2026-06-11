@@ -115,7 +115,7 @@ impl LocalBackend {
 /// `Phonetic` returns the metaphone code of the UTF-8 text; non-UTF-8 or
 /// empty-code values yield `None` (the row is skipped). `Vector`/`FullText`
 /// are flush-built and must never reach this path.
-fn encode_index_key(
+pub(crate) fn encode_index_key(
     index_type: IndexType,
     value: &[u8],
 ) -> std::result::Result<Option<ferrosa_index::IndexKey>, String> {

@@ -1073,13 +1073,31 @@ impl<F: FlushTarget> TableStore<F> {
             for (index_name, col_pos) in &self.indexed_columns {
                 if let Some(cell) = row.cells.iter().find(|(idx, _)| *idx as usize == *col_pos) {
                     if let Some(ref value) = cell.1.value {
-                        let index_key = IndexKey(value.clone());
-                        let row_pos = RowPosition {
-                            partition_key: key.key.as_bytes().to_vec(),
-                            clustering_key: row.clustering.clone(),
-                        };
-                        if let Some(idx) = guard.indexes.get(index_name) {
-                            idx.insert(index_key, row_pos);
+                        // Per-type key encoding: a phonetic index stores the
+                        // phonetic *code* (not the raw text) so it can be
+                        // point-looked-up by the query term's code at read time.
+                        // BTree/Hash/Composite use the raw bytes verbatim. A
+                        // value that encodes to nothing (e.g. non-UTF-8 text on a
+                        // phonetic index) yields no index entry.
+                        let index_type = self.index_type_for(index_name);
+                        match crate::index::scheduler::encode_index_key(index_type, value) {
+                            Ok(Some(index_key)) => {
+                                let row_pos = RowPosition {
+                                    partition_key: key.key.as_bytes().to_vec(),
+                                    clustering_key: row.clustering.clone(),
+                                };
+                                if let Some(idx) = guard.indexes.get(index_name) {
+                                    idx.insert(index_key, row_pos);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    index_name,
+                                    %e,
+                                    "store: skipping memtable index entry; key encoding failed"
+                                );
+                            }
                         }
                     }
                     // If value is None (tombstone), skip — no index entry for deletions
@@ -3763,6 +3781,26 @@ impl<F: FlushTarget> TableStore<F> {
     pub fn read_by_index(&self, index_name: &str, key: &IndexKey) -> Result<Vec<Partition>> {
         let guard = self.view.load();
 
+        // Per-type read dispatch: encode the raw query term into the index's
+        // native key space before probing. A phonetic index is keyed by the
+        // phonetic *code* of the term (both the memtable index and the flushed
+        // sidecar store codes), so a `WHERE name = 'Jon'` lookup must encode
+        // 'Jon' to its code and point-look-up that — not the raw bytes.
+        // BTree/Hash/Composite are identity-encoded. A term that encodes to
+        // nothing (e.g. empty/non-UTF-8 text on a phonetic index) cannot match
+        // any stored entry, so return no rows.
+        let index_type = self.index_type_for(index_name);
+        let lookup_key = match crate::index::scheduler::encode_index_key(index_type, &key.0) {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "secondary index '{index_name}' read key encoding failed: {e}"
+                )));
+            }
+        };
+        let key = &lookup_key;
+
         let mut positions: Vec<RowPosition> = Vec::new();
         let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
             if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
@@ -6386,6 +6424,124 @@ mod tests {
         let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
         assert!(pks.contains(&b"user1".as_slice()));
         assert!(pks.contains(&b"user2".as_slice()));
+    }
+
+    /// Phase 2 (per-type read dispatch): a phonetic index must point-lookup the
+    /// memtable index by the *phonetic code* of the query term, not the raw
+    /// bytes. Writing "John" and querying the phonetically-equivalent "Jon"
+    /// must return the row via the index path — no full scan, no post-filter.
+    #[test]
+    fn read_by_index_phonetic_memtable_matches_by_code() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+
+        let mut store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("name_idx".to_string(), 0_usize)],
+        );
+        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        // Query with the phonetically equivalent "Jon" — the index path must
+        // encode the term and find the row, even though the raw bytes differ.
+        let results = store
+            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phonetic index must match 'Jon' to stored 'John' via code lookup"
+        );
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
+    }
+
+    /// Phase 2: the same phonetic point-lookup must work through the sidecar
+    /// after a flush, since the flushed sidecar inherits the memtable's
+    /// phonetic-code keys.
+    #[test]
+    fn read_by_index_phonetic_sidecar_matches_by_code_after_flush() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+
+        let mut store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("name_idx".to_string(), 0_usize)],
+        );
+        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        let results = store
+            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phonetic sidecar must match 'Jon' to flushed 'John' via code lookup"
+        );
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
     }
 
     // -------------------------------------------------------------------------
