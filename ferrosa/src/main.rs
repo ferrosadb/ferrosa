@@ -835,6 +835,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 4b'. Re-register secondary indexes from the persisted
+    // `system_schema.indexes` table. `load_local_schema` (schema.json) restores
+    // table schemas with no indexes, so without this every secondary index is
+    // silently dropped on restart. This runs after system tables (step 3) and
+    // user tables (above) are registered so `add_index` can resolve targets.
+    match storage.reload_indexes_from_system_schema() {
+        Ok(count) if count > 0 => {
+            tracing::info!(
+                count,
+                "re-registered persisted secondary indexes after restart"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(%e, "failed to reload secondary indexes from system_schema"),
+    }
+
     if storage_auth_enabled {
         let loader =
             ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));

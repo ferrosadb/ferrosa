@@ -702,6 +702,37 @@ fn now_nanos_since_reference() -> i64 {
     reference_instant().elapsed().as_nanos() as i64
 }
 
+/// Decode a `system_schema.indexes` composite clustering key into
+/// `(table_name, index_name)`.
+///
+/// Inverse of the `[u16 len][table_name][u16 len][index_name]` encoding in
+/// `ferrosa_schema::system::persistence::index_to_rows`. Returns `None` when
+/// the bytes are truncated or the lengths overrun the buffer.
+fn decode_index_clustering(clustering: &[u8]) -> Option<(String, String)> {
+    fn take_len_prefixed(buf: &[u8], pos: &mut usize) -> Option<String> {
+        let len_end = pos.checked_add(2)?;
+        let len = u16::from_be_bytes(buf.get(*pos..len_end)?.try_into().ok()?) as usize;
+        let str_end = len_end.checked_add(len)?;
+        let bytes = buf.get(len_end..str_end)?;
+        *pos = str_end;
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    let mut pos = 0usize;
+    let table = take_len_prefixed(clustering, &mut pos)?;
+    let index_name = take_len_prefixed(clustering, &mut pos)?;
+    Some((table, index_name))
+}
+
+/// Read a UTF-8 cell value at `col_index` from a row, if present and live.
+fn cell_text(row: &Row, col_index: u16) -> Option<String> {
+    row.cells
+        .iter()
+        .find(|(idx, _)| *idx == col_index)
+        .and_then(|(_, cell)| cell.value.as_deref())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
 type SSTableSidecarMap = Arc<HashMap<String, crate::index::sidecar::SidecarReader>>;
 
@@ -2472,6 +2503,148 @@ impl StorageEngine {
                 tracing::warn!("failed to re-register table from schema.json: {e}");
             }
         }
+    }
+
+    /// Rebuilds live secondary indexes from the persisted `system_schema.indexes`
+    /// table after a restart.
+    ///
+    /// `load_local_schema_if_present` re-registers user tables with no indexes
+    /// (`register_table_inner(.., vec![])`), so a restart used to silently drop
+    /// every secondary index. This reads the dogfooded `system_schema.indexes`
+    /// rows and re-registers each index on its (already-registered) user table
+    /// via [`Self::add_index`], preserving the persisted [`IndexType`] so the
+    /// memtable-index + backfill pipeline rebuilds the correct index kind.
+    ///
+    /// Must run *after* `system_schema.indexes` and the user tables are
+    /// registered (boot order: `register_system_tables` → local schema restore →
+    /// this). Returns the number of indexes re-registered. Rows that can't be
+    /// resolved (unknown kind, missing target column, unregistered table) are
+    /// logged and skipped rather than aborting the whole reload.
+    pub fn reload_indexes_from_system_schema(&self) -> ferrosa_common::Result<usize> {
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        if !self.tables.read().contains_key(&indexes_tid) {
+            // Table not registered (no dogfooded schema yet) — nothing to do.
+            return Ok(0);
+        }
+
+        // Full scan of system_schema.indexes. This table holds one row per
+        // index cluster-wide; it is tiny. Bound the scan at the engine's
+        // range-read materialization cap and warn loudly if we hit it, so a
+        // truncated reload is visible rather than silently dropping indexes.
+        const MAX_INDEXES_TO_RELOAD: usize = 10_000;
+        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_RELOAD)?;
+
+        let mut restored = 0usize;
+        let mut rows_seen = 0usize;
+        for partition in &partitions {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
+            for row in &partition.rows {
+                rows_seen += 1;
+                if self.reload_one_index(&keyspace, row)? {
+                    restored += 1;
+                }
+            }
+        }
+        if rows_seen >= MAX_INDEXES_TO_RELOAD {
+            tracing::warn!(
+                rows_seen,
+                cap = MAX_INDEXES_TO_RELOAD,
+                "system_schema.indexes reload hit the read cap — some indexes may not have been restored"
+            );
+        }
+        Ok(restored)
+    }
+
+    /// Re-registers a single index from a decoded `system_schema.indexes` row.
+    ///
+    /// Returns `Ok(true)` when the index was re-registered, `Ok(false)` when the
+    /// row was skipped (tombstone, unknown kind, unresolvable column/table).
+    fn reload_one_index(&self, keyspace: &str, row: &Row) -> ferrosa_common::Result<bool> {
+        let Some((table, index_name)) = decode_index_clustering(&row.clustering) else {
+            tracing::warn!(
+                keyspace,
+                "system_schema.indexes row has malformed clustering — skipping"
+            );
+            return Ok(false);
+        };
+
+        let kind = cell_text(row, ferrosa_schema::system::persistence::INDEXES_COL_KIND);
+        let target = cell_text(row, ferrosa_schema::system::persistence::INDEXES_COL_TARGET);
+        let (Some(kind), Some(target)) = (kind, target) else {
+            tracing::warn!(
+                keyspace,
+                table,
+                index_name,
+                "system_schema.indexes row missing kind/target cell — skipping"
+            );
+            return Ok(false);
+        };
+
+        let Some(index_type) = ferrosa_schema::system::persistence::index_type_from_kind(&kind)
+        else {
+            tracing::warn!(
+                keyspace,
+                table,
+                index_name,
+                kind,
+                "system_schema.indexes row has unknown index kind — skipping"
+            );
+            return Ok(false);
+        };
+
+        // Generic add_index covers BTree/Hash/Composite/Phonetic/Filtered.
+        // FullText and Vector use dedicated sidecar build paths and are
+        // reconstructed elsewhere; skip them loudly here so the gap is visible.
+        if matches!(
+            index_type,
+            ferrosa_index::IndexType::FullText | ferrosa_index::IndexType::Vector
+        ) {
+            tracing::warn!(
+                keyspace,
+                table,
+                index_name,
+                kind,
+                "skipping reload of fulltext/vector index — needs dedicated rebuild path"
+            );
+            return Ok(false);
+        }
+
+        let table_id = TableId::new(keyspace, &table);
+        // `target` may be a "col_a, col_b" join; the first column drives the
+        // ordinal (generic single-column indexes target one column).
+        let target_col = target.split(", ").next().unwrap_or(&target);
+        let Some(column_position) = self.regular_column_position(&table_id, target_col) else {
+            tracing::warn!(
+                keyspace,
+                table,
+                index_name,
+                target_col,
+                "cannot resolve index target column to a position — table unregistered or column missing"
+            );
+            return Ok(false);
+        };
+
+        self.add_index(&table_id, &index_name, column_position, index_type)?;
+        tracing::info!(
+            keyspace,
+            table,
+            index_name,
+            kind,
+            "re-registered persisted index after restart"
+        );
+        Ok(true)
+    }
+
+    /// Position of `column_name` within a registered table's regular columns,
+    /// matching the ordinal convention used by the CREATE INDEX wire path.
+    fn regular_column_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id)?;
+        state
+            .schema
+            .regular_columns
+            .iter()
+            .position(|c| c.name == column_name)
     }
 
     /// Registers a secondary index on a table.
@@ -5401,6 +5574,27 @@ impl StorageEngine {
     #[cfg(test)]
     pub(crate) fn deferred_replay_mutation_count_for_test(&self) -> usize {
         self.deferred_replay_mutations.lock().len()
+    }
+
+    /// Whether `index_name` is registered on `table_id`'s store, and its type.
+    #[cfg(test)]
+    pub(crate) fn index_type_for_test(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> Option<ferrosa_index::IndexType> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id)?;
+        if state
+            .store
+            .indexed_columns()
+            .iter()
+            .any(|(n, _)| n == index_name)
+        {
+            Some(state.store.index_type_for(index_name))
+        } else {
+            None
+        }
     }
 
     /// Flushes tables that exceed the size threshold, have unflushed data older
@@ -15157,6 +15351,79 @@ mod tests {
             0,
             "schema-backed open should not start with deferred replay mutations"
         );
+    }
+
+    /// Headline reload-survival test: a non-BTree (Phonetic) index created and
+    /// persisted to `system_schema.indexes`, flushed, then recovered after the
+    /// engine is dropped and reopened from the same data dir. After reopen,
+    /// `reload_indexes_from_system_schema` must re-register the index on the
+    /// user table AND restore its real type — not the BTree default that the
+    /// old `register_table_inner(.., vec![])` gap produced.
+    #[test]
+    fn reopen_reregisters_persisted_index_with_real_type() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let user_tid = TableId::new("test_ks", "test_table");
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        let idx_meta = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            name: "idx_val_phonetic".to_string(),
+            index_type: IndexType::Phonetic,
+            target_columns: vec!["val".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+
+            // Persist the index row exactly as the DDL write path does.
+            let row = persistence::index_to_rows(&idx_meta);
+            engine
+                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+
+            engine.flush(&user_tid).unwrap();
+            engine.flush(&indexes_tid).unwrap();
+        }
+
+        // Reopen: replicate the boot sequence — system tables registered, user
+        // schema reloaded from schema.json, then index reconstruction.
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+
+        // Sanity: the index is NOT registered yet (the gap this fix closes).
+        assert_eq!(
+            engine.index_type_for_test(&user_tid, "idx_val_phonetic"),
+            None,
+            "index must be absent before reconstruction — proves the test exercises the fix"
+        );
+
+        let restored = engine.reload_indexes_from_system_schema().unwrap();
+        assert_eq!(
+            restored, 1,
+            "exactly one persisted index should be restored"
+        );
+
+        assert_eq!(
+            engine.index_type_for_test(&user_tid, "idx_val_phonetic"),
+            Some(IndexType::Phonetic),
+            "index must survive restart AND keep its real Phonetic type, not the BTree default"
+        );
+    }
+
+    fn now_micros_for_test() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
     }
 
     #[test]

@@ -373,6 +373,26 @@ pub fn index_type_kind(index_type: &ferrosa_index::IndexType) -> &'static str {
     }
 }
 
+/// Map a persisted `kind` string back to its `IndexType`.
+///
+/// Inverse of [`index_type_kind`]. Returns `None` for an unrecognized kind
+/// rather than silently defaulting, so startup reconstruction can surface a
+/// corrupt `system_schema.indexes` row instead of registering a wrong type.
+pub fn index_type_from_kind(kind: &str) -> Option<ferrosa_index::IndexType> {
+    use ferrosa_index::IndexType;
+    let ty = match kind {
+        "btree" => IndexType::BTree,
+        "hash" => IndexType::Hash,
+        "composite" => IndexType::Composite,
+        "phonetic" => IndexType::Phonetic,
+        "filtered" => IndexType::Filtered,
+        "vector" => IndexType::Vector,
+        "fulltext" => IndexType::FullText,
+        _ => return None,
+    };
+    Some(ty)
+}
+
 /// Convert an `IndexMetadata` into a storage row for `system_schema.indexes`.
 ///
 /// Partition key = `keyspace_name`; composite clustering =
@@ -1034,6 +1054,28 @@ mod tests {
         assert_eq!(schema.regular_columns[0].name, "kind");
         assert_eq!(schema.regular_columns[1].name, "target");
         assert_eq!(schema.regular_columns[2].name, "options");
+    }
+
+    #[test]
+    fn index_type_kind_round_trips_through_from_kind() {
+        use ferrosa_index::IndexType;
+        for ty in [
+            IndexType::BTree,
+            IndexType::Hash,
+            IndexType::Composite,
+            IndexType::Phonetic,
+            IndexType::Filtered,
+            IndexType::Vector,
+            IndexType::FullText,
+        ] {
+            let kind = index_type_kind(&ty);
+            assert_eq!(
+                index_type_from_kind(kind),
+                Some(ty),
+                "kind {kind} must round-trip back to its IndexType"
+            );
+        }
+        assert_eq!(index_type_from_kind("nonsense"), None);
     }
 
     #[test]
