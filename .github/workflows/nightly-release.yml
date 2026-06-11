@@ -1,8 +1,23 @@
-name: Nightly Release
+name: Release (on-merge + nightly)
 
 on:
+  # Release-on-merge: every push to `main` (i.e. a merged PR) cuts the next
+  # SemVer release derived from Conventional Commit history. The `should_release`
+  # guard below skips when nothing releasable landed since the latest tag, so a
+  # doc/CI-only change does not necessarily cut a build. Doc/spec-only pushes are
+  # excluded outright via paths-ignore to avoid a full multi-platform build for
+  # prose-only changes.
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'specs/**'
+      - 'docs/**'
+      - '.github/**'
   schedule:
-    # Run once per night in UTC. The workflow skips itself when no commits have
+    # Safety-net nightly in UTC (catches anything the push path missed, e.g. a
+    # release run that failed transiently). Skips itself when no commits have
     # landed since the latest stable vX.Y.Z tag. Releases are cut as tags only:
     # the version bump commit is captured by the tag and never pushed to the
     # `main` branch (its ruleset requires pull requests). `release.yml` builds
@@ -86,7 +101,9 @@ jobs:
           # rejected (GH013). The tag is the release artifact source; main's
           # Cargo.toml version is decorative between releases.
           git commit -m "chore(release): ${NEXT_TAG}"
-          git tag -a "${NEXT_TAG}" -m "${NEXT_TAG} nightly release" -m "${BUMP} bump from ${BASE_TAG} after ${COMMIT_COUNT} commits."
+          git tag -a "${NEXT_TAG}" \
+            -m "${NEXT_TAG} (${GITHUB_EVENT_NAME} release)" \
+            -m "${BUMP} bump from ${BASE_TAG} after ${COMMIT_COUNT} commits."
           # Push the tag only (the branch ruleset does not cover refs/tags/*).
           git push origin "${NEXT_TAG}"
 
@@ -96,6 +113,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEXT_TAG: ${{ steps.next.outputs.next_tag }}
         # Explicit dispatch is required: tags pushed with GITHUB_TOKEN do NOT
-        # trigger release.yml's `on: push` (GitHub's recursion guard). The
-        # nightly is the prerelease/"nightly" channel.
+        # trigger release.yml's `on: push` (GitHub's recursion guard). Every
+        # auto-cut release — whether from a merge, the nightly cron, or a manual
+        # dispatch — is a prerelease (the "nightly" channel); a maintainer
+        # promotes it to stable via promote-release.yml.
         run: gh workflow run release.yml --ref "${NEXT_TAG}" -f prerelease=true

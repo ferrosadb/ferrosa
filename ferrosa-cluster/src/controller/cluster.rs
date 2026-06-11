@@ -2460,7 +2460,35 @@ impl RpcHandler for ClusterInviteHandler {
         let mut connect_tasks = tokio::task::JoinSet::new();
         let raft_rt_for_connect = self.peer_manager.raft_runtime();
         let data_rt_for_connect = self.peer_manager.data_runtime();
+        // Resolve the controller once for the per-peer connect cooldown below.
+        // A live upgrade is the normal case; if it fails the node is shutting
+        // down (no further invite rounds, so no storm to guard against).
+        let connect_cooldown_ctrl = self.controller.upgrade();
         for (peer_id, reverse_addr) in &new_peers {
+            // Rate-limit connect attempts per discovered peer. A peer that can
+            // never be reached (stale host_id, dead listener) would otherwise
+            // be re-dialed on every invite round, and the re-broadcast below
+            // keeps the rounds coming — a self-amplifying connection storm that
+            // exhausts the local ephemeral port range and wedges all outbound
+            // networking. The cooldown caps it to one attempt per peer per
+            // CLUSTER_RECONNECT_INVITE_COOLDOWN, mirroring invite delivery.
+            if let Some(ctrl) = connect_cooldown_ctrl.as_ref() {
+                let mut recent = ctrl.recent_invite_connects.lock();
+                if !super::invite::reserve_reconnect_invite(
+                    &mut recent,
+                    *peer_id,
+                    std::time::Instant::now(),
+                    super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
+                    super::MAX_CONNECTED_PEERS,
+                ) {
+                    tracing::debug!(
+                        peer = %peer_id,
+                        "cluster invite: connect to discovered peer suppressed by cooldown"
+                    );
+                    continue;
+                }
+            }
+
             let pm = self.peer_manager.clone();
             let cfg = self.net_config.clone();
             let local_id = self.local_host_id;

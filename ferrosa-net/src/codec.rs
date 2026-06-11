@@ -179,6 +179,31 @@ impl MsgType {
                 | Self::RaftInstallSnapshot
         )
     }
+
+    /// Returns true for the streaming range-read RESPONSE frames that
+    /// belong to a single ordered, per-`request_id` stream: chunk,
+    /// heartbeat, and done.
+    ///
+    /// These frames MUST be dispatched in wire order. The coordinator's
+    /// `StreamFrameRouter` enforces a strict, contiguous chunk `seq` and
+    /// closes the route on the first gap; dispatching one task per frame
+    /// lets chunk `seq=N+1` overtake `seq=N` under tokio scheduling and
+    /// trips that check mid-stream, surfacing as
+    /// `ChannelClosedBeforeDone`. The fault stays invisible until a
+    /// single response carries more than one chunk — which is exactly
+    /// what intra-partition row fragmentation (bounded full-scan memory)
+    /// introduced for wide partitions.
+    ///
+    /// The producer-side `RangeReadStreamRequest` is deliberately
+    /// excluded: it runs a long storage read and must stay off the
+    /// frame-reader path. `RangeReadStreamCancel` is likewise excluded —
+    /// it is not part of the ordered response stream.
+    pub fn is_ordered_stream_response(self) -> bool {
+        matches!(
+            self,
+            Self::RangeReadStreamChunk | Self::RangeReadStreamHeartbeat | Self::RangeReadStreamDone
+        )
+    }
 }
 
 impl TryFrom<u8> for MsgType {

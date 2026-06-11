@@ -5,10 +5,16 @@ consumes them.
 
 ## TL;DR
 
-- **Versioning is automatic.** The nightly job derives the next SemVer from
+- **Versioning is automatic.** The release job derives the next SemVer from
   Conventional Commit history. **Do not hand-edit `[workspace.package] version`
   in `Cargo.toml` in a PR** — it is owned by the release automation and is
   overwritten.
+- **Releases cut on merge.** Every push to `main` (a merged PR) that carries a
+  releasable commit cuts the next release automatically. A **nightly cron** runs
+  as a safety-net for anything the merge path missed. Both paths share one
+  workflow (`nightly-release.yml`) and the same tag-only mechanics. Doc/spec-only
+  merges are excluded (`paths-ignore`) so prose changes don't trigger a full
+  multi-platform build.
 - **Two channels:**
   - **nightly** — every automatically cut `vX.Y.Z` release. Marked as a GitHub
     *prerelease*.
@@ -37,8 +43,9 @@ and push only the tag.
 ## Pipeline
 
 ```
-nightly-release.yml  (cron 08:17 UTC, or manual)
+nightly-release.yml  (on: push→main [merge], cron 08:17 UTC, or manual)
   └─ next-release-version.sh        # SemVer from Conventional Commits since last vX.Y.Z tag
+  └─ should_release? (commits since last tag) — else skip
   └─ bump Cargo.toml + commit (local only)
   └─ git tag vX.Y.Z  →  git push origin vX.Y.Z      # tag only, never main
   └─ gh workflow run release.yml -f prerelease=true # explicit: GITHUB_TOKEN tag
