@@ -27,7 +27,7 @@ pub mod hash;
 pub mod phonetic;
 pub mod vector;
 
-pub use filtered::evaluate_predicate;
+pub use filtered::{evaluate_predicate, query_constraint_implies_predicate};
 pub use phonetic::PhoneticAlgorithm;
 
 use ferrosa_common::CellValue;
