@@ -9,6 +9,10 @@ use parking_lot::RwLock;
 use ferrosa_index::vector::{distance, IndexResult, RowPosition};
 use ferrosa_index::DistanceMetric;
 
+/// An ANN result paired with the partition-key scope captured at insert time
+/// (`None` when the entry was inserted without a scope).
+pub type ScopedIndexResult = (IndexResult, Option<Vec<u8>>);
+
 /// Mutable in-memory vector index backed by a brute-force linear scan.
 ///
 /// Thread safety: `RwLock` -- writers take exclusive lock for insert,
@@ -140,6 +144,46 @@ impl VectorMemtableIndex {
         Ok(scored
             .into_iter()
             .map(|(score, position)| IndexResult { position, score })
+            .collect())
+    }
+
+    /// Search for the `k` nearest vectors to `query`, returning each result
+    /// paired with the partition-key scope captured at insert time.
+    ///
+    /// The scope is the serialized partition key bytes recorded via
+    /// [`insert_with_scope`]. It is `None` for entries inserted without a scope.
+    /// The router-level index-consult path uses the scope to recover the base
+    /// table row, since the vector `RowPosition::offset` is only a sequential
+    /// placeholder in the memtable and cannot address a row on its own.
+    ///
+    /// `ef_search` is accepted for API compatibility but ignored in this
+    /// brute-force implementation.
+    pub fn search_with_scopes(
+        &self,
+        query: &[f32],
+        k: usize,
+        _ef_search: usize,
+    ) -> Result<Vec<ScopedIndexResult>, ferrosa_index::IndexError> {
+        let inner = self.inner.read();
+
+        if inner.vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut scored: Vec<(f32, RowPosition, Option<Vec<u8>>)> = inner
+            .vectors
+            .iter()
+            .zip(inner.positions.iter())
+            .zip(inner.scopes.iter())
+            .map(|((vec, pos), scope)| (distance(&self.metric, query, vec), *pos, scope.clone()))
+            .collect();
+
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+
+        Ok(scored
+            .into_iter()
+            .map(|(score, position, scope)| (IndexResult { position, score }, scope))
             .collect())
     }
 
@@ -314,6 +358,60 @@ mod tests {
         }
         let results = index.search(&[0.0, 0.0], 3, 50).unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_with_scopes_returns_partition_scope_in_distance_order() {
+        let index = VectorMemtableIndex::new(DistanceMetric::L2, 16, 200);
+        index.insert_with_scope(
+            RowPosition::new(0),
+            vec![10.0, 0.0],
+            Some(b"pk_far".to_vec()),
+        );
+        index.insert_with_scope(
+            RowPosition::new(1),
+            vec![1.0, 0.0],
+            Some(b"pk_near".to_vec()),
+        );
+        index.insert_with_scope(
+            RowPosition::new(2),
+            vec![5.0, 0.0],
+            Some(b"pk_mid".to_vec()),
+        );
+
+        let results = index.search_with_scopes(&[0.0, 0.0], 3, 50).unwrap();
+        assert_eq!(results.len(), 3);
+        // Nearest first: pk_near, pk_mid, pk_far.
+        assert_eq!(results[0].1.as_deref(), Some(b"pk_near".as_ref()));
+        assert_eq!(results[1].1.as_deref(), Some(b"pk_mid".as_ref()));
+        assert_eq!(results[2].1.as_deref(), Some(b"pk_far".as_ref()));
+        // Scores are non-decreasing.
+        for w in results.windows(2) {
+            assert!(w[0].0.score <= w[1].0.score);
+        }
+    }
+
+    #[test]
+    fn search_with_scopes_truncates_to_k() {
+        let index = VectorMemtableIndex::new(DistanceMetric::L2, 16, 200);
+        for i in 0..10u64 {
+            index.insert_with_scope(
+                RowPosition::new(i),
+                vec![i as f32, 0.0],
+                Some(format!("pk{i}").into_bytes()),
+            );
+        }
+        let results = index.search_with_scopes(&[0.0, 0.0], 3, 50).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_with_scopes_carries_none_for_unscoped_inserts() {
+        let index = VectorMemtableIndex::new(DistanceMetric::L2, 16, 200);
+        index.insert(RowPosition::new(0), vec![1.0, 0.0]);
+        let results = index.search_with_scopes(&[1.0, 0.0], 1, 50).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, None);
     }
 
     #[test]
