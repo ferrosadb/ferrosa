@@ -63,6 +63,10 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         memtable_num_shards: 64,
     };
     let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+    // Match the real boot sequence (engine startup registers system_schema.* /
+    // system_auth.* before serving DDL), so DDL that dogfoods system tables
+    // (e.g. CREATE TYPE → system_schema.types) has its target table registered.
+    engine.register_system_tables().unwrap();
     let schema = Arc::new(
         Schema::new(SchemaConfig {
             hasher: PasswordHasher::Bcrypt { cost: 4 },

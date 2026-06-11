@@ -11,7 +11,6 @@ pub mod observability;
 pub mod peers;
 pub mod persistence;
 pub mod schema_tables;
-pub mod type_tables;
 
 /// Cassandra-compatible release version reported by `system.local` and
 /// `system.peers`. This must be consistent across all code paths.
@@ -29,4 +28,3 @@ pub use auth_tables::{RoleMemberRow, RolePermissionRow, RoleRow};
 pub use function_tables::SystemSchemaFunctionsTable;
 pub use persistence::all_system_table_schemas;
 pub use schema_tables::{ColumnRow, KeyspaceRow, TableRow};
-pub use type_tables::SystemSchemaTypesTable;

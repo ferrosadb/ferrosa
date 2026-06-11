@@ -2059,12 +2059,15 @@ async fn route_select(
             ))
         }
         ("system_schema", "types") => {
-            // p1-37: field_names/field_types MUST be `frozen<list<text>>`
-            // per Cassandra. scylla 0.15's metadata fetch type-checks
-            // these columns and refuses to cache the schema if they're
-            // declared as `text` — which then blocks every DDL through
-            // the driver.
-            let snap = state.schema.snapshot();
+            // Dogfooding: serve from the persisted `system_schema.types` storage
+            // table (not the in-memory Registry or the retired virtual table).
+            // The Registry remains the live in-memory cache, rebuilt from these
+            // same rows at boot via `replay_types_into_schema`.
+            //
+            // p1-37: field_names/field_types MUST be `frozen<list<text>>` per
+            // Cassandra. scylla 0.15's metadata fetch type-checks these columns
+            // and refuses to cache the schema if they're declared as `text` —
+            // which then blocks every DDL through the driver.
             let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
                 "type_name".into(),
@@ -2077,9 +2080,12 @@ async fn route_select(
                 CqlType::List(Box::new(CqlType::Varchar)),
                 CqlType::List(Box::new(CqlType::Varchar)),
             ];
-            let rows: Vec<Vec<Option<CqlValue>>> = snap
-                .types
-                .values()
+            let stored = state
+                .engine
+                .read_persisted_types()
+                .map_err(|e| CqlError::ServerError(format!("read system_schema.types: {e}")))?;
+            let rows: Vec<Vec<Option<CqlValue>>> = stored
+                .into_iter()
                 .map(|udt| {
                     let field_names: Vec<CqlValue> = udt
                         .fields
@@ -2092,8 +2098,8 @@ async fn route_select(
                         .map(|(_, t)| CqlValue::Text(bridge::cql_type_display_name(t).to_string()))
                         .collect();
                     vec![
-                        Some(CqlValue::Text(udt.keyspace.clone())),
-                        Some(CqlValue::Text(udt.name.clone())),
+                        Some(CqlValue::Text(udt.keyspace_name.clone())),
+                        Some(CqlValue::Text(udt.type_name.clone())),
                         Some(CqlValue::List(field_names)),
                         Some(CqlValue::List(field_types)),
                     ]
@@ -9374,6 +9380,24 @@ async fn route_alter_type(
         }
     }
 
+    // Re-persist the altered UDT to the dogfooded `system_schema.types` table so
+    // the storage-served read path reflects the change after restart. ALTER TYPE
+    // mutates the Registry in place (not via the DDL `SystemTableWriter`), so we
+    // upsert the row here — same PK (keyspace) + clustering (type_name) as the
+    // CREATE path, overwriting the previous field list.
+    if let Some(updated) = state.schema.get_type(&ks, &name) {
+        let row = ferrosa_schema::system::persistence::type_to_row(&updated);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let tid = TableId::new("system_schema", "types");
+        state
+            .engine
+            .write(&tid, &row.key, row.row, ts)
+            .map_err(|e| CqlError::ServerError(format!("persist altered type: {e}")))?;
+    }
+
     Ok(result::encode_schema_change(
         "UPDATED",
         "TYPE",
@@ -11876,6 +11900,100 @@ mod tests {
         );
     }
 
+    /// Dogfooding parity: `CREATE TYPE` persists a `system_schema.types` row
+    /// and `SELECT * FROM system_schema.types` is served from that stored row
+    /// (not the in-memory Registry or the retired virtual table).
+    #[tokio::test]
+    async fn select_system_schema_types_reads_from_storage() {
+        let (state, _dir) = setup();
+        // Boot order parity: system_schema.* tables registered before any DDL.
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE systypes WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TYPE systypes.address (street text, zip int)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT * — the row must come from the stored table.
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.types").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "CREATE TYPE must persist exactly one system_schema.types row"
+        );
+    }
+
+    /// Proves the `system_schema.types` read path is backed by *storage*, not
+    /// the in-memory Registry: a row written directly to the stored table (with
+    /// no corresponding Registry entry) is still returned by the SELECT, and a
+    /// DROP-TYPE tombstone removes it.
+    #[tokio::test]
+    async fn system_schema_types_served_from_storage_not_registry() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Write a system_schema.types row straight to storage, bypassing the
+        // Registry entirely.
+        let udt = ferrosa_schema::UserTypeMetadata {
+            keyspace: "ghost_ks".to_string(),
+            name: "ghost_type".to_string(),
+            fields: vec![("f".to_string(), CqlType::Int)],
+        };
+        let row = ferrosa_schema::system::persistence::type_to_row(&udt);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let tid = TableId::new("system_schema", "types");
+        state.engine.write(&tid, &row.key, row.row, ts).unwrap();
+
+        // The Registry has no such type, yet the SELECT returns it.
+        assert!(
+            !state
+                .schema
+                .snapshot()
+                .types
+                .contains_key(&("ghost_ks".into(), "ghost_type".into())),
+            "precondition: Registry must NOT contain the ghost type"
+        );
+
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.types").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "row written only to storage must be returned by the SELECT"
+        );
+    }
+
     /// Regression: PR#21 (Gap 7) hardcoded the 10-col Cassandra-5.0 shape
     /// for system_schema.views to satisfy the DataStax driver's `ViewParser`
     /// boolean lookups.  The scylla 0.15 driver issues
@@ -12465,6 +12583,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_type_stores_in_schema() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -12507,6 +12626,7 @@ mod tests {
     #[tokio::test]
     async fn route_drop_type() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -12547,6 +12667,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_type_if_not_exists() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -12605,6 +12726,7 @@ mod tests {
     #[tokio::test]
     async fn route_alter_type_add_field() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -12637,6 +12759,7 @@ mod tests {
     #[tokio::test]
     async fn route_alter_type_rename_field() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -12669,6 +12792,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_type_uses_session_keyspace() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ks = Some("ks".to_string());
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -12716,6 +12840,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_type_duplicate_without_if_not_exists() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -13454,6 +13579,7 @@ mod tests {
     #[tokio::test]
     async fn create_type_udt() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -13868,6 +13994,7 @@ mod tests {
     #[tokio::test]
     async fn create_table_with_frozen_udt_collection() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,

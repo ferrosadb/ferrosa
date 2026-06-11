@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::system::persistence::{
-    grant_to_row, index_to_rows, keyspace_to_row, role_to_row, table_to_rows, SystemTableMutation,
+    grant_to_row, index_to_rows, keyspace_to_row, role_to_row, table_to_rows, type_to_row,
+    SystemTableMutation,
 };
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::engine::StorageEngine;
@@ -178,6 +179,25 @@ impl SystemTableWriter {
                 let tid = TableId::new("system_schema", "indexes");
                 let row = Row {
                     clustering,
+                    cells: vec![],
+                    deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
+                    primary_key_liveness: LivenessInfo::NONE,
+                };
+                self.engine.write(&tid, &key, row, ts)?;
+            }
+            SystemTableMutation::TypeCreated(udt) => {
+                let row = type_to_row(&udt);
+                let ts = now_micros();
+                let tid = TableId::new("system_schema", "types");
+                self.engine.write(&tid, &row.key, row.row, ts)?;
+            }
+            SystemTableMutation::TypeDropped { keyspace, name } => {
+                let ts = now_micros();
+                let key = DecoratedKey::new(PartitionKey::new(keyspace.as_bytes().to_vec()));
+                let tid = TableId::new("system_schema", "types");
+                // Clustering = type_name (single text column).
+                let row = Row {
+                    clustering: name.as_bytes().to_vec(),
                     cells: vec![],
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
