@@ -282,6 +282,72 @@ impl Limit {
     }
 }
 
+/// `ORDER BY col GEO_NEAREST OF (lat, lon)` — k-nearest-neighbour geospatial
+/// ordering. The companion `LIMIT k` bounds the result to the k nearest points.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoNearest {
+    /// The geo-indexed column being ordered by proximity.
+    pub column: String,
+    /// The query point's latitude.
+    pub lat: f64,
+    /// The query point's longitude.
+    pub lon: f64,
+}
+
+/// A geospatial function predicate in a `WHERE` clause, evaluated against a
+/// geo-indexed column. Coordinates are `(lat, lon)` in degrees; radius is in
+/// metres. These mirror the vector `ANN OF` path: the planner detects the
+/// predicate, asks the geo index for candidate cell ranges, then refines with
+/// exact distance / containment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeoPredicate {
+    /// `GEO_WITHIN_RADIUS(col, (lat, lon), radius_m)` — points within
+    /// `radius_m` metres of `(lat, lon)`.
+    WithinRadius {
+        /// The geo-indexed column.
+        column: String,
+        /// Centre latitude.
+        lat: f64,
+        /// Centre longitude.
+        lon: f64,
+        /// Radius in metres.
+        radius_m: f64,
+    },
+    /// `GEO_WITHIN_BBOX(col, (sw_lat, sw_lon), (ne_lat, ne_lon))` — points
+    /// inside the axis-aligned box. When `sw_lon > ne_lon` the box crosses the
+    /// antimeridian and is treated as the union of the two longitude spans.
+    WithinBbox {
+        /// The geo-indexed column.
+        column: String,
+        /// South-west corner `(lat, lon)`.
+        sw: (f64, f64),
+        /// North-east corner `(lat, lon)`.
+        ne: (f64, f64),
+    },
+    /// `ST_WITHIN(col, ((lat1, lon1), (lat2, lon2), ...))` — points inside the
+    /// query polygon defined by its outer-ring `vertices` in `(lat, lon)`
+    /// order. The ring is implicitly closed. The planner covers the polygon's
+    /// bounding box with cell ranges, then refines candidates with an exact
+    /// point-in-polygon test.
+    WithinPolygon {
+        /// The geo-indexed column.
+        column: String,
+        /// Outer-ring vertices in `(lat, lon)` order.
+        vertices: Vec<(f64, f64)>,
+    },
+}
+
+impl GeoPredicate {
+    /// The geo-indexed column this predicate targets.
+    pub fn column(&self) -> &str {
+        match self {
+            GeoPredicate::WithinRadius { column, .. } => column,
+            GeoPredicate::WithinBbox { column, .. } => column,
+            GeoPredicate::WithinPolygon { column, .. } => column,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     pub keyspace: Option<String>,
@@ -295,6 +361,12 @@ pub struct SelectStatement {
     /// ANN (Approximate Nearest Neighbor) ordering: `ORDER BY col ANN OF <term>`.
     /// Stores the column name and the vector term for similarity search.
     pub ann_of: Option<(String, Term)>,
+    /// `ORDER BY col GEO_NEAREST OF (lat, lon)` — geospatial k-NN ordering.
+    pub geo_nearest: Option<GeoNearest>,
+    /// `GEO_WITHIN_RADIUS` / `GEO_WITHIN_BBOX` predicates extracted from the
+    /// WHERE clause (kept separate from `where_clauses` because they are
+    /// function predicates over a geo index, not scalar column comparisons).
+    pub geo_predicates: Vec<GeoPredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -636,6 +708,8 @@ mod tests {
             limit: None,
             allow_filtering: false,
             ann_of: None,
+            geo_nearest: None,
+            geo_predicates: vec![],
         });
         let stmt = Statement::Subscribe {
             inner: Box::new(inner),

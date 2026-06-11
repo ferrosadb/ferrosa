@@ -16,6 +16,10 @@ use tabled::settings::Style;
 use ferrosa_cql::client::{CqlClient, QueryResult};
 use ferrosa_cql::error::CqlError;
 
+/// Offline SSTable analysis & recovery (`ferrosa-ctl sstable ...`). Operates on
+/// an on-disk table directory with no network connection.
+pub mod sstable;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Render a `QueryResult` as a plain table and print it to stdout.

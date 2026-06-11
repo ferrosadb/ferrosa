@@ -18,9 +18,18 @@ use crate::lexer::{Keyword, Lexer, TokenKind};
 /// Security mitigation M2.
 const MAX_NESTING_DEPTH: usize = 32;
 
-/// Return type for ORDER BY parsing: standard ordering clauses plus an
-/// optional ANN OF (Approximate Nearest Neighbor) clause.
-type OrderByResult = (Vec<(String, OrderDirection)>, Option<(String, Term)>);
+/// Return type for ORDER BY parsing: standard ordering clauses, an optional
+/// ANN OF (Approximate Nearest Neighbor) clause, and an optional GEO_NEAREST OF
+/// (geospatial k-NN) clause.
+type OrderByResult = (
+    Vec<(String, OrderDirection)>,
+    Option<(String, Term)>,
+    Option<GeoNearest>,
+);
+
+/// Return type for WHERE parsing: scalar comparison clauses plus any
+/// geospatial function predicates (`GEO_WITHIN_RADIUS` / `GEO_WITHIN_BBOX`).
+type WhereResult = (Vec<WhereClause>, Vec<GeoPredicate>);
 
 /// Maximum number of elements in a collection literal.
 /// Security mitigation M6.
@@ -166,20 +175,22 @@ impl<'input> Parser<'input> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::From))?;
         let (keyspace, table) = self.parse_table_ref()?;
 
-        // Optional WHERE
-        let where_clauses = if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
-            self.parse_where_clauses()?
-        } else {
-            vec![]
-        };
+        // Optional WHERE (scalar clauses plus geospatial function predicates)
+        let (where_clauses, geo_predicates) =
+            if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
+                self.parse_where_clauses()?
+            } else {
+                (vec![], vec![])
+            };
 
-        // Optional ORDER BY (including ANN OF for vector similarity search)
-        let (order_by, ann_of) = if self.lexer.eat(&TokenKind::Keyword(Keyword::Order))? {
-            self.lexer.expect(&TokenKind::Keyword(Keyword::By))?;
-            self.parse_order_by_with_ann()?
-        } else {
-            (vec![], None)
-        };
+        // Optional ORDER BY (including ANN OF vector and GEO_NEAREST OF geo k-NN)
+        let (order_by, ann_of, geo_nearest) =
+            if self.lexer.eat(&TokenKind::Keyword(Keyword::Order))? {
+                self.lexer.expect(&TokenKind::Keyword(Keyword::By))?;
+                self.parse_order_by_with_ann()?
+            } else {
+                (vec![], None, None)
+            };
 
         // Optional LIMIT
         let limit = if self.lexer.eat(&TokenKind::Keyword(Keyword::Limit))? {
@@ -222,6 +233,8 @@ impl<'input> Parser<'input> {
             limit,
             allow_filtering,
             ann_of,
+            geo_nearest,
+            geo_predicates,
         })
     }
 
@@ -294,19 +307,23 @@ impl<'input> Parser<'input> {
         Ok(cols)
     }
 
-    /// Parse ORDER BY clause, handling both standard `col ASC|DESC` and
-    /// ANN (Approximate Nearest Neighbor) syntax: `col ANN OF <term>`.
+    /// Parse ORDER BY clause, handling standard `col ASC|DESC`, vector
+    /// `col ANN OF <term>`, and geospatial `col GEO_NEAREST OF (lat, lon)`.
     fn parse_order_by_with_ann(&mut self) -> Result<OrderByResult, CqlError> {
         let mut items = vec![];
         let mut ann_of = None;
+        let mut geo_nearest = None;
         loop {
             let col = self.parse_ident()?;
 
-            // Check for ANN OF <term> syntax (vector similarity ordering).
-            // ANN is not a keyword — it arrives as Ident("ann") after lowercasing
-            // by parse_ident, or as a raw Ident token we peek at directly.
+            // ANN / GEO_NEAREST are not reserved keywords — they arrive as
+            // Ident tokens we peek at directly and compare case-insensitively.
             let peek = self.lexer.peek()?;
             let is_ann = matches!(&peek.kind, TokenKind::Ident(s) if s.eq_ignore_ascii_case("ann"));
+            let is_geo_nearest = matches!(
+                &peek.kind,
+                TokenKind::Ident(s) if s.eq_ignore_ascii_case("geo_nearest")
+            );
             if is_ann {
                 // Consume "ANN"
                 self.lexer.next_token()?;
@@ -316,6 +333,21 @@ impl<'input> Parser<'input> {
                 let term = self.parse_term()?;
                 ann_of = Some((col, term));
                 // ANN OF is always the sole ordering clause — break out.
+                break;
+            }
+            if is_geo_nearest {
+                // Consume "GEO_NEAREST"
+                self.lexer.next_token()?;
+                // Expect "OF"
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Of))?;
+                // Parse the query point `(lat, lon)`.
+                let (lat, lon) = self.parse_lat_lon_tuple()?;
+                geo_nearest = Some(GeoNearest {
+                    column: col,
+                    lat,
+                    lon,
+                });
+                // GEO_NEAREST OF is always the sole ordering clause.
                 break;
             }
 
@@ -331,7 +363,37 @@ impl<'input> Parser<'input> {
                 break;
             }
         }
-        Ok((items, ann_of))
+        Ok((items, ann_of, geo_nearest))
+    }
+
+    /// Parse a parenthesised `(lat, lon)` pair of signed floating-point
+    /// literals. Used by `GEO_NEAREST OF` and the geo WHERE predicates.
+    fn parse_lat_lon_tuple(&mut self) -> Result<(f64, f64), CqlError> {
+        self.lexer.expect(&TokenKind::LParen)?;
+        let lat = self.parse_signed_float()?;
+        self.lexer.expect(&TokenKind::Comma)?;
+        let lon = self.parse_signed_float()?;
+        self.lexer.expect(&TokenKind::RParen)?;
+        Ok((lat, lon))
+    }
+
+    /// Parse a signed numeric literal as `f64`. Accepts both integer and float
+    /// literals (CQL writes `3000` and `37.7` interchangeably for coordinates
+    /// and metres) and a leading unary minus.
+    fn parse_signed_float(&mut self) -> Result<f64, CqlError> {
+        let negate = self.lexer.eat(&TokenKind::Minus)?;
+        let tok = self.lexer.next_token()?;
+        let value = match tok.kind {
+            TokenKind::FloatLiteral(f) => f,
+            TokenKind::IntegerLiteral(n) => n as f64,
+            other => {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected a numeric coordinate, got {other:?} at position {}",
+                    tok.pos
+                )))
+            }
+        };
+        Ok(if negate { -value } else { value })
     }
 
     // ---------------------------------------------------------------
@@ -393,7 +455,7 @@ impl<'input> Parser<'input> {
         let assignments = self.parse_assignments()?;
 
         self.lexer.expect(&TokenKind::Keyword(Keyword::Where))?;
-        let where_clauses = self.parse_where_clauses()?;
+        let where_clauses = self.parse_scalar_where_clauses()?;
 
         // Optional IF EXISTS / IF <conditions>
         let (if_exists, if_conditions) = self.parse_if_clause()?;
@@ -486,7 +548,7 @@ impl<'input> Parser<'input> {
         let (using_timestamp, _) = self.parse_using_clause()?;
 
         self.lexer.expect(&TokenKind::Keyword(Keyword::Where))?;
-        let where_clauses = self.parse_where_clauses()?;
+        let where_clauses = self.parse_scalar_where_clauses()?;
 
         let (if_exists, if_conditions) = self.parse_if_clause()?;
 
@@ -2216,14 +2278,39 @@ impl<'input> Parser<'input> {
     // WHERE clauses
     // ---------------------------------------------------------------
 
-    fn parse_where_clauses(&mut self) -> Result<Vec<WhereClause>, CqlError> {
+    fn parse_where_clauses(&mut self) -> Result<WhereResult, CqlError> {
         let mut clauses = vec![];
+        let mut geo_predicates = vec![];
         loop {
             let column = self.parse_ident()?;
 
             // Check for token(column) pattern: `token` followed by `(`.
             let has_lparen = self.lexer.eat(&TokenKind::LParen)?;
             let is_token_fn = column.eq_ignore_ascii_case("token") && has_lparen;
+            // Geospatial function predicates: GEO_WITHIN_RADIUS / GEO_WITHIN_BBOX.
+            // They appear in predicate position as a function call over a geo
+            // column, not as a scalar `col op value` comparison.
+            if has_lparen && column.eq_ignore_ascii_case("geo_within_radius") {
+                geo_predicates.push(self.parse_geo_within_radius()?);
+                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                    break;
+                }
+                continue;
+            }
+            if has_lparen && column.eq_ignore_ascii_case("geo_within_bbox") {
+                geo_predicates.push(self.parse_geo_within_bbox()?);
+                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                    break;
+                }
+                continue;
+            }
+            if has_lparen && column.eq_ignore_ascii_case("st_within") {
+                geo_predicates.push(self.parse_st_within()?);
+                if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                    break;
+                }
+                continue;
+            }
             let actual_column = if is_token_fn {
                 let col = self.parse_ident()?;
                 self.lexer.expect(&TokenKind::RParen)?;
@@ -2257,7 +2344,84 @@ impl<'input> Parser<'input> {
                 break;
             }
         }
+        Ok((clauses, geo_predicates))
+    }
+
+    /// Parse WHERE clauses in a context (UPDATE/DELETE) that does not support
+    /// geospatial function predicates. Rejects them with a clear error rather
+    /// than silently dropping them.
+    fn parse_scalar_where_clauses(&mut self) -> Result<Vec<WhereClause>, CqlError> {
+        let (clauses, geo_predicates) = self.parse_where_clauses()?;
+        if !geo_predicates.is_empty() {
+            return Err(CqlError::SyntaxError(
+                "geospatial WHERE predicates (GEO_WITHIN_RADIUS / GEO_WITHIN_BBOX / ST_WITHIN) \
+                 are only supported in SELECT statements"
+                    .to_string(),
+            ));
+        }
         Ok(clauses)
+    }
+
+    /// Parse the body of `GEO_WITHIN_RADIUS(col, (lat, lon), radius_m)` after
+    /// the function name and opening `(` have been consumed.
+    fn parse_geo_within_radius(&mut self) -> Result<GeoPredicate, CqlError> {
+        let column = self.parse_ident()?;
+        self.lexer.expect(&TokenKind::Comma)?;
+        let (lat, lon) = self.parse_lat_lon_tuple()?;
+        self.lexer.expect(&TokenKind::Comma)?;
+        let radius_m = self.parse_signed_float()?;
+        self.lexer.expect(&TokenKind::RParen)?;
+        Ok(GeoPredicate::WithinRadius {
+            column,
+            lat,
+            lon,
+            radius_m,
+        })
+    }
+
+    /// Parse the body of `GEO_WITHIN_BBOX(col, (sw_lat, sw_lon), (ne_lat, ne_lon))`
+    /// after the function name and opening `(` have been consumed.
+    fn parse_geo_within_bbox(&mut self) -> Result<GeoPredicate, CqlError> {
+        let column = self.parse_ident()?;
+        self.lexer.expect(&TokenKind::Comma)?;
+        let sw = self.parse_lat_lon_tuple()?;
+        self.lexer.expect(&TokenKind::Comma)?;
+        let ne = self.parse_lat_lon_tuple()?;
+        self.lexer.expect(&TokenKind::RParen)?;
+        Ok(GeoPredicate::WithinBbox { column, sw, ne })
+    }
+
+    /// Parse the body of `ST_WITHIN(col, ((lat1, lon1), (lat2, lon2), ...))`
+    /// after the function name and opening `(` have been consumed. The polygon
+    /// is the outer ring of `(lat, lon)` vertices; an explicit closing vertex is
+    /// permitted (the executor closes the ring regardless). A ring with fewer
+    /// than three vertices cannot enclose any area and is rejected here rather
+    /// than silently matching nothing.
+    fn parse_st_within(&mut self) -> Result<GeoPredicate, CqlError> {
+        let column = self.parse_ident()?;
+        self.lexer.expect(&TokenKind::Comma)?;
+        // Outer `(` of the vertex list.
+        self.lexer.expect(&TokenKind::LParen)?;
+        let mut vertices = vec![self.parse_lat_lon_tuple()?];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            vertices.push(self.parse_lat_lon_tuple()?);
+        }
+        self.lexer.expect(&TokenKind::RParen)?;
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        // A closing vertex equal to the first is allowed; count distinct ring
+        // vertices for the minimum-3 check.
+        let effective = if vertices.len() >= 2 && vertices.first() == vertices.last() {
+            vertices.len() - 1
+        } else {
+            vertices.len()
+        };
+        if effective < 3 {
+            return Err(CqlError::SyntaxError(format!(
+                "ST_WITHIN polygon needs at least 3 distinct vertices, got {effective}"
+            )));
+        }
+        Ok(GeoPredicate::WithinPolygon { column, vertices })
     }
 
     fn parse_comparison_op(&mut self) -> Result<ComparisonOp, CqlError> {
@@ -4441,6 +4605,140 @@ mod tests {
                 }
             }
             other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_geo_nearest_order_by() {
+        let stmt = parse(
+            "SELECT id, name FROM places \
+             ORDER BY location GEO_NEAREST OF (37.7880, -122.4074) LIMIT 3",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                let gn = s.geo_nearest.expect("geo_nearest should be set");
+                assert_eq!(gn.column, "location");
+                assert!((gn.lat - 37.7880).abs() < 1e-9);
+                assert!((gn.lon - (-122.4074)).abs() < 1e-9);
+                assert_eq!(s.limit.and_then(|l| l.as_literal()), Some(3));
+                // GEO_NEAREST is the sole ordering; no plain ORDER BY items.
+                assert!(s.order_by.is_empty());
+                assert!(s.ann_of.is_none());
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_geo_within_radius_where() {
+        let stmt = parse(
+            "SELECT id, name FROM places \
+             WHERE GEO_WITHIN_RADIUS(location, (37.7955, -122.3937), 3000)",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.geo_predicates.len(), 1);
+                match &s.geo_predicates[0] {
+                    crate::ast::GeoPredicate::WithinRadius {
+                        column,
+                        lat,
+                        lon,
+                        radius_m,
+                    } => {
+                        assert_eq!(column, "location");
+                        assert!((lat - 37.7955).abs() < 1e-9);
+                        assert!((lon - (-122.3937)).abs() < 1e-9);
+                        assert!((radius_m - 3000.0).abs() < 1e-9);
+                    }
+                    other => panic!("expected WithinRadius, got {other:?}"),
+                }
+                // The geo predicate is not also a scalar WHERE clause.
+                assert!(s.where_clauses.is_empty());
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_geo_within_bbox_where() {
+        let stmt = parse(
+            "SELECT id, name FROM places \
+             WHERE GEO_WITHIN_BBOX(location, (37.70, -122.52), (37.83, -122.35))",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.geo_predicates.len(), 1);
+                match &s.geo_predicates[0] {
+                    crate::ast::GeoPredicate::WithinBbox { column, sw, ne } => {
+                        assert_eq!(column, "location");
+                        assert!((sw.0 - 37.70).abs() < 1e-9 && (sw.1 - (-122.52)).abs() < 1e-9);
+                        assert!((ne.0 - 37.83).abs() < 1e-9 && (ne.1 - (-122.35)).abs() < 1e-9);
+                    }
+                    other => panic!("expected WithinBbox, got {other:?}"),
+                }
+                assert!(s.where_clauses.is_empty());
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_st_within_polygon_where() {
+        let stmt = parse(
+            "SELECT id, name FROM places \
+             WHERE ST_WITHIN(location, ((37.70, -122.52), (37.83, -122.52), (37.83, -122.35), (37.70, -122.35)))",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.geo_predicates.len(), 1);
+                match &s.geo_predicates[0] {
+                    crate::ast::GeoPredicate::WithinPolygon { column, vertices } => {
+                        assert_eq!(column, "location");
+                        assert_eq!(vertices.len(), 4);
+                        assert!((vertices[0].0 - 37.70).abs() < 1e-9);
+                        assert!((vertices[0].1 - (-122.52)).abs() < 1e-9);
+                        assert!((vertices[2].0 - 37.83).abs() < 1e-9);
+                        assert!((vertices[2].1 - (-122.35)).abs() < 1e-9);
+                    }
+                    other => panic!("expected WithinPolygon, got {other:?}"),
+                }
+                assert!(s.where_clauses.is_empty());
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_st_within_requires_at_least_three_vertices() {
+        let err = parse(
+            "SELECT id FROM places \
+             WHERE ST_WITHIN(location, ((0.0, 0.0), (1.0, 1.0)))",
+        );
+        assert!(err.is_err(), "a 2-vertex polygon must be rejected");
+    }
+
+    #[test]
+    fn parse_geo_within_bbox_antimeridian() {
+        // SW lon 179, NE lon -179 crosses the dateline; the parser must preserve
+        // the corners verbatim so the executor can detect the crossing.
+        let stmt = parse(
+            "SELECT id, name FROM places \
+             WHERE GEO_WITHIN_BBOX(location, (-1.0, 179.0), (1.0, -179.0))",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => match &s.geo_predicates[0] {
+                crate::ast::GeoPredicate::WithinBbox { sw, ne, .. } => {
+                    assert!((sw.1 - 179.0).abs() < 1e-9);
+                    assert!((ne.1 - (-179.0)).abs() < 1e-9);
+                }
+                other => panic!("expected WithinBbox, got {other:?}"),
+            },
+            other => panic!("expected Select, got {other:?}"),
         }
     }
 

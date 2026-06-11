@@ -347,6 +347,8 @@ mod tests {
             limit: None,
             allow_filtering: false,
             ann_of: None,
+            geo_nearest: None,
+            geo_predicates: vec![],
         })
     }
 
@@ -561,6 +563,8 @@ mod tests {
             limit: None,
             allow_filtering: false,
             ann_of: None,
+            geo_nearest: None,
+            geo_predicates: vec![],
         });
 
         let keys = extract_keys(&sel, "ks");

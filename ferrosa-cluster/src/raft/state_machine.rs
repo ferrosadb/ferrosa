@@ -1048,6 +1048,11 @@ impl FerrosStateMachine {
                             .or_insert(IndexNodeStatus::Building);
                     }
                 }
+                if let Some(writer) = &self.system_writer {
+                    if let Err(e) = writer.apply(SystemTableMutation::IndexCreated(index.clone())) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_index_internal(index) {
                         tracing::error!(%e, "Raft apply: schema.create_index_internal failed");
@@ -1068,6 +1073,15 @@ impl FerrosStateMachine {
                     table.clone(),
                     index.clone(),
                 ));
+                if let Some(writer) = &self.system_writer {
+                    if let Err(e) = writer.apply(SystemTableMutation::IndexDropped {
+                        keyspace: keyspace.clone(),
+                        table: table.clone(),
+                        name: index.clone(),
+                    }) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_index_internal(&keyspace, &table, &index) {
                         tracing::error!(%e, "Raft apply: schema.drop_index_internal failed");

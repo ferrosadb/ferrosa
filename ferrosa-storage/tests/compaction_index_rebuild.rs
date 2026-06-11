@@ -188,7 +188,9 @@ fn add_index_registers_in_tracker() {
     assert_eq!(engine.sstable_count(&table_id), 1);
 
     // Now add an index -- this should register in the tracker.
-    engine.add_index(&table_id, "val_idx", 0).unwrap();
+    engine
+        .add_index(&table_id, "val_idx", 0, ferrosa_index::IndexType::BTree)
+        .unwrap();
 
     // The index should be registered in the tracker.
     // We can't easily access the tracker from outside, but the add_index

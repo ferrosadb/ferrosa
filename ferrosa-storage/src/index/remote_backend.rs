@@ -415,6 +415,7 @@ impl BuildResponse {
 
         Ok(IndexBuildResult {
             sstable_id: job.sstable_id.clone(),
+            index_type: job.index_type,
             sidecar_entries: std::collections::HashMap::new(),
             build_duration: Duration::from_millis(self.elapsed_ms.unwrap_or(0)),
             sidecar_written_to_s3: true,

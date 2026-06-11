@@ -23,7 +23,7 @@ use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
 use ferrosa_common::task_pool::TaskPool;
 use ferrosa_common::Result;
-use ferrosa_index::{IndexKey, RowPosition};
+use ferrosa_index::{IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
 use ferrosa_sstable::reader::SSTableReader;
 use ferrosa_sstable::types::{Partition, Row};
@@ -430,6 +430,10 @@ pub struct TableStore<F: FlushTarget> {
     /// Column position is the index into `Row.cells` by column ordinal
     /// (matching the `u16` tag in each cell tuple).
     indexed_columns: Vec<(String, usize)>,
+    /// Per-index type, keyed by index name. Threaded from the schema so eager /
+    /// backfill / compaction index-build jobs carry the correct `IndexType`
+    /// instead of a hardcoded `BTree`. Missing entries default to `BTree`.
+    index_types: HashMap<String, IndexType>,
     /// Full-text index declarations: `(index_name, column_position)` pairs.
     /// Built as FTI sidecar files during flush.
     fulltext_indexes: Vec<(String, usize)>,
@@ -444,6 +448,16 @@ pub struct TableStore<F: FlushTarget> {
     /// Incremented on each flush. Used by compaction swap to identify
     /// exactly which SSTables to remove.
     next_gen: std::sync::atomic::AtomicU64,
+    /// Partition-key scopes observed per vector index, accumulated at flush.
+    ///
+    /// Persisted vector sidecars store only a placeholder `RowPosition::offset`
+    /// and do **not** record the partition key, so a flushed global-sidecar
+    /// `IndexResult` cannot be mapped back to a base-table row on its own. The
+    /// scoped per-prefix sidecars written at flush time *are* keyed by scope,
+    /// so remembering which scopes were flushed lets the index-consult path in
+    /// [`ann_search_partitions`] enumerate those scoped sidecars and recover the
+    /// actual partition keys without a full table scan.
+    vector_index_scopes: parking_lot::Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
 }
 
 fn new_memtable() -> Arc<dyn Memtable> {
@@ -465,6 +479,16 @@ fn new_indexes(indexed_columns: &[(String, usize)]) -> Arc<HashMap<String, Arc<M
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
         .collect();
     Arc::new(map)
+}
+
+/// Default per-index types for a freshly-declared set of secondary indexes.
+/// Defaults every declaration to `BTree`; the true type is supplied later via
+/// [`TableStore::add_index`] (or by reload from persisted schema metadata).
+fn default_index_types(indexed_columns: &[(String, usize)]) -> HashMap<String, IndexType> {
+    indexed_columns
+        .iter()
+        .map(|(name, _)| (name.clone(), IndexType::BTree))
+        .collect()
 }
 
 /// Build a fresh `HashMap` of empty `VectorMemtableIndex` instances, one per
@@ -714,11 +738,13 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
+            index_types: default_index_types(&indexed_columns),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
@@ -915,11 +941,13 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
+            index_types: default_index_types(&indexed_columns),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
@@ -988,11 +1016,13 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
+            index_types: default_index_types(&indexed_columns),
             indexed_columns,
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
@@ -1056,13 +1086,31 @@ impl<F: FlushTarget> TableStore<F> {
             for (index_name, col_pos) in &self.indexed_columns {
                 if let Some(cell) = row.cells.iter().find(|(idx, _)| *idx as usize == *col_pos) {
                     if let Some(ref value) = cell.1.value {
-                        let index_key = IndexKey(value.clone());
-                        let row_pos = RowPosition {
-                            partition_key: key.key.as_bytes().to_vec(),
-                            clustering_key: row.clustering.clone(),
-                        };
-                        if let Some(idx) = guard.indexes.get(index_name) {
-                            idx.insert(index_key, row_pos);
+                        // Per-type key encoding: a phonetic index stores the
+                        // phonetic *code* (not the raw text) so it can be
+                        // point-looked-up by the query term's code at read time.
+                        // BTree/Hash/Composite use the raw bytes verbatim. A
+                        // value that encodes to nothing (e.g. non-UTF-8 text on a
+                        // phonetic index) yields no index entry.
+                        let index_type = self.index_type_for(index_name);
+                        match crate::index::scheduler::encode_index_key(index_type, value) {
+                            Ok(Some(index_key)) => {
+                                let row_pos = RowPosition {
+                                    partition_key: key.key.as_bytes().to_vec(),
+                                    clustering_key: row.clustering.clone(),
+                                };
+                                if let Some(idx) = guard.indexes.get(index_name) {
+                                    idx.insert(index_key, row_pos);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    index_name,
+                                    %e,
+                                    "store: skipping memtable index entry; key encoding failed"
+                                );
+                            }
                         }
                     }
                     // If value is None (tombstone), skip — no index entry for deletions
@@ -1960,6 +2008,14 @@ impl<F: FlushTarget> TableStore<F> {
                 }
 
                 for (scope, scoped_entries) in by_scope {
+                    // Remember this scope so `ann_search_partitions` can later
+                    // enumerate the scoped sidecar and recover partition keys
+                    // (the global sidecar drops the scope on write).
+                    self.vector_index_scopes
+                        .lock()
+                        .entry(cfg.index_name.clone())
+                        .or_default()
+                        .insert(scope.clone());
                     let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
                     match ferrosa_index::vector::hnsw::build_and_serialize(
                         cfg.m,
@@ -3746,6 +3802,26 @@ impl<F: FlushTarget> TableStore<F> {
     pub fn read_by_index(&self, index_name: &str, key: &IndexKey) -> Result<Vec<Partition>> {
         let guard = self.view.load();
 
+        // Per-type read dispatch: encode the raw query term into the index's
+        // native key space before probing. A phonetic index is keyed by the
+        // phonetic *code* of the term (both the memtable index and the flushed
+        // sidecar store codes), so a `WHERE name = 'Jon'` lookup must encode
+        // 'Jon' to its code and point-look-up that — not the raw bytes.
+        // BTree/Hash/Composite are identity-encoded. A term that encodes to
+        // nothing (e.g. empty/non-UTF-8 text on a phonetic index) cannot match
+        // any stored entry, so return no rows.
+        let index_type = self.index_type_for(index_name);
+        let lookup_key = match crate::index::scheduler::encode_index_key(index_type, &key.0) {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "secondary index '{index_name}' read key encoding failed: {e}"
+                )));
+            }
+        };
+        let key = &lookup_key;
+
         let mut positions: Vec<RowPosition> = Vec::new();
         let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
             if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
@@ -3798,13 +3874,107 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Query a geo (cell-id) secondary index by a set of `[start, end]` cell-id
+    /// ranges, returning the matching base-table partitions.
+    ///
+    /// Unlike [`read_by_index`](Self::read_by_index) — which does a point lookup
+    /// on an exact key — a geo index is keyed by an 8-byte big-endian
+    /// space-filling-curve cell id, so a spatial query maps to a small bounded
+    /// set of contiguous cell-id ranges (produced by `ferrosa_index::geo::cover_*`).
+    /// Each `(start, end)` is an **inclusive** range of `u64` cell ids; this
+    /// scans the ordered memtable index and every SSTable sidecar for entries
+    /// whose big-endian key falls inside any range, deduplicates by
+    /// `(partition_key, clustering_key)`, and fetches the rows.
+    ///
+    /// The same fail-loud `INDEX_RESULT_CAP` bound as `read_by_index` applies:
+    /// the candidate set is never silently truncated — exceeding the cap returns
+    /// an error suggesting `ALLOW FILTERING`. The geo cover ranges are already
+    /// bounded (<= a few thousand cells), so the candidate count is bounded by
+    /// the data that actually lives in those cells. Refinement with exact
+    /// distance / containment is the caller's responsibility (the cover is an
+    /// over-approximation).
+    pub fn read_by_index_cell_ranges(
+        &self,
+        index_name: &str,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Partition>> {
+        let guard = self.view.load();
+
+        let mut positions: Vec<RowPosition> = Vec::new();
+        let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
+            if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "geo index query exceeded {} row limit; \
+                     use ALLOW FILTERING for unbounded scans",
+                    INDEX_RESULT_CAP
+                )));
+            }
+            positions.extend(batch);
+            Ok(())
+        };
+
+        // Encode each (start, end) cell id to its big-endian key bounds once.
+        let key_ranges: Vec<(IndexKey, IndexKey)> = ranges
+            .iter()
+            .map(|(start, end)| {
+                (
+                    IndexKey(start.to_be_bytes().to_vec()),
+                    IndexKey(end.to_be_bytes().to_vec()),
+                )
+            })
+            .collect();
+
+        // 1. Memtable index: ordered range scan per range.
+        if let Some(idx) = guard.indexes.get(index_name) {
+            for (start_key, end_key) in &key_ranges {
+                append_positions(idx.range(start_key, end_key))?;
+            }
+        }
+
+        // 2. SSTable sidecar indexes: ordered range scan per range.
+        for sidecar in guard.sidecar_indexes.iter() {
+            if let Some(reader) = sidecar.get(index_name) {
+                for (start_key, end_key) in &key_ranges {
+                    if let Ok(results) = reader.range(start_key, end_key) {
+                        append_positions(results)?;
+                    }
+                }
+            }
+        }
+
+        // 3. Deduplicate by (partition_key, clustering_key). A point may appear
+        //    in overlapping ranges and across memtable + sidecars.
+        let mut seen = std::collections::HashSet::new();
+        positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
+
+        // 4. Fetch base-table rows, carrying the clustering key so wide clustered
+        //    tables do not materialize the whole partition per hit.
+        let mut partitions = Vec::new();
+        for pos in &positions {
+            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+                pos.partition_key.clone(),
+            ));
+            let read = if pos.clustering_key.is_empty() {
+                self.read(&dk)
+            } else {
+                self.read_clustering_row(&dk, &pos.clustering_key)
+            };
+            if let Ok(Some(partition)) = read {
+                partitions.push(partition);
+            }
+        }
+
+        Ok(partitions)
+    }
+
     /// Retrieve a named memtable-level secondary index.
     ///
     /// Returns `None` if no index with the given name was declared at
     /// Dynamically adds a secondary index. Future writes will be indexed.
-    pub fn add_index(&mut self, index_name: String, column_position: usize) {
+    pub fn add_index(&mut self, index_name: String, column_position: usize, index_type: IndexType) {
         self.indexed_columns
             .push((index_name.clone(), column_position));
+        self.index_types.insert(index_name.clone(), index_type);
         let current = self.view.load();
         let mut new_indexes = (*current.indexes).clone();
         new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
@@ -3834,6 +4004,16 @@ impl<F: FlushTarget> TableStore<F> {
     /// Returns the current secondary index declarations.
     pub fn indexed_columns(&self) -> &[(String, usize)] {
         &self.indexed_columns
+    }
+
+    /// The declared `IndexType` for a named secondary index, defaulting to
+    /// `BTree` when unknown. Used by the eager / backfill / compaction index
+    /// build paths so a job carries the index's real type.
+    pub fn index_type_for(&self, index_name: &str) -> IndexType {
+        self.index_types
+            .get(index_name)
+            .copied()
+            .unwrap_or(IndexType::BTree)
     }
 
     /// Returns the current full-text index declarations.
@@ -4083,6 +4263,124 @@ impl<F: FlushTarget> TableStore<F> {
         });
         all.truncate(k);
         Ok(all.into_iter().map(|(_, result)| result).collect())
+    }
+
+    /// Consult the vector index for the `k` nearest rows and return their
+    /// **base-table partitions** in ascending-score (nearest-first) order.
+    ///
+    /// Unlike `ann_search`, which returns placeholder `IndexResult`s whose
+    /// `RowPosition::offset` cannot address a row, this method recovers the
+    /// partition-key scope captured at insert time and fetches each row via the
+    /// normal read path — so the router can serve `ORDER BY col ANN OF [...]
+    /// LIMIT k` straight from the index without a full table scan.
+    ///
+    /// Sources and scope availability (Fail Loud, Never Fake):
+    /// - **Active/flushing memtable**: the partition key is carried inline by
+    ///   [`VectorMemtableIndex::search_with_scopes`]; rows are recovered exactly.
+    /// - **Flushed scoped sidecars**: written per partition-key prefix at flush
+    ///   time and remembered in `vector_index_scopes`, so each is probed under
+    ///   its own scope and the partition key is recovered from that scope.
+    /// - **Flushed *global* HNSW sidecar / quantized `.qvec`**: these persist
+    ///   only a placeholder offset and therefore carry **no** partition key. A
+    ///   result that arrives only from such a scope-less source cannot be mapped
+    ///   to a row; rather than fabricate one, this method **logs a loud warning
+    ///   and skips it**. (In practice every flushed vector also lands in a
+    ///   scoped sidecar, so scope recovery succeeds; the warning fires only for
+    ///   legacy/external artifacts that predate scoped sidecars.)
+    ///
+    /// The result is bounded by `k`: at most `k` partitions are ever fetched.
+    pub fn ann_search_partitions(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<Partition>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Best (lowest) score per partition-key scope. Deduping by scope keeps
+        // one entry per partition and lets us bound the fetch by k.
+        let mut best_by_scope: HashMap<Vec<u8>, f32> = HashMap::new();
+        let mut consider = |scope: Vec<u8>, score: f32| {
+            best_by_scope
+                .entry(scope)
+                .and_modify(|existing| {
+                    if score < *existing {
+                        *existing = score;
+                    }
+                })
+                .or_insert(score);
+        };
+
+        // Source (a): active memtable — scope carried inline.
+        let guard = self.view.load();
+        let mut scopeless_memtable_hits = 0usize;
+        if let Some(vi) = guard.vector_indexes.get(index_name) {
+            let results = vi.search_with_scopes(query, k, ef_search).map_err(|e| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "ann_search_partitions memtable failed: {e}"
+                ))
+            })?;
+            for (result, scope) in results {
+                match scope {
+                    Some(scope) => consider(scope, result.score),
+                    None => scopeless_memtable_hits += 1,
+                }
+            }
+        }
+        if scopeless_memtable_hits > 0 {
+            tracing::warn!(
+                index_name,
+                scopeless_memtable_hits,
+                "ann_search_partitions: skipping memtable vector results without a \
+                 partition-key scope — cannot recover the base row, falling back loudly \
+                 (these rows will not appear in index-consult results)"
+            );
+        }
+
+        // Source (b): flushed scoped sidecars — probe each remembered scope.
+        let scopes: Vec<Vec<u8>> = self
+            .vector_index_scopes
+            .lock()
+            .get(index_name)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        for scope in scopes {
+            let scoped =
+                self.ann_search_in_partition_scope(index_name, &scope, query, k, ef_search)?;
+            for result in scoped {
+                consider(scope.clone(), result.score);
+            }
+        }
+
+        // Rank scopes by best score, take the k nearest, then fetch their rows.
+        let mut ranked: Vec<(Vec<u8>, f32)> = best_by_scope.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(k);
+
+        let mut partitions = Vec::with_capacity(ranked.len());
+        for (scope, _score) in ranked {
+            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(scope.clone()));
+            match self.read(&dk) {
+                Ok(Some(partition)) => partitions.push(partition),
+                Ok(None) => {
+                    tracing::warn!(
+                        index_name,
+                        "ann_search_partitions: vector index referenced a partition that no \
+                         longer exists in the base table; skipping (index/base drift)"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(partitions)
     }
 
     /// Returns the generation number of the most recently flushed SSTable.
@@ -4537,6 +4835,27 @@ mod tests {
                 ..WriteOptions::default()
             },
         )
+    }
+
+    /// Phase 0 (index-type threading): `add_index` records the declared
+    /// `IndexType` so eager/backfill/compaction build jobs carry the real type
+    /// instead of a hardcoded `BTree`. Unknown indexes default to `BTree`.
+    #[test]
+    fn add_index_threads_declared_index_type() {
+        let mut store = test_store();
+        assert_eq!(
+            store.index_type_for("missing"),
+            IndexType::BTree,
+            "unknown index defaults to BTree"
+        );
+        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        store.add_index("emb_idx".to_string(), 1, IndexType::Vector);
+        assert_eq!(store.index_type_for("name_idx"), IndexType::Phonetic);
+        assert_eq!(
+            store.index_type_for("emb_idx"),
+            IndexType::Vector,
+            "a vector index is no longer mis-stamped as BTree"
+        );
     }
 
     fn file_backed_test_store(dir: &std::path::Path) -> TableStore<crate::flush::FileFlushTarget> {
@@ -6094,6 +6413,137 @@ mod tests {
     }
 
     // =========================================================================
+    // Geo cell-range index read (read_by_index_cell_ranges)
+    // =========================================================================
+
+    /// Build a CQL `frozen<tuple<double,double>>` wire body for a geo point.
+    fn geo_tuple_bytes(lat: f64, lon: f64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24);
+        for f in [lat, lon] {
+            v.extend_from_slice(&8i32.to_be_bytes());
+            v.extend_from_slice(&f.to_be_bytes());
+        }
+        v
+    }
+
+    /// Create a geo-indexed store with a single `frozen<tuple<double,double>>`
+    /// `location` column at position 0 and a `Geo` index over it.
+    fn geo_store() -> TableStore<InMemoryFlushTarget> {
+        let schema = TableSchema {
+            keyspace: "geo".to_string(),
+            table: "places".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "location".to_string(),
+                type_name:
+                    "org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.TupleType(org.apache.cassandra.db.marshal.DoubleType,org.apache.cassandra.db.marshal.DoubleType))"
+                        .to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let mut store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![],
+        );
+        store.add_index("loc_geo".to_string(), 0, IndexType::Geo);
+        store
+    }
+
+    fn write_geo_point(store: &TableStore<InMemoryFlushTarget>, pk: &str, lat: f64, lon: f64) {
+        let key = make_key(pk);
+        store
+            .write(
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(geo_tuple_bytes(lat, lon), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn read_by_index_cell_ranges_returns_points_in_range() {
+        use ferrosa_index::geo::{cover_radius, encode_point, DEFAULT_COVER_LEVEL};
+
+        let store = geo_store();
+        // SF cluster + a far NYC point.
+        write_geo_point(&store, "ferry", 37.7955, -122.3937);
+        write_geo_point(&store, "union", 37.7880, -122.4074);
+        write_geo_point(&store, "nyc", 40.7580, -73.9855);
+
+        // Cover a 3km radius around the Ferry Building. The two SF points fall
+        // inside; NYC does not.
+        let ranges: Vec<(u64, u64)> = cover_radius(37.7955, -122.3937, 3000.0, DEFAULT_COVER_LEVEL)
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        let partitions = store.read_by_index_cell_ranges("loc_geo", &ranges).unwrap();
+
+        // The cover is an over-approximation, but it must contain both SF cells
+        // and must not contain NYC's cell.
+        let nyc_id = encode_point(40.7580, -73.9855);
+        assert!(
+            !ranges.iter().any(|(s, e)| nyc_id >= *s && nyc_id <= *e),
+            "NYC cell must be outside the SF cover ranges"
+        );
+        // Both SF partitions are fetched (refinement happens in the router).
+        assert!(
+            partitions.len() >= 2,
+            "expected at least the two SF points, got {}",
+            partitions.len()
+        );
+    }
+
+    #[test]
+    fn read_by_index_cell_ranges_dedups_and_bounds() {
+        let store = geo_store();
+        // Insert one well-formed point, then >cap raw entries at one cell id to
+        // trip the fail-loud bound.
+        write_geo_point(&store, "p1", 0.0, 0.0);
+
+        let idx = store.get_memtable_index("loc_geo").unwrap();
+        let cell = ferrosa_index::geo::encode_point(0.0, 0.0);
+        let key = IndexKey(cell.to_be_bytes().to_vec());
+        for i in 0..(INDEX_RESULT_CAP as u32 + 1) {
+            idx.insert(
+                key.clone(),
+                RowPosition {
+                    partition_key: format!("pk{i}").into_bytes(),
+                    clustering_key: vec![],
+                },
+            );
+        }
+        let ranges = vec![(cell, cell)];
+        let result = store.read_by_index_cell_ranges("loc_geo", &ranges);
+        assert!(result.is_err(), "should fail loud when cap exceeded");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("10000") || msg.contains("ALLOW FILTERING"),
+            "error should mention the cap or ALLOW FILTERING, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_by_index_cell_ranges_unknown_index_is_empty() {
+        let store = geo_store();
+        write_geo_point(&store, "p1", 1.0, 2.0);
+        let result = store
+            .read_by_index_cell_ranges("nonexistent", &[(0, u64::MAX)])
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    // =========================================================================
     // Task 7: Handle null indexed column values
     // =========================================================================
 
@@ -6337,6 +6787,124 @@ mod tests {
         let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
         assert!(pks.contains(&b"user1".as_slice()));
         assert!(pks.contains(&b"user2".as_slice()));
+    }
+
+    /// Phase 2 (per-type read dispatch): a phonetic index must point-lookup the
+    /// memtable index by the *phonetic code* of the query term, not the raw
+    /// bytes. Writing "John" and querying the phonetically-equivalent "Jon"
+    /// must return the row via the index path — no full scan, no post-filter.
+    #[test]
+    fn read_by_index_phonetic_memtable_matches_by_code() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+
+        let mut store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("name_idx".to_string(), 0_usize)],
+        );
+        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        // Query with the phonetically equivalent "Jon" — the index path must
+        // encode the term and find the row, even though the raw bytes differ.
+        let results = store
+            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phonetic index must match 'Jon' to stored 'John' via code lookup"
+        );
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
+    }
+
+    /// Phase 2: the same phonetic point-lookup must work through the sidecar
+    /// after a flush, since the flushed sidecar inherits the memtable's
+    /// phonetic-code keys.
+    #[test]
+    fn read_by_index_phonetic_sidecar_matches_by_code_after_flush() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+
+        let mut store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("name_idx".to_string(), 0_usize)],
+        );
+        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        let results = store
+            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phonetic sidecar must match 'Jon' to flushed 'John' via code lookup"
+        );
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
     }
 
     // -------------------------------------------------------------------------
@@ -6804,6 +7372,94 @@ mod tests {
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
         );
+    }
+
+    #[test]
+    fn ann_search_partitions_returns_nearest_rows_with_pk_in_score_order() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        // k0 is the exact match for the query, k1 close, k2 far.
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .unwrap();
+        store
+            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .unwrap();
+
+        let partitions = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .expect("ann_search_partitions must not fail");
+
+        // k < N: only the two nearest partitions come back.
+        assert_eq!(
+            partitions.len(),
+            2,
+            "k=2 must yield exactly two partitions, got {partitions:?}"
+        );
+        // Nearest-first: k0 then k1. The partition key is recovered from scope.
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
+        assert_eq!(partitions[1].key.key.as_bytes(), b"k1");
+        // The recovered partition actually carries the row payload.
+        assert!(
+            !partitions[0].rows.is_empty(),
+            "recovered partition must contain its row(s)"
+        );
+    }
+
+    #[test]
+    fn ann_search_partitions_recovers_rows_after_flush() {
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .unwrap();
+        // Flush moves the vectors into the persisted (scoped) sidecars; the row
+        // payloads live in the SSTable. The index-consult path must still recover
+        // the nearest partition by partition key.
+        store.flush().unwrap();
+
+        let partitions = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .expect("ann_search_partitions must not fail after flush");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
+        assert!(!partitions[0].rows.is_empty());
     }
 
     #[test]

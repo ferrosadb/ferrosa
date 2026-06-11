@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::system::persistence::{
-    grant_to_row, keyspace_to_row, role_to_row, table_to_rows, SystemTableMutation,
+    grant_to_row, index_to_rows, keyspace_to_row, role_to_row, table_to_rows, SystemTableMutation,
 };
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::engine::StorageEngine;
@@ -148,6 +148,36 @@ impl SystemTableWriter {
                 let tid = TableId::new("system_auth", "role_permissions");
                 let row = Row {
                     clustering: resource.to_string().as_bytes().to_vec(),
+                    cells: vec![],
+                    deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
+                    primary_key_liveness: LivenessInfo::NONE,
+                };
+                self.engine.write(&tid, &key, row, ts)?;
+            }
+            SystemTableMutation::IndexCreated(index) => {
+                let row = index_to_rows(&index);
+                let ts = now_micros();
+                let tid = TableId::new("system_schema", "indexes");
+                self.engine.write(&tid, &row.key, row.row, ts)?;
+            }
+            SystemTableMutation::IndexDropped {
+                keyspace,
+                table,
+                name,
+            } => {
+                let ts = now_micros();
+                let key = DecoratedKey::new(PartitionKey::new(keyspace.as_bytes().to_vec()));
+
+                // Composite clustering: [u16 len][table][u16 len][index_name].
+                let mut clustering = Vec::new();
+                clustering.extend_from_slice(&(table.len() as u16).to_be_bytes());
+                clustering.extend_from_slice(table.as_bytes());
+                clustering.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                clustering.extend_from_slice(name.as_bytes());
+
+                let tid = TableId::new("system_schema", "indexes");
+                let row = Row {
+                    clustering,
                     cells: vec![],
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,

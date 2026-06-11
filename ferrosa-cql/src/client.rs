@@ -33,6 +33,73 @@ pub struct CqlClient {
     ready: bool,
 }
 
+/// A server-side prepared statement handle, produced by [`CqlClient::prepare`]
+/// and consumed by [`CqlClient::execute`].
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    id: [u8; 16],
+}
+
+impl PreparedStatement {
+    /// The 16-byte server-assigned statement id.
+    pub fn id(&self) -> &[u8; 16] {
+        &self.id
+    }
+}
+
+/// Build a CQL v4 EXECUTE request body: `[short id_len=16][id][short cl]
+/// [byte flags=0x01][short n_values]([int len][bytes] | [int -1])*`.
+///
+/// Pure (no I/O) so the wire encoding is unit-tested without a live server.
+fn build_execute_body(id: &[u8; 16], values: &[Option<Vec<u8>>], cl: u16) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_u16(16);
+    body.put_slice(id);
+    body.put_u16(cl);
+    // v4 parameter flags are a single byte; 0x01 = "values present".
+    body.put_u8(0x01);
+    body.put_u16(values.len() as u16);
+    for v in values {
+        match v {
+            Some(bytes) => {
+                body.put_i32(bytes.len() as i32);
+                body.put_slice(bytes);
+            }
+            // A negative length is the wire encoding for a NULL bound value.
+            None => body.put_i32(-1),
+        }
+    }
+    body
+}
+
+/// Parse the 16-byte statement id from a RESULT/Prepared (kind 0x0004) body.
+fn parse_prepared_id(body: &[u8]) -> Result<[u8; 16], CqlError> {
+    let mut cursor = body;
+    if cursor.remaining() < 4 {
+        return Err(CqlError::Protocol("prepared result: body too short".into()));
+    }
+    let kind = cursor.get_i32();
+    if kind != 0x0004 {
+        return Err(CqlError::Protocol(format!(
+            "expected Prepared result (0x0004), got {kind:#06x}"
+        )));
+    }
+    if cursor.remaining() < 2 {
+        return Err(CqlError::Protocol(
+            "prepared result: missing id length".into(),
+        ));
+    }
+    let id_len = cursor.get_u16() as usize;
+    if id_len != 16 || cursor.remaining() < 16 {
+        return Err(CqlError::Protocol(format!(
+            "prepared result: unexpected id length {id_len}"
+        )));
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&cursor[..16]);
+    Ok(id)
+}
+
 impl CqlClient {
     /// Connect to a CQL server and complete the STARTUP handshake.
     ///
@@ -220,6 +287,78 @@ impl CqlClient {
             return Err(CqlError::ServerError(error_msg));
         }
 
+        parse_result(&resp.body)
+    }
+
+    /// Prepare a statement server-side, returning its id for [`Self::execute`].
+    ///
+    /// Preparing once and executing with bound values is the robust way to
+    /// insert binary data (blobs, UUIDs, vectors, composite keys): each value
+    /// is sent as raw bytes, so there is no literal-escaping or per-type
+    /// serialization to get wrong — exactly the property salvage re-ingest
+    /// needs.
+    pub async fn prepare(&mut self, cql: &str) -> Result<PreparedStatement, CqlError> {
+        let stream_id = self.next_stream_id();
+        let mut body = BytesMut::new();
+        body.put_i32(cql.len() as i32);
+        body.put_slice(cql.as_bytes());
+        let frame = CqlFrame {
+            header: FrameHeader {
+                version: 0x04,
+                flags: 0,
+                stream_id,
+                opcode: Opcode::Prepare,
+                length: body.len() as u32,
+            },
+            body: body.freeze(),
+        };
+        self.framed.send(frame).await?;
+        let resp = self
+            .framed
+            .next()
+            .await
+            .ok_or_else(|| CqlError::Protocol("connection closed".into()))?
+            .map_err(|e| CqlError::Protocol(format!("prepare response error: {e}")))?;
+        if resp.header.opcode == Opcode::Error {
+            return Err(CqlError::ServerError(parse_error(&resp.body)?));
+        }
+        let id = parse_prepared_id(&resp.body)?;
+        Ok(PreparedStatement { id })
+    }
+
+    /// Execute a prepared statement with bound values at consistency `cl`.
+    ///
+    /// `values` are positional, matching the `?` markers in prepare order. A
+    /// `None` binds a CQL `NULL`; a `Some(bytes)` binds the raw serialized
+    /// value (the same byte form stored on disk and on the CQL wire).
+    pub async fn execute(
+        &mut self,
+        stmt: &PreparedStatement,
+        values: &[Option<Vec<u8>>],
+        cl: u16,
+    ) -> Result<QueryResult, CqlError> {
+        let stream_id = self.next_stream_id();
+        let body = build_execute_body(&stmt.id, values, cl);
+        let frame = CqlFrame {
+            header: FrameHeader {
+                version: 0x04,
+                flags: 0,
+                stream_id,
+                opcode: Opcode::Execute,
+                length: body.len() as u32,
+            },
+            body: body.freeze(),
+        };
+        self.framed.send(frame).await?;
+        let resp = self
+            .framed
+            .next()
+            .await
+            .ok_or_else(|| CqlError::Protocol("connection closed".into()))?
+            .map_err(|e| CqlError::Protocol(format!("execute response error: {e}")))?;
+        if resp.header.opcode == Opcode::Error {
+            return Err(CqlError::ServerError(parse_error(&resp.body)?));
+        }
         parse_result(&resp.body)
     }
 
@@ -784,5 +923,59 @@ mod tests {
         buf.put_u16(10); // claims 10 bytes but none follow
         let mut cursor = &buf[..];
         assert!(read_short_string(&mut cursor).is_err());
+    }
+
+    // ── prepared-statement wire encoding ─────────────────────────────────────
+
+    #[test]
+    fn build_execute_body_encodes_id_cl_and_values() {
+        let id = [7u8; 16];
+        let values = vec![Some(vec![0xde, 0xad]), None, Some(vec![])];
+        let body = build_execute_body(&id, &values, 1);
+
+        let mut c = &body[..];
+        assert_eq!(c.get_u16(), 16, "id length");
+        assert_eq!(&c[..16], &[7u8; 16]);
+        c.advance(16);
+        assert_eq!(c.get_u16(), 1, "consistency level ONE");
+        assert_eq!(c.get_u8(), 0x01, "v4 flags byte: values present");
+        assert_eq!(c.get_u16(), 3, "value count");
+        // value 0: 2 bytes 0xdead
+        assert_eq!(c.get_i32(), 2);
+        assert_eq!(&c[..2], &[0xde, 0xad]);
+        c.advance(2);
+        // value 1: NULL → length -1, no bytes
+        assert_eq!(c.get_i32(), -1);
+        // value 2: empty (present but zero-length)
+        assert_eq!(c.get_i32(), 0);
+        assert!(c.is_empty(), "no trailing bytes");
+    }
+
+    #[test]
+    fn parse_prepared_id_extracts_16_byte_id() {
+        let mut body = BytesMut::new();
+        body.put_i32(0x0004); // Prepared kind
+        body.put_u16(16);
+        body.put_slice(&[0xab; 16]);
+        body.put_slice(&[0, 0, 0, 0]); // trailing metadata — ignored
+        assert_eq!(parse_prepared_id(&body).unwrap(), [0xab; 16]);
+    }
+
+    #[test]
+    fn parse_prepared_id_rejects_non_prepared_kind() {
+        let mut body = BytesMut::new();
+        body.put_i32(0x0002); // ROWS, not Prepared
+        body.put_u16(16);
+        body.put_slice(&[0u8; 16]);
+        assert!(parse_prepared_id(&body).is_err());
+    }
+
+    #[test]
+    fn parse_prepared_id_rejects_bad_id_length() {
+        let mut body = BytesMut::new();
+        body.put_i32(0x0004);
+        body.put_u16(8); // not 16
+        body.put_slice(&[0u8; 8]);
+        assert!(parse_prepared_id(&body).is_err());
     }
 }

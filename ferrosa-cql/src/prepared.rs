@@ -87,6 +87,8 @@ mod tests {
                 limit: None,
                 allow_filtering: false,
                 ann_of: None,
+                geo_nearest: None,
+                geo_predicates: vec![],
             }),
             keyspace: Some("ks".into()),
             result_columns: vec![("id".into(), CqlType::Int)],

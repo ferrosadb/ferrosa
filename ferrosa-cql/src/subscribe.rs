@@ -417,6 +417,8 @@ mod tests {
             prepared_cache: Arc::new(crate::prepared::PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
+            index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
             udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,

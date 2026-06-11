@@ -13,10 +13,21 @@ path = "src/main.rs"
 [dependencies]
 ferrosa-cql = { path = "../ferrosa-cql" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
+# Offline SSTable analysis/recovery (`sstable` subcommands) reuses the engine's
+# own corruption validator (`StorageEngine::smoke_test_generation`) so a ctl
+# verdict can never diverge from what startup does, plus the BTI reader.
+ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
+ferrosa-common = { path = "../ferrosa-common" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+# Object-store cleanup (`sstable s3-clean`) — delete corrupt-gen objects from S3
+# so cold restarts can't re-download and re-detect them.
+object_store = { version = "0.11", features = ["aws"] }
+futures = "0.3"
 tabled = "0.20"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ratatui = "0.29"
 crossterm = "0.28"
@@ -27,7 +38,9 @@ sled = "0.34"
 [dev-dependencies]
 arc-swap = "1.7"
 ferrosa-schema = { path = "../ferrosa-schema" }
-ferrosa-storage = { path = "../ferrosa-storage" }
+# Reuse the engine's real-SSTable fixtures (table_dir_with_n_generations /
+# corrupt_one_generation) so `sstable` tests run against genuine BTI files.
+ferrosa-storage = { path = "../ferrosa-storage", features = ["test-support"] }
 ferrosa-udf = { path = "../ferrosa-udf" }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
