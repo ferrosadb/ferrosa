@@ -2827,11 +2827,11 @@ impl StorageEngine {
     }
 
     /// Registers a secondary index, optionally carrying a partial-index
-    /// [`FilterPredicate`].
+    /// `FilterPredicate`.
     ///
-    /// For [`IndexType::Filtered`] the predicate is threaded into BOTH the
+    /// For `IndexType::Filtered` the predicate is threaded into BOTH the
     /// memtable index (so live writes are filtered identically) and every
-    /// backfill [`IndexBuildJob`] (so the SSTable sidecars hold only matching
+    /// backfill `IndexBuildJob` (so the SSTable sidecars hold only matching
     /// rows). For every other index type the predicate is `None` and this
     /// behaves exactly like [`add_index`](Self::add_index).
     pub fn add_index_with_predicate(
