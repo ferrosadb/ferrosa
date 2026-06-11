@@ -55,6 +55,16 @@ pub enum ScanPlan {
         op: String,
     },
 
+    /// A full-text query (`WHERE col = fts_match('...')`) served by a registered
+    /// full-text index. The FTS predicate is a function over the indexed column,
+    /// not a scalar `=`, so it does not flow through the generic single-/multi-
+    /// index matching above; the router builds this variant directly so EXPLAIN
+    /// reports the full-text index rather than a FullScan.
+    FullTextIndex {
+        index_name: String,
+        index_column: String,
+    },
+
     /// No indexes match. Requires ALLOW FILTERING.
     FullScan,
 }
@@ -92,6 +102,10 @@ impl fmt::Display for ScanPlan {
                 index_column,
                 op,
             } => write!(f, "GeoIndex({index_name} on {index_column}, {op})"),
+            ScanPlan::FullTextIndex {
+                index_name,
+                index_column,
+            } => write!(f, "FullTextIndex({index_name} on {index_column})"),
             ScanPlan::FullScan => write!(f, "FullScan"),
         }
     }
@@ -458,6 +472,17 @@ mod tests {
             format!("{plan}"),
             "GeoIndex(places_location_geo on location, GeoWithinRadius)"
         );
+    }
+
+    #[test]
+    fn display_full_text_index() {
+        let plan = ScanPlan::FullTextIndex {
+            index_name: "ftu_body".to_string(),
+            index_column: "body".to_string(),
+        };
+        assert_eq!(format!("{plan}"), "FullTextIndex(ftu_body on body)");
+        // A full-text query is index-accelerated; it must never render FullScan.
+        assert_ne!(plan, ScanPlan::FullScan);
     }
 
     #[test]
