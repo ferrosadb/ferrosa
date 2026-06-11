@@ -851,6 +851,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => tracing::warn!(%e, "failed to reload secondary indexes from system_schema"),
     }
 
+    // 4b''. Reconstruct user-defined types from the persisted
+    // `system_schema.types` table. `schema.json` does not carry UDTs, so without
+    // this every CREATE TYPE is silently lost on restart. Runs after system
+    // tables (step 3) and user keyspaces are registered so create_type_internal
+    // can resolve the owning keyspace.
+    {
+        let loader =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));
+        match loader.replay_types_into_schema(&schema) {
+            Ok(count) if count > 0 => {
+                tracing::info!(
+                    count,
+                    "reconstructed persisted user-defined types after restart"
+                )
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(%e, "failed to reconstruct user-defined types from system_schema")
+            }
+        }
+    }
+
     if storage_auth_enabled {
         let loader =
             ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));

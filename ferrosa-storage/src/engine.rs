@@ -733,6 +733,15 @@ fn cell_text(row: &Row, col_index: u16) -> Option<String> {
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Read the raw bytes of a cell at `col_index` from a row, if present and live.
+fn cell_bytes(row: &Row, col_index: u16) -> Option<Vec<u8>> {
+    row.cells
+        .iter()
+        .find(|(idx, _)| *idx == col_index)
+        .and_then(|(_, cell)| cell.value.as_deref())
+        .map(|bytes| bytes.to_vec())
+}
+
 /// A decoded row of the persisted `system_schema.indexes` table.
 ///
 /// Returned by [`StorageEngine::read_persisted_indexes`] so the CQL router can
@@ -753,6 +762,53 @@ pub struct PersistedIndexRow {
     pub target: String,
     /// Index options serialized as JSON.
     pub options: String,
+}
+
+/// A decoded row of the persisted `system_schema.types` table.
+///
+/// Returned by [`StorageEngine::read_persisted_types`] so both the CQL router
+/// (to serve `SELECT * FROM system_schema.types`) and the boot-time loader (to
+/// rebuild the schema Registry's UDT map) read from the same storage source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTypeRow {
+    /// Partition key — the keyspace owning the type.
+    pub keyspace_name: String,
+    /// Clustering column — the type name.
+    pub type_name: String,
+    /// Ordered `(field_name, field_type)` pairs.
+    pub fields: Vec<(String, ferrosa_common::CqlType)>,
+}
+
+/// Decode one stored `system_schema.types` row into a [`PersistedTypeRow`].
+///
+/// Returns `None` for tombstones or rows whose `field_names`/`field_types`
+/// cells are missing, malformed JSON, or length-mismatched — so callers surface
+/// only well-formed UDT metadata rather than reconstructing a corrupt type.
+fn decode_persisted_type_row(keyspace: &str, row: &Row) -> Option<PersistedTypeRow> {
+    if !row.deletion.is_live() {
+        return None;
+    }
+    let type_name = String::from_utf8(row.clustering.clone()).ok()?;
+
+    let names_bytes = cell_bytes(
+        row,
+        ferrosa_schema::system::persistence::TYPES_COL_FIELD_NAMES,
+    )?;
+    let types_bytes = cell_bytes(
+        row,
+        ferrosa_schema::system::persistence::TYPES_COL_FIELD_TYPES,
+    )?;
+    let names: Vec<String> = serde_json::from_slice(&names_bytes).ok()?;
+    let types: Vec<ferrosa_common::CqlType> = serde_json::from_slice(&types_bytes).ok()?;
+    if names.len() != types.len() {
+        return None;
+    }
+    let fields = names.into_iter().zip(types).collect();
+    Some(PersistedTypeRow {
+        keyspace_name: keyspace.to_string(),
+        type_name,
+        fields,
+    })
 }
 
 /// Decode one stored `system_schema.indexes` row into a [`PersistedIndexRow`].
@@ -2645,6 +2701,34 @@ impl StorageEngine {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
                 if let Some(decoded) = decode_persisted_index_row(&keyspace, row) {
+                    out.push(decoded);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads every live row of the persisted `system_schema.types` table and
+    /// decodes it into [`PersistedTypeRow`]s.
+    ///
+    /// Storage-backed source for both `SELECT * FROM system_schema.types` (the
+    /// retired virtual table) and boot-time UDT reconstruction into the schema
+    /// Registry. Tombstoned/malformed rows are skipped. Returns an empty vector
+    /// when the table is not registered.
+    pub fn read_persisted_types(&self) -> ferrosa_common::Result<Vec<PersistedTypeRow>> {
+        let types_tid = TableId::new("system_schema", "types");
+        if !self.tables.read().contains_key(&types_tid) {
+            return Ok(Vec::new());
+        }
+
+        const MAX_TYPES_TO_READ: usize = 10_000;
+        let partitions = self.read_range(&types_tid, None, None, MAX_TYPES_TO_READ)?;
+
+        let mut out = Vec::new();
+        for partition in &partitions {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
+            for row in &partition.rows {
+                if let Some(decoded) = decode_persisted_type_row(&keyspace, row) {
                     out.push(decoded);
                 }
             }
@@ -15904,6 +15988,109 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros() as i64
+    }
+
+    /// A persisted `system_schema.types` row survives a flush + reopen and
+    /// `read_persisted_types` decodes it back into the original UDT fields,
+    /// including a nested collection field type (lossless serde round-trip).
+    #[test]
+    fn read_persisted_types_round_trips_through_storage() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let types_tid = TableId::new("system_schema", "types");
+        let udt = UserTypeMetadata {
+            keyspace: "app".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+                (
+                    "tags".to_string(),
+                    CqlType::List(Box::new(CqlType::Varchar)),
+                ),
+            ],
+        };
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_system_tables().unwrap();
+
+            // Persist the type row exactly as the DDL write path does.
+            let row = persistence::type_to_row(&udt);
+            engine
+                .write(&types_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+            engine.flush(&types_tid).unwrap();
+        }
+
+        // Reopen and read from storage (SSTable, not memtable).
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+
+        let stored = engine.read_persisted_types().unwrap();
+        assert_eq!(stored.len(), 1, "exactly one persisted type expected");
+        let row = &stored[0];
+        assert_eq!(row.keyspace_name, "app");
+        assert_eq!(row.type_name, "address");
+        assert_eq!(
+            row.fields,
+            vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+                (
+                    "tags".to_string(),
+                    CqlType::List(Box::new(CqlType::Varchar))
+                ),
+            ],
+            "fields (incl. nested list<text>) must round-trip losslessly"
+        );
+    }
+
+    /// A tombstoned `system_schema.types` row (DROP TYPE) masks the live row:
+    /// `read_persisted_types` returns nothing after the tombstone is written.
+    #[test]
+    fn read_persisted_types_skips_tombstoned_rows() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let types_tid = TableId::new("system_schema", "types");
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+
+        let udt = UserTypeMetadata {
+            keyspace: "app".to_string(),
+            name: "gone".to_string(),
+            fields: vec![("x".to_string(), CqlType::Int)],
+        };
+        let row = persistence::type_to_row(&udt);
+        engine
+            .write(&types_tid, &row.key, row.row, now_micros_for_test())
+            .unwrap();
+        assert_eq!(engine.read_persisted_types().unwrap().len(), 1);
+
+        // Tombstone the same (keyspace, type_name) via a row deletion.
+        let ts = now_micros_for_test() + 1;
+        let key = DecoratedKey::new(PartitionKey::new(b"app".to_vec()));
+        let tombstone = Row {
+            clustering: b"gone".to_vec(),
+            cells: vec![],
+            deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        engine.write(&types_tid, &key, tombstone, ts).unwrap();
+
+        assert!(
+            engine.read_persisted_types().unwrap().is_empty(),
+            "dropped type must not appear in read_persisted_types"
+        );
     }
 
     #[test]
