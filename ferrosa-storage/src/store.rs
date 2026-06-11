@@ -3874,6 +3874,99 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Query a geo (cell-id) secondary index by a set of `[start, end]` cell-id
+    /// ranges, returning the matching base-table partitions.
+    ///
+    /// Unlike [`read_by_index`](Self::read_by_index) — which does a point lookup
+    /// on an exact key — a geo index is keyed by an 8-byte big-endian
+    /// space-filling-curve cell id, so a spatial query maps to a small bounded
+    /// set of contiguous cell-id ranges (produced by `ferrosa_index::geo::cover_*`).
+    /// Each `(start, end)` is an **inclusive** range of `u64` cell ids; this
+    /// scans the ordered memtable index and every SSTable sidecar for entries
+    /// whose big-endian key falls inside any range, deduplicates by
+    /// `(partition_key, clustering_key)`, and fetches the rows.
+    ///
+    /// The same fail-loud [`INDEX_RESULT_CAP`] bound as `read_by_index` applies:
+    /// the candidate set is never silently truncated — exceeding the cap returns
+    /// an error suggesting `ALLOW FILTERING`. The geo cover ranges are already
+    /// bounded (<= a few thousand cells), so the candidate count is bounded by
+    /// the data that actually lives in those cells. Refinement with exact
+    /// distance / containment is the caller's responsibility (the cover is an
+    /// over-approximation).
+    pub fn read_by_index_cell_ranges(
+        &self,
+        index_name: &str,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Partition>> {
+        let guard = self.view.load();
+
+        let mut positions: Vec<RowPosition> = Vec::new();
+        let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
+            if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "geo index query exceeded {} row limit; \
+                     use ALLOW FILTERING for unbounded scans",
+                    INDEX_RESULT_CAP
+                )));
+            }
+            positions.extend(batch);
+            Ok(())
+        };
+
+        // Encode each (start, end) cell id to its big-endian key bounds once.
+        let key_ranges: Vec<(IndexKey, IndexKey)> = ranges
+            .iter()
+            .map(|(start, end)| {
+                (
+                    IndexKey(start.to_be_bytes().to_vec()),
+                    IndexKey(end.to_be_bytes().to_vec()),
+                )
+            })
+            .collect();
+
+        // 1. Memtable index: ordered range scan per range.
+        if let Some(idx) = guard.indexes.get(index_name) {
+            for (start_key, end_key) in &key_ranges {
+                append_positions(idx.range(start_key, end_key))?;
+            }
+        }
+
+        // 2. SSTable sidecar indexes: ordered range scan per range.
+        for sidecar in guard.sidecar_indexes.iter() {
+            if let Some(reader) = sidecar.get(index_name) {
+                for (start_key, end_key) in &key_ranges {
+                    if let Ok(results) = reader.range(start_key, end_key) {
+                        append_positions(results)?;
+                    }
+                }
+            }
+        }
+
+        // 3. Deduplicate by (partition_key, clustering_key). A point may appear
+        //    in overlapping ranges and across memtable + sidecars.
+        let mut seen = std::collections::HashSet::new();
+        positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
+
+        // 4. Fetch base-table rows, carrying the clustering key so wide clustered
+        //    tables do not materialize the whole partition per hit.
+        let mut partitions = Vec::new();
+        for pos in &positions {
+            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+                pos.partition_key.clone(),
+            ));
+            let read = if pos.clustering_key.is_empty() {
+                self.read(&dk)
+            } else {
+                self.read_clustering_row(&dk, &pos.clustering_key)
+            };
+            if let Ok(Some(partition)) = read {
+                partitions.push(partition);
+            }
+        }
+
+        Ok(partitions)
+    }
+
     /// Retrieve a named memtable-level secondary index.
     ///
     /// Returns `None` if no index with the given name was declared at
@@ -6317,6 +6410,137 @@ mod tests {
             err_msg.contains("10000") || err_msg.contains("ALLOW FILTERING"),
             "error should mention cap or ALLOW FILTERING, got: {err_msg}"
         );
+    }
+
+    // =========================================================================
+    // Geo cell-range index read (read_by_index_cell_ranges)
+    // =========================================================================
+
+    /// Build a CQL `frozen<tuple<double,double>>` wire body for a geo point.
+    fn geo_tuple_bytes(lat: f64, lon: f64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24);
+        for f in [lat, lon] {
+            v.extend_from_slice(&8i32.to_be_bytes());
+            v.extend_from_slice(&f.to_be_bytes());
+        }
+        v
+    }
+
+    /// Create a geo-indexed store with a single `frozen<tuple<double,double>>`
+    /// `location` column at position 0 and a `Geo` index over it.
+    fn geo_store() -> TableStore<InMemoryFlushTarget> {
+        let schema = TableSchema {
+            keyspace: "geo".to_string(),
+            table: "places".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "location".to_string(),
+                type_name:
+                    "org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.TupleType(org.apache.cassandra.db.marshal.DoubleType,org.apache.cassandra.db.marshal.DoubleType))"
+                        .to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let mut store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![],
+        );
+        store.add_index("loc_geo".to_string(), 0, IndexType::Geo);
+        store
+    }
+
+    fn write_geo_point(store: &TableStore<InMemoryFlushTarget>, pk: &str, lat: f64, lon: f64) {
+        let key = make_key(pk);
+        store
+            .write(
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(geo_tuple_bytes(lat, lon), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn read_by_index_cell_ranges_returns_points_in_range() {
+        use ferrosa_index::geo::{cover_radius, encode_point, DEFAULT_COVER_LEVEL};
+
+        let store = geo_store();
+        // SF cluster + a far NYC point.
+        write_geo_point(&store, "ferry", 37.7955, -122.3937);
+        write_geo_point(&store, "union", 37.7880, -122.4074);
+        write_geo_point(&store, "nyc", 40.7580, -73.9855);
+
+        // Cover a 3km radius around the Ferry Building. The two SF points fall
+        // inside; NYC does not.
+        let ranges: Vec<(u64, u64)> = cover_radius(37.7955, -122.3937, 3000.0, DEFAULT_COVER_LEVEL)
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        let partitions = store.read_by_index_cell_ranges("loc_geo", &ranges).unwrap();
+
+        // The cover is an over-approximation, but it must contain both SF cells
+        // and must not contain NYC's cell.
+        let nyc_id = encode_point(40.7580, -73.9855);
+        assert!(
+            !ranges.iter().any(|(s, e)| nyc_id >= *s && nyc_id <= *e),
+            "NYC cell must be outside the SF cover ranges"
+        );
+        // Both SF partitions are fetched (refinement happens in the router).
+        assert!(
+            partitions.len() >= 2,
+            "expected at least the two SF points, got {}",
+            partitions.len()
+        );
+    }
+
+    #[test]
+    fn read_by_index_cell_ranges_dedups_and_bounds() {
+        let store = geo_store();
+        // Insert one well-formed point, then >cap raw entries at one cell id to
+        // trip the fail-loud bound.
+        write_geo_point(&store, "p1", 0.0, 0.0);
+
+        let idx = store.get_memtable_index("loc_geo").unwrap();
+        let cell = ferrosa_index::geo::encode_point(0.0, 0.0);
+        let key = IndexKey(cell.to_be_bytes().to_vec());
+        for i in 0..(INDEX_RESULT_CAP as u32 + 1) {
+            idx.insert(
+                key.clone(),
+                RowPosition {
+                    partition_key: format!("pk{i}").into_bytes(),
+                    clustering_key: vec![],
+                },
+            );
+        }
+        let ranges = vec![(cell, cell)];
+        let result = store.read_by_index_cell_ranges("loc_geo", &ranges);
+        assert!(result.is_err(), "should fail loud when cap exceeded");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("10000") || msg.contains("ALLOW FILTERING"),
+            "error should mention the cap or ALLOW FILTERING, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_by_index_cell_ranges_unknown_index_is_empty() {
+        let store = geo_store();
+        write_geo_point(&store, "p1", 1.0, 2.0);
+        let result = store
+            .read_by_index_cell_ranges("nonexistent", &[(0, u64::MAX)])
+            .unwrap();
+        assert!(result.is_empty());
     }
 
     // =========================================================================

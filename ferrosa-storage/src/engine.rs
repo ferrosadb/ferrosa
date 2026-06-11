@@ -5121,6 +5121,26 @@ impl StorageEngine {
         }
     }
 
+    /// Query a geo (cell-id) secondary index by inclusive `[start, end]` cell-id
+    /// ranges across the memtable index and SSTable sidecars.
+    ///
+    /// Delegates to [`TableStore::read_by_index_cell_ranges`]. Returns an empty
+    /// vec if the table is not registered. The same fail-loud `INDEX_RESULT_CAP`
+    /// bound applies — an unbounded candidate set returns an error rather than
+    /// silently truncating.
+    pub fn read_by_index_cell_ranges(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        ranges: &[(u64, u64)],
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.read_by_index_cell_ranges(index_name, ranges),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Truncates a table: clears the memtable and drops all SSTable references.
     ///
     /// Full-text search across all FTI sidecar files for a table+index.
@@ -13158,6 +13178,97 @@ mod tests {
             );
             assert_eq!(results[0].key.key.as_bytes(), b"user1");
         }
+    }
+
+    /// Geo schema: a `places` table whose `location` column is a
+    /// `frozen<tuple<double,double>>` indexed with `IndexType::Geo`.
+    fn geo_schema() -> TableSchema {
+        TableSchema {
+            keyspace: "geo".to_string(),
+            table: "places".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "location".to_string(),
+                type_name:
+                    "org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.TupleType(org.apache.cassandra.db.marshal.DoubleType,org.apache.cassandra.db.marshal.DoubleType))"
+                        .to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    fn geo_tuple_bytes(lat: f64, lon: f64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24);
+        for f in [lat, lon] {
+            v.extend_from_slice(&8i32.to_be_bytes());
+            v.extend_from_slice(&f.to_be_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn engine_read_by_index_cell_ranges_finds_points_in_cover() {
+        use ferrosa_index::geo::{cover_radius, DEFAULT_COVER_LEVEL};
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("geo", "places");
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(geo_schema()).unwrap();
+        engine
+            .add_index(&tid, "loc_geo", 0, IndexType::Geo)
+            .unwrap();
+
+        for (pk, lat, lon) in [
+            ("ferry", 37.7955, -122.3937),
+            ("union", 37.7880, -122.4074),
+            ("nyc", 40.7580, -73.9855),
+        ] {
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(geo_tuple_bytes(lat, lon), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine.write(&tid, &make_key(pk), row, 1000).unwrap();
+        }
+
+        let ranges: Vec<(u64, u64)> = cover_radius(37.7955, -122.3937, 3000.0, DEFAULT_COVER_LEVEL)
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        let partitions = engine
+            .read_by_index_cell_ranges(&tid, "loc_geo", &ranges)
+            .unwrap();
+        // The two SF points are inside the 3km cover; NYC is far away.
+        assert!(
+            partitions.len() >= 2,
+            "expected >= 2 SF partitions, got {}",
+            partitions.len()
+        );
+        let pks: Vec<Vec<u8>> = partitions
+            .iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect();
+        assert!(pks.iter().any(|k| k == b"ferry"));
+        assert!(pks.iter().any(|k| k == b"union"));
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn engine_read_by_index_cell_ranges_unknown_table_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let result = engine
+            .read_by_index_cell_ranges(&TableId::new("nope", "nope"), "idx", &[(0, u64::MAX)])
+            .unwrap();
+        assert!(result.is_empty());
+        engine.shutdown().unwrap();
     }
 
     #[test]
