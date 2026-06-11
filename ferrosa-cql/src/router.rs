@@ -6741,6 +6741,55 @@ fn parse_filter_op(op: &str) -> Result<ferrosa_index::FilterOp, CqlError> {
     }
 }
 
+/// Coerce a filtered-index `filter_value` (always a string in the WITH OPTIONS
+/// map) into the [`Term`] shape the column's [`CqlType`] expects.
+///
+/// Text-like columns keep the value verbatim as a string literal. Numeric and
+/// boolean columns parse the string into the matching literal so that, e.g.,
+/// `filter_value':'21'` on an `int` column produces an integer literal rather
+/// than failing the type check that rejects a string literal on an int column.
+/// Parsing failures fail loud — a partial index with an unparseable predicate
+/// value must be rejected at CREATE time, not silently registered.
+fn filter_value_to_term(value: &str, cql_type: &CqlType) -> Result<Term, CqlError> {
+    match cql_type {
+        CqlType::Int
+        | CqlType::Bigint
+        | CqlType::Smallint
+        | CqlType::Tinyint
+        | CqlType::Varint
+        | CqlType::Counter
+        | CqlType::Timestamp => {
+            let n = value.parse::<i64>().map_err(|_| {
+                CqlError::Invalid(format!(
+                    "filtered index filter_value '{value}' is not a valid integer for the \
+                     filter column type"
+                ))
+            })?;
+            Ok(Term::IntegerLiteral(n))
+        }
+        CqlType::Float | CqlType::Double | CqlType::Decimal => {
+            let f = value.parse::<f64>().map_err(|_| {
+                CqlError::Invalid(format!(
+                    "filtered index filter_value '{value}' is not a valid number for the \
+                     filter column type"
+                ))
+            })?;
+            Ok(Term::FloatLiteral(f))
+        }
+        CqlType::Boolean => {
+            let b = value.parse::<bool>().map_err(|_| {
+                CqlError::Invalid(format!(
+                    "filtered index filter_value '{value}' is not a valid boolean (true/false)"
+                ))
+            })?;
+            Ok(Term::BoolLiteral(b))
+        }
+        // Text, inet, timestamps-as-strings, uuid, blob, dates, etc. all accept
+        // a string literal and parse it in `term_to_cql_value`.
+        _ => Ok(Term::StringLiteral(value.to_string())),
+    }
+}
+
 /// Build a fully-encoded [`ferrosa_index::FilterPredicate`] from the WITH
 /// OPTIONS of a `CREATE INDEX ... USING 'filtered'` statement.
 ///
@@ -6797,8 +6846,12 @@ fn build_filter_predicate_from_options(
         .get(filter_column)
         .ok_or_else(|| CqlError::Invalid(format!("filter_column '{filter_column}' not found")))?;
     let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
-    let cql_value =
-        bridge::term_to_cql_value(&Term::StringLiteral(filter_value.clone()), &cql_type)?;
+    // The WITH OPTIONS map always carries the filter value as a string. Coerce
+    // it to the term shape the column's type expects (e.g. `'21'` on an `int`
+    // column becomes an integer literal) before encoding — otherwise a numeric
+    // partial predicate would be rejected as a type mismatch at CREATE time.
+    let term = filter_value_to_term(filter_value, &cql_type)?;
+    let cql_value = bridge::term_to_cql_value(&term, &cql_type)?;
     let value = crate::types::encode_value(&cql_value);
 
     Ok(ferrosa_index::FilterPredicate {
@@ -6817,14 +6870,19 @@ fn build_filter_predicate_from_options(
 /// `indexed_col = v` but fall outside the partial predicate — a silent
 /// correctness bug.
 ///
-/// Conservative, sound rule: the query must carry an `Eq` predicate on the
-/// index's filter column whose encoded value SATISFIES the index predicate. For
-/// an index predicate `status = 'active'`, only a query with `status = 'active'`
-/// qualifies; every such row has `status = 'active'`, which is exactly the set
-/// the index retains, so the result is both correct and complete. A query with
-/// no `status` predicate, or `status = 'inactive'`, does not qualify and the
-/// index is withheld (the planner then falls back to FullScan / the usual
-/// unindexed-column error).
+/// Sound rule: the query must carry a predicate on the index's filter column
+/// whose value-set is a provable SUBSET of the index's retained set (see
+/// [`ferrosa_index::query_constraint_implies_predicate`]). This covers both the
+/// Eq-implies-Eq case and RANGE implication:
+/// - index predicate `status = 'active'`, query `status = 'active'` → usable
+/// - index predicate `age > 21`, query `age = 30` / `age > 25` / `age >= 22` → usable
+/// - index predicate `age > 21`, query `age > 10` / `age >= 21` → withheld
+///   (those queries admit rows the index excludes, so the result would be
+///   incomplete)
+///
+/// A query with no predicate on the filter column, or one whose value-set is
+/// not provably contained, does not qualify and the index is withheld (the
+/// planner then falls back to FullScan / the usual unindexed-column error).
 fn query_implies_filter_predicate(
     where_clauses: &[WhereClause],
     table_meta: &TableMetadata,
@@ -6833,9 +6891,14 @@ fn query_implies_filter_predicate(
     predicate: &ferrosa_index::FilterPredicate,
 ) -> bool {
     for wc in where_clauses {
-        if wc.op != ComparisonOp::Eq || wc.token_fn {
+        if wc.token_fn {
             continue;
         }
+        // Map the WHERE op to a filter op; only scalar comparisons can imply a
+        // partial predicate (IN/CONTAINS/LIKE/etc. are not handled and withhold).
+        let Some(query_op) = comparison_to_filter_op(&wc.op) else {
+            continue;
+        };
         // Match the WHERE column to the predicate's filter column by storage
         // ordinal — the same ordinal the predicate was built with.
         let Some(storage_idx) = table_meta.storage_column_index(&wc.column) else {
@@ -6845,15 +6908,37 @@ fn query_implies_filter_predicate(
             continue;
         }
         // Encode the query's literal the same way the predicate value was
-        // encoded, then check the index predicate accepts it.
+        // encoded, then check subset containment in that byte space.
         let Ok(key) = term_to_index_key(&wc.value, &wc.column, table_meta, ks, schema) else {
             continue;
         };
-        if ferrosa_index::evaluate_predicate(predicate, &key.0) {
+        if ferrosa_index::query_constraint_implies_predicate(query_op, &key.0, predicate) {
             return true;
         }
     }
     false
+}
+
+/// Map a CQL [`ComparisonOp`] to the index [`ferrosa_index::FilterOp`] used by
+/// partial-predicate implication. Only the scalar comparison operators have a
+/// filter-op equivalent; multi-value / pattern operators (`IN`, `CONTAINS`,
+/// `LIKE`, `SoundsLike`, …) return `None` so the planner withholds the partial
+/// index rather than reasoning unsoundly about them.
+fn comparison_to_filter_op(op: &ComparisonOp) -> Option<ferrosa_index::FilterOp> {
+    use ferrosa_index::FilterOp;
+    match op {
+        ComparisonOp::Eq => Some(FilterOp::Eq),
+        ComparisonOp::Ne => Some(FilterOp::NotEq),
+        ComparisonOp::Lt => Some(FilterOp::Lt),
+        ComparisonOp::Gt => Some(FilterOp::Gt),
+        ComparisonOp::Le => Some(FilterOp::LtEq),
+        ComparisonOp::Ge => Some(FilterOp::GtEq),
+        ComparisonOp::In
+        | ComparisonOp::Contains
+        | ComparisonOp::ContainsKey
+        | ComparisonOp::SoundsLike
+        | ComparisonOp::Like => None,
+    }
 }
 
 /// The set of filter-column NAMES covered by the given usable filtered
@@ -16771,6 +16856,146 @@ mod tests {
             count, 2,
             "without the implied predicate, both 'alice' rows must be returned (completeness)"
         );
+    }
+
+    /// Filtered (partial) index, RANGE-implication soundness (true positives):
+    /// a partial index `age > 21` must serve queries whose value-set is a
+    /// provable subset of `{age > 21}` — `age = 30`, `age > 25`, and `age >= 22`.
+    /// Each is index-accelerated (EXPLAIN names the index, not FullScan) and
+    /// returns exactly the implied rows. Built on an `int` column so the storage
+    /// encoding is the positive big-endian range where byte-order == value-order.
+    #[tokio::test]
+    async fn filtered_index_used_when_query_implies_range_predicate() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE fra WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fra.people (id int PRIMARY KEY, name text, age int)",
+            // Partial index on `name`, retaining only rows with age > 21.
+            "CREATE INDEX fra_name_adult ON fra.people (name) USING 'filtered' \
+             WITH OPTIONS = {'filter_column':'age','filter_op':'>','filter_value':'21'}",
+            "INSERT INTO fra.people (id, name, age) VALUES (1, 'alice', 30)",
+            "INSERT INTO fra.people (id, name, age) VALUES (2, 'alice', 18)",
+            "INSERT INTO fra.people (id, name, age) VALUES (3, 'alice', 26)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // age = 30 ⊆ {age > 21}: implied. Only the age=30 alice (id=1) qualifies.
+        let q = "SELECT id FROM fra.people WHERE name = 'alice' AND age = 30";
+        assert_explain_plan(&state, &ctx, q, "fra_name_adult").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(
+            count, 1,
+            "age=30 implies age>21 and selects only the 30 row"
+        );
+
+        // age > 25 ⊆ {age > 21}: implied. alice rows with age>25 are id=1 (30)
+        // and id=3 (26); both are in the index, so the index serves them.
+        let q = "SELECT id FROM fra.people WHERE name = 'alice' AND age > 25";
+        assert_explain_plan(&state, &ctx, q, "fra_name_adult").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(
+            count, 2,
+            "age>25 implies age>21 and selects the 30 and 26 rows"
+        );
+
+        // age >= 22 ⊆ {age > 21}: implied (22 > 21). Same two rows.
+        let q = "SELECT id FROM fra.people WHERE name = 'alice' AND age >= 22";
+        assert_explain_plan(&state, &ctx, q, "fra_name_adult").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 2, "age>=22 implies age>21");
+    }
+
+    /// Filtered (partial) index, RANGE-implication soundness (withheld cases):
+    /// a query whose filter-column value-set is NOT a provable subset of the
+    /// index's retained set MUST fall to FullScan so no qualifying row is
+    /// dropped. For a `age > 21` partial index, `age > 10` and `age >= 21` both
+    /// admit rows the index excludes (e.g. age 21 itself, age 18), so the index
+    /// is withheld and the complete result set is returned.
+    #[tokio::test]
+    async fn filtered_index_withheld_when_query_does_not_imply_range_predicate() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE frw WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE frw.people (id int PRIMARY KEY, name text, age int)",
+            "CREATE INDEX frw_name_adult ON frw.people (name) USING 'filtered' \
+             WITH OPTIONS = {'filter_column':'age','filter_op':'>','filter_value':'21'}",
+            // Three alices: age 30 (in index), age 21 (boundary, excluded),
+            // age 18 (excluded).
+            "INSERT INTO frw.people (id, name, age) VALUES (1, 'alice', 30)",
+            "INSERT INTO frw.people (id, name, age) VALUES (2, 'alice', 21)",
+            "INSERT INTO frw.people (id, name, age) VALUES (3, 'alice', 18)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // Assert a query is withheld (the partial index is not named and the
+        // plan is FullScan, proving soundness) and that the complete result set
+        // is still returned. Because withholding leaves `age` genuinely
+        // unindexed, the value-returning query must use ALLOW FILTERING — which
+        // is exactly the safe fallback we want: a full scan with a precise
+        // post-filter, never a silently incomplete index read.
+        async fn assert_withheld_full(
+            state: &SharedState,
+            ctx: &RequestContext<'_>,
+            q: &str,
+            index_name: &str,
+            expected_count: i32,
+        ) {
+            let stmt = crate::parser::parse(&format!("EXPLAIN {q}")).unwrap();
+            match route(state, ctx, stmt).await.unwrap() {
+                RouteResult::Result(b) => {
+                    let haystack = String::from_utf8_lossy(&b).into_owned();
+                    assert!(
+                        !haystack.contains(index_name),
+                        "partial index must be withheld for `{q}`, got: {haystack}"
+                    );
+                    assert!(
+                        haystack.contains("FullScan"),
+                        "`{q}` must fall to FullScan, got: {haystack}"
+                    );
+                }
+                _ => panic!("expected Result from EXPLAIN"),
+            }
+            // No partial-index hit is recorded; the complete set is returned via
+            // the full-scan + post-filter path.
+            let count =
+                assert_index_hit_and_count(state, ctx, &format!("{q} ALLOW FILTERING"), 0).await;
+            assert_eq!(
+                count, expected_count,
+                "`{q}` must return the complete set ({expected_count} rows)"
+            );
+        }
+
+        // age > 10 admits age=18 and age=21, neither in the {age>21} index.
+        assert_withheld_full(
+            &state,
+            &ctx,
+            "SELECT id FROM frw.people WHERE name = 'alice' AND age > 10",
+            "frw_name_adult",
+            3,
+        )
+        .await;
+
+        // age >= 21 admits age=21 (the index excludes the boundary).
+        assert_withheld_full(
+            &state,
+            &ctx,
+            "SELECT id FROM frw.people WHERE name = 'alice' AND age >= 21",
+            "frw_name_adult",
+            2,
+        )
+        .await;
     }
 
     /// CREATE INDEX ... USING 'filtered' with a missing/invalid predicate option
