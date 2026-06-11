@@ -33,6 +33,13 @@ pub struct BuildRequest {
     pub table: (String, String),
     pub column_position: usize,
     pub priority: String,
+    /// Partial-index predicate. `Some` only for a `filtered` index build: the
+    /// fully-encoded [`ferrosa_index::FilterPredicate`] (value bytes already in
+    /// storage encoding) the builder applies at build time so the remote sidecar
+    /// contains exactly the matching rows — never an unfiltered sidecar. Omitted
+    /// (deserializes to `None`) for every other index type.
+    #[serde(default)]
+    pub filter_predicate: Option<ferrosa_index::FilterPredicate>,
 }
 
 /// Response returned from a completed build.
@@ -236,17 +243,7 @@ impl WorkerPool {
         }
 
         // Build the index using LocalBackend (blocking — run on a thread).
-        let index_type = parse_index_type(&req.index_type)?;
-        let job = IndexBuildJob {
-            sstable_id: req.sstable_id.clone(),
-            index_name: req.index_name.clone(),
-            index_type,
-            table: (req.table.0.clone(), req.table.1.clone()),
-            priority: parse_priority(&req.priority),
-            enqueued_at: Instant::now(),
-            column_position: req.column_position,
-            filter_predicate: None,
-        };
+        let job = build_job(req)?;
 
         let job_dir_clone = job_dir.clone();
         let build_result = tokio::task::spawn_blocking(move || {
@@ -301,12 +298,31 @@ impl BuildRequest {
     }
 }
 
+/// Build an [`IndexBuildJob`] from a [`BuildRequest`], carrying the partial
+/// predicate (if any) so a `filtered` build applies it at build time. This is
+/// the single place the wire request is mapped to a job; extracted so the
+/// predicate plumbing is unit-testable without spinning up the HTTP path.
+fn build_job(req: &BuildRequest) -> Result<IndexBuildJob, String> {
+    let index_type = parse_index_type(&req.index_type)?;
+    Ok(IndexBuildJob {
+        sstable_id: req.sstable_id.clone(),
+        index_name: req.index_name.clone(),
+        index_type,
+        table: (req.table.0.clone(), req.table.1.clone()),
+        priority: parse_priority(&req.priority),
+        enqueued_at: Instant::now(),
+        column_position: req.column_position,
+        filter_predicate: req.filter_predicate.clone(),
+    })
+}
+
 fn parse_index_type(s: &str) -> Result<IndexType, String> {
     match s.to_lowercase().as_str() {
         "btree" => Ok(IndexType::BTree),
         "hash" => Ok(IndexType::Hash),
         "composite" => Ok(IndexType::Composite),
         "phonetic" => Ok(IndexType::Phonetic),
+        "filtered" => Ok(IndexType::Filtered),
         "vector" => Ok(IndexType::Vector),
         "fulltext" => Ok(IndexType::FullText),
         "geo" => Ok(IndexType::Geo),
@@ -335,7 +351,69 @@ mod tests {
             Ok(IndexType::FullText)
         ));
         assert!(matches!(parse_index_type("GEO"), Ok(IndexType::Geo)));
+        // Filtered must be recognized now that the remote builder carries the
+        // partial predicate and filters at build time.
+        assert!(matches!(
+            parse_index_type("filtered"),
+            Ok(IndexType::Filtered)
+        ));
         assert!(parse_index_type("unknown").is_err());
+    }
+
+    /// A filtered build request deserializes the wire `filter_predicate` and,
+    /// via `build_job`, threads it into the `IndexBuildJob` so `LocalBackend`
+    /// filters rows at build time. Without this, the remote builder would write
+    /// an UNFILTERED sidecar — a silent correctness bug.
+    #[test]
+    fn build_request_threads_filter_predicate_into_job() {
+        use ferrosa_index::{FilterOp, FilterPredicate};
+
+        let predicate = FilterPredicate {
+            column_position: 1,
+            op: FilterOp::Gt,
+            value: vec![0, 0, 0, 21],
+        };
+        // Construct the request the way the engine sends it (JSON), to prove the
+        // wire field deserializes.
+        let json = serde_json::json!({
+            "sstable_id": "gen-7",
+            "index_name": "name_adult_idx",
+            "index_type": "filtered",
+            "s3_endpoint": "memory://",
+            "s3_bucket": "b",
+            "s3_prefix": "p/ks.tbl/gen-7",
+            "table": ["ks", "tbl"],
+            "column_position": 0,
+            "priority": "normal",
+            "filter_predicate": predicate,
+        });
+        let req: BuildRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.filter_predicate.as_ref(), Some(&predicate));
+
+        let job = build_job(&req).unwrap();
+        assert!(matches!(job.index_type, IndexType::Filtered));
+        assert_eq!(job.filter_predicate.as_ref(), Some(&predicate));
+        assert_eq!(job.column_position, 0);
+    }
+
+    /// A non-filtered request omits `filter_predicate`; the job carries `None`.
+    #[test]
+    fn build_request_without_predicate_yields_none() {
+        let json = serde_json::json!({
+            "sstable_id": "gen-1",
+            "index_name": "email_idx",
+            "index_type": "btree",
+            "s3_endpoint": "memory://",
+            "s3_bucket": "b",
+            "s3_prefix": "p/ks.tbl/gen-1",
+            "table": ["ks", "tbl"],
+            "column_position": 0,
+            "priority": "normal",
+        });
+        let req: BuildRequest = serde_json::from_value(json).unwrap();
+        assert!(req.filter_predicate.is_none());
+        let job = build_job(&req).unwrap();
+        assert!(job.filter_predicate.is_none());
     }
 
     #[test]
@@ -363,6 +441,7 @@ mod tests {
                 table: ("ks".into(), "tbl".into()),
                 column_position: 0,
                 priority: "normal".into(),
+                filter_predicate: None,
             })
             .await;
 

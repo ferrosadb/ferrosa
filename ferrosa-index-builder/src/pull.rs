@@ -89,6 +89,8 @@ pub async fn run(
                             table: (entry.keyspace.clone(), entry.table.clone()),
                             column_position: *col_pos,
                             priority: "normal".into(),
+                            // Pull mode rebuilds btree indexes only; no partial predicate.
+                            filter_predicate: None,
                         };
 
                         let pool = Arc::clone(&pool);

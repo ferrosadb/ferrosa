@@ -268,26 +268,7 @@ impl RemoteBackend {
         let endpoint = &self.endpoints[endpoint_idx];
         let url = format!("{endpoint}/internal/index/build");
 
-        let table_id = format!("{}.{}", job.table.0, job.table.1);
-        let s3_prefix = self.s3_resolver.resolve(&table_id, &job.sstable_id);
-
-        let body = serde_json::json!({
-            "sstable_id": job.sstable_id,
-            "index_name": job.index_name,
-            "index_type": format!("{:?}", job.index_type).to_lowercase(),
-            "artifact_kind": if job.index_type == ferrosa_index::IndexType::Vector { Some("hvq_qvec") } else { None },
-            "direct_upload": job.index_type == ferrosa_index::IndexType::Vector,
-            "s3_endpoint": self.s3_resolver.endpoint,
-            "s3_bucket": self.s3_resolver.bucket,
-            "s3_prefix": s3_prefix,
-            "table": [&job.table.0, &job.table.1],
-            "column_position": job.column_position,
-            "priority": match job.priority {
-                super::scheduler::BuildPriority::High => "high",
-                super::scheduler::BuildPriority::Normal => "normal",
-                super::scheduler::BuildPriority::Initial => "initial",
-            },
-        });
+        let body = build_request_body(job, &self.s3_resolver);
 
         let config = ureq::config::Config::builder()
             .timeout_global(Some(self.timeout))
@@ -350,22 +331,52 @@ impl RemoteBackend {
     }
 }
 
+/// Build the JSON request body sent to a remote index builder for `job`.
+///
+/// Mirrors every build parameter the builder needs to reproduce the local
+/// build: identity, S3 location, table, column position, priority — and, for a
+/// partial (Filtered) index, the fully-encoded [`ferrosa_index::FilterPredicate`]
+/// under `filter_predicate` so the builder filters rows at build time exactly as
+/// the local path does. Non-filtered jobs omit the field (the builder then
+/// defaults to an unfiltered build). The predicate value bytes are already in
+/// storage encoding, so the round-trip is type-system independent.
+fn build_request_body(job: &IndexBuildJob, resolver: &S3PathResolver) -> serde_json::Value {
+    let table_id = format!("{}.{}", job.table.0, job.table.1);
+    let s3_prefix = resolver.resolve(&table_id, &job.sstable_id);
+
+    let mut body = serde_json::json!({
+        "sstable_id": job.sstable_id,
+        "index_name": job.index_name,
+        "index_type": format!("{:?}", job.index_type).to_lowercase(),
+        "artifact_kind": if job.index_type == ferrosa_index::IndexType::Vector { Some("hvq_qvec") } else { None },
+        "direct_upload": job.index_type == ferrosa_index::IndexType::Vector,
+        "s3_endpoint": resolver.endpoint,
+        "s3_bucket": resolver.bucket,
+        "s3_prefix": s3_prefix,
+        "table": [&job.table.0, &job.table.1],
+        "column_position": job.column_position,
+        "priority": match job.priority {
+            super::scheduler::BuildPriority::High => "high",
+            super::scheduler::BuildPriority::Normal => "normal",
+            super::scheduler::BuildPriority::Initial => "initial",
+        },
+    });
+
+    // Only attach the predicate for partial indexes; a non-filtered job omits
+    // the field entirely so the builder builds the index unfiltered.
+    if let Some(predicate) = &job.filter_predicate {
+        body["filter_predicate"] = serde_json::to_value(predicate)
+            .expect("FilterPredicate serializes to JSON (Vec<u8>/enum/usize)");
+    }
+
+    body
+}
+
 impl IndexBuildBackend for RemoteBackend {
     fn build(&self, job: &IndexBuildJob) -> Result<IndexBuildResult, String> {
-        // The remote builder wire protocol does not yet carry a partial-index
-        // FilterPredicate, so dispatching a Filtered job remotely would build an
-        // UNFILTERED sidecar — a silent correctness bug. Build it locally
-        // instead (the local fallback applies the predicate the job carries).
-        if job.filter_predicate.is_some() {
-            tracing::info!(
-                sstable_id = %job.sstable_id,
-                index_name = %job.index_name,
-                "filtered index build kept local — remote builder does not carry the partial predicate"
-            );
-            return self.local_fallback.build(job);
-        }
-
-        // Try each available endpoint.
+        // Try each available endpoint. A partial (Filtered) index carries its
+        // predicate in the request body (see `build_request_body`), so the
+        // builder filters at build time — no local-only fallback needed.
         let n = self.endpoints.len();
         let start = self.next_endpoint.fetch_add(1, Ordering::Relaxed) as usize;
         let mut last_error = String::new();
@@ -573,53 +584,68 @@ mod tests {
         assert_eq!(result.artifact_manifest_entries[0].build_id, 9);
     }
 
-    /// A Filtered job must never be dispatched to a remote endpoint (the wire
-    /// protocol carries no predicate), so `build` routes it straight to the
-    /// local fallback. With a missing SSTable the local fallback fails with an
-    /// "open data" error — proving the local path ran and the (unreachable)
-    /// remote endpoint was never contacted.
+    /// A Filtered job is now dispatched to the remote builder: the wire request
+    /// body MUST carry the fully-encoded partial predicate so the builder filters
+    /// at build time (rather than producing an unfiltered sidecar). This asserts
+    /// the predicate round-trips into the request JSON under `filter_predicate`,
+    /// mirroring how `column_position` and the other build params are carried.
     #[test]
-    fn filtered_job_is_built_locally_not_dispatched_remotely() {
+    fn filtered_job_request_body_carries_predicate() {
         use ferrosa_index::{FilterOp, FilterPredicate};
 
-        let dir = tempfile::tempdir().unwrap();
         let resolver = S3PathResolver {
             bucket: "b".into(),
             endpoint: "memory://".into(),
             prefix: "p".into(),
         };
-        let backend = RemoteBackend::new(
-            // An endpoint that would fail loudly if contacted.
-            vec!["http://127.0.0.1:1/never".to_string()],
-            resolver,
-            Duration::from_millis(50),
-            0,
-            3,
-            Duration::from_secs(60),
-            LocalBackend::new(dir.path().to_path_buf()),
-        );
-
+        let predicate = FilterPredicate {
+            column_position: 1,
+            op: FilterOp::Gt,
+            value: vec![0, 0, 0, 21],
+        };
         let job = IndexBuildJob {
-            sstable_id: "missing-gen".to_string(),
-            index_name: "name_active_idx".to_string(),
+            sstable_id: "gen-7".to_string(),
+            index_name: "name_adult_idx".to_string(),
             index_type: ferrosa_index::IndexType::Filtered,
             table: ("ks".to_string(), "tbl".to_string()),
             priority: super::super::scheduler::BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
-            filter_predicate: Some(FilterPredicate {
-                column_position: 1,
-                op: FilterOp::Eq,
-                value: b"active".to_vec(),
-            }),
+            filter_predicate: Some(predicate.clone()),
         };
 
-        let err = backend.build(&job).expect_err(
-            "filtered build must reach the local fallback and fail on the missing SSTable",
-        );
+        let body = build_request_body(&job, &resolver);
+        assert_eq!(body["index_type"], "filtered");
+        assert_eq!(body["column_position"], 0);
+        // The predicate is present and decodes back to the exact predicate.
+        let decoded: FilterPredicate =
+            serde_json::from_value(body["filter_predicate"].clone()).unwrap();
+        assert_eq!(decoded, predicate);
+    }
+
+    /// A non-filtered job carries no `filter_predicate` field (it is omitted, not
+    /// null), so the remote builder defaults to an unfiltered build.
+    #[test]
+    fn non_filtered_job_request_body_omits_predicate() {
+        let resolver = S3PathResolver {
+            bucket: "b".into(),
+            endpoint: "memory://".into(),
+            prefix: "p".into(),
+        };
+        let job = IndexBuildJob {
+            sstable_id: "gen-1".to_string(),
+            index_name: "email_idx".to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: super::super::scheduler::BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+            filter_predicate: None,
+        };
+        let body = build_request_body(&job, &resolver);
         assert!(
-            err.contains("open data"),
-            "expected a local-fallback file error, got: {err}"
+            body.get("filter_predicate").is_none(),
+            "non-filtered jobs must omit filter_predicate, got: {body}"
         );
     }
 }
