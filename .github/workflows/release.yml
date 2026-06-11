@@ -5,6 +5,14 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      prerelease:
+        description: >-
+          Mark the GitHub release as a prerelease (the "nightly" channel).
+          Stable releases are promoted separately via promote-release.yml.
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -340,7 +348,18 @@ jobs:
           # Replace VERSION placeholder in notes
           NOTES="${NOTES//VERSION/${VERSION}}"
 
+          # Channel policy: every freshly built release is a prerelease (the
+          # "nightly" channel). A release becomes "stable" only when a human
+          # promotes it (promote-release.yml -> marks it --latest, not pre).
+          # Tag-push events carry no input, so they default to prerelease too.
+          PRERELEASE="${{ github.event.inputs.prerelease }}"
+          if [ "${PRERELEASE}" = "false" ]; then
+            REL_FLAGS=(--latest)
+          else
+            REL_FLAGS=(--prerelease)
+          fi
+
           gh release create "v${VERSION}" dist/* \
             --title "Ferrosa v${VERSION}" \
             --notes "$NOTES" \
-            --latest
+            "${REL_FLAGS[@]}"
