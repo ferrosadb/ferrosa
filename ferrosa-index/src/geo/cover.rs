@@ -39,7 +39,7 @@ fn lon_step(level: u32) -> f64 {
 ///
 /// `sw`/`ne` are `(lat, lon)` corners. If `sw_lon > ne_lon` the box is taken to
 /// cross the antimeridian and is scanned as two longitude sub-spans. The chosen
-/// `level` is automatically coarsened if the grid would exceed [`MAX_GRID_CELLS`].
+/// `level` is automatically coarsened if the grid would exceed `MAX_GRID_CELLS`.
 pub fn cover_bbox(sw: (f64, f64), ne: (f64, f64), level: u32) -> Vec<CellRange> {
     let (sw_lat, sw_lon) = sw;
     let (ne_lat, ne_lon) = ne;

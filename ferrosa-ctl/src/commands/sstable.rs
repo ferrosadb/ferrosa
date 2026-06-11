@@ -6,11 +6,11 @@
 //! subdirectory, the same way the engine does at startup.
 //!
 //! The corruption verdict is delegated to the storage engine's own startup
-//! smoke test, [`StorageEngine::smoke_test_generation`] — the exact function
+//! smoke test, `StorageEngine::smoke_test_generation` — the exact function
 //! the self-heal detector runs to decide what to quarantine. A ctl verdict can
 //! therefore never diverge from what a node decides at boot. Component-level
 //! detail (partition counts, Data.db extent, timestamps) comes from the BTI
-//! [`SSTableReader`].
+//! `SSTableReader`.
 //!
 //! All commands here are **read-only** except the recovery action, which only
 //! ever moves files (never deletes) and defaults to a dry run.

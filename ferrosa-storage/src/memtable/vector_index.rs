@@ -151,7 +151,7 @@ impl VectorMemtableIndex {
     /// paired with the partition-key scope captured at insert time.
     ///
     /// The scope is the serialized partition key bytes recorded via
-    /// [`insert_with_scope`]. It is `None` for entries inserted without a scope.
+    /// `insert_with_scope`. It is `None` for entries inserted without a scope.
     /// The router-level index-consult path uses the scope to recover the base
     /// table row, since the vector `RowPosition::offset` is only a sequential
     /// placeholder in the memtable and cannot address a row on its own.

@@ -2557,7 +2557,7 @@ impl StorageEngine {
     /// (`register_table_inner(.., vec![])`), so a restart used to silently drop
     /// every secondary index. This reads the dogfooded `system_schema.indexes`
     /// rows and re-registers each index on its (already-registered) user table
-    /// via [`Self::add_index`], preserving the persisted [`IndexType`] so the
+    /// via [`Self::add_index`], preserving the persisted `IndexType` so the
     /// memtable-index + backfill pipeline rebuilds the correct index kind.
     ///
     /// Must run *after* `system_schema.indexes` and the user tables are

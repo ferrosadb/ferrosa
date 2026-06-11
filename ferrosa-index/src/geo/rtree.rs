@@ -99,7 +99,7 @@ impl<T> Rtree<T> {
     ///
     /// The entries are sorted by centre latitude, sliced into
     /// `ceil(sqrt(n / capacity))` vertical strips, each strip sorted by centre
-    /// longitude and packed into leaves of up to [`NODE_CAPACITY`] entries.
+    /// longitude and packed into leaves of up to `NODE_CAPACITY` entries.
     /// Internal levels are then packed bottom-up the same way until a single
     /// root remains. Tree height is `O(log n)` so the iterative query stack is
     /// bounded.

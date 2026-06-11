@@ -3886,7 +3886,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// whose big-endian key falls inside any range, deduplicates by
     /// `(partition_key, clustering_key)`, and fetches the rows.
     ///
-    /// The same fail-loud [`INDEX_RESULT_CAP`] bound as `read_by_index` applies:
+    /// The same fail-loud `INDEX_RESULT_CAP` bound as `read_by_index` applies:
     /// the candidate set is never silently truncated — exceeding the cap returns
     /// an error suggesting `ALLOW FILTERING`. The geo cover ranges are already
     /// bounded (<= a few thousand cells), so the candidate count is bounded by
@@ -4006,7 +4006,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self.indexed_columns
     }
 
-    /// The declared [`IndexType`] for a named secondary index, defaulting to
+    /// The declared `IndexType` for a named secondary index, defaulting to
     /// `BTree` when unknown. Used by the eager / backfill / compaction index
     /// build paths so a job carries the index's real type.
     pub fn index_type_for(&self, index_name: &str) -> IndexType {
@@ -4268,7 +4268,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// Consult the vector index for the `k` nearest rows and return their
     /// **base-table partitions** in ascending-score (nearest-first) order.
     ///
-    /// Unlike [`ann_search`], which returns placeholder `IndexResult`s whose
+    /// Unlike `ann_search`, which returns placeholder `IndexResult`s whose
     /// `RowPosition::offset` cannot address a row, this method recovers the
     /// partition-key scope captured at insert time and fetches each row via the
     /// normal read path — so the router can serve `ORDER BY col ANN OF [...]
