@@ -139,6 +139,51 @@ any miss once the variant exists — a useful forcing function):
    mirroring `vector/` and `VectorIndexMethod`.
 9. `ST_Within`/`ST_Intersects`/`ST_Contains`, exact predicates, polygon/line support.
 
+## 6a. Phase-2 status & this PR's slice
+
+Phase 1 (point index over BTree, `GEO_NEAREST` / `GEO_WITHIN_RADIUS` /
+`GEO_WITHIN_BBOX` / `ST_WITHIN(point, polygon)`) is **implemented and tested** on
+main: `ferrosa-index/src/geo/` carries the encoder, cover/knn planners, haversine
+refine, single-ring `Polygon` + ray-cast, and a bulk-loaded STR `Rtree`. The CQL
+surface dispatches through `route_geo_select` with EXPLAIN `GeoIndex` and
+`index_usage` accounting.
+
+Phase 2 is decomposed into independent vertical slices so each can land green:
+
+| Slice | What it adds | Status |
+|---|---|---|
+| **P2-a — R-tree in the live `ST_WITHIN` path** | use the existing `geo::rtree` to prune polygon-bbox candidates before the exact ray-cast | **this PR** |
+| **P2-b — stored `GEOMETRY` column (WKB)** | a marshalled geometry type in `ferrosa-common`, WKB parse/serialize, round-trip | deferred |
+| **P2-c — `ST_INTERSECTS` / `ST_CONTAINS`** | predicates between two *stored* geometries, backed by P2-b + the R-tree sidecar | deferred |
+| **P2-d — rich geometry** | multi-ring polygons (holes), linestrings, antimeridian splitting, native `-GEO-` sidecar | deferred |
+
+### What THIS PR (P2-a) delivers
+
+- A pure, tested `geo::points_in_polygon_rtree(candidates, polygon)` helper
+  (`ferrosa-index/src/geo/geometry.rs`): bulk-loads the candidate points into the
+  `Rtree` (degenerate point bboxes), queries it with the polygon's exact bounding
+  box to **prune off-bbox candidates in O(log n)**, then runs `point_in_polygon`
+  only on the survivors. Verified equal to brute-force ray-casting (including a
+  concave-notch case and degenerate/empty inputs).
+- Wires that helper into the live single-polygon `ST_WITHIN` query path
+  (`ferrosa-cql/src/router.rs::route_geo_select`), replacing the prior brute-force
+  `filter(point_in_polygon)` over every fetched candidate. The cell cover is a
+  coarse over-approximation of the polygon bbox, so the R-tree prune removes the
+  rows the cover pulled in beyond the true bbox before any ray-cast runs.
+- End-to-end coverage unchanged and still green: the central-SF and concave-notch
+  `ST_WITHIN` E2E tests both assert EXPLAIN `GeoIndex` + the `index_usage`
+  increment, and now exercise the R-tree-pruned path.
+
+### What THIS PR defers (see `remaining`)
+
+- **Stored `GEOMETRY` column type + WKB marshal** (P2-b) — the foundation for
+  comparing two stored geometries. Not started here; `ST_WITHIN` still operates on
+  the query-literal polygon vs stored *points*.
+- **`ST_INTERSECTS` / `ST_CONTAINS`** between two stored geometries (P2-c).
+- **Multi-ring polygons / holes, linestrings, antimeridian-crossing polygons**
+  (P2-d). Antimeridian `ST_WITHIN` is still rejected loudly (no silent wrong
+  answer), as before.
+
 ## 7. Risks & open questions
 
 - **CRS / distance:** Phase 1 should default to WGS84 spherical (haversine); planar is

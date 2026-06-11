@@ -18,7 +18,7 @@ pub mod rtree;
 
 pub use cover::{cover_bbox, cover_radius, CellRange, DEFAULT_COVER_LEVEL};
 pub use encode::{encode_cell, encode_point, BITS_PER_AXIS, CELL_ID_BITS};
-pub use geometry::{point_in_polygon, polygon_bbox, Polygon};
+pub use geometry::{point_in_polygon, points_in_polygon_rtree, polygon_bbox, GeoPoint, Polygon};
 pub use knn::{nearest_k, GeoCandidate};
 pub use refine::{haversine_m, within_bbox, within_radius, EARTH_RADIUS_M};
 pub use rtree::{Rtree, RtreeBbox};
