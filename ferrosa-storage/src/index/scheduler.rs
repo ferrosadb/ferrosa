@@ -230,14 +230,26 @@ impl IndexBuildBackend for LocalBackend {
         })
         .map_err(|e| format!("open sstable: {e}"))?;
 
-        // Read all partitions and build sidecar entries.
-        let all_partitions = reader
-            .read_all_partitions()
-            .map_err(|e| format!("read partitions: {e}"))?;
+        // Stream partitions one at a time rather than materializing the whole
+        // SSTable. `read_all_partitions()` would hold every decoded partition —
+        // all cell values of all columns — in memory at once; on a large
+        // SSTable that is an OOM hazard. `partitions_iter()` keeps a single
+        // partition live plus the (much smaller) extracted index entries:
+        // O(1) memory for uncompressed SSTables, O(decompressed chunk) for
+        // compressed, independent of partition count. The index `entries` Vec
+        // is inherently O(indexed rows) — a sidecar must index every row, so it
+        // is not capped here (dropping entries would silently corrupt the
+        // index); the win is not holding the full row payloads alongside it.
+        let mut iter = reader
+            .partitions_iter()
+            .map_err(|e| format!("open partition iterator: {e}"))?;
 
         let mut entries: Vec<(ferrosa_index::IndexKey, RowPosition)> = Vec::new();
 
-        for partition in &all_partitions {
+        while let Some(partition) = iter
+            .next_partition()
+            .map_err(|e| format!("read partition: {e}"))?
+        {
             let pk_bytes = partition.key.key.as_bytes().to_vec();
             for row in &partition.rows {
                 // Find the cell at the declared column position.
@@ -1459,6 +1471,55 @@ mod tests {
         assert!(keys.contains(&IndexKey(b"alice".to_vec())));
         assert!(keys.contains(&IndexKey(b"bob".to_vec())));
         assert_eq!(entries.len(), 2);
+    }
+
+    /// Regression guard for the streaming build path: building over many
+    /// partitions must emit exactly one index entry per indexed row — proving
+    /// the streaming `partitions_iter()` visits every partition with nothing
+    /// dropped or truncated, while never materializing the whole SSTable.
+    #[test]
+    fn local_backend_build_streams_all_rows_across_partitions() {
+        let values: Vec<(Vec<u8>, Vec<u8>)> = (0..50u32)
+            .map(|i| {
+                (
+                    format!("pk{i:03}").into_bytes(),
+                    format!("val{i:03}").into_bytes(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = values
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let (dir, gen) = write_text_sstable(&refs);
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: gen,
+            index_name: "name_idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+        };
+
+        let result = backend.build(&job).unwrap();
+        let entries = result
+            .sidecar_entries
+            .get("name_idx")
+            .expect("btree build should produce sidecar entries");
+        // Exactly one entry per row across all 50 partitions — nothing dropped.
+        assert_eq!(
+            entries.len(),
+            50,
+            "streaming build must visit every partition"
+        );
+        // Boundary partitions (first and last in token order) are indexed.
+        let has = |v: &[u8]| entries.iter().any(|(k, _)| k.0 == v);
+        assert!(
+            has(b"val000") && has(b"val049"),
+            "first and last partitions must both produce entries"
+        );
     }
 
     #[test]
