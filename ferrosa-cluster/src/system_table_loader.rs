@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ferrosa_common::Error as FerrosaError;
 use ferrosa_schema::system::persistence::PERMISSIONS_COL_PERMISSIONS;
-use ferrosa_schema::{GrantEntry, Permission, Resource, Schema};
+use ferrosa_schema::{GrantEntry, Permission, Resource, Schema, UserTypeMetadata};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
@@ -106,6 +106,48 @@ impl SystemTableLoader {
             })?;
         }
         Ok(count)
+    }
+
+    /// Load persisted user-defined types from `system_schema.types`.
+    ///
+    /// Reconstructs each [`UserTypeMetadata`] from the storage-decoded rows
+    /// (the engine drops tombstones and malformed rows). Field order is
+    /// preserved exactly as persisted.
+    pub fn load_user_types(&self) -> ferrosa_common::Result<Vec<UserTypeMetadata>> {
+        let rows = self.engine.read_persisted_types()?;
+        Ok(rows
+            .into_iter()
+            .map(|r| UserTypeMetadata {
+                keyspace: r.keyspace_name,
+                name: r.type_name,
+                fields: r.fields,
+            })
+            .collect())
+    }
+
+    /// Replay persisted `system_schema.types` rows into the live schema Registry.
+    ///
+    /// Skips types whose keyspace is already gone or that already exist (the
+    /// Registry's `create_type_internal` rejects duplicates) so a partially
+    /// hydrated Registry does not abort the whole replay. Returns the number of
+    /// types successfully (re-)registered.
+    pub fn replay_types_into_schema(&self, schema: &Schema) -> ferrosa_common::Result<usize> {
+        let types = self.load_user_types()?;
+        let mut restored = 0usize;
+        for udt in types {
+            match schema.create_type_internal(&udt) {
+                Ok(()) => restored += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        keyspace = %udt.keyspace,
+                        name = %udt.name,
+                        %e,
+                        "skipping system_schema.types replay row"
+                    );
+                }
+            }
+        }
+        Ok(restored)
     }
 }
 
@@ -363,6 +405,58 @@ mod tests {
         );
         assert!(grants[0].permissions.contains(&Permission::Modify));
         assert!(grants[0].permissions.contains(&Permission::Select));
+    }
+
+    #[test]
+    fn replay_types_reconstructs_udt_into_schema() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+        use ferrosa_schema::UserTypeMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        // Persist a CREATE TYPE through the dogfooded writer.
+        let udt = UserTypeMetadata {
+            keyspace: "app".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+            ],
+        };
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(
+                ferrosa_schema::system::persistence::SystemTableMutation::TypeCreated(udt.clone()),
+            )
+            .unwrap();
+
+        // Fresh schema (as on a cold restart) with the owning keyspace present.
+        let schema = test_schema();
+        schema
+            .create_keyspace_internal(KeyspaceMetadata {
+                name: "app".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: std::collections::HashMap::from([(
+                        "replication_factor".to_string(),
+                        "1".to_string(),
+                    )]),
+                },
+            })
+            .unwrap();
+
+        let count = SystemTableLoader::new(engine)
+            .replay_types_into_schema(&schema)
+            .unwrap();
+
+        assert_eq!(count, 1, "exactly one persisted UDT should be replayed");
+        let restored = schema
+            .get_type("app", "address")
+            .expect("UDT must be live in the Registry after replay");
+        assert_eq!(restored, udt, "replayed UDT must equal the persisted one");
     }
 
     #[test]

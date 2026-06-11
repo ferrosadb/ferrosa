@@ -362,6 +362,13 @@ impl DdlCoordinator {
                 self.schema
                     .create_type_internal(udt)
                     .map_err(|e| ClusterError::Internal(format!("create_type: {e}")))?;
+                crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::TypeCreated(
+                            udt.clone(),
+                        ),
+                    )
+                    .map_err(ClusterError::Storage)?;
             }
             DdlOperation::DropType {
                 ref keyspace,
@@ -370,6 +377,14 @@ impl DdlCoordinator {
                 self.schema
                     .drop_type_internal(keyspace, name)
                     .map_err(|e| ClusterError::Internal(format!("drop_type: {e}")))?;
+                crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::TypeDropped {
+                            keyspace: keyspace.clone(),
+                            name: name.clone(),
+                        },
+                    )
+                    .map_err(ClusterError::Storage)?;
             }
             DdlOperation::CreateFunction(ref func) => {
                 self.schema

@@ -47,7 +47,6 @@ pub use system::peers::{query_peers, query_peers_with_view, ClusterState, PeerIn
 pub use system::schema_tables::{
     query_columns, query_keyspaces, query_tables, ColumnRow, KeyspaceRow, TableRow,
 };
-pub use system::type_tables::SystemSchemaTypesTable;
 pub use system::TopologyView;
 pub use virtual_registry::VirtualTableRegistry;
 pub use virtual_table::{

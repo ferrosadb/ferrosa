@@ -83,6 +83,20 @@ pub const INDEXES_COL_TARGET: u16 = 1;
 pub const INDEXES_COL_OPTIONS: u16 = 2;
 
 // ---------------------------------------------------------------------------
+// system_schema.types column indices
+// ---------------------------------------------------------------------------
+// Partition key: keyspace_name (text)
+// Clustering key: type_name (text)
+// Regular columns:
+
+/// `field_names` `frozen<list<text>>`, stored as a JSON array of field names.
+pub const TYPES_COL_FIELD_NAMES: u16 = 0;
+/// `field_types` `frozen<list<text>>`, stored as a JSON array of the serde
+/// representation of each field's `CqlType`, so reconstruction is lossless
+/// (collections, UDT references, vectors all round-trip).
+pub const TYPES_COL_FIELD_TYPES: u16 = 1;
+
+// ---------------------------------------------------------------------------
 // SystemTableMutation enum
 // ---------------------------------------------------------------------------
 
@@ -91,6 +105,7 @@ use crate::auth::role::RoleMetadata;
 use crate::metadata::index::IndexMetadata;
 use crate::metadata::keyspace::KeyspaceMetadata;
 use crate::metadata::table::TableMetadata;
+use crate::metadata::user_type::UserTypeMetadata;
 
 /// A mutation to a system table, emitted by the Raft state machine after
 /// applying a DDL or auth command. The `SystemTableWriter` converts these
@@ -135,6 +150,17 @@ pub enum SystemTableMutation {
         /// Table the index was built on.
         table: String,
         /// Name of the dropped index.
+        name: String,
+    },
+
+    // ---- system_schema.types ----
+    /// A user-defined type was created or altered (upsert row).
+    TypeCreated(UserTypeMetadata),
+    /// A user-defined type was dropped (tombstone row).
+    TypeDropped {
+        /// Keyspace owning the type.
+        keyspace: String,
+        /// Name of the dropped type.
         name: String,
     },
 }
@@ -432,6 +458,36 @@ pub fn index_to_rows(index: &IndexMetadata) -> SystemRow {
     }
 }
 
+/// Convert a `UserTypeMetadata` into a storage row for `system_schema.types`.
+///
+/// Partition key = `keyspace_name`; clustering = `type_name`; cells =
+/// `field_names` (JSON array of names) and `field_types` (JSON array of each
+/// field's `CqlType` serialized via serde — lossless, so reconstruction at
+/// boot rebuilds the exact original type including nested collections / UDT
+/// references).
+pub fn type_to_row(udt: &UserTypeMetadata) -> SystemRow {
+    let ts = now_micros();
+    let key = DecoratedKey::new(PartitionKey::new(udt.keyspace.as_bytes().to_vec()));
+
+    let field_names: Vec<&str> = udt.fields.iter().map(|(n, _)| n.as_str()).collect();
+    let field_types: Vec<&ferrosa_common::CqlType> = udt.fields.iter().map(|(_, t)| t).collect();
+    let names_json = serde_json::to_vec(&field_names).unwrap_or_default();
+    let types_json = serde_json::to_vec(&field_types).unwrap_or_default();
+
+    SystemRow {
+        key,
+        row: Row {
+            clustering: udt.name.as_bytes().to_vec(),
+            cells: vec![
+                (TYPES_COL_FIELD_NAMES, CellValue::live(names_json, ts)),
+                (TYPES_COL_FIELD_TYPES, CellValue::live(types_json, ts)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // System table TableSchema builders
 // ---------------------------------------------------------------------------
@@ -614,6 +670,36 @@ pub fn indexes_table_schema() -> TableSchema {
     }
 }
 
+/// Returns `TableSchema` for `system_schema.types`.
+///
+/// Cassandra declares `field_names`/`field_types` as `frozen<list<text>>`;
+/// ferrosa persists them as UTF8 cells holding JSON (the storage column type
+/// is opaque text), while the CQL router advertises the `list<text>` wire
+/// type to clients.
+pub fn types_table_schema() -> TableSchema {
+    TableSchema {
+        keyspace: "system_schema".to_string(),
+        table: "types".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![ColumnDefinition {
+            name: "type_name".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        }],
+        static_columns: vec![],
+        regular_columns: vec![
+            ColumnDefinition {
+                name: "field_names".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "field_types".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+        ],
+        extensions: Default::default(),
+    }
+}
+
 /// Returns all system table schemas for registration at bootstrap.
 pub fn all_system_table_schemas() -> Vec<TableSchema> {
     let mut schemas = vec![
@@ -621,6 +707,7 @@ pub fn all_system_table_schemas() -> Vec<TableSchema> {
         tables_table_schema(),
         columns_table_schema(),
         indexes_table_schema(),
+        types_table_schema(),
         roles_table_schema(),
         role_members_table_schema(),
         role_permissions_table_schema(),
@@ -717,11 +804,12 @@ mod tests {
     }
 
     #[test]
-    fn all_system_table_schemas_returns_ten() {
+    fn all_system_table_schemas_returns_eleven() {
         let schemas = all_system_table_schemas();
-        assert_eq!(schemas.len(), 10);
+        assert_eq!(schemas.len(), 11);
         let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
         assert!(names.contains(&(&"system_schema".to_string(), &"indexes".to_string())));
+        assert!(names.contains(&(&"system_schema".to_string(), &"types".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"keyspaces".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"tables".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"columns".to_string())));
@@ -1086,5 +1174,142 @@ mod tests {
         let schemas = all_system_table_schemas();
         let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
         assert!(names.contains(&(&"system_schema".to_string(), &"indexes".to_string())));
+    }
+
+    // -- system_schema.types tests --
+
+    #[test]
+    fn types_column_indices_are_sequential() {
+        assert_eq!(TYPES_COL_FIELD_NAMES, 0);
+        assert_eq!(TYPES_COL_FIELD_TYPES, 1);
+    }
+
+    #[test]
+    fn types_table_schema_layout() {
+        let schema = types_table_schema();
+        assert_eq!(schema.keyspace, "system_schema");
+        assert_eq!(schema.table, "types");
+        assert_eq!(schema.clustering_columns.len(), 1);
+        assert_eq!(schema.clustering_columns[0].name, "type_name");
+        assert_eq!(schema.regular_columns.len(), 2);
+        assert_eq!(schema.regular_columns[0].name, "field_names");
+        assert_eq!(schema.regular_columns[1].name, "field_types");
+    }
+
+    #[test]
+    fn all_system_table_schemas_includes_types() {
+        let schemas = all_system_table_schemas();
+        let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
+        assert!(names.contains(&(&"system_schema".to_string(), &"types".to_string())));
+    }
+
+    #[test]
+    fn type_to_row_encodes_pk_clustering_and_cells() {
+        use ferrosa_common::CqlType;
+
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+            ],
+        };
+
+        let row = type_to_row(&udt);
+
+        // Partition key = keyspace_name.
+        assert_eq!(row.key.key.as_bytes(), b"ks");
+        // Clustering = type_name (single text column, no length prefix).
+        assert_eq!(row.row.clustering, b"address");
+
+        // Two cells: field_names, field_types.
+        assert_eq!(row.row.cells.len(), 2);
+
+        let (names_idx, names_cell) = &row.row.cells[0];
+        assert_eq!(*names_idx, TYPES_COL_FIELD_NAMES);
+        let names: Vec<String> =
+            serde_json::from_slice(names_cell.value.as_deref().unwrap()).unwrap();
+        assert_eq!(names, vec!["street".to_string(), "zip".to_string()]);
+
+        let (types_idx, types_cell) = &row.row.cells[1];
+        assert_eq!(*types_idx, TYPES_COL_FIELD_TYPES);
+        let types: Vec<CqlType> =
+            serde_json::from_slice(types_cell.value.as_deref().unwrap()).unwrap();
+        assert_eq!(types, vec![CqlType::Varchar, CqlType::Int]);
+
+        // Row is live.
+        assert_eq!(row.row.deletion, DeletionTime::LIVE);
+    }
+
+    #[test]
+    fn type_to_row_round_trips_nested_collection_fields() {
+        use ferrosa_common::CqlType;
+
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "complex".to_string(),
+            fields: vec![
+                (
+                    "tags".to_string(),
+                    CqlType::List(Box::new(CqlType::Varchar)),
+                ),
+                (
+                    "attrs".to_string(),
+                    CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int)),
+                ),
+            ],
+        };
+
+        let row = type_to_row(&udt);
+        let (_, types_cell) = &row.row.cells[1];
+        let decoded: Vec<CqlType> =
+            serde_json::from_slice(types_cell.value.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            decoded,
+            vec![
+                CqlType::List(Box::new(CqlType::Varchar)),
+                CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int)),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_to_row_empty_fields() {
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "empty".to_string(),
+            fields: vec![],
+        };
+        let row = type_to_row(&udt);
+        let (_, names_cell) = &row.row.cells[0];
+        let names: Vec<String> =
+            serde_json::from_slice(names_cell.value.as_deref().unwrap()).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn type_mutation_variants_construct() {
+        use ferrosa_common::CqlType;
+
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+        match SystemTableMutation::TypeCreated(udt.clone()) {
+            SystemTableMutation::TypeCreated(u) => assert_eq!(u.name, "address"),
+            _ => panic!("wrong variant"),
+        }
+        match (SystemTableMutation::TypeDropped {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+        }) {
+            SystemTableMutation::TypeDropped { keyspace, name } => {
+                assert_eq!(keyspace, "ks");
+                assert_eq!(name, "address");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

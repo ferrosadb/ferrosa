@@ -98,6 +98,39 @@ schema-as-data, `schema.json` is retired (or kept only as a legacy import path),
 Registry is a pure in-memory cache rebuilt from `system_schema` SSTables at boot — matching
 Cassandra. This is a larger effort and can land table-by-table after indexes.
 
+### Progress
+
+- **`system_schema.indexes` — DONE** (the original landed slice; template for the rest).
+- **`system_schema.types` — DONE** (this PR, `dogfood/system-schema-types`). Full vertical
+  slice mirroring the indexes pattern:
+  - Persisted schema `types_table_schema()` (PK `keyspace_name`, clustering `type_name`,
+    regular `field_names`/`field_types`) added to `all_system_table_schemas`.
+  - `SystemTableMutation::TypeCreated`/`TypeDropped` + `type_to_row` encoder
+    (`persistence.rs`). `field_names`/`field_types` are persisted as JSON of the serde
+    `CqlType` so reconstruction is **lossless** for nested collections / UDT refs / vectors.
+  - DDL wiring at all three apply sites (`ddl_path.rs` Direct, `pair/ddl.rs`,
+    `raft/state_machine.rs`), plus the `SystemTableWriter::apply` arms. **ALTER TYPE**
+    (add/rename field) re-persists the row via an upsert in `route_alter_type` (it mutates
+    the Registry in place rather than going through the DDL writer).
+  - Startup reconstruction: `StorageEngine::read_persisted_types` (+ `PersistedTypeRow`,
+    `decode_persisted_type_row`) and `SystemTableLoader::{load_user_types,
+    replay_types_into_schema}`, wired into `main.rs` boot (step 4b'') after system tables and
+    user keyspaces are registered.
+  - Retired the virtual table: deleted `system/type_tables.rs` (`SystemSchemaTypesTable`) and
+    its registration; the router's `("system_schema","types")` SELECT now reads from
+    `read_persisted_types`.
+  - Tests: encoder round-trip (incl. nested collection) in `persistence.rs`; storage
+    flush+reopen read + tombstone skip in `engine.rs`; loader replay-into-Registry in
+    `system_table_loader.rs`; router CREATE→SELECT-from-storage parity + storage-not-Registry
+    + ALTER-TYPE-survives in `router.rs` / `tests/handshake.rs`.
+- **Deferred for `types`**: DROP KEYSPACE does **not** yet cascade-tombstone its
+  `system_schema.types` rows (the Raft `drop_keyspace_cascades_types` path clears Registry +
+  Raft state only). The orphaned stored rows are harmless for reads scoped by keyspace but
+  should be tombstoned for full parity; this is a small follow-up.
+- **Still TODO**: `functions`, `aggregates`, `views` (hardcoded-empty in the router), and
+  making `keyspaces/tables/columns` fully storage-served. Apply the identical pattern
+  per-table.
+
 ## Critical files
 
 - Schema/encoders: `ferrosa-schema/src/system/persistence.rs` (mutation enum l.84, encoders

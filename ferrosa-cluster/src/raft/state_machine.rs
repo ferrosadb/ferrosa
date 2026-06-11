@@ -1108,6 +1108,11 @@ impl FerrosStateMachine {
             RaftOp::CreateType(udt) => {
                 let key = (udt.keyspace.clone(), udt.name.clone());
                 self.state.types.entry(key).or_insert_with(|| udt.clone());
+                if let Some(writer) = &self.system_writer {
+                    if let Err(e) = writer.apply(SystemTableMutation::TypeCreated(udt.clone())) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_type_internal(&udt) {
                         tracing::error!(%e, "Raft apply: schema.create_type_internal failed");
@@ -1116,6 +1121,14 @@ impl FerrosStateMachine {
             }
             RaftOp::DropType { keyspace, name } => {
                 self.state.types.remove(&(keyspace.clone(), name.clone()));
+                if let Some(writer) = &self.system_writer {
+                    if let Err(e) = writer.apply(SystemTableMutation::TypeDropped {
+                        keyspace: keyspace.clone(),
+                        name: name.clone(),
+                    }) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_type_internal(&keyspace, &name) {
                         tracing::error!(%e, "Raft apply: schema.drop_type_internal failed");
