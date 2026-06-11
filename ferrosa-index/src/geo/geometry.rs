@@ -91,6 +91,59 @@ pub fn polygon_bbox(poly: &Polygon) -> Option<((f64, f64), (f64, f64))> {
     Some(((min_lat, min_lon), (max_lat, max_lon)))
 }
 
+/// A candidate point fed to [`points_in_polygon_rtree`], tagged with an opaque
+/// caller id so the survivors can be mapped back to their source rows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeoPoint<T> {
+    /// Opaque caller id (e.g. an index into a side table of rows).
+    pub id: T,
+    /// Point latitude in degrees.
+    pub lat: f64,
+    /// Point longitude in degrees.
+    pub lon: f64,
+}
+
+/// Filter `candidates` to the ids whose point falls inside `poly`, using the
+/// [`Rtree`](super::rtree::Rtree) to **prune** before the exact ray-cast.
+///
+/// The candidate set fetched from a cell-cover of the polygon's bounding box is
+/// a coarse over-approximation: many points lie outside the polygon's true
+/// bbox. Brute force ray-casts every candidate against every polygon edge
+/// (`O(candidates × vertices)`). Instead we bulk-load the candidate points into
+/// an R-tree keyed by their degenerate bbox, query it with the polygon's bbox
+/// to discard everything outside the bbox in `O(log n)` per survivor, then run
+/// the exact [`point_in_polygon`] test only on the (typically far smaller) set
+/// of bbox survivors.
+///
+/// A degenerate polygon (`< 3` vertices) or one with no bbox encloses no points
+/// and yields an empty result. Order of the returned ids follows R-tree
+/// traversal, not input order; callers that need input order should re-sort.
+pub fn points_in_polygon_rtree<T: Clone>(candidates: &[GeoPoint<T>], poly: &Polygon) -> Vec<T> {
+    use super::rtree::{Rtree, RtreeBbox};
+
+    if poly.is_degenerate() {
+        return Vec::new();
+    }
+    let Some((sw, ne)) = polygon_bbox(poly) else {
+        return Vec::new();
+    };
+    let entries: Vec<(RtreeBbox, usize)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (RtreeBbox::point(c.lat, c.lon), i))
+        .collect();
+    let tree = Rtree::bulk_load(entries);
+    let query = RtreeBbox::new(sw, ne);
+    let mut out = Vec::new();
+    for &idx in tree.query_bbox(&query) {
+        let c = &candidates[idx];
+        if point_in_polygon(c.lat, c.lon, poly) {
+            out.push(c.id.clone());
+        }
+    }
+    out
+}
+
 /// Exact point-in-polygon test for `(lat, lon)` against a single-ring polygon,
 /// via ray casting (the even–odd / crossing-number rule).
 ///
@@ -273,6 +326,113 @@ mod tests {
         // A normal SF polygon does not.
         let sf = Polygon::new(vec![(37.70, -122.52), (37.83, -122.52), (37.83, -122.35)]);
         assert!(!sf.crosses_antimeridian());
+    }
+
+    #[test]
+    fn rtree_prune_matches_brute_force_point_in_polygon() {
+        // A polygon around central SF. Build a mixed candidate set: some inside,
+        // some outside the polygon, some outside even its bbox. The R-tree-pruned
+        // filter must return exactly the ids the brute-force ray-cast returns.
+        let poly = Polygon::new(vec![
+            (37.70, -122.52),
+            (37.83, -122.52),
+            (37.83, -122.35),
+            (37.70, -122.35),
+        ]);
+        let candidates = vec![
+            GeoPoint {
+                id: 0u32,
+                lat: 37.7955,
+                lon: -122.3937,
+            }, // Ferry Bldg: in
+            GeoPoint {
+                id: 1,
+                lat: 37.7880,
+                lon: -122.4074,
+            }, // Union Sq: in
+            GeoPoint {
+                id: 2,
+                lat: 37.7694,
+                lon: -122.4862,
+            }, // GG Park: in
+            GeoPoint {
+                id: 3,
+                lat: 40.7580,
+                lon: -73.9855,
+            }, // NYC: out of bbox
+            GeoPoint {
+                id: 4,
+                lat: 37.90,
+                lon: -122.40,
+            }, // N of bbox
+            GeoPoint {
+                id: 5,
+                lat: 37.75,
+                lon: -122.30,
+            }, // E of bbox
+        ];
+
+        let mut got = points_in_polygon_rtree(&candidates, &poly);
+        got.sort_unstable();
+
+        let mut want: Vec<u32> = candidates
+            .iter()
+            .filter(|c| point_in_polygon(c.lat, c.lon, &poly))
+            .map(|c| c.id)
+            .collect();
+        want.sort_unstable();
+
+        assert_eq!(got, want);
+        assert_eq!(got, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn rtree_prune_degenerate_polygon_yields_nothing() {
+        let line = Polygon::new(vec![(0.0, 0.0), (0.0, 1.0)]);
+        let candidates = vec![GeoPoint {
+            id: 7u32,
+            lat: 0.0,
+            lon: 0.5,
+        }];
+        assert!(points_in_polygon_rtree(&candidates, &line).is_empty());
+    }
+
+    #[test]
+    fn rtree_prune_empty_candidates_yields_nothing() {
+        let sq = unit_square();
+        let candidates: Vec<GeoPoint<u32>> = Vec::new();
+        assert!(points_in_polygon_rtree(&candidates, &sq).is_empty());
+    }
+
+    #[test]
+    fn rtree_prune_excludes_concave_notch_point() {
+        // Same concave shape as `concave_polygon_excludes_the_notch`: a point in
+        // the notch is inside the bbox (so survives the R-tree prune) but must be
+        // dropped by the exact ray-cast.
+        let poly = Polygon::new(vec![
+            (0.0, 0.0),
+            (0.0, 4.0),
+            (4.0, 4.0),
+            (4.0, 0.0),
+            (2.0, 0.0),
+            (2.0, 3.0),
+            (1.0, 3.0),
+            (1.0, 0.0),
+        ]);
+        let candidates = vec![
+            GeoPoint {
+                id: 0u32,
+                lat: 0.5,
+                lon: 2.0,
+            }, // body: in
+            GeoPoint {
+                id: 1,
+                lat: 1.5,
+                lon: 1.0,
+            }, // notch (in bbox): out
+        ];
+        let got = points_in_polygon_rtree(&candidates, &poly);
+        assert_eq!(got, vec![0]);
     }
 
     #[test]
