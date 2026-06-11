@@ -835,6 +835,10 @@ pub struct SharedState {
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
+    /// Records full-scan occurrences for `system_observability.full_scan_reasons`.
+    pub full_scan_tracker: Arc<crate::virtual_tables::FullScanTracker>,
+    /// Records secondary-index usage for `system_observability.index_usage`.
+    pub index_usage_tracker: Arc<crate::virtual_tables::IndexUsageTracker>,
     /// WASM UDF executor for compiling and invoking user-defined functions.
     pub udf_executor: Arc<UdfExecutor>,
     /// Broadcast channel for CQL EVENT push notifications.
@@ -2685,6 +2689,11 @@ async fn route_select_user_table(
         // index registration exists (useful for simple single-column FTI).
         let index_name = fti_index_name.as_deref().unwrap_or(fts_column);
 
+        // Observability: record that the full-text index was consulted.
+        state
+            .index_usage_tracker
+            .record(ks, &s.table, index_name, "FullText");
+
         let matching_pks = state
             .engine
             .fulltext_search(&table_id, index_name, fts_query)
@@ -2977,6 +2986,16 @@ async fn route_select_user_table(
                     ));
                 }
 
+                // Observability: record that a secondary index was consulted.
+                let plan_kind = if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
+                    "IndexScanWithFilter"
+                } else {
+                    "SingleIndex"
+                };
+                state
+                    .index_usage_tracker
+                    .record(ks, &s.table, index_name, plan_kind);
+
                 // Find the WHERE clause for the indexed column.
                 let index_wc = s
                     .where_clauses
@@ -3073,6 +3092,12 @@ async fn route_select_user_table(
             }
 
             ScanPlan::IndexIntersection { ref indexes } => {
+                // Observability: record that each intersected index was consulted.
+                for (index_name, _index_column) in indexes {
+                    state
+                        .index_usage_tracker
+                        .record(ks, &s.table, index_name, "IndexIntersection");
+                }
                 // Consult ALL matched single-column indexes and intersect their
                 // result sets on partition-key identity, so we fetch only the
                 // partitions present in every index rather than the full result
@@ -3143,6 +3168,20 @@ async fn route_select_user_table(
             }
 
             ScanPlan::FullScan => {
+                // Observability: record the predicate that triggered the full
+                // scan so operators can find queries that need an index.
+                {
+                    let (pred_col, pred_op) = s
+                        .where_clauses
+                        .iter()
+                        .find(|wc| !wc.token_fn)
+                        .map(|wc| (wc.column.as_str(), comparison_op_str(&wc.op)))
+                        .unwrap_or(("", ""));
+                    state
+                        .full_scan_tracker
+                        .record(ks, &s.table, pred_col, pred_op);
+                }
+
                 // Check ALLOW FILTERING requirement.
                 let indexed_columns: Vec<String> = snap
                     .indexes
@@ -3894,6 +3933,24 @@ fn encode_virtual_rows_streaming(
             });
         },
     ))
+}
+
+/// Render a `ComparisonOp` as the operator string recorded in
+/// `system_observability.full_scan_reasons`.
+fn comparison_op_str(op: &ComparisonOp) -> &'static str {
+    match op {
+        ComparisonOp::Eq => "=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Le => "<=",
+        ComparisonOp::Ge => ">=",
+        ComparisonOp::In => "IN",
+        ComparisonOp::Ne => "!=",
+        ComparisonOp::Contains => "CONTAINS",
+        ComparisonOp::ContainsKey => "CONTAINS KEY",
+        ComparisonOp::SoundsLike => "SOUNDS LIKE",
+        ComparisonOp::Like => "LIKE",
+    }
 }
 
 // ── EXPLAIN ──────────────────────────────────────────────────────────────
@@ -9769,6 +9826,8 @@ mod tests {
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
+            index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
             udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,
@@ -9789,7 +9848,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn test_ctx<'a>(auth: &'a AuthContext, ks: &'a Option<String>) -> RequestContext<'a> {
         RequestContext {
             auth,
@@ -15566,6 +15624,271 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    // ── Phase 3: per-type index-usage observability ─────────────────────────
+    //
+    // Each of the following tests proves, for one index type, BOTH that the
+    // query returns the correct rows AND that the index was observably hit:
+    // the `system_observability.index_usage` counter increments and EXPLAIN
+    // reports a non-`FullScan` plan. The vector test asserts correct ANN
+    // ordering and that the vector index is registered (the router ANN path is
+    // a brute-force sort pending Phase 2 vector read dispatch, so it honestly
+    // does not claim an index_usage hit it cannot demonstrate).
+
+    /// Run a non-EXPLAIN query and assert the index_usage counter advanced by
+    /// exactly the expected delta, returning the decoded row count.
+    async fn assert_index_hit_and_count(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        select_cql: &str,
+        expected_delta: u64,
+    ) -> i32 {
+        let before = state.index_usage_tracker.total_index_hits();
+        let stmt = crate::parser::parse(select_cql).unwrap();
+        let row_count = match route(state, ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected Result for: {select_cql}"),
+        };
+        let after = state.index_usage_tracker.total_index_hits();
+        assert_eq!(
+            after - before,
+            expected_delta,
+            "index_usage must advance by {expected_delta} for: {select_cql} (before={before}, after={after})"
+        );
+        row_count
+    }
+
+    /// Assert that EXPLAIN of `select_cql` reports a plan that is not a
+    /// `FullScan` and contains `expected_plan`.
+    async fn assert_explain_plan(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        select_cql: &str,
+        expected_plan: &str,
+    ) {
+        let stmt = crate::parser::parse(&format!("EXPLAIN {select_cql}")).unwrap();
+        match route(state, ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let haystack = String::from_utf8_lossy(&b).into_owned();
+                assert!(
+                    haystack.contains(expected_plan),
+                    "EXPLAIN of `{select_cql}` must contain `{expected_plan}`, got: {haystack}"
+                );
+                assert!(
+                    !haystack.contains("FullScan"),
+                    "EXPLAIN of `{select_cql}` must not be FullScan, got: {haystack}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+    }
+
+    /// BTree (default) index: `WHERE col = ?` without a PK predicate plans
+    /// `SingleIndex`, returns the matching row, and increments index_usage.
+    #[tokio::test]
+    async fn btree_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE bt WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE bt.users (id int PRIMARY KEY, email text)",
+            "CREATE INDEX bt_email ON bt.users (email) USING 'btree'",
+            "INSERT INTO bt.users (id, email) VALUES (1, 'a@x.com')",
+            "INSERT INTO bt.users (id, email) VALUES (2, 'b@x.com')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM bt.users WHERE email = 'a@x.com'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "btree index lookup must return exactly 1 row");
+    }
+
+    /// Hash index: `WHERE col = ?` (POINT_LOOKUP) plans `SingleIndex`, returns
+    /// the matching row, and increments index_usage.
+    #[tokio::test]
+    async fn hash_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE hsh WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE hsh.sessions (id int PRIMARY KEY, user_id text)",
+            "CREATE INDEX hsh_user ON hsh.sessions (user_id) USING 'hash'",
+            "INSERT INTO hsh.sessions (id, user_id) VALUES (1, 'u-100')",
+            "INSERT INTO hsh.sessions (id, user_id) VALUES (2, 'u-200')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM hsh.sessions WHERE user_id = 'u-100'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "hash index lookup must return exactly 1 row");
+    }
+
+    /// Composite index: `WHERE col = ?` plans `SingleIndex`, returns the
+    /// matching row, and increments index_usage.
+    #[tokio::test]
+    async fn composite_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE cmp WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE cmp.events (id int PRIMARY KEY, region text)",
+            "CREATE INDEX cmp_region ON cmp.events (region) USING 'composite'",
+            "INSERT INTO cmp.events (id, region) VALUES (1, 'us-east')",
+            "INSERT INTO cmp.events (id, region) VALUES (2, 'eu-west')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM cmp.events WHERE region = 'us-east'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "composite index lookup must return exactly 1 row");
+    }
+
+    /// Phonetic index: `WHERE name = 'Jon'` matches 'John' via the phonetic
+    /// index path, returns the row, and increments index_usage.
+    #[tokio::test]
+    async fn phonetic_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE phu WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE phu.people (id int PRIMARY KEY, name text)",
+            "CREATE INDEX phu_name ON phu.people (name) USING 'phonetic'",
+            "INSERT INTO phu.people (id, name) VALUES (1, 'John')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let q = "SELECT id FROM phu.people WHERE name = 'Jon'";
+        assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "phonetic index must match 'Jon' to 'John'");
+    }
+
+    /// Full-text index: `WHERE body = fts_match(...)` consults the FTI, returns
+    /// the matching rows, and increments index_usage.
+    #[tokio::test]
+    async fn fulltext_index_usage_observable_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE ftu WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ftu.docs (id int PRIMARY KEY, body text)",
+            "CREATE INDEX ftu_body ON ftu.docs (body) USING 'fulltext'",
+            "INSERT INTO ftu.docs (id, body) VALUES (1, 'rust is a fast distributed database')",
+            "INSERT INTO ftu.docs (id, body) VALUES (2, 'hello world')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("ftu", "docs"))
+            .unwrap();
+        let q = "SELECT id FROM ftu.docs WHERE body = fts_match('distributed AND database')";
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "fts_match must return exactly the matching doc");
+    }
+
+    /// Vector index: an `ORDER BY ... ANN OF` query returns the nearest rows in
+    /// distance order, and the vector index is registered in storage. The
+    /// router ANN path is brute-force pending Phase 2 vector read dispatch, so
+    /// this asserts correctness + index registration rather than an
+    /// index_usage hit it cannot honestly demonstrate.
+    #[tokio::test]
+    async fn vector_index_registered_and_ann_orders_correctly() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE vec WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE vec.items (id int PRIMARY KEY, embedding vector<float, 4>)",
+            "CREATE INDEX vec_ann ON vec.items (embedding) USING 'vector'",
+            "INSERT INTO vec.items (id, embedding) VALUES (1, [0.90, 0.10, 0.00, 0.00])",
+            "INSERT INTO vec.items (id, embedding) VALUES (2, [0.00, 0.00, 0.90, 0.10])",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        // The vector index must be registered with the engine (HNSW default).
+        assert_eq!(
+            state
+                .engine
+                .vector_index_method(&ferrosa_storage::TableId::new("vec", "items"), "vec_ann")
+                .unwrap(),
+            ferrosa_storage::VectorIndexMethod::Hnsw,
+            "vector index must be registered with the default HNSW method"
+        );
+        // ANN query returns the nearest row first.
+        let stmt = crate::parser::parse(
+            "SELECT id FROM vec.items ORDER BY embedding ANN OF [0.90, 0.10, 0.00, 0.00] LIMIT 1",
+        )
+        .unwrap();
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(count, 1, "ANN OF LIMIT 1 must return exactly 1 row");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Full-scan observability: a `WHERE col = ?` with no index and ALLOW
+    /// FILTERING must plan `FullScan`, record into the full_scan_tracker (so
+    /// `system_observability.full_scan_reasons` surfaces it), and return the
+    /// correct rows. This is the negative counterpart to the index-hit tests.
+    #[tokio::test]
+    async fn full_scan_recorded_when_no_index() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE fsr WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fsr.t (id int PRIMARY KEY, color text)",
+            "INSERT INTO fsr.t (id, color) VALUES (1, 'red')",
+            "INSERT INTO fsr.t (id, color) VALUES (2, 'blue')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let before = state.full_scan_tracker.total_full_scans();
+        let stmt = crate::parser::parse("SELECT id FROM fsr.t WHERE color = 'red' ALLOW FILTERING")
+            .unwrap();
+        let count = match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(count, 1, "full scan with post-filter must return 1 row");
+        assert_eq!(
+            state.full_scan_tracker.total_full_scans() - before,
+            1,
+            "an unindexed WHERE must record exactly one full scan"
+        );
     }
 
     /// `CREATE INDEX` followed by `INSERT` then `SELECT WHERE indexed_col = ?`

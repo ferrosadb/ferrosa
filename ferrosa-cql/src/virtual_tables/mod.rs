@@ -10,6 +10,7 @@ pub mod billing;
 pub mod connections;
 pub mod consolidation_status;
 pub mod full_scan_reasons;
+pub mod index_usage;
 pub mod materialization;
 pub mod query_fingerprints;
 pub mod rrd_runtime_settings;
@@ -22,6 +23,7 @@ pub use billing::{BillingMeter, BillingMetersTable};
 pub use connections::{ConnectionInfo, ConnectionTracker, ConnectionsTable};
 pub use consolidation_status::ConsolidationStatusTable;
 pub use full_scan_reasons::{FullScanReasonsTable, FullScanTracker};
+pub use index_usage::{IndexUsageTable, IndexUsageTracker};
 pub use materialization::{
     InMemoryMaterializationProvider, MaterializationObservabilityProvider,
     MaterializationQueueSnapshot, MaterializationQueuesTable, MaterializationStatusSnapshot,

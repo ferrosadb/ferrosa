@@ -1155,6 +1155,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection_tracker =
         Arc::new(ferrosa_cql::virtual_tables::connections::ConnectionTracker::new());
     let query_tracker = Arc::new(ferrosa_cql::virtual_tables::active_queries::QueryTracker::new());
+    // Index-observability trackers: shared between the router (which records
+    // full-scan and index-usage events) and the virtual tables registered
+    // below (which expose them via system_observability.*). Use one Arc each
+    // so what the router records is what operators read.
+    let full_scan_tracker = Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new());
+    let index_usage_tracker = Arc::new(ferrosa_cql::virtual_tables::IndexUsageTracker::new());
     let udf_executor = Arc::new(
         ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default())
             .expect("failed to initialize UDF executor"),
@@ -1172,6 +1178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,
+        full_scan_tracker: full_scan_tracker.clone(),
+        index_usage_tracker: index_usage_tracker.clone(),
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller: Arc::clone(&mode_controller),
@@ -1266,9 +1274,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::QueryFingerprintsTable::new(fingerprint_tracker.clone()),
     ));
-    let full_scan_tracker = Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new());
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::FullScanReasonsTable::new(full_scan_tracker.clone()),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::IndexUsageTable::new(index_usage_tracker.clone()),
     ));
     let table_access_tracker = Arc::new(ferrosa_cql::virtual_tables::TableAccessTracker::new());
     schema.virtual_tables().register(Arc::new(
