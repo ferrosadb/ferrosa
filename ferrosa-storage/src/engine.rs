@@ -586,6 +586,36 @@ fn build_index_scheduler(
     (scheduler, tracker)
 }
 
+/// Build a high-priority eager-index rebuild job for a single index on a newly
+/// materialized SSTable (flush output or compaction output).
+///
+/// The index's real [`IndexType`](ferrosa_index::IndexType) is read from the
+/// store via [`TableStore::index_type_for`] so a non-BTree index
+/// (phonetic/vector/fulltext/filtered/geo) is dispatched to the correct builder
+/// rather than mis-stamped as `BTree`. Both the flush and compaction eager-build
+/// sites call this so they cannot drift apart again.
+fn eager_index_build_job(
+    store: &TableStore<FileFlushTarget>,
+    table_id: &TableId,
+    sstable_id: String,
+    index_name: &str,
+    column_position: usize,
+) -> crate::index::IndexBuildJob {
+    crate::index::IndexBuildJob {
+        sstable_id,
+        index_name: index_name.to_string(),
+        index_type: store.index_type_for(index_name),
+        table: (
+            table_id.keyspace().to_string(),
+            table_id.table().to_string(),
+        ),
+        priority: crate::index::BuildPriority::High,
+        enqueued_at: std::time::Instant::now(),
+        column_position,
+        filter_predicate: None,
+    }
+}
+
 /// Top-level storage engine.
 ///
 /// One instance per node. Manages multiple tables, each with its own
@@ -5806,19 +5836,13 @@ impl StorageEngine {
                     // Only submit if the index needs building (not already current).
                     if let Some(idx_state) = tracker_state {
                         if !idx_state.indexed_sstables.contains(&format!("{gen}")) {
-                            let job = crate::index::IndexBuildJob {
-                                sstable_id: format!("{gen}"),
-                                index_name: index_name.clone(),
-                                index_type: state.store.index_type_for(index_name),
-                                table: (
-                                    table_id.keyspace().to_string(),
-                                    table_id.table().to_string(),
-                                ),
-                                priority: crate::index::BuildPriority::High,
-                                enqueued_at: std::time::Instant::now(),
-                                column_position: *col_pos,
-                                filter_predicate: None,
-                            };
+                            let job = eager_index_build_job(
+                                &state.store,
+                                table_id,
+                                format!("{gen}"),
+                                index_name,
+                                *col_pos,
+                            );
                             let _ = scheduler.submit(job);
                         }
                     }
@@ -6064,19 +6088,13 @@ impl StorageEngine {
                     // Same as flush — keeps MemtableIndex bounded in steady state.
                     if let Some(ref scheduler) = self.index_scheduler {
                         for (index_name, col_pos) in state.store.indexed_columns() {
-                            let job = crate::index::IndexBuildJob {
-                                sstable_id: output.id.clone(),
-                                index_name: index_name.clone(),
-                                index_type: ferrosa_index::IndexType::BTree,
-                                table: (
-                                    table_id.keyspace().to_string(),
-                                    table_id.table().to_string(),
-                                ),
-                                priority: crate::index::BuildPriority::High,
-                                enqueued_at: std::time::Instant::now(),
-                                column_position: *col_pos,
-                                filter_predicate: None,
-                            };
+                            let job = eager_index_build_job(
+                                &state.store,
+                                table_id,
+                                output.id.clone(),
+                                index_name,
+                                *col_pos,
+                            );
                             if let Err(e) = scheduler.submit(job) {
                                 tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
                             }
@@ -15924,6 +15942,69 @@ mod tests {
             engine.index_type_for_test(&user_tid, "idx_val_phonetic"),
             Some(IndexType::Phonetic),
             "index must survive restart AND keep its real Phonetic type, not the BTree default"
+        );
+    }
+
+    /// Regression guard for the compaction eager-index re-typing bug: the
+    /// post-flush AND post-compaction eager rebuild both construct their
+    /// `IndexBuildJob` via [`eager_index_build_job`], which must carry the
+    /// index's *real* type read from the store — not a hardcoded `BTree`.
+    ///
+    /// The compaction site (engine.rs `poll_compactions`) previously stamped
+    /// every rebuild job `index_type: IndexType::BTree`, so a Phonetic index
+    /// got a BTree-typed rebuild after compaction and dispatched to the wrong
+    /// builder. This asserts the shared helper both sites now call preserves
+    /// the Phonetic type, and that an unknown index name still defaults to
+    /// BTree (matching `index_type_for`).
+    #[test]
+    fn eager_index_build_job_carries_real_index_type_after_compaction() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        let table_dir = dir.path().join("sstables").join(table_id.to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        let schema = test_schema();
+        let mut store = TableStore::new(
+            schema.clone(),
+            FileFlushTarget::new_starting_at(table_dir).unwrap(),
+            write_options_for_schema(&schema, true).unwrap(),
+        );
+        // Register a non-BTree (Phonetic) index on column 0, exactly as the DDL
+        // path does, so the store can report its real type.
+        store.add_index("val_phonetic_idx".to_string(), 0, IndexType::Phonetic);
+
+        // Mirror the compaction eager-rebuild call: output SSTable id + col pos.
+        let job = eager_index_build_job(
+            &store,
+            &table_id,
+            "compacted-1".to_string(),
+            "val_phonetic_idx",
+            0,
+        );
+        assert_eq!(
+            job.index_type,
+            IndexType::Phonetic,
+            "compaction rebuild job must carry the real Phonetic type, not a hardcoded BTree"
+        );
+        assert_eq!(job.sstable_id, "compacted-1");
+        assert_eq!(job.index_name, "val_phonetic_idx");
+        assert_eq!(job.table, ("test_ks".to_string(), "test_table".to_string()));
+
+        // Control: an index name the store does not know still defaults to
+        // BTree (so the fix does not over-reach and break the common path).
+        let btree_job = eager_index_build_job(
+            &store,
+            &table_id,
+            "compacted-1".to_string(),
+            "unknown_idx",
+            0,
+        );
+        assert_eq!(
+            btree_job.index_type,
+            IndexType::BTree,
+            "an unregistered index defaults to BTree, matching index_type_for"
         );
     }
 
