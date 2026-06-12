@@ -3,7 +3,7 @@ set -euo pipefail
 
 # setup-precommit.sh — Install pre-commit and configure hooks for this project
 #
-# Copied to projects by /op-init. Run once after cloning:
+# Copied to projects by /warp. Run once after cloning:
 #   ./setup-precommit.sh
 #
 # What it does:
