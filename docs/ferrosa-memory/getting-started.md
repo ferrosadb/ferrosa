@@ -11,7 +11,7 @@ For most users, start with the hosted setup scripts instead of cloning repositor
 Ferrosa Database only:
 
 ```bash
-curl -fsSL https://ferrosadb.com/setup.sh | bash
+curl -fsSL https://ferrosadb.com/install.sh | bash
 ```
 
 Ferrosa Memory plus agent onboarding:

@@ -2801,3 +2801,204 @@ fn keyspace_needs_cluster_replay_excludes_builtin_system_keyspaces() {
         );
     }
 }
+
+// ─── formation RF tests (RED → GREEN via resolve_formation_rf) ───────────────
+
+/// Helper: create a [`ferrosa_schema::KeyspaceMetadata`] with SimpleStrategy.
+fn simple_strategy_ks(name: &str, rf: usize) -> ferrosa_schema::KeyspaceMetadata {
+    use ferrosa_schema::KeyspaceMetadata;
+    use ferrosa_schema::ReplicationParams;
+    let mut options = std::collections::HashMap::new();
+    options.insert("replication_factor".to_string(), rf.to_string());
+    KeyspaceMetadata {
+        name: name.to_string(),
+        durable_writes: true,
+        replication: ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options,
+        },
+    }
+}
+
+/// Helper: create a [`ferrosa_schema::KeyspaceMetadata`] with
+/// NetworkTopologyStrategy and a per-DC map.
+fn nts_ks(name: &str, dc_rf: &[(&str, usize)]) -> ferrosa_schema::KeyspaceMetadata {
+    use ferrosa_schema::KeyspaceMetadata;
+    use ferrosa_schema::ReplicationParams;
+    let mut options = std::collections::HashMap::new();
+    for (dc, rf) in dc_rf {
+        options.insert(dc.to_string(), rf.to_string());
+    }
+    KeyspaceMetadata {
+        name: name.to_string(),
+        durable_writes: true,
+        replication: ReplicationParams {
+            strategy: "NetworkTopologyStrategy".to_string(),
+            options,
+        },
+    }
+}
+
+#[test]
+fn formation_rf_extracted_from_simple_strategy_keyspace() {
+    let schema = test_schema();
+    schema
+        .create_keyspace_internal(simple_strategy_ks("myapp", 3))
+        .expect("should add keyspace");
+
+    let rf = super::cluster::resolve_formation_rf(&schema, "dc1", 3);
+    assert_eq!(
+        rf, 3,
+        "resolve_formation_rf must return the SimpleStrategy RF (3), not the hardcoded 1"
+    );
+}
+
+#[test]
+fn formation_rf_defaults_to_1_with_no_user_keyspaces() {
+    let schema = test_schema();
+    // Fresh schema has only system keyspaces — user keyspace list is empty.
+    let rf = super::cluster::resolve_formation_rf(&schema, "dc1", 1);
+    assert_eq!(
+        rf, 1,
+        "with no user keyspaces, resolve_formation_rf must return the provided default (1)"
+    );
+}
+
+#[test]
+fn formation_rf_extracted_from_nts_keyspace() {
+    let schema = test_schema();
+    schema
+        .create_keyspace_internal(nts_ks("myapp", &[("dc1", 3), ("dc2", 2)]))
+        .expect("should add keyspace");
+
+    // With local_dc = "dc1", should use dc1's RF (3).
+    let rf_local = super::cluster::resolve_formation_rf(&schema, "dc1", 3);
+    assert_eq!(
+        rf_local, 3,
+        "resolve_formation_rf with local_dc=dc1 must return dc1's RF (3)"
+    );
+
+    // With a DC that isn't in the map, falls back to summing all DCs (5).
+    let rf_sum = super::cluster::resolve_formation_rf(&schema, "dc_unknown", 3);
+    assert_eq!(
+        rf_sum, 5,
+        "resolve_formation_rf with an unknown local_dc must sum all DC RFs (3+2=5)"
+    );
+}
+
+#[test]
+fn formation_rf_takes_max_across_keyspaces() {
+    let schema = test_schema();
+    schema
+        .create_keyspace_internal(simple_strategy_ks("ks_low", 3))
+        .expect("should add ks_low");
+    schema
+        .create_keyspace_internal(simple_strategy_ks("ks_high", 5))
+        .expect("should add ks_high");
+
+    let rf = super::cluster::resolve_formation_rf(&schema, "dc1", 3);
+    assert_eq!(
+        rf, 5,
+        "resolve_formation_rf must return the maximum RF across all user keyspaces (5 > 3)"
+    );
+}
+
+#[tokio::test]
+async fn formation_emits_reduced_durability_warning_counter_when_rf_less_than_configured() {
+    use std::sync::atomic::Ordering;
+    // Reset counter before the test to avoid cross-test contamination.
+    super::cluster::FORMATION_REDUCED_DURABILITY_WRITES.store(0, Ordering::SeqCst);
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    // RF=3 keyspace, but we'll form with only 1 peer (cluster_size = 2 total)
+    schema
+        .create_keyspace_internal(simple_strategy_ks("myapp", 3))
+        .expect("should add keyspace");
+
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    // Transition with 1 peer → cluster_size = 2, configured_rf = 3 → counter increments.
+    let peer1_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+    controller.transition_to_cluster(vec![(peer1_id, peer1_addr)]);
+
+    let count = super::cluster::FORMATION_REDUCED_DURABILITY_WRITES.load(Ordering::SeqCst);
+    assert!(
+        count > 0,
+        "FORMATION_REDUCED_DURABILITY_WRITES must be non-zero when cluster_size ({}) < configured_rf (3)",
+        2
+    );
+}
+
+#[tokio::test]
+async fn transition_to_cluster_uses_keyspace_rf_not_hardcoded_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    // Create a user keyspace with RF=3 BEFORE transitioning to cluster.
+    schema
+        .create_keyspace_internal(simple_strategy_ks("myapp", 3))
+        .expect("should add RF=3 keyspace");
+
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    // Transition directly to cluster (skip pair step — transition_to_cluster
+    // is pub(super) and can be called directly from tests).
+    let peer1_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+    let peer2_addr: SocketAddr = "127.0.0.2:7002".parse().unwrap();
+    controller.transition_to_cluster(vec![(peer1_id, peer1_addr), (peer2_id, peer2_addr)]);
+
+    // Inspect the coordinator's default_rf through the write_path.
+    let write_path = controller.write_path.load();
+    let default_rf = match &**write_path {
+        crate::write_path::WritePath::Cluster(coordinator) => coordinator.default_rf,
+        other => panic!(
+            "write_path must be WritePath::Cluster after transition_to_cluster, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    };
+
+    assert_eq!(
+        default_rf, 3,
+        "coordinator default_rf must be 3 (from keyspace schema), not the hardcoded 1"
+    );
+}

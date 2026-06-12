@@ -21,6 +21,7 @@ tracing = "0.1"
 password-hash = { version = "0.6", features = ["rand_core", "getrandom"] }
 
 [dev-dependencies]
+bincode = "1"
 proptest = "1"
 serial_test = "3"
 tracing-subscriber = { version = "0.3", features = ["json"] }
