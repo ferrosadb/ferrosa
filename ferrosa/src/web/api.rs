@@ -237,11 +237,11 @@ async fn repair_handler(
 /// with the four membership maps that the Jepsen structural-invariant checker
 /// (`ferrosa_jepsen::checker::membership::MembershipSnapshot`) expects.
 ///
-/// The `/admin/*` path lives outside `/api/*` so it is not subject to the
-/// API auth middleware. This endpoint is read-only and exposes only
-/// information that is already returnable through `/api/cluster/*`; if a
-/// future deployment wants to gate `/admin/*` behind a separate auth layer,
-/// register a middleware here.
+/// **Auth:** `/admin/*` is subject to the same `auth_middleware` as `/api/*`.
+/// Callers must supply valid `Authorization: Basic` credentials. In development
+/// mode (`auth_disabled = true`) the middleware is bypassed automatically.
+/// The Jepsen harness should be configured with superuser credentials when
+/// running against a production-mode node.
 pub fn admin_routes() -> Router<WebAppState> {
     Router::new().route("/membership-snapshot", get(membership_snapshot_handler))
 }

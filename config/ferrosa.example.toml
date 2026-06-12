@@ -89,5 +89,28 @@ bind = "127.0.0.1:9090"
 #
 # Roles and password hashes are stored INSIDE ferrosa, in the system_auth
 # keyspace (Cassandra-compatible) — there is NO external auth.yaml file.
-# install.sh seeds the default `ferrosa_admin` superuser; rotate that password
-# on first login via `ALTER ROLE ferrosa_admin WITH PASSWORD = '...'`.
+#
+# SEED CREDENTIALS
+# ----------------
+# On first startup, ferrosa seeds three roles (ferrosa_admin, graph_engine,
+# ferrosa_user) if they do not yet exist.
+#
+# Development mode (default / FERROSA_MODE=development):
+#   Well-known passwords are used and a WARNING is emitted. Do not expose
+#   a development-mode node to untrusted networks.
+#
+# Production mode (FERROSA_MODE=production):
+#   Random 96-hex-char passwords are generated for each role and printed
+#   once to stderr at startup. Record them immediately — they are not
+#   stored anywhere accessible after that startup.
+#
+#   To supply your own admin password at first bootstrap (e.g. from a
+#   secrets manager), set: FERROSA_SEED_ADMIN_PASSWORD=<your-password>
+#   Subsequent startups are idempotent — existing roles are never overwritten.
+#
+# WEB CONSOLE (/metrics)
+# ----------------------
+# The Prometheus scrape endpoint at GET /metrics is always publicly accessible
+# (no auth required) so Prometheus scrapers work without credentials.
+# All other /api/* and /admin/* routes require auth when
+# FERROSA_MODE=production (or auth_disabled=false).
