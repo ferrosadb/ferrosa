@@ -110,6 +110,34 @@ pub struct SeedConfig {
     pub mode: DeploymentMode,
 }
 
+impl SeedConfig {
+    /// Build a `SeedConfig` from the environment.
+    ///
+    /// `FERROSA_SEED_ADMIN_PASSWORD` supplies an explicit admin password at
+    /// first bootstrap (documented in `config/ferrosa.example.toml`); when
+    /// unset, production mode generates a random password and development
+    /// mode uses the well-known seed credential.
+    pub fn from_env() -> Self {
+        Self::from_parts(
+            DeploymentMode::from_env(),
+            std::env::var("FERROSA_SEED_ADMIN_PASSWORD").ok(),
+        )
+    }
+
+    /// Pure constructor backing `from_env`, separated so tests stay free of
+    /// process-global environment races.
+    ///
+    /// An empty password is treated as unset so `FERROSA_SEED_ADMIN_PASSWORD=""`
+    /// in a compose file can never seed an empty admin password.
+    pub fn from_parts(mode: DeploymentMode, admin_password: Option<String>) -> Self {
+        Self {
+            admin_password: admin_password.filter(|p| !p.is_empty()),
+            service_password: None,
+            mode,
+        }
+    }
+}
+
 /// Outcome returned by `seed_default_roles_with_config`.
 ///
 /// Each field is `Some(password)` only when the corresponding role was **newly
@@ -222,7 +250,9 @@ pub fn seed_default_roles_with_config(
 /// `seed_default_roles_with_config`. In development mode (the default),
 /// the well-known credentials `SEED_ADMIN_PASSWORD` / `SEED_APP_PASSWORD`
 /// are used. In production mode (`FERROSA_MODE=production`), random
-/// passwords are generated and printed to stderr.
+/// passwords are generated and printed to stderr. An explicit admin
+/// password may be supplied via `FERROSA_SEED_ADMIN_PASSWORD` (empty
+/// value = unset); see `SeedConfig::from_env`.
 ///
 /// If a role already exists the corresponding branch is skipped — no
 /// grants are re-applied, no password is overwritten.
@@ -230,11 +260,7 @@ pub fn seed_default_roles_with_config(
 /// Returns `Err` only if the password hasher itself fails or a grant
 /// insert fails. Grant failures are not swallowed.
 pub fn seed_default_roles(schema: &Schema) -> crate::Result<()> {
-    let config = SeedConfig {
-        admin_password: None,
-        service_password: None,
-        mode: DeploymentMode::from_env(),
-    };
+    let config = SeedConfig::from_env();
     seed_default_roles_with_config(schema, &config)?;
     Ok(())
 }
@@ -779,6 +805,32 @@ mod tests {
         assert!(
             result.is_ok(),
             "admin must authenticate with the explicit override password"
+        );
+    }
+
+    // A10: FERROSA_SEED_ADMIN_PASSWORD (documented in ferrosa.example.toml)
+    // must flow into SeedConfig. Pure constructor so the test is env-race-free.
+    #[test]
+    fn from_parts_with_password_sets_admin_password() {
+        let config = SeedConfig::from_parts(
+            DeploymentMode::Production,
+            Some("operator-supplied-pw".to_string()),
+        );
+        assert_eq!(
+            config.admin_password.as_deref(),
+            Some("operator-supplied-pw"),
+            "FERROSA_SEED_ADMIN_PASSWORD value must become the explicit admin password"
+        );
+        assert_eq!(config.mode, DeploymentMode::Production);
+    }
+
+    // A11: empty env value must be treated as unset, never seeded as a password
+    #[test]
+    fn from_parts_empty_string_treated_as_unset() {
+        let config = SeedConfig::from_parts(DeploymentMode::Production, Some(String::new()));
+        assert!(
+            config.admin_password.is_none(),
+            "FERROSA_SEED_ADMIN_PASSWORD=\"\" must not seed an empty admin password"
         );
     }
 }
