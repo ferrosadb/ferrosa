@@ -1,5 +1,48 @@
 # Filtered (partial) index: multi-column conjunction predicates
 
+Status: IMPLEMENTED (branch `correctness/filtered-multi-column`). The conjunction
+predicate is end-to-end: type/wire format with backward-compatible decode,
+build + memtable gating via a shared row evaluator, CQL `'filter'` conjunction
+parsing, and a sound planner that withholds unless EVERY clause is implied.
+
+What shipped (vs. the deferred plan below):
+
+1. **Type / wire format (`ferrosa-index`)** — `FilterClause { column_position,
+   op, value }` plus `FilterPredicate { version, clauses: Vec<FilterClause> }`
+   (a conjunction; a row is retained iff all clauses hold). Serializes as the v2
+   `{"version":2,"clauses":[...]}` shape; a custom `Deserialize` ALSO accepts the
+   legacy flat single-clause JSON (`{"column_position":..,"op":..,"value":..}`),
+   so old `system_schema.indexes` rows and in-flight build requests survive the
+   upgrade. `evaluate_predicate` is an all-clauses fold; `evaluate_predicate_row`
+   resolves each clause's own column for multi-column gating;
+   `query_constraint_implies_predicate_clause` proves per-clause subset
+   containment. An empty conjunction retains nothing (fail-safe).
+2. **Build path (`ferrosa-storage`)** — `FilteredBuilder`, the `LocalBackend`
+   sidecar scan (`scheduler.rs`), and the memtable write path (`store.rs`) all
+   gate on the shared `evaluate_predicate_row`, so sidecar and memtable agree.
+3. **CQL surface (`ferrosa-cql`)** — `CREATE INDEX ... USING 'filtered' WITH
+   OPTIONS = {'filter': 'col <op> lit AND ...'}` parses a restricted CQL boolean
+   conjunction into clauses (`parse_filter_conjunction`/`split_clause`), each
+   column resolved to its storage ordinal and each literal encoded to storage
+   bytes (`build_filter_clause`). The legacy three-key form is still accepted as
+   a single clause. Any unparseable clause fails loud at CREATE time.
+4. **Planner (`router.rs`)** — `filtered_index_covered_columns` marks ALL
+   conjunction columns covered; `query_implies_filter_predicate` requires every
+   clause to be implied by a WHERE constraint on that clause's own column
+   (withhold if even one is not provably implied).
+5. **Remote builder (`ferrosa-index-builder`)** — no change; the existing
+   `filter_predicate` wire field carries the conjunction type verbatim.
+
+Tests: `ferrosa-index/src/filtered.rs` (conjunction fold, per-clause + withheld
+implication, conjunction build, option-string + legacy-JSON round-trip);
+`ferrosa-schema/src/metadata/index.rs` (conjunction + legacy serde round-trip);
+`ferrosa-cql/src/router.rs` (`filtered_index_multi_column_conjunction_end_to_end`,
+`parse_filter_conjunction_*`).
+
+---
+
+Original spec (deferred plan):
+
 Status: TODO (follow-on to the Filtered partial index, commit `e7762b32`).
 
 ## What already shipped

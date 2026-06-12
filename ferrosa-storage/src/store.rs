@@ -1157,14 +1157,18 @@ impl<F: FlushTarget> TableStore<F> {
                 // column does not match. `evaluate_predicate` is shared with the
                 // build path so memtable and sidecar never disagree.
                 if let Some(predicate) = self.index_filter_predicates.get(index_name) {
-                    let filter_cell = row
-                        .cells
-                        .iter()
-                        .find(|(idx, _)| *idx as usize == predicate.column_position);
-                    let matches = match filter_cell.and_then(|(_, c)| c.value.as_ref()) {
-                        Some(v) => ferrosa_index::evaluate_predicate(predicate, v),
-                        None => false,
-                    };
+                    // Conjunction gating: a row belongs in the partial index only
+                    // when EVERY clause's column is present (live) and satisfies
+                    // its comparison. `evaluate_predicate_row` resolves each
+                    // clause's own column; it is the shared source of truth with
+                    // the sidecar build path, so memtable and sidecar never
+                    // disagree on which rows belong.
+                    let matches = ferrosa_index::evaluate_predicate_row(predicate, |col_pos| {
+                        row.cells
+                            .iter()
+                            .find(|(idx, _)| *idx as usize == col_pos)
+                            .and_then(|(_, c)| c.value.as_deref())
+                    });
                     if !matches {
                         continue;
                     }
