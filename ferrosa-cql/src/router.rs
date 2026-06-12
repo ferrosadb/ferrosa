@@ -16144,6 +16144,11 @@ mod tests {
             );
         }
         let (state, _dir) = setup();
+        // CREATE FUNCTION now dogfoods a write to system_schema.functions, so the
+        // table must be registered (mirrors the WASM create-function tests). This
+        // test only runs under `--features asc-udf` + FERROSA_ASC_BUNDLE, so the
+        // missing registration wasn't caught by a default `cargo test`.
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
