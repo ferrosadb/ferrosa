@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
+bincode = "1"
 crc32fast = "1"
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }

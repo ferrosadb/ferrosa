@@ -549,4 +549,91 @@ mod tests {
             other => panic!("unexpected variant: {other:?}"),
         }
     }
+
+    /// Pin the bincode discriminant (variant index) of every `RaftOp` variant.
+    ///
+    /// `bincode` encodes enum variants as a `u32` little-endian tag equal to
+    /// the 0-indexed declaration order.  Any reordering of `RaftOp` silently
+    /// bricks all persisted Raft log entries written by a prior build.  This
+    /// test encodes a minimal representative command for each variant, extracts
+    /// the tag from the first 4 bytes of the encoded `RaftOp`, and asserts it
+    /// equals the expected declaration index.
+    ///
+    /// NOTE: only a representative subset is checked here — the full enum has
+    /// more variants.  The intent is to pin the variants most likely to be
+    /// accidentally reordered (DDL head, index ops, topology ops).
+    #[test]
+    fn raft_op_variant_tag_stability() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::metadata::index::IndexMetadata;
+
+        // Helper: serialize a RaftOp and return its 4-byte variant tag.
+        fn tag(op: &RaftOp) -> u32 {
+            let bytes = bincode::serialize(op).expect("serialize RaftOp");
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        }
+
+        // ---- DDL (declaration order 0–21) ----------------------------------
+        assert_eq!(
+            tag(&RaftOp::CreateKeyspace(simple_keyspace("ks"))),
+            0,
+            "CreateKeyspace"
+        );
+        assert_eq!(tag(&RaftOp::DropKeyspace("ks".into())), 1, "DropKeyspace");
+
+        // CreateIndex is at declaration index 13.
+        let index_meta = IndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: "idx".into(),
+            index_type: IndexType::BTree,
+            target_columns: vec!["col".into()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        assert_eq!(
+            tag(&RaftOp::CreateIndex(index_meta.clone())),
+            13,
+            "CreateIndex"
+        );
+        assert_eq!(
+            tag(&RaftOp::DropIndex {
+                keyspace: "ks".into(),
+                table: "tbl".into(),
+                index: "idx".into()
+            }),
+            14,
+            "DropIndex"
+        );
+
+        // ---- Topology (declaration order 22–25) ----------------------------
+        let node = NodeInfo {
+            host_id: Uuid::new_v4(),
+            addr: "127.0.0.1:7000".into(),
+            data_center: "dc1".into(),
+            rack: "rack1".into(),
+            state: NodeState::Joining,
+            cql_broadcast: None,
+        };
+        assert_eq!(tag(&RaftOp::JoinNode(node.clone())), 22, "JoinNode");
+        assert_eq!(tag(&RaftOp::UpdateNodeInfo(node)), 23, "UpdateNodeInfo");
+        assert_eq!(tag(&RaftOp::LeaveNode { node_id: 1 }), 24, "LeaveNode");
+        assert_eq!(
+            tag(&RaftOp::AssignTokens {
+                node_id: 1,
+                tokens: vec![]
+            }),
+            25,
+            "AssignTokens"
+        );
+
+        // ---- Config / lifecycle (declaration order 26–28) ------------------
+        assert_eq!(
+            tag(&RaftOp::ApproveNode {
+                host_id: Uuid::new_v4()
+            }),
+            27,
+            "ApproveNode"
+        );
+    }
 }
