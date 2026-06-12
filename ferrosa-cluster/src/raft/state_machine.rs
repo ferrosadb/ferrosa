@@ -1147,6 +1147,12 @@ impl FerrosStateMachine {
                     .functions
                     .entry(key)
                     .or_insert_with(|| func.clone());
+                if let Some(writer) = &self.system_writer {
+                    if let Err(e) = writer.apply(SystemTableMutation::FunctionCreated(func.clone()))
+                    {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_function_internal(&func) {
                         tracing::error!(%e, "Raft apply: schema.create_function_internal failed");
@@ -1160,6 +1166,15 @@ impl FerrosStateMachine {
             } => {
                 let key = (keyspace.clone(), name.clone(), arg_types.clone());
                 self.state.functions.remove(&key);
+                if let Some(writer) = &self.system_writer {
+                    if let Err(e) = writer.apply(SystemTableMutation::FunctionDropped {
+                        keyspace: keyspace.clone(),
+                        name: name.clone(),
+                        arg_types: arg_types.clone(),
+                    }) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_function_internal(&keyspace, &name, &arg_types) {
                         tracing::error!(%e, "Raft apply: schema.drop_function_internal failed");
