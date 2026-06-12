@@ -27,6 +27,7 @@ pub mod api;
 pub mod auth;
 pub mod debug;
 pub mod observability;
+pub mod readiness;
 pub mod snapshots;
 pub mod static_files;
 pub mod ws;
@@ -114,7 +115,11 @@ pub fn build_router(state: WebAppState) -> Router {
 
     // /admin/* is not behind auth — it exposes read-only diagnostics used by
     // the Jepsen verification harness (Sprint 2 W2.3).
+    //
+    // /readyz is also not behind auth so orchestrators (docker-compose, k8s,
+    // smoke scripts) can probe it without credentials.
     api.nest("/admin", api::admin_routes())
+        .merge(readiness::readiness_route())
         .route("/metrics", get(api::get_metrics))
         .fallback(static_files::static_handler)
         .with_state(state)
