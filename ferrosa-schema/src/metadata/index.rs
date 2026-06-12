@@ -65,11 +65,7 @@ mod tests {
             name: "idx_active".into(),
             index_type: IndexType::Filtered,
             target_columns: vec!["email".into()],
-            filter_predicate: Some(FilterPredicate {
-                column_position: 2,
-                op: FilterOp::Eq,
-                value: b"active".to_vec(),
-            }),
+            filter_predicate: Some(FilterPredicate::single(2, FilterOp::Eq, b"active".to_vec())),
             options: HashMap::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
@@ -140,11 +136,7 @@ mod tests {
             name: "idx_filtered".into(),
             index_type: IndexType::Filtered,
             target_columns: vec!["status".into()],
-            filter_predicate: Some(FilterPredicate {
-                column_position: 0,
-                op: FilterOp::Eq,
-                value: b"active".to_vec(),
-            }),
+            filter_predicate: Some(FilterPredicate::single(0, FilterOp::Eq, b"active".to_vec())),
             options: HashMap::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
@@ -155,8 +147,57 @@ mod tests {
         assert!(matches!(back.index_type, IndexType::Filtered));
         assert_eq!(back.target_columns, vec!["status"]);
         let pred = back.filter_predicate.unwrap();
-        assert_eq!(pred.column_position, 0);
-        assert!(matches!(pred.op, FilterOp::Eq));
-        assert_eq!(pred.value, b"active");
+        assert_eq!(pred.clauses().len(), 1);
+        let clause = &pred.clauses()[0];
+        assert_eq!(clause.column_position, 0);
+        assert!(matches!(clause.op, FilterOp::Eq));
+        assert_eq!(clause.value, b"active");
+    }
+
+    /// A persisted index metadata row carrying a multi-column conjunction
+    /// predicate round-trips through serde (the shape stored in
+    /// `system_schema.indexes`).
+    #[test]
+    fn index_metadata_conjunction_roundtrip() {
+        use ferrosa_index::FilterClause;
+        let meta = IndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: "idx_conj".into(),
+            index_type: IndexType::Filtered,
+            target_columns: vec!["name".into()],
+            filter_predicate: Some(FilterPredicate::conjunction(vec![
+                FilterClause::new(1, FilterOp::Gt, vec![0, 0, 0, 21]),
+                FilterClause::new(2, FilterOp::Eq, b"eng".to_vec()),
+            ])),
+            options: HashMap::new(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMetadata = serde_json::from_str(&json).unwrap();
+        let pred = back.filter_predicate.unwrap();
+        assert_eq!(pred.clauses().len(), 2);
+        assert_eq!(pred.clauses()[0].column_position, 1);
+        assert!(matches!(pred.clauses()[0].op, FilterOp::Gt));
+        assert_eq!(pred.clauses()[1].column_position, 2);
+        assert_eq!(pred.clauses()[1].value, b"eng");
+    }
+
+    /// Backward-compatible decode: a legacy single-clause flat JSON row (the
+    /// exact shape the old `FilterPredicate` serialized) still deserializes into
+    /// an `IndexMetadata` with a one-clause conjunction.
+    #[test]
+    fn index_metadata_legacy_single_clause_predicate_decodes() {
+        let legacy = r#"{
+            "keyspace":"ks","table":"tbl","name":"idx_legacy",
+            "index_type":"Filtered","target_columns":["status"],
+            "filter_predicate":{"column_position":3,"op":"Eq","value":[97,99,116,105,118,101]},
+            "options":{}
+        }"#;
+        let back: IndexMetadata = serde_json::from_str(legacy).unwrap();
+        let pred = back.filter_predicate.unwrap();
+        assert_eq!(pred.clauses().len(), 1);
+        assert_eq!(pred.clauses()[0].column_position, 3);
+        assert!(matches!(pred.clauses()[0].op, FilterOp::Eq));
+        assert_eq!(pred.clauses()[0].value, b"active");
     }
 }

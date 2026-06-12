@@ -368,11 +368,7 @@ mod tests {
     fn build_request_threads_filter_predicate_into_job() {
         use ferrosa_index::{FilterOp, FilterPredicate};
 
-        let predicate = FilterPredicate {
-            column_position: 1,
-            op: FilterOp::Gt,
-            value: vec![0, 0, 0, 21],
-        };
+        let predicate = FilterPredicate::single(1, FilterOp::Gt, vec![0, 0, 0, 21]);
         // Construct the request the way the engine sends it (JSON), to prove the
         // wire field deserializes.
         let json = serde_json::json!({

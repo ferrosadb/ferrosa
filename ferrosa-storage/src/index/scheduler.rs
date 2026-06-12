@@ -257,22 +257,20 @@ impl IndexBuildBackend for LocalBackend {
         {
             let pk_bytes = partition.key.key.as_bytes().to_vec();
             for row in &partition.rows {
-                // Partial (filtered) index: skip rows whose filter-column cell
-                // does not satisfy the predicate. The sidecar must hold ONLY
-                // matching rows so the read path (which delegates to a plain
+                // Partial (filtered) index: skip rows that do not satisfy the
+                // predicate. For a multi-column conjunction, EVERY clause's
+                // column must be present (live) and satisfy its comparison. The
+                // sidecar must hold ONLY matching rows so the read path (a plain
                 // btree point/range lookup) returns the partial result set.
-                // `evaluate_predicate` is the shared source of truth with the
+                // `evaluate_predicate_row` is the shared source of truth with the
                 // memtable write path, so sidecar and memtable agree.
                 if let Some(predicate) = job.filter_predicate.as_ref() {
-                    let filter_cell = row
-                        .cells
-                        .iter()
-                        .find(|(pos, _)| *pos as usize == predicate.column_position);
-                    let matches = match filter_cell.and_then(|(_, c)| c.value.as_ref()) {
-                        Some(value) => ferrosa_index::evaluate_predicate(predicate, value),
-                        // Filter column absent or tombstoned -> does not match.
-                        None => false,
-                    };
+                    let matches = ferrosa_index::evaluate_predicate_row(predicate, |col_pos| {
+                        row.cells
+                            .iter()
+                            .find(|(pos, _)| *pos as usize == col_pos)
+                            .and_then(|(_, c)| c.value.as_deref())
+                    });
                     if !matches {
                         continue;
                     }
@@ -1071,11 +1069,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
-            filter_predicate: Some(FilterPredicate {
-                column_position: 1,
-                op: FilterOp::Eq,
-                value: b"active".to_vec(),
-            }),
+            filter_predicate: Some(FilterPredicate::single(1, FilterOp::Eq, b"active".to_vec())),
         };
         let result = backend.build(&job).unwrap();
 

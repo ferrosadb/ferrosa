@@ -6796,29 +6796,89 @@ fn filter_value_to_term(value: &str, cql_type: &CqlType) -> Result<Term, CqlErro
     }
 }
 
-/// Build a fully-encoded [`ferrosa_index::FilterPredicate`] from the WITH
-/// OPTIONS of a `CREATE INDEX ... USING 'filtered'` statement.
+/// Build one fully-encoded [`ferrosa_index::FilterClause`] from a
+/// `(column, op, value)` triple, resolving the column's **storage** ordinal and
+/// encoding the value to storage bytes. Every failure is loud — a partial index
+/// with a broken clause would silently index the wrong rows.
+fn build_filter_clause(
+    state: &SharedState,
+    ks: &str,
+    table: &str,
+    column: &str,
+    op_str: &str,
+    value_str: &str,
+) -> Result<ferrosa_index::FilterClause, CqlError> {
+    let op = parse_filter_op(op_str)?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), table.to_string()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{table} not found")))?;
+
+    // Storage ordinal of the filter column: the cell tag the build/memtable
+    // paths compare the clause against.
+    let column_position = table_meta.storage_column_index(column).ok_or_else(|| {
+        CqlError::Invalid(format!(
+            "filtered index filter column '{column}' is not a column of {ks}.{table}"
+        ))
+    })? as usize;
+
+    let col_meta = table_meta
+        .columns
+        .get(column)
+        .ok_or_else(|| CqlError::Invalid(format!("filter column '{column}' not found")))?;
+    let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+    // The WITH OPTIONS map always carries the filter value as a string. Coerce
+    // it to the term shape the column's type expects (e.g. `'21'` on an `int`
+    // column becomes an integer literal) before encoding — otherwise a numeric
+    // partial predicate would be rejected as a type mismatch at CREATE time.
+    let term = filter_value_to_term(value_str, &cql_type)?;
+    let cql_value = bridge::term_to_cql_value(&term, &cql_type)?;
+    let value = crate::types::encode_value(&cql_value);
+
+    Ok(ferrosa_index::FilterClause::new(column_position, op, value))
+}
+
+/// Build a fully-encoded [`ferrosa_index::FilterPredicate`] (a conjunction of
+/// one or more clauses) from the WITH OPTIONS of a
+/// `CREATE INDEX ... USING 'filtered'` statement.
 ///
-/// Required options: `filter_column` (the partial-predicate column),
-/// `filter_op` (one of `=`,`!=`,`<`,`>`,`<=`,`>=`), and `filter_value` (a CQL
-/// literal parsed against the filter column's type). The predicate's
-/// `column_position` is the filter column's **storage** ordinal (statics then
-/// regulars, name-sorted) so it matches the cell ordinal the build/memtable
-/// paths compare against. The `value` is encoded to storage bytes here so the
-/// storage layer never needs the CQL type system.
+/// Two accepted forms:
+/// - **Single string** `{'filter': "col <op> lit [AND col <op> lit]..."}` — a
+///   conjunction parsed from a restricted CQL boolean expression. This is the
+///   multi-column form.
+/// - **Legacy three-key** `{'filter_column': .., 'filter_op': .., 'filter_value':
+///   ..}` — a single clause, preserved for backward compatibility.
 ///
 /// Every missing/invalid option fails loud — a partial index with a broken
-/// predicate would silently index every row, an unsound result.
+/// predicate would silently index the wrong rows, an unsound result.
 fn build_filter_predicate_from_options(
     state: &SharedState,
     ks: &str,
     table: &str,
     options: &HashMap<String, String>,
 ) -> Result<ferrosa_index::FilterPredicate, CqlError> {
+    // Preferred form: a single `'filter'` conjunction string.
+    if let Some(filter_expr) = options.get("filter") {
+        let parsed = parse_filter_conjunction(filter_expr)?;
+        let clauses = parsed
+            .into_iter()
+            .map(|(col, op, val)| build_filter_clause(state, ks, table, &col, &op, &val))
+            .collect::<Result<Vec<_>, _>>()?;
+        if clauses.is_empty() {
+            return Err(CqlError::Invalid(
+                "filtered index 'filter' expression parsed to zero clauses".into(),
+            ));
+        }
+        return Ok(ferrosa_index::FilterPredicate::conjunction(clauses));
+    }
+
+    // Legacy single-clause three-key form.
     let filter_column = options.get("filter_column").ok_or_else(|| {
         CqlError::Invalid(
-            "filtered index requires WITH OPTIONS = {'filter_column': ..., 'filter_op': ..., \
-             'filter_value': ...}; missing 'filter_column'"
+            "filtered index requires WITH OPTIONS = {'filter': \"col <op> lit AND ...\"} or the \
+             legacy {'filter_column': ..., 'filter_op': ..., 'filter_value': ...}; missing both"
                 .into(),
         )
     })?;
@@ -6829,42 +6889,92 @@ fn build_filter_predicate_from_options(
         CqlError::Invalid("filtered index WITH OPTIONS missing 'filter_value'".into())
     })?;
 
-    let op = parse_filter_op(filter_op_str)?;
+    let clause = build_filter_clause(state, ks, table, filter_column, filter_op_str, filter_value)?;
+    Ok(ferrosa_index::FilterPredicate::conjunction(vec![clause]))
+}
 
-    let snap = state.schema.snapshot();
-    let table_meta = snap
-        .tables
-        .get(&(ks.to_string(), table.to_string()))
-        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{table} not found")))?;
+/// Parse a restricted CQL boolean conjunction `col <op> literal [AND col <op>
+/// literal]...` into `(column, op_str, value_str)` triples. The op tokens are
+/// the same symbols [`parse_filter_op`] accepts (`=`,`!=`,`<`,`>`,`<=`,`>=`).
+/// String literals may be single-quoted (`'eng'`); the quotes are stripped.
+/// Any unparseable clause fails loud rather than being silently dropped.
+fn parse_filter_conjunction(expr: &str) -> Result<Vec<(String, String, String)>, CqlError> {
+    // Split on the word `AND` (case-insensitive), surrounded by whitespace.
+    let mut clauses = Vec::new();
+    for raw in split_on_and(expr) {
+        let clause = raw.trim();
+        if clause.is_empty() {
+            continue;
+        }
+        let (column, op, value) = split_clause(clause)?;
+        clauses.push((column, op, value));
+    }
+    if clauses.is_empty() {
+        return Err(CqlError::Invalid(format!(
+            "filtered index 'filter' expression '{expr}' has no clauses"
+        )));
+    }
+    Ok(clauses)
+}
 
-    // Storage ordinal of the filter column: the cell tag the build/memtable
-    // paths compare the predicate against.
-    let column_position = table_meta
-        .storage_column_index(filter_column)
+/// Split a conjunction expression on the keyword `AND` (case-insensitive),
+/// matched only as a whole whitespace-delimited token so column/value text
+/// containing the substring "and" is not split.
+fn split_on_and(expr: &str) -> Vec<String> {
+    let tokens: Vec<&str> = expr.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for tok in tokens {
+        if tok.eq_ignore_ascii_case("and") {
+            out.push(current.join(" "));
+            current.clear();
+        } else {
+            current.push(tok);
+        }
+    }
+    out.push(current.join(" "));
+    out
+}
+
+/// Split a single clause `col <op> literal` into its three parts. The operator
+/// is matched greedily (two-char ops `<=`/`>=`/`!=` before single-char) so
+/// `age>=21` and `age >= 21` both parse. The literal has surrounding single
+/// quotes stripped.
+fn split_clause(clause: &str) -> Result<(String, String, String), CqlError> {
+    // Two-char operators must be tried before single-char to avoid `>=` parsing
+    // as `>`.
+    const TWO_CHAR: &[&str] = &["<=", ">=", "!="];
+    const ONE_CHAR: &[&str] = &["=", "<", ">"];
+
+    let find_op = |ops: &[&str]| -> Option<(usize, usize)> {
+        ops.iter()
+            .filter_map(|op| clause.find(op).map(|idx| (idx, op.len())))
+            .min_by_key(|(idx, _)| *idx)
+    };
+
+    let (op_idx, op_len) = find_op(TWO_CHAR)
+        .or_else(|| find_op(ONE_CHAR))
         .ok_or_else(|| {
             CqlError::Invalid(format!(
-                "filtered index filter_column '{filter_column}' is not a column of {ks}.{table}"
-            ))
-        })? as usize;
+            "filtered index clause '{clause}' has no comparison operator (expected =,!=,<,>,<=,>=)"
+        ))
+        })?;
 
-    let col_meta = table_meta
-        .columns
-        .get(filter_column)
-        .ok_or_else(|| CqlError::Invalid(format!("filter_column '{filter_column}' not found")))?;
-    let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
-    // The WITH OPTIONS map always carries the filter value as a string. Coerce
-    // it to the term shape the column's type expects (e.g. `'21'` on an `int`
-    // column becomes an integer literal) before encoding — otherwise a numeric
-    // partial predicate would be rejected as a type mismatch at CREATE time.
-    let term = filter_value_to_term(filter_value, &cql_type)?;
-    let cql_value = bridge::term_to_cql_value(&term, &cql_type)?;
-    let value = crate::types::encode_value(&cql_value);
-
-    Ok(ferrosa_index::FilterPredicate {
-        column_position,
-        op,
-        value,
-    })
+    let column = clause[..op_idx].trim().to_string();
+    let op = clause[op_idx..op_idx + op_len].to_string();
+    let value_raw = clause[op_idx + op_len..].trim();
+    if column.is_empty() || value_raw.is_empty() {
+        return Err(CqlError::Invalid(format!(
+            "filtered index clause '{clause}' is malformed (expected 'column <op> literal')"
+        )));
+    }
+    // Strip a single pair of surrounding single quotes from string literals.
+    let value = value_raw
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(value_raw)
+        .to_string();
+    Ok((column, op, value))
 }
 
 /// Soundness gate for partial (Filtered) indexes.
@@ -6896,29 +7006,53 @@ fn query_implies_filter_predicate(
     schema: &Schema,
     predicate: &ferrosa_index::FilterPredicate,
 ) -> bool {
+    // Conjunction soundness: the index retains rows where EVERY clause holds, so
+    // the query may serve from it ONLY when each clause is provably implied by
+    // some WHERE constraint on that clause's column. If even one clause is not
+    // implied, withhold the index — serving it would silently drop rows.
+    let clauses = predicate.clauses();
+    if clauses.is_empty() {
+        return false;
+    }
+    clauses
+        .iter()
+        .all(|clause| clause_implied_by_where(clause, where_clauses, table_meta, ks, schema))
+}
+
+/// Is a single filter `clause` provably implied by some WHERE constraint on the
+/// clause's own column? Scans the WHERE clauses for a scalar comparison on the
+/// clause column whose value-set is a provable subset of the clause's retained
+/// set (per [`ferrosa_index::query_constraint_implies_predicate_clause`]).
+fn clause_implied_by_where(
+    clause: &ferrosa_index::FilterClause,
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> bool {
     for wc in where_clauses {
         if wc.token_fn {
             continue;
         }
         // Map the WHERE op to a filter op; only scalar comparisons can imply a
-        // partial predicate (IN/CONTAINS/LIKE/etc. are not handled and withhold).
+        // clause (IN/CONTAINS/LIKE/etc. are not handled and withhold).
         let Some(query_op) = comparison_to_filter_op(&wc.op) else {
             continue;
         };
-        // Match the WHERE column to the predicate's filter column by storage
-        // ordinal — the same ordinal the predicate was built with.
+        // Match the WHERE column to the clause's column by storage ordinal — the
+        // same ordinal the clause was built with.
         let Some(storage_idx) = table_meta.storage_column_index(&wc.column) else {
             continue;
         };
-        if storage_idx as usize != predicate.column_position {
+        if storage_idx as usize != clause.column_position {
             continue;
         }
-        // Encode the query's literal the same way the predicate value was
-        // encoded, then check subset containment in that byte space.
+        // Encode the query's literal the same way the clause value was encoded,
+        // then check subset containment in that byte space.
         let Ok(key) = term_to_index_key(&wc.value, &wc.column, table_meta, ks, schema) else {
             continue;
         };
-        if ferrosa_index::query_constraint_implies_predicate(query_op, &key.0, predicate) {
+        if ferrosa_index::query_constraint_implies_predicate_clause(query_op, &key.0, clause) {
             return true;
         }
     }
@@ -6963,12 +7097,16 @@ fn filtered_index_covered_columns(
         let Some(pred) = meta.filter_predicate.as_ref() else {
             continue;
         };
-        for (name, _) in table_meta.columns.iter() {
-            if table_meta.storage_column_index(name).map(|i| i as usize)
-                == Some(pred.column_position)
-            {
-                covered.push(name.clone());
-                break;
+        // Mark EVERY conjunction clause's column covered: the partial index has
+        // already enforced all of them, so the planner need not re-filter any.
+        for clause in pred.clauses() {
+            for (name, _) in table_meta.columns.iter() {
+                if table_meta.storage_column_index(name).map(|i| i as usize)
+                    == Some(clause.column_position)
+                {
+                    covered.push(name.clone());
+                    break;
+                }
             }
         }
     }
@@ -10810,6 +10948,45 @@ mod tests {
                 &superuser_auth(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn parse_filter_conjunction_single_and_multi_clause() {
+        // Single clause.
+        let parsed = parse_filter_conjunction("age > 21").unwrap();
+        assert_eq!(parsed, vec![("age".into(), ">".into(), "21".into())]);
+
+        // Two clauses, mixed ops, quoted string literal stripped.
+        let parsed = parse_filter_conjunction("age >= 21 AND dept = 'eng'").unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("age".into(), ">=".into(), "21".into()),
+                ("dept".into(), "=".into(), "eng".into()),
+            ]
+        );
+
+        // Case-insensitive AND, no spaces around the operator.
+        let parsed = parse_filter_conjunction("a<=5 and b!='x'").unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("a".into(), "<=".into(), "5".into()),
+                ("b".into(), "!=".into(), "x".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_filter_conjunction_rejects_malformed() {
+        // No operator.
+        assert!(parse_filter_conjunction("age 21").is_err());
+        // Missing value.
+        assert!(parse_filter_conjunction("age >").is_err());
+        // Missing column.
+        assert!(parse_filter_conjunction("> 21").is_err());
+        // Empty expression.
+        assert!(parse_filter_conjunction("   ").is_err());
     }
 
     #[test]
@@ -17123,6 +17300,107 @@ mod tests {
             2,
         )
         .await;
+    }
+
+    /// Filtered (partial) index with a MULTI-COLUMN conjunction predicate
+    /// (`age > 21 AND dept = 'eng'`). The index retains rows where BOTH clauses
+    /// hold. A query implying both clauses uses the index and returns exactly
+    /// the matching rows; a query implying only ONE clause is withheld (serving
+    /// it would drop rows) and, with ALLOW FILTERING, returns the complete set.
+    #[tokio::test]
+    async fn filtered_index_multi_column_conjunction_end_to_end() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE fmc WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fmc.people (id int PRIMARY KEY, name text, age int, dept text)",
+            // Partial index on `name`, retaining only rows with age > 21 AND
+            // dept = 'eng' (the multi-column conjunction `filter` form).
+            "CREATE INDEX fmc_eng_adults ON fmc.people (name) USING 'filtered' \
+             WITH OPTIONS = {'filter': 'age > 21 AND dept = ''eng'''}",
+            // id=1: age 30, eng  -> BOTH clauses hold  -> indexed.
+            "INSERT INTO fmc.people (id, name, age, dept) VALUES (1, 'alice', 30, 'eng')",
+            // id=2: age 18, eng  -> age fails           -> excluded.
+            "INSERT INTO fmc.people (id, name, age, dept) VALUES (2, 'alice', 18, 'eng')",
+            // id=3: age 40, sales-> dept fails          -> excluded.
+            "INSERT INTO fmc.people (id, name, age, dept) VALUES (3, 'alice', 40, 'sales')",
+            // id=4: age 26, eng  -> BOTH clauses hold   -> indexed.
+            "INSERT INTO fmc.people (id, name, age, dept) VALUES (4, 'alice', 26, 'eng')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // Query implies BOTH clauses: age = 30 ⊆ {age>21} and dept = 'eng' ⊆
+        // {dept='eng'}. The index is usable and returns exactly id=1.
+        let q = "SELECT id FROM fmc.people WHERE name = 'alice' AND age = 30 AND dept = 'eng'";
+        assert_explain_plan(&state, &ctx, q, "fmc_eng_adults").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 1, "age=30 AND dept=eng implies both clauses, 1 row");
+
+        // Query implies BOTH via a range on age: age > 25 ⊆ {age>21}, dept eng.
+        // id=1 (30) and id=4 (26) are both in the index.
+        let q = "SELECT id FROM fmc.people WHERE name = 'alice' AND age > 25 AND dept = 'eng'";
+        assert_explain_plan(&state, &ctx, q, "fmc_eng_adults").await;
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 2, "age>25 AND dept=eng implies both clauses, 2 rows");
+
+        // Withheld: implies ONLY the age clause (dept is unconstrained). Using
+        // the index would drop the genuinely-retained eng rows that this query
+        // also wants via the dept-agnostic predicate; serving it is unsound.
+        // The plan must be FullScan and, with ALLOW FILTERING, return the full
+        // set of alices with age>25 (id=1 age30 eng, id=3 age40 sales, id=4
+        // age26 eng).
+        let q = "SELECT id FROM fmc.people WHERE name = 'alice' AND age > 25";
+        {
+            let stmt = crate::parser::parse(&format!("EXPLAIN {q}")).unwrap();
+            match route(&state, &ctx, stmt).await.unwrap() {
+                RouteResult::Result(b) => {
+                    let haystack = String::from_utf8_lossy(&b).into_owned();
+                    assert!(
+                        !haystack.contains("fmc_eng_adults"),
+                        "partial index must be withheld when only one clause is implied, got: {haystack}"
+                    );
+                    assert!(
+                        haystack.contains("FullScan"),
+                        "withheld query must fall to FullScan, got: {haystack}"
+                    );
+                }
+                _ => panic!("expected Result from EXPLAIN"),
+            }
+            let count =
+                assert_index_hit_and_count(&state, &ctx, &format!("{q} ALLOW FILTERING"), 0).await;
+            assert_eq!(
+                count, 3,
+                "withheld query returns the complete set (3 alices with age>25)"
+            );
+        }
+
+        // Withheld: implies ONLY the dept clause (age unconstrained).
+        let q = "SELECT id FROM fmc.people WHERE name = 'alice' AND dept = 'eng'";
+        {
+            let stmt = crate::parser::parse(&format!("EXPLAIN {q}")).unwrap();
+            match route(&state, &ctx, stmt).await.unwrap() {
+                RouteResult::Result(b) => {
+                    let haystack = String::from_utf8_lossy(&b).into_owned();
+                    assert!(
+                        !haystack.contains("fmc_eng_adults"),
+                        "partial index must be withheld when only the dept clause is implied, got: {haystack}"
+                    );
+                }
+                _ => panic!("expected Result from EXPLAIN"),
+            }
+            // All eng alices regardless of age: id=1 (30), id=2 (18), id=4 (26).
+            let count =
+                assert_index_hit_and_count(&state, &ctx, &format!("{q} ALLOW FILTERING"), 0).await;
+            assert_eq!(
+                count, 3,
+                "withheld dept-only query returns all 3 eng alices"
+            );
+        }
     }
 
     /// CREATE INDEX ... USING 'filtered' with a missing/invalid predicate option

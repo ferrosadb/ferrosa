@@ -598,11 +598,7 @@ mod tests {
             endpoint: "memory://".into(),
             prefix: "p".into(),
         };
-        let predicate = FilterPredicate {
-            column_position: 1,
-            op: FilterOp::Gt,
-            value: vec![0, 0, 0, 21],
-        };
+        let predicate = FilterPredicate::single(1, FilterOp::Gt, vec![0, 0, 0, 21]);
         let job = IndexBuildJob {
             sstable_id: "gen-7".to_string(),
             index_name: "name_adult_idx".to_string(),

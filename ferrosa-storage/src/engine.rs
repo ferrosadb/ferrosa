@@ -15975,11 +15975,7 @@ mod tests {
             .position(|n| *n == "status")
             .expect("status column present");
 
-        let predicate = FilterPredicate {
-            column_position: status_pos,
-            op: FilterOp::Eq,
-            value: b"active".to_vec(),
-        };
+        let predicate = FilterPredicate::single(status_pos, FilterOp::Eq, b"active".to_vec());
         let mut options = std::collections::HashMap::new();
         options.insert(
             FILTER_PREDICATE_OPTION_KEY.to_string(),

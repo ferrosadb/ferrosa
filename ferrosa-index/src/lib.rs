@@ -27,7 +27,10 @@ pub mod hash;
 pub mod phonetic;
 pub mod vector;
 
-pub use filtered::{evaluate_predicate, query_constraint_implies_predicate};
+pub use filtered::{
+    evaluate_clause, evaluate_predicate, evaluate_predicate_row, query_clause_implies,
+    query_constraint_implies_predicate, query_constraint_implies_predicate_clause,
+};
 pub use phonetic::PhoneticAlgorithm;
 
 use ferrosa_common::CellValue;
@@ -276,30 +279,126 @@ pub enum FilterOp {
     GtEq,
 }
 
-/// A filter predicate applied to a specific column during index building.
+/// A single comparison clause of a (possibly multi-column) filter predicate:
+/// `column_position <op> value`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FilterPredicate {
+pub struct FilterClause {
     /// The column position to filter on.
     pub column_position: usize,
     /// The comparison operator.
     pub op: FilterOp,
-    /// The value to compare against.
+    /// The value to compare against (storage encoding).
     pub value: Vec<u8>,
 }
 
+impl FilterClause {
+    /// Construct a single clause.
+    pub fn new(column_position: usize, op: FilterOp, value: Vec<u8>) -> Self {
+        Self {
+            column_position,
+            op,
+            value,
+        }
+    }
+}
+
+/// A filter predicate applied during index building: a **conjunction** of one
+/// or more [`FilterClause`]s. A row is retained only when EVERY clause holds
+/// (logical AND). A single-clause predicate is the common case and is preserved
+/// for backward compatibility on the wire (see this type's custom `Deserialize`,
+/// which still accepts the legacy flat single-clause JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FilterPredicate {
+    /// Wire format version. `1` is the legacy single-clause flat shape (decoded
+    /// transparently); `2` is the conjunction shape serialized here.
+    pub version: u8,
+    /// The conjoined clauses. Non-empty for a well-formed predicate.
+    pub clauses: Vec<FilterClause>,
+}
+
+/// Current serialized wire version for the conjunction shape.
+const FILTER_PREDICATE_VERSION: u8 = 2;
+
 impl FilterPredicate {
+    /// Construct a single-column predicate (the common case).
+    pub fn single(column_position: usize, op: FilterOp, value: Vec<u8>) -> Self {
+        Self {
+            version: FILTER_PREDICATE_VERSION,
+            clauses: vec![FilterClause::new(column_position, op, value)],
+        }
+    }
+
+    /// Construct a conjunction predicate from clauses. The caller provides at
+    /// least one clause; an empty conjunction retains nothing useful and is
+    /// rejected by [`evaluate_predicate`].
+    pub fn conjunction(clauses: Vec<FilterClause>) -> Self {
+        Self {
+            version: FILTER_PREDICATE_VERSION,
+            clauses,
+        }
+    }
+
+    /// The conjoined clauses.
+    pub fn clauses(&self) -> &[FilterClause] {
+        &self.clauses
+    }
+
     /// Serialize this predicate to a JSON string suitable for stashing in an
-    /// index `options` map (the `value` bytes are already in storage encoding,
-    /// so the round-trip is exact and type-system independent).
+    /// index `options` map (the clause `value` bytes are already in storage
+    /// encoding, so the round-trip is exact and type-system independent).
     pub fn to_option_string(&self) -> IndexResult<String> {
         serde_json::to_string(self).map_err(IndexError::from)
     }
 
     /// Reconstruct a predicate from the JSON produced by
-    /// [`to_option_string`](Self::to_option_string). Returns `None` when the
-    /// string is absent or does not deserialize, so callers can fail safe.
+    /// [`to_option_string`](Self::to_option_string), OR from the legacy
+    /// single-clause flat shape (`{"column_position":..,"op":..,"value":..}`).
+    /// Returns `None` when the string is absent or does not deserialize, so
+    /// callers can fail safe.
     pub fn from_option_string(s: &str) -> Option<Self> {
         serde_json::from_str(s).ok()
+    }
+}
+
+impl<'de> Deserialize<'de> for FilterPredicate {
+    /// Accept BOTH wire shapes:
+    /// - conjunction (v2): `{"version":2,"clauses":[{...},...]}`
+    /// - legacy single clause (v1): `{"column_position":..,"op":..,"value":..}`
+    ///
+    /// The legacy shape is the exact JSON the original single-clause
+    /// `FilterPredicate` serialized, so old `system_schema.indexes` rows and
+    /// in-flight build requests keep deserializing after the upgrade.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            // v2 fields
+            version: Option<u8>,
+            clauses: Option<Vec<FilterClause>>,
+            // v1 (legacy flat single-clause) fields
+            column_position: Option<usize>,
+            op: Option<FilterOp>,
+            value: Option<Vec<u8>>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if let Some(clauses) = wire.clauses {
+            return Ok(FilterPredicate {
+                version: wire.version.unwrap_or(FILTER_PREDICATE_VERSION),
+                clauses,
+            });
+        }
+        match (wire.column_position, wire.op, wire.value) {
+            (Some(column_position), Some(op), Some(value)) => {
+                Ok(FilterPredicate::single(column_position, op, value))
+            }
+            _ => Err(serde::de::Error::custom(
+                "FilterPredicate JSON has neither a `clauses` array (v2) nor a legacy \
+                 `column_position`/`op`/`value` triple (v1)",
+            )),
+        }
     }
 }
 
