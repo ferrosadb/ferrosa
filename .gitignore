@@ -5,7 +5,7 @@
 /releases/
 
 # .claude/skills/ contains symlinks to the research repo (~/.claude/skills/).
-# Other developers: run setup.sh from the research repo, then re-link with /op-init.
+# Other developers: run setup.sh from the research repo, then re-link with /warp.
 .worktrees/
 .claude/worktrees/
 .fastembed_cache/
