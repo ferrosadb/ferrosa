@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — 3-Node Cluster Setup</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --border: #1e1e2a;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 4rem 2rem 6rem;
+    }
+
+    .back-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-bottom: 2rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 3rem;
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1.5rem;
+      margin-top: 4rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      margin-top: 2rem;
+    }
+
+    p, li {
+      color: var(--text-secondary);
+      margin-bottom: 1rem;
+      max-width: 720px;
+      line-height: 1.7;
+    }
+
+    ul, ol { padding-left: 1.5rem; margin-bottom: 1.5rem; }
+    li { margin-bottom: 0.5rem; }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.875em;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--accent-cool);
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin-bottom: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.8;
+      color: var(--text-secondary);
+    }
+
+    pre .cm { color: #546e7a; }
+    pre .kw { color: #c792ea; }
+    pre .str { color: #c3e88d; }
+    pre .var { color: #f78c6c; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    td { color: var(--text-secondary); }
+    td:first-child { color: var(--text-primary); font-weight: 600; }
+    td code { font-size: 0.8125rem; }
+
+    .note {
+      background: rgba(226, 114, 91, 0.08);
+      border: 1px solid rgba(226, 114, 91, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .note strong { color: var(--accent); }
+
+    .warning {
+      background: rgba(212, 165, 116, 0.08);
+      border: 1px solid rgba(212, 165, 116, 0.3);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .warning strong { color: var(--accent-warm); }
+
+    .toc {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem 2rem;
+      margin-bottom: 2rem;
+    }
+
+    .toc h4 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+    }
+
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin-bottom: 0.375rem; }
+    .toc a { font-size: 0.9375rem; font-weight: 500; }
+
+    .step-number {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 700;
+      width: 1.5rem;
+      height: 1.5rem;
+      border-radius: 50%;
+      text-align: center;
+      line-height: 1.5rem;
+      margin-right: 0.5rem;
+      flex-shrink: 0;
+    }
+
+    @media (max-width: 640px) {
+      h1 { font-size: 1.75rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="/" class="back-link">&larr; Ferrosa Suite home</a> &middot; <a href="/database/" class="back-link">Database home</a>
+
+  <h1>3-Node <span>Cluster</span> Setup</h1>
+  <p class="subtitle">Run a production-shaped 3-node Ferrosa cluster. This guide covers prerequisites, per-node configuration, formation, verification, and expected cold-start behavior after a full restart.</p>
+
+  <div class="warning">
+    <strong>Developer Preview &mdash; Clustering durability caveat:</strong>
+    Ferrosa clustering is in active hardening. Data written during cluster formation may have reduced durability until the Raft state machine commits topology and bootstrap streaming completes data redistribution across all replicas. Do not use this configuration for production data until you have run your own durability validation with a representative workload. See <a href="getting-started.html#operational-notes">Operational Notes</a> for general durability considerations.
+  </div>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ul>
+      <li><a href="#prerequisites">Prerequisites</a></li>
+      <li><a href="#architecture">How 3-node clustering works</a></li>
+      <li><a href="#per-node-config">Per-node configuration</a></li>
+      <li><a href="#formation">Formation procedure</a></li>
+      <li><a href="#verify">Verification</a></li>
+      <li><a href="#cold-start">Expected cold-start behavior</a></li>
+      <li><a href="#readiness-probe">Readiness probe</a></li>
+      <li><a href="#docker-compose">Docker Compose quickstart</a></li>
+      <li><a href="#troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+
+  <!-- ── Prerequisites ── -->
+  <h2 id="prerequisites">Prerequisites</h2>
+
+  <ul>
+    <li>Three machines (or containers) with stable hostnames or IP addresses that can reach each other on TCP port <strong>7000</strong> (internode protocol).</li>
+    <li>Each node must be able to resolve the other nodes' <code>FERROSA_INTERNODE_BROADCAST</code> addresses at startup and on reconnect. Use hostnames where possible — they survive container IP churn. Static IPs are acceptable for bare-metal deployments.</li>
+    <li>Port <strong>9042</strong> (CQL) and port <strong>9090</strong> (web console / readiness probe) open for client and operator access on each node.</li>
+    <li>Shared S3-compatible storage (or a local MinIO instance) configured identically on all three nodes. All nodes must point at the same bucket.</li>
+    <li>Clocks synchronized (NTP or equivalent). Ferrosa tolerates up to 5 seconds of skew by default (<code>FERROSA_CLOCK_MAX_SKEW_SECS</code>). Larger skew causes Accord transaction validation failures.</li>
+  </ul>
+
+  <!-- ── Architecture ── -->
+  <h2 id="architecture">How 3-node clustering works</h2>
+
+  <p>A Ferrosa cluster uses two layers:</p>
+  <ol>
+    <li><strong>Raft consensus</strong> (via openraft) for cluster metadata: membership, schema, token assignments, and DDL replication. One node acts as the Raft leader; all DDL and membership changes are serialized through it.</li>
+    <li><strong>CQL coordinator</strong> with a Murmur3 token ring for data routing. Reads and writes are routed to the subset of nodes that own the token range for each partition key, subject to the configured consistency level.</li>
+  </ol>
+
+  <p>Formation proceeds through three states:</p>
+  <table>
+    <thead><tr><th>State</th><th>Condition</th><th>CQL ready?</th></tr></thead>
+    <tbody>
+      <tr><td>Standalone</td><td>No seeds configured or seeds unreachable</td><td>Yes</td></tr>
+      <tr><td>Forming</td><td>Peers connected; waiting for Raft leader election</td><td>No</td></tr>
+      <tr><td>Cluster</td><td>Raft leader elected; data routing active</td><td>Yes</td></tr>
+    </tbody>
+  </table>
+
+  <p>A Raft quorum of 2 out of 3 nodes is required for leader election and for DDL operations. Data reads and writes at <code>LOCAL_QUORUM</code> also require 2 of 3 replicas.</p>
+
+  <!-- ── Per-node Config ── -->
+  <h2 id="per-node-config">Per-node configuration</h2>
+
+  <p>The following environment variables are required on every node. Values differ per node where indicated.</p>
+
+  <table>
+    <thead><tr><th>Variable</th><th>node1</th><th>node2</th><th>node3</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>FERROSA_INTERNODE_BIND</code></td>
+        <td colspan="3"><code>0.0.0.0:7000</code> (same on all)</td>
+      </tr>
+      <tr>
+        <td><code>FERROSA_INTERNODE_BROADCAST</code></td>
+        <td><code>node1:7000</code></td>
+        <td><code>node2:7000</code></td>
+        <td><code>node3:7000</code></td>
+      </tr>
+      <tr>
+        <td><code>FERROSA_SEED</code></td>
+        <td><code>node2:7000,node3:7000</code></td>
+        <td><code>node1:7000,node3:7000</code></td>
+        <td><code>node1:7000,node2:7000</code></td>
+      </tr>
+      <tr>
+        <td><code>FERROSA_CLUSTER_NAME</code></td>
+        <td colspan="3"><code>my-cluster</code> (must match across all nodes)</td>
+      </tr>
+      <tr>
+        <td><code>FERROSA_DATA_DIR</code></td>
+        <td colspan="3"><code>/var/lib/ferrosa</code> (local per-node volume)</td>
+      </tr>
+      <tr>
+        <td><code>FERROSA_S3_ENDPOINT</code></td>
+        <td colspan="3">Same S3 endpoint on all nodes</td>
+      </tr>
+      <tr>
+        <td><code>FERROSA_S3_BUCKET</code></td>
+        <td colspan="3">Same bucket on all nodes</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Set the seeds list to include the <em>other</em> nodes — never list a node as its own seed. Each entry is a <code>hostname:port</code> or <code>ip:port</code> on the internode port (default <strong>7000</strong>).</p>
+
+  <h3>Minimal node1 environment (bare-metal example)</h3>
+  <pre><span class="cm"># node1</span>
+<span class="kw">FERROSA_DATA_DIR</span>=/var/lib/ferrosa
+<span class="kw">FERROSA_CLUSTER_NAME</span>=my-cluster
+<span class="kw">FERROSA_INTERNODE_BIND</span>=0.0.0.0:7000
+<span class="kw">FERROSA_INTERNODE_BROADCAST</span>=node1.internal:7000
+<span class="kw">FERROSA_SEED</span>=node2.internal:7000,node3.internal:7000
+<span class="kw">FERROSA_S3_ENDPOINT</span>=https://s3.us-east-1.amazonaws.com
+<span class="kw">FERROSA_S3_BUCKET</span>=my-ferrosa-cluster
+<span class="kw">FERROSA_S3_REGION</span>=us-east-1</pre>
+
+  <pre><span class="cm"># node2</span>
+<span class="kw">FERROSA_DATA_DIR</span>=/var/lib/ferrosa
+<span class="kw">FERROSA_CLUSTER_NAME</span>=my-cluster
+<span class="kw">FERROSA_INTERNODE_BIND</span>=0.0.0.0:7000
+<span class="kw">FERROSA_INTERNODE_BROADCAST</span>=node2.internal:7000
+<span class="kw">FERROSA_SEED</span>=node1.internal:7000,node3.internal:7000
+<span class="kw">FERROSA_S3_ENDPOINT</span>=https://s3.us-east-1.amazonaws.com
+<span class="kw">FERROSA_S3_BUCKET</span>=my-ferrosa-cluster
+<span class="kw">FERROSA_S3_REGION</span>=us-east-1</pre>
+
+  <pre><span class="cm"># node3</span>
+<span class="kw">FERROSA_DATA_DIR</span>=/var/lib/ferrosa
+<span class="kw">FERROSA_CLUSTER_NAME</span>=my-cluster
+<span class="kw">FERROSA_INTERNODE_BIND</span>=0.0.0.0:7000
+<span class="kw">FERROSA_INTERNODE_BROADCAST</span>=node3.internal:7000
+<span class="kw">FERROSA_SEED</span>=node1.internal:7000,node2.internal:7000
+<span class="kw">FERROSA_S3_ENDPOINT</span>=https://s3.us-east-1.amazonaws.com
+<span class="kw">FERROSA_S3_BUCKET</span>=my-ferrosa-cluster
+<span class="kw">FERROSA_S3_REGION</span>=us-east-1</pre>
+
+  <div class="note">
+    <strong>Broadcast address:</strong> <code>FERROSA_INTERNODE_BROADCAST</code> is the address other nodes use to connect back to this node. Use a hostname (not an IP) wherever possible so the address remains valid if the container or VM gets a new IP. Ferrosa re-resolves broadcast hostnames on each connection attempt.
+  </div>
+
+  <!-- ── Formation ── -->
+  <h2 id="formation">Formation procedure</h2>
+
+  <p>Ferrosa cluster formation is automatic once all three nodes can reach each other. Start all three nodes simultaneously (or within the election timeout window — see <a href="#cold-start">cold-start behavior</a>):</p>
+
+  <ol>
+    <li>Start node1, node2, and node3 with the configuration above.</li>
+    <li>Each node connects to its seeds and transitions from Standalone to Forming.</li>
+    <li>Raft leader election runs automatically among the three nodes. No operator action is required.</li>
+    <li>Once a leader is elected, Ferrosa transitions to Cluster mode and begins routing CQL traffic through the token ring.</li>
+    <li>Bootstrap streaming redistributes any data written in standalone mode to the correct token owners.</li>
+  </ol>
+
+  <div class="note">
+    <strong>Simultaneous start:</strong> Starting all three nodes within a few seconds of each other gives the fastest convergence. If node3 is delayed by more than the election timeout window (~6 seconds at default settings), the other two may elect a leader before node3 joins — which is fine, but node3 will receive a snapshot from the leader on its first connection.
+  </div>
+
+  <p>There is no explicit "join" command. Set the seeds, start the node, and formation happens automatically.</p>
+
+  <!-- ── Verify ── -->
+  <h2 id="verify">Verification</h2>
+
+  <h3>Readiness probe</h3>
+  <p>Check the <code>/readyz</code> endpoint on each node's web console port (default <strong>9090</strong>). It returns <code>200 OK</code> with <code>{"ready":true}</code> once a Raft leader is present and the node is serving CQL traffic:</p>
+  <pre><span class="cm"># Check node1</span>
+<span class="kw">curl</span> -s http://node1:9090/readyz | python3 -m json.tool
+
+<span class="cm"># Expected output when ready:</span>
+<span class="str">{"ready": true}
+
+# Expected output while Raft is still converging:</span>
+<span class="str">{"ready": false, "waiting_for": "raft_leader", "detail": "no raft leader elected yet"}</span></pre>
+
+  <div class="note">
+    <strong>HTTP status:</strong> <code>/readyz</code> returns <code>200</code> when ready, <code>503</code> when not ready. Orchestrators should check the HTTP status code, not just the body.
+  </div>
+
+  <h3>Cluster mode via API</h3>
+  <pre><span class="kw">curl</span> -s http://node1:9090/api/cluster/status | python3 -m json.tool
+<span class="cm"># Shows: {"mode": "Cluster", "role": null, "host_id": "..."}</span></pre>
+
+  <h3>Cluster status via ferrosa-ctl</h3>
+  <pre><span class="kw">ferrosa-ctl</span> status
+<span class="kw">ferrosa-ctl</span> topology   <span class="cm"># Shows token ring with all 3 nodes in Normal state</span></pre>
+
+  <h3>Peer list via CQL</h3>
+  <pre><span class="kw">cqlsh</span> node1 9042
+cqlsh&gt; SELECT peer, data_center, rack FROM system.peers;
+
+<span class="cm"># Should show 2 rows — the other two nodes</span></pre>
+
+  <h3>Write a row and read it back across nodes</h3>
+  <pre><span class="cm"># On node1: create keyspace with RF=3 for full data distribution</span>
+<span class="kw">cqlsh</span> node1 9042 -e "
+  CREATE KEYSPACE demo WITH replication = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 3
+  };
+  CREATE TABLE demo.ping (id text PRIMARY KEY, ts timestamp);
+  INSERT INTO demo.ping (id, ts) VALUES ('ok', toTimestamp(now()));
+"
+
+<span class="cm"># Read from node3 at QUORUM to confirm replication</span>
+<span class="kw">cqlsh</span> node3 9042 -e "
+  CONSISTENCY QUORUM;
+  SELECT * FROM demo.ping;
+"</pre>
+
+  <!-- ── Cold Start ── -->
+  <h2 id="cold-start">Expected cold-start behavior</h2>
+
+  <p>After a full cluster restart (all three nodes stopped and restarted), Ferrosa nodes go through this sequence:</p>
+
+  <ol>
+    <li><strong>Listeners bind</strong> — CQL (:9042), web (:9090), and internode (:7000) listeners accept connections. The node is not yet ready to serve CQL.</li>
+    <li><strong>Peer connections form</strong> — Nodes dial their seeds and establish internode connections. This typically takes 5&ndash;30 seconds depending on container startup ordering.</li>
+    <li><strong>Raft leader election</strong> — openraft pre-vote rounds run until one node wins a quorum of votes. In normal conditions this converges in 3&ndash;15 seconds after peer connections form.</li>
+    <li><strong>DDL path activates</strong> — The winning leader swaps the DDL path to Cluster mode. Schema is re-applied from the Raft log. This produces the log line: <code>raft leader elected, swapping DDL path to Cluster</code>.</li>
+    <li><strong>Cluster mode active</strong> — <code>/readyz</code> returns <code>200</code>. CQL clients can connect and execute queries.</li>
+  </ol>
+
+  <div class="warning">
+    <strong>Pre-vote convergence can take up to several minutes in some conditions.</strong>
+    A known edge case: if all three nodes have a non-empty Raft log from before the restart, pre-vote rounds may back off for up to ~3 minutes before a leader is elected. This is caused by openraft 0.9&rsquo;s pre-vote quorum check interacting with the full-cluster restart sequence. During this window, <code>/readyz</code> returns <code>503</code> and CQL requests return errors.
+    <br><br>
+    The TCP port is bound and containers appear &ldquo;healthy&rdquo; by naive TCP probes immediately &mdash; this is why the readiness probe exists. Scripts that wait for &ldquo;all containers healthy&rdquo; should use <code>/readyz</code>, not a TCP check.
+    <br><br>
+    If convergence takes longer than 5 minutes, restart the cluster again. A second restart from the same persisted state usually converges quickly.
+  </div>
+
+  <!-- ── Readiness Probe ── -->
+  <h2 id="readiness-probe">Readiness probe reference</h2>
+
+  <p>The <code>/readyz</code> endpoint is available on the web console port (default 9090) without authentication.</p>
+
+  <table>
+    <thead><tr><th>Mode</th><th>HTTP status</th><th>Condition</th></tr></thead>
+    <tbody>
+      <tr><td>Standalone</td><td>200</td><td>Always ready (no peers)</td></tr>
+      <tr><td>Pair / Degraded</td><td>200</td><td>Ready (pair HA or stale reads)</td></tr>
+      <tr><td>Forming (no Raft)</td><td>503</td><td>Raft not yet initialized</td></tr>
+      <tr><td>Forming / Cluster (no leader)</td><td>503</td><td>Leader election in progress</td></tr>
+      <tr><td>Cluster (leader present)</td><td>200</td><td>Ready to serve CQL</td></tr>
+    </tbody>
+  </table>
+
+  <p>Response body when not ready:</p>
+  <pre><span class="str">{"ready": false, "waiting_for": "raft_leader", "detail": "no raft leader elected yet"}</span></pre>
+
+  <p>The <code>waiting_for</code> field always names the blocking condition so log-scraping scripts and operators can distinguish &ldquo;Raft not initialized&rdquo; from &ldquo;election in progress&rdquo;.</p>
+
+  <!-- ── Docker Compose ── -->
+  <h2 id="docker-compose">Docker Compose quickstart</h2>
+
+  <p>The repository&rsquo;s <code>docker-compose.yml</code> runs a 3-node cluster with a local RustFS (S3-compatible) backend. Use it for local integration testing. It uses <code>/readyz</code> as the healthcheck:</p>
+
+  <pre><span class="cm"># Start all services</span>
+<span class="kw">docker compose up -d</span>
+
+<span class="cm"># Wait for all three nodes to report ready</span>
+<span class="kw">for</span> port in 9090 9091 9092; <span class="kw">do</span>
+  <span class="kw">echo</span> -n "node (port $port): "
+  <span class="kw">until</span> curl -sf http://127.0.0.1:$port/readyz &gt;/dev/null 2&gt;&amp;1; <span class="kw">do</span>
+    <span class="kw">sleep</span> 5; printf ".";
+  <span class="kw">done</span>
+  <span class="kw">echo</span> " ready"
+<span class="kw">done</span>
+
+<span class="cm"># Connect to node1</span>
+<span class="kw">cqlsh</span> 127.0.0.1 9042</pre>
+
+  <div class="note">
+    <strong>Auth in Docker Compose:</strong> The default <code>docker-compose.yml</code> runs with <code>FERROSA_AUTH_DISABLED=true</code> for local development convenience. To enable auth, use the included overlay:
+    <pre style="margin-top:0.75rem;"><span class="kw">docker compose</span> -f docker-compose.yml -f docker-compose.secure.yml up -d</pre>
+    After formation, rotate the default <code>ferrosa_admin</code> password via <code>cqlsh</code>:
+    <pre><span class="kw">cqlsh</span> -u ferrosa_admin -p ferrosa_admin 127.0.0.1 9042
+cqlsh&gt; ALTER ROLE ferrosa_admin WITH PASSWORD='<span class="var">your-strong-password</span>';</pre>
+  </div>
+
+  <!-- ── Troubleshooting ── -->
+  <h2 id="troubleshooting">Troubleshooting</h2>
+
+  <h3>/readyz returns 503 for more than 5 minutes</h3>
+  <p>Check the logs for the blocking condition:</p>
+  <pre><span class="kw">docker logs</span> &lt;node&gt; | grep -E "pre-vote|leader|forming|raft"</pre>
+  <ul>
+    <li>Repeated <code>pre-vote round did not reach quorum</code> lines: nodes cannot reach each other on port 7000. Check firewall rules and DNS resolution of the <code>FERROSA_INTERNODE_BROADCAST</code> addresses.</li>
+    <li><code>raft not yet initialized</code> in the <code>/readyz</code> body: the background Raft init task has not yet completed. Wait 10&ndash;30 seconds after peer connections appear in the logs.</li>
+    <li>No log output from all three nodes: at least one node has not started. Check <code>docker compose ps</code>.</li>
+  </ul>
+
+  <h3>One node is stuck in Forming after the other two have a leader</h3>
+  <p>The lagging node will receive an <code>InstallSnapshot</code> from the leader and catch up automatically. If it has not caught up after 2 minutes:</p>
+  <pre><span class="kw">docker compose restart</span> node3   <span class="cm"># or whichever node is lagging</span></pre>
+  <p>The restarted node re-dials its seeds, loads the Raft snapshot, and joins the cluster. It does not need a clean data directory.</p>
+
+  <h3>Cluster mode but reads return errors</h3>
+  <p>Verify that bootstrap streaming has completed by checking that all three nodes are in <code>Normal</code> state:</p>
+  <pre><span class="kw">ferrosa-ctl</span> topology</pre>
+  <p>If a node shows <code>Joining</code> state, bootstrap streaming is still in progress. CQL reads at <code>QUORUM</code> will succeed once all replicas are in <code>Normal</code> state.</p>
+
+  <!-- ── Nav back ── -->
+  <h2 id="next">Next steps</h2>
+  <p>
+    <a href="getting-started.html">Getting Started guide &rarr;</a> &mdash; single-node setup, CQL drivers, configuration reference, and architecture overview.
+  </p>
+  <p>
+    <a href="cql-compatibility.html">CQL Compatibility reference &rarr;</a> &mdash; full list of supported statements, types, and functions.
+  </p>
+
+</div>
+
+</body>
+</html>
