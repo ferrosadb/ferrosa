@@ -1,0 +1,35 @@
+##############################################################################
+# SECURE OVERLAY — enable CQL auth                                           #
+#                                                                            #
+# Usage:                                                                     #
+#   docker compose -f docker-compose.yml -f docker-compose.secure.yml up    #
+#                                                                            #
+# This overlay removes FERROSA_AUTH_DISABLED and enables auth by setting    #
+# FERROSA_AUTH_ENABLED=true. After the cluster forms, rotate the default    #
+# ferrosa_admin password immediately:                                        #
+#                                                                            #
+#   cqlsh -u ferrosa_admin -p ferrosa_admin 127.0.0.1 9042                  #
+#   ALTER ROLE ferrosa_admin WITH PASSWORD='<strong-password>';              #
+#                                                                            #
+# There is currently no mechanism to inject the initial admin password at   #
+# container startup time — the seed credential (ferrosa_admin / ferrosa_admin)
+# is baked into the binary (see ferrosa-schema/src/auth/bootstrap.rs).      #
+# The 5-minute warning in the binary logs will fire until the password is   #
+# rotated.                                                                   #
+##############################################################################
+
+services:
+  node1:
+    environment:
+      FERROSA_AUTH_DISABLED: ""     # clear the dev-only flag
+      FERROSA_AUTH_ENABLED: "true"
+
+  node2:
+    environment:
+      FERROSA_AUTH_DISABLED: ""
+      FERROSA_AUTH_ENABLED: "true"
+
+  node3:
+    environment:
+      FERROSA_AUTH_DISABLED: ""
+      FERROSA_AUTH_ENABLED: "true"
