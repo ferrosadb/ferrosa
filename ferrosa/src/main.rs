@@ -873,6 +873,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 4b'''. Reconstruct user-defined functions from the persisted
+    // `system_schema.functions` table. Like UDTs, UDFs are not carried in
+    // `schema.json`, so without this every CREATE FUNCTION is silently lost on
+    // restart. Runs after user types (step 4b'') so a function whose signature
+    // references a UDT can resolve it.
+    {
+        let loader =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));
+        match loader.replay_functions_into_schema(&schema) {
+            Ok(count) if count > 0 => {
+                tracing::info!(
+                    count,
+                    "reconstructed persisted user-defined functions after restart"
+                )
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(%e, "failed to reconstruct user-defined functions from system_schema")
+            }
+        }
+    }
+
     if storage_auth_enabled {
         let loader =
             ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));

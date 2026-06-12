@@ -390,6 +390,13 @@ impl DdlCoordinator {
                 self.schema
                     .create_function_internal(func)
                     .map_err(|e| ClusterError::Internal(format!("create_function: {e}")))?;
+                crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::FunctionCreated(
+                            func.clone(),
+                        ),
+                    )
+                    .map_err(ClusterError::Storage)?;
             }
             DdlOperation::DropFunction {
                 ref keyspace,
@@ -399,6 +406,15 @@ impl DdlCoordinator {
                 self.schema
                     .drop_function_internal(keyspace, name, arg_types)
                     .map_err(|e| ClusterError::Internal(format!("drop_function: {e}")))?;
+                crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::FunctionDropped {
+                            keyspace: keyspace.clone(),
+                            name: name.clone(),
+                            arg_types: arg_types.clone(),
+                        },
+                    )
+                    .map_err(ClusterError::Storage)?;
             }
             DdlOperation::CreateAggregate(ref agg) => {
                 self.schema

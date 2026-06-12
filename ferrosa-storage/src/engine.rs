@@ -841,6 +841,101 @@ fn decode_persisted_type_row(keyspace: &str, row: &Row) -> Option<PersistedTypeR
     })
 }
 
+/// A decoded row of the persisted `system_schema.functions` table.
+///
+/// Returned by [`StorageEngine::read_persisted_functions`] so both the CQL
+/// router (to serve `SELECT * FROM system_schema.functions`) and the boot-time
+/// loader (to rebuild the schema Registry's function map) read from the same
+/// storage source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedFunctionRow {
+    /// Partition key — the keyspace owning the function.
+    pub keyspace_name: String,
+    /// First clustering column — the function name.
+    pub function_name: String,
+    /// Argument names, in declaration order.
+    pub arg_names: Vec<String>,
+    /// Argument types (second clustering column, decoded from JSON), in order.
+    pub arg_types: Vec<ferrosa_common::CqlType>,
+    /// Declared return type.
+    pub return_type: ferrosa_common::CqlType,
+    /// Whether the function is invoked on null input.
+    pub called_on_null: bool,
+    /// Implementation language (e.g. "wasm").
+    pub language: String,
+    /// Function body (hex-encoded WASM binary).
+    pub body: String,
+}
+
+/// Decode the `system_schema.functions` composite clustering key into
+/// `(function_name, arg_types)`.
+///
+/// Inverse of `ferrosa_schema::system::persistence::function_clustering`:
+/// `[u16 len][function_name][u16 len][argument_types_json]`. Returns `None` when
+/// the bytes are truncated or the JSON is malformed.
+fn decode_function_clustering(clustering: &[u8]) -> Option<(String, Vec<ferrosa_common::CqlType>)> {
+    let mut pos = 0usize;
+    let name_len_end = pos.checked_add(2)?;
+    let name_len = u16::from_be_bytes(clustering.get(pos..name_len_end)?.try_into().ok()?) as usize;
+    let name_end = name_len_end.checked_add(name_len)?;
+    let name = String::from_utf8(clustering.get(name_len_end..name_end)?.to_vec()).ok()?;
+    pos = name_end;
+
+    let json_len_end = pos.checked_add(2)?;
+    let json_len = u16::from_be_bytes(clustering.get(pos..json_len_end)?.try_into().ok()?) as usize;
+    let json_end = json_len_end.checked_add(json_len)?;
+    let json = clustering.get(json_len_end..json_end)?;
+    let arg_types: Vec<ferrosa_common::CqlType> = serde_json::from_slice(json).ok()?;
+    Some((name, arg_types))
+}
+
+/// Decode one stored `system_schema.functions` row into a [`PersistedFunctionRow`].
+///
+/// Returns `None` for tombstones or rows whose clustering / required cells are
+/// missing or malformed, so callers surface only well-formed function metadata
+/// rather than reconstructing a corrupt overload.
+fn decode_persisted_function_row(keyspace: &str, row: &Row) -> Option<PersistedFunctionRow> {
+    if !row.deletion.is_live() {
+        return None;
+    }
+    let (function_name, arg_types) = decode_function_clustering(&row.clustering)?;
+
+    let names_bytes = cell_bytes(
+        row,
+        ferrosa_schema::system::persistence::FUNCTIONS_COL_ARGUMENT_NAMES,
+    )?;
+    let arg_names: Vec<String> = serde_json::from_slice(&names_bytes).ok()?;
+
+    let return_bytes = cell_bytes(
+        row,
+        ferrosa_schema::system::persistence::FUNCTIONS_COL_RETURN_TYPE,
+    )?;
+    let return_type: ferrosa_common::CqlType = serde_json::from_slice(&return_bytes).ok()?;
+
+    let called_on_null_bytes = cell_bytes(
+        row,
+        ferrosa_schema::system::persistence::FUNCTIONS_COL_CALLED_ON_NULL,
+    )?;
+    let called_on_null = called_on_null_bytes.first().copied().unwrap_or(0) != 0;
+
+    let language = cell_text(
+        row,
+        ferrosa_schema::system::persistence::FUNCTIONS_COL_LANGUAGE,
+    )?;
+    let body = cell_text(row, ferrosa_schema::system::persistence::FUNCTIONS_COL_BODY)?;
+
+    Some(PersistedFunctionRow {
+        keyspace_name: keyspace.to_string(),
+        function_name,
+        arg_names,
+        arg_types,
+        return_type,
+        called_on_null,
+        language,
+        body,
+    })
+}
+
 /// Decode one stored `system_schema.indexes` row into a [`PersistedIndexRow`].
 ///
 /// Returns `None` for tombstones or rows whose clustering / required cells are
@@ -2759,6 +2854,34 @@ impl StorageEngine {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
                 if let Some(decoded) = decode_persisted_type_row(&keyspace, row) {
+                    out.push(decoded);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads every live row of the persisted `system_schema.functions` table and
+    /// decodes it into [`PersistedFunctionRow`]s.
+    ///
+    /// Storage-backed source for both `SELECT * FROM system_schema.functions`
+    /// (replacing the hardcoded-empty router arm) and boot-time UDF
+    /// reconstruction into the schema Registry. Tombstoned/malformed rows are
+    /// skipped. Returns an empty vector when the table is not registered.
+    pub fn read_persisted_functions(&self) -> ferrosa_common::Result<Vec<PersistedFunctionRow>> {
+        let functions_tid = TableId::new("system_schema", "functions");
+        if !self.tables.read().contains_key(&functions_tid) {
+            return Ok(Vec::new());
+        }
+
+        const MAX_FUNCTIONS_TO_READ: usize = 10_000;
+        let partitions = self.read_range(&functions_tid, None, None, MAX_FUNCTIONS_TO_READ)?;
+
+        let mut out = Vec::new();
+        for partition in &partitions {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
+            for row in &partition.rows {
+                if let Some(decoded) = decode_persisted_function_row(&keyspace, row) {
                     out.push(decoded);
                 }
             }
@@ -16256,6 +16379,110 @@ mod tests {
             engine.read_persisted_types().unwrap().is_empty(),
             "dropped type must not appear in read_persisted_types"
         );
+    }
+
+    /// A persisted `system_schema.functions` row survives a flush + reopen and
+    /// `read_persisted_functions` decodes it back into the original metadata,
+    /// including a nested-collection return type (lossless serde round-trip).
+    #[test]
+    fn read_persisted_functions_round_trips_through_storage() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::function::UserFunctionMetadata;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let functions_tid = TableId::new("system_schema", "functions");
+        let func = UserFunctionMetadata {
+            keyspace: "app".to_string(),
+            name: "tokenize".to_string(),
+            arg_names: vec!["s".to_string()],
+            arg_types: vec![CqlType::Varchar],
+            return_type: CqlType::List(Box::new(CqlType::Varchar)),
+            called_on_null: true,
+            language: "wasm".to_string(),
+            body: "deadbeef".to_string(),
+        };
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_system_tables().unwrap();
+
+            let row = persistence::function_to_row(&func);
+            engine
+                .write(&functions_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+            engine.flush(&functions_tid).unwrap();
+        }
+
+        // Reopen and read from storage (SSTable, not memtable).
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+
+        let stored = engine.read_persisted_functions().unwrap();
+        assert_eq!(stored.len(), 1, "exactly one persisted function expected");
+        let row = &stored[0];
+        assert_eq!(row.keyspace_name, "app");
+        assert_eq!(row.function_name, "tokenize");
+        assert_eq!(row.arg_names, vec!["s".to_string()]);
+        assert_eq!(row.arg_types, vec![CqlType::Varchar]);
+        assert_eq!(row.return_type, CqlType::List(Box::new(CqlType::Varchar)));
+        assert!(row.called_on_null);
+        assert_eq!(row.language, "wasm");
+        assert_eq!(row.body, "deadbeef");
+    }
+
+    /// Two overloads of the same function name persist as distinct rows and a
+    /// tombstone of one overload (DROP FUNCTION) masks only that overload.
+    #[test]
+    fn read_persisted_functions_overloads_and_tombstone() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::function::UserFunctionMetadata;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let functions_tid = TableId::new("system_schema", "functions");
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+
+        let make = |arg: CqlType| UserFunctionMetadata {
+            keyspace: "app".to_string(),
+            name: "norm".to_string(),
+            arg_names: vec!["v".to_string()],
+            arg_types: vec![arg.clone()],
+            return_type: arg,
+            called_on_null: false,
+            language: "wasm".to_string(),
+            body: "ab".to_string(),
+        };
+        for func in [make(CqlType::Int), make(CqlType::Varchar)] {
+            let row = persistence::function_to_row(&func);
+            engine
+                .write(&functions_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+        }
+        assert_eq!(
+            engine.read_persisted_functions().unwrap().len(),
+            2,
+            "two overloads must persist as distinct rows"
+        );
+
+        // Tombstone only the int overload.
+        let ts = now_micros_for_test() + 1;
+        let key = DecoratedKey::new(PartitionKey::new(b"app".to_vec()));
+        let tombstone = Row {
+            clustering: persistence::function_clustering("norm", &[CqlType::Int]),
+            cells: vec![],
+            deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        engine.write(&functions_tid, &key, tombstone, ts).unwrap();
+
+        let remaining = engine.read_persisted_functions().unwrap();
+        assert_eq!(remaining.len(), 1, "only the text overload should remain");
+        assert_eq!(remaining[0].arg_types, vec![CqlType::Varchar]);
     }
 
     #[test]
