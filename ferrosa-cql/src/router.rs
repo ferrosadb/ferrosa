@@ -2284,12 +2284,16 @@ async fn route_select(
                 &[],
             ))
         }
-        // system_schema.functions — empty, but column metadata mirrors
-        // Cassandra so the Java driver's `FunctionParser` finds the
-        // boolean `called_on_null_input` it expects.  See gap 7 in
-        // ferrosa-nosqlbench/docs/initial-gaps-found.md.
+        // system_schema.functions — dogfooded: served from the persisted
+        // `system_schema.functions` storage table (not the in-memory Registry).
+        // The column shape mirrors Cassandra so the Java driver's
+        // `FunctionParser` finds the boolean `called_on_null_input` and the
+        // `argument_types`/`argument_names` `list<text>` columns it expects (see
+        // gap 7 in ferrosa-nosqlbench/docs/initial-gaps-found.md). The Registry
+        // remains the live in-memory cache, rebuilt from these same rows at boot
+        // via `replay_functions_into_schema`.
         ("system_schema", "functions") => {
-            let col_names = vec![
+            let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
                 "function_name".into(),
                 "argument_types".into(),
@@ -2310,12 +2314,40 @@ async fn route_select(
                 CqlType::Varchar,
                 CqlType::Varchar,
             ];
+            let stored = state
+                .engine
+                .read_persisted_functions()
+                .map_err(|e| CqlError::ServerError(format!("read system_schema.functions: {e}")))?;
+            let rows: Vec<Vec<Option<CqlValue>>> = stored
+                .into_iter()
+                .map(|f| {
+                    let arg_types: Vec<CqlValue> = f
+                        .arg_types
+                        .iter()
+                        .map(|t| CqlValue::Text(bridge::cql_type_display_name(t).to_string()))
+                        .collect();
+                    let arg_names: Vec<CqlValue> =
+                        f.arg_names.iter().cloned().map(CqlValue::Text).collect();
+                    vec![
+                        Some(CqlValue::Text(f.keyspace_name)),
+                        Some(CqlValue::Text(f.function_name)),
+                        Some(CqlValue::List(arg_types)),
+                        Some(CqlValue::List(arg_names)),
+                        Some(CqlValue::Text(f.body)),
+                        Some(CqlValue::Boolean(f.called_on_null)),
+                        Some(CqlValue::Text(f.language)),
+                        Some(CqlValue::Text(
+                            bridge::cql_type_display_name(&f.return_type).to_string(),
+                        )),
+                    ]
+                })
+                .collect();
             Ok(result::encode_rows(
                 &col_names,
                 &col_types,
                 "system_schema",
                 "functions",
-                &[],
+                &rows,
             ))
         }
         // cqlsh queries these system_schema tables during startup introspection.
@@ -12268,6 +12300,91 @@ mod tests {
         );
     }
 
+    /// Dogfooding parity: a `system_schema.functions` row written straight to
+    /// storage (bypassing the Registry) is returned by
+    /// `SELECT * FROM system_schema.functions`, proving the read path is
+    /// storage-backed (replacing the old hardcoded-empty arm), and a
+    /// DROP-FUNCTION tombstone removes it.
+    #[tokio::test]
+    async fn system_schema_functions_served_from_storage_not_registry() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Write a function row straight to storage, bypassing the Registry.
+        let func = ferrosa_schema::UserFunctionMetadata {
+            keyspace: "ghost_ks".to_string(),
+            name: "ghost_fn".to_string(),
+            arg_names: vec!["v".to_string()],
+            arg_types: vec![CqlType::Int],
+            return_type: CqlType::Int,
+            called_on_null: true,
+            language: "wasm".to_string(),
+            body: "ab".to_string(),
+        };
+        let row = ferrosa_schema::system::persistence::function_to_row(&func);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let tid = TableId::new("system_schema", "functions");
+        state.engine.write(&tid, &row.key, row.row, ts).unwrap();
+
+        // The Registry has no such function, yet the SELECT returns it.
+        assert!(
+            !state.schema.snapshot().functions.contains_key(&(
+                "ghost_ks".into(),
+                "ghost_fn".into(),
+                vec![CqlType::Int]
+            )),
+            "precondition: Registry must NOT contain the ghost function"
+        );
+
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.functions").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            1,
+            "row written only to storage must be returned by the SELECT"
+        );
+
+        // Tombstone the function (DROP FUNCTION) and confirm it disappears.
+        let ts2 = ts + 1;
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"ghost_ks".to_vec(),
+        ));
+        let tombstone = ferrosa_sstable::types::Row {
+            clustering: ferrosa_schema::system::persistence::function_clustering(
+                "ghost_fn",
+                &[CqlType::Int],
+            ),
+            cells: vec![],
+            deletion: ferrosa_sstable::types::DeletionTime::new(ts2, (ts2 / 1_000_000) as u32),
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+        };
+        state.engine.write(&tid, &key, tombstone, ts2).unwrap();
+
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.functions").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(
+            extract_row_count(&body),
+            0,
+            "dropped function must not appear after tombstone"
+        );
+    }
+
     /// Regression: PR#21 (Gap 7) hardcoded the 10-col Cassandra-5.0 shape
     /// for system_schema.views to satisfy the DataStax driver's `ViewParser`
     /// boolean lookups.  The scylla 0.15 driver issues
@@ -15964,6 +16081,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_function_valid_wasm_stores_in_schema() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16070,6 +16188,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_function_with_streaming_marker_compiles_aggregate() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16157,6 +16276,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_or_replace_function_replaces_schema_entry() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16213,6 +16333,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16262,6 +16383,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_function_duplicate_without_replace_errors() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16299,6 +16421,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_function_if_not_exists_succeeds_on_duplicate() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16339,6 +16462,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_function_if_not_exists_duplicate_does_not_compile_body() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16376,6 +16500,7 @@ mod tests {
     #[tokio::test]
     async fn route_drop_function_removes_from_schema() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16427,6 +16552,7 @@ mod tests {
     #[tokio::test]
     async fn route_create_function_with_current_keyspace() {
         let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
 
         // Create keyspace first (without current_keyspace set)
         let ctx = RequestContext {

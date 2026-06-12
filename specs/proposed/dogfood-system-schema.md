@@ -91,8 +91,9 @@ Cassandra shape: PK `keyspace_name`, clustering `(table_name, index_name)`, regu
 
 ## Broader follow-on (full Cassandra model)
 
-Extend the same pattern to the rest: make `system_schema.types/functions/aggregates/views`
-stored (today hardcoded/empty in the router), and make `keyspaces/tables/columns` fully
+Extend the same pattern to the rest: make `system_schema.aggregates/views`
+stored (today hardcoded/empty in the router; `types` and `functions` are now done), and make
+`keyspaces/tables/columns` fully
 storage-served rather than computed-from-Registry. End state: `system_schema` is entirely
 schema-as-data, `schema.json` is retired (or kept only as a legacy import path), and the
 Registry is a pure in-memory cache rebuilt from `system_schema` SSTables at boot — matching
@@ -127,9 +128,39 @@ Cassandra. This is a larger effort and can land table-by-table after indexes.
   `system_schema.types` rows (the Raft `drop_keyspace_cascades_types` path clears Registry +
   Raft state only). The orphaned stored rows are harmless for reads scoped by keyspace but
   should be tombstoned for full parity; this is a small follow-up.
-- **Still TODO**: `functions`, `aggregates`, `views` (hardcoded-empty in the router), and
-  making `keyspaces/tables/columns` fully storage-served. Apply the identical pattern
-  per-table.
+- **`system_schema.functions` — DONE** (this PR, `dogfood/system-schema-functions`). Full
+  vertical slice mirroring the indexes/types pattern, with overload support:
+  - Persisted schema `functions_table_schema()` (PK `keyspace_name`, **composite clustering**
+    `(function_name, argument_types)`, regulars `argument_names`/`return_type`/
+    `called_on_null_input`/`language`/`body`) added to `all_system_table_schemas`.
+  - `SystemTableMutation::FunctionCreated`/`FunctionDropped` + `function_to_row` encoder and a
+    shared `function_clustering(name, arg_types)` helper (`persistence.rs`). The clustering's
+    second component is the JSON of the serde `CqlType` arg list, so **distinct overloads of
+    the same function name are distinct rows** and a drop tombstones only the matching
+    overload. `return_type` is persisted as serde `CqlType` JSON so nested collection / UDT
+    return types reconstruct losslessly.
+  - DDL wiring at all three apply sites (`ddl_path.rs` Direct, `pair/ddl.rs`,
+    `raft/state_machine.rs`), plus the two `SystemTableWriter::apply` arms.
+  - Startup reconstruction: `StorageEngine::read_persisted_functions` (+ `PersistedFunctionRow`,
+    `decode_persisted_function_row`, `decode_function_clustering`) and
+    `SystemTableLoader::{load_user_functions, replay_functions_into_schema}`, wired into
+    `main.rs` boot (step 4b''' after types so a function referencing a UDT resolves it).
+  - Retired the virtual/hardcoded path: deleted `system/function_tables.rs`
+    (`SystemSchemaFunctionsTable`, which was dead code shadowed by the router) and replaced the
+    router's hardcoded-empty `("system_schema","functions")` arm with a `read_persisted_functions`
+    storage read. The Cassandra column shape (`argument_types`/`argument_names` as `list<text>`,
+    `called_on_null_input` boolean) is preserved so DataStax/scylla driver introspection passes.
+  - Tests: encoder round-trip (incl. nested return type, empty args) + overload clustering +
+    mutation variants in `persistence.rs`; storage flush+reopen read + overload/tombstone in
+    `engine.rs`; loader replay-into-Registry in `system_table_loader.rs`; router
+    storage-not-Registry parity + tombstone in `router.rs`.
+- **Deferred for `functions`**: like `types`, DROP KEYSPACE does not cascade-tombstone the
+  keyspace's `system_schema.functions` rows (harmless for keyspace-scoped reads). A
+  `CREATE OR REPLACE FUNCTION` that changes the body but keeps the same signature upserts the
+  row through the normal create path (same clustering) — covered. UDF arg-name changes that
+  keep the signature also upsert correctly.
+- **Still TODO**: `aggregates`, `views` (hardcoded-empty in the router), and making
+  `keyspaces/tables/columns` fully storage-served. Apply the identical pattern per-table.
 
 ## Critical files
 

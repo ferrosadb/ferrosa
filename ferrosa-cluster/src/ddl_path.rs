@@ -359,6 +359,13 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
             schema
                 .create_function_internal(func)
                 .map_err(|e| ClusterError::Internal(format!("create_function: {e}")))?;
+            SystemTableWriter::new(Arc::clone(engine))
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::FunctionCreated(
+                        func.clone(),
+                    ),
+                )
+                .map_err(ClusterError::Storage)?;
         }
         DdlOperation::DropFunction {
             ref keyspace,
@@ -368,6 +375,15 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
             schema
                 .drop_function_internal(keyspace, name, arg_types)
                 .map_err(|e| ClusterError::Internal(format!("drop_function: {e}")))?;
+            SystemTableWriter::new(Arc::clone(engine))
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::FunctionDropped {
+                        keyspace: keyspace.clone(),
+                        name: name.clone(),
+                        arg_types: arg_types.clone(),
+                    },
+                )
+                .map_err(ClusterError::Storage)?;
         }
         DdlOperation::CreateAggregate(ref agg) => {
             schema
