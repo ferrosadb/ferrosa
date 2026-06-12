@@ -11945,6 +11945,94 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Deterministic reproduction of the read-vs-compaction data-loss race that
+    /// `concurrent_read_during_compaction` only hit under CI coverage timing. A
+    /// read snapshots the view (still referencing gen2, which solely holds `t2`),
+    /// pauses at a test barrier, and a compaction then merges gen1+gen2 into one
+    /// SSTable and deletes the inputs. When the read resumes it fails to open the
+    /// deleted gen2; it must NOT silently return `Ok(None)` but retry against the
+    /// new view, where the merged SSTable still holds `t2`.
+    #[tokio::test]
+    async fn read_during_compaction_retries_against_new_view() {
+        use crate::store::read_race_test_hook::{ReadViewBarrier, ARMED};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // t1 -> gen1, t2 -> gen2. t2 lives ONLY in gen2 (no survivor SSTable).
+        engine
+            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+
+        // Submit a compaction merging gen1+gen2 and wait until the merged output
+        // is PRODUCED — but not yet swapped in (poll_compactions applies the swap
+        // and deletes the inputs; we control exactly when that happens).
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            let task = crate::compaction::metadata::CompactionTask {
+                inputs: metadata,
+                output_dir: dir.path().join("compaction"),
+                schema: test_schema(),
+                table_id: tid.clone(),
+            };
+            engine.compaction_executor.submit(task).unwrap();
+        }
+        // Reader thread: arm it so its read pauses right after snapshotting the
+        // still-unswapped view (referencing gen2).
+        let barrier = ReadViewBarrier::new();
+        let b_reader = Arc::clone(&barrier);
+        let eng = Arc::clone(&engine);
+        let rtid = tid.clone();
+        let reader = std::thread::spawn(move || {
+            ARMED.with(|c| *c.borrow_mut() = Some(b_reader));
+            eng.read(&rtid, &make_key("t2"))
+                .expect("read must not error")
+        });
+
+        // With the read holding the old view, drive the swap to completion:
+        // poll until the background merge finishes and poll_compactions applies
+        // it (view -> merged, gen1/gen2 files deleted) out from under the read.
+        // The bound is a generous hang-guard (~30s), NOT a timing assertion: the
+        // background merge always completes, but under a fully parallel test run
+        // the executor thread can be heavily starved, so we wait it out rather
+        // than racing a fixed deadline.
+        barrier.wait_reached();
+        let mut swapped = false;
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                swapped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            swapped,
+            "compaction swap should merge the two inputs into one (background merge never completed)"
+        );
+        barrier.release();
+
+        let got = reader.join().unwrap();
+        assert!(
+            got.is_some(),
+            "t2 must remain readable across a concurrent compaction that deleted its SSTable"
+        );
+    }
+
     #[test]
     fn commit_log_position_exposed() {
         let dir = tempfile::tempdir().unwrap();
