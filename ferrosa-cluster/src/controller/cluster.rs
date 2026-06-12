@@ -22,6 +22,10 @@ use std::sync::Arc;
 pub(crate) static RAFT_PUBLISH_NO_SUBSCRIBERS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RAFT_INITIALIZE_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LEADER_ELECTION_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// Number of times cluster formation started with fewer nodes than the
+/// configured replication factor. Non-zero means writes during this
+/// formation window had reduced durability — run repair to recover.
+pub static FORMATION_REDUCED_DURABILITY_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the silent-failure counters. Public so the metrics endpoint
 /// and tests can observe whether the cluster bootstrap has produced any
@@ -148,6 +152,57 @@ pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool)
 /// machine and storage engine.
 pub(super) fn keyspace_needs_cluster_replay(name: &str) -> bool {
     !ferrosa_schema::is_system_keyspace(name)
+}
+
+/// Resolve the formation replication factor from the current schema.
+///
+/// Reads all user keyspaces (non-system) from `schema` and returns the
+/// maximum RF across them.  For `NetworkTopologyStrategy`, uses the
+/// per-DC factor for `local_dc` if present; otherwise sums all DC values.
+/// Returns `default_rf` (typically 1 or 3) when there are no user keyspaces.
+///
+/// This must NOT hardcode 1 — the caller is responsible for emitting a
+/// WARN when the cluster does not yet have enough nodes to satisfy this RF.
+pub(super) fn resolve_formation_rf(
+    schema: &ferrosa_schema::Schema,
+    local_dc: &str,
+    default_rf: usize,
+) -> usize {
+    let snapshot = schema.snapshot();
+    let mut max_rf = default_rf;
+
+    for (name, ks) in &snapshot.keyspaces {
+        if ferrosa_schema::is_system_keyspace(name) {
+            continue;
+        }
+        let rf = match ks.replication.strategy.as_str() {
+            "SimpleStrategy" => ks
+                .replication
+                .options
+                .get("replication_factor")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1),
+            "NetworkTopologyStrategy" => {
+                if let Some(dc_rf) = ks.replication.options.get(local_dc) {
+                    dc_rf.parse::<usize>().unwrap_or(1)
+                } else {
+                    // Sum all DCs, skipping the "class" meta-key.
+                    ks.replication
+                        .options
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "class")
+                        .filter_map(|(_, v)| v.parse::<usize>().ok())
+                        .sum()
+                }
+            }
+            _ => 1,
+        };
+        if rf > max_rf {
+            max_rf = rf;
+        }
+    }
+
+    max_rf
 }
 
 /// Drain a DDL queue (W1.14, P0-1 hazard).
@@ -828,13 +883,29 @@ impl ModeController {
 
         // 5. Create coordinator
         //
-        // Start with RF=1 CL=ONE during initial formation so that data written
-        // in standalone mode (only on node1) remains readable. The coordinator
-        // routes reads to the single replica that has the data. After bootstrap
-        // streaming redistributes data to new token owners, operators can
-        // ALTER KEYSPACE to increase RF.
-        let initial_rf = 1;
+        // Use the maximum RF across all user keyspaces so the coordinator
+        // enforces the durability guarantee the operator configured.
+        // CL=ONE is kept intentionally: during formation the cluster may not
+        // yet have enough live replicas to meet a higher CL, and CL is
+        // orthogonal to RF — operators can ALTER the CL policy once all nodes
+        // reach Normal state.
+        //
+        // If fewer nodes are currently available than the configured RF, we
+        // accept writes with reduced durability and emit a loud warning so
+        // operators know to run REPAIR once the ring is fully formed.
+        let initial_rf = resolve_formation_rf(&self.schema, &self.config.data_center, 3);
+        let cluster_size = peers.len() + 1; // self + peers
         let initial_cl = ConsistencyLevel::One;
+        if initial_rf > cluster_size {
+            FORMATION_REDUCED_DURABILITY_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                configured_rf = initial_rf,
+                current_cluster_size = cluster_size,
+                "FORMATION DURABILITY WARNING: cluster has fewer nodes than configured RF; \
+                 writes during formation have reduced durability. Run REPAIR once all \
+                 nodes reach Normal state to restore full replication."
+            );
+        }
         let coordinator = Arc::new(
             ClusterCoordinator::new(
                 ring_arc.clone(),
