@@ -152,12 +152,34 @@ Phase 2 is decomposed into independent vertical slices so each can land green:
 
 | Slice | What it adds | Status |
 |---|---|---|
-| **P2-a — R-tree in the live `ST_WITHIN` path** | use the existing `geo::rtree` to prune polygon-bbox candidates before the exact ray-cast | **this PR** |
-| **P2-b — stored `GEOMETRY` column (WKB)** | a marshalled geometry type in `ferrosa-common`, WKB parse/serialize, round-trip | deferred |
-| **P2-c — `ST_INTERSECTS` / `ST_CONTAINS`** | predicates between two *stored* geometries, backed by P2-b + the R-tree sidecar | deferred |
+| **P2-a — R-tree in the live `ST_WITHIN` path** | use the existing `geo::rtree` to prune polygon-bbox candidates before the exact ray-cast | landed |
+| **P2-b — stored `GEOMETRY` column (WKB)** | a marshalled geometry type in `ferrosa-common`, WKB parse/serialize, round-trip | **this PR — landed** |
+| **P2-c — `ST_INTERSECTS` / `ST_CONTAINS`** | predicates between two *stored* geometries, backed by P2-b + the R-tree sidecar | **this PR — algorithmic core landed; CQL surface deferred** |
 | **P2-d — rich geometry** | multi-ring polygons (holes), linestrings, antimeridian splitting, native `-GEO-` sidecar | deferred |
 
-### What THIS PR (P2-a) delivers
+### What THIS PR (P2-b + P2-c core) delivers
+
+- **P2-b — stored `GEOMETRY` column type, WKB-marshalled** in
+  `ferrosa-common/src/geometry.rs`: a `Geometry` enum (`Point` + single-outer-ring
+  `Polygon` over `(lat, lon)` degrees), with `marshal_wkb` / `parse_wkb` against
+  the OGC WKB byte format. Serialization emits little-endian (NDR) and closes
+  polygon rings explicitly; parsing accepts either byte order. Round-trip and
+  edge-case tests pass (17): point/polygon round-trip, big-endian parse,
+  explicit-vs-open ring equivalence, and **loud rejection** (no silent wrong
+  answer) of unknown byte-order flags, unsupported geometry types (`LineString`,
+  `MultiPolygon`, Z/M), multi-ring/hole polygons, degenerate rings, truncated
+  buffers, trailing bytes, and antimeridian-crossing polygons.
+- **P2-c — algorithmic `ST_CONTAINS` / `ST_INTERSECTS` core** in
+  `ferrosa-index/src/geo/predicate.rs`: `st_contains` / `st_intersects` over two
+  stored `ferrosa_common::Geometry` values, bridging the marshalled geometry to
+  the existing `point_in_polygon` ray-cast. Exact for Point/Point, Polygon/Point,
+  and Point/Polygon (boundary counts as inside; `ST_INTERSECTS` is symmetric).
+  Polygon-vs-polygon returns `PredicateError::UnsupportedPair` (needs ring-edge
+  crossing detection — deferred to P2-d) rather than a plausible-but-wrong answer.
+  10 unit tests cover the SF-square / Ferry-Building / NYC fixtures, symmetry,
+  boundary inclusion, and the loud polygon-vs-polygon rejection.
+
+#### Already landed (P2-a, prior PR)
 
 - A pure, tested `geo::points_in_polygon_rtree(candidates, polygon)` helper
   (`ferrosa-index/src/geo/geometry.rs`): bulk-loads the candidate points into the
@@ -176,13 +198,19 @@ Phase 2 is decomposed into independent vertical slices so each can land green:
 
 ### What THIS PR defers (see `remaining`)
 
-- **Stored `GEOMETRY` column type + WKB marshal** (P2-b) — the foundation for
-  comparing two stored geometries. Not started here; `ST_WITHIN` still operates on
-  the query-literal polygon vs stored *points*.
-- **`ST_INTERSECTS` / `ST_CONTAINS`** between two stored geometries (P2-c).
+- **CQL surface for `GEOMETRY` + `ST_CONTAINS` / `ST_INTERSECTS`** — the column
+  type is not yet exposed through DDL/`CqlType`/`CqlValue`, and the predicates are
+  not yet wired into `router.rs` query planning. This PR ships the marshal
+  foundation (P2-b) and the exact predicate core (P2-c) so the remaining work is
+  pure plumbing: a `CqlType::Geometry` (Custom-typed on the wire, like Vector), a
+  `CqlValue::Geometry(Vec<u8>)` carrying WKB, DDL `geometry` type resolution, and
+  `route_geo_select` dispatch that decodes two stored geometries and calls
+  `geo::st_contains` / `geo::st_intersects`.
+- **Polygon-vs-polygon `ST_*`** — needs ring-edge crossing detection; the core
+  rejects it loudly today (`PredicateError::UnsupportedPair`).
 - **Multi-ring polygons / holes, linestrings, antimeridian-crossing polygons**
-  (P2-d). Antimeridian `ST_WITHIN` is still rejected loudly (no silent wrong
-  answer), as before.
+  (P2-d). `parse_wkb` rejects all of these loudly (no silent wrong answer), as
+  the prior `ST_WITHIN` antimeridian path does.
 
 ## 7. Risks & open questions
 
