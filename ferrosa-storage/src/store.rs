@@ -709,6 +709,63 @@ pub fn filter_tombstoned_sidecar_entries(
     entries.retain(|_, positions| !positions.is_empty());
 }
 
+/// Test-only deterministic hook for the read-vs-compaction race. A read, right
+/// after it snapshots the store view, pauses at an armed barrier so a test can
+/// interpose a full compaction (view swap + input-file deletion) before the read
+/// opens its SSTables — reproducing the stale-view condition every time instead
+/// of relying on timing.
+#[cfg(test)]
+pub(crate) mod read_race_test_hook {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// One-shot rendezvous between a paused read and the test driving it.
+    #[derive(Default)]
+    pub struct ReadViewBarrier {
+        /// `(reached, released)`.
+        state: Mutex<(bool, bool)>,
+        cv: Condvar,
+    }
+
+    impl ReadViewBarrier {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        /// Reader side: signal that the view is snapshotted, then block until
+        /// the test releases.
+        pub(crate) fn reach_and_wait(&self) {
+            let mut g = self.state.lock().unwrap();
+            g.0 = true;
+            self.cv.notify_all();
+            while !g.1 {
+                g = self.cv.wait(g).unwrap();
+            }
+        }
+
+        /// Test side: block until the read has snapshotted its view.
+        pub fn wait_reached(&self) {
+            let mut g = self.state.lock().unwrap();
+            while !g.0 {
+                g = self.cv.wait(g).unwrap();
+            }
+        }
+
+        /// Test side: let the paused read proceed.
+        pub fn release(&self) {
+            let mut g = self.state.lock().unwrap();
+            g.1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    thread_local! {
+        /// When set on a thread, that thread's next `read_limited_rows` pauses
+        /// once at the barrier right after snapshotting the view.
+        pub static ARMED: std::cell::RefCell<Option<Arc<ReadViewBarrier>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+}
+
 impl<F: FlushTarget> TableStore<F> {
     /// Create a new `TableStore` with an empty memtable and no SSTables.
     pub fn new(schema: TableSchema, flush_target: F, options: WriteOptions) -> Self {
@@ -1218,9 +1275,46 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         row_limit: usize,
     ) -> Result<Option<Partition>> {
+        // A read takes an atomic snapshot of the store view. If an SSTable in
+        // that snapshot is concurrently compacted away (its local file deleted)
+        // before we open it, the data has already moved into a new SSTable in a
+        // newer view — so reload and retry instead of returning a partial result
+        // that silently drops the key (a fail-loud violation). Bounded so a
+        // genuinely corrupt/missing file still falls through to tolerant handling.
+        const MAX_VIEW_RETRIES: usize = 8;
+        for attempt in 0..=MAX_VIEW_RETRIES {
+            let view = self.view.load_full();
+
+            #[cfg(test)]
+            if let Some(barrier) = read_race_test_hook::ARMED.with(|c| c.borrow_mut().take()) {
+                barrier.reach_and_wait();
+            }
+
+            let (result, sstable_open_failed) = self.read_with_view(&view, key, row_limit)?;
+            if sstable_open_failed
+                && attempt < MAX_VIEW_RETRIES
+                && !Arc::ptr_eq(&view, &self.view.load_full())
+            {
+                continue;
+            }
+            return Ok(result);
+        }
+        unreachable!("read retry loop returns within MAX_VIEW_RETRIES")
+    }
+
+    /// One attempt of [`read_limited_rows`] against a fixed `view` snapshot.
+    /// Returns the merged partition (if any) plus whether any SSTable failed to
+    /// open — the signal the caller uses to retry against a fresh view when the
+    /// view was concurrently swapped by compaction.
+    fn read_with_view(
+        &self,
+        guard: &StoreView,
+        key: &DecoratedKey,
+        row_limit: usize,
+    ) -> Result<(Option<Partition>, bool)> {
         let started = Instant::now();
-        let guard = self.view.load();
         let schema = self.schema.load();
+        let mut sstable_open_failed = false;
 
         let mut sources: Vec<Partition> = Vec::new();
         let mut memtable_hits = 0u64;
@@ -1265,6 +1359,7 @@ impl<F: FlushTarget> TableStore<F> {
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     sstable_errors += 1;
+                    sstable_open_failed = true;
                     continue;
                 }
             };
@@ -1315,7 +1410,7 @@ impl<F: FlushTarget> TableStore<F> {
                 sstable_hits,
                 sstable_errors,
             );
-            return Ok(None);
+            return Ok((None, sstable_open_failed));
         }
 
         let mut merged = merge::merge_partitions(sources);
@@ -1333,7 +1428,7 @@ impl<F: FlushTarget> TableStore<F> {
             sstable_hits,
             sstable_errors,
         );
-        Ok(Some(merged))
+        Ok((Some(merged), sstable_open_failed))
     }
 
     /// Read exactly one clustered row from a partition by clustering-key
