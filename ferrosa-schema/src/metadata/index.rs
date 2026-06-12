@@ -200,4 +200,70 @@ mod tests {
         assert!(matches!(pred.clauses()[0].op, FilterOp::Eq));
         assert_eq!(pred.clauses()[0].value, b"active");
     }
+
+    #[test]
+    fn bincode_roundtrip_index_metadata_with_predicate() {
+        let meta = IndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: "idx_partial".into(),
+            index_type: IndexType::Filtered,
+            target_columns: vec!["status".into()],
+            filter_predicate: Some(FilterPredicate::single(0, FilterOp::Eq, b"active".to_vec())),
+            options: std::collections::HashMap::new(),
+        };
+        let encoded = bincode::serialize(&meta).expect("bincode serialize");
+        let decoded: IndexMetadata = bincode::deserialize(&encoded).expect("bincode deserialize");
+        assert_eq!(decoded.name, meta.name);
+        let pred = decoded.filter_predicate.unwrap();
+        assert_eq!(pred.clauses().len(), 1);
+        assert_eq!(pred.clauses()[0].column_position, 0);
+        assert!(matches!(pred.clauses()[0].op, FilterOp::Eq));
+        assert_eq!(pred.clauses()[0].value, b"active");
+    }
+
+    #[test]
+    fn bincode_decodes_legacy_flat_predicate_via_index_metadata() {
+        use ferrosa_index::FilterOp as FO;
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldFilterPredicate {
+            column_position: usize,
+            op: FO,
+            value: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        struct OldIndexMetadata {
+            keyspace: String,
+            table: String,
+            name: String,
+            index_type: IndexType,
+            target_columns: Vec<String>,
+            filter_predicate: Option<OldFilterPredicate>,
+            options: std::collections::HashMap<String, String>,
+        }
+
+        let old_meta = OldIndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: "idx_legacy".into(),
+            index_type: IndexType::Filtered,
+            target_columns: vec!["status".into()],
+            filter_predicate: Some(OldFilterPredicate {
+                column_position: 5,
+                op: FO::Gt,
+                value: vec![0, 0, 0, 10],
+            }),
+            options: std::collections::HashMap::new(),
+        };
+
+        let legacy_bytes = bincode::serialize(&old_meta).expect("serialize legacy IndexMetadata");
+        let decoded: IndexMetadata =
+            bincode::deserialize(&legacy_bytes).expect("deserialize legacy IndexMetadata into new type");
+        let pred = decoded.filter_predicate.expect("predicate present");
+        assert_eq!(pred.clauses().len(), 1);
+        assert_eq!(pred.clauses()[0].column_position, 5);
+        assert!(matches!(pred.clauses()[0].op, FilterOp::Gt));
+        assert_eq!(pred.clauses()[0].value, vec![0, 0, 0, 10]);
+    }
 }

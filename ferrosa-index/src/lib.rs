@@ -474,3 +474,69 @@ mod tests {
         assert_eq!(vec_f32_to_bytes(&v), cql_cell);
     }
 }
+
+#[cfg(test)]
+mod bincode_compat_tests {
+    use super::*;
+
+    #[test]
+    fn bincode_roundtrip_single_clause_predicate() {
+        let predicate = FilterPredicate::single(2, FilterOp::Eq, b"active".to_vec());
+        let encoded = bincode::serialize(&predicate).expect("serialize");
+        let decoded: FilterPredicate = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(decoded, predicate);
+    }
+
+    #[test]
+    fn bincode_roundtrip_conjunction_predicate() {
+        let predicate = FilterPredicate::conjunction(vec![
+            FilterClause::new(1, FilterOp::Gt, vec![0, 0, 0, 21]),
+            FilterClause::new(2, FilterOp::Eq, b"active".to_vec()),
+        ]);
+        let encoded = bincode::serialize(&predicate).expect("serialize");
+        let decoded: FilterPredicate = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(decoded, predicate);
+    }
+
+    #[test]
+    fn bincode_decodes_legacy_flat_predicate() {
+        #[derive(serde::Serialize)]
+        struct LegacyFilterPredicate {
+            column_position: usize,
+            op: FilterOp,
+            value: Vec<u8>,
+        }
+        let legacy = LegacyFilterPredicate {
+            column_position: 3,
+            op: FilterOp::Eq,
+            value: b"active".to_vec(),
+        };
+        let legacy_bytes = bincode::serialize(&legacy).expect("serialize legacy");
+        let decoded: FilterPredicate =
+            bincode::deserialize(&legacy_bytes).expect("deserialize legacy into new FilterPredicate");
+        assert_eq!(decoded.clauses().len(), 1);
+        let clause = &decoded.clauses()[0];
+        assert_eq!(clause.column_position, 3);
+        assert!(matches!(clause.op, FilterOp::Eq));
+        assert_eq!(clause.value, b"active");
+    }
+
+    #[test]
+    fn bincode_index_type_variant_tag_stability() {
+        let cases: &[(IndexType, u32)] = &[
+            (IndexType::BTree, 0),
+            (IndexType::Hash, 1),
+            (IndexType::Composite, 2),
+            (IndexType::Phonetic, 3),
+            (IndexType::Filtered, 4),
+            (IndexType::Vector, 5),
+            (IndexType::FullText, 6),
+            (IndexType::Geo, 7),
+        ];
+        for (variant, expected_tag) in cases {
+            let bytes = bincode::serialize(variant).expect("serialize");
+            let tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(tag, *expected_tag, "IndexType variant {:?} has wrong tag", variant);
+        }
+    }
+}
