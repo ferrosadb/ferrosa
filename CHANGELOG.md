@@ -4,6 +4,137 @@ All notable changes to Ferrosa are documented in this file. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+<!-- NIGHTLY releases are cut automatically on every merged PR; they are
+     prereleases on the nightly channel. A STABLE release is promoted from a
+     nightly build by a maintainer via the Promote Release workflow. -->
+
+## [0.20.0] - 2026-06-12 <!-- NIGHTLY -->
+
+### Added
+
+- Multi-column conjunction filter predicates for partial indexes: a single
+  partial index can now accelerate queries that combine multiple equality and
+  range predicates in the same `WHERE` clause.
+
+## [0.19.1] - 2026-06-12 <!-- NIGHTLY -->
+
+### Fixed
+
+- **Compaction eager-index rebuild used wrong IndexType.** The compaction path
+  now resolves the real per-column `IndexType` instead of falling back to a
+  generic placeholder, so rebuilt indexes match the original index definition.
+
+## [0.19.0] - 2026-06-12 <!-- NIGHTLY -->
+
+### Added
+
+- WKB `GEOMETRY` marshaling (geospatial P2-b): geometry values are serialized
+  to and from Well-Known Binary format for storage and wire transport.
+- `ST_CONTAINS` and `ST_INTERSECTS` as stored geometric predicates (P2-c),
+  evaluated directly against WKB-encoded geometry columns.
+
+## [0.18.2] - 2026-06-12 <!-- NIGHTLY -->
+
+### Changed
+
+- Internal onboarding docs updated: `/op-init` skill references renamed to
+  `/warp`. No functional changes to the server or CLI.
+
+## [0.18.1] - 2026-06-12 <!-- NIGHTLY -->
+
+### Fixed
+
+- **Stale-view reads during compaction could lose data.** When a compaction
+  task opened an SSTable reader view that had been superseded, the storage
+  engine now retries the read against a fresh view instead of surfacing a
+  not-found or returning stale data.
+
+## [0.18.0] - 2026-06-11 <!-- NIGHTLY -->
+
+### Added
+
+- `system_schema.types` is now a persisted storage table backed by Ferrosa's
+  own storage engine, completing the system_schema dogfooding arc for UDTs.
+  UDT definitions survive restarts without a separate serialization path.
+
+## [0.17.0] - 2026-06-11 <!-- NIGHTLY -->
+
+### Added
+
+- Filtered partial index range implication: the query planner now recognizes
+  when a range predicate is implied by the partial index filter and skips
+  redundant post-filtering.
+- Native remote-builder predicate support: the remote index builder now
+  receives and evaluates the partial index predicate, reducing round-trip
+  data volume for remote builds.
+
+## [0.16.0] - 2026-06-11 <!-- NIGHTLY -->
+
+### Added
+
+- `ST_WITHIN` polygon candidate pruning through the R-tree: geospatial queries
+  using `ST_WITHIN` now use the R-tree to eliminate non-intersecting cells
+  before running the exact polygon test, significantly reducing evaluation cost
+  on large datasets.
+
+## [0.15.0] - 2026-06-11 <!-- NIGHTLY -->
+
+### Added
+
+- `FullTextIndex` is now reported in `EXPLAIN` output, closing the 2i
+  acceleration visibility gap for full-text queries.
+- `FilteredIndex` accelerates queries end-to-end as a partial index: the query
+  planner selects it, the execution engine routes through it, and results are
+  post-filtered only when the partial predicate is not fully implied.
+
+### Fixed
+
+- Broken intra-doc links in `add_index_with_predicate` storage documentation.
+
+## [0.14.1] - 2026-06-11 <!-- NIGHTLY -->
+
+### Added
+
+- Index subsystem major refactor: typed per-`IndexType` dispatch replaces the
+  previous uniform dispatch path, enabling per-type query planning and
+  optimization.
+- `system_schema.indexes` dogfooded as a persisted storage table (previously
+  in-memory only).
+- Vector ANN index consulted during query planning: the HNSW/IVFFlat backends
+  now participate in the query planner's index-selection path, including a
+  fix for big-endian vector decoding in the planner.
+- Geospatial queries via CQL surface: `GEO_NEAREST`, `WITHIN`, and `BBOX`
+  predicates; `ST_WITHIN` with an R-tree-backed candidate index.
+
+## [0.14.0] - 2026-06-10 <!-- STABLE -->
+
+### Added
+
+- Token-aware N-way paged range merge across replicas: the coordinator now
+  merges range-read results from N replicas in a single paged pass, with
+  token-aware routing.
+- Automated release pipeline: releases are now cut automatically on every
+  merged PR via Conventional Commit history (nightly channel), and promoted
+  to stable by a maintainer workflow.
+
+### Fixed
+
+- **OOM P0: full-scan memory unbounded.** Intra-partition row streaming and
+  coordinator paging are now bounded; wide-partition or broad range scans no
+  longer accumulate unbounded memory.
+- **SSTable writes not crash-atomic.** Writes now go through an fsync barrier
+  and WAL ordering so a crash mid-write cannot produce a corrupt SSTable.
+- **Accord commit not gated on fsync.** `handle_commit` now requires the fsync
+  barrier before advancing committed state to disk, preventing phantom commits
+  on disk failure.
+- **Internode reconnect used connect-time IP.** The internode layer now
+  reconnects to the peer's advertised broadcast hostname instead of the IP
+  observed at connect time, fixing stale membership after podman IP churn.
+- **ClusterInvite connect storms.** Cooldown added between connect attempts to
+  unreachable peers during cluster formation.
+- **Streaming range-read response frame ordering.** Response frames are now
+  dispatched in wire order instead of completion order.
+
 ## [0.13.0] - 2026-06-04
 
 ### Added
@@ -100,6 +231,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - Shipped config templates and source defaults updated to `:17000` internode
   port and current auth role names (`ferrosa_admin`, `ferrosa_user`).
 
+[0.20.0]: https://github.com/ferrosadb/ferrosa/compare/v0.19.1...v0.20.0
+[0.19.1]: https://github.com/ferrosadb/ferrosa/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/ferrosadb/ferrosa/compare/v0.18.2...v0.19.0
+[0.18.2]: https://github.com/ferrosadb/ferrosa/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/ferrosadb/ferrosa/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/ferrosadb/ferrosa/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/ferrosadb/ferrosa/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/ferrosadb/ferrosa/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/ferrosadb/ferrosa/compare/v0.14.1...v0.15.0
+[0.14.1]: https://github.com/ferrosadb/ferrosa/compare/v0.14.0...v0.14.1
+[0.14.0]: https://github.com/ferrosadb/ferrosa/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/ferrosadb/ferrosa/compare/v0.12.2...v0.13.0
 [0.12.0]: https://github.com/ferrosadb/ferrosa/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ferrosadb/ferrosa/compare/v0.10.0...v0.11.0
