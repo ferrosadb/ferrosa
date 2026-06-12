@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::system::persistence::{
-    grant_to_row, index_to_rows, keyspace_to_row, role_to_row, table_to_rows, type_to_row,
-    SystemTableMutation,
+    function_clustering, function_to_row, grant_to_row, index_to_rows, keyspace_to_row,
+    role_to_row, table_to_rows, type_to_row, SystemTableMutation,
 };
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::engine::StorageEngine;
@@ -198,6 +198,30 @@ impl SystemTableWriter {
                 // Clustering = type_name (single text column).
                 let row = Row {
                     clustering: name.as_bytes().to_vec(),
+                    cells: vec![],
+                    deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
+                    primary_key_liveness: LivenessInfo::NONE,
+                };
+                self.engine.write(&tid, &key, row, ts)?;
+            }
+            SystemTableMutation::FunctionCreated(func) => {
+                let row = function_to_row(&func);
+                let ts = now_micros();
+                let tid = TableId::new("system_schema", "functions");
+                self.engine.write(&tid, &row.key, row.row, ts)?;
+            }
+            SystemTableMutation::FunctionDropped {
+                keyspace,
+                name,
+                arg_types,
+            } => {
+                let ts = now_micros();
+                let key = DecoratedKey::new(PartitionKey::new(keyspace.as_bytes().to_vec()));
+                let tid = TableId::new("system_schema", "functions");
+                // Composite clustering matches the create path so the tombstone
+                // masks the matching overload row.
+                let row = Row {
+                    clustering: function_clustering(&name, &arg_types),
                     cells: vec![],
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,

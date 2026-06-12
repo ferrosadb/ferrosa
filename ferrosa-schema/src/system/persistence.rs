@@ -97,11 +97,34 @@ pub const TYPES_COL_FIELD_NAMES: u16 = 0;
 pub const TYPES_COL_FIELD_TYPES: u16 = 1;
 
 // ---------------------------------------------------------------------------
+// system_schema.functions column indices
+// ---------------------------------------------------------------------------
+// Partition key: keyspace_name (text)
+// Clustering key: function_name (text), argument_types (text) -- composite,
+//   where argument_types is the JSON array of each arg's serde `CqlType` so
+//   overloads with different argument types are distinct rows (matching
+//   Cassandra's `(function_name, argument_types frozen<list<text>>)` clustering).
+// Regular columns:
+
+/// `argument_names` `frozen<list<text>>`, stored as a JSON array of names.
+pub const FUNCTIONS_COL_ARGUMENT_NAMES: u16 = 0;
+/// `return_type` text, stored as the JSON of the serde `CqlType` so nested
+/// collection / UDT return types round-trip losslessly.
+pub const FUNCTIONS_COL_RETURN_TYPE: u16 = 1;
+/// `called_on_null_input` boolean, stored as 1-byte (0x00 / 0x01).
+pub const FUNCTIONS_COL_CALLED_ON_NULL: u16 = 2;
+/// `language` text (e.g. "wasm").
+pub const FUNCTIONS_COL_LANGUAGE: u16 = 3;
+/// `body` text (hex-encoded WASM binary).
+pub const FUNCTIONS_COL_BODY: u16 = 4;
+
+// ---------------------------------------------------------------------------
 // SystemTableMutation enum
 // ---------------------------------------------------------------------------
 
 use crate::auth::permission::{GrantEntry, Permission, Resource};
 use crate::auth::role::RoleMetadata;
+use crate::metadata::function::UserFunctionMetadata;
 use crate::metadata::index::IndexMetadata;
 use crate::metadata::keyspace::KeyspaceMetadata;
 use crate::metadata::table::TableMetadata;
@@ -162,6 +185,20 @@ pub enum SystemTableMutation {
         keyspace: String,
         /// Name of the dropped type.
         name: String,
+    },
+
+    // ---- system_schema.functions ----
+    /// A user-defined function was created or replaced (upsert row).
+    FunctionCreated(UserFunctionMetadata),
+    /// A user-defined function overload was dropped (tombstone row). The
+    /// `arg_types` disambiguate the overload, matching the composite clustering.
+    FunctionDropped {
+        /// Keyspace owning the function.
+        keyspace: String,
+        /// Name of the dropped function.
+        name: String,
+        /// Argument types of the dropped overload.
+        arg_types: Vec<ferrosa_common::CqlType>,
     },
 }
 
@@ -488,6 +525,72 @@ pub fn type_to_row(udt: &UserTypeMetadata) -> SystemRow {
     }
 }
 
+/// Encode the composite clustering key for a `system_schema.functions` row:
+/// `[u16 len][function_name][u16 len][argument_types_json]`.
+///
+/// `argument_types` is the JSON array of the serde `CqlType` for each argument,
+/// so two overloads of the same function name with different argument types map
+/// to distinct clustering keys (and distinct rows). Shared by the create
+/// encoder and the drop tombstone path so a tombstone masks the matching row.
+pub fn function_clustering(name: &str, arg_types: &[ferrosa_common::CqlType]) -> Vec<u8> {
+    let arg_types_json = serde_json::to_vec(arg_types).unwrap_or_default();
+    let mut clustering = Vec::new();
+    clustering.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(name.as_bytes());
+    clustering.extend_from_slice(&(arg_types_json.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(&arg_types_json);
+    clustering
+}
+
+/// Convert a `UserFunctionMetadata` into a storage row for
+/// `system_schema.functions`.
+///
+/// Partition key = `keyspace_name`; composite clustering =
+/// `[u16 len][function_name][u16 len][argument_types_json]` (see
+/// [`function_clustering`]); cells = `argument_names` (JSON array),
+/// `return_type` (serde `CqlType` JSON), `called_on_null_input` (1-byte bool),
+/// `language`, `body`. `return_type` is persisted as serde JSON so nested
+/// collection / UDT return types reconstruct losslessly at boot.
+pub fn function_to_row(func: &UserFunctionMetadata) -> SystemRow {
+    let ts = now_micros();
+    let key = DecoratedKey::new(PartitionKey::new(func.keyspace.as_bytes().to_vec()));
+
+    let clustering = function_clustering(&func.name, &func.arg_types);
+    let names_json = serde_json::to_vec(&func.arg_names).unwrap_or_default();
+    let return_type_json = serde_json::to_vec(&func.return_type).unwrap_or_default();
+
+    SystemRow {
+        key,
+        row: Row {
+            clustering,
+            cells: vec![
+                (
+                    FUNCTIONS_COL_ARGUMENT_NAMES,
+                    CellValue::live(names_json, ts),
+                ),
+                (
+                    FUNCTIONS_COL_RETURN_TYPE,
+                    CellValue::live(return_type_json, ts),
+                ),
+                (
+                    FUNCTIONS_COL_CALLED_ON_NULL,
+                    CellValue::live(encode_bool(func.called_on_null), ts),
+                ),
+                (
+                    FUNCTIONS_COL_LANGUAGE,
+                    CellValue::live(func.language.as_bytes().to_vec(), ts),
+                ),
+                (
+                    FUNCTIONS_COL_BODY,
+                    CellValue::live(func.body.as_bytes().to_vec(), ts),
+                ),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // System table TableSchema builders
 // ---------------------------------------------------------------------------
@@ -700,6 +803,55 @@ pub fn types_table_schema() -> TableSchema {
     }
 }
 
+/// Returns `TableSchema` for `system_schema.functions`.
+///
+/// Cassandra declares `argument_names`/`argument_types` as `frozen<list<text>>`
+/// and clusters on `(function_name, argument_types)`. ferrosa persists the
+/// cells as opaque UTF8 (JSON for the lists, serde for `return_type`, a 1-byte
+/// bool for `called_on_null_input`); the CQL router advertises the Cassandra
+/// wire types to clients so driver introspection type-checks pass.
+pub fn functions_table_schema() -> TableSchema {
+    TableSchema {
+        keyspace: "system_schema".to_string(),
+        table: "functions".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![
+            ColumnDefinition {
+                name: "function_name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "argument_types".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+        ],
+        static_columns: vec![],
+        regular_columns: vec![
+            ColumnDefinition {
+                name: "argument_names".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "return_type".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "called_on_null_input".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.BooleanType".to_string(),
+            },
+            ColumnDefinition {
+                name: "language".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+            ColumnDefinition {
+                name: "body".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
+        ],
+        extensions: Default::default(),
+    }
+}
+
 /// Returns all system table schemas for registration at bootstrap.
 pub fn all_system_table_schemas() -> Vec<TableSchema> {
     let mut schemas = vec![
@@ -708,6 +860,7 @@ pub fn all_system_table_schemas() -> Vec<TableSchema> {
         columns_table_schema(),
         indexes_table_schema(),
         types_table_schema(),
+        functions_table_schema(),
         roles_table_schema(),
         role_members_table_schema(),
         role_permissions_table_schema(),
@@ -804,12 +957,13 @@ mod tests {
     }
 
     #[test]
-    fn all_system_table_schemas_returns_eleven() {
+    fn all_system_table_schemas_returns_twelve() {
         let schemas = all_system_table_schemas();
-        assert_eq!(schemas.len(), 11);
+        assert_eq!(schemas.len(), 12);
         let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
         assert!(names.contains(&(&"system_schema".to_string(), &"indexes".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"types".to_string())));
+        assert!(names.contains(&(&"system_schema".to_string(), &"functions".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"keyspaces".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"tables".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"columns".to_string())));
@@ -1286,6 +1440,170 @@ mod tests {
         let names: Vec<String> =
             serde_json::from_slice(names_cell.value.as_deref().unwrap()).unwrap();
         assert!(names.is_empty());
+    }
+
+    // -- system_schema.functions tests --
+
+    #[test]
+    fn functions_column_indices_are_sequential() {
+        assert_eq!(FUNCTIONS_COL_ARGUMENT_NAMES, 0);
+        assert_eq!(FUNCTIONS_COL_RETURN_TYPE, 1);
+        assert_eq!(FUNCTIONS_COL_CALLED_ON_NULL, 2);
+        assert_eq!(FUNCTIONS_COL_LANGUAGE, 3);
+        assert_eq!(FUNCTIONS_COL_BODY, 4);
+    }
+
+    #[test]
+    fn functions_table_schema_layout() {
+        let schema = functions_table_schema();
+        assert_eq!(schema.keyspace, "system_schema");
+        assert_eq!(schema.table, "functions");
+        assert_eq!(schema.clustering_columns.len(), 2);
+        assert_eq!(schema.clustering_columns[0].name, "function_name");
+        assert_eq!(schema.clustering_columns[1].name, "argument_types");
+        assert_eq!(schema.regular_columns.len(), 5);
+        assert_eq!(schema.regular_columns[0].name, "argument_names");
+        assert_eq!(schema.regular_columns[1].name, "return_type");
+        assert_eq!(schema.regular_columns[2].name, "called_on_null_input");
+        assert_eq!(schema.regular_columns[3].name, "language");
+        assert_eq!(schema.regular_columns[4].name, "body");
+    }
+
+    #[test]
+    fn all_system_table_schemas_includes_functions() {
+        let schemas = all_system_table_schemas();
+        let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
+        assert!(names.contains(&(&"system_schema".to_string(), &"functions".to_string())));
+    }
+
+    fn sample_function() -> UserFunctionMetadata {
+        use ferrosa_common::CqlType;
+        UserFunctionMetadata {
+            keyspace: "ks".into(),
+            name: "double_it".into(),
+            arg_names: vec!["val".into()],
+            arg_types: vec![CqlType::Int],
+            return_type: CqlType::Int,
+            called_on_null: true,
+            language: "wasm".into(),
+            body: "deadbeef".into(),
+        }
+    }
+
+    #[test]
+    fn function_to_row_encodes_pk_clustering_and_cells() {
+        use ferrosa_common::CqlType;
+
+        let func = sample_function();
+        let row = function_to_row(&func);
+
+        // Partition key = keyspace_name.
+        assert_eq!(row.key.key.as_bytes(), b"ks");
+
+        // Composite clustering: [u16 len][name][u16 len][arg_types_json].
+        let expected = function_clustering("double_it", &[CqlType::Int]);
+        assert_eq!(row.row.clustering, expected);
+
+        // Five cells.
+        assert_eq!(row.row.cells.len(), 5);
+
+        let (names_idx, names_cell) = &row.row.cells[0];
+        assert_eq!(*names_idx, FUNCTIONS_COL_ARGUMENT_NAMES);
+        let names: Vec<String> =
+            serde_json::from_slice(names_cell.value.as_deref().unwrap()).unwrap();
+        assert_eq!(names, vec!["val".to_string()]);
+
+        let (ret_idx, ret_cell) = &row.row.cells[1];
+        assert_eq!(*ret_idx, FUNCTIONS_COL_RETURN_TYPE);
+        let ret: CqlType = serde_json::from_slice(ret_cell.value.as_deref().unwrap()).unwrap();
+        assert_eq!(ret, CqlType::Int);
+
+        let (con_idx, con_cell) = &row.row.cells[2];
+        assert_eq!(*con_idx, FUNCTIONS_COL_CALLED_ON_NULL);
+        assert_eq!(con_cell.value.as_deref(), Some(&[0x01][..]));
+
+        let (lang_idx, lang_cell) = &row.row.cells[3];
+        assert_eq!(*lang_idx, FUNCTIONS_COL_LANGUAGE);
+        assert_eq!(lang_cell.value.as_deref(), Some(&b"wasm"[..]));
+
+        let (body_idx, body_cell) = &row.row.cells[4];
+        assert_eq!(*body_idx, FUNCTIONS_COL_BODY);
+        assert_eq!(body_cell.value.as_deref(), Some(&b"deadbeef"[..]));
+
+        // Row is live.
+        assert_eq!(row.row.deletion, DeletionTime::LIVE);
+    }
+
+    #[test]
+    fn function_clustering_disambiguates_overloads() {
+        use ferrosa_common::CqlType;
+        let int_overload = function_clustering("normalize", &[CqlType::Int]);
+        let text_overload = function_clustering("normalize", &[CqlType::Varchar]);
+        assert_ne!(int_overload, text_overload);
+        // Same name+args produce identical clustering (so a tombstone masks it).
+        assert_eq!(
+            int_overload,
+            function_clustering("normalize", &[CqlType::Int])
+        );
+    }
+
+    #[test]
+    fn function_to_row_round_trips_nested_return_type() {
+        use ferrosa_common::CqlType;
+        let mut func = sample_function();
+        func.return_type = CqlType::List(Box::new(CqlType::Varchar));
+        let row = function_to_row(&func);
+        let (_, ret_cell) = &row.row.cells[1];
+        let ret: CqlType = serde_json::from_slice(ret_cell.value.as_deref().unwrap()).unwrap();
+        assert_eq!(ret, CqlType::List(Box::new(CqlType::Varchar)));
+    }
+
+    #[test]
+    fn function_to_row_empty_args() {
+        use ferrosa_common::CqlType;
+        let func = UserFunctionMetadata {
+            keyspace: "ks".into(),
+            name: "now_utc".into(),
+            arg_names: vec![],
+            arg_types: vec![],
+            return_type: CqlType::Timestamp,
+            called_on_null: false,
+            language: "wasm".into(),
+            body: "cafe".into(),
+        };
+        let row = function_to_row(&func);
+        let (_, names_cell) = &row.row.cells[0];
+        let names: Vec<String> =
+            serde_json::from_slice(names_cell.value.as_deref().unwrap()).unwrap();
+        assert!(names.is_empty());
+        let (_, con_cell) = &row.row.cells[2];
+        assert_eq!(con_cell.value.as_deref(), Some(&[0x00][..]));
+    }
+
+    #[test]
+    fn function_mutation_variants_construct() {
+        use ferrosa_common::CqlType;
+        let func = sample_function();
+        match SystemTableMutation::FunctionCreated(func.clone()) {
+            SystemTableMutation::FunctionCreated(f) => assert_eq!(f.name, "double_it"),
+            _ => panic!("wrong variant"),
+        }
+        match (SystemTableMutation::FunctionDropped {
+            keyspace: "ks".into(),
+            name: "double_it".into(),
+            arg_types: vec![CqlType::Int],
+        }) {
+            SystemTableMutation::FunctionDropped {
+                keyspace,
+                name,
+                arg_types,
+            } => {
+                assert_eq!(keyspace, "ks");
+                assert_eq!(name, "double_it");
+                assert_eq!(arg_types, vec![CqlType::Int]);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use ferrosa_common::Error as FerrosaError;
 use ferrosa_schema::system::persistence::PERMISSIONS_COL_PERMISSIONS;
-use ferrosa_schema::{GrantEntry, Permission, Resource, Schema, UserTypeMetadata};
+use ferrosa_schema::{
+    GrantEntry, Permission, Resource, Schema, UserFunctionMetadata, UserTypeMetadata,
+};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
@@ -143,6 +145,54 @@ impl SystemTableLoader {
                         name = %udt.name,
                         %e,
                         "skipping system_schema.types replay row"
+                    );
+                }
+            }
+        }
+        Ok(restored)
+    }
+
+    /// Load persisted user-defined functions from `system_schema.functions`.
+    ///
+    /// Reconstructs each [`UserFunctionMetadata`] from the storage-decoded rows
+    /// (the engine drops tombstones and malformed rows). Overloads are distinct
+    /// rows, so the returned vector preserves each `(name, arg_types)` pair.
+    pub fn load_user_functions(&self) -> ferrosa_common::Result<Vec<UserFunctionMetadata>> {
+        let rows = self.engine.read_persisted_functions()?;
+        Ok(rows
+            .into_iter()
+            .map(|r| UserFunctionMetadata {
+                keyspace: r.keyspace_name,
+                name: r.function_name,
+                arg_names: r.arg_names,
+                arg_types: r.arg_types,
+                return_type: r.return_type,
+                called_on_null: r.called_on_null,
+                language: r.language,
+                body: r.body,
+            })
+            .collect())
+    }
+
+    /// Replay persisted `system_schema.functions` rows into the live schema
+    /// Registry.
+    ///
+    /// Skips functions whose keyspace is already gone or that already exist (the
+    /// Registry's `create_function_internal` rejects duplicates) so a partially
+    /// hydrated Registry does not abort the whole replay. Returns the number of
+    /// functions successfully (re-)registered.
+    pub fn replay_functions_into_schema(&self, schema: &Schema) -> ferrosa_common::Result<usize> {
+        let functions = self.load_user_functions()?;
+        let mut restored = 0usize;
+        for func in functions {
+            match schema.create_function_internal(&func) {
+                Ok(()) => restored += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        keyspace = %func.keyspace,
+                        name = %func.name,
+                        %e,
+                        "skipping system_schema.functions replay row"
                     );
                 }
             }
@@ -504,5 +554,61 @@ mod tests {
                 &Resource::Table("agent_memory".to_string(), "entity_store".to_string()),
             )
             .expect("persisted MODIFY grant must be effective after replay");
+    }
+
+    #[test]
+    fn replay_functions_reconstructs_udf_into_schema() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+        use ferrosa_schema::UserFunctionMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        // Persist a CREATE FUNCTION through the dogfooded writer.
+        let func = UserFunctionMetadata {
+            keyspace: "app".to_string(),
+            name: "double_it".to_string(),
+            arg_names: vec!["val".to_string()],
+            arg_types: vec![CqlType::Int],
+            return_type: CqlType::Int,
+            called_on_null: true,
+            language: "wasm".to_string(),
+            body: "deadbeef".to_string(),
+        };
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(
+                ferrosa_schema::system::persistence::SystemTableMutation::FunctionCreated(
+                    func.clone(),
+                ),
+            )
+            .unwrap();
+
+        // Fresh schema (cold restart) with the owning keyspace present.
+        let schema = test_schema();
+        schema
+            .create_keyspace_internal(KeyspaceMetadata {
+                name: "app".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: std::collections::HashMap::from([(
+                        "replication_factor".to_string(),
+                        "1".to_string(),
+                    )]),
+                },
+            })
+            .unwrap();
+
+        let count = SystemTableLoader::new(engine)
+            .replay_functions_into_schema(&schema)
+            .unwrap();
+
+        assert_eq!(count, 1, "exactly one persisted UDF should be replayed");
+        let restored = schema
+            .get_function("app", "double_it", &[CqlType::Int])
+            .expect("UDF must be live in the Registry after replay");
+        assert_eq!(restored, func, "replayed UDF must equal the persisted one");
     }
 }
