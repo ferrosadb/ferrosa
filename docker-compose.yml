@@ -1,3 +1,22 @@
+##############################################################################
+# LOCAL DEV ONLY — auth disabled                                             #
+#                                                                            #
+# This compose file is for local development and integration testing ONLY.  #
+# All three ferrosa nodes run with FERROSA_AUTH_DISABLED=true because the   #
+# binary does NOT support an env-var-injected initial admin password at      #
+# startup. Auth is hardened after cluster formation via CQL:                 #
+#                                                                            #
+#   cqlsh -u ferrosa_admin -p ferrosa_admin <node-ip>                       #
+#   ALTER ROLE ferrosa_admin WITH PASSWORD='<strong-password>';              #
+#                                                                            #
+# For a production-secure deployment, see docker-compose.secure.yml         #
+# (side-by-side overlay) which starts from FERROSA_AUTH_ENABLED=true and    #
+# documents the post-formation credential rotation procedure.                #
+#                                                                            #
+# NEVER expose these containers to public networks without rotating the      #
+# default ferrosa_admin password.                                            #
+##############################################################################
+
 services:
   # Volume permissions — RustFS runs as UID 10001
   volume-permissions:
@@ -68,6 +87,18 @@ services:
       FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
       - node1-data:/var/lib/ferrosa
+    # Use /readyz (leader-aware readiness probe) instead of a bare TCP
+    # check so that the container is only marked healthy once Raft has
+    # elected a leader and the node is ready to serve CQL traffic.
+    # Note: after a full-cluster restart, Raft leader election can take
+    # up to several minutes — see docs/database/clustering.html for
+    # the expected cold-start timeline.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9090/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
   node2:
     build: .
@@ -91,6 +122,12 @@ services:
       FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
       - node2-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9090/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
   node3:
     build: .
@@ -114,6 +151,12 @@ services:
       FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
       - node3-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9090/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
 volumes:
   rustfs-data:

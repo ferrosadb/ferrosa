@@ -242,7 +242,7 @@
   <a href="/" class="back-link">&larr; Ferrosa Suite home</a> · <a href="/database/" class="back-link">Database home</a>
 
   <h1>Migration <span>Guide</span></h1>
-  <p class="subtitle">Move from Apache Cassandra to Ferrosa without rewriting application code. Same CQL protocol, same drivers, same consistency model, same LWT semantics.</p>
+  <p class="subtitle">Move from Apache Cassandra to Ferrosa with the same CQL protocol, the same drivers, and the same LWT semantics. Most core application paths migrate without code changes; a small set of features — GROUP BY, PER PARTITION LIMIT, Java UDFs, and server-push schema events — require changes described below.</p>
 
   <div class="note">
     <strong>Developer Preview:</strong> Ferrosa is in active development. Run representative dual-read and failure-recovery tests before migrating production traffic.
@@ -277,9 +277,10 @@
   </ol>
 
   <div class="success">
-    <strong>Zero driver changes:</strong> Ferrosa speaks the CQL native protocol (negotiated at v4) with SASL authentication,
-    LZ4/Snappy compression, and prepared statement support. Your Python, Java, Go, and Node.js
-    drivers connect without modification.
+    <strong>No driver changes required:</strong> Ferrosa speaks the CQL native protocol (negotiated at v4) with SASL authentication,
+    LZ4/Snappy compression, and prepared statement support. Your Python, Java, Go, Node.js, C#, and Rust
+    drivers connect without modification. Driver compatibility is verified by automated smoke tests
+    on every CI build — see <code>tests/drivers/</code> and <code>.github/workflows/driver-tests.yml</code>.
   </div>
 
   <!-- ── Compatibility ── -->
@@ -292,7 +293,8 @@
       <tr><td>SASL authentication</td><td><span class="check">Compatible</span></td><td>PasswordAuthenticator flow</td></tr>
       <tr><td>Frame compression</td><td><span class="check">Compatible</span></td><td>LZ4, Snappy</td></tr>
       <tr><td>Prepared statements</td><td><span class="check">Compatible</span></td><td>W-TinyLFU cache</td></tr>
-      <tr><td>Batch operations</td><td><span class="check">Compatible</span></td><td>Unlogged batches</td></tr>
+      <tr><td>Unlogged batches</td><td><span class="check">Compatible</span></td><td>Unlogged and counter batches</td></tr>
+      <tr><td>Logged batches</td><td><span class="check">Compatible</span></td><td>Atomic via commit-log group write (single-node); 3-phase batchlog protocol (cluster). No batchlog table in single-node mode — equivalent crash-recovery via commit log.</td></tr>
       <tr><td>system_schema.*</td><td><span class="check">Compatible</span></td><td>All standard tables</td></tr>
       <tr><td>system.local</td><td><span class="check">Compatible</span></td><td>Including tokens column</td></tr>
       <tr><td>Murmur3Partitioner</td><td><span class="check">Compatible</span></td><td>Same token distribution</td></tr>
@@ -324,15 +326,21 @@
   <div class="step-grid">
     <div class="step-num">1</div>
     <div class="step-content">
-      <h3>Audit your schema</h3>
+      <h3>Audit your schema and queries</h3>
       <p>Export your Cassandra schema and check for unsupported features.
         Ferrosa supports all standard CQL types, partition/clustering keys, table options, UDTs,
-        UDFs (WASM), and lightweight transactions. Check for materialized views — these are not yet supported.</p>
+        WASM UDFs, and lightweight transactions. The following require code changes:</p>
+      <ul>
+        <li><strong>Materialized views</strong> — not supported; rewrite against base tables.</li>
+        <li><strong>GROUP BY / PER PARTITION LIMIT</strong> — not parsed; restructure queries.</li>
+        <li><strong>Java or JavaScript UDFs</strong> — rejected; recompile to WebAssembly.</li>
+        <li><strong>Schema-change EVENT push</strong> — REGISTER accepted but EVENT frames never sent; configure drivers to poll for schema changes if needed.</li>
+      </ul>
       <pre><span class="cm"># Export schema from Cassandra</span>
 <span class="kw">cqlsh</span> -e <span class="str">"DESCRIBE SCHEMA"</span> > schema.cql
 
 <span class="cm"># Check for unsupported features</span>
-<span class="kw">grep</span> -i <span class="str">"MATERIALIZED VIEW"</span> schema.cql</pre>
+<span class="kw">grep</span> -iE <span class="str">"MATERIALIZED VIEW|GROUP BY|PER PARTITION LIMIT|LANGUAGE (java|javascript)"</span> schema.cql</pre>
     </div>
 
     <div class="step-num">2</div>

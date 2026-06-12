@@ -1935,6 +1935,7 @@ dependencies = [
 name = "ferrosa-index"
 version = "0.13.0"
 dependencies = [
+ "bincode",
  "crc32fast",
  "ferrosa-common",
  "rand 0.10.1",
@@ -2053,6 +2054,7 @@ dependencies = [
  "arc-swap",
  "argon2 0.6.0-rc.8",
  "bcrypt",
+ "bincode",
  "ferrosa-common",
  "ferrosa-index",
  "ferrosa-sstable",

@@ -27,6 +27,7 @@ pub mod api;
 pub mod auth;
 pub mod debug;
 pub mod observability;
+pub mod readiness;
 pub mod snapshots;
 pub mod static_files;
 pub mod ws;
@@ -96,25 +97,30 @@ impl FromRef<WebAppState> for Arc<ModeController> {
 
 /// Build the axum router for the web console.
 ///
-/// Auth middleware is scoped to `/api/*` routes only — static assets
-/// (the embedded web UI at `/`) and `/metrics` (Prometheus scrape)
-/// remain publicly accessible.
+/// Auth middleware is applied to both `/api/*` and `/admin/*` routes.
+/// Static assets (the embedded web UI at `/`) and `/metrics` (Prometheus
+/// scrape) remain publicly accessible without credentials.
+///
+/// When `state.auth_disabled` is `true` (development mode), the
+/// `auth_middleware` bypasses credential checks for all protected routes.
 pub fn build_router(state: WebAppState) -> Router {
-    let api = Router::new()
+    let protected = Router::new()
         .nest("/api", api::routes())
         .nest("/api", snapshots::snapshot_routes())
         .nest("/api", observability::routes())
         .nest("/api/cluster", api::cluster_routes())
         .nest("/api/debug", debug::debug_routes())
         .route("/api/ws", get(ws::ws_handler))
+        .nest("/admin", api::admin_routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
         ));
 
-    // /admin/* is not behind auth — it exposes read-only diagnostics used by
-    // the Jepsen verification harness (Sprint 2 W2.3).
-    api.nest("/admin", api::admin_routes())
+    // /readyz is not behind auth so orchestrators (docker-compose, k8s,
+    // smoke scripts) can probe it without credentials.
+    protected
+        .merge(readiness::readiness_route())
         .route("/metrics", get(api::get_metrics))
         .fallback(static_files::static_handler)
         .with_state(state)
