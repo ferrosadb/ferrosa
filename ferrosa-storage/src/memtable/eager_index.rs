@@ -60,6 +60,15 @@ impl EagerIndexBuilder {
             let job = IndexBuildJob {
                 sstable_id: event.sstable_id.clone(),
                 index_name: index_name.clone(),
+                // NOTE: hardcoded `BTree` because `FlushCompleteEvent` only
+                // carries `(index_name, column_position)` and has no source
+                // for the index's real `IndexType`. This `EagerIndexBuilder`
+                // is the un-wired helper — the live flush/compaction eager
+                // rebuild runs through `engine::eager_index_build_job`, which
+                // reads the real type from `TableStore::index_type_for`. If
+                // this builder is ever wired in, thread the declared
+                // `IndexType` through `FlushCompleteEvent::indexed_columns`
+                // (or a parallel field) before using it for non-BTree indexes.
                 index_type: ferrosa_index::IndexType::BTree,
                 table: (event.keyspace.clone(), event.table.clone()),
                 priority: BuildPriority::High,
