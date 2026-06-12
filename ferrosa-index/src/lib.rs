@@ -305,9 +305,10 @@ impl FilterClause {
 /// A filter predicate applied during index building: a **conjunction** of one
 /// or more [`FilterClause`]s. A row is retained only when EVERY clause holds
 /// (logical AND). A single-clause predicate is the common case and is preserved
-/// for backward compatibility on the wire (see this type's custom `Deserialize`,
-/// which still accepts the legacy flat single-clause JSON).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// for backward compatibility on the wire (see this type's custom `Serialize`
+/// and `Deserialize`, which maintain byte-identical layout with the legacy
+/// flat single-clause bincode encoding).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterPredicate {
     /// Wire format version. `1` is the legacy single-clause flat shape (decoded
     /// transparently); `2` is the conjunction shape serialized here.
@@ -360,44 +361,108 @@ impl FilterPredicate {
     }
 }
 
-impl<'de> Deserialize<'de> for FilterPredicate {
+impl serde::Serialize for FilterPredicate {
+    /// Bincode wire format (non-human-readable):
+    ///
+    /// Single-clause: `(column_position: usize, op: FilterOp, value: Vec<u8>)` —
+    /// byte-identical to the pre-9ad38bfb legacy flat struct output.
+    ///
+    /// Multi-clause conjunction: `(usize::MAX, FilterOp::Eq, bincode_bytes: Vec<u8>)` —
+    /// `usize::MAX` is the conjunction sentinel; `value` contains `bincode::serialize`d
+    /// `Vec<FilterClause>`.
+    ///
+    /// JSON wire format (human-readable): `{"version": N, "clauses": [...]}`.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            use serde::ser::SerializeStruct;
+            let mut s = serializer.serialize_struct("FilterPredicate", 2)?;
+            s.serialize_field("version", &self.version)?;
+            s.serialize_field("clauses", &self.clauses)?;
+            s.end()
+        } else {
+            use serde::ser::SerializeTuple;
+            match self.clauses.as_slice() {
+                [single] => {
+                    let mut tup = serializer.serialize_tuple(3)?;
+                    tup.serialize_element(&single.column_position)?;
+                    tup.serialize_element(&single.op)?;
+                    tup.serialize_element(&single.value)?;
+                    tup.end()
+                }
+                clauses => {
+                    let conjunction_bytes =
+                        bincode::serialize(clauses).map_err(serde::ser::Error::custom)?;
+                    let mut tup = serializer.serialize_tuple(3)?;
+                    tup.serialize_element(&usize::MAX)?;
+                    tup.serialize_element(&FilterOp::Eq)?;
+                    tup.serialize_element(&conjunction_bytes)?;
+                    tup.end()
+                }
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FilterPredicate {
     /// Accept BOTH wire shapes:
+    ///
+    /// **JSON (human-readable)**:
     /// - conjunction (v2): `{"version":2,"clauses":[{...},...]}`
     /// - legacy single clause (v1): `{"column_position":..,"op":..,"value":..}`
     ///
-    /// The legacy shape is the exact JSON the original single-clause
-    /// `FilterPredicate` serialized, so old `system_schema.indexes` rows and
-    /// in-flight build requests keep deserializing after the upgrade.
+    /// **Bincode (non-human-readable)**:
+    /// - single-clause: `(column_position: usize, op: FilterOp, value: Vec<u8>)` —
+    ///   byte-identical to the legacy flat struct
+    /// - multi-clause conjunction: `(usize::MAX, FilterOp::Eq [sentinel], bincode_bytes: Vec<u8>)`
+    ///
+    /// The legacy shapes are byte-identical to what older builds serialized,
+    /// so old `system_schema.indexes` rows and Raft log entries keep
+    /// deserializing after the upgrade.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        struct Wire {
-            // v2 fields
-            version: Option<u8>,
-            clauses: Option<Vec<FilterClause>>,
-            // v1 (legacy flat single-clause) fields
-            column_position: Option<usize>,
-            op: Option<FilterOp>,
-            value: Option<Vec<u8>>,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        if let Some(clauses) = wire.clauses {
-            return Ok(FilterPredicate {
-                version: wire.version.unwrap_or(FILTER_PREDICATE_VERSION),
-                clauses,
-            });
-        }
-        match (wire.column_position, wire.op, wire.value) {
-            (Some(column_position), Some(op), Some(value)) => {
+        if deserializer.is_human_readable() {
+            #[derive(serde::Deserialize)]
+            struct Wire {
+                version: Option<u8>,
+                clauses: Option<Vec<FilterClause>>,
+                column_position: Option<usize>,
+                op: Option<FilterOp>,
+                value: Option<Vec<u8>>,
+            }
+            let wire = Wire::deserialize(deserializer)?;
+            if let Some(clauses) = wire.clauses {
+                return Ok(FilterPredicate {
+                    version: wire.version.unwrap_or(FILTER_PREDICATE_VERSION),
+                    clauses,
+                });
+            }
+            match (wire.column_position, wire.op, wire.value) {
+                (Some(column_position), Some(op), Some(value)) => {
+                    Ok(FilterPredicate::single(column_position, op, value))
+                }
+                _ => Err(serde::de::Error::custom(
+                    "FilterPredicate JSON has neither a `clauses` array (v2) nor a legacy \
+                     `column_position`/`op`/`value` triple (v1)",
+                )),
+            }
+        } else {
+            let (column_position, op, value): (usize, FilterOp, Vec<u8>) =
+                serde::Deserialize::deserialize(deserializer)?;
+            if column_position == usize::MAX {
+                let clauses: Vec<FilterClause> =
+                    bincode::deserialize(&value).map_err(serde::de::Error::custom)?;
+                Ok(FilterPredicate {
+                    version: FILTER_PREDICATE_VERSION,
+                    clauses,
+                })
+            } else {
                 Ok(FilterPredicate::single(column_position, op, value))
             }
-            _ => Err(serde::de::Error::custom(
-                "FilterPredicate JSON has neither a `clauses` array (v2) nor a legacy \
-                 `column_position`/`op`/`value` triple (v1)",
-            )),
         }
     }
 }
@@ -512,8 +577,8 @@ mod bincode_compat_tests {
             value: b"active".to_vec(),
         };
         let legacy_bytes = bincode::serialize(&legacy).expect("serialize legacy");
-        let decoded: FilterPredicate =
-            bincode::deserialize(&legacy_bytes).expect("deserialize legacy into new FilterPredicate");
+        let decoded: FilterPredicate = bincode::deserialize(&legacy_bytes)
+            .expect("deserialize legacy into new FilterPredicate");
         assert_eq!(decoded.clauses().len(), 1);
         let clause = &decoded.clauses()[0];
         assert_eq!(clause.column_position, 3);
@@ -536,7 +601,11 @@ mod bincode_compat_tests {
         for (variant, expected_tag) in cases {
             let bytes = bincode::serialize(variant).expect("serialize");
             let tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-            assert_eq!(tag, *expected_tag, "IndexType variant {:?} has wrong tag", variant);
+            assert_eq!(
+                tag, *expected_tag,
+                "IndexType variant {:?} has wrong tag",
+                variant
+            );
         }
     }
 }

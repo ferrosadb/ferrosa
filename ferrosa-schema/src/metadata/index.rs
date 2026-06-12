@@ -258,8 +258,8 @@ mod tests {
         };
 
         let legacy_bytes = bincode::serialize(&old_meta).expect("serialize legacy IndexMetadata");
-        let decoded: IndexMetadata =
-            bincode::deserialize(&legacy_bytes).expect("deserialize legacy IndexMetadata into new type");
+        let decoded: IndexMetadata = bincode::deserialize(&legacy_bytes)
+            .expect("deserialize legacy IndexMetadata into new type");
         let pred = decoded.filter_predicate.expect("predicate present");
         assert_eq!(pred.clauses().len(), 1);
         assert_eq!(pred.clauses()[0].column_position, 5);
