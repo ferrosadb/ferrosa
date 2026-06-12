@@ -231,6 +231,7 @@
       <li><a href="#subscribe">SUBSCRIBE Extension</a></li>
       <li><a href="#graph">Graph (Cypher) Extension</a></li>
       <li><a href="#not-yet">Not Yet Supported</a></li>
+      <li><a href="#behavioral-differences">Behavioral Differences</a></li>
     </ul>
   </div>
 
@@ -862,21 +863,64 @@
   <!-- ── Not Yet ── -->
   <h2 id="not-yet">Not Yet Supported</h2>
 
-  <p>The following Cassandra features are not yet implemented. They are planned for future releases:</p>
+  <p>The following Cassandra features are not yet implemented. Applications that use them require code changes before migrating:</p>
 
   <table>
-    <thead><tr><th>Feature</th><th>Status</th></tr></thead>
+    <thead><tr><th>Feature</th><th>Status</th><th>Impact</th></tr></thead>
     <tbody>
-      <tr><td>Logged batch atomicity</td><td>Planned</td></tr>
-      <tr><td>Query tracing</td><td>Planned</td></tr>
-      <tr><td>Materialized views</td><td>Planned</td></tr>
+      <tr><td>GROUP BY</td><td>Not supported</td><td>SELECT statements with GROUP BY are rejected at parse time; queries must be restructured or aggregation moved to the application layer.</td></tr>
+      <tr><td>PER PARTITION LIMIT</td><td>Not supported</td><td>The <code>PER PARTITION LIMIT n</code> clause is not parsed; rewrite as application-side limiting or use clustering key range predicates.</td></tr>
+      <tr><td>Query tracing</td><td>Not supported</td><td>The TRACING flag in QUERY/EXECUTE frames is accepted but silently ignored — no <code>system_traces</code> rows are written. Tools that depend on tracing data (DevCenter, some observability agents) will see empty trace results.</td></tr>
+      <tr><td>Schema-change EVENT push</td><td>Wired but inert</td><td>REGISTER is accepted and READY is returned, but Ferrosa never sends EVENT frames to registered clients. Drivers that rely on server-push schema invalidation (some DataStax driver versions with <code>schema_event_refresh_delay</code> disabled) must be configured to poll instead, or schema changes will not be reflected until the connection is recycled.</td></tr>
+      <tr><td>Materialized views</td><td>Not supported</td><td>CREATE MATERIALIZED VIEW is rejected; queries that read from materialized views must be rewritten against base tables.</td></tr>
+      <tr><td>Java / JavaScript UDFs</td><td>Not supported</td><td>Cassandra <code>CREATE FUNCTION ... LANGUAGE java</code> and <code>LANGUAGE javascript</code> are rejected. Ferrosa supports <code>LANGUAGE wasm</code> and <code>LANGUAGE assemblyscript</code> only; existing Java UDFs must be recompiled to WebAssembly.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Behavioral Differences ── -->
+  <h2 id="behavioral-differences">Behavioral Differences</h2>
+
+  <p>These features exist in both Cassandra and Ferrosa but behave differently. Applications that depend on the Cassandra behavior may produce incorrect results without code changes:</p>
+
+  <table>
+    <thead><tr><th>Area</th><th>Cassandra behavior</th><th>Ferrosa behavior</th><th>Impact</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Write-vs-delete tie on same timestamp</td>
+        <td>Tombstone wins (delete beats write)</td>
+        <td>Write wins (data is preserved)</td>
+        <td>Applications that delete and re-insert with the same client timestamp may observe stale data. Use distinct timestamps for deletes.</td>
+      </tr>
+      <tr>
+        <td>LOGGED batch crash recovery</td>
+        <td>Uses a batchlog table on a coordinator peer for replay on coordinator failure</td>
+        <td>Single-node: atomic group commit in the commit log (no batchlog). Cluster: full 3-phase batchlog protocol.</td>
+        <td>No application behavior difference in the non-crash path. Single-node Ferrosa provides equivalent crash recovery via the commit log without a separate batchlog table.</td>
+      </tr>
+      <tr>
+        <td>Secondary index consistency window</td>
+        <td>SAI indexes are updated synchronously on the write path</td>
+        <td>Indexes are built asynchronously after memtable flush; a brief staleness window exists between write acknowledgement and index availability</td>
+        <td>Queries immediately after a write may not see the new row via an index. Use partition-key reads for read-your-writes guarantees. Monitor staleness via <code>system_views.secondary_indexes</code>.</td>
+      </tr>
+      <tr>
+        <td>Counter multi-node reconciliation</td>
+        <td>Distributed sharded counters with per-replica local increments and reconciliation</td>
+        <td>Counter increment/decrement is executed via the standard write path; full distributed counter reconciliation semantics are not independently verified</td>
+        <td>Counter values may diverge under concurrent multi-node increments. Validate counter workloads before production migration.</td>
+      </tr>
     </tbody>
   </table>
 
   <div class="note">
-    <strong>Note:</strong> Even without these features, Ferrosa is fully compatible with standard
-    CQL drivers for core operations: DDL, DML, prepared statements, batches, system keyspaces,
-    and SASL authentication. Most applications migrate without code changes.
+    <strong>Driver compatibility:</strong> Ferrosa's core CQL paths — DDL, DML, prepared statements,
+    unlogged and logged batches, LWT, system keyspaces, and SASL authentication — are exercised by
+    automated driver smoke tests on every CI build across six language drivers: Python
+    (<code>cassandra-driver</code>), Go (<code>gocql</code>), Node.js (<code>cassandra-driver</code>),
+    Java (DataStax Java Driver), C# (DataStax C# Driver), and Rust (<code>scylla-rust-driver</code>).
+    Applications that limit themselves to these paths connect and run without driver changes.
+    See <code>.github/workflows/driver-tests.yml</code> and <code>tests/drivers/</code> for the
+    test matrix.
   </div>
 
 </div>
