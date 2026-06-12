@@ -232,7 +232,7 @@
   <div class="toc">
     <h4>On this page</h4>
     <ul>
-      <li><a href="#install">Install Preview Binary</a></li>
+      <li><a href="#install">Install</a></li>
       <li><a href="#run">Run Ferrosa</a></li>
       <li><a href="#connect">Connect a CQL Driver</a></li>
       <li><a href="#config">Configuration Reference</a></li>
@@ -243,14 +243,30 @@
     </ul>
   </div>
 
-  <!-- ── Install from Package ── -->
+  <!-- ── Install ── -->
   <h2 id="install">Installation</h2>
 
-  <p>The planned developer-preview installer targets macOS and Linux first. Windows support can be added later if there is demand.</p>
-  <pre><span class="kw">curl</span> -fsSL https://ferrosadb.com/setup.sh | bash</pre>
-  <div class="note">
-    <strong>Preview setup:</strong> The setup script is intended to download the matching Ferrosa release or prepare a source checkout, place binaries on your PATH when appropriate, and print the next command to run a local node. Until packaged release artifacts are published, build from source or use release artifacts from the preview PR/release.
-  </div>
+  <p>The installer detects your platform, downloads the latest release binary into <code>~/.ferrosa/bin/</code>, writes a default config to <code>~/.ferrosa/config/</code>, and optionally registers a launchctl/systemd unit and sets CQL admin credentials.</p>
+  <pre><span class="kw">curl</span> -fsSL https://ferrosadb.com/install.sh | bash</pre>
+
+  <h3>Supported platforms</h3>
+  <table>
+    <thead><tr><th>Platform</th><th>Tarball / Package</th></tr></thead>
+    <tbody>
+      <tr><td>macOS Apple Silicon (arm64)</td><td><code>ferrosa-v&lt;version&gt;-aarch64-apple-darwin.tar.gz</code> or Homebrew tap</td></tr>
+      <tr><td>macOS Intel (x86_64)</td><td><code>ferrosa-v&lt;version&gt;-x86_64-apple-darwin.tar.gz</code> or Homebrew tap</td></tr>
+      <tr><td>Linux x86_64 (static musl)</td><td><code>ferrosa-v&lt;version&gt;-x86_64-unknown-linux-musl.tar.gz</code> or <code>.deb</code></td></tr>
+      <tr><td>Linux aarch64 (static musl)</td><td><code>ferrosa-v&lt;version&gt;-aarch64-unknown-linux-musl.tar.gz</code> or <code>.deb</code></td></tr>
+    </tbody>
+  </table>
+  <p>Release tarballs, <code>.deb</code> packages, and Homebrew bottles are published on the <a href="https://github.com/ferrosadb/ferrosa/releases">GitHub Releases page</a>. Each release includes a <code>SHA256SUMS</code> file; verify with <code>sha256sum -c SHA256SUMS --ignore-missing</code>.</p>
+
+  <h3>Build from source</h3>
+  <p>If you prefer to build locally, you need a recent stable Rust toolchain:</p>
+  <pre><span class="kw">git</span> clone https://github.com/ferrosadb/ferrosa
+<span class="kw">cd</span> ferrosa
+<span class="kw">cargo</span> build --release
+<span class="cm"># Binaries land in ./target/release/ferrosa and ./target/release/ferrosa-ctl</span></pre>
 
 
   <!-- ── Run ── -->
@@ -292,7 +308,7 @@ ferrosa</pre>
       <tr><td>Web Console</td><td><code>9090</code></td><td>HTTP (REST API + static UI + WebSocket)</td></tr>
       <tr><td>Graph HTTP</td><td><code>7474</code></td><td>HTTP/JSON (Cypher queries)</td></tr>
       <tr><td>Prometheus Metrics</td><td><code>9090/metrics</code></td><td>HTTP (text exposition)</td></tr>
-      <tr><td>Internode (cluster)</td><td><code>7000</code></td><td>Custom binary protocol</td></tr>
+      <tr><td>Internode (cluster)</td><td><code>17000</code></td><td>Custom binary protocol (changed from :7000 in v0.11.0 to avoid macOS ControlCenter conflict)</td></tr>
     </tbody>
   </table>
 
@@ -436,8 +452,8 @@ session.execute(<span class="str">"""
     <tbody>
       <tr><td><code>FERROSA_CLUSTER_NAME</code></td><td><code>ferrosa</code></td><td>Cluster name (must match across nodes)</td></tr>
       <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses; each entry may be an IP:port or resolvable hostname:port</td></tr>
-      <tr><td><code>FERROSA_INTERNODE_BIND</code></td><td><code>0.0.0.0:7000</code></td><td>Internode protocol bind address</td></tr>
-      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td><code>127.0.0.1:7000</code></td><td>Address other nodes use to reach this node; also forms the default internal topology view. May be an IP:port or resolvable hostname:port.</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_BIND</code></td><td><code>0.0.0.0:17000</code></td><td>Internode protocol bind address</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td><code>127.0.0.1:17000</code></td><td>Address other nodes use to reach this node; also forms the default internal topology view. May be an IP:port or resolvable hostname:port.</td></tr>
       <tr><td><code>FERROSA_INTERNODE_PSK</code></td><td>—</td><td>Pre-shared key for internode auth (HMAC-SHA256)</td></tr>
       <tr><td><code>FERROSA_INTERNODE_TLS_CERT</code></td><td>—</td><td>PEM certificate path for internode TLS</td></tr>
       <tr><td><code>FERROSA_INTERNODE_TLS_KEY</code></td><td>—</td><td>PEM private-key path for internode TLS</td></tr>
@@ -572,8 +588,8 @@ session.execute(<span class="str">"""
 <span class="kw">ferrosa-ctl</span> monitor
 
 <span class="cm"># Cluster management</span>
-<span class="kw">ferrosa-ctl</span> add-node <span class="str">10.0.0.5:7000</span>        <span class="cm"># Pre-approve a node for cluster join</span>
-<span class="kw">ferrosa-ctl</span> decommission <span class="str">10.0.0.3:7000</span>   <span class="cm"># Gracefully remove a node</span>
+<span class="kw">ferrosa-ctl</span> add-node <span class="str">10.0.0.5:17000</span>        <span class="cm"># Pre-approve a node for cluster join</span>
+<span class="kw">ferrosa-ctl</span> decommission <span class="str">10.0.0.3:17000</span>   <span class="cm"># Gracefully remove a node</span>
 <span class="kw">ferrosa-ctl</span> ring                          <span class="cm"># Show token ring distribution</span>
 <span class="kw">ferrosa-ctl</span> rebalance                     <span class="cm"># Trigger token rebalancing</span></pre>
 
@@ -699,7 +715,7 @@ session.execute(<span class="str">"""
   <h3>Example: host Mac clients plus Podman-network clients</h3>
   <pre><span class="kw">FERROSA_CQL_BIND</span>=0.0.0.0:9042
 <span class="kw">FERROSA_CQL_BROADCAST</span>=127.0.0.1:19042
-<span class="kw">FERROSA_INTERNODE_BROADCAST</span>=10.89.1.48:7000
+<span class="kw">FERROSA_INTERNODE_BROADCAST</span>=10.89.1.48:17000
 <span class="kw">FERROSA_CQL_INTERNAL_CLIENT_CIDRS</span>=10.89.0.0/16</pre>
   <p>In that setup, host-side drivers reconnect to <code>127.0.0.1:19042</code> after topology discovery, while clients running on the Podman network see <code>10.89.x.x:9042</code>.</p>
 
