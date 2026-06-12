@@ -704,6 +704,18 @@ impl ModeController {
     pub fn hint_store(&self) -> Arc<HintStore> {
         self.hint_store.clone()
     }
+
+    /// Override the deployment mode without performing a real cluster transition.
+    ///
+    /// This is a **test helper**: it directly replaces the stored mode so that
+    /// tests in external crates can drive mode-dependent behaviour (e.g. the
+    /// `/readyz` readiness probe) without standing up a full Raft cluster.
+    ///
+    /// Production code must never call this method — use the proper transition
+    /// methods (`transition_to_pair`, `transition_to_cluster`, etc.) instead.
+    pub fn set_mode_for_test(&self, mode: DeploymentMode) {
+        self.mode.store(Arc::new(mode));
+    }
 }
 
 #[cfg(test)]
