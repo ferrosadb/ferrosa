@@ -358,6 +358,136 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    /// Build a minimal `WebAppState` similar to the one in `web/api.rs` tests,
+    /// for use in /admin auth tests that require the full router.
+    fn make_state_for_admin_tests(auth_disabled: bool) -> crate::web::WebAppState {
+        use ferrosa_cluster::ModeController;
+        use ferrosa_net::rpc::HandlerRegistry;
+        use ferrosa_storage::commitlog::CommitLogConfig;
+        use ferrosa_storage::compaction::CompactionConfig;
+        use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+
+        // Safety: test-only — clearing env var for hermetic tests.
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                log_dir: dir.path().join("commitlog"),
+                checkpoint_dir: dir.path().join("commitlog"),
+                archive: None,
+                ..CommitLogConfig::default()
+            },
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
+            flush_threshold_bytes: 4096,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.path().to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+        };
+        let storage =
+            std::sync::Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
+        let schema = std::sync::Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(TestAuditSink::new()),
+                secrets: Box::new(EnvSecretsProvider),
+                mode: DeploymentMode::Development,
+            })
+            .expect("test schema"),
+        );
+        let host_id = uuid::Uuid::new_v4();
+        let registry = std::sync::Arc::new(HandlerRegistry::new());
+        let (mode_controller, _handles) = ModeController::new(
+            std::sync::Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            std::sync::Arc::new(ferrosa_net::config::NetConfig::default()),
+            host_id,
+            storage.clone(),
+            schema.clone(),
+            registry,
+        );
+        crate::web::WebAppState {
+            registry: std::sync::Arc::new(ferrosa_schema::VirtualTableRegistry::new()),
+            mode_controller,
+            schema,
+            storage,
+            host_id,
+            auth_disabled,
+            debug: None,
+        }
+    }
+
+    // B1: /admin/* returns 401 without credentials when auth is enabled
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn admin_route_returns_401_without_credentials() {
+        let state = make_state_for_admin_tests(false);
+        let router = crate::web::build_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/admin/membership-snapshot")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "GET /admin/membership-snapshot must return 401 when no credentials are provided"
+        );
+    }
+
+    // B2: /admin/* returns 200 with valid superuser credentials
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn admin_route_returns_200_with_superuser_credentials() {
+        let state = make_state_for_admin_tests(false);
+        let router = crate::web::build_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/admin/membership-snapshot")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                basic_auth_header("cassandra", "cassandra"),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /admin/membership-snapshot must return 200 with valid superuser credentials"
+        );
+    }
+
+    // B3: /admin/* returns 200 when auth_disabled=true (dev mode bypass)
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn admin_route_open_when_auth_disabled() {
+        let state = make_state_for_admin_tests(true);
+        let router = crate::web::build_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/admin/membership-snapshot")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /admin/membership-snapshot must return 200 when auth_disabled=true (dev mode)"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn operator_role_via_member_of_returns_200() {
