@@ -790,6 +790,20 @@ fn if_v_eq_gate(expected: i32) -> ferrosa_cluster::accord::ConditionGate {
     })
 }
 
+/// Build the `INSERT ... IF NOT EXISTS` gate the CQL layer supplies: apply iff the
+/// F+1-agreed row at `t` is absent. Mirrors `eval_if_conditions` for the existence
+/// predicate, but routed through the generic linearizable read-at-`t` seam so the
+/// "exactly one applies" guarantee is enforced against REAL stored state.
+fn if_not_exists_gate() -> ferrosa_cluster::accord::ConditionGate {
+    Box::new(|row: Option<&[u8]>| match row {
+        // A non-empty agreed row means the partition already exists at `t`:
+        // IF NOT EXISTS does not hold (CQL: applied=false).
+        Some(bytes) if !bytes.is_empty() => false,
+        // Absent at `t`: the insert applies.
+        _ => true,
+    })
+}
+
 /// Regression for the generic-IF lost-update bug: a generic `IF col=val` whose
 /// condition is FALSE against the F+1-agreed row at `t` must ABORT before the
 /// Apply phase — the mutation must NOT persist, and the driver must report
@@ -942,4 +956,305 @@ async fn generic_if_mismatch_does_not_persist_and_match_does() {
         .server
         .shutdown(std::time::Duration::from_millis(100))
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent INSERT ... IF NOT EXISTS through the engine seam: EXACTLY ONE
+// applies. (The earlier `two_coordinators_*` test runs WITHOUT an engine; this
+// one drives both coordinators against REAL per-replica StorageEngines so a
+// double-apply would be observable as two distinct persisted values.)
+// ---------------------------------------------------------------------------
+
+/// Two coordinators concurrently fire `INSERT ... IF NOT EXISTS` (modelled via
+/// the generic linearizable read-at-`t` seam + an existence gate) at the SAME
+/// empty key, each carrying a DISTINCT value. Accord must serialize them so that
+/// **exactly one** insert applies; the loser's gate sees the winner's row at its
+/// (later) `t` and aborts with `ConditionNotMet`. Both replicas' engines must end
+/// holding the SAME single value — the winner's.
+///
+/// A lost-update / double-apply bug would surface as: both succeed, OR the two
+/// engines disagree, OR the persisted value is the loser's.
+///
+/// # KNOWN-FAILING — linearizability gap (intentionally `#[ignore]`)
+///
+/// This test currently FAILS: under genuine concurrency **both** transactions
+/// apply (a lost update / double-apply). Root cause is the *documented, deferred*
+/// dep-wait gap in `ferrosa-cluster/src/accord/handlers.rs` (`AccordRead`
+/// handler): the `ReadVote` handler does NOT block until every conflicting
+/// dependency `t' < t` has reached `Applied` before performing the read-at-`t`.
+/// Both contenders therefore read the empty key *before* either applies, both
+/// existence gates pass, and both inserts land. The coordinator's F+1-agreement
+/// safety net does not catch this because BOTH replicas agree on the (stale)
+/// empty read.
+///
+/// The assertions below encode the CORRECT (linearizable) behavior, so once the
+/// read-vote dep-wait is implemented this test will pass UNMODIFIED. It is left
+/// `#[ignore]`d — not deleted and not weakened to assert the broken behavior —
+/// because faking a passing exactly-once proof would hide a silent data-loss bug
+/// (per the fail-loud rule). Run explicitly with:
+///   `cargo test -p ferrosa-cluster --test accord_lwt_concurrent -- --ignored`
+#[tokio::test]
+#[ignore = "linearizability gap: ReadVote handler lacks dep-wait — concurrent IF NOT \
+            EXISTS double-applies (handlers.rs AccordRead). Test asserts the correct \
+            behavior and will pass once dep-wait lands."]
+async fn concurrent_insert_if_not_exists_exactly_one_applies_through_engine() {
+    let id_a = uuid::Uuid::from_bytes([0x91; 16]);
+    let id_b = uuid::Uuid::from_bytes([0x92; 16]);
+
+    let node_a = start_engine_test_node(id_a).await;
+    let node_b = start_engine_test_node(id_b).await;
+
+    node_a
+        .peer_manager
+        .ensure_peer(id_b, &node_b.local_addr.to_string())
+        .await
+        .expect("node_a -> node_b connect");
+    node_b
+        .peer_manager
+        .ensure_peer(id_a, &node_a.local_addr.to_string())
+        .await
+        .expect("node_b -> node_a connect");
+
+    let replica_ids = vec![id_a, id_b];
+    let pk = "race-key";
+    let key = pk.as_bytes().to_vec();
+
+    // Each coordinator persists/read through ITS OWN engine locally; cross-node
+    // Apply persists to the peer's engine via the registered AccordHandler.
+    let applier_a = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+        node_a.engine.clone(),
+    ));
+    let reader_a = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+        node_a.engine.clone(),
+    ));
+    let applier_b = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+        node_b.engine.clone(),
+    ));
+    let reader_b = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+        node_b.engine.clone(),
+    ));
+
+    // Contender A inserts v=11; contender B inserts v=22 — distinct so the
+    // surviving value identifies the winner unambiguously.
+    let clock_a = HybridLogicalClock::new(node_a.node_id, 700_000_000);
+    let clock_b = HybridLogicalClock::new(node_b.node_id, 700_000_000);
+
+    let mut driver_a = AccordCoordinatorDriver::new(
+        node_a.node_id,
+        replica_ids.clone(),
+        Arc::clone(&node_a.peer_manager),
+        false,
+        &clock_a,
+        key.clone(),
+        e2e_mutation_bytes(pk, 11, 1),
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    })
+    .with_local_applier(applier_a)
+    .with_local_reader(reader_a)
+    .with_condition_gate(if_not_exists_gate());
+
+    let mut driver_b = AccordCoordinatorDriver::new(
+        node_b.node_id,
+        replica_ids.clone(),
+        Arc::clone(&node_b.peer_manager),
+        false,
+        &clock_b,
+        key.clone(),
+        e2e_mutation_bytes(pk, 22, 1),
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    })
+    .with_local_applier(applier_b)
+    .with_local_reader(reader_b)
+    .with_condition_gate(if_not_exists_gate());
+
+    let (res_a, res_b) = tokio::join!(driver_a.run_transaction(), driver_b.run_transaction());
+
+    eprintln!(
+        "concurrent IF NOT EXISTS: a={:?} b={:?}",
+        res_a.as_ref().map(|(t, _)| t),
+        res_b.as_ref().map(|(t, _)| t)
+    );
+
+    // EXACTLY ONE may apply. The other must abort with ConditionNotMet (it read
+    // the winner's row at its later `t`) — never a second silent apply.
+    let a_applied = res_a.is_ok();
+    let b_applied = res_b.is_ok();
+    match (&res_a, &res_b) {
+        (Ok(_), Err(AccordDriverError::ConditionNotMet { current_row }))
+        | (Err(AccordDriverError::ConditionNotMet { current_row }), Ok(_)) => {
+            // The loser's ConditionNotMet must carry the winner's real row.
+            let loser_saw = decode_v_from_read_row(current_row);
+            assert!(
+                loser_saw == Some(11) || loser_saw == Some(22),
+                "loser's ConditionNotMet must carry the winner's real persisted row, got {loser_saw:?}"
+            );
+        }
+        other => panic!(
+            "exactly one INSERT IF NOT EXISTS must apply and the other must return \
+             ConditionNotMet; got {other:?}"
+        ),
+    }
+    assert!(
+        a_applied ^ b_applied,
+        "EXACTLY ONE coordinator must apply (a_applied={a_applied}, b_applied={b_applied})"
+    );
+
+    // Both engines must converge on the SAME single winning value.
+    let v_a = engine_v(node_a.engine.clone(), &key);
+    let v_b = engine_v(node_b.engine.clone(), &key);
+    assert!(v_a.is_some(), "winner's row must be persisted on node_a");
+    assert_eq!(
+        v_a, v_b,
+        "both replicas must hold the SAME value after the race (split-brain / divergent apply)"
+    );
+    let winner = v_a.unwrap();
+    assert!(
+        winner == 11 || winner == 22,
+        "persisted value must be one contender's, got {winner}"
+    );
+    // The winner is whichever coordinator's run_transaction succeeded.
+    let expected = if a_applied { 11 } else { 22 };
+    assert_eq!(
+        winner, expected,
+        "the persisted value must match the coordinator that reported [applied]=true"
+    );
+
+    node_a
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    node_b
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Durability: an applied LWT value survives a state-machine + engine RESTART
+// (commit-log replay on reopen of the same data dir).
+// ---------------------------------------------------------------------------
+
+/// Apply a value via the full Accord LWT path, then DROP the state machine and
+/// engine and REOPEN a fresh `StorageEngine` from the same data dir. The applied
+/// value must survive — proving the LWT write reached durable storage (commit
+/// log / SSTables), not just an in-memory state machine.
+#[tokio::test]
+async fn applied_lwt_value_survives_state_machine_restart() {
+    use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+
+    let id_coord = uuid::Uuid::from_bytes([0xA1; 16]);
+    let id_replica = uuid::Uuid::from_bytes([0xA2; 16]);
+
+    let coord = start_engine_test_node(id_coord).await;
+    let replica = start_engine_test_node(id_replica).await;
+
+    coord
+        .peer_manager
+        .ensure_peer(id_replica, &replica.local_addr.to_string())
+        .await
+        .expect("coord -> replica connect");
+    replica
+        .peer_manager
+        .ensure_peer(id_coord, &coord.local_addr.to_string())
+        .await
+        .expect("replica -> coord connect");
+
+    let replica_ids = vec![id_coord, id_replica];
+    let pk = "durable-row";
+    let key = pk.as_bytes().to_vec();
+
+    let coord_applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+        coord.engine.clone(),
+    ));
+    let coord_reader = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+        coord.engine.clone(),
+    ));
+
+    // INSERT v=42 IF NOT EXISTS — applies through the full Accord path onto both
+    // replicas' real engines.
+    let clock1 = HybridLogicalClock::new(coord.node_id, 800_000_000);
+    let mut writer = AccordCoordinatorDriver::new(
+        coord.node_id,
+        replica_ids.clone(),
+        Arc::clone(&coord.peer_manager),
+        false,
+        &clock1,
+        key.clone(),
+        e2e_mutation_bytes(pk, 42, 1),
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    })
+    .with_local_applier(coord_applier)
+    .with_local_reader(coord_reader)
+    .with_condition_gate(if_not_exists_gate());
+
+    writer
+        .run_transaction()
+        .await
+        .expect("INSERT v=42 IF NOT EXISTS must apply");
+    assert_eq!(
+        engine_v(coord.engine.clone(), &key),
+        Some(42),
+        "coord applied v=42"
+    );
+    assert_eq!(
+        engine_v(replica.engine.clone(), &key),
+        Some(42),
+        "replica applied v=42"
+    );
+
+    // Capture each replica's data dir, then tear everything down. Sync the
+    // commit log first (clean-shutdown fsync) so the applied LWT rows are durable
+    // on disk, then DROP the nodes (state machines, appliers, engine handles).
+    // The TempDir is kept alive separately so the on-disk data survives the drop.
+    coord
+        .engine
+        .force_commit_log_sync()
+        .expect("coord commit-log sync");
+    replica
+        .engine
+        .force_commit_log_sync()
+        .expect("replica commit-log sync");
+
+    let coord_dir = coord.dir.clone();
+    let replica_dir = replica.dir.clone();
+    let coord_path = coord_dir.path().to_path_buf();
+    let replica_path = replica_dir.path().to_path_buf();
+
+    coord
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    replica
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    drop(coord);
+    drop(replica);
+
+    // REOPEN fresh engines from the same dirs via the crash-recovery path:
+    // `open` returns the unflushed commit-log mutations, which `replay_mutations`
+    // re-materializes after the table schema is re-registered. The applied LWT
+    // row must survive on BOTH replicas — durability via commit-log replay.
+    for (label, path) in [("coord", coord_path), ("replica", replica_path)] {
+        let cfg = StorageEngineConfig::test_config(&path);
+        let (reopened, pending) = StorageEngine::open(cfg, None).unwrap();
+        let reopened = Arc::new(reopened);
+        reopened.register_table(e2e_schema()).unwrap();
+        reopened.replay_mutations(pending).unwrap();
+        assert_eq!(
+            engine_v(reopened.clone(), &key),
+            Some(42),
+            "{label}: applied LWT value v=42 must survive a state-machine + engine restart \
+             (durability via commit-log replay)"
+        );
+    }
 }
