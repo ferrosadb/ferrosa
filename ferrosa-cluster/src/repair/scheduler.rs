@@ -126,7 +126,12 @@ impl AutoRepairConfig {
         let d = Self::default();
         let enabled = std::env::var("FERROSA_AUTO_REPAIR_ENABLED")
             .ok()
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
             .unwrap_or(d.enabled);
         let interval = std::env::var("FERROSA_AUTO_REPAIR_INTERVAL_SECS")
             .ok()
@@ -315,7 +320,11 @@ impl AutoRepairScheduler {
     /// Construct a scheduler. `coord` bounds per-table session concurrency;
     /// `ctx` supplies the live ring/executor/tables each tick; `cfg` controls
     /// cadence and skip-lists.
-    pub fn new(coord: RepairCoordinator, ctx: Arc<dyn RepairContext>, cfg: AutoRepairConfig) -> Self {
+    pub fn new(
+        coord: RepairCoordinator,
+        ctx: Arc<dyn RepairContext>,
+        cfg: AutoRepairConfig,
+    ) -> Self {
         Self {
             coord,
             ctx,
@@ -340,17 +349,20 @@ impl AutoRepairScheduler {
         inc_auto_repair_tick();
 
         // One consistent snapshot of the ring view for the whole tick.
-        let (ring, local_node_id, executor) =
-            match (self.ctx.token_ring(), self.ctx.local_node_id(), self.ctx.build_executor()) {
-                (Some(ring), Some(id), Some(exec)) => (ring, id, exec),
-                _ => {
-                    AUTO_REPAIR_SKIPPED_NOT_READY.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(
+        let (ring, local_node_id, executor) = match (
+            self.ctx.token_ring(),
+            self.ctx.local_node_id(),
+            self.ctx.build_executor(),
+        ) {
+            (Some(ring), Some(id), Some(exec)) => (ring, id, exec),
+            _ => {
+                AUTO_REPAIR_SKIPPED_NOT_READY.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
                         "auto-repair: node not ring-ready (no ring / node_id / executor); skipping tick"
                     );
-                    return;
-                }
-            };
+                return;
+            }
+        };
 
         let tables_with_rf = self.ctx.user_tables();
         let tables: Vec<TableId> = tables_with_rf.iter().map(|(t, _)| t.clone()).collect();
@@ -499,7 +511,8 @@ impl AutoRepairScheduler {
                 // Recompute the sub-tick from the live table count each cycle so
                 // membership/schema churn re-spreads coverage (design: cadence).
                 let table_count = scheduler.ctx.user_tables().len();
-                let period = AutoRepairScheduler::sub_tick(interval_cfg, table_count, max_concurrent);
+                let period =
+                    AutoRepairScheduler::sub_tick(interval_cfg, table_count, max_concurrent);
                 tokio::select! {
                     result = shutdown.changed() => {
                         if result.is_err() || *shutdown.borrow() {
@@ -557,7 +570,10 @@ mod tests {
         let n2 = select_initiated_ranges(&ring, 2, 3);
         let n3 = select_initiated_ranges(&ring, 3, 3);
 
-        assert!(!n1.is_empty(), "lowest-host_id node must initiate its ranges");
+        assert!(
+            !n1.is_empty(),
+            "lowest-host_id node must initiate its ranges"
+        );
         assert!(n2.is_empty(), "node 2 must NOT initiate (node 1 is lower)");
         assert!(n3.is_empty(), "node 3 must NOT initiate (node 1 is lower)");
 
@@ -629,8 +645,14 @@ mod tests {
         assert!(c.enabled, "auto-repair on by default");
         assert_eq!(c.interval, Duration::from_secs(86_400), "24h default");
         assert_eq!(c.max_concurrent_tables, 1);
-        assert!(c.is_skipped(&tid("system_auth", "roles")), "system* skipped");
-        assert!(!c.is_skipped(&tid("app", "users")), "user keyspace not skipped");
+        assert!(
+            c.is_skipped(&tid("system_auth", "roles")),
+            "system* skipped"
+        );
+        assert!(
+            !c.is_skipped(&tid("app", "users")),
+            "user keyspace not skipped"
+        );
     }
 
     #[test]
@@ -666,7 +688,10 @@ mod tests {
         covered.extend(p1);
         covered.extend(p2);
         covered.sort_by(|a, b| a.table().cmp(b.table()));
-        assert_eq!(covered, tables, "three ticks cover every table exactly once");
+        assert_eq!(
+            covered, tables,
+            "three ticks cover every table exactly once"
+        );
     }
 
     #[test]
@@ -676,7 +701,9 @@ mod tests {
         assert!(select_tables_for_tick(&[], 0, 1, &empty, &cfg).0.is_empty());
         // All-system set → nothing picked, no infinite scan.
         let sys = vec![tid("system", "a"), tid("system_auth", "b")];
-        assert!(select_tables_for_tick(&sys, 0, 4, &empty, &cfg).0.is_empty());
+        assert!(select_tables_for_tick(&sys, 0, 4, &empty, &cfg)
+            .0
+            .is_empty());
     }
 
     // -- AutoRepairScheduler / RepairContext tests (no real IO) -------------
@@ -830,8 +857,11 @@ mod tests {
             tables: vec![(tid("app", "a"), 3)],
             ready: false, // not in cluster mode / not placed in ring
         });
-        let mut sched =
-            AutoRepairScheduler::new(RepairCoordinator::default(), ctx, AutoRepairConfig::default());
+        let mut sched = AutoRepairScheduler::new(
+            RepairCoordinator::default(),
+            ctx,
+            AutoRepairConfig::default(),
+        );
 
         sched.run_tick().await;
 
