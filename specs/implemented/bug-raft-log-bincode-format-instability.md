@@ -1,7 +1,7 @@
 ---
 type: implemented
 priority: P1
-status: partially-fixed
+status: fixed
 created: 2026-06-12
 fixed: 2026-06-12
 affected-versions: all (no raft log format versioning exists)
@@ -113,40 +113,66 @@ as `column_position` (it would require a table with 2^64-1 columns).
 **ferrosa-cluster (raft::tests)**:
 - `raft_op_variant_tag_stability` — pins bincode discriminant tags for `CreateIndex` (13), `DropIndex` (14), `JoinNode` (22), `UpdateNodeInfo` (23), `LeaveNode` (24), `AssignTokens` (25), `ApproveNode` (27) and more
 
-## Status: Partially fixed
+## Status: Fixed (recovery on the live fmem cluster still pending sign-off)
 
-### Fixed (this branch)
+### Fixed (branch `fix/raft-log-filterpredicate-bincode-compat`)
 
 - Bincode decode compatibility: new builds can decode `FilterPredicate`
   log entries written by old builds (and vice versa for single-clause case)
 - Stability tests pin `IndexType` and `RaftOp` variant tags so future
   reordering is caught at CI time before it reaches a persistent log
 
-### Remaining open work
+### Fixed (branch `fix/raft-log-format-versioning`, 2026-06-12)
 
-The following items from the original fix shape are **not** implemented
-here and remain open:
+All four items from the original fix shape are now implemented:
 
-1. **Versioned log envelope** — a top-level format version tag on
-   `RaftCommand` itself, so any future field change is detectable and
-   a meaningful error message names the recovery procedure
-2. **CI golden-file decode gate** — decode raft log entries written by the
-   previous release tag (extend the driver-conformance pattern)
-3. **`ferrosa-ctl raft-log inspect/truncate`** — operator tooling to decode
-   what is readable, report the first bad entry, and optionally truncate to
-   the last snapshot-covered index after explicit confirmation
-4. **Startup error message improvement** — distinguish "log entry newer
-   than snapshot is unreadable" and name the recovery procedure in the
-   fatal error output
+1. **Versioned log envelope** — landed earlier as W1.19c (`FRE1` magic +
+   `ENTRY_FORMAT_VERSION` byte in `SledLogStore::serialize_entry`, with
+   legacy bare-bincode and pre-UpdateNodeInfo decode fallthroughs);
+   unknown future versions fail loud
+2. **CI golden-file decode gate** —
+   `ferrosa-cluster/tests/fixtures/raft_log_entries_golden_v1.bin`
+   freezes `serialize_entry` bytes across drift-prone variants (NodeInfo,
+   IndexMetadata, FilterPredicate single + conjunction, membership);
+   `golden_raft_log_entries_decode` fails any change that can no longer
+   decode them. Regenerate only for an intentional, version-bumped format
+   change: `FERROSA_REGEN_RAFT_GOLDEN=1 cargo test -p ferrosa-cluster
+   golden_raft_log_entries_decode`
+3. **`ferrosa-ctl raft log-inspect/log-truncate`** — offline operator
+   tooling. `log-inspect` reports vote/committed/purge markers, the
+   readable/unreadable split, and the first bad entry (index, error, hex
+   preview) plus the exact recovery command; `log-truncate --from <idx>`
+   drops the unreadable tail and clamps the committed marker to the
+   surviving log or the snapshot-covered purge point. `--dry-run`
+   previews; the destructive path refuses without `--yes`
+4. **Startup error message improvement** — decode errors now name the
+   failing entry index, the blast radius (metadata plane down, CQL still
+   serving, /readyz not-ready), and the `ferrosa-ctl` recovery procedure
+   (`SledLogStore::deserialize_entry_at` / `UnreadableLogEntry`)
+
+Smoke-verified against a copy of the live fmem node1 raft dir: inspect
+located 79 unreadable entries in `[1523..3081]` directly above the purge
+point (1522); truncate removed them and clamped committed `3081 → 1522`;
+re-inspect came back clean.
 
 ## Recovery procedure for the fmem cluster (pending operator approval)
 
-The snapshot at 5999 is readable everywhere; entries 6000–6121 (122
-metadata ops) are not. Purging log segments beyond the snapshot on all
-three nodes and restarting re-forms Raft from the snapshot. Cost: those
-122 committed metadata ops are discarded — acceptable only because
-membership (3 nodes) and token ring (768) are stable and CQL schema is
-persisted separately in `schema.json`. Requires explicit sign-off.
+State drifts as the cluster churns (originally entries 6000–6121; by
+2026-06-12 evening node1 showed 79 unreadable entries in `[1523..3081]`
+after a purge to 1522, vote term up to 964 from election churn). The
+procedure, per node:
+
+1. Stop the node.
+2. `ferrosa-ctl raft log-inspect --data-dir <dir>` — note the first bad
+   index.
+3. `ferrosa-ctl raft log-truncate --data-dir <dir> --from <first-bad>
+   --yes`
+4. Restart after all damaged nodes are truncated.
+
+Cost: committed metadata ops at/above the cut are discarded — acceptable
+only because membership (3 nodes) and token ring (768) are stable and
+CQL schema is persisted separately in `schema.json`. Requires explicit
+sign-off.
 
 ## Related
 
