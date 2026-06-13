@@ -50,6 +50,123 @@ use crate::timeseries::{
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
+/// One operation in an atomic batch (spec URS-QEC-X02).
+///
+/// Both variants lower to a [`Row`] inside a [`Mutation`]; the enum exists so
+/// callers (Accord LWT apply, Cypher delete-cascade, Bolt transactions) express
+/// intent without hand-building `Row` deletion markers.
+#[derive(Debug, Clone)]
+pub enum BatchOp {
+    /// Upsert a row at `key` in `keyspace.table` @ `timestamp`.
+    Write {
+        /// Target keyspace.
+        keyspace: String,
+        /// Target table.
+        table: String,
+        /// Partition key.
+        key: DecoratedKey,
+        /// Row to upsert.
+        row: Row,
+        /// Mutation timestamp (microseconds since epoch).
+        timestamp: i64,
+    },
+    /// Tombstone. `clustering = None` deletes the whole partition; `Some(bytes)`
+    /// deletes one clustered row. Lowers to a `Row` carrying a `DeletionTime`.
+    Tombstone {
+        /// Target keyspace.
+        keyspace: String,
+        /// Target table.
+        table: String,
+        /// Partition key.
+        key: DecoratedKey,
+        /// `None` = whole-partition delete; `Some` = single clustered row.
+        clustering: Option<Vec<u8>>,
+        /// Mutation timestamp (microseconds since epoch).
+        timestamp: i64,
+    },
+}
+
+impl BatchOp {
+    /// Lower this op to a single-row [`Mutation`] for `write_atomic_batch`.
+    ///
+    /// A `Tombstone` becomes a pure tombstone `Row` (no cells, non-LIVE
+    /// `DeletionTime`) — the in-memory representation the memtable merge path
+    /// already honors for both partition (`clustering = None`) and clustered
+    /// (`clustering = Some`) deletes.
+    fn into_mutation(self) -> Mutation {
+        match self {
+            BatchOp::Write {
+                keyspace,
+                table,
+                key,
+                row,
+                timestamp,
+            } => Mutation::new(keyspace, table, key, vec![row], timestamp),
+            BatchOp::Tombstone {
+                keyspace,
+                table,
+                key,
+                clustering,
+                timestamp,
+            } => {
+                let deletion = deletion_at(timestamp);
+                let row = Row {
+                    clustering: clustering.unwrap_or_default(),
+                    cells: Vec::new(),
+                    deletion,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+                };
+                Mutation::new(keyspace, table, key, vec![row], timestamp)
+            }
+        }
+    }
+}
+
+/// Build a non-LIVE [`ferrosa_sstable::types::DeletionTime`] for a tombstone at
+/// `timestamp` microseconds. `local_deletion_time` (seconds) is derived from the
+/// microsecond timestamp, saturating into `u32`.
+fn deletion_at(timestamp: i64) -> ferrosa_sstable::types::DeletionTime {
+    let local_seconds = timestamp.div_euclid(1_000_000).clamp(0, u32::MAX as i64) as u32;
+    ferrosa_sstable::types::DeletionTime::new(timestamp, local_seconds)
+}
+
+/// Staging handle for a Bolt explicit transaction (spec URS-QEC-X02 §5.3).
+///
+/// Ops accumulate in memory; nothing is durable until [`Self::commit`].
+/// [`Self::abort`] (or `Drop`) discards them with no I/O.
+pub struct BatchTxn<'e> {
+    engine: &'e StorageEngine,
+    ops: Vec<BatchOp>,
+}
+
+impl<'e> BatchTxn<'e> {
+    /// Append an op to the pending set (no durable write yet).
+    pub fn stage(&mut self, op: BatchOp) {
+        self.ops.push(op);
+    }
+
+    /// Number of staged ops.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// `true` when no ops are staged.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Apply all staged ops atomically (delegates to
+    /// [`StorageEngine::apply_batch`]). Fail-loud on engine error.
+    pub fn commit(self) -> ferrosa_common::Result<()> {
+        self.engine.apply_batch(self.ops)
+    }
+
+    /// Discard all staged ops; no I/O. Equivalent to dropping the handle.
+    pub fn abort(self) {
+        drop(self);
+    }
+}
+
 pub(crate) fn write_options_for_schema(
     schema: &TableSchema,
     verify_output: bool,
@@ -5111,6 +5228,36 @@ impl StorageEngine {
         }
 
         Ok(())
+    }
+
+    /// Apply a batch of mixed ops atomically and durably (single fsync group).
+    ///
+    /// All-or-nothing: every op lowers to a [`Mutation`] and the whole set is
+    /// applied through [`Self::write_atomic_batch`], which preflights every
+    /// target table **before** appending any commit-log record. On any
+    /// preflight / append failure **none** of the ops are applied and an `Err`
+    /// is returned (spec URS-QEC-X02, fail-loud per X01). Ops touching the same
+    /// `(keyspace, table, key)` are applied in `ops` order.
+    ///
+    /// An empty batch is `Ok(())`.
+    pub fn apply_batch(&self, ops: Vec<BatchOp>) -> ferrosa_common::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mutations = ops.into_iter().map(BatchOp::into_mutation).collect();
+        self.write_atomic_batch(mutations)
+    }
+
+    /// Open a staging handle for a Bolt explicit transaction (B02).
+    ///
+    /// Ops are staged in memory; nothing is durable until [`BatchTxn::commit`].
+    /// [`BatchTxn::abort`] (or dropping the handle) discards the staged ops with
+    /// no I/O — exactly the `ROLLBACK` / connection-drop semantics.
+    pub fn begin_batch(&self) -> BatchTxn<'_> {
+        BatchTxn {
+            engine: self,
+            ops: Vec::new(),
+        }
     }
 
     /// Reads a partition from a table, merging memtable and SSTable sources.
