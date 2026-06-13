@@ -2215,6 +2215,143 @@ async fn union_all_preserves_duplicates_and_union_deduplicates_rows() {
 }
 
 #[tokio::test]
+async fn union_over_match_deduplicates_rows() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    // Seed three people, two sharing the name "Alice".
+    for (id, name) in [
+        ("00000000-0000-0000-0000-00000000e001", "Alice"),
+        ("00000000-0000-0000-0000-00000000e002", "Alice"),
+        ("00000000-0000-0000-0000-00000000e003", "Bob"),
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{id: '{id}', name: '{name}'}}) RETURN n.name"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    // UNION of two identical MATCH arms must dedup across arms (and within),
+    // so "Alice" (twice in each arm) collapses to a single row.
+    let union_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name AS a \
+                      UNION \
+                      MATCH (n:Person) RETURN n.name AS a",
+            "keyspace": "social"
+        })),
+    );
+    let union_resp = app.clone().oneshot(union_req).await.unwrap();
+    let status = union_resp.status();
+    let union_body = response_json(union_resp).await;
+    assert_eq!(status, StatusCode::OK, "UNION query failed: {union_body:?}");
+    assert_eq!(union_body["columns"], serde_json::json!(["a"]));
+    let mut rows = union_body["rows"].as_array().unwrap().clone();
+    rows.sort_by_key(|r| r.to_string());
+    assert_eq!(
+        rows,
+        vec![serde_json::json!(["Alice"]), serde_json::json!(["Bob"])],
+        "UNION must deduplicate rows across and within arms"
+    );
+
+    // UNION ALL keeps every duplicate: each arm yields 3 rows (Alice, Alice, Bob),
+    // so the combined result has 6 rows.
+    let union_all_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name AS a \
+                      UNION ALL \
+                      MATCH (n:Person) RETURN n.name AS a",
+            "keyspace": "social"
+        })),
+    );
+    let union_all_resp = app.oneshot(union_all_req).await.unwrap();
+    let status = union_all_resp.status();
+    let union_all_body = response_json(union_all_resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "UNION ALL query failed: {union_all_body:?}"
+    );
+    assert_eq!(
+        union_all_body["rows"].as_array().unwrap().len(),
+        6,
+        "UNION ALL must preserve every duplicate row from both arms"
+    );
+}
+
+#[tokio::test]
+async fn union_mismatched_columns_returns_clear_error() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    // Arms differ in column name (`a` vs `b`) — openCypher requires identical
+    // result column names/arity across arms, so this must fail loud, not
+    // silently merge or return wrong/empty results.
+    let mismatch_name_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name AS a \
+                      UNION \
+                      MATCH (n:Person) RETURN n.name AS b",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.clone().oneshot(mismatch_name_req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "mismatched UNION column names must be a validation error"
+    );
+    let body = response_json(resp).await;
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("UNION") && err.contains("column"),
+        "error must clearly mention UNION column mismatch, got: {err:?}"
+    );
+
+    // Arms differ in arity (1 column vs 2 columns) — same fail-loud requirement.
+    let mismatch_arity_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name AS a \
+                      UNION \
+                      MATCH (n:Person) RETURN n.name AS a, n.age AS b",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(mismatch_arity_req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "mismatched UNION column arity must be a validation error"
+    );
+    let body = response_json(resp).await;
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("UNION") && err.contains("column"),
+        "error must clearly mention UNION column mismatch, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn http_query_missing_param_returns_validation_error() {
     let (schema, storage, _dir) = setup();
     create_social_graph_schema(&schema);
