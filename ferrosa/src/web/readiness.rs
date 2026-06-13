@@ -39,9 +39,20 @@ use serde_json::{json, Value};
 
 use super::WebAppState;
 
-/// Register the `/readyz` route on the given router.
+/// Register the readiness routes on the given router.
+///
+/// Both `/readyz` and `/health` are wired to the same leader-aware handler.
+/// `/health` is an alias kept for orchestrator probes (docker-compose
+/// healthchecks, the Jepsen multi-DC bring-up workflow, k8s) that historically
+/// expect a `/health` path. Before this alias existed, those probes hit the
+/// static-file fallback and always received `404`, so the healthchecks were a
+/// no-op (they could never gate on the cluster actually forming). Routing
+/// `/health` through the readiness handler makes the bring-up fail-loud: in
+/// Forming/Cluster mode it returns `503` until a Raft leader is elected.
 pub fn readiness_route() -> Router<WebAppState> {
-    Router::new().route("/readyz", get(readyz_handler))
+    Router::new()
+        .route("/readyz", get(readyz_handler))
+        .route("/health", get(readyz_handler))
 }
 
 /// `GET /readyz` — leader-aware readiness probe.
@@ -191,6 +202,40 @@ mod tests {
             StatusCode::NOT_FOUND,
             "GET /readyz must not return 404"
         );
+    }
+
+    /// `/health` is an alias of `/readyz` and must be routable — not a 404.
+    /// This is what the docker-compose healthchecks and the Jepsen multi-DC
+    /// bring-up workflow probe; before the alias existed it hit the static
+    /// fallback and 404'd, making those probes a silent no-op.
+    #[tokio::test]
+    async fn health_alias_is_routable() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET /health must not return 404 — orchestrators probe it"
+        );
+    }
+
+    /// `/health` must behave identically to `/readyz`: standalone returns 200.
+    #[tokio::test]
+    async fn health_alias_standalone_returns_200() {
+        let state = make_state();
+        assert_eq!(state.mode_controller.mode(), DeploymentMode::Standalone);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Standalone mode (the default for a new `ModeController`) must return 200.
