@@ -175,6 +175,16 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
                 }
             }
         }
+        Expr::ListComprehension {
+            var,
+            list,
+            filter,
+            projection,
+        } => eval_list_comprehension(var, list, filter.as_deref(), projection.as_deref(), bindings),
+        Expr::MapProjection { var, selectors } => eval_map_projection(var, selectors, bindings),
+        Expr::PatternComprehension { .. } => Err(GraphError::Validation(
+            "pattern comprehension requires graph-aware evaluation".into(),
+        )),
         Expr::Map(props) => {
             let mut map = serde_json::Map::new();
             for (name, expr) in props {
@@ -235,6 +245,98 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Comprehensions and map projection
+// ---------------------------------------------------------------------------
+
+/// Evaluate a list comprehension `[var IN list WHERE filter | projection]`.
+///
+/// Iterates `list`, scoping `var` to each element (shadowing any outer
+/// binding without mutating the caller's map). Elements failing `filter`
+/// (false or null) are dropped; surviving elements are mapped through
+/// `projection` (identity when absent). A null list yields null per
+/// openCypher semantics.
+fn eval_list_comprehension(
+    var: &str,
+    list: &Expr,
+    filter: Option<&Expr>,
+    projection: Option<&Expr>,
+    bindings: &HashMap<String, Value>,
+) -> Result<Value> {
+    let list_val = eval_expr(list, bindings)?;
+    let items = match list_val {
+        Value::Array(items) => items,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(GraphError::Validation(format!(
+                "list comprehension expects a list to iterate, got {other:?}"
+            )));
+        }
+    };
+
+    let mut scoped = bindings.clone();
+    let mut out = Vec::new();
+    for item in items {
+        scoped.insert(var.to_string(), item.clone());
+        if let Some(pred) = filter {
+            if as_bool(&eval_expr(pred, &scoped)?) != Some(true) {
+                continue;
+            }
+        }
+        let value = match projection {
+            Some(expr) => eval_expr(expr, &scoped)?,
+            None => item,
+        };
+        out.push(value);
+    }
+    Ok(Value::Array(out))
+}
+
+/// Evaluate a map projection `var {.prop, key: expr, .*}`.
+///
+/// `var` must bind to an object (or null → null). Each selector copies a
+/// named property, inserts a computed entry, or (for `.*`) copies every
+/// property of the base object.
+fn eval_map_projection(
+    var: &str,
+    selectors: &[crate::parser::MapProjectionSelector],
+    bindings: &HashMap<String, Value>,
+) -> Result<Value> {
+    use crate::parser::MapProjectionSelector as Sel;
+
+    let base = bindings.get(var).cloned().unwrap_or(Value::Null);
+    let base_obj = match base {
+        Value::Object(map) => map,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(GraphError::Validation(format!(
+                "map projection base `{var}` must be a map, got {other:?}"
+            )));
+        }
+    };
+
+    let mut out = serde_json::Map::new();
+    for selector in selectors {
+        match selector {
+            Sel::Property(name) => {
+                out.insert(
+                    name.clone(),
+                    base_obj.get(name).cloned().unwrap_or(Value::Null),
+                );
+            }
+            Sel::Literal { key, value } => {
+                out.insert(key.clone(), eval_expr(value, bindings)?);
+            }
+            Sel::All => {
+                for (k, v) in &base_obj {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    Ok(Value::Object(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,5 +1199,126 @@ mod tests {
             right: Box::new(Expr::Literal(Literal::Integer(0))),
         };
         assert_eq!(eval_expr(&expr, &empty_bindings()).unwrap(), Value::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // List comprehensions
+    // -----------------------------------------------------------------------
+
+    fn parse_only_expr(query: &str) -> Expr {
+        let stmt = crate::parser::parse(query).unwrap();
+        match stmt {
+            crate::parser::Statement::Match { return_clause, .. }
+            | crate::parser::Statement::Return { return_clause } => {
+                return_clause.items.into_iter().next().unwrap().expr
+            }
+            other => panic!("expected Match/Return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_list_comprehension_filter_and_project() {
+        // [x IN [1,2,3,4] WHERE x > 2 | x * 10] = [30, 40]
+        let expr = parse_only_expr("RETURN [x IN [1, 2, 3, 4] WHERE x > 2 | x * 10]");
+        let result = eval_expr(&expr, &empty_bindings()).unwrap();
+        assert_eq!(result, json!([30, 40]));
+    }
+
+    #[test]
+    fn eval_list_comprehension_filter_only() {
+        // [x IN [1,2,3] WHERE x > 1] = [2, 3]
+        let expr = parse_only_expr("RETURN [x IN [1, 2, 3] WHERE x > 1]");
+        let result = eval_expr(&expr, &empty_bindings()).unwrap();
+        assert_eq!(result, json!([2, 3]));
+    }
+
+    #[test]
+    fn eval_list_comprehension_project_only() {
+        // [x IN [1,2,3] | x + 1] = [2, 3, 4]
+        let expr = parse_only_expr("RETURN [x IN [1, 2, 3] | x + 1]");
+        let result = eval_expr(&expr, &empty_bindings()).unwrap();
+        assert_eq!(result, json!([2, 3, 4]));
+    }
+
+    #[test]
+    fn eval_list_comprehension_identity() {
+        // [x IN [1,2,3]] = [1, 2, 3]
+        let expr = parse_only_expr("RETURN [x IN [1, 2, 3]]");
+        let result = eval_expr(&expr, &empty_bindings()).unwrap();
+        assert_eq!(result, json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn eval_list_comprehension_null_list_is_null() {
+        // x IN null → null (per openCypher).
+        let expr = parse_only_expr("RETURN [x IN null | x]");
+        let result = eval_expr(&expr, &empty_bindings()).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn eval_list_comprehension_does_not_leak_scope_var() {
+        // The comprehension variable `x` must be scoped — after evaluation it
+        // must not appear in the outer bindings.
+        let expr = parse_only_expr("RETURN [x IN [1, 2] | x]");
+        let mut bindings = empty_bindings();
+        let _ = eval_expr(&expr, &bindings).unwrap();
+        assert!(!bindings.contains_key("x"));
+        // Also ensure a pre-existing outer `x` is shadowed, not mutated.
+        bindings.insert("x".into(), json!("outer"));
+        let _ = eval_expr(&expr, &bindings).unwrap();
+        assert_eq!(bindings.get("x"), Some(&json!("outer")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Map projections
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eval_map_projection_properties() {
+        let expr = parse_only_expr("MATCH (n) RETURN n {.name, .age}");
+        let result = eval_expr(&expr, &sample_bindings()).unwrap();
+        assert_eq!(result, json!({"name": "Alice", "age": 30}));
+    }
+
+    #[test]
+    fn eval_map_projection_literal_entry() {
+        let expr = parse_only_expr("MATCH (n) RETURN n {.name, doubled: n.age + n.age}");
+        let result = eval_expr(&expr, &sample_bindings()).unwrap();
+        assert_eq!(result, json!({"name": "Alice", "doubled": 60}));
+    }
+
+    #[test]
+    fn eval_map_projection_all() {
+        // n {.*} copies every property of n.
+        let expr = parse_only_expr("MATCH (n) RETURN n {.*}");
+        let result = eval_expr(&expr, &sample_bindings()).unwrap();
+        assert_eq!(
+            result,
+            json!({"name": "Alice", "age": 30, "_id": "abc123", "_type": "KNOWS"})
+        );
+    }
+
+    #[test]
+    fn eval_map_projection_missing_prop_is_null() {
+        let expr = parse_only_expr("MATCH (n) RETURN n {.nope}");
+        let result = eval_expr(&expr, &sample_bindings()).unwrap();
+        assert_eq!(result, json!({"nope": Value::Null}));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pattern comprehensions require graph-aware evaluation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eval_pattern_comprehension_requires_graph_context() {
+        // The pure-binding evaluator cannot traverse edges; it must fail loud,
+        // never silently return an empty/wrong list.
+        let expr = parse_only_expr("MATCH (n) RETURN [ (n)-[:KNOWS]->(m) | m.name ]");
+        let err = eval_expr(&expr, &empty_bindings()).unwrap_err();
+        assert!(
+            err.to_string().contains("pattern comprehension"),
+            "unexpected error: {err}"
+        );
     }
 }

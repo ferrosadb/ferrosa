@@ -719,6 +719,64 @@ impl<'input> Parser<'input> {
         Ok(props)
     }
 
+    /// Parse a map projection body `{ .prop, key: expr, .* }` for base `var`.
+    fn parse_map_projection(&mut self, var: String) -> ParseResult<Expr> {
+        self.lexer.expect(&TokenKind::LBrace)?;
+        let mut selectors = Vec::new();
+
+        if self.lexer.peek()?.kind != TokenKind::RBrace {
+            loop {
+                selectors.push(self.parse_map_projection_selector()?);
+                if !self.lexer.eat(&TokenKind::Comma)? {
+                    break;
+                }
+            }
+        }
+
+        self.lexer.expect(&TokenKind::RBrace)?;
+        Ok(Expr::MapProjection { var, selectors })
+    }
+
+    /// Parse one selector inside a map projection: `.prop`, `.*`, or
+    /// `key: expr`.
+    fn parse_map_projection_selector(&mut self) -> ParseResult<MapProjectionSelector> {
+        if self.lexer.eat(&TokenKind::Dot)? {
+            // `.*` (all) or `.prop` (single property).
+            if self.lexer.eat(&TokenKind::Star)? {
+                return Ok(MapProjectionSelector::All);
+            }
+            let tok = self.lexer.next_token()?;
+            let name = match tok.kind {
+                TokenKind::Ident(name) => name.to_string(),
+                _ => {
+                    return Err(ParseError::new(
+                        format!("expected property name after '.', got {:?}", tok.kind),
+                        tok.span,
+                    ));
+                }
+            };
+            return Ok(MapProjectionSelector::Property(name));
+        }
+
+        // `key: expr` computed entry.
+        let key_tok = self.lexer.next_token()?;
+        let key = match key_tok.kind {
+            TokenKind::Ident(name) => name.to_string(),
+            _ => {
+                return Err(ParseError::new(
+                    format!(
+                        "expected '.property', '.*', or 'key: expr' in map projection, got {:?}",
+                        key_tok.kind
+                    ),
+                    key_tok.span,
+                ));
+            }
+        };
+        self.lexer.expect(&TokenKind::Colon)?;
+        let value = self.parse_expr()?;
+        Ok(MapProjectionSelector::Literal { key, value })
+    }
+
     // --- Expression parsing (precedence climbing) ---
     // Depth is checked at the entry point to catch all recursive paths.
 
@@ -966,6 +1024,14 @@ impl<'input> Parser<'input> {
 
     fn parse_postfix(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_primary()?;
+        // Map projection: `var { ... }`. Only a bare variable can be the base
+        // of a projection, so this never conflicts with a `{ }` map literal.
+        if let Expr::Var(var) = &expr {
+            if self.lexer.peek()?.kind == TokenKind::LBrace {
+                let var = var.clone();
+                expr = self.parse_map_projection(var)?;
+            }
+        }
         loop {
             if self.lexer.eat(&TokenKind::LBracket)? {
                 let start = if self.lexer.peek()?.kind == TokenKind::Dot {
@@ -1028,6 +1094,157 @@ impl<'input> Parser<'input> {
             var,
             list: Box::new(list),
             predicate: Box::new(predicate),
+        })
+    }
+
+    /// Parse a `[ ... ]` expression: list literal, list comprehension, or
+    /// pattern comprehension. Disambiguated by bounded lookahead after `[`:
+    ///   - `[(...` → pattern comprehension
+    ///   - `[ident IN ...` → list comprehension
+    ///   - otherwise → list literal
+    fn parse_bracket_expr(&mut self) -> ParseResult<Expr> {
+        self.lexer.expect(&TokenKind::LBracket)?;
+
+        // Pattern comprehension begins with a node pattern `(`.
+        if self.lexer.peek()?.kind == TokenKind::LParen {
+            return self.parse_pattern_comprehension();
+        }
+
+        // List comprehension begins with `ident IN`. Snapshot the lexer so a
+        // bare list literal that happens to start with an identifier still
+        // parses correctly.
+        if matches!(self.lexer.peek()?.kind, TokenKind::Ident(_)) {
+            let snapshot = self.lexer.clone();
+            let var_tok = self.lexer.next_token()?;
+            if self.lexer.peek()?.kind == TokenKind::Keyword(Keyword::In) {
+                let var = match var_tok.kind {
+                    TokenKind::Ident(name) => name.to_string(),
+                    _ => unreachable!("guarded by matches! above"),
+                };
+                self.lexer.expect(&TokenKind::Keyword(Keyword::In))?;
+                return self.parse_list_comprehension_tail(var);
+            }
+            // Not a comprehension — rewind and fall through to list literal.
+            self.lexer = snapshot;
+        }
+
+        // Plain list literal: `[e1, e2, ...]`.
+        let mut items = Vec::new();
+        if !self.lexer.eat(&TokenKind::RBracket)? {
+            items.push(self.parse_expr()?);
+            while self.lexer.eat(&TokenKind::Comma)? {
+                items.push(self.parse_expr()?);
+            }
+            self.lexer.expect(&TokenKind::RBracket)?;
+        }
+        Ok(Expr::List(items))
+    }
+
+    /// Parse the tail of a list comprehension after `[var IN`:
+    /// `list [WHERE pred] [| expr] ]`.
+    fn parse_list_comprehension_tail(&mut self, var: String) -> ParseResult<Expr> {
+        let list = self.parse_expr()?;
+        let filter = if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        let projection = if self.lexer.eat(&TokenKind::Pipe)? {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.lexer.expect(&TokenKind::RBracket)?;
+        Ok(Expr::ListComprehension {
+            var,
+            list: Box::new(list),
+            filter,
+            projection,
+        })
+    }
+
+    /// Parse a pattern comprehension `[ (start)-[...]->(...) [WHERE p] | proj ]`.
+    /// The leading `[` has already been consumed.
+    fn parse_pattern_comprehension(&mut self) -> ParseResult<Expr> {
+        let span = self.lexer.peek()?.span;
+        let start = self.parse_node_pattern()?;
+        let Pattern::Node {
+            var: Some(start_var),
+            ..
+        } = start
+        else {
+            return Err(ParseError::new(
+                "pattern comprehension must start with a bound variable, e.g. [ (a)-[:R]->(b) | b ]",
+                span,
+            ));
+        };
+
+        // Parse one or more relationship+target hops, preserving target vars.
+        let mut hops = Vec::new();
+        loop {
+            let rel = self.parse_rel_pattern()?;
+            let target = self.parse_node_pattern()?;
+            let Pattern::Rel {
+                rel_type,
+                direction,
+                props,
+                length_range,
+                ..
+            } = rel
+            else {
+                unreachable!("parse_rel_pattern returns Pattern::Rel")
+            };
+            if length_range.is_some() {
+                return Err(ParseError::new(
+                    "variable-length pattern comprehensions are not yet supported",
+                    span,
+                ));
+            }
+            if !props.is_empty() {
+                return Err(ParseError::new(
+                    "relationship property filters in pattern comprehensions are not yet supported",
+                    span,
+                ));
+            }
+            let Pattern::Node {
+                var: target_var,
+                label: target_label,
+                props: target_props,
+            } = target
+            else {
+                unreachable!("parse_node_pattern returns Pattern::Node")
+            };
+            hops.push(PatternComprehensionHop {
+                rel_type,
+                direction,
+                target_var,
+                target_label,
+                target_props,
+            });
+            let tok = self.lexer.peek()?;
+            if !matches!(
+                tok.kind,
+                TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus
+            ) {
+                break;
+            }
+        }
+
+        let filter = if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        // The projection `| expr` is mandatory for pattern comprehensions.
+        self.lexer.expect(&TokenKind::Pipe)?;
+        let projection = Box::new(self.parse_expr()?);
+        self.lexer.expect(&TokenKind::RBracket)?;
+
+        Ok(Expr::PatternComprehension {
+            start_var,
+            hops,
+            filter,
+            projection,
         })
     }
 
@@ -1101,18 +1318,7 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 Ok(Expr::Literal(Literal::Null))
             }
-            TokenKind::LBracket => {
-                self.lexer.next_token()?;
-                let mut items = Vec::new();
-                if !self.lexer.eat(&TokenKind::RBracket)? {
-                    items.push(self.parse_expr()?);
-                    while self.lexer.eat(&TokenKind::Comma)? {
-                        items.push(self.parse_expr()?);
-                    }
-                    self.lexer.expect(&TokenKind::RBracket)?;
-                }
-                Ok(Expr::List(items))
-            }
+            TokenKind::LBracket => self.parse_bracket_expr(),
             TokenKind::LBrace => Ok(Expr::Map(self.parse_prop_map()?)),
             TokenKind::LParen => {
                 // Parenthesized expression — recursion depth is tracked
@@ -2477,5 +2683,192 @@ mod tests {
         } else {
             panic!("expected Match with NOT");
         }
+    }
+
+    // --- List comprehensions ---
+
+    /// Extract the single RETURN-item expression from a `MATCH ... RETURN <e>`.
+    fn only_return_expr(query: &str) -> Expr {
+        let stmt = parse(query).unwrap();
+        match stmt {
+            Statement::Match { return_clause, .. } | Statement::Return { return_clause } => {
+                assert_eq!(return_clause.items.len(), 1, "expected one RETURN item");
+                return_clause.items.into_iter().next().unwrap().expr
+            }
+            other => panic!("expected Match/Return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_list_comprehension_full() {
+        // [x IN list WHERE pred | expr]
+        let expr = only_return_expr("MATCH (n) RETURN [x IN n.nums WHERE x > 2 | x + 10]");
+        match expr {
+            Expr::ListComprehension {
+                var,
+                list,
+                filter,
+                projection,
+            } => {
+                assert_eq!(var, "x");
+                assert!(matches!(*list, Expr::Property { ref name, .. } if name == "nums"));
+                assert!(filter.is_some(), "expected WHERE filter");
+                assert!(matches!(*filter.unwrap(), Expr::Comparison { .. }));
+                assert!(matches!(*projection.unwrap(), Expr::Arithmetic { .. }));
+            }
+            other => panic!("expected ListComprehension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_list_comprehension_filter_only() {
+        // [x IN list WHERE pred]
+        let expr = only_return_expr("RETURN [x IN [1, 2, 3] WHERE x > 1]");
+        match expr {
+            Expr::ListComprehension {
+                filter, projection, ..
+            } => {
+                assert!(filter.is_some());
+                assert!(projection.is_none(), "no projection expected");
+            }
+            other => panic!("expected ListComprehension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_list_comprehension_projection_only() {
+        // [x IN list | expr]
+        let expr = only_return_expr("RETURN [x IN [1, 2, 3] | x * 2]");
+        match expr {
+            Expr::ListComprehension {
+                filter, projection, ..
+            } => {
+                assert!(filter.is_none(), "no filter expected");
+                assert!(projection.is_some());
+            }
+            other => panic!("expected ListComprehension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_list_comprehension_no_filter_no_projection() {
+        // [x IN list] — equivalent to the list itself.
+        let expr = only_return_expr("RETURN [x IN [1, 2, 3]]");
+        match expr {
+            Expr::ListComprehension {
+                filter, projection, ..
+            } => {
+                assert!(filter.is_none());
+                assert!(projection.is_none());
+            }
+            other => panic!("expected ListComprehension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plain_list_literal_unaffected() {
+        // A list literal without `x IN` must remain a List, not a comprehension.
+        let expr = only_return_expr("RETURN [1, 2, 3]");
+        assert!(matches!(expr, Expr::List(_)), "got {expr:?}");
+    }
+
+    // --- Map projections ---
+
+    #[test]
+    fn parse_map_projection_properties() {
+        // n {.name, .age}
+        let expr = only_return_expr("MATCH (n) RETURN n {.name, .age}");
+        match expr {
+            Expr::MapProjection { var, selectors } => {
+                assert_eq!(var, "n");
+                assert_eq!(selectors.len(), 2);
+                assert_eq!(
+                    selectors[0],
+                    MapProjectionSelector::Property("name".into())
+                );
+                assert_eq!(selectors[1], MapProjectionSelector::Property("age".into()));
+            }
+            other => panic!("expected MapProjection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_map_projection_literal_and_all() {
+        // n {.name, total: n.a + n.b, .*}
+        let expr = only_return_expr("MATCH (n) RETURN n {.name, total: n.a + n.b, .*}");
+        match expr {
+            Expr::MapProjection { var, selectors } => {
+                assert_eq!(var, "n");
+                assert_eq!(selectors.len(), 3);
+                assert_eq!(
+                    selectors[0],
+                    MapProjectionSelector::Property("name".into())
+                );
+                assert!(matches!(
+                    &selectors[1],
+                    MapProjectionSelector::Literal { key, .. } if key == "total"
+                ));
+                assert_eq!(selectors[2], MapProjectionSelector::All);
+            }
+            other => panic!("expected MapProjection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_map_literal_still_works() {
+        // A bare `{k: v}` (no leading variable) is a Map literal, not a projection.
+        let expr = only_return_expr("RETURN {name: 'Alice', age: 30}");
+        assert!(matches!(expr, Expr::Map(_)), "got {expr:?}");
+    }
+
+    // --- Pattern comprehensions ---
+
+    #[test]
+    fn parse_pattern_comprehension_basic() {
+        // [ (n)-[:KNOWS]->(m) | m.name ]
+        let expr = only_return_expr("MATCH (n) RETURN [ (n)-[:KNOWS]->(m) | m.name ]");
+        match expr {
+            Expr::PatternComprehension {
+                start_var,
+                hops,
+                filter,
+                projection,
+            } => {
+                assert_eq!(start_var, "n");
+                assert_eq!(hops.len(), 1);
+                assert_eq!(hops[0].rel_type.as_deref(), Some("KNOWS"));
+                assert!(filter.is_none());
+                assert!(matches!(*projection, Expr::Property { ref name, .. } if name == "name"));
+            }
+            other => panic!("expected PatternComprehension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pattern_comprehension_with_where() {
+        // [ (n)-[:KNOWS]->(m) WHERE m.age > 30 | m.name ]
+        let expr =
+            only_return_expr("MATCH (n) RETURN [ (n)-[:KNOWS]->(m) WHERE m.age > 30 | m.name ]");
+        match expr {
+            Expr::PatternComprehension {
+                filter, projection, ..
+            } => {
+                assert!(filter.is_some(), "expected WHERE filter");
+                assert!(matches!(*filter.unwrap(), Expr::Comparison { .. }));
+                assert!(matches!(*projection, Expr::Property { .. }));
+            }
+            other => panic!("expected PatternComprehension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pattern_comprehension_requires_projection() {
+        // Pattern comprehensions must always supply a `| expr`. Without it the
+        // parser must error loudly, never silently accept.
+        let err = parse("MATCH (n) RETURN [ (n)-[:KNOWS]->(m) ]").unwrap_err();
+        assert!(
+            !err.message.is_empty(),
+            "expected a parse error for missing projection"
+        );
     }
 }
