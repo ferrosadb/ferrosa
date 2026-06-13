@@ -924,6 +924,18 @@ impl Segment {
         ENTRY_OVERHEAD + mutation.serialized_size()
     }
 
+    /// The largest single entry (payload + overhead) that can ever fit in a
+    /// fresh segment of `capacity` bytes.
+    ///
+    /// A fresh segment starts at [`INITIAL_POSITION`] (header + first sync
+    /// marker); a closing sync marker is also reserved so `force_sync` can
+    /// always append its EOF marker. Returns 0 when the capacity cannot hold
+    /// even an empty entry — callers must treat that as "no entry fits".
+    pub fn max_entry_size(capacity: usize) -> usize {
+        let reserved = INITIAL_POSITION as usize + SYNC_MARKER_SIZE;
+        capacity.saturating_sub(reserved)
+    }
+
     /// Computes the total entry size for a single-row borrowed mutation.
     pub fn entry_total_size_single_row(
         keyspace: &str,

@@ -32,6 +32,17 @@ use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 ///
 /// See specs/in-process/bug-memtable-flush-wedge-truncated-timeuuid-
 /// from-now-function.md for the bug this guards against.
+/// True when `row` is the in-memory marker for a partition-level `DELETE`
+/// (`DELETE FROM t WHERE pk = ?`): empty clustering, no cells, and a non-LIVE
+/// deletion. Such a marker carries a partition tombstone, not a clustered row,
+/// and must be lifted into [`Partition::deletion`] rather than stored as a row
+/// (otherwise it suppresses nothing on read). A genuine clustered row always
+/// has cells or a LIVE primary-key liveness, so this predicate never matches
+/// real data.
+pub(crate) fn is_partition_tombstone(row: &Row) -> bool {
+    row.clustering.is_empty() && row.cells.is_empty() && row.deletion != DeletionTime::LIVE
+}
+
 pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Result<()> {
     // Clustering shape: production wedge was an 8-byte clustering on a
     // TimeUUID-clustered table. Catching this at the memtable boundary
@@ -44,8 +55,7 @@ pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Re
     // marker has no clustering by construction and must be allowed
     // through even on a clustered table — it carries no payload that
     // the strict-shape check is protecting.
-    let is_partition_tombstone =
-        row.clustering.is_empty() && row.cells.is_empty() && row.deletion != DeletionTime::LIVE;
+    let is_partition_tombstone = is_partition_tombstone(row);
     if !is_partition_tombstone {
         if let Err(reason) = validate_clustering_shape(&schema.clustering_columns, &row.clustering)
         {
