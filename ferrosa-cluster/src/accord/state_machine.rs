@@ -33,7 +33,7 @@ use ferrosa_common::accord::{
 use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnStatus};
 use ferrosa_storage::accord::sync_writer::SyncWriter;
 
-use crate::accord::apply::{ApplyMutation, NoopStorageApplier, StorageApplier};
+use crate::accord::apply::{ApplyMutation, NoopStorageApplier, StorageApplier, StorageReader};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -92,6 +92,12 @@ pub struct AccordStateMachine {
     /// for protocol-only tests; production wires a real engine-backed applier
     /// via [`AccordStateMachine::with_applier`].
     applier: Arc<dyn StorageApplier>,
+    /// Optional storage read seam for the generic-`IF` linearizable read-at-`t`
+    /// (Gap 4). `None` keeps the conflict-index existence path used by
+    /// `INSERT IF NOT EXISTS`. Production wires an engine-backed reader via
+    /// [`AccordStateMachine::with_applier_and_reader`] so generic predicates can
+    /// read the real row at `t`.
+    reader: Option<Arc<dyn StorageReader>>,
 }
 
 impl AccordStateMachine {
@@ -110,6 +116,7 @@ impl AccordStateMachine {
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
             applier: Arc::new(NoopStorageApplier::new()),
+            reader: None,
         }
     }
 
@@ -130,6 +137,7 @@ impl AccordStateMachine {
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
             applier: Arc::new(NoopStorageApplier::new()),
+            reader: None,
         }
     }
 
@@ -152,7 +160,66 @@ impl AccordStateMachine {
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
             applier,
+            reader: None,
         }
+    }
+
+    /// Create with a real [`StorageApplier`] **and** a [`StorageReader`]
+    /// (full production wiring).
+    ///
+    /// The reader backs the generic-`IF` linearizable read-at-`t` (Gap 4): on a
+    /// `ReadVote` carrying [`ReadPredicate::ReadRow`](crate::accord::wire::ReadPredicate),
+    /// the replica reads the row at `t` and returns its bytes for the coordinator
+    /// to evaluate. `INSERT IF NOT EXISTS` still uses the existence path.
+    pub fn with_applier_and_reader(
+        node_id: u64,
+        sync_writer: Arc<dyn SyncWriter>,
+        applier: Arc<dyn StorageApplier>,
+        reader: Arc<dyn StorageReader>,
+    ) -> Self {
+        Self {
+            node_id,
+            txn_states: HashMap::new(),
+            conflict_index: ConflictIndex::new(100_000),
+            sync_writer,
+            dep_waiters: HashMap::new(),
+            committed_txns: HashSet::new(),
+            last_notified: Vec::new(),
+            applier,
+            reader: Some(reader),
+        }
+    }
+
+    /// Read the row at `t` via the wired [`StorageReader`], if any.
+    ///
+    /// Returns `Ok(None)` when no reader is wired (the caller should fall back to
+    /// the existence path) or when the row does not exist at `t`. The `Some`
+    /// variant carries the serialized single-partition `Mutation` bytes for the
+    /// coordinator to decode and evaluate the IF predicate against.
+    pub fn read_row_bytes_at(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key: &[u8],
+        t: Timestamp,
+    ) -> Option<Vec<u8>> {
+        let reader = self.reader.as_ref()?;
+        match reader.read_row_at(keyspace, table, key, t) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Fail loud in logs; the coordinator treats a missing row-vote as
+                // "no dissent" only when it has F+1 agreement, so a read error
+                // here surfaces as the replica abstaining (no current_row), never
+                // as a fabricated success.
+                tracing::error!(%e, keyspace, table, "accord: read_row_at failed during ReadVote");
+                None
+            }
+        }
+    }
+
+    /// Whether a [`StorageReader`] is wired (generic-`IF` read-at-`t` available).
+    pub fn has_reader(&self) -> bool {
+        self.reader.is_some()
     }
 
     /// Get the current state for a transaction (if any).
@@ -619,8 +686,11 @@ pub fn build_accord_state_machine(
     sync_writer: Arc<dyn SyncWriter>,
     storage: Arc<ferrosa_storage::engine::StorageEngine>,
 ) -> AccordStateMachine {
-    let applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(storage));
-    AccordStateMachine::with_applier(node_id, sync_writer, applier)
+    let applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(
+        storage.clone(),
+    ));
+    let reader = Arc::new(crate::accord::apply::EngineStorageReader::new(storage));
+    AccordStateMachine::with_applier_and_reader(node_id, sync_writer, applier, reader)
 }
 
 // Helper extension for TxnPhase to expose rank for comparison.

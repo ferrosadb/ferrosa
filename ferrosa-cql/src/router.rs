@@ -1034,6 +1034,130 @@ fn build_lwt_mutation(
     Ok((key_bytes, mutation_bytes))
 }
 
+/// Decode the agreed row-at-`t` bytes (a serialized single-partition
+/// [`Mutation`](ferrosa_storage::Mutation)) into a `column -> value` map for IF
+/// evaluation, using the SAME positional decode the local read path uses
+/// ([`bridge::partition_to_rows_with_storage_mapping`]).
+///
+/// Returns `Ok(None)` when there is no agreed row (row absent at `t`).
+fn decode_agreed_row_to_map(
+    state: &SharedState,
+    ks: &str,
+    table: &str,
+    agreed_row: Option<&[u8]>,
+) -> Result<Option<HashMap<String, Option<CqlValue>>>, CqlError> {
+    use ferrosa_storage::Mutation;
+
+    let bytes = match agreed_row {
+        None => return Ok(None),
+        Some(b) => b,
+    };
+
+    let mutation = Mutation::deserialize_from(bytes)
+        .map_err(|e| CqlError::ServerError(format!("failed to decode LWT read-vote row: {e}")))?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), table.to_string()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{table} not found")))?;
+
+    let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+    let all_col_types: Vec<CqlType> = table_meta
+        .columns
+        .values()
+        .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pk_indices: Vec<usize> = table_meta
+        .partition_key
+        .iter()
+        .filter_map(|name| table_meta.columns.get_index_of(name))
+        .collect();
+    let ck_indices: Vec<usize> = table_meta
+        .clustering_key
+        .iter()
+        .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+        .collect();
+    let storage_to_table = storage_to_table_indices(table_meta);
+
+    let partition = ferrosa_sstable::types::Partition {
+        key: mutation.key.clone(),
+        deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+        static_row: None,
+        rows: mutation.rows.clone(),
+    };
+
+    let rows = bridge::partition_to_rows_with_storage_mapping(
+        &partition,
+        &all_col_names,
+        &all_col_types,
+        &pk_indices,
+        &ck_indices,
+        &storage_to_table,
+    );
+
+    let row_values = match rows.into_iter().next() {
+        None => return Ok(None),
+        Some(r) => r,
+    };
+
+    let map: HashMap<String, Option<CqlValue>> = all_col_names
+        .iter()
+        .cloned()
+        .zip(row_values)
+        .collect();
+    Ok(Some(map))
+}
+
+/// Resolve the `(keyspace, table)` an LWT statement targets.
+fn lwt_keyspace_table(
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+) -> Result<(String, String), CqlError> {
+    let (ks_opt, table) = match stmt {
+        Statement::Insert(s) => (&s.keyspace, &s.table),
+        Statement::Update(s) => (&s.keyspace, &s.table),
+        Statement::Delete(s) => (&s.keyspace, &s.table),
+        _ => {
+            return Err(CqlError::Invalid(
+                "LWT via Accord supports only INSERT/UPDATE/DELETE".into(),
+            ))
+        }
+    };
+    let ks = resolve_keyspace(ks_opt, ctx.current_keyspace)?.to_string();
+    Ok((ks, table.clone()))
+}
+
+/// Columns (name + type) to include in a `[applied]=false` LWT result set.
+///
+/// For a generic `IF`, these are the IF-condition columns. For `INSERT IF NOT
+/// EXISTS` (and any path whose statement carries no explicit conditions), all
+/// table columns are returned (the Cassandra contract returns the full
+/// conflicting row). Returns an empty list when `lwt.applied` (no row needed).
+fn lwt_condition_columns(
+    state: &SharedState,
+    ks: &str,
+    table: &str,
+    lwt: &crate::accord_router::LwtResult,
+) -> Result<Vec<(String, CqlType)>, CqlError> {
+    if lwt.applied {
+        return Ok(Vec::new());
+    }
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), table.to_string()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{table} not found")))?;
+
+    let mut cols = Vec::new();
+    for name in table_meta.columns.keys() {
+        let col_meta = &table_meta.columns[name];
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+        cols.push((name.clone(), cql_type));
+    }
+    Ok(cols)
+}
+
 /// Route a LWT statement through the Accord consensus protocol.
 ///
 /// Constructs an `AccordCoordinatorDriver`, runs the full PreAccept → Commit
@@ -1084,6 +1208,25 @@ async fn route_lwt_via_accord(
     // that persisted nothing (the phantom-write bug).
     let (key, mutation) = build_lwt_mutation(state, ctx, stmt)?;
 
+    // Resolve the target keyspace/table for the generic-IF read-vote so replicas
+    // (and the coordinator's own local reader) can target the read-at-`t`.
+    let (ks, table) = lwt_keyspace_table(ctx, stmt)?;
+
+    // Classify the IF predicate. `NotExists` uses the replica existence path;
+    // `Generic` reads the row at `t` so the coordinator evaluates `IF col=val`.
+    use crate::accord_router::{classify_lwt, LwtPredicateKind};
+    use ferrosa_cluster::accord::ReadPredicate;
+    let predicate_kind = classify_lwt(stmt);
+    let read_predicate = match predicate_kind {
+        Some(LwtPredicateKind::Generic) => ReadPredicate::ReadRow {
+            keyspace: ks.clone(),
+            table: table.clone(),
+        },
+        // NotExists, or a non-LWT statement reaching here (defensive): keep the
+        // existence semantics.
+        _ => ReadPredicate::NotExists,
+    };
+
     let mut driver = AccordCoordinatorDriver::new(
         node_id,
         replica_ids,
@@ -1092,35 +1235,73 @@ async fn route_lwt_via_accord(
         &clock,
         key,
         mutation,
-    );
+    )
+    .with_read_predicate(read_predicate);
+
+    // Give the coordinator a local applier so its OWN replica persists the
+    // mutation it coordinates (its self-send Apply RPC is unreachable). Without
+    // this the coordinator node silently lacks its own LWT writes. For the
+    // generic path also wire a local reader so its read-at-`t` counts toward the
+    // F+1 row agreement and matches the replicas that applied.
+    {
+        let applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+            state.engine.clone(),
+        ));
+        driver = driver.with_local_applier(applier);
+    }
+    if matches!(predicate_kind, Some(LwtPredicateKind::Generic)) {
+        let reader = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+            state.engine.clone(),
+        ));
+        driver = driver.with_local_reader(reader);
+    }
 
     match driver.run_transaction().await {
         Ok(_) => {
-            // Gap 4: F+1 read-votes agreed the IF condition held.
-            // Gap 5: F+1 apply acknowledgements received.
-            let result = crate::accord_router::encode_lwt_result(
-                &crate::accord_router::LwtResult {
+            // Gap 5: F+1 apply acknowledgements received (write is durable).
+            //
+            // Decide [applied] from the IF predicate:
+            // - Generic IF: evaluate the F+1-agreed row-at-`t` with the canonical
+            //   eval_if_conditions (reused, not forked). A mismatch returns
+            //   [applied]=false + the real current row.
+            // - INSERT IF NOT EXISTS: the read-vote already gated this (a present
+            //   row yields ConditionNotMet below), so reaching Ok means applied.
+            let lwt = match predicate_kind {
+                Some(LwtPredicateKind::Generic) => {
+                    let agreed =
+                        decode_agreed_row_to_map(state, &ks, &table, driver.last_read_row())?;
+                    crate::accord_router::eval_lwt_for_statement(stmt, agreed.as_ref()).unwrap_or(
+                        crate::accord_router::LwtResult {
+                            applied: true,
+                            current_values: HashMap::new(),
+                        },
+                    )
+                }
+                _ => crate::accord_router::LwtResult {
                     applied: true,
-                    current_values: std::collections::HashMap::new(),
+                    current_values: HashMap::new(),
                 },
-                "",
-                "",
-                &[],
-            );
+            };
+            let cond_cols = lwt_condition_columns(state, &ks, &table, &lwt)?;
+            let result = crate::accord_router::encode_lwt_result(&lwt, &ks, &table, &cond_cols);
             Ok(RouteResult::Result(result))
         }
-        Err(AccordDriverError::ConditionNotMet { .. }) => {
-            // Gap 4: F+1 read-votes agreed the IF condition did NOT hold.
-            // Return [applied]=false with the current row value.
-            let result = crate::accord_router::encode_lwt_result(
-                &crate::accord_router::LwtResult {
-                    applied: false,
-                    current_values: std::collections::HashMap::new(),
-                },
-                "",
-                "",
-                &[],
-            );
+        Err(AccordDriverError::ConditionNotMet { current_row }) => {
+            // Gap 4: F+1 read-votes agreed the IF condition did NOT hold
+            // (INSERT IF NOT EXISTS: the row already existed). Return
+            // [applied]=false with the real current row from the read-vote.
+            let agreed_bytes: Option<&[u8]> = if current_row.is_empty() {
+                None
+            } else {
+                Some(current_row.as_slice())
+            };
+            let agreed = decode_agreed_row_to_map(state, &ks, &table, agreed_bytes)?;
+            let lwt = crate::accord_router::LwtResult {
+                applied: false,
+                current_values: agreed.unwrap_or_default(),
+            };
+            let cond_cols = lwt_condition_columns(state, &ks, &table, &lwt)?;
+            let result = crate::accord_router::encode_lwt_result(&lwt, &ks, &table, &cond_cols);
             Ok(RouteResult::Result(result))
         }
         Err(AccordDriverError::QuorumUnavailable) => Err(CqlError::ServerError(

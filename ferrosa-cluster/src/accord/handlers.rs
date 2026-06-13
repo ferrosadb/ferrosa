@@ -162,19 +162,33 @@ impl RpcHandler for AccordHandler {
                 //
                 // A full production implementation would read actual storage.
                 if let Ok(vote_req) = bincode::deserialize::<ReadVotePayload>(&b) {
+                    use crate::accord::wire::ReadPredicate;
                     let sm = self.state.lock();
-                    // Check if any transaction for this key was already applied.
-                    // We use txn_count as a proxy: if no transactions have been
-                    // applied (Applied phase) for this key's epoch, condition holds.
-                    // More precisely: check if there's an Applied txn with a
-                    // commit timestamp <= vote_req.t.
-                    let condition_holds = sm.read_condition_holds_at(&vote_req.key, &vote_req.t);
+                    let (condition_holds, current_row) = match &vote_req.predicate {
+                        // INSERT IF NOT EXISTS: existence path (no schema needed).
+                        // condition holds iff the row does NOT exist at `t`.
+                        ReadPredicate::NotExists => (
+                            sm.read_condition_holds_at(&vote_req.key, &vote_req.t),
+                            vec![],
+                        ),
+                        // Generic IF col=val: the replica only does the
+                        // linearizable read-at-`t` and returns the row bytes; the
+                        // coordinator (which owns the table schema) evaluates the
+                        // predicate via `eval_if_conditions`. The replica reports
+                        // `condition_holds=true` as a neutral value — the
+                        // coordinator's evaluation is authoritative.
+                        ReadPredicate::ReadRow { keyspace, table } => {
+                            let row =
+                                sm.read_row_bytes_at(keyspace, table, &vote_req.key, vote_req.t);
+                            (true, row.unwrap_or_default())
+                        }
+                    };
                     drop(sm);
                     let ok = ReadVoteOkPayload {
                         txn_id: vote_req.txn_id,
                         from: self.local_node_id,
                         condition_holds,
-                        current_row: vec![],
+                        current_row,
                     };
                     let resp_bytes = bincode::serialize(&ok).ok()?;
                     Some(Message::AccordReadOK(Bytes::from(resp_bytes)))

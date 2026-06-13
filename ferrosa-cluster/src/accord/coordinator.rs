@@ -426,6 +426,46 @@ pub struct AccordCoordinatorDriver {
     /// for Accord conflict ordering). An empty vector means "no mutation"
     /// (read-only / protocol-only transactions).
     mutation: Vec<u8>,
+    /// How replicas should answer the Gap-4 read-vote: existence semantics for
+    /// `INSERT IF NOT EXISTS` (the default) or a generic read-row-at-`t` whose
+    /// IF predicate this coordinator evaluates after collecting F+1 agreed rows.
+    read_predicate: crate::accord::wire::ReadPredicate,
+    /// For a generic `IF` read-vote: the row bytes that F+1 replicas agreed on at
+    /// `t`, captured during the read phase so the router can decode and evaluate
+    /// the predicate. `None` when the read-vote returned no row (row absent at
+    /// `t`) or for the existence path. Read via [`Self::last_read_row`].
+    last_read_row: Option<Vec<u8>>,
+    /// Optional reader for the coordinator's OWN replica, used by the generic
+    /// `IF` read-vote so the coordinator's local read-at-`t` counts toward F+1
+    /// agreement (its self-send is not reachable over the network). Set via
+    /// [`Self::with_local_reader`]; `None` falls back to remote votes only.
+    local_reader: Option<Arc<dyn crate::accord::apply::StorageReader>>,
+    /// Optional applier for the coordinator's OWN replica. The coordinator's
+    /// self-send Apply RPC is unreachable, so without this its own node never
+    /// persists the mutations it coordinates (a silent data-loss / read-skew
+    /// hazard, and it makes the coordinator's local generic-`IF` read disagree
+    /// with the replicas that did apply). When set, the coordinator applies the
+    /// committed mutation locally during the Apply phase. Set via
+    /// [`Self::with_local_applier`].
+    local_applier: Option<Arc<dyn crate::accord::apply::StorageApplier>>,
+}
+
+/// Return the row bytes that at least `quorum` of `reads` agree on, if any.
+///
+/// All collected reads must be the SAME bytes for the read to be linearizable:
+/// any divergence means replicas disagree on the row state at `t`, which is a
+/// correctness failure. Returns `Some(bytes)` only when `reads.len() >= quorum`
+/// and every read is identical; `None` otherwise (caller aborts).
+fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
+    if reads.len() < quorum {
+        return None;
+    }
+    let first = &reads[0];
+    if reads.iter().all(|r| r == first) {
+        Some(first.clone())
+    } else {
+        None
+    }
 }
 
 impl AccordCoordinatorDriver {
@@ -477,7 +517,61 @@ impl AccordCoordinatorDriver {
             replica_ids,
             self_id,
             mutation,
+            read_predicate: crate::accord::wire::ReadPredicate::NotExists,
+            last_read_row: None,
+            local_reader: None,
+            local_applier: None,
         }
+    }
+
+    /// Supply an applier for the coordinator's own replica so it persists the
+    /// mutations it coordinates (its self-send Apply RPC is unreachable).
+    ///
+    /// Without this the coordinator node silently lacks its own LWT writes; with
+    /// it, the coordinator's storage matches the replicas' and its local
+    /// generic-`IF` read agrees with them. Production wires the same
+    /// engine-backed applier the replicas use.
+    pub fn with_local_applier(
+        mut self,
+        applier: Arc<dyn crate::accord::apply::StorageApplier>,
+    ) -> Self {
+        self.local_applier = Some(applier);
+        self
+    }
+
+    /// Supply a reader for the coordinator's own replica (generic-`IF` path).
+    ///
+    /// The coordinator's self-send is unreachable over the network, so without a
+    /// local reader its own replica cannot contribute to the F+1 read agreement.
+    /// Production wires the same engine-backed [`StorageReader`] the replicas use.
+    ///
+    /// [`StorageReader`]: crate::accord::apply::StorageReader
+    pub fn with_local_reader(
+        mut self,
+        reader: Arc<dyn crate::accord::apply::StorageReader>,
+    ) -> Self {
+        self.local_reader = Some(reader);
+        self
+    }
+
+    /// The row bytes F+1 replicas agreed on during the generic-`IF` read-vote.
+    ///
+    /// `Some(serialized_mutation)` when the row existed at `t`; `None` when the
+    /// row was absent at `t` or for the existence path. Valid only after a
+    /// successful [`Self::run_transaction`].
+    pub fn last_read_row(&self) -> Option<&[u8]> {
+        self.last_read_row.as_deref()
+    }
+
+    /// Set the read-vote predicate for this transaction.
+    ///
+    /// Defaults to [`ReadPredicate::NotExists`](crate::accord::wire::ReadPredicate)
+    /// (`INSERT IF NOT EXISTS`). For a generic `IF col=val`, the router supplies
+    /// [`ReadPredicate::ReadRow`](crate::accord::wire::ReadPredicate) carrying the
+    /// `keyspace`/`table` so replicas read the row at `t` and return its bytes.
+    pub fn with_read_predicate(mut self, predicate: crate::accord::wire::ReadPredicate) -> Self {
+        self.read_predicate = predicate;
+        self
     }
 
     /// Build the Apply-phase payload bytes for this transaction.
@@ -750,6 +844,7 @@ impl AccordCoordinatorDriver {
             txn_id,
             t: commit_t,
             key: key.clone(),
+            predicate: self.read_predicate.clone(),
         };
         let read_bytes = bincode::serialize(&read_payload)
             .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
@@ -757,6 +852,35 @@ impl AccordCoordinatorDriver {
 
         let mut votes_false = 0usize;
         let mut dissenting_row: Vec<u8> = Vec::new();
+        // For the generic ReadRow predicate: collect each replica's row-at-`t`
+        // bytes so we can require F+1 *agreement* on the row state before the
+        // coordinator evaluates the IF predicate. Disagreement is a correctness
+        // failure (non-linearizable read) and must abort, never silently pick one.
+        let mut read_rows: Vec<Vec<u8>> = Vec::new();
+        let is_generic = matches!(
+            self.read_predicate,
+            crate::accord::wire::ReadPredicate::ReadRow { .. }
+        );
+
+        // The coordinator's own replica is not reachable over the network
+        // (self-send fails). For the generic path it must contribute its local
+        // read-at-`t` so that, with RF=2 (sq=2), F+1 agreement is achievable and
+        // the result is deterministic across all replicas. The applier already
+        // persisted earlier conflicting txns locally before this read (dep-wait).
+        if is_generic {
+            if let (Some(reader), crate::accord::wire::ReadPredicate::ReadRow { keyspace, table }) =
+                (&self.local_reader, &self.read_predicate)
+            {
+                match reader.read_row_at(keyspace, table, &key, commit_t) {
+                    Ok(bytes) => read_rows.push(bytes.unwrap_or_default()),
+                    Err(e) => {
+                        return Err(AccordDriverError::Network(format!(
+                            "coordinator local read-at-t failed: {e}"
+                        )));
+                    }
+                }
+            }
+        }
 
         let remote_read_futs: Vec<_> = self
             .replica_ids
@@ -774,15 +898,24 @@ impl AccordCoordinatorDriver {
             match result {
                 Ok(Message::AccordReadOK(b)) if !b.is_empty() => {
                     match bincode::deserialize::<ReadVoteOkPayload>(b) {
-                        Ok(vote) if !vote.condition_holds => {
-                            votes_false += 1;
-                            if dissenting_row.is_empty() {
-                                dissenting_row = vote.current_row.clone();
+                        Ok(vote) => {
+                            if is_generic {
+                                // Generic IF: replica returns the row bytes at `t`
+                                // (condition_holds is a neutral true). Collect for
+                                // F+1 agreement; the coordinator evaluates the
+                                // predicate authoritatively below.
+                                read_rows.push(vote.current_row.clone());
+                            } else if !vote.condition_holds {
+                                // INSERT IF NOT EXISTS existence path.
+                                votes_false += 1;
+                                if dissenting_row.is_empty() {
+                                    dissenting_row = vote.current_row.clone();
+                                }
                             }
                         }
-                        _ => {
-                            // Condition holds, pre-Gap-4 replica, or parse error:
-                            // treat as condition_holds=true (forward-compatible default).
+                        Err(_) => {
+                            // pre-Gap-4 replica or parse error: treat as
+                            // condition_holds=true (forward-compatible default).
                         }
                     }
                 }
@@ -800,18 +933,37 @@ impl AccordCoordinatorDriver {
             }
         }
 
-        // F+1 matching votes decide the outcome.
-        // Only return ConditionNotMet if F+1 replicas explicitly voted false.
-        if votes_false >= sq {
-            tracing::info!(
-                txn_id = ?txn_id,
-                votes_false,
-                sq,
-                "accord: IF condition not met — [applied]=false"
-            );
-            return Err(AccordDriverError::ConditionNotMet {
-                current_row: dissenting_row,
-            });
+        if is_generic {
+            // Require F+1 replicas to agree on the SAME row bytes at `t`. This is
+            // the linearizable read: a divergent read is non-linearizable and must
+            // abort (fail loud) rather than have the coordinator guess.
+            let agreed = agreed_row(&read_rows, sq);
+            match agreed {
+                Some(row) => {
+                    self.last_read_row = if row.is_empty() { None } else { Some(row) };
+                }
+                None => {
+                    return Err(AccordDriverError::Network(format!(
+                        "generic IF read-vote lacked F+1 ({sq}) agreement on the row at t \
+                         (got {} reads) — refusing a non-linearizable LWT",
+                        read_rows.len()
+                    )));
+                }
+            }
+        } else {
+            // F+1 matching votes decide the outcome.
+            // Only return ConditionNotMet if F+1 replicas explicitly voted false.
+            if votes_false >= sq {
+                tracing::info!(
+                    txn_id = ?txn_id,
+                    votes_false,
+                    sq,
+                    "accord: IF condition not met — [applied]=false"
+                );
+                return Err(AccordDriverError::ConditionNotMet {
+                    current_row: dissenting_row,
+                });
+            }
         }
 
         // ------------------------------------------------------------------
@@ -825,6 +977,28 @@ impl AccordCoordinatorDriver {
 
         let apply_bytes = self.apply_payload_bytes()?;
         let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
+
+        // Coordinator's OWN replica apply. Its self-send is unreachable, so apply
+        // the committed mutation locally here (mirroring a remote replica's
+        // handle_apply) before counting the implicit ack. Without this the
+        // coordinator node never persists what it coordinates. Fail loud: a local
+        // apply error must abort, never fake the implicit ack.
+        if self_is_replica && !self.mutation.is_empty() {
+            if let Some(applier) = &self.local_applier {
+                applier
+                    .apply(
+                        txn_id,
+                        crate::accord::apply::ApplyMutation {
+                            data: self.mutation.clone(),
+                            t: commit_t,
+                            deps: commit_deps.iter().copied().collect(),
+                        },
+                    )
+                    .map_err(|e| {
+                        AccordDriverError::Network(format!("coordinator local apply failed: {e}"))
+                    })?;
+            }
+        }
 
         // Coordinator itself counts as 1 implicit apply ack.
         let mut apply_acks = if self_is_replica { 1usize } else { 0usize };
