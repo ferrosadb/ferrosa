@@ -81,10 +81,23 @@ pub async fn execute_update(
                 total_deleted += exec_clear(graph, keyspace, storage, write_path).await?;
             }
             spargebra::GraphUpdateOperation::Load { .. } => {
-                return Err(SparqlError::Plan("SPARQL LOAD is not implemented".into()));
+                // URS-QEC-X01: LOAD fetches and parses an external RDF document.
+                // This engine has no HTTP fetch + RDF-document parser pipeline,
+                // so it cannot honor LOAD. Fail loud rather than silently
+                // succeed with zero triples.
+                return Err(SparqlError::Plan(
+                    "SPARQL LOAD is not implemented: this endpoint has no RDF \
+                     document fetch/parse pipeline"
+                        .into(),
+                ));
             }
             spargebra::GraphUpdateOperation::Create { .. } => {
-                return Err(SparqlError::Plan("SPARQL CREATE is not implemented".into()));
+                // CREATE GRAPH is a success no-op in the single-graph-per-keyspace
+                // model: graphs are implicit (materialized by the partition-key
+                // graph component on first insert), so the named graph "exists"
+                // after this call with nothing to allocate. Per SPARQL 1.1,
+                // CREATE on a fresh graph succeeds; we cannot cheaply detect
+                // pre-existence, so (with or without SILENT) we report success.
             }
         }
     }
@@ -111,6 +124,24 @@ async fn exec_delete_insert(
     storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
 ) -> Result<(usize, usize), SparqlError> {
+    // URS-QEC-X01: a delete or insert template whose target graph is a named
+    // graph distinct from this keyspace's default graph is NOT addressable in
+    // the single-graph-per-keyspace model (the read/write path keys the table
+    // by keyspace and does not filter by the graph partition-key component).
+    // Honoring it by writing into the default graph would be a silent wrong
+    // result, so we fail loud BEFORE evaluating the WHERE or applying any
+    // mutation. This is what makes the spargebra ADD/MOVE/COPY desugaring
+    // (which targets named graphs) fail loud instead of silently operating on
+    // the wrong graph. (A named-graph *read* — `GraphPattern::Graph` in the
+    // WHERE clause, produced when COPY/MOVE/ADD source is a named graph — is
+    // separately rejected by the planner.)
+    for tmpl in delete {
+        check_quad_graph_pattern(&tmpl.graph_name, keyspace, "DELETE")?;
+    }
+    for tmpl in insert {
+        check_quad_graph_pattern(&tmpl.graph_name, keyspace, "INSERT")?;
+    }
+
     let plan = crate::planner::plan_where(pattern, keyspace)?;
     let solutions = crate::executor::execute_bindings(&plan, write_path).await?;
 
@@ -207,6 +238,42 @@ struct InsertTriple {
     obj_type: String,
     datatype: Option<String>,
     language: Option<String>,
+}
+
+/// Validate that a quad template's target graph (a [`GraphNamePattern`], as
+/// carried by both INSERT and DELETE templates in a `DeleteInsert`) is
+/// addressable in this single-graph-per-keyspace engine.
+///
+/// `DefaultGraph` maps to the keyspace's default graph (always OK). A
+/// `NamedNode` equal to the keyspace is the same graph (OK). Any other named
+/// graph — or a variable-bound graph — is not addressable: return a fail-loud
+/// error instead of silently operating on the default graph (URS-QEC-X01).
+fn check_quad_graph_pattern(
+    graph: &spargebra::term::GraphNamePattern,
+    keyspace: &str,
+    op: &str,
+) -> Result<(), SparqlError> {
+    match graph {
+        spargebra::term::GraphNamePattern::DefaultGraph => Ok(()),
+        spargebra::term::GraphNamePattern::NamedNode(n) if n.as_str() == keyspace => Ok(()),
+        spargebra::term::GraphNamePattern::NamedNode(n) => {
+            Err(named_graph_unsupported(op, n.as_str(), keyspace))
+        }
+        spargebra::term::GraphNamePattern::Variable(v) => Err(SparqlError::Plan(format!(
+            "{op} into a variable-bound graph (?{}) is not supported: this endpoint \
+             exposes a single graph per keyspace ('{keyspace}')",
+            v.as_str()
+        ))),
+    }
+}
+
+/// Build the standard fail-loud error for an unaddressable named graph.
+fn named_graph_unsupported(op: &str, graph: &str, keyspace: &str) -> SparqlError {
+    SparqlError::Plan(format!(
+        "{op} into named graph <{graph}> is not supported: this endpoint exposes a \
+         single graph per keyspace ('{keyspace}'); named graphs distinct from it \
+         are not addressable (so ADD/MOVE/COPY across graphs cannot be honored)"
+    ))
 }
 
 /// Resolve a `TermPattern` (subject/object position) against a solution into a
