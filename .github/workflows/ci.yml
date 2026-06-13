@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+  # No `branches:` filter on PRs: run the full suite on EVERY pull request,
+  # including stacked PRs whose base is another feature branch (a PR "train").
+  # With `branches: [main]` these were skipped entirely — only the
+  # path-filtered Driver Smoke ran — so stacked PRs went unexercised.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
