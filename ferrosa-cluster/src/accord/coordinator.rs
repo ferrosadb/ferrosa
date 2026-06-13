@@ -417,6 +417,15 @@ pub struct AccordCoordinatorDriver {
     /// coordinator itself as an implicit ack for Commit and Apply (the
     /// coordinator drove the protocol and counts as one replica).
     self_id: uuid::Uuid,
+    /// Encoded mutation to apply on commit: a self-describing commit-log
+    /// `Mutation` (keyspace/table, `DecoratedKey`, rows, timestamp).
+    ///
+    /// This is what each replica decodes and writes to storage in the Apply
+    /// phase — it is carried as the Apply payload's `result_data`. It is
+    /// distinct from `coordinator.key` (the raw partition-key bytes used only
+    /// for Accord conflict ordering). An empty vector means "no mutation"
+    /// (read-only / protocol-only transactions).
+    mutation: Vec<u8>,
 }
 
 impl AccordCoordinatorDriver {
@@ -429,7 +438,9 @@ impl AccordCoordinatorDriver {
     /// - `peers`: the peer connection manager for RPC fanout.
     /// - `is_leaseholder`: whether this node is the token-range leaseholder.
     /// - `clock`: HLC for generating the coordinator timestamp `t0`.
-    /// - `key`: raw partition key bytes.
+    /// - `key`: raw partition key bytes (used for Accord conflict ordering).
+    /// - `mutation`: encoded commit-log `Mutation` to apply on commit, carried
+    ///   as the Apply payload's `result_data`. Empty for read-only txns.
     pub fn new(
         node_id: u64,
         replica_ids: Vec<uuid::Uuid>,
@@ -437,6 +448,7 @@ impl AccordCoordinatorDriver {
         is_leaseholder: bool,
         clock: &HybridLogicalClock,
         key: Vec<u8>,
+        mutation: Vec<u8>,
     ) -> Self {
         let rf = replica_ids.len();
         assert!(rf > 0, "replica_ids must be non-empty");
@@ -464,7 +476,24 @@ impl AccordCoordinatorDriver {
             peers,
             replica_ids,
             self_id,
+            mutation,
         }
+    }
+
+    /// Build the Apply-phase payload bytes for this transaction.
+    ///
+    /// The payload carries the encoded **mutation** as `result_data` — NOT the
+    /// Accord partition key. Each replica decodes `result_data` as a commit-log
+    /// `Mutation` and writes it to local storage; passing the key here would be
+    /// a phantom write (storage applier would fail to decode, or worse, persist
+    /// nothing). See `state_machine::handle_apply` for the consuming side.
+    fn apply_payload_bytes(&self) -> Result<Vec<u8>, AccordDriverError> {
+        use crate::accord::wire::ApplyPayload;
+        let apply_payload = ApplyPayload {
+            txn_id: self.coordinator.txn_id,
+            result_data: self.mutation.clone(),
+        };
+        bincode::serialize(&apply_payload).map_err(|e| AccordDriverError::Codec(e.to_string()))
     }
 
     /// Run the full Accord protocol for this transaction.
@@ -794,15 +823,7 @@ impl AccordCoordinatorDriver {
         // to reach F+1 total before returning the LWT result.
         // ------------------------------------------------------------------
 
-        let apply_bytes = {
-            use crate::accord::wire::ApplyPayload;
-            let apply_payload = ApplyPayload {
-                txn_id,
-                result_data: key.clone(),
-            };
-            bincode::serialize(&apply_payload)
-                .map_err(|e| AccordDriverError::Codec(e.to_string()))?
-        };
+        let apply_bytes = self.apply_payload_bytes()?;
         let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
 
         // Coordinator itself counts as 1 implicit apply ack.
@@ -1605,6 +1626,75 @@ mod tests {
         assert!(
             has_accord_span,
             "expected at least one 'accord.*' span, got: {recorded:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Apply payload carries the real MUTATION, not the partition key.
+    //
+    // Increment 3 of the LWT data path: the coordinator's Apply phase must hand
+    // each replica the encoded commit-log `Mutation` (`result_data`), which the
+    // storage applier decodes and writes. Carrying the raw partition key here is
+    // the phantom-write bug — the applier cannot decode a bare key as a
+    // `Mutation`, so nothing durable is written even though `[applied]=true` is
+    // returned. This test pins `result_data == mutation` (and `!= key`).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_payload_carries_mutation_not_key() {
+        use crate::accord::wire::ApplyPayload;
+        use ferrosa_common::accord::HybridLogicalClock;
+        use ferrosa_net::config::NetConfig;
+        use ferrosa_net::peer::{PeerEventListener, PeerManager};
+        use std::sync::Arc;
+
+        struct NoopListener;
+        impl PeerEventListener for NoopListener {
+            fn on_peer_connected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_disconnected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_suspected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_recovered(&self, _: uuid::Uuid) {}
+            fn on_peer_failed(&self, _: uuid::Uuid) {}
+        }
+
+        let self_uuid = uuid::Uuid::new_v4();
+        let node_id =
+            u64::from_be_bytes(self_uuid.as_bytes()[..8].try_into().expect("uuid 16 bytes"));
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            self_uuid,
+            Arc::new(NoopListener),
+        ));
+        let clock = HybridLogicalClock::new(node_id, 0);
+
+        // A partition key distinct from the encoded mutation bytes.
+        let key = b"pk-bytes".to_vec();
+        let mutation = b"ENCODED-MUTATION-BYTES".to_vec();
+
+        let driver = AccordCoordinatorDriver::new(
+            node_id,
+            vec![self_uuid],
+            peers,
+            true,
+            &clock,
+            key.clone(),
+            mutation.clone(),
+        );
+
+        let bytes = driver
+            .apply_payload_bytes()
+            .expect("apply payload must serialize");
+        let decoded: ApplyPayload =
+            bincode::deserialize(&bytes).expect("apply payload must round-trip");
+
+        assert_eq!(
+            decoded.result_data, mutation,
+            "Apply result_data MUST be the encoded mutation (not the partition key) — \
+             a replica decodes result_data as a commit-log Mutation and writes it"
+        );
+        assert_ne!(
+            decoded.result_data, key,
+            "Apply result_data must NOT be the raw partition key — that is the \
+             phantom-write bug this increment closes"
         );
     }
 }
