@@ -69,6 +69,8 @@ pub struct SparqlAskResult {
 pub enum ResultFormat {
     /// `application/sparql-results+json` (default for SELECT/ASK).
     Json,
+    /// `application/sparql-results+xml` (SPARQL XML Results Format per W3C).
+    Xml,
     /// `text/turtle` (Turtle/N-Triples-like serialization).
     Turtle,
     /// `application/n-triples` (N-Triples format).
@@ -82,7 +84,9 @@ impl ResultFormat {
     /// type is found.
     pub fn from_accept(accept: &str) -> Self {
         // Check for exact or partial matches in priority order.
-        if accept.contains("text/turtle") {
+        if accept.contains("application/sparql-results+xml") {
+            Self::Xml
+        } else if accept.contains("text/turtle") {
             Self::Turtle
         } else if accept.contains("application/n-triples") {
             Self::NTriples
@@ -95,6 +99,7 @@ impl ResultFormat {
     pub fn content_type(self) -> &'static str {
         match self {
             Self::Json => "application/sparql-results+json",
+            Self::Xml => "application/sparql-results+xml",
             Self::Turtle => "text/turtle",
             Self::NTriples => "application/n-triples",
         }
@@ -102,6 +107,46 @@ impl ResultFormat {
 }
 
 impl SparqlJsonResults {
+    /// Serialize to SPARQL Results XML format per W3C.
+    ///
+    /// Produces `application/sparql-results+xml` per the W3C SPARQL 1.1
+    /// Query Results XML Format specification.  The output is well-formed XML
+    /// with the `<sparql>` root, `<head>` with `<variable>` elements, and
+    /// `<results>` with `<result>` / `<binding>` / `<uri>` / `<literal>` /
+    /// `<bnode>` leaves.
+    pub fn to_xml(&self) -> Result<Vec<u8>, String> {
+        let mut buf = String::new();
+        buf.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        buf.push_str("<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\n");
+
+        // <head>
+        buf.push_str("  <head>\n");
+        for var in &self.head.vars {
+            buf.push_str(&format!("    <variable name=\"{}\"/>\n", xml_escape(var)));
+        }
+        buf.push_str("  </head>\n");
+
+        // <results>
+        buf.push_str("  <results>\n");
+        for row in &self.results.bindings {
+            buf.push_str("    <result>\n");
+            for var in &self.head.vars {
+                if let Some(binding) = row.get(var) {
+                    buf.push_str(&format!(
+                        "      <binding name=\"{}\">{}</binding>\n",
+                        xml_escape(var),
+                        format_xml_binding(binding)
+                    ));
+                }
+            }
+            buf.push_str("    </result>\n");
+        }
+        buf.push_str("  </results>\n");
+        buf.push_str("</sparql>\n");
+
+        Ok(buf.into_bytes())
+    }
+
     /// Serialize to N-Triples format (one triple per line).
     ///
     /// Produces a simple tabular rendering: each binding row becomes one
@@ -129,6 +174,49 @@ impl SparqlJsonResults {
     /// of N-Triples. Full Turtle grouping/prefixing is deferred.
     pub fn to_turtle(&self) -> Vec<u8> {
         self.to_ntriples()
+    }
+}
+
+/// Escape a string for inclusion in XML text content or attribute values.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Serialize a single binding value as an XML element leaf.
+///
+/// Per W3C SPARQL Results XML:
+/// - URI → `<uri>iri</uri>`
+/// - bnode → `<bnode>label</bnode>`
+/// - literal → `<literal [xml:lang] [datatype]>value</literal>`
+fn format_xml_binding(binding: &Binding) -> String {
+    match binding.binding_type.as_str() {
+        "uri" => format!("<uri>{}</uri>", xml_escape(&binding.value)),
+        "bnode" => {
+            // Strip leading "_:" label prefix if present.
+            let label = binding.value.strip_prefix("_:").unwrap_or(&binding.value);
+            format!("<bnode>{}</bnode>", xml_escape(label))
+        }
+        _ => {
+            // Literal — may carry xml:lang or datatype attributes.
+            let lang_attr = binding
+                .lang
+                .as_deref()
+                .map(|l| format!(" xml:lang=\"{}\"", xml_escape(l)))
+                .unwrap_or_default();
+            let dt_attr = binding
+                .datatype
+                .as_deref()
+                .map(|d| format!(" datatype=\"{}\"", xml_escape(d)))
+                .unwrap_or_default();
+            format!(
+                "<literal{lang_attr}{dt_attr}>{}</literal>",
+                xml_escape(&binding.value)
+            )
+        }
     }
 }
 

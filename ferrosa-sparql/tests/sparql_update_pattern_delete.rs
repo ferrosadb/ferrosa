@@ -64,6 +64,7 @@ async fn select_count(eng: &SparqlEngine, query: &str) -> usize {
     match eng.execute(query, KS).await.expect("select must succeed") {
         SparqlResult::Select(r) => r.results.bindings.len(),
         SparqlResult::Ask(_) => panic!("expected SELECT result, got ASK"),
+        SparqlResult::Graph(_) => panic!("expected SELECT result, got Graph"),
     }
 }
 
@@ -77,6 +78,7 @@ async fn select_values(eng: &SparqlEngine, query: &str, var: &str) -> Vec<String
             .filter_map(|row| row.get(var).map(|b| b.value.clone()))
             .collect(),
         SparqlResult::Ask(_) => panic!("expected SELECT result, got ASK"),
+        SparqlResult::Graph(_) => panic!("expected SELECT result, got Graph"),
     }
 }
 
