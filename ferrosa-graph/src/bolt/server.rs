@@ -297,6 +297,47 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Handle a Bolt explicit-transaction control message (`BEGIN` / `COMMIT` /
+/// `ROLLBACK`).
+///
+/// URS-QEC-B01 wires these message types into the dispatch path. The connection
+/// transaction state machine (URS-QEC-B02) — queueing statements, deferring
+/// execution to `COMMIT`, and backing it with the `StorageEngine` batch
+/// primitive — lands in the next increment. Until then these messages must
+/// **fail loud** (URS-QEC-X01): an explicit transaction we cannot actually open
+/// or durably commit must return a Bolt `FAILURE`, never a silent `SUCCESS` that
+/// would ack a transaction we never persisted.
+fn handle_tx_message(msg: &BoltMessage, _state: &mut ConnectionState) -> Vec<BoltMessage> {
+    let (code, message) = match msg {
+        BoltMessage::Begin { .. } => (
+            "Neo.ClientError.Transaction.TransactionStartFailed",
+            "explicit transactions (BEGIN) are not yet supported on this server",
+        ),
+        BoltMessage::Commit => (
+            "Neo.ClientError.Transaction.TransactionNotFound",
+            "COMMIT received with no open explicit transaction \
+             (explicit transactions are not yet supported)",
+        ),
+        BoltMessage::Rollback => (
+            "Neo.ClientError.Transaction.TransactionNotFound",
+            "ROLLBACK received with no open explicit transaction \
+             (explicit transactions are not yet supported)",
+        ),
+        // Not a transaction control message — caller guarantees this is unreachable.
+        _ => (
+            "Neo.DatabaseError.General.UnknownError",
+            "handle_tx_message called with a non-transaction message",
+        ),
+    };
+    vec![BoltMessage::Failure {
+        metadata: vec![
+            ("code".into(), PackValue::String(code.into())),
+            ("neo4j_code".into(), PackValue::String(code.into())),
+            ("message".into(), PackValue::String(message.into())),
+        ],
+    }]
+}
+
 /// Process a single message and produce response messages.
 async fn process_message(
     msg: BoltMessage,
@@ -305,6 +346,10 @@ async fn process_message(
     state: &mut ConnectionState,
 ) -> Result<Vec<BoltMessage>, GraphError> {
     match msg {
+        BoltMessage::Begin { .. } | BoltMessage::Commit | BoltMessage::Rollback => {
+            Ok(handle_tx_message(&msg, state))
+        }
+
         BoltMessage::Run {
             query,
             params,
@@ -765,5 +810,85 @@ mod tests {
         assert_eq!(find_string_field(&map, "name"), Some("Alice".into()));
         assert_eq!(find_string_field(&map, "age"), None); // Not a string
         assert_eq!(find_string_field(&map, "missing"), None);
+    }
+
+    /// Extract the `code` field from a FAILURE message, if present.
+    fn failure_code(msg: &BoltMessage) -> Option<String> {
+        match msg {
+            BoltMessage::Failure { metadata } => find_string_field(metadata, "code"),
+            _ => None,
+        }
+    }
+
+    /// BEGIN must NOT silently SUCCEED while the transaction state machine is
+    /// unimplemented — it must fail loud (URS-QEC-X01).
+    #[test]
+    fn begin_fails_loud_not_silent_success() {
+        let mut state = ConnectionState::new();
+        let replies = handle_tx_message(&BoltMessage::Begin { extra: vec![] }, &mut state);
+        assert_eq!(replies.len(), 1, "expected exactly one reply");
+        assert!(
+            matches!(replies[0], BoltMessage::Failure { .. }),
+            "BEGIN must return FAILURE, never SUCCESS, until the tx state machine exists; got {:?}",
+            replies[0]
+        );
+        assert_eq!(
+            failure_code(&replies[0]).as_deref(),
+            Some("Neo.ClientError.Transaction.TransactionStartFailed"),
+        );
+    }
+
+    /// COMMIT with no open transaction must fail loud — never a fake SUCCESS that
+    /// acks a transaction it never persisted.
+    #[test]
+    fn commit_without_tx_fails_loud() {
+        let mut state = ConnectionState::new();
+        let replies = handle_tx_message(&BoltMessage::Commit, &mut state);
+        assert_eq!(replies.len(), 1);
+        assert!(
+            matches!(replies[0], BoltMessage::Failure { .. }),
+            "COMMIT must return FAILURE, got {:?}",
+            replies[0]
+        );
+    }
+
+    /// ROLLBACK with no open transaction must fail loud, not silently succeed.
+    #[test]
+    fn rollback_without_tx_fails_loud() {
+        let mut state = ConnectionState::new();
+        let replies = handle_tx_message(&BoltMessage::Rollback, &mut state);
+        assert_eq!(replies.len(), 1);
+        assert!(
+            matches!(replies[0], BoltMessage::Failure { .. }),
+            "ROLLBACK must return FAILURE, got {:?}",
+            replies[0]
+        );
+    }
+
+    /// Every FAILURE we emit for tx messages carries both `code` and `message`
+    /// fields so drivers surface a real error rather than hanging.
+    #[test]
+    fn tx_failures_carry_code_and_message() {
+        for msg in [
+            BoltMessage::Begin { extra: vec![] },
+            BoltMessage::Commit,
+            BoltMessage::Rollback,
+        ] {
+            let mut state = ConnectionState::new();
+            let replies = handle_tx_message(&msg, &mut state);
+            match &replies[0] {
+                BoltMessage::Failure { metadata } => {
+                    assert!(
+                        find_string_field(metadata, "code").is_some(),
+                        "missing code for {msg:?}"
+                    );
+                    assert!(
+                        find_string_field(metadata, "message").is_some(),
+                        "missing message for {msg:?}"
+                    );
+                }
+                other => panic!("expected FAILURE for {msg:?}, got {other:?}"),
+            }
+        }
     }
 }
