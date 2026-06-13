@@ -374,12 +374,12 @@ impl<'input> Parser<'input> {
         self.lexer.expect(&TokenKind::RBrace)?;
 
         // Optional trailing RETURN after the CALL {} block.
-        let return_clause = if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::Return))
-        {
-            Some(self.parse_return_clause()?)
-        } else {
-            None
-        };
+        let return_clause =
+            if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::Return)) {
+                Some(self.parse_return_clause()?)
+            } else {
+                None
+            };
 
         Ok(Statement::CallSubquery {
             outer: Box::new(outer),
@@ -2798,7 +2798,8 @@ mod tests {
     fn parse_call_subquery_unit_no_inner_return() {
         // A unit subquery: the inner body only performs updates (no RETURN), and
         // there is no trailing RETURN.
-        let stmt = parse("MATCH (p:Person) CALL { WITH p CREATE (:Person {name: p.name}) }").unwrap();
+        let stmt =
+            parse("MATCH (p:Person) CALL { WITH p CREATE (:Person {name: p.name}) }").unwrap();
         match stmt {
             Statement::CallSubquery {
                 inner,
@@ -2832,7 +2833,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.message.contains("unsupported Cypher clause: Keyword(Call)"),
+            err.message
+                .contains("unsupported Cypher clause: Keyword(Call)"),
             "nested CALL must fail loud, got: {}",
             err.message
         );
@@ -2892,7 +2894,8 @@ mod tests {
         ] {
             let err = parse(q).unwrap_err();
             assert!(
-                err.message.contains("requires a variable bound by an enclosing")
+                err.message
+                    .contains("requires a variable bound by an enclosing")
                     || err
                         .message
                         .contains("FOREACH body may only contain update clauses"),
