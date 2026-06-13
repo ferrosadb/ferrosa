@@ -366,6 +366,29 @@ pub enum Statement {
         /// Update clauses executed per element, in order.
         body: Vec<Statement>,
     },
+    /// `MATCH ... CALL { WITH <imports> <inner> } [RETURN ...]`
+    ///
+    /// A correlated subquery: the `inner` statement runs once per row produced by
+    /// the `outer` statement, with each variable in `imports` (the inner leading
+    /// `WITH`) bound to that outer row. Inner results are UNITED across rows.
+    ///
+    /// Two shapes are supported:
+    /// - **Returning** subquery (`inner` projects rows): each inner row is paired
+    ///   with its driving outer row; the trailing `return_clause` (if present)
+    ///   projects over the combined `outer ⨯ inner` bindings.
+    /// - **Unit** subquery (`inner` performs only updates, no RETURN): executed for
+    ///   its write side effects per outer row, leaving outer cardinality unchanged.
+    CallSubquery {
+        /// The driving query whose rows are imported into the subquery, one at a
+        /// time. Must project every name in `imports`.
+        outer: Box<Statement>,
+        /// Variables imported into the subquery via its leading `WITH`.
+        imports: Vec<String>,
+        /// The subquery body, run once per outer row with `imports` bound.
+        inner: Box<Statement>,
+        /// Optional trailing `RETURN` after the `CALL {}` block.
+        return_clause: Option<ReturnClause>,
+    },
 }
 
 #[cfg(test)]

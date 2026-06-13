@@ -30,7 +30,7 @@ use crate::executor::expand::{build_columns, execute, GraphEngineConfig};
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::executor::subscribe::SubscriptionRegistry;
 use crate::parser::{
-    parse, Assignment, Expr, Literal, Pattern, ReturnClause, Statement, WithPipeline,
+    parse, Assignment, Expr, Literal, Pattern, ReturnClause, ReturnItem, Statement, WithPipeline,
 };
 use crate::planner::logical::validate;
 use crate::planner::physical::{plan, PhysicalPlan};
@@ -276,6 +276,9 @@ fn statement_requires_adjacency(statement: &Statement) -> bool {
                     .is_some_and(return_clause_requires_adjacency)
         }
         Statement::Foreach { body, .. } => body.iter().any(statement_requires_adjacency),
+        Statement::CallSubquery { outer, inner, .. } => {
+            statement_requires_adjacency(outer) || statement_requires_adjacency(inner)
+        }
     }
 }
 
@@ -683,6 +686,29 @@ impl GraphEngine {
                 .execute_foreach(&var, &list, &body, keyspace, auth)
                 .await;
         }
+        if let Statement::CallSubquery {
+            outer,
+            imports,
+            inner,
+            return_clause,
+        } = statement
+        {
+            return self
+                .execute_call_subquery(*outer, &imports, *inner, return_clause, keyspace, auth)
+                .await;
+        }
+        self.execute_statement(statement, keyspace, auth).await
+    }
+
+    /// Validate, plan, and execute a single non-orchestrated statement (i.e. not
+    /// FOREACH / CALL {}, which the engine expands first). Shared by the top-level
+    /// query path and the CALL {} subquery orchestrator.
+    async fn execute_statement(
+        &self,
+        statement: Statement,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<GraphResult> {
         if statement_requires_adjacency(&statement) {
             let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
             if adjacency_registered {
@@ -840,6 +866,115 @@ impl GraphEngine {
         Ok(PlannedForeach {
             plans,
             element_count: elements.len(),
+        })
+    }
+
+    /// Execute a correlated `CALL {}` subquery: run the `inner` subquery once per
+    /// `outer` row, with each `imports` variable bound to that row, and unite the
+    /// results.
+    ///
+    /// Semantics (openCypher CALL {} subquery):
+    /// - **Returning** subquery: the inner statement projects rows. Each inner row
+    ///   is paired with its driving outer row. The optional trailing `return_clause`
+    ///   projects over the combined `outer ∪ inner` bindings; without one, the inner
+    ///   rows are returned directly. Result rows are the UNION over all outer rows.
+    /// - **Unit** subquery: the inner statement performs only updates (no RETURN).
+    ///   It runs for its write side effects once per outer row and does not change
+    ///   the outer cardinality; the outer rows pass through unchanged (or are
+    ///   projected by the trailing RETURN if present).
+    ///
+    /// Correlation is by value substitution (the same machinery as FOREACH): each
+    /// outer row's imported values are materialized into the inner statement before
+    /// it is validated/planned/executed. Reads of imported node properties
+    /// (`p.name`) resolve against the materialized node map.
+    ///
+    /// Fail-loud: a nested `CALL {}` inside the body is rejected at parse time;
+    /// any inner validation/plan/exec error surfaces with the outer row's context.
+    async fn execute_call_subquery(
+        &self,
+        outer: Statement,
+        imports: &[String],
+        inner: Statement,
+        return_clause: Option<ReturnClause>,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<GraphResult> {
+        // 1. Run the outer query, projecting each imported variable as a column so
+        //    we can bind it per row. The outer is the MATCH built by the parser with
+        //    an empty RETURN; we replace it with `RETURN <imports...>`.
+        let outer = project_imports(outer, imports)?;
+        let outer_result = self.execute_statement(outer, keyspace, auth).await?;
+        let import_cols = outer_result.columns.clone();
+
+        let inner_returns = statement_is_returning(&inner);
+        let mut out_columns: Option<Vec<String>> = None;
+        let mut out_rows: Vec<Vec<Value>> = Vec::new();
+        let mut stats = QueryStats::default();
+
+        // 2. For each outer row, materialize imports into the inner subquery and run.
+        for outer_row in &outer_result.rows {
+            let mut import_bindings: HashMap<String, Value> = HashMap::new();
+            for (col, value) in import_cols.iter().zip(outer_row.iter()) {
+                import_bindings.insert(col.clone(), value.clone());
+            }
+
+            // Substitute every imported variable into the inner statement, then
+            // constant-fold the now-closed expressions (e.g. `p.age + 1000` becomes
+            // a literal once `p` is materialized) so update clauses that only accept
+            // literal property values still see one.
+            let mut bound_inner = inner.clone();
+            for name in imports {
+                if let Some(value) = import_bindings.get(name) {
+                    let replacement = value_to_expr(value)?;
+                    bound_inner = subst_var_statement(bound_inner, name, &replacement);
+                }
+            }
+            let bound_inner = fold_constants_statement(bound_inner)?;
+
+            let inner_result = self
+                .execute_statement(bound_inner, keyspace, auth)
+                .await?;
+            stats.vertices_written += inner_result.stats.vertices_written;
+            stats.vertices_deleted += inner_result.stats.vertices_deleted;
+            stats.vertices_read += inner_result.stats.vertices_read;
+            stats.edges_read += inner_result.stats.edges_read;
+
+            // 3. Combine per the subquery shape.
+            if let Some(rc) = &return_clause {
+                // Trailing RETURN: evaluate over combined outer ∪ inner bindings.
+                // A unit inner contributes no inner columns, so the trailing RETURN
+                // sees only the outer (import) bindings and emits one row per outer
+                // row. A returning inner emits one combined row per inner row.
+                let inner_rows = if inner_returns {
+                    rows_as_bindings(&inner_result)
+                } else {
+                    vec![HashMap::new()]
+                };
+                let cols = projection_columns(rc);
+                set_or_check_columns(&mut out_columns, &cols)?;
+                for inner_binding in inner_rows {
+                    let mut combined = import_bindings.clone();
+                    combined.extend(inner_binding);
+                    let mut row = Vec::with_capacity(rc.items.len());
+                    for item in &rc.items {
+                        row.push(eval_expr(&item.expr, &combined)?);
+                    }
+                    out_rows.push(row);
+                }
+            } else if inner_returns {
+                // No trailing RETURN: unite the inner rows directly.
+                set_or_check_columns(&mut out_columns, &inner_result.columns)?;
+                out_rows.extend(inner_result.rows);
+            }
+            // Unit subquery with no trailing RETURN: nothing to project; the writes
+            // already happened. (Outer cardinality is preserved but yields no
+            // columns, matching a write-only statement's empty result shape.)
+        }
+
+        Ok(GraphResult {
+            columns: out_columns.unwrap_or_default(),
+            rows: out_rows,
+            stats,
         })
     }
 
@@ -1338,7 +1473,115 @@ fn bind_statement_params(
                 .map(|stmt| bind_statement_params(stmt, params))
                 .collect::<Result<Vec<_>>>()?,
         },
+        Statement::CallSubquery {
+            outer,
+            imports,
+            inner,
+            return_clause,
+        } => Statement::CallSubquery {
+            outer: Box::new(bind_statement_params(*outer, params)?),
+            imports,
+            inner: Box::new(bind_statement_params(*inner, params)?),
+            return_clause: return_clause
+                .map(|clause| bind_return_clause_params(clause, params))
+                .transpose()?,
+        },
     })
+}
+
+/// Rewrite the `outer` driving statement of a CALL {} subquery so it projects each
+/// imported variable as a column (`RETURN p, q, ...`). The parser builds the outer
+/// as a `MATCH` with an empty RETURN; here we fill in the projection so the engine
+/// can read one binding per imported variable per row.
+///
+/// Only a plain `MATCH` outer is supported as the CALL {} driver. Anything else
+/// fails loud rather than silently dropping the correlation.
+fn project_imports(outer: Statement, imports: &[String]) -> Result<Statement> {
+    match outer {
+        Statement::Match {
+            pattern,
+            where_clause,
+            ..
+        } => Ok(Statement::Match {
+            pattern,
+            where_clause,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: imports
+                    .iter()
+                    .map(|name| ReturnItem {
+                        expr: Expr::Var(name.clone()),
+                        alias: Some(name.clone()),
+                    })
+                    .collect(),
+                order_by: vec![],
+                limit: None,
+            },
+        }),
+        other => Err(GraphError::Validation(format!(
+            "CALL {{}} subquery driver must be a MATCH, got {other:?}"
+        ))),
+    }
+}
+
+/// Whether a statement projects rows (has a RETURN). Returning statements feed the
+/// CALL {} union; non-returning (unit) statements run only for write side effects.
+fn statement_is_returning(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Match { .. }
+        | Statement::MatchWith { .. }
+        | Statement::MatchWithOptional { .. }
+        | Statement::Unwind { .. }
+        | Statement::Return { .. }
+        | Statement::Union { .. } => true,
+        Statement::Create { return_clause, .. } => return_clause.is_some(),
+        Statement::Merge { return_clause, .. } => return_clause.is_some(),
+        Statement::CallSubquery { return_clause, .. } => return_clause.is_some(),
+        Statement::Set { .. }
+        | Statement::Remove { .. }
+        | Statement::Delete { .. }
+        | Statement::Foreach { .. }
+        | Statement::Subscribe { .. }
+        | Statement::Unsubscribe { .. } => false,
+    }
+}
+
+/// Column names a trailing CALL {} RETURN clause projects.
+fn projection_columns(rc: &ReturnClause) -> Vec<String> {
+    build_columns(rc)
+}
+
+/// Turn a `GraphResult`'s rows into per-row binding maps keyed by column name, so
+/// trailing-RETURN expressions can read inner-subquery outputs by name.
+fn rows_as_bindings(result: &GraphResult) -> Vec<HashMap<String, Value>> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            result
+                .columns
+                .iter()
+                .cloned()
+                .zip(row.iter().cloned())
+                .collect()
+        })
+        .collect()
+}
+
+/// Set the output columns on first use, or verify subsequent unions agree. Mirrors
+/// the UNION arm-shape check: differing column shapes across outer rows is a hard
+/// error, not a silent last-write-wins.
+fn set_or_check_columns(slot: &mut Option<Vec<String>>, cols: &[String]) -> Result<()> {
+    match slot {
+        Some(existing) if existing.as_slice() != cols => Err(GraphError::Validation(
+            "CALL {} subquery produced inconsistent column shapes across rows".to_string(),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(cols.to_vec());
+            Ok(())
+        }
+    }
 }
 
 /// Convert a runtime JSON value into the equivalent literal `Expr`.
@@ -1393,6 +1636,22 @@ fn subst_var_expr(expr: Expr, var: &str, replacement: &Expr) -> Expr {
     let boxed = |e: Box<Expr>| Box::new(subst_var_expr(*e, var, replacement));
     match expr {
         Expr::Var(name) if name == var => replacement.clone(),
+        // Property access on the substituted variable: when `replacement` is the
+        // materialized node/map (the common case for an imported CALL {} variable),
+        // resolve `var.name` to the map's `name` entry. This lets a correlated
+        // subquery read properties off an imported node (`WITH p ... p.name`).
+        // A missing key resolves to NULL (openCypher property-of-missing-key).
+        Expr::Property { var: pvar, name } if pvar == var => {
+            if let Expr::Map(entries) = replacement {
+                entries
+                    .iter()
+                    .find(|(k, _)| k == &name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Expr::Literal(Literal::Null))
+            } else {
+                Expr::Property { var: pvar, name }
+            }
+        }
         Expr::Function { name, args } => Expr::Function {
             name,
             args: args.into_iter().map(recur).collect(),
@@ -1599,11 +1858,237 @@ fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statem
                 body,
             }
         }
-        // REMOVE/DELETE (and any non-update statement) are rejected in a FOREACH
-        // body at parse time, so they never reach substitution here; pass through
-        // unchanged defensively.
+        // Read statements appear as CALL {} subquery bodies (correlated reads). The
+        // imported variable is materialized into their projections / patterns /
+        // filters so the subquery sees the outer row.
+        Statement::Return { return_clause } => Statement::Return {
+            return_clause: subst_var_return_clause(return_clause, var, replacement),
+        },
+        Statement::Match {
+            pattern,
+            where_clause,
+            return_clause,
+        } => Statement::Match {
+            pattern: pattern
+                .into_iter()
+                .map(|p| subst_var_pattern(p, var, replacement))
+                .collect(),
+            where_clause: where_clause.map(|w| subst_var_expr(w, var, replacement)),
+            return_clause: subst_var_return_clause(return_clause, var, replacement),
+        },
+        Statement::MatchWith {
+            pattern,
+            where_clause,
+            with_pipeline,
+            return_clause,
+        } => Statement::MatchWith {
+            pattern: pattern
+                .into_iter()
+                .map(|p| subst_var_pattern(p, var, replacement))
+                .collect(),
+            where_clause: where_clause.map(|w| subst_var_expr(w, var, replacement)),
+            with_pipeline: subst_var_with_pipeline(with_pipeline, var, replacement),
+            return_clause: subst_var_return_clause(return_clause, var, replacement),
+        },
+        Statement::Unwind {
+            expr,
+            var: unwind_var,
+            with_pipeline,
+            return_clause,
+        } => {
+            // The UNWIND alias shadows the imported var inside the rest of the query.
+            let expr = subst_var_expr(expr, var, replacement);
+            if unwind_var == var {
+                Statement::Unwind {
+                    expr,
+                    var: unwind_var,
+                    with_pipeline,
+                    return_clause,
+                }
+            } else {
+                Statement::Unwind {
+                    expr,
+                    var: unwind_var,
+                    with_pipeline: with_pipeline
+                        .map(|wp| subst_var_with_pipeline(wp, var, replacement)),
+                    return_clause: subst_var_return_clause(return_clause, var, replacement),
+                }
+            }
+        }
+        // Any other statement form as a subquery body is not substituted here; it is
+        // either rejected upstream or correlation-free, so pass through unchanged.
         other => other,
     }
+}
+
+/// Substitute the imported variable throughout a RETURN clause (projection items
+/// and ORDER BY expressions). LIMIT/DISTINCT carry no variable references.
+fn subst_var_return_clause(rc: ReturnClause, var: &str, replacement: &Expr) -> ReturnClause {
+    ReturnClause {
+        distinct: rc.distinct,
+        items: rc
+            .items
+            .into_iter()
+            .map(|item| ReturnItem {
+                expr: subst_var_expr(item.expr, var, replacement),
+                alias: item.alias,
+            })
+            .collect(),
+        order_by: rc
+            .order_by
+            .into_iter()
+            .map(|o| crate::parser::OrderItem {
+                expr: subst_var_expr(o.expr, var, replacement),
+                direction: o.direction,
+            })
+            .collect(),
+        limit: rc.limit,
+    }
+}
+
+/// Substitute the imported variable inside a WITH pipeline (its projection and
+/// trailing WHERE filter).
+fn subst_var_with_pipeline(
+    wp: WithPipeline,
+    var: &str,
+    replacement: &Expr,
+) -> WithPipeline {
+    WithPipeline {
+        clause: subst_var_return_clause(wp.clause, var, replacement),
+        where_clause: wp.where_clause.map(|w| subst_var_expr(w, var, replacement)),
+    }
+}
+
+/// Whether an expression is *closed*: it contains no free variable, property, or
+/// parameter reference, so it can be evaluated with empty bindings. Used to decide
+/// whether a substituted expression can be safely constant-folded to a literal.
+fn expr_is_closed(expr: &Expr) -> bool {
+    match expr {
+        Expr::Var(_) | Expr::Property { .. } | Expr::Parameter(_) => false,
+        Expr::Literal(_) => true,
+        Expr::Distinct(e) | Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            expr_is_closed(e)
+        }
+        Expr::Comparison { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => expr_is_closed(left) && expr_is_closed(right),
+        Expr::In { value, list } => expr_is_closed(value) && expr_is_closed(list),
+        Expr::Index { target, index } => expr_is_closed(target) && expr_is_closed(index),
+        Expr::Function { args, .. } => args.iter().all(expr_is_closed),
+        Expr::List(items) => items.iter().all(expr_is_closed),
+        Expr::Map(entries) => entries.iter().all(|(_, v)| expr_is_closed(v)),
+        // Conservatively treat any other form as non-closed: do not fold it.
+        _ => false,
+    }
+}
+
+/// Constant-fold a closed expression to a literal by evaluating it with empty
+/// bindings. Non-closed (still-correlated/pattern-referencing) expressions are
+/// returned unchanged so the executor evaluates them in context.
+fn fold_expr(expr: Expr) -> Result<Expr> {
+    if expr_is_closed(&expr) {
+        let value = eval_expr(&expr, &HashMap::new())?;
+        return value_to_expr(&value);
+    }
+    Ok(expr)
+}
+
+/// Fold the property-map of a pattern (node/rel props): any closed value becomes a
+/// literal. Used after import substitution so update clauses that require literal
+/// property values accept correlated-then-folded derived values.
+fn fold_pattern(pattern: Pattern) -> Result<Pattern> {
+    let fold_props = |props: Vec<(String, Expr)>| -> Result<Vec<(String, Expr)>> {
+        props
+            .into_iter()
+            .map(|(k, v)| Ok((k, fold_expr(v)?)))
+            .collect()
+    };
+    Ok(match pattern {
+        Pattern::Node { var, label, props } => Pattern::Node {
+            var,
+            label,
+            props: fold_props(props)?,
+        },
+        Pattern::Rel {
+            var,
+            rel_type,
+            direction,
+            props,
+            length_range,
+        } => Pattern::Rel {
+            var,
+            rel_type,
+            direction,
+            props: fold_props(props)?,
+            length_range,
+        },
+        Pattern::Path(elements) => Pattern::Path(
+            elements
+                .into_iter()
+                .map(fold_pattern)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+/// Constant-fold closed expressions in an import-substituted inner subquery
+/// statement. Only update clauses (whose property/assignment values may need to be
+/// literals) are folded; read clauses are left for the executor to evaluate.
+fn fold_constants_statement(stmt: Statement) -> Result<Statement> {
+    Ok(match stmt {
+        Statement::Create {
+            patterns,
+            return_clause,
+        } => Statement::Create {
+            patterns: patterns
+                .into_iter()
+                .map(fold_pattern)
+                .collect::<Result<Vec<_>>>()?,
+            return_clause,
+        },
+        Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        } => Statement::Merge {
+            patterns: patterns
+                .into_iter()
+                .map(fold_pattern)
+                .collect::<Result<Vec<_>>>()?,
+            set_clause: set_clause
+                .into_iter()
+                .map(|a| {
+                    Ok(Assignment {
+                        var: a.var,
+                        property: a.property,
+                        value: fold_expr(a.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            return_clause,
+        },
+        Statement::Set {
+            pattern,
+            where_clause,
+            assignments,
+        } => Statement::Set {
+            pattern,
+            where_clause,
+            assignments: assignments
+                .into_iter()
+                .map(|a| {
+                    Ok(Assignment {
+                        var: a.var,
+                        property: a.property,
+                        value: fold_expr(a.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
+        // Read clauses and others: no folding needed (executor evaluates exprs).
+        other => other,
+    })
 }
 
 /// Format a physical plan as a human-readable string for EXPLAIN output.

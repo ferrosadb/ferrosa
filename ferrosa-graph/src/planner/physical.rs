@@ -417,6 +417,11 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
         Statement::Foreach { .. } => Err(GraphError::Validation(
             "FOREACH must be expanded into its body clauses before planning".to_string(),
         )),
+        // CALL {} subqueries are orchestrated by the engine; a `CallSubquery`
+        // reaching the planner is an internal invariant violation — fail loud.
+        Statement::CallSubquery { .. } => Err(GraphError::Validation(
+            "CALL {} subquery must be orchestrated by the engine before planning".to_string(),
+        )),
     }
 }
 

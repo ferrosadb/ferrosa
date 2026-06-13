@@ -125,6 +125,10 @@ fn permission_for_statement(stmt: &Statement) -> Permission {
         Statement::Unsubscribe { .. } => Permission::Select,
         Statement::Merge { .. } => Permission::Modify,
         Statement::Foreach { .. } => Permission::Modify,
+        // A CALL {} subquery may contain writes; require Modify conservatively.
+        // (In practice the engine orchestrates it and validates inner/outer
+        // separately, so this is a safety net for any direct validation path.)
+        Statement::CallSubquery { .. } => Permission::Modify,
     }
 }
 
@@ -219,6 +223,15 @@ pub fn validate(
         Statement::Foreach { .. } => {
             return Err(GraphError::Validation(
                 "FOREACH must be expanded into its body clauses before validation".to_string(),
+            ));
+        }
+        // CALL {} subqueries are orchestrated by the engine (outer rows drive the
+        // inner subquery), which validates the outer and inner statements
+        // separately. A `CallSubquery` reaching whole-statement validation is an
+        // internal invariant violation — fail loud.
+        Statement::CallSubquery { .. } => {
+            return Err(GraphError::Validation(
+                "CALL {} subquery must be orchestrated by the engine before validation".to_string(),
             ));
         }
     };

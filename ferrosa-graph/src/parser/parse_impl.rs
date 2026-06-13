@@ -301,20 +301,92 @@ impl<'input> Parser<'input> {
                     variables,
                 })
             }
-            TokenKind::Keyword(Keyword::Call)
-            | TokenKind::Keyword(Keyword::Foreach)
+            TokenKind::Keyword(Keyword::Call) => {
+                let outer = Statement::Match {
+                    pattern,
+                    where_clause,
+                    return_clause: ReturnClause {
+                        distinct: false,
+                        items: vec![],
+                        order_by: vec![],
+                        limit: None,
+                    },
+                };
+                self.parse_call_subquery(outer)
+            }
+            TokenKind::Keyword(Keyword::Foreach)
             | TokenKind::Keyword(Keyword::Load) => Err(ParseError::new(
                 format!("unsupported Cypher clause: {:?}", tok.kind),
                 tok.span,
             )),
             _ => Err(ParseError::new(
                 format!(
-                    "expected RETURN, OPTIONAL MATCH, WITH, SET, REMOVE, DELETE, or DETACH DELETE after MATCH, got {:?}",
+                    "expected RETURN, OPTIONAL MATCH, WITH, SET, REMOVE, DELETE, DETACH DELETE, or CALL after MATCH, got {:?}",
                     tok.kind
                 ),
                 tok.span,
             )),
         }
+    }
+
+    /// Parse a `CALL { WITH <imports> <inner> } [RETURN ...]` block following an
+    /// already-parsed `outer` driving statement (typically a MATCH).
+    ///
+    /// Grammar:
+    ///   call := CALL `{` WITH var (`,` var)* inner_statement `}` [RETURN ...]
+    ///
+    /// The leading `WITH <imports>` declares which outer variables are correlated
+    /// into the subquery. Only bare variable imports are supported (no aliasing /
+    /// projection in the import WITH); anything else fails loud. The inner body is
+    /// a full statement — either returning (projects rows) or a unit update.
+    fn parse_call_subquery(&mut self, outer: Statement) -> ParseResult<Statement> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Call))?;
+        self.lexer.expect(&TokenKind::LBrace)?;
+
+        // The subquery must begin with `WITH <imports>` for correlation. We only
+        // accept bare variable names here; an aliased/expression WITH is rejected
+        // loudly rather than silently importing the wrong thing.
+        if !matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::With)) {
+            let tok = self.lexer.peek()?;
+            return Err(ParseError::new(
+                format!(
+                    "CALL {{}} subquery must begin with `WITH <vars>` to import correlated \
+                     variables, got {:?}",
+                    tok.kind
+                ),
+                tok.span,
+            ));
+        }
+        self.lexer.expect(&TokenKind::Keyword(Keyword::With))?;
+        let imports = self.parse_var_list()?;
+        if imports.is_empty() {
+            let tok = self.lexer.peek()?;
+            return Err(ParseError::new(
+                "CALL {} subquery `WITH` must import at least one variable".to_string(),
+                tok.span,
+            ));
+        }
+
+        // Parse the inner subquery body. A nested CALL inside the body must fail
+        // loud (handled by parse_statement returning an unsupported-clause error).
+        let inner = self.parse_statement()?;
+
+        self.lexer.expect(&TokenKind::RBrace)?;
+
+        // Optional trailing RETURN after the CALL {} block.
+        let return_clause = if matches!(self.lexer.peek()?.kind, TokenKind::Keyword(Keyword::Return))
+        {
+            Some(self.parse_return_clause()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::CallSubquery {
+            outer: Box::new(outer),
+            imports,
+            inner: Box::new(inner),
+            return_clause,
+        })
     }
 
     fn parse_create(&mut self) -> ParseResult<Statement> {
@@ -2683,11 +2755,9 @@ mod tests {
                 "unsupported Cypher clause: Keyword(With)",
             ),
             (
+                // Bare top-level CALL (a stored-procedure call, not a `CALL {}`
+                // subquery) is still unsupported.
                 "CALL db.labels()",
-                "unsupported Cypher clause: Keyword(Call)",
-            ),
-            (
-                "MATCH (n) CALL { WITH n RETURN n } RETURN n",
                 "unsupported Cypher clause: Keyword(Call)",
             ),
             (
@@ -2702,6 +2772,70 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn parse_call_subquery_correlated_returning() {
+        let stmt =
+            parse("MATCH (p:Person) CALL { WITH p RETURN p.age AS a } RETURN p.name, a").unwrap();
+        match stmt {
+            Statement::CallSubquery {
+                outer,
+                imports,
+                inner,
+                return_clause,
+            } => {
+                assert!(matches!(*outer, Statement::Match { .. }));
+                assert_eq!(imports, vec!["p".to_string()]);
+                assert!(matches!(*inner, Statement::Return { .. }));
+                assert!(return_clause.is_some(), "trailing RETURN must be captured");
+            }
+            other => panic!("expected CallSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_call_subquery_unit_no_inner_return() {
+        // A unit subquery: the inner body only performs updates (no RETURN), and
+        // there is no trailing RETURN.
+        let stmt = parse("MATCH (p:Person) CALL { WITH p CREATE (:Person {name: p.name}) }").unwrap();
+        match stmt {
+            Statement::CallSubquery {
+                inner,
+                return_clause,
+                ..
+            } => {
+                assert!(matches!(*inner, Statement::Create { .. }));
+                assert!(return_clause.is_none());
+            }
+            other => panic!("expected CallSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_call_subquery_requires_leading_with() {
+        // Without a leading WITH the correlation is ambiguous; fail loud.
+        let err = parse("MATCH (p:Person) CALL { RETURN 1 AS x } RETURN p.name, x").unwrap_err();
+        assert!(
+            err.message.contains("must begin with `WITH"),
+            "expected leading-WITH requirement, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_call_subquery_nested_call_fails_loud() {
+        // A CALL {} nested directly inside another CALL {} is unsupported and must
+        // fail loud at parse time, never silently no-op.
+        let err = parse(
+            "MATCH (p:Person) CALL { WITH p CALL { WITH p RETURN p.age AS a } RETURN a } RETURN a",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("unsupported Cypher clause: Keyword(Call)"),
+            "nested CALL must fail loud, got: {}",
+            err.message
+        );
     }
 
     #[test]
