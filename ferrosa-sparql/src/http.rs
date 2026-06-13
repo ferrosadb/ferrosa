@@ -133,7 +133,7 @@ async fn handle_sparql_update(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("rdf");
 
-    match state.engine.execute_update(&update_str, keyspace) {
+    match state.engine.execute_update(&update_str, keyspace).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({

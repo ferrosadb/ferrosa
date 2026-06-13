@@ -56,6 +56,29 @@ pub async fn execute(
     Ok(results)
 }
 
+/// Evaluate a plan's WHERE pattern and return the raw solution bindings
+/// (after FILTER, before projection/ORDER/DISTINCT/LIMIT).
+///
+/// Used by SPARQL UPDATE pattern-deletes (`DELETE WHERE`,
+/// `DELETE/INSERT … WHERE`): the full, unprojected binding set is needed so
+/// every matched solution can be substituted into the delete/insert templates.
+pub async fn execute_bindings(
+    plan: &QueryPlan,
+    write_path: &Arc<WritePath>,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let mut binding_sets = evaluate_triple_patterns(plan, write_path).await?;
+
+    if !plan.filters.is_empty() {
+        binding_sets.retain(|row| {
+            plan.filters
+                .iter()
+                .all(|expr| crate::filter::eval_filter(expr, row))
+        });
+    }
+
+    Ok(binding_sets)
+}
+
 /// Evaluate all triple patterns via nested-loop join, returning binding sets.
 async fn evaluate_triple_patterns(
     plan: &QueryPlan,
@@ -393,6 +416,14 @@ fn extract_composite_component(data: &[u8], position: usize) -> Option<String> {
 /// Extract triples from partition rows into the output vec.
 fn extract_rows_from_partition(rows: &[Row], subject: &str, triples: &mut Vec<FetchedTriple>) {
     for row in rows {
+        // Skip deleted rows: a row whose deletion marker is non-live is a
+        // tombstone (or a row masked by one in the merge) and MUST NOT surface
+        // as a triple. Without this, a SPARQL delete would remain visible to a
+        // subsequent SELECT (URS-QEC-D05).
+        if !row.deletion.is_live() {
+            continue;
+        }
+
         let predicate = extract_clustering_string(&row.clustering, 0);
         let object = extract_clustering_string(&row.clustering, 1);
 
@@ -461,8 +492,11 @@ fn apply_scan_filters(op: &TripleOp, triples: &mut Vec<FetchedTriple>) {
 
 /// Extract a string component from a CQL clustering key at the given position.
 ///
-/// Clustering keys are encoded as length-prefixed components:
-///   `[u16 len][bytes][0x00 separator]...`
+/// Clustering keys use the strict CQL composite encoding written by
+/// `update::encode_triple_clustering`: `[u16 len][bytes]` per component with NO
+/// separator byte (this is what `ferrosa-common::schema` validates). A trailing
+/// separator must NOT be assumed — for short components the next component's
+/// length prefix high byte is `0x00`, and skipping it would corrupt the read.
 ///
 /// BUG-S10 fix: logs warnings on malformed/truncated keys instead of
 /// returning empty strings silently.
@@ -493,10 +527,6 @@ fn extract_clustering_string(clustering: &[u8], position: usize) -> String {
             return String::from_utf8_lossy(&clustering[offset..offset + len]).to_string();
         }
         offset += len;
-        // Skip end-of-component byte if present.
-        if offset < clustering.len() && clustering[offset] == 0 {
-            offset += 1;
-        }
     }
     tracing::warn!(
         position,
@@ -701,10 +731,22 @@ mod tests {
         );
     }
 
+    /// Build a strict CQL clustering component: `[u16 len][bytes]` (no
+    /// separator), matching `update::encode_triple_clustering`.
+    fn encode_clustering_component(s: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        buf
+    }
+
     #[test]
     fn extract_clustering_string_two_components() {
-        let mut clustering = encode_component("http://xmlns.com/foaf/0.1/name");
-        clustering.extend_from_slice(&encode_component("Alice"));
+        // Strict separator-free encoding — the reader must NOT assume a
+        // trailing 0x00 separator (it would corrupt the second component's
+        // length prefix, whose high byte is 0x00 for short objects).
+        let mut clustering = encode_clustering_component("http://xmlns.com/foaf/0.1/name");
+        clustering.extend_from_slice(&encode_clustering_component("Alice"));
         assert_eq!(
             extract_clustering_string(&clustering, 0),
             "http://xmlns.com/foaf/0.1/name"

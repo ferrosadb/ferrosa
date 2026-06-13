@@ -115,7 +115,11 @@ impl SparqlEngine {
     }
 
     /// Execute a SPARQL UPDATE and return the result.
-    pub fn execute_update(
+    ///
+    /// Async because pattern-based ops (`DELETE WHERE`, `DELETE/INSERT … WHERE`,
+    /// `CLEAR`, `DROP`) evaluate their WHERE clause through the async SELECT
+    /// executor before tombstoning the bound triples.
+    pub async fn execute_update(
         &self,
         update_str: &str,
         keyspace: &str,
@@ -131,7 +135,7 @@ impl SparqlEngine {
             )));
         }
         self.ensure_table_registered(ks);
-        crate::update::execute_update(update_str, ks, &self.storage)
+        crate::update::execute_update(update_str, ks, &self.storage, &self.write_path).await
     }
 
     /// Execute a SPARQL query and return results.
