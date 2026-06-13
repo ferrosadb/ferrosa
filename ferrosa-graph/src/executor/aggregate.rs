@@ -51,8 +51,9 @@ impl Accumulator for CountAcc {
     }
 }
 
-/// Sums numeric values as f64. Non-numeric values are ignored.
-/// Returns Null if no numeric values were accumulated.
+/// Sums numeric values as f64. Non-numeric (and null) values are ignored.
+/// Returns the additive identity `0` when no numeric values were accumulated,
+/// matching openCypher semantics (`sum()` over zero rows is `0`, not null).
 pub struct SumAcc {
     sum: f64,
     has_value: bool,
@@ -85,7 +86,8 @@ impl Accumulator for SumAcc {
         if self.has_value {
             serde_json::json!(self.sum)
         } else {
-            Value::Null
+            // openCypher: sum() over zero numeric inputs is the identity 0.
+            serde_json::json!(0)
         }
     }
 
@@ -213,6 +215,9 @@ impl Accumulator for MaxAcc {
 
 /// Collects values into a JSON array.
 ///
+/// Null values are skipped (openCypher `collect()` ignores nulls), so an
+/// empty input or all-null input yields `[]`, never null.
+///
 /// Enforces a configurable size limit (default 10,000) to prevent
 /// unbounded memory growth (FMEA F6).
 pub struct CollectAcc {
@@ -233,6 +238,10 @@ impl CollectAcc {
 
 impl Accumulator for CollectAcc {
     fn accumulate(&mut self, value: &Value) {
+        // openCypher: collect() ignores null values.
+        if value.is_null() {
+            return;
+        }
         if self.exceeded {
             return;
         }
@@ -340,9 +349,19 @@ mod tests {
     }
 
     #[test]
-    fn sum_acc_empty_returns_null() {
+    fn sum_acc_empty_returns_zero() {
+        // openCypher: sum() over zero rows is the additive identity 0, not null.
         let acc = SumAcc::new();
-        assert_eq!(acc.finish(), Value::Null);
+        assert_eq!(acc.finish(), serde_json::json!(0));
+    }
+
+    #[test]
+    fn sum_acc_all_non_numeric_returns_zero() {
+        // No numeric inputs is the same as empty for sum: identity 0.
+        let mut acc = SumAcc::new();
+        acc.accumulate(&serde_json::json!("nope"));
+        acc.accumulate(&Value::Null);
+        assert_eq!(acc.finish(), serde_json::json!(0));
     }
 
     #[test]
@@ -398,6 +417,32 @@ mod tests {
         acc.accumulate(&serde_json::json!(9.81));
         assert_eq!(acc.finish(), serde_json::json!([1, "hello", 9.81]));
         assert!(!acc.exceeded());
+    }
+
+    #[test]
+    fn collect_acc_skips_nulls() {
+        // openCypher: collect() ignores null values.
+        let mut acc = CollectAcc::new(10_000);
+        acc.accumulate(&serde_json::json!(1));
+        acc.accumulate(&Value::Null);
+        acc.accumulate(&serde_json::json!("hello"));
+        acc.accumulate(&Value::Null);
+        assert_eq!(acc.finish(), serde_json::json!([1, "hello"]));
+    }
+
+    #[test]
+    fn collect_acc_empty_returns_empty_array() {
+        // collect() over zero rows is the empty list, never null.
+        let acc = CollectAcc::new(10_000);
+        assert_eq!(acc.finish(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn collect_acc_all_nulls_returns_empty_array() {
+        let mut acc = CollectAcc::new(10_000);
+        acc.accumulate(&Value::Null);
+        acc.accumulate(&Value::Null);
+        assert_eq!(acc.finish(), serde_json::json!([]));
     }
 
     #[test]
