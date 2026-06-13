@@ -305,6 +305,50 @@ enum RaftAction {
         dry_run: bool,
     },
 
+    /// Offline scan of a stopped node's raft log: decode every persisted
+    /// entry with this build and report what is readable, where format
+    /// drift starts, and the persisted vote/committed/purge markers.
+    ///
+    /// Recovery path for "raft log entry N is unreadable" startup fatals
+    /// (specs/implemented/bug-raft-log-bincode-format-instability.md).
+    /// The node must be stopped — sled holds an exclusive lock.
+    LogInspect {
+        /// Path to the node's Raft data directory (e.g. `/var/lib/ferrosa/raft`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Offline removal of all raft log entries with index >= --from on a
+    /// stopped node, clamping the committed marker to the surviving log
+    /// (or the snapshot-covered purge point if the log empties).
+    ///
+    /// DESTRUCTIVE: committed metadata ops at and beyond --from are
+    /// discarded. Use after `raft log-inspect` reports an unreadable tail;
+    /// run on every node whose log carries the same damage, then restart.
+    /// Requires --yes (or use --dry-run to preview).
+    LogTruncate {
+        /// Path to the node's Raft data directory (e.g. `/var/lib/ferrosa/raft`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+
+        /// First log index to remove (everything at and above is dropped).
+        /// Use the first-undecodable index from `raft log-inspect`.
+        #[arg(long)]
+        from: u64,
+
+        /// Report what would be removed without mutating the store.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm the destructive truncation.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Transfer Raft leadership to a target node (Ongaro §3.10).
     ///
     /// Useful for graceful drains during DC-aware operations and for
@@ -532,6 +576,15 @@ async fn main() {
         },
         Commands::Raft { action } => match action {
             RaftAction::Reset { data_dir, dry_run } => commands::raft_reset(&data_dir, dry_run),
+            RaftAction::LogInspect { data_dir, json } => {
+                commands::raft_log_inspect(&data_dir, json)
+            }
+            RaftAction::LogTruncate {
+                data_dir,
+                from,
+                dry_run,
+                yes,
+            } => commands::raft_log_truncate(&data_dir, from, dry_run, yes),
             RaftAction::TransferLeader { to } => {
                 commands::raft_transfer_leader(&web_host, web_port, &to).await
             }
@@ -754,6 +807,74 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// `ferrosa-ctl raft log-inspect --data-dir <path> --json` parses.
+    #[test]
+    fn subcommand_raft_log_inspect_parses() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "log-inspect",
+            "--data-dir",
+            "/var/lib/ferrosa/raft",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action: RaftAction::LogInspect { data_dir, json },
+            } => {
+                assert_eq!(data_dir, std::path::PathBuf::from("/var/lib/ferrosa/raft"));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// `ferrosa-ctl raft log-truncate` parses and `--from` is required.
+    #[test]
+    fn subcommand_raft_log_truncate_parses_and_requires_from() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "log-truncate",
+            "--data-dir",
+            "/var/lib/ferrosa/raft",
+            "--from",
+            "6000",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Raft {
+                action:
+                    RaftAction::LogTruncate {
+                        data_dir,
+                        from,
+                        dry_run,
+                        yes,
+                    },
+            } => {
+                assert_eq!(data_dir, std::path::PathBuf::from("/var/lib/ferrosa/raft"));
+                assert_eq!(from, 6000);
+                assert!(!dry_run);
+                assert!(yes);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // --from is mandatory: truncating "everything" must be impossible
+        // to express by accident.
+        assert!(Cli::try_parse_from([
+            "ferrosa-ctl",
+            "raft",
+            "log-truncate",
+            "--data-dir",
+            "/var/lib/ferrosa/raft",
+            "--yes",
+        ])
+        .is_err());
     }
 
     /// W1.11 CLI parsing: `--dry-run` is supported.

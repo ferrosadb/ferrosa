@@ -802,6 +802,153 @@ pub fn raft_reset(
     Ok(())
 }
 
+/// Offline raft log scan: decode every persisted entry and report the
+/// readable/unreadable split plus the persisted markers. Recovery entry
+/// point for format-drift fatals
+/// (specs/implemented/bug-raft-log-bincode-format-instability.md).
+pub fn raft_log_inspect(
+    data_dir: &std::path::Path,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use ferrosa_cluster::raft::log_store::SledLogStore;
+
+    let report = SledLogStore::inspect(data_dir)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    fn opt<T: std::fmt::Debug>(v: &Option<T>) -> String {
+        v.as_ref()
+            .map(|x| format!("{x:?}"))
+            .unwrap_or_else(|| "<none>".to_string())
+    }
+
+    println!(
+        "ferrosa-ctl raft log-inspect\n\
+         path:          {}\n\
+         vote:          {}\n\
+         committed:     {}\n\
+         last_purged:   {}\n\
+         entries:       {} total ({} decodable, {} unreadable)\n\
+         index range:   {} .. {}",
+        data_dir.display(),
+        opt(&report.vote),
+        opt(&report.committed),
+        opt(&report.last_purged),
+        report.total_entries,
+        report.decoded_entries,
+        report.undecodable_count,
+        opt(&report.first_index),
+        opt(&report.last_index),
+    );
+
+    match &report.first_undecodable {
+        None => println!("verdict:       all entries decode with this build"),
+        Some(bad) => println!(
+            "first bad:     entry {} (bytes: {}…)\n\
+             error:         {}\n\
+             recover:       stop the node, then\n\
+             \x20              ferrosa-ctl raft log-truncate --data-dir {} --from {} --yes\n\
+             note:          committed metadata ops >= {} will be discarded; the\n\
+             \x20              snapshot-covered state (last_purged) is unaffected. Run on\n\
+             \x20              every node whose log carries the same damage, then restart.",
+            bad.index,
+            bad.preview_hex,
+            bad.error,
+            data_dir.display(),
+            bad.index,
+            bad.index,
+        ),
+    }
+
+    Ok(())
+}
+
+/// Offline raft log truncation: drop entries at and above `--from`,
+/// clamping the committed marker to the surviving log. Destructive —
+/// requires `--yes` (or `--dry-run` to preview).
+pub fn raft_log_truncate(
+    data_dir: &std::path::Path,
+    from: u64,
+    dry_run: bool,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use ferrosa_cluster::raft::log_store::SledLogStore;
+
+    if dry_run {
+        let report = SledLogStore::inspect(data_dir)?;
+        // Raft log indexes are contiguous, so the doomed count is a range size.
+        let doomed = match (report.first_index, report.last_index) {
+            (Some(first), Some(last)) if last >= from => last - from.max(first) + 1,
+            _ => 0,
+        };
+        println!(
+            "ferrosa-ctl raft log-truncate --dry-run\n\
+             path:          {}\n\
+             would remove:  {} entries (index {} through {})\n\
+             committed:     {} (will be clamped if it points past the cut)\n\
+             last_purged:   {}",
+            data_dir.display(),
+            doomed,
+            from,
+            report
+                .last_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "<empty log>".to_string()),
+            report
+                .committed
+                .map(|c| format!("{c:?}"))
+                .unwrap_or_else(|| "<none>".to_string()),
+            report
+                .last_purged
+                .map(|p| format!("{p:?}"))
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+        return Ok(());
+    }
+
+    if !yes {
+        return Err(format!(
+            "refusing to truncate the raft log without --yes: entries >= {from} \
+             (including committed metadata ops) will be permanently discarded. \
+             Preview with --dry-run first."
+        )
+        .into());
+    }
+
+    let report = SledLogStore::truncate_from(data_dir, from)?;
+    println!(
+        "ferrosa-ctl raft log-truncate\n\
+         path:          {}\n\
+         removed:       {} entries (from index {})\n\
+         new last:      {}\n\
+         committed:     {} -> {}\n\
+         next start:    the node re-forms raft from its snapshot; repeat on every\n\
+         \x20              node with the same damage before restarting the cluster.",
+        data_dir.display(),
+        report.removed_entries,
+        report
+            .first_removed_index
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| format!("{from}; log had no entries at or above it")),
+        report
+            .new_last_index
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "<empty log>".to_string()),
+        report
+            .committed_before
+            .map(|c| format!("{c:?}"))
+            .unwrap_or_else(|| "<none>".to_string()),
+        report
+            .committed_after
+            .map(|c| format!("{c:?}"))
+            .unwrap_or_else(|| "<none>".to_string()),
+    );
+    Ok(())
+}
+
 /// W6.7 (ADR-015): bootstrap a new per-DC Raft group.
 ///
 /// Computes the deterministic [`ferrosa_cluster::raft::RaftGroupId`]
