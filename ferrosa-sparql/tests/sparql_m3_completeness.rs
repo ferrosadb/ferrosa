@@ -11,7 +11,7 @@
 //! | URS-QEC-S01 | CONSTRUCT / DESCRIBE query forms | `plan_query` must return Ok for these forms; engine must produce graph output |
 //! | URS-QEC-S02 | Full SPARQL UPDATE beyond M1: INSERT WHERE | INSERT WHERE must persist triples |
 //! | URS-QEC-S03 | RDF* eval (silent → fail loud) + SPARQL XML results | annotated var must NOT silently be absent; XML serialization round-trip |
-//! | URS-QEC-S04 | ORDER BY expressions (silent → fail loud) | non-variable ORDER BY must return Err, not silently skip |
+//! | URS-QEC-S04 | ORDER BY expressions | non-variable ORDER BY (e.g. `?a + ?b`, `STR(?x)`) must be evaluated per-solution and sort correctly (ASC/DESC), not be silently ignored |
 
 use std::sync::Arc;
 
@@ -311,52 +311,80 @@ fn result_format_accepts_xml_content_type() {
 }
 
 // ---------------------------------------------------------------------------
-// URS-QEC-S04 — ORDER BY on expressions must fail loud
+// URS-QEC-S04 — ORDER BY on expressions (evaluated per-solution, ASC/DESC)
 // ---------------------------------------------------------------------------
 
-/// S04 (URS-QEC-X01): ORDER BY with a non-variable expression (e.g. a
-/// function call like `STR(?name)`, or an arithmetic expression) must return a
-/// clear SPARQL protocol error, NOT silently skip the ordering and return
-/// results in arbitrary order.
+/// S04 (headline): `ORDER BY (?a + ?b) DESC` must evaluate the arithmetic
+/// expression per solution and sort by the resulting sum, descending — not
+/// silently ignore the clause and return rows in arbitrary order.
 ///
-/// Current (broken) behaviour: `planner.rs` logs a warning and falls through,
-/// silently discarding the ORDER BY clause.  The caller gets results in an
-/// arbitrary, undocumented order with no indication that the requested ordering
-/// was not applied.
-///
-/// Required behaviour: the engine returns `Err(SparqlError::Plan(…))` so the
-/// HTTP layer returns 400 Bad Request, not a silently unordered 200.
+/// Data: three subjects with integer (?a, ?b) pairs whose sums are 5, 9, 7.
+/// DESC ordering by (?a + ?b) must yield subjects in sum order 9, 7, 5.
 #[tokio::test]
-async fn order_by_expression_fails_loud_not_silent_ignore() {
+async fn order_by_arithmetic_expression_desc_orders_correctly() {
     let (storage, wp, _dir) = setup();
     let eng = engine(storage, wp);
 
-    // The query itself must fail loud at planning time regardless of stored data.
-    let err = eng
-        .execute(
-            "SELECT ?s ?name \
-             WHERE  { ?s <http://ex/name> ?name } \
-             ORDER BY STR(?name)",
-            KS,
-        )
-        .await
-        .expect_err(
-            "ORDER BY on a function expression must return Err (fail loud), \
-             not silently ignore the ordering clause and return Ok",
-        );
+    eng.execute_update(
+        "INSERT DATA { \
+            <http://ex/x> <http://ex/a> 2 ; <http://ex/b> 3 . \
+            <http://ex/y> <http://ex/a> 4 ; <http://ex/b> 5 . \
+            <http://ex/z> <http://ex/a> 1 ; <http://ex/b> 6 }",
+        KS,
+    )
+    .await
+    .expect("insert data");
 
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("order")
-            || msg.contains("expression")
-            || msg.contains("not implemented")
-            || msg.contains("unsupported"),
-        "error must explain that ORDER BY expressions are not implemented: {msg}"
+    let subjects = select_values(
+        &eng,
+        "SELECT ?s ?a ?b \
+         WHERE { ?s <http://ex/a> ?a ; <http://ex/b> ?b } \
+         ORDER BY DESC(?a + ?b)",
+        "s",
+    )
+    .await;
+
+    // y: 4+5=9, z: 1+6=7, x: 2+3=5
+    assert_eq!(
+        subjects,
+        vec!["http://ex/y", "http://ex/z", "http://ex/x"],
+        "ORDER BY (?a + ?b) DESC must sort by the evaluated sum, descending"
+    );
+}
+
+/// S04 (function expression, ASC): `ORDER BY STR(?name)` must evaluate the
+/// function per solution and sort by its string result ascending.
+#[tokio::test]
+async fn order_by_str_function_expression_orders_correctly() {
+    let (storage, wp, _dir) = setup();
+    let eng = engine(storage, wp);
+
+    eng.execute_update(
+        "INSERT DATA { \
+            <http://ex/b> <http://ex/name> \"Berta\" . \
+            <http://ex/a> <http://ex/name> \"Anna\"  . \
+            <http://ex/c> <http://ex/name> \"Carl\" }",
+        KS,
+    )
+    .await
+    .expect("insert data");
+
+    let names = select_values(
+        &eng,
+        "SELECT ?name WHERE { ?s <http://ex/name> ?name } ORDER BY STR(?name)",
+        "name",
+    )
+    .await;
+
+    assert_eq!(
+        names,
+        vec!["Anna", "Berta", "Carl"],
+        "ORDER BY STR(?name) must sort by the function result ascending"
     );
 }
 
 /// S04 (positive case): ORDER BY on a plain variable must still work correctly
-/// after the fail-loud change — we must not regress variable-based ordering.
+/// — we must not regress the trivial variable-ordering path.
 #[tokio::test]
 async fn order_by_variable_still_works_after_fail_loud_change() {
     let (storage, wp, _dir) = setup();
@@ -386,29 +414,34 @@ async fn order_by_variable_still_works_after_fail_loud_change() {
     );
 }
 
-/// S04 (negative direction): ORDER BY DESC(expression) must also fail loud.
+/// S04 (function expression, DESC): `ORDER BY DESC(STR(?name))` must evaluate
+/// the function per solution and sort by its string result descending.
 #[tokio::test]
-async fn order_by_desc_expression_fails_loud() {
+async fn order_by_desc_function_expression_orders_correctly() {
     let (storage, wp, _dir) = setup();
     let eng = engine(storage, wp);
 
-    let err = eng
-        .execute(
-            "SELECT ?s ?name \
-             WHERE  { ?s <http://ex/name> ?name } \
-             ORDER BY DESC(STR(?name))",
-            KS,
-        )
-        .await
-        .expect_err("ORDER BY DESC(expr) must return Err (fail loud)");
+    eng.execute_update(
+        "INSERT DATA { \
+            <http://ex/b> <http://ex/name> \"Berta\" . \
+            <http://ex/a> <http://ex/name> \"Anna\"  . \
+            <http://ex/c> <http://ex/name> \"Carl\" }",
+        KS,
+    )
+    .await
+    .expect("insert data");
 
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("order")
-            || msg.contains("expression")
-            || msg.contains("not implemented")
-            || msg.contains("unsupported"),
-        "error must mention unsupported ORDER BY expression: {msg}"
+    let names = select_values(
+        &eng,
+        "SELECT ?name WHERE { ?s <http://ex/name> ?name } ORDER BY DESC(STR(?name))",
+        "name",
+    )
+    .await;
+
+    assert_eq!(
+        names,
+        vec!["Carl", "Berta", "Anna"],
+        "ORDER BY DESC(STR(?name)) must sort by the function result descending"
     );
 }
 

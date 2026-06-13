@@ -30,8 +30,9 @@ pub async fn execute(
         });
     }
 
-    // BUG-S13: apply ORDER BY.
-    apply_order_by(&mut binding_sets, &plan.order_by);
+    // BUG-S13 / URS-QEC-S04: apply ORDER BY (evaluates expressions per solution;
+    // fails loud on unsupported forms).
+    apply_order_by(&mut binding_sets, &plan.order_by)?;
 
     // BUG-S13: apply DISTINCT.
     if plan.distinct {
@@ -229,19 +230,34 @@ fn try_insert_binding(row: &mut HashMap<String, Binding>, name: &str, binding: &
     }
 }
 
-/// Sort binding sets by ORDER BY conditions (BUG-S13).
+/// Sort binding sets by ORDER BY conditions (BUG-S13, URS-QEC-S04).
+///
+/// Each condition holds a full expression (a plain `?var` is the trivial
+/// `Variable` expression). The expression is evaluated per solution and the
+/// solutions are sorted by the result, numerically when both sides are numeric.
+///
+/// URS-QEC-X01 (fail loud): if any ORDER BY expression contains a sub-form this
+/// engine cannot evaluate, return an error instead of silently sorting those
+/// rows as equal (which would yield an arbitrary, undocumented order).
 fn apply_order_by(
     binding_sets: &mut [HashMap<String, Binding>],
     order_by: &[crate::planner::OrderCondition],
-) {
+) -> Result<(), SparqlError> {
     if order_by.is_empty() {
-        return;
+        return Ok(());
+    }
+    for cond in order_by {
+        if let Some(what) = crate::filter::unsupported_expr(&cond.expression) {
+            return Err(SparqlError::Plan(format!(
+                "ORDER BY expression is not supported: {what}; \
+                 cannot evaluate it per solution, refusing to return an \
+                 arbitrarily-ordered result"
+            )));
+        }
     }
     binding_sets.sort_by(|a, b| {
         for cond in order_by {
-            let va = a.get(&cond.variable).map(|b| b.value.as_str());
-            let vb = b.get(&cond.variable).map(|b| b.value.as_str());
-            let ord = va.cmp(&vb);
+            let ord = crate::filter::order_cmp(&cond.expression, a, b);
             let ord = if cond.ascending { ord } else { ord.reverse() };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -249,6 +265,7 @@ fn apply_order_by(
         }
         std::cmp::Ordering::Equal
     });
+    Ok(())
 }
 
 /// Remove duplicate binding rows (BUG-S13).
@@ -682,10 +699,10 @@ mod tests {
             make_binding_row("name", "Bob"),
         ];
         let conditions = vec![crate::planner::OrderCondition {
-            variable: "name".into(),
+            expression: var_expr("name"),
             ascending: true,
         }];
-        apply_order_by(&mut rows, &conditions);
+        apply_order_by(&mut rows, &conditions).unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r["name"].value.as_str()).collect();
         assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
     }
@@ -698,12 +715,66 @@ mod tests {
             make_binding_row("name", "Bob"),
         ];
         let conditions = vec![crate::planner::OrderCondition {
-            variable: "name".into(),
+            expression: var_expr("name"),
             ascending: false,
         }];
-        apply_order_by(&mut rows, &conditions);
+        apply_order_by(&mut rows, &conditions).unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r["name"].value.as_str()).collect();
         assert_eq!(names, vec!["Charlie", "Bob", "Alice"]);
+    }
+
+    // --- URS-QEC-S04: ORDER BY on expressions ---
+
+    fn make_numeric_row(
+        a_var: &str,
+        a_val: &str,
+        b_var: &str,
+        b_val: &str,
+    ) -> HashMap<String, Binding> {
+        let mut row = HashMap::new();
+        for (var, val) in [(a_var, a_val), (b_var, b_val)] {
+            row.insert(
+                var.to_string(),
+                Binding {
+                    binding_type: "literal".into(),
+                    value: val.into(),
+                    datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+                    lang: None,
+                },
+            );
+        }
+        row
+    }
+
+    fn var_expr(name: &str) -> spargebra::algebra::Expression {
+        spargebra::algebra::Expression::Variable(spargebra::term::Variable::new_unchecked(name))
+    }
+
+    #[test]
+    fn apply_order_by_arithmetic_expression_desc() {
+        // ORDER BY (?a + ?b) DESC must sort by the evaluated sum, descending.
+        // Rows: sums are 5 (2+3), 9 (4+5), 7 (1+6).
+        let mut rows = vec![
+            make_numeric_row("a", "2", "b", "3"), // 5
+            make_numeric_row("a", "4", "b", "5"), // 9
+            make_numeric_row("a", "1", "b", "6"), // 7
+        ];
+        let sum =
+            spargebra::algebra::Expression::Add(Box::new(var_expr("a")), Box::new(var_expr("b")));
+        let conditions = vec![crate::planner::OrderCondition {
+            expression: sum,
+            ascending: false,
+        }];
+        apply_order_by(&mut rows, &conditions).unwrap();
+        let sums: Vec<i64> = rows
+            .iter()
+            .map(|r| r["a"].value.parse::<i64>().unwrap() + r["b"].value.parse::<i64>().unwrap())
+            .collect();
+        assert_eq!(
+            sums,
+            vec![9, 7, 5],
+            "ORDER BY (?a + ?b) DESC must order by sum descending"
+        );
     }
 
     // --- BUG-S13: DISTINCT ---
