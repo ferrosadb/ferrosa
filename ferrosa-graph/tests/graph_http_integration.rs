@@ -5948,6 +5948,178 @@ async fn http_call_subquery_unit_performs_writes_per_row() {
     );
 }
 
+/// Trailing `RETURN ... LIMIT n` after a `CALL {}` must apply the limit. With 3
+/// outer rows the unbounded result is 3 rows; `LIMIT 1` must cut it to exactly 1.
+/// Silently ignoring the limit (returning 3) is a wrong result (URS-QEC-X01).
+#[tokio::test]
+async fn http_call_subquery_trailing_return_applies_limit() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p RETURN p.age AS a } \
+                      RETURN p.name, a LIMIT 1",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trailing LIMIT must return 200");
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "trailing CALL {{}} RETURN ... LIMIT 1 must emit exactly 1 row, not all 3"
+    );
+}
+
+/// Trailing `RETURN DISTINCT` after a `CALL {}` must deduplicate. Three outer rows
+/// each project the constant `1`; `DISTINCT one` must collapse to a single row.
+/// Returning 3 duplicate rows is a silent wrong result (URS-QEC-X01).
+#[tokio::test]
+async fn http_call_subquery_trailing_return_applies_distinct() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p RETURN 1 AS one } \
+                      RETURN DISTINCT one",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trailing DISTINCT must return 200");
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "trailing CALL {{}} RETURN DISTINCT must collapse 3 identical rows to 1"
+    );
+    assert_eq!(rows[0][0].as_i64(), Some(1), "the surviving distinct row is 1");
+}
+
+/// Trailing `RETURN ... ORDER BY` after a `CALL {}` must sort the united result.
+/// Without ORDER BY the rows arrive in outer-match order; ORDER BY age DESC must
+/// produce a strictly descending sequence. Ignoring ORDER BY is a wrong result.
+#[tokio::test]
+async fn http_call_subquery_trailing_return_applies_order_by() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p RETURN p.age AS a } \
+                      RETURN a ORDER BY a DESC",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trailing ORDER BY must return 200");
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().expect("age int")).collect();
+    assert_eq!(
+        ages,
+        vec![72, 49, 36],
+        "trailing CALL {{}} RETURN ... ORDER BY a DESC must sort the united rows descending"
+    );
+}
+
+/// Trailing `RETURN count(*)` after a `CALL {}` must aggregate over the united
+/// result. Three outer rows each yield one inner row, so `count(*)` over the whole
+/// trailing projection is 3. Evaluating count per-row (returning 1 three times, or
+/// any non-grouped shape) is a silent wrong result (URS-QEC-X01).
+#[tokio::test]
+async fn http_call_subquery_trailing_return_aggregates_count() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p RETURN p.age AS a } \
+                      RETURN count(*) AS n",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trailing aggregation must return 200");
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "an aggregate-only trailing RETURN must collapse to a single grouped row"
+    );
+    assert_eq!(
+        rows[0][0].as_i64(),
+        Some(3),
+        "count(*) over the 3 united inner rows must be 3, not a per-row 1"
+    );
+}
+
+/// Trailing `RETURN key, count(*)` after a `CALL {}` must group by the non-aggregate
+/// key. Three Person rows each map to a distinct age, so grouping by age yields 3
+/// groups of count 1. A correlated grouped aggregation over the united result.
+#[tokio::test]
+async fn http_call_subquery_trailing_return_grouped_aggregate() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p RETURN p.age AS a } \
+                      RETURN a, count(*) AS n ORDER BY a",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trailing grouped aggregate must return 200");
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let pairs: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|r| (r[0].as_i64().expect("age"), r[1].as_i64().expect("count")))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![(36, 1), (49, 1), (72, 1)],
+        "grouped aggregate must produce one (age, count=1) row per distinct age, ordered"
+    );
+}
+
 /// Fail loud: a `CALL {}` nested inside another `CALL {}` is not supported. The
 /// engine must return a clear Cypher error (non-200), never silently no-op or
 /// return wrong/empty results.
