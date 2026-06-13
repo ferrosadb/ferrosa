@@ -35,7 +35,10 @@ pub mod two_phase_ddl;
 pub mod uda_integration;
 pub(crate) mod wire;
 
-pub use apply::{ApplyError, ApplyMutation, DepWaitApplier, NoopStorageApplier, StorageApplier};
+pub use apply::{
+    ApplyError, ApplyMutation, DepWaitApplier, EngineStorageApplier, NoopStorageApplier,
+    StorageApplier,
+};
 pub use clock::{ClockError, ClockValidator};
 pub use clock_validation::{
     validate_timestamp_drift, ClockDriftRejection, DEFAULT_MAX_CLOCK_DRIFT_NS,

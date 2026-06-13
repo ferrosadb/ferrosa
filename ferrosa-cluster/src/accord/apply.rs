@@ -22,9 +22,11 @@
 //! `DepWaitApplier` uses a `parking_lot::Mutex` for the dep-wait graph so it
 //! can be shared across the coordinator thread and the replica handler thread.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ferrosa_common::accord::{Timestamp, TxnId};
+use ferrosa_storage::{Mutation, StorageEngine, TableId};
 use parking_lot::Mutex;
 
 use crate::accord::dep_wait::DepWaitGraph;
@@ -124,6 +126,87 @@ impl Default for NoopStorageApplier {
 impl StorageApplier for NoopStorageApplier {
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
         self.applied.lock().push((txn_id, mutation.t));
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EngineStorageApplier — real persistence via StorageEngine
+// ---------------------------------------------------------------------------
+
+/// Production [`StorageApplier`] that durably persists a committed mutation to
+/// the local [`StorageEngine`].
+///
+/// `ApplyMutation.data` is decoded as a self-describing commit-log
+/// [`Mutation`], which carries the `(keyspace, table)` → [`TableId`], the
+/// [`DecoratedKey`](ferrosa_common::DecoratedKey), the row data, and the
+/// write timestamp. Each row is written via [`StorageEngine::write`], which
+/// appends to the commit log and the memtable (persist-before-return).
+///
+/// # Idempotency
+///
+/// Accord delivers `Apply` at-least-once, and recovery may re-drive it. The
+/// applier records every `(txn_id, t)` it has applied and treats a repeat as a
+/// no-op. This is required for correctness: re-decoding and re-writing an old
+/// mutation would resurrect a stale value over a newer write to the same key
+/// (last-write-wins would normally protect us, but a re-applied mutation
+/// re-uses its *original* cell timestamp, so a naive re-write is a lost-update
+/// hazard). Tracking applied transactions makes re-apply a true no-op.
+pub struct EngineStorageApplier {
+    engine: Arc<StorageEngine>,
+    /// `(txn_id, t.time)` pairs already persisted — for idempotent re-apply.
+    applied: Mutex<HashSet<(TxnId, u64)>>,
+}
+
+impl EngineStorageApplier {
+    /// Create an applier backed by the live storage engine.
+    pub fn new(engine: Arc<StorageEngine>) -> Self {
+        Self {
+            engine,
+            applied: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Number of distinct `(txn_id, t)` pairs persisted (for assertions/metrics).
+    pub fn applied_count(&self) -> usize {
+        self.applied.lock().len()
+    }
+}
+
+impl StorageApplier for EngineStorageApplier {
+    fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
+        let key = (txn_id, mutation.t.time);
+
+        // Idempotency gate: an already-applied (txn_id, t) is a no-op. Checked
+        // before decode so a duplicate Apply never re-writes a stale value.
+        if self.applied.lock().contains(&key) {
+            return Ok(());
+        }
+
+        // Decode the self-describing commit-log mutation. Fail loud on garbage.
+        let decoded = Mutation::deserialize_from(&mutation.data).map_err(|e| ApplyError {
+            txn_id,
+            reason: format!("failed to decode apply mutation: {e}"),
+        })?;
+
+        let table_id = TableId::new(&decoded.keyspace, &decoded.table);
+
+        // Persist every row at the mutation's timestamp. `StorageEngine::write`
+        // appends to the commit log (durable) before the memtable, and returns
+        // an error if the table is unregistered or admission is denied — we
+        // propagate that as `ApplyError` (never fake success).
+        for row in decoded.rows {
+            self.engine
+                .write(&table_id, &decoded.key, row, decoded.timestamp)
+                .map_err(|e| ApplyError {
+                    txn_id,
+                    reason: format!("storage write failed for {table_id}: {e}"),
+                })?;
+        }
+
+        // Record only after all rows are durable, so a mid-apply failure leaves
+        // the txn re-appliable rather than falsely marked applied.
+        self.applied.lock().insert(key);
         Ok(())
     }
 }
@@ -427,5 +510,221 @@ mod tests {
             log_a_pos < log_b_pos,
             "txn_a must be applied before txn_b in the log"
         );
+    }
+}
+
+// ===========================================================================
+// EngineStorageApplier tests — real persistence via StorageEngine
+// ===========================================================================
+//
+// Increment 3 of the Accord LWT data-path plan: a `StorageApplier` that
+// decodes `ApplyMutation.data` as a self-describing commit-log `Mutation`
+// (TableId via keyspace/table, DecoratedKey, Row, ts) and persists it through
+// `StorageEngine::write`. These tests use a REAL engine (not a Noop) and
+// assert the row is durably readable afterwards — closing the phantom-write
+// gap at the storage seam.
+
+#[cfg(test)]
+mod engine_applier_tests {
+    use super::*;
+    use ferrosa_common::accord::{Timestamp, TxnId};
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use ferrosa_storage::{Mutation, StorageEngine, StorageEngineConfig, TableId};
+
+    const KS: &str = "lwt_ks";
+    const TABLE: &str = "lwt_table";
+
+    fn accord_ts(micros: u64) -> Timestamp {
+        Timestamp::synthetic(micros)
+    }
+
+    fn txn(node: u64, micros: u64) -> TxnId {
+        TxnId::new(node, accord_ts(micros))
+    }
+
+    fn test_schema() -> TableSchema {
+        TableSchema {
+            keyspace: KS.to_string(),
+            table: TABLE.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    fn make_engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        (Arc::new(engine), dir)
+    }
+
+    fn make_key(s: &str) -> DecoratedKey {
+        DecoratedKey::new(PartitionKey::new(s.as_bytes().to_vec()))
+    }
+
+    fn make_row(value: &[u8], cell_ts: i64) -> Row {
+        Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(value.to_vec(), cell_ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(cell_ts),
+        }
+    }
+
+    /// Encode an `ApplyMutation` whose `data` is a serialized commit-log
+    /// `Mutation` — the wire format the production applier must decode.
+    fn encoded_mutation(
+        key: DecoratedKey,
+        value: &[u8],
+        cell_ts: i64,
+        t: Timestamp,
+        deps: Vec<TxnId>,
+    ) -> ApplyMutation {
+        let m = Mutation::new(
+            KS.to_string(),
+            TABLE.to_string(),
+            key,
+            vec![make_row(value, cell_ts)],
+            cell_ts,
+        );
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        ApplyMutation { data: buf, t, deps }
+    }
+
+    fn read_cell0(engine: &StorageEngine, key: &DecoratedKey) -> Option<Vec<u8>> {
+        let partition = engine.read(&TableId::new(KS, TABLE), key).unwrap()?;
+        let row = partition.rows.first()?;
+        row.cells.first().and_then(|(_, c)| c.value.clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // RED: applying persists a row that is then readable via the engine.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_persists_row_readable_via_engine() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let key = make_key("pk1");
+        let t = accord_ts(1000);
+        let mutation = encoded_mutation(key.clone(), b"hello", 1000, t, vec![]);
+
+        applier
+            .apply(txn(1, 1000), mutation)
+            .expect("apply must persist the mutation to the engine");
+
+        assert_eq!(
+            read_cell0(&engine, &key).as_deref(),
+            Some(b"hello".as_slice()),
+            "the row written by apply must be readable via the engine — \
+             not a phantom write"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotent on (txn_id, t): re-applying the same txn is a safe no-op and
+    // must NOT clobber a newer value written under a different txn/timestamp.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_is_idempotent_on_txn_and_timestamp() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let key = make_key("pk1");
+        let id = txn(1, 1000);
+        let t = accord_ts(1000);
+
+        // First apply writes "v1".
+        applier
+            .apply(id, encoded_mutation(key.clone(), b"v1", 1000, t, vec![]))
+            .unwrap();
+
+        // A later txn writes "v2" with a higher cell timestamp.
+        applier
+            .apply(
+                txn(2, 2000),
+                encoded_mutation(key.clone(), b"v2", 2000, accord_ts(2000), vec![]),
+            )
+            .unwrap();
+        assert_eq!(read_cell0(&engine, &key).as_deref(), Some(b"v2".as_slice()));
+
+        // Re-applying the FIRST txn (same txn_id + t) must be a no-op: it must
+        // not resurrect "v1" over the newer "v2".
+        applier
+            .apply(id, encoded_mutation(key.clone(), b"v1", 1000, t, vec![]))
+            .unwrap();
+        assert_eq!(
+            read_cell0(&engine, &key).as_deref(),
+            Some(b"v2".as_slice()),
+            "re-applying an already-applied (txn_id, t) must not re-write"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail loud: a write to an unregistered table must return ApplyError,
+    // never a silent success.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_to_unregistered_table_fails_loud() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        // Build a mutation targeting a table that was never registered.
+        let m = Mutation::new(
+            KS.to_string(),
+            "no_such_table".to_string(),
+            make_key("pk1"),
+            vec![make_row(b"x", 1000)],
+            1000,
+        );
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        let mutation = ApplyMutation {
+            data: buf,
+            t: accord_ts(1000),
+            deps: vec![],
+        };
+
+        let err = applier
+            .apply(txn(1, 1000), mutation)
+            .expect_err("apply to an unregistered table must fail loud, not fake success");
+        assert!(
+            err.reason.contains("no_such_table") || err.reason.contains("not registered"),
+            "error must name the failure: {}",
+            err.reason
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Decode failure: malformed mutation bytes must return ApplyError.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_with_malformed_data_fails_loud() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine);
+
+        let mutation = ApplyMutation {
+            data: vec![0xFF, 0x00, 0x01], // truncated / not a valid Mutation
+            t: accord_ts(1000),
+            deps: vec![],
+        };
+
+        let err = applier
+            .apply(txn(1, 1000), mutation)
+            .expect_err("malformed mutation bytes must fail loud");
+        assert!(!err.reason.is_empty(), "decode error must carry a reason");
     }
 }
