@@ -164,12 +164,25 @@ impl Memtable for ShardedBTreeMemtable {
                 self.size.fetch_sub(old_size - new_size, Ordering::Relaxed);
             }
         } else {
-            // New partition
-            let partition = Partition {
-                key: key.clone(),
-                deletion: DeletionTime::LIVE,
-                static_row: None,
-                rows: vec![row],
+            // New partition. A partition-tombstone marker (empty clustering,
+            // no cells, non-LIVE deletion) is a partition-level DELETE: lift it
+            // into `Partition::deletion` instead of storing a phantom row, so a
+            // subsequent read suppresses every clustered row at or below the
+            // tombstone timestamp (see `super::is_partition_tombstone`).
+            let partition = if super::is_partition_tombstone(&row) {
+                Partition {
+                    key: key.clone(),
+                    deletion: row.deletion,
+                    static_row: None,
+                    rows: Vec::new(),
+                }
+            } else {
+                Partition {
+                    key: key.clone(),
+                    deletion: DeletionTime::LIVE,
+                    static_row: None,
+                    rows: vec![row],
+                }
             };
             let size = Self::estimate_partition_size(&partition);
             shard.insert(key.clone(), Arc::new(partition));
@@ -297,6 +310,17 @@ impl Memtable for ShardedBTreeMemtable {
 /// same clustering key exists, merges cells (newer timestamp wins per cell).
 /// Otherwise inserts the row at the correct sorted position.
 pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) {
+    // A partition-tombstone marker is a partition-level DELETE: merge it into
+    // `Partition::deletion` (newer tombstone wins, LWW) rather than storing it
+    // as a clustered row. Otherwise it would sit in `rows` as a phantom
+    // empty-clustering row and suppress nothing, silently dropping the delete.
+    if super::is_partition_tombstone(&new_row) {
+        if new_row.deletion.marked_for_delete_at > partition.deletion.marked_for_delete_at {
+            partition.deletion = new_row.deletion;
+        }
+        return;
+    }
+
     // Binary search by clustering key
     let pos = partition
         .rows
@@ -671,6 +695,70 @@ mod tests {
         };
         mem.put(&key, row, &schema)
             .expect("partition tombstone must be accepted on clustered table");
+    }
+
+    /// A partition-tombstone marker must be lifted into `Partition::deletion`
+    /// (LWW), not stored as a phantom empty-clustering row. Otherwise a
+    /// whole-partition `DELETE FROM t WHERE pk = ?` suppresses nothing and the
+    /// rows silently survive (the bug the batch primitive exposed).
+    #[test]
+    fn put_partition_tombstone_sets_partition_deletion_not_a_row() {
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "t".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let key = make_key("pk1");
+
+        // Seed two clustered rows (ts=100), then a partition tombstone (ts=200).
+        let row1 = Row {
+            clustering: 1i32.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(b"a".to_vec(), 100))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(100),
+        };
+        let row2 = Row {
+            clustering: 2i32.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(b"b".to_vec(), 100))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(100),
+        };
+        mem.put(&key, row1, &schema).unwrap();
+        mem.put(&key, row2, &schema).unwrap();
+        mem.put(
+            &key,
+            Row {
+                clustering: vec![],
+                cells: vec![],
+                deletion: DeletionTime::new(200, 0),
+                primary_key_liveness: LivenessInfo::NONE,
+            },
+            &schema,
+        )
+        .unwrap();
+
+        let partition = mem.get(&key).unwrap().expect("partition present");
+        // The tombstone is lifted to the partition, not stored as a phantom row.
+        assert_eq!(
+            partition.deletion.marked_for_delete_at, 200,
+            "partition-level deletion must carry the tombstone timestamp"
+        );
+        assert!(
+            partition.rows.iter().all(|r| !r.clustering.is_empty()),
+            "no empty-clustering phantom tombstone row may be stored in rows"
+        );
     }
 
     /// 16-byte TimeUUID cell must be accepted (control case for the

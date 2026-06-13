@@ -5161,14 +5161,31 @@ impl StorageEngine {
             return Ok(());
         }
 
-        // Preflight every target table before appending any batch mutation to
-        // the commitlog. This preserves all-or-nothing client-visible failure
-        // semantics for overload rejection.
+        // Preflight every target table AND every entry's size before appending
+        // any batch mutation to the commitlog. This preserves all-or-nothing
+        // semantics: every fallible append condition (table registration,
+        // overload admission, and oversized-entry rejection) is checked up
+        // front, so Phase 1 cannot fail *partway* and leave an already-appended
+        // (and therefore replay-durable) prefix of the batch on disk.
         {
             let tables = self.tables.read();
+            let max_entry = self.commit_log.max_entry_size();
             let mut checked = HashSet::new();
             for m in &mutations {
                 self.check_write_admission()?;
+
+                // Oversized-entry preflight: an entry larger than a fresh
+                // segment can never be appended, so reject the whole batch now
+                // rather than after appending earlier ops.
+                let entry_size = CommitLog::entry_size(m);
+                if entry_size > max_entry {
+                    return Err(ferrosa_common::Error::InvalidData(format!(
+                        "batch entry ({entry_size} bytes) exceeds commit-log \
+                         segment capacity ({max_entry} bytes usable); increase \
+                         segment_size or split the batch"
+                    )));
+                }
+
                 let table_id = TableId::new(&m.keyspace, &m.table);
                 if !checked.insert(table_id.clone()) {
                     continue;
@@ -5189,6 +5206,18 @@ impl StorageEngine {
             let table_id = TableId::new(&m.keyspace, &m.table);
             positions.insert(table_id, cl_pos);
         }
+
+        // Durability barrier: synchronously fsync the appended batch BEFORE it
+        // is made visible in the memtable (Phase 2). Without this, under the
+        // production-default `Periodic` sync strategy `append()` only schedules
+        // a background fsync, so the rows would become readable while still
+        // unsynced — a crash in that window would lose an acked, already-visible
+        // batch. `force_sync` propagates fsync failures as `Err` (fail-loud);
+        // on error nothing has been applied to the memtable yet, so the batch
+        // remains all-or-nothing: the appended entries replay together on the
+        // next restart if they reached disk, or are lost together if they did
+        // not — never a torn, partly-visible state.
+        self.commit_log.force_sync()?;
 
         // Phase 2: Apply to memtables and update commit log positions.
         let tables = self.tables.read();

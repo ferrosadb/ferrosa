@@ -83,9 +83,14 @@ pub enum BatchOp {
 }
 
 impl StorageEngine {
-    /// Apply a batch of mixed ops atomically and durably (single fsync group).
-    /// All-or-nothing: on any preflight/append failure, **none** are applied and
-    /// an `Err` is returned. Ops touching the same key are applied in `ops` order.
+    /// Apply a batch of mixed ops atomically and durably. The whole group is
+    /// appended to the commit log and **synchronously fsynced (force_sync)
+    /// before any op becomes visible**, so `Ok` implies on-disk durability even
+    /// under the production-default `Periodic` sync strategy. All-or-nothing: a
+    /// full preflight (table registration, admission, and per-entry size vs.
+    /// segment capacity) rejects the batch before any append, so on failure
+    /// **none** are applied and an `Err` is returned. Ops touching the same key
+    /// are applied in `ops` order. Not read-isolated (see Guarantees §4).
     pub fn apply_batch(&self, ops: Vec<BatchOp>) -> ferrosa_common::Result<()>;
 
     /// Open a staging handle (Bolt explicit tx). Stages ops in memory; nothing
@@ -117,20 +122,37 @@ delegates to `apply_batch`. No second durability path is introduced.
 
 ## 4. Guarantees
 
-- **Atomicity (all-or-nothing, crash-atomic).** Preflight admission for all
-  target tables happens before any commit-log append. Commit-log append is the
-  commit point: either the whole batch's records reach the log or the call
-  returns `Err` having appended none that become visible. Memtable apply happens
-  only after the full log group is written.
-- **Durability.** One commit-log group per batch, one fsync (per the commit-log's
-  group-commit policy). Recovery replays the whole group; partial groups are
-  discarded by the existing commit-log framing/CRC.
-- **Isolation.** Snapshot-free; the batch is **atomically visible** for reads
-  once memtable apply completes (no torn intermediate state is observable across
-  the batch's memtable writes, which happen under the tables read-lock without
-  yielding). This primitive provides atomic *durability+visibility*, **not**
-  serializable concurrency control — cross-batch ordering for LWT/strict
-  serializability remains Accord's job; this is the apply substrate beneath it.
+- **Atomicity (all-or-nothing, crash-atomic).** A **full preflight** runs before
+  any commit-log append and rejects the entire batch on any condition that could
+  otherwise make an individual append fail partway: (a) unregistered target
+  table, (b) write/memtable overload admission, and (c) **any entry larger than a
+  commit-log segment** (`CommitLog::max_entry_size`). Because every per-append
+  failure mode is screened up front, the Phase-1 append loop cannot fail after
+  appending a prefix, so no replay-durable partial batch can exist. The appended
+  group is the durable commit point (see Durability); memtable apply happens only
+  after the whole group is durably synced.
+- **Durability (synchronous, strategy-independent).** After Phase-1 appends and
+  **before** the batch becomes visible in the memtable, `write_atomic_batch`
+  calls `commit_log.force_sync()` — a real fsync that propagates failures as
+  `Err` (fail-loud). This makes the guarantee hold under the **production-default
+  `Periodic` sync strategy**, where `append()` alone only *schedules* a
+  background fsync up to `sync_interval` later: without the barrier the rows
+  would become readable while still unsynced, so a crash could lose an acked,
+  already-visible batch. With the barrier, `apply_batch` returns `Ok` only after
+  the whole group is on disk. Recovery replays the whole group; partial/torn
+  final groups are discarded by the existing commit-log framing/CRC.
+- **Isolation — explicitly NOT provided (documented non-isolation contract).**
+  The batch is applied to per-key memtable shards one mutation at a time with
+  **no batch-level visibility barrier or snapshot**. A concurrent reader running
+  between two ops of the same batch can observe a **partial** batch (op 1 visible,
+  op 2 not yet). Callers needing cross-op atomic visibility must serialize their
+  own reads or rely on Accord ordering. This primitive provides atomic
+  *durability* (all-or-nothing on disk) and immediate post-return visibility,
+  **not** read isolation / serializable concurrency control. If Phase-2 memtable
+  apply fails after the durable sync, the error is surfaced (`Err`), but the
+  batch is already durable and replays all-or-nothing on the next restart — the
+  durable outcome stays atomic even though the live in-memory view may be
+  transiently incomplete until that replay.
 - **Fail-loud (X01).** Every step returns `Result`. **No** `let _ = write(...)`,
   no `continue`-on-error swallowing. Observer-derived mutations (§5.2) become
   part of the batch and surface their errors. An empty batch is `Ok(())`.
@@ -177,8 +199,8 @@ application-level forget-journal once available.
 
 | When crash occurs | Outcome |
 | --- | --- |
-| Before commit-log append completes | Batch not durable; replay applies nothing. Caller saw `Err` or no ack. All-or-nothing holds. |
-| After full log group written, before/ during memtable apply | Replay re-applies the **entire** group (all ops + derived observer mutations) from the log. Memtable rebuilt atomically. |
+| Before commit-log append + force_sync completes | Batch not durable; nothing was made visible (sync precedes memtable apply). Replay applies nothing. Caller saw `Err` or no ack. All-or-nothing holds. |
+| After force_sync, before/ during memtable apply | The whole group is already fsynced. Replay re-applies the **entire** group (all ops + derived observer mutations) from the log. Memtable rebuilt atomically. An acked batch is never lost. |
 | Mid-`BatchTxn` (staged, not committed) | Staged ops live only in memory; lost on crash exactly like `ROLLBACK`. Nothing durable, nothing replayed. |
 | Partial/torn final log group | Discarded by existing commit-log CRC/framing on recovery; never partially applied. |
 

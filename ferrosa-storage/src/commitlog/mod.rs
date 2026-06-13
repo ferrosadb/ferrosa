@@ -1050,6 +1050,22 @@ impl CommitLog {
         Ok(mutations)
     }
 
+    /// The largest single commit-log entry (payload + framing overhead) that
+    /// can ever be appended, given the configured segment size.
+    ///
+    /// An entry larger than this can never be appended (it overflows even a
+    /// fresh segment), so [`Self::append`] would fail. Batch callers pre-flight
+    /// against this so a multi-entry batch can never fail *partway* through its
+    /// appends, preserving all-or-nothing durability.
+    pub fn max_entry_size(&self) -> usize {
+        Segment::max_entry_size(self.config.segment_size)
+    }
+
+    /// The framed on-disk size of `mutation` as a single commit-log entry.
+    pub fn entry_size(mutation: &Mutation) -> usize {
+        Segment::entry_total_size(mutation)
+    }
+
     /// Force-syncs the active segment to disk.
     ///
     /// Waits for all in-flight writers to complete, then flushes the

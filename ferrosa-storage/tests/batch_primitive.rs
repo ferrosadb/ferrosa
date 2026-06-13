@@ -45,11 +45,25 @@ fn test_schema(keyspace: &str, table: &str) -> TableSchema {
 }
 
 fn test_engine_config(dir: &Path) -> StorageEngineConfig {
+    engine_config_with(dir, SyncStrategyConfig::Batch, 256 * 1024)
+}
+
+/// Engine config with an explicit commit-log sync strategy + segment size.
+///
+/// The durability and oversized-entry tests pin behavior under the PRODUCTION
+/// default sync strategy (`Periodic`), not the zero-loss `Batch` strategy the
+/// other tests use, so the synchronous-durability guarantee is proven where it
+/// actually has to hold.
+fn engine_config_with(
+    dir: &Path,
+    sync_strategy: SyncStrategyConfig,
+    segment_size: usize,
+) -> StorageEngineConfig {
     StorageEngineConfig {
         commit_log: CommitLogConfig {
-            segment_size: 256 * 1024,
+            segment_size,
             max_segment_age: Duration::from_secs(60),
-            sync_strategy: SyncStrategyConfig::Batch,
+            sync_strategy,
             batch: Default::default(),
             log_dir: dir.join("commitlog"),
             checkpoint_dir: dir.join("commitlog"),
@@ -355,4 +369,205 @@ fn batch_txn_commit_applies_abort_discards() {
         read_cell(&engine, &tid, &key, &ck(2)).as_deref(),
         Some(&b"committed_b"[..])
     );
+}
+
+/// DURABILITY (synchronous, under the PRODUCTION default strategy + crash):
+/// after `apply_batch` returns `Ok` under `Periodic` sync, the batch is on disk
+/// **before** the call returns — a crash that loses all in-memory state and the
+/// background sync timer must NOT lose an acked batch.
+///
+/// Crash is simulated faithfully: the `Periodic` background thread is set to a
+/// 1-hour interval so it cannot fsync during the test, and the engine is
+/// *dropped without `shutdown()`* (no clean flush — `PeriodicSync::drop` does
+/// not flush). The ONLY way the bytes can be on disk is an explicit
+/// force-sync inside `apply_batch`. We then reopen the directory and replay:
+/// the rows must be present.
+#[test]
+fn apply_batch_is_synchronously_durable_under_periodic_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = make_key("p1");
+    // 1-hour interval: the periodic background thread will not fsync during the
+    // test, so durability can only come from a synchronous force-sync.
+    let cfg = || engine_config_with(dir.path(), periodic_one_hour(), 256 * 1024);
+
+    {
+        let engine = StorageEngine::new(cfg(), None).unwrap();
+        engine.register_table(test_schema("ks", "t")).unwrap();
+        engine
+            .apply_batch(vec![
+                BatchOp::Write {
+                    keyspace: "ks".into(),
+                    table: "t".into(),
+                    key: key.clone(),
+                    row: live_row(ck(1), b"acked_a", 100),
+                    timestamp: 100,
+                },
+                BatchOp::Write {
+                    keyspace: "ks".into(),
+                    table: "t".into(),
+                    key: key.clone(),
+                    row: live_row(ck(2), b"acked_b", 100),
+                    timestamp: 100,
+                },
+            ])
+            .unwrap();
+        // SIMULATED CRASH: drop the engine WITHOUT shutdown(). Under Periodic
+        // the Drop path does not flush, so anything on disk got there only via
+        // a synchronous fsync inside apply_batch.
+        drop(engine);
+    }
+
+    let (engine, pending) = StorageEngine::open(cfg(), None).unwrap();
+    engine.register_table(test_schema("ks", "t")).unwrap();
+    engine.replay_mutations(pending).unwrap();
+
+    let tid = TableId::new("ks", "t");
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(1)).as_deref(),
+        Some(&b"acked_a"[..]),
+        "acked batch must be durable before apply_batch returns (no background sync, no clean shutdown)"
+    );
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(2)).as_deref(),
+        Some(&b"acked_b"[..]),
+        "acked batch must be durable before apply_batch returns (no background sync, no clean shutdown)"
+    );
+}
+
+/// ATOMICITY (Phase-1 mid-batch append failure): a batch whose SECOND op is too
+/// large to fit a commit-log segment must apply NONE of its ops — neither
+/// durably (no replay of op #1) nor in-memory. The pre-existing implementation
+/// appended op #1 before op #2's append failed, leaving op #1 durable: a
+/// partial apply surviving a crash. The whole-batch size pre-flight must reject
+/// before any append.
+#[test]
+fn apply_batch_oversized_entry_applies_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // Small segment so a modest row overflows a single commit-log entry. Batch
+    // sync keeps the test deterministic (the failure is the append, not sync).
+    let cfg = || engine_config_with(dir.path(), SyncStrategyConfig::Batch, 4 * 1024);
+
+    let result = {
+        let engine = StorageEngine::new(cfg(), None).unwrap();
+        engine.register_table(test_schema("ks", "t")).unwrap();
+        let key = make_key("p1");
+        // Op #1 is small and would append fine; op #2's value exceeds the
+        // segment capacity so its append fails mid-batch.
+        let huge = vec![b'x'; 8 * 1024];
+        let r = engine.apply_batch(vec![
+            BatchOp::Write {
+                keyspace: "ks".into(),
+                table: "t".into(),
+                key: key.clone(),
+                row: live_row(ck(1), b"small_first", 100),
+                timestamp: 100,
+            },
+            BatchOp::Write {
+                keyspace: "ks".into(),
+                table: "t".into(),
+                key: key.clone(),
+                row: live_row(ck(2), &huge, 100),
+                timestamp: 100,
+            },
+        ]);
+        assert!(
+            r.is_err(),
+            "a batch with an entry larger than a segment must fail loud"
+        );
+        // In-memory: op #1 must NOT be visible (all-or-nothing).
+        let tid = TableId::new("ks", "t");
+        assert_eq!(
+            read_cell(&engine, &tid, &key, &ck(1)),
+            None,
+            "op #1 must not be visible after an all-or-nothing batch rejection"
+        );
+        drop(engine);
+        r
+    };
+    assert!(result.is_err());
+
+    // Durable: op #1 must NOT replay after a restart — nothing was appended.
+    let (engine, pending) = StorageEngine::open(cfg(), None).unwrap();
+    engine.register_table(test_schema("ks", "t")).unwrap();
+    engine.replay_mutations(pending).unwrap();
+    let tid = TableId::new("ks", "t");
+    assert_eq!(
+        read_cell(&engine, &tid, &make_key("p1"), &ck(1)),
+        None,
+        "no op of a rejected batch may survive a crash (no partial durable apply)"
+    );
+}
+
+/// TOMBSTONE LOWERING (whole-partition delete): a `Tombstone { clustering:
+/// None }` in a batch must delete every clustered row of the partition, not
+/// just an empty-clustering row. Exercises the `clustering.unwrap_or_default()`
+/// partition-tombstone lowering path that the existing tests (which only delete
+/// a single `Some(ck)` row) never covered.
+#[test]
+fn apply_batch_partition_tombstone_deletes_all_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::new(test_engine_config(dir.path()), None).unwrap();
+    engine.register_table(test_schema("ks", "t")).unwrap();
+    let tid = TableId::new("ks", "t");
+    let key = make_key("p1");
+
+    // Seed two clustered rows in the partition.
+    engine
+        .apply_batch(vec![
+            BatchOp::Write {
+                keyspace: "ks".into(),
+                table: "t".into(),
+                key: key.clone(),
+                row: live_row(ck(1), b"r1", 100),
+                timestamp: 100,
+            },
+            BatchOp::Write {
+                keyspace: "ks".into(),
+                table: "t".into(),
+                key: key.clone(),
+                row: live_row(ck(2), b"r2", 100),
+                timestamp: 100,
+            },
+        ])
+        .unwrap();
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(1)).as_deref(),
+        Some(&b"r1"[..])
+    );
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(2)).as_deref(),
+        Some(&b"r2"[..])
+    );
+
+    // Whole-partition tombstone (clustering: None) at a higher timestamp.
+    engine
+        .apply_batch(vec![BatchOp::Tombstone {
+            keyspace: "ks".into(),
+            table: "t".into(),
+            key: key.clone(),
+            clustering: None,
+            timestamp: 200,
+        }])
+        .unwrap();
+
+    // Both rows must now be gone.
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(1)),
+        None,
+        "partition tombstone must delete row ck(1)"
+    );
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(2)),
+        None,
+        "partition tombstone must delete row ck(2)"
+    );
+}
+
+/// A `Periodic` strategy whose background fsync interval is one hour — long
+/// enough that the timer never fires during a unit test, isolating synchronous
+/// durability from background flushing.
+fn periodic_one_hour() -> SyncStrategyConfig {
+    SyncStrategyConfig::Periodic {
+        sync_interval: Duration::from_secs(3600),
+    }
 }
