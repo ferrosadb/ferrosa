@@ -65,6 +65,11 @@ fn kind_matches(actual: &TokenKind<'_>, expected: &TokenKind<'_>) -> bool {
 ///
 /// Yields `Token<'input>` values that borrow from the source string.
 /// Maintains a byte offset cursor and supports peek/next.
+///
+/// `Clone` is cheap (a borrowed `&str`/`&[u8]`, a `usize`, and an optional
+/// peeked token) and is used by the parser to snapshot/restore for bounded
+/// lookahead where single-token `peek` is insufficient.
+#[derive(Clone)]
 pub struct Lexer<'input> {
     pub(crate) input: &'input str,
     bytes: &'input [u8],

@@ -24,8 +24,8 @@ use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::parser::{
-    CompareOp, Direction, Expr, Literal, RemoveItem, ReturnClause, ReturnItem, SortDir,
-    WithPipeline,
+    CompareOp, Direction, Expr, Literal, PatternComprehensionHop, RemoveItem, ReturnClause,
+    ReturnItem, SortDir, WithPipeline,
 };
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
 
@@ -602,6 +602,287 @@ async fn pattern_predicate_exists(
     Ok(!frontier.is_empty())
 }
 
+/// Whether an expression (or any sub-expression) is a pattern comprehension,
+/// which requires graph-aware evaluation during projection.
+fn expr_has_pattern_comprehension(expr: &Expr) -> bool {
+    match expr {
+        Expr::PatternComprehension { .. } => true,
+        Expr::Function { args, .. } | Expr::List(args) => {
+            args.iter().any(expr_has_pattern_comprehension)
+        }
+        Expr::Distinct(e) | Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            expr_has_pattern_comprehension(e)
+        }
+        Expr::Comparison { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::In {
+            value: left,
+            list: right,
+        }
+        | Expr::Index {
+            target: left,
+            index: right,
+        } => expr_has_pattern_comprehension(left) || expr_has_pattern_comprehension(right),
+        Expr::ListPredicate {
+            list, predicate, ..
+        } => expr_has_pattern_comprehension(list) || expr_has_pattern_comprehension(predicate),
+        Expr::ListComprehension {
+            list,
+            filter,
+            projection,
+            ..
+        } => {
+            expr_has_pattern_comprehension(list)
+                || filter.as_deref().is_some_and(expr_has_pattern_comprehension)
+                || projection
+                    .as_deref()
+                    .is_some_and(expr_has_pattern_comprehension)
+        }
+        Expr::Map(props) => props.iter().any(|(_, e)| expr_has_pattern_comprehension(e)),
+        Expr::MapProjection { selectors, .. } => selectors.iter().any(|s| match s {
+            crate::parser::MapProjectionSelector::Literal { value, .. } => {
+                expr_has_pattern_comprehension(value)
+            }
+            _ => false,
+        }),
+        Expr::Slice { target, start, end } => {
+            expr_has_pattern_comprehension(target)
+                || start.as_deref().is_some_and(expr_has_pattern_comprehension)
+                || end.as_deref().is_some_and(expr_has_pattern_comprehension)
+        }
+        Expr::Var(_)
+        | Expr::Property { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::PatternPredicate { .. } => false,
+    }
+}
+
+/// Evaluate a RETURN/projection expression with graph context.
+///
+/// Pattern comprehensions need to traverse edges, so they cannot be handled by
+/// the pure-binding [`eval::eval_expr`]. This function intercepts them (and any
+/// nesting that contains them) and delegates everything else to `eval_expr`.
+#[allow(clippy::too_many_arguments)]
+fn graph_eval_expr<'a>(
+    expr: &'a Expr,
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    schema: Option<&'a Schema>,
+    bindings: &'a HashMap<String, serde_json::Value>,
+    current_var: &'a str,
+    current_key: &'a DecoratedKey,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>> {
+    Box::pin(async move {
+        match expr {
+            Expr::PatternComprehension {
+                start_var,
+                hops,
+                filter,
+                projection,
+            } => {
+                eval_pattern_comprehension(
+                    write_path,
+                    keyspace,
+                    schema,
+                    bindings,
+                    current_var,
+                    current_key,
+                    start_var,
+                    hops,
+                    filter.as_deref(),
+                    projection,
+                )
+                .await
+            }
+            // No graph-aware sub-evaluation needed for other expression kinds.
+            _ => eval::eval_expr(expr, bindings),
+        }
+    })
+}
+
+/// Evaluate a pattern comprehension `[ (start)-[:R]->(m) WHERE p | proj ]`.
+///
+/// Traverses a single hop from the already-bound `start_var`, binds each
+/// matched target node to its variable, applies the optional `filter`, and
+/// collects the `projection` per surviving match into a list.
+///
+/// Multi-hop comprehensions are not yet supported and fail loud rather than
+/// returning a partial/wrong list.
+#[allow(clippy::too_many_arguments)]
+async fn eval_pattern_comprehension(
+    write_path: &WritePath,
+    keyspace: &str,
+    schema: Option<&Schema>,
+    bindings: &HashMap<String, serde_json::Value>,
+    current_var: &str,
+    current_key: &DecoratedKey,
+    start_var: &str,
+    hops: &[PatternComprehensionHop],
+    filter: Option<&Expr>,
+    projection: &Expr,
+) -> Result<serde_json::Value> {
+    if hops.len() != 1 {
+        return Err(GraphError::Validation(
+            "multi-hop pattern comprehensions are not yet supported".into(),
+        ));
+    }
+    if start_var != current_var {
+        return Err(GraphError::Validation(format!(
+            "pattern comprehension start variable `{start_var}` is not bound at this point"
+        )));
+    }
+    let hop = &hops[0];
+    if matches!(hop.direction, Direction::In) {
+        return Err(GraphError::Validation(
+            "incoming pattern comprehensions require a reverse adjacency index".into(),
+        ));
+    }
+
+    let neighbor_ids =
+        outgoing_neighbor_ids(write_path, keyspace, schema, current_key, hop.rel_type.as_deref())
+            .await?;
+
+    let mut out = Vec::new();
+    for neighbor_id in neighbor_ids {
+        let target_json = resolve_target_node_json(
+            write_path,
+            keyspace,
+            schema,
+            &neighbor_id,
+            hop.target_label.as_deref(),
+            hop.target_props.as_slice(),
+            hop.target_var.as_deref().unwrap_or("_comprehension_target"),
+        )
+        .await?;
+        let Some(target_json) = target_json else {
+            continue;
+        };
+
+        let mut scoped = bindings.clone();
+        if let Some(target_var) = &hop.target_var {
+            scoped.insert(target_var.clone(), target_json);
+        }
+        if let Some(pred) = filter {
+            if !eval::filter_passes(pred, &scoped)? {
+                continue;
+            }
+        }
+        out.push(eval::eval_expr(projection, &scoped)?);
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
+/// Collect outgoing neighbor vertex ids for a source vertex over an optional
+/// relationship type, using the adjacency index with an edge-table fallback.
+async fn outgoing_neighbor_ids(
+    write_path: &WritePath,
+    keyspace: &str,
+    schema: Option<&Schema>,
+    source_key: &DecoratedKey,
+    rel_type: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
+    let adj_ks = adjacency_keyspace_name(keyspace);
+    let adj_table_id = TableId::new(&adj_ks, "adjacency");
+
+    let hex_candidate = DecoratedKey::new(PartitionKey::new(
+        hex::encode(source_key.key.as_bytes()).into_bytes(),
+    ));
+    let source_keys = [source_key.clone(), hex_candidate];
+
+    let mut neighbor_ids = Vec::new();
+    for key in &source_keys {
+        if let Some(partition) = write_path.read(&adj_table_id, key).await? {
+            for row in &partition.rows {
+                if let Some(neighbor_id) = extract_neighbor_id_for_direction(
+                    &row.clustering,
+                    rel_type,
+                    Some(DIRECTION_OUT),
+                ) {
+                    neighbor_ids.push(neighbor_id);
+                }
+            }
+        }
+    }
+
+    if neighbor_ids.is_empty() {
+        if let (Some(schema_ref), Some(rel_type)) = (schema, rel_type) {
+            if let Some(edge_meta) = resolve_table_by_graph_label(schema_ref, keyspace, rel_type) {
+                if edge_meta
+                    .extensions
+                    .get("graph.type")
+                    .is_some_and(|graph_type| graph_type == "edge")
+                {
+                    let edge_tid = TableId::new(&edge_meta.keyspace, &edge_meta.name);
+                    let strategy = graph_replication_strategy(schema, &edge_meta.keyspace)?;
+                    for key in &source_keys {
+                        if let Some(edge_partition) = write_path
+                            .pk_read(&edge_tid, key, ConsistencyLevel::One, &strategy)
+                            .await?
+                        {
+                            for row in &edge_partition.rows {
+                                if let Some(components) = decode_clustering_components(
+                                    &row.clustering,
+                                    edge_meta.clustering_key.len(),
+                                ) {
+                                    if let Some(dst) = components.first() {
+                                        neighbor_ids.push(dst.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(neighbor_ids)
+}
+
+/// Load a neighbor vertex's properties as JSON, honoring an optional label and
+/// inline property filter. Returns `None` when the label is missing or the
+/// inline filter does not match.
+async fn resolve_target_node_json(
+    write_path: &WritePath,
+    keyspace: &str,
+    schema: Option<&Schema>,
+    neighbor_id: &[u8],
+    target_label: Option<&str>,
+    target_props: &[(String, Expr)],
+    var_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(target_label) = target_label else {
+        // Unlabeled target: expose the neighbor id (hex) when we cannot resolve
+        // a concrete row, so projections like `| id(m)` still work.
+        return Ok(Some(serde_json::Value::String(hex::encode(neighbor_id))));
+    };
+    let Some(schema_ref) = schema else {
+        return Err(GraphError::Validation(
+            "pattern comprehension label filters require schema metadata".into(),
+        ));
+    };
+    let Some(target_meta) = resolve_table_by_graph_label(schema_ref, keyspace, target_label) else {
+        return Err(GraphError::Validation(format!(
+            "unknown graph label in pattern comprehension: {target_label}"
+        )));
+    };
+    let target_tid = TableId::new(&target_meta.keyspace, &target_meta.name);
+    let matched = find_vertex_match(
+        write_path,
+        &target_tid,
+        &target_meta,
+        &HashMap::new(),
+        neighbor_id,
+        target_props,
+        var_name,
+        schema,
+    )
+    .await?;
+    Ok(matched.map(|m| m.json))
+}
+
 fn execute_return_only(return_clause: &ReturnClause, start: Instant) -> Result<GraphResult> {
     let bindings = HashMap::new();
     let mut rows = vec![return_clause
@@ -1044,6 +1325,15 @@ async fn execute_expand(
     // Step 3: Build result from return clause, projecting property values.
     let columns = build_columns(return_clause);
 
+    // Pattern comprehensions in the projection need graph traversal keyed on
+    // the anchor (start) variable. Only take the graph-aware path when a
+    // comprehension is actually present, to avoid per-row overhead otherwise.
+    let needs_graph_projection = return_clause
+        .items
+        .iter()
+        .any(|item| expr_has_pattern_comprehension(&item.expr));
+    let anchor_var = anchor.var.as_deref().unwrap_or("");
+
     let mut result_states = Vec::new();
     let mut rows = Vec::new();
     for state in &current_states {
@@ -1051,13 +1341,24 @@ async fn execute_expand(
             break;
         }
 
-        let row: Vec<serde_json::Value> = return_clause
-            .items
-            .iter()
-            .map(|item| {
+        let mut row = Vec::with_capacity(return_clause.items.len());
+        for item in &return_clause.items {
+            let value = if needs_graph_projection {
+                graph_eval_expr(
+                    &item.expr,
+                    write_path,
+                    keyspace,
+                    schema,
+                    &state.bindings,
+                    anchor_var,
+                    &state.current_key,
+                )
+                .await?
+            } else {
                 eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
-            })
-            .collect();
+            };
+            row.push(value);
+        }
         result_states.push(state.clone());
         rows.push(row);
     }
