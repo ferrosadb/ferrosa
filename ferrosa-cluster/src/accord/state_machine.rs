@@ -554,11 +554,42 @@ impl TxnPhaseExt for TxnPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accord::apply::{ApplyError, ApplyMutation, StorageApplier};
     use ferrosa_storage::accord::sync_writer::{MockSyncWriter, SyncWriteCall};
+    use parking_lot::Mutex;
 
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    /// A `StorageApplier` that captures the full mutation payload (not just
+    /// `(txn_id, t)` like `NoopStorageApplier`) so a test can assert the exact
+    /// mutation bytes that reached the storage seam.
+    struct CapturingApplier {
+        captured: Mutex<Vec<(TxnId, Vec<u8>, Timestamp)>>,
+    }
+
+    impl CapturingApplier {
+        fn new() -> Self {
+            Self {
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// All `(txn_id, mutation_data, t)` triples captured, in apply order.
+        fn captured(&self) -> Vec<(TxnId, Vec<u8>, Timestamp)> {
+            self.captured.lock().clone()
+        }
+    }
+
+    impl StorageApplier for CapturingApplier {
+        fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
+            self.captured
+                .lock()
+                .push((txn_id, mutation.data, mutation.t));
+            Ok(())
+        }
+    }
 
     fn ts(micros: u64) -> Timestamp {
         Timestamp::synthetic(micros)
@@ -1189,6 +1220,53 @@ mod tests {
             state.phase,
             TxnPhase::Applied,
             "replay after crash must successfully apply"
+        );
+    }
+
+    /// RED (inc1 of accord-lwt-real-data-path): the apply seam must invoke a
+    /// `StorageApplier` with the mutation payload. Today `handle_apply` only
+    /// writes `"Applied:{t}"` to the protocol log and NEVER writes the row —
+    /// the phantom-write bug (`bug-accord-lwt-acks-phantom-write.md`). This
+    /// test drives a committed txn to `handle_apply` carrying mutation bytes
+    /// and a capturing applier, then asserts the applier received exactly those
+    /// bytes. It does not compile today: `AccordStateMachine` has no
+    /// `StorageApplier` field and no `with_applier` constructor. inc2 adds the
+    /// field + wiring to turn this GREEN; inc1+inc2 are committed together.
+    #[test]
+    fn sm_apply_invokes_storage_applier_with_mutation() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        // inc2 adds `with_applier`; until then this line fails to compile,
+        // which is the intended RED state for this commit.
+        let mut sm = AccordStateMachine::with_applier(1, writer.clone(), applier.clone());
+
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        let t = ts(1001);
+        let mutation_bytes = b"real-row-mutation".to_vec();
+
+        // Drive a full lifecycle up to Apply.
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_accept(txn_id, t0, t, vec![], BallotNumber(1));
+        sm.handle_commit(txn_id, t0, t, vec![]);
+        sm.handle_apply(txn_id, mutation_bytes.clone());
+
+        // The applier must have been invoked with the mutation payload.
+        let captured = applier.captured();
+        assert_eq!(
+            captured.len(),
+            1,
+            "handle_apply must invoke the StorageApplier exactly once"
+        );
+        let (got_txn, got_data, got_t) = &captured[0];
+        assert_eq!(*got_txn, txn_id, "applier must receive the txn id");
+        assert_eq!(
+            *got_data, mutation_bytes,
+            "applier must receive the mutation bytes (no phantom write)"
+        );
+        assert_eq!(
+            *got_t, t,
+            "applier must receive the agreed execution timestamp"
         );
     }
 
