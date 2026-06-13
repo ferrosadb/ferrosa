@@ -26,6 +26,8 @@ use ferrosa_cluster::raft::handlers::{
 use ferrosa_cluster::raft::{NodeInfo, NodeState};
 use ferrosa_cluster::ring::TokenRing;
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+use ferrosa_graph::bolt::codec::PackValue;
+use ferrosa_graph::bolt::message::BoltMessage;
 use ferrosa_graph::engine::GraphEngine;
 use ferrosa_graph::executor::expand::GraphEngineConfig;
 use ferrosa_graph::http::{build_router, AppState};
@@ -4737,6 +4739,401 @@ fn adjacency_partition_references(
         row.deletion.is_live()
             && extract_neighbor_id(&row.clustering, None).as_deref() == Some(neighbor)
     })
+}
+
+// ── Bolt parity test (T-QEC-D04 / URS-QEC-D05) ─────────────────────────────
+
+/// A minimal Bolt v5 client over a real TCP socket: handshake, HELLO, LOGON,
+/// then RUN/PULL per query. Exercises the **actual** `start_bolt_server`
+/// connection handler and PackStream codec — the same path a Neo4j driver
+/// would drive — so the test proves Bolt behaves identically to HTTP, not that
+/// they merely share a function.
+struct BoltTestClient {
+    stream: tokio::net::TcpStream,
+    decoder: ferrosa_graph::bolt::codec::ChunkDecoder,
+    /// Decoded-but-not-yet-consumed messages (a single TCP read can yield
+    /// several framed messages, e.g. SUCCESS + RECORDs).
+    pending: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl BoltTestClient {
+    /// Connect and complete handshake + HELLO + LOGON (auth_disabled server,
+    /// so credentials are accepted as superuser).
+    async fn connect(addr: std::net::SocketAddr) -> Self {
+        use ferrosa_graph::bolt::codec::ChunkDecoder;
+        use ferrosa_graph::bolt::handshake::{BOLT_MAGIC, BOLT_VERSION_5_0};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Retry briefly while the spawned server task binds its listener.
+        let mut stream = {
+            let mut connected = None;
+            for _ in 0..100 {
+                if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
+                    connected = Some(s);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            connected.expect("Bolt TCP connect must succeed")
+        };
+
+        // Handshake: magic + 4 version proposals (only Bolt 5.0 offered).
+        let mut hs = Vec::with_capacity(20);
+        hs.extend_from_slice(&BOLT_MAGIC);
+        hs.extend_from_slice(&BOLT_VERSION_5_0.to_be_bytes());
+        hs.extend_from_slice(&[0u8; 12]);
+        stream.write_all(&hs).await.expect("handshake write");
+        let mut resp = [0u8; 4];
+        stream
+            .read_exact(&mut resp)
+            .await
+            .expect("handshake response read");
+        assert_eq!(
+            u32::from_be_bytes(resp),
+            BOLT_VERSION_5_0,
+            "server must negotiate Bolt 5.0"
+        );
+
+        let mut client = Self {
+            stream,
+            decoder: ChunkDecoder::new(),
+            pending: std::collections::VecDeque::new(),
+        };
+
+        // HELLO (no inline auth) then LOGON with basic scheme.
+        let hello = BoltMessage::Hello {
+            extra: vec![(
+                "user_agent".into(),
+                PackValue::String("ferrosa-test/1.0".into()),
+            )],
+        };
+        client.send(&hello).await;
+        client.expect_success("HELLO").await;
+
+        let logon = BoltMessage::Logon {
+            auth: vec![
+                ("scheme".into(), PackValue::String("basic".into())),
+                ("principal".into(), PackValue::String("tester".into())),
+                ("credentials".into(), PackValue::String("ignored".into())),
+            ],
+        };
+        client.send(&logon).await;
+        client.expect_success("LOGON").await;
+        client
+    }
+
+    /// Send one Bolt message, chunk-framed.
+    async fn send(&mut self, msg: &BoltMessage) {
+        use ferrosa_graph::bolt::codec::{chunk_encode, DEFAULT_MAX_CHUNK_SIZE};
+        use tokio::io::AsyncWriteExt;
+
+        let framed = chunk_encode(&msg.encode(), DEFAULT_MAX_CHUNK_SIZE);
+        self.stream.write_all(&framed).await.expect("bolt send");
+    }
+
+    /// Read the next complete Bolt message from the socket, buffering any
+    /// extra messages that arrive in the same TCP read.
+    async fn recv(&mut self) -> BoltMessage {
+        use tokio::io::AsyncReadExt;
+
+        loop {
+            if let Some(data) = self.pending.pop_front() {
+                return BoltMessage::decode(&data).expect("decode bolt message");
+            }
+            let mut buf = [0u8; 4096];
+            let n = self.stream.read(&mut buf).await.expect("bolt recv read");
+            assert!(n > 0, "unexpected EOF from Bolt server");
+            self.pending.extend(self.decoder.feed(&buf[..n]));
+        }
+    }
+
+    /// Assert the next message is SUCCESS, surfacing FAILURE details otherwise.
+    async fn expect_success(&mut self, ctx: &str) {
+        match self.recv().await {
+            BoltMessage::Success { .. } => {}
+            BoltMessage::Failure { metadata } => {
+                panic!("Bolt {ctx} returned FAILURE: {metadata:?}");
+            }
+            other => panic!("Bolt {ctx} expected SUCCESS, got {other:?}"),
+        }
+    }
+
+    /// RUN + PULL a query, returning the result rows (each a list of PackValues).
+    /// Panics (fail-loud) if the server returns a Bolt FAILURE for the RUN.
+    async fn query(&mut self, cypher: &str, keyspace: &str) -> Vec<Vec<PackValue>> {
+        let run = BoltMessage::Run {
+            query: cypher.to_string(),
+            params: vec![],
+            extra: vec![("db".into(), PackValue::String(keyspace.to_string()))],
+        };
+        self.send(&run).await;
+        match self.recv().await {
+            BoltMessage::Success { .. } => {}
+            BoltMessage::Failure { metadata } => {
+                panic!("Bolt RUN `{cypher}` returned FAILURE: {metadata:?}");
+            }
+            other => panic!("Bolt RUN `{cypher}` expected SUCCESS, got {other:?}"),
+        }
+
+        let pull = BoltMessage::Pull {
+            extra: vec![("n".into(), PackValue::Int(-1))],
+        };
+        self.send(&pull).await;
+
+        let mut rows = Vec::new();
+        loop {
+            match self.recv().await {
+                BoltMessage::Record { values } => rows.push(values),
+                BoltMessage::Success { .. } => break,
+                BoltMessage::Failure { metadata } => {
+                    panic!("Bolt PULL `{cypher}` returned FAILURE: {metadata:?}");
+                }
+                other => panic!("Bolt PULL `{cypher}` unexpected message {other:?}"),
+            }
+        }
+        rows
+    }
+}
+
+/// Direct-CQL snapshot of the post-delete state of the `Center` node: its
+/// vertex row count, outbound edge count, inbound edge counts from each named
+/// in-neighbor, and its adjacency partition live-row count. Two interfaces are
+/// "the same result" iff their snapshots are byte-for-byte equal (all zeros
+/// after a successful DETACH DELETE).
+#[derive(Debug, PartialEq, Eq)]
+struct CenterDeleteSnapshot {
+    person_v: usize,
+    out_edges: usize,
+    in_edges: Vec<(String, usize)>,
+    adjacency: usize,
+}
+
+fn center_delete_snapshot(storage: &StorageEngine, in_neighbors: &[&str]) -> CenterDeleteSnapshot {
+    let ks = "social";
+    let adj_ks = "system_graph_social";
+    let center = vertex_key_bytes("Center");
+    CenterDeleteSnapshot {
+        person_v: live_row_count(storage, ks, "person_v", &center),
+        out_edges: live_row_count(storage, ks, "knows_e", &center),
+        in_edges: in_neighbors
+            .iter()
+            .map(|src| {
+                (
+                    (*src).to_string(),
+                    live_row_count(storage, ks, "knows_e", &vertex_key_bytes(src)),
+                )
+            })
+            .collect(),
+        adjacency: live_row_count(storage, adj_ks, "adjacency", &center),
+    }
+}
+
+/// Build the `Center`-with-2-out-2-in graph through `engine.execute`. Shared by
+/// both arms of the parity test so the pre-delete state is identical.
+async fn build_center_graph(engine: &Arc<GraphEngine>, auth: &AuthContext) {
+    let ks = "social";
+    for name in ["Center", "OutA", "OutB", "InX", "InY"] {
+        engine
+            .execute(
+                &format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                ks,
+                auth,
+            )
+            .await
+            .expect("node MERGE must succeed");
+    }
+    for dst in ["OutA", "OutB"] {
+        engine
+            .execute(
+                &format!(
+                    "MERGE (a:Person {{name: 'Center'}})-[r:KNOWS]->(b:Person {{name: '{dst}'}}) RETURN r"
+                ),
+                ks,
+                auth,
+            )
+            .await
+            .expect("outbound edge MERGE must succeed");
+    }
+    for src in ["InX", "InY"] {
+        engine
+            .execute(
+                &format!(
+                    "MERGE (a:Person {{name: '{src}'}})-[r:KNOWS]->(b:Person {{name: 'Center'}}) RETURN r"
+                ),
+                ks,
+                auth,
+            )
+            .await
+            .expect("inbound edge MERGE must succeed");
+    }
+}
+
+/// T-QEC-D04 (URS-QEC-D05): a `DETACH DELETE n` issued over the **real Bolt
+/// wire protocol** produces the SAME result as the same statement over the HTTP
+/// `/graph/query` endpoint. After each delete:
+///   (a) the node is immediately invisible to a subsequent read on that same
+///       interface (Bolt MATCH / HTTP MATCH), and
+///   (b) it is gone from direct CQL reads of the underlying `knows_e` and
+///       `system_graph_social.adjacency` tables.
+/// The two interfaces' post-delete CQL snapshots must be byte-for-byte equal.
+/// Bolt shares the Cypher executor, so no executor change is expected — this
+/// test is the proof that Bolt has not diverged.
+#[tokio::test]
+async fn detach_delete_via_bolt_matches_http_and_is_invisible_to_reads_and_cql() {
+    let in_neighbors = ["InX", "InY"];
+
+    // ── HTTP arm ──────────────────────────────────────────────────────────
+    let (http_engine, http_storage, http_schema, _http_dir) = detach_delete_engine();
+    let auth = superuser_auth();
+    build_center_graph(&http_engine, &auth).await;
+
+    // Drive the real HTTP router over the SAME engine the graph was built on,
+    // so the delete and the follow-up read share one storage view.
+    let http_app = build_router(AppState {
+        engine: Arc::clone(&http_engine),
+        schema: Arc::clone(&http_schema),
+        auth_disabled: false,
+    });
+
+    // DETACH DELETE over HTTP.
+    let del_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'Center'}) DETACH DELETE n",
+            "keyspace": "social"
+        })),
+    );
+    let del_resp = http_app.clone().oneshot(del_req).await.unwrap();
+    assert_eq!(
+        del_resp.status(),
+        StatusCode::OK,
+        "HTTP DETACH DELETE status"
+    );
+    let del_body = response_json(del_resp).await;
+    // The executor reports the delete as a one-row `status` result on BOTH
+    // interfaces; capture HTTP's so we can prove Bolt returns the same string.
+    let http_delete_status = del_body["rows"][0][0]
+        .as_str()
+        .expect("HTTP DETACH DELETE must return a status row")
+        .to_string();
+    assert_eq!(
+        http_delete_status, "deleted 1 vertices",
+        "HTTP DETACH DELETE status row, got body: {del_body:?}"
+    );
+
+    // (a) HTTP read on the same interface no longer sees Center.
+    let read_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'Center'}) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let read_resp = http_app.oneshot(read_req).await.unwrap();
+    assert_eq!(read_resp.status(), StatusCode::OK);
+    let http_read_rows = response_json(read_resp).await["rows"]
+        .as_array()
+        .expect("rows array")
+        .len();
+    assert_eq!(
+        http_read_rows, 0,
+        "HTTP MATCH after DETACH DELETE must return no rows"
+    );
+
+    // (b) direct CQL snapshot of the HTTP store.
+    let http_snapshot = center_delete_snapshot(&http_storage, &in_neighbors);
+
+    // ── Bolt arm ──────────────────────────────────────────────────────────
+    let (bolt_engine, bolt_storage, bolt_schema, _bolt_dir) = detach_delete_engine();
+    build_center_graph(&bolt_engine, &auth).await;
+
+    let bolt_config = ferrosa_graph::bolt::server::BoltConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        auth_disabled: true,
+        ..Default::default()
+    };
+    // Bind first to learn the ephemeral port, then serve on it.
+    let listener = std::net::TcpListener::bind(bolt_config.bind_addr).unwrap();
+    let bolt_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let bolt_config = ferrosa_graph::bolt::server::BoltConfig {
+        bind_addr: bolt_addr,
+        ..bolt_config
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_engine = Arc::clone(&bolt_engine);
+    let server_schema = Arc::clone(&bolt_schema);
+    let server = tokio::spawn(async move {
+        ferrosa_graph::bolt::server::start_bolt_server(
+            server_engine,
+            server_schema,
+            bolt_config,
+            shutdown_rx,
+        )
+        .await
+    });
+
+    let mut client = BoltTestClient::connect(bolt_addr).await;
+
+    // DETACH DELETE over Bolt — must return the SAME status row as HTTP.
+    let del_rows = client
+        .query(
+            "MATCH (n:Person {name: 'Center'}) DETACH DELETE n",
+            "social",
+        )
+        .await;
+    let bolt_delete_status = match del_rows.as_slice() {
+        [row] => match row.as_slice() {
+            [PackValue::String(s)] => s.clone(),
+            other => panic!("Bolt DETACH DELETE status row shape unexpected: {other:?}"),
+        },
+        other => panic!("Bolt DETACH DELETE must return exactly one status row; got {other:?}"),
+    };
+    assert_eq!(
+        bolt_delete_status, http_delete_status,
+        "Bolt DETACH DELETE status row must match HTTP's"
+    );
+
+    // (a) Bolt read on the same interface no longer sees Center.
+    let bolt_read_rows = client
+        .query("MATCH (n:Person {name: 'Center'}) RETURN n.name", "social")
+        .await;
+    assert!(
+        bolt_read_rows.is_empty(),
+        "Bolt MATCH after DETACH DELETE must return no rows; got {bolt_read_rows:?}"
+    );
+
+    // (b) direct CQL snapshot of the Bolt store.
+    let bolt_snapshot = center_delete_snapshot(&bolt_storage, &in_neighbors);
+
+    // Clean shutdown of the Bolt server.
+    let _ = shutdown_tx.send(true);
+    server.abort();
+
+    // ── Parity assertions ─────────────────────────────────────────────────
+    // Both interfaces fully tore down Center: nothing left in CQL.
+    assert_eq!(
+        http_snapshot,
+        CenterDeleteSnapshot {
+            person_v: 0,
+            out_edges: 0,
+            in_edges: vec![("InX".into(), 0), ("InY".into(), 0)],
+            adjacency: 0,
+        },
+        "HTTP DETACH DELETE must leave zero CQL rows for Center"
+    );
+    // The whole point of T-QEC-D04: Bolt == HTTP, exactly.
+    assert_eq!(
+        bolt_snapshot, http_snapshot,
+        "Bolt DETACH DELETE must produce the SAME CQL result as HTTP"
+    );
+    assert_eq!(
+        http_read_rows,
+        bolt_read_rows.len(),
+        "Bolt and HTTP post-delete reads must agree (both empty)"
+    );
 }
 
 /// Remove all single-quoted string literals from a Cypher query string,
