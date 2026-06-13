@@ -27,15 +27,15 @@ pub use cluster_view::{
     ClusterRepairView, ClusterTopology, ProbeOutcome, RepairProbe, RingTopology, RpcRepairProbe,
 };
 pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
-pub use scheduler::{
-    select_initiated_ranges, select_tables_for_tick, AutoRepairConfig, AutoRepairScheduler,
-    InitiatedRange, RepairContext,
-};
 pub use executor::{
     InMemoryRepairStore, LocalRepairExecutor, RepairStore, StorageEngineRepairStore,
 };
 pub use merkle::MerkleTree;
 pub use rpc::{RemoteRepairStore, RepairApplyHandler, RepairFetchHandler, RepairMerkleHandler};
+pub use scheduler::{
+    select_initiated_ranges, select_tables_for_tick, AutoRepairConfig, AutoRepairScheduler,
+    InitiatedRange, RepairContext,
+};
 
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
