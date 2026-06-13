@@ -1,28 +1,34 @@
-//! RDF* (RDF-star) annotation query support.
+//! RDF* (RDF-star) annotation query support — **not yet implemented**.
 //!
 //! RDF* extends RDF with statement-about-statement annotations:
 //! ```sparql
 //! << :alice :knows :bob >> :since "2020" .
 //! ```
 //!
-//! In ferrosa, annotations are stored in an `edge_annotations` table:
-//! ```sql
-//! CREATE TABLE edge_annotations (
-//!     tenant_id uuid,
-//!     session_id uuid,
-//!     src_id uuid,
-//!     edge_type text,
-//!     dst_id uuid,
-//!     property_name text,
-//!     property_value text,
-//!     value_type text,
-//!     created_at timestamp,
-//!     PRIMARY KEY ((tenant_id, session_id, src_id, edge_type, dst_id), property_name)
-//! );
-//! ```
+//! ## Current status (URS-QEC-S03a / URS-QEC-X01)
 //!
-//! The SPARQL planner translates RDF* triple patterns into joins between
-//! the main triples table and the edge_annotations table.
+//! Quoted-triple *matching and binding* is **out of scope** for the M3 SPARQL
+//! increment and is therefore **fail-loud**, never silently approximated:
+//!
+//! - The query planner ([`crate::planner`]) rejects any triple pattern with a
+//!   quoted triple in subject or object position with `SparqlError::Plan`, so a
+//!   SELECT/ASK over `<< ?s ?p ?o >> ?prop ?val` returns a 400, not inner
+//!   bindings with the annotation variable silently absent.
+//! - [`evaluate_rdf_star_pattern`] below mirrors that fail-loud contract for any
+//!   future caller.
+//!
+//! ## What real support would require (deliberately not built here)
+//!
+//! Ferrosa's RDF store is the single `rdf_triples` table
+//! (`((graph, subject), predicate, object)`); there is **no** dedicated
+//! annotation/quoted-triple table, and the SPARQL `INSERT` path can only store a
+//! quoted triple as an opaque `<<…>>` string in *object* position — a
+//! quoted-triple *subject* (the annotation case) cannot even be inserted today.
+//! Real evaluation would need: (1) a storage encoding for quoted-triple terms in
+//! key position, (2) parser/insert support for quoted-triple subjects, and
+//! (3) a join planner that decomposes `<< s p o >>` and binds the inner pattern
+//! before binding the outer annotation property. Until that exists, this module
+//! fails loud rather than returning a wrong answer.
 
 use std::collections::HashMap;
 
