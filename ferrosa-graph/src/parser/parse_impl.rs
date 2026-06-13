@@ -371,58 +371,37 @@ impl<'input> Parser<'input> {
 
     /// Parse a single update clause permitted inside a FOREACH body.
     ///
-    /// openCypher restricts the body to updating clauses: CREATE, MERGE, SET,
-    /// REMOVE, DELETE/DETACH DELETE, and nested FOREACH. Anything else (MATCH,
-    /// RETURN, WITH, ...) is a parse error — FOREACH never projects rows.
+    /// openCypher allows the body to contain CREATE, MERGE, SET, REMOVE,
+    /// DELETE/DETACH DELETE, and nested FOREACH. Ferrosa currently supports a
+    /// **top-level** FOREACH only — there is no enclosing MATCH/WITH to bind
+    /// variables. CREATE/MERGE (and nested FOREACH thereof) are fully expressible
+    /// because the loop element materializes into literal properties. SET, REMOVE,
+    /// and DELETE necessarily target a variable bound by a preceding MATCH/WITH,
+    /// which a top-level FOREACH cannot provide, so they are rejected here with a
+    /// clear fail-loud error rather than silently building an unusable clause.
+    /// Anything else (MATCH, RETURN, WITH, ...) is likewise a parse error.
     fn parse_foreach_body_clause(&mut self) -> ParseResult<Statement> {
         let tok = self.lexer.peek()?;
         match &tok.kind {
             TokenKind::Keyword(Keyword::Create) => self.parse_create(),
             TokenKind::Keyword(Keyword::Merge) => self.parse_merge(),
             TokenKind::Keyword(Keyword::Foreach) => self.parse_foreach(),
-            TokenKind::Keyword(Keyword::Set) => {
-                self.lexer.next_token()?;
-                let assignments = self.parse_assignment_list()?;
-                Ok(Statement::Set {
-                    pattern: vec![],
-                    where_clause: None,
-                    assignments,
-                })
-            }
-            TokenKind::Keyword(Keyword::Remove) => {
-                self.lexer.next_token()?;
-                let items = self.parse_remove_items()?;
-                Ok(Statement::Remove {
-                    pattern: vec![],
-                    where_clause: None,
-                    items,
-                })
-            }
-            TokenKind::Keyword(Keyword::Detach) => {
-                self.lexer.next_token()?;
-                self.lexer.expect(&TokenKind::Keyword(Keyword::Delete))?;
-                let variables = self.parse_var_list()?;
-                Ok(Statement::Delete {
-                    pattern: vec![],
-                    where_clause: None,
-                    detach: true,
-                    variables,
-                })
-            }
-            TokenKind::Keyword(Keyword::Delete) => {
-                self.lexer.next_token()?;
-                let variables = self.parse_var_list()?;
-                Ok(Statement::Delete {
-                    pattern: vec![],
-                    where_clause: None,
-                    detach: false,
-                    variables,
-                })
-            }
+            TokenKind::Keyword(Keyword::Set)
+            | TokenKind::Keyword(Keyword::Remove)
+            | TokenKind::Keyword(Keyword::Delete)
+            | TokenKind::Keyword(Keyword::Detach) => Err(ParseError::new(
+                format!(
+                    "FOREACH body clause {:?} requires a variable bound by an enclosing \
+                     MATCH/WITH; only top-level FOREACH (CREATE/MERGE/FOREACH over a list) \
+                     is supported",
+                    tok.kind
+                ),
+                tok.span,
+            )),
             _ => Err(ParseError::new(
                 format!(
                     "FOREACH body may only contain update clauses \
-                     (CREATE, MERGE, SET, REMOVE, DELETE, FOREACH), got {:?}",
+                     (CREATE, MERGE, FOREACH), got {:?}",
                     tok.kind
                 ),
                 tok.span,
@@ -2749,6 +2728,44 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn parse_foreach_nested_create_body_succeeds() {
+        let stmt =
+            parse("FOREACH (x IN [1] | CREATE (:Person {n: x}) FOREACH (y IN [2] | CREATE (:Person {n: y})))")
+                .unwrap();
+        match stmt {
+            Statement::Foreach { body, .. } => {
+                assert_eq!(body.len(), 2);
+                assert!(matches!(body[0], Statement::Create { .. }));
+                assert!(matches!(body[1], Statement::Foreach { .. }));
+            }
+            other => panic!("expected Foreach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_foreach_rejects_set_remove_delete_body() {
+        // SET/REMOVE/DELETE operate on variables bound by an enclosing MATCH/WITH.
+        // A top-level FOREACH has no such binding, so these must fail loud at parse
+        // time rather than building unusable clauses that reference no variable.
+        for q in [
+            "FOREACH (x IN [1] | SET x.flag = true)",
+            "FOREACH (x IN [1] | REMOVE x.flag)",
+            "FOREACH (x IN [1] | DELETE x)",
+            "FOREACH (x IN [1] | DETACH DELETE x)",
+        ] {
+            let err = parse(q).unwrap_err();
+            assert!(
+                err.message.contains("requires a variable bound by an enclosing")
+                    || err
+                        .message
+                        .contains("FOREACH body may only contain update clauses"),
+                "query {q:?} should fail loud, got: {}",
+                err.message
+            );
+        }
     }
 
     // --- MERGE: relationship patterns and multi-clause ---
