@@ -975,28 +975,22 @@ async fn generic_if_mismatch_does_not_persist_and_match_does() {
 /// A lost-update / double-apply bug would surface as: both succeed, OR the two
 /// engines disagree, OR the persisted value is the loser's.
 ///
-/// # KNOWN-FAILING — linearizability gap (intentionally `#[ignore]`)
+/// # Linearizability proof — concurrent `INSERT IF NOT EXISTS` exactly-once
 ///
-/// This test currently FAILS: under genuine concurrency **both** transactions
-/// apply (a lost update / double-apply). Root cause is the *documented, deferred*
-/// dep-wait gap in `ferrosa-cluster/src/accord/handlers.rs` (`AccordRead`
-/// handler): the `ReadVote` handler does NOT block until every conflicting
-/// dependency `t' < t` has reached `Applied` before performing the read-at-`t`.
-/// Both contenders therefore read the empty key *before* either applies, both
-/// existence gates pass, and both inserts land. The coordinator's F+1-agreement
-/// safety net does not catch this because BOTH replicas agree on the (stale)
-/// empty read.
+/// Under genuine concurrency exactly one transaction applies; the loser (larger
+/// `t`) reads the winner's persisted row at its `t` and returns
+/// `ConditionNotMet`. This is enforced by the ReadVote dep-wait: a replica (and
+/// the coordinator's own local read-vote, via
+/// [`with_local_accord_state`](ferrosa_cluster::accord::AccordCoordinatorDriver::with_local_accord_state))
+/// blocks until every conflicting transaction `t0 < t` has reached `Applied`
+/// before performing the read-at-`t`, so the loser observes the winner's write
+/// instead of a stale empty key. On dep-wait timeout the read ABSTAINS (no row),
+/// so the coordinator's F+1 agreement fails loud rather than fabricating a
+/// double-apply.
 ///
-/// The assertions below encode the CORRECT (linearizable) behavior, so once the
-/// read-vote dep-wait is implemented this test will pass UNMODIFIED. It is left
-/// `#[ignore]`d — not deleted and not weakened to assert the broken behavior —
-/// because faking a passing exactly-once proof would hide a silent data-loss bug
-/// (per the fail-loud rule). Run explicitly with:
-///   `cargo test -p ferrosa-cluster --test accord_lwt_concurrent -- --ignored`
+/// Before the dep-wait fix this test failed: both contenders read the empty key
+/// before either applied, both existence gates passed, and both inserts landed.
 #[tokio::test]
-#[ignore = "linearizability gap: ReadVote handler lacks dep-wait — concurrent IF NOT \
-            EXISTS double-applies (handlers.rs AccordRead). Test asserts the correct \
-            behavior and will pass once dep-wait lands."]
 async fn concurrent_insert_if_not_exists_exactly_one_applies_through_engine() {
     let id_a = uuid::Uuid::from_bytes([0x91; 16]);
     let id_b = uuid::Uuid::from_bytes([0x92; 16]);
@@ -1054,6 +1048,7 @@ async fn concurrent_insert_if_not_exists_exactly_one_applies_through_engine() {
     })
     .with_local_applier(applier_a)
     .with_local_reader(reader_a)
+    .with_local_accord_state(node_a.accord_state.clone())
     .with_condition_gate(if_not_exists_gate());
 
     let mut driver_b = AccordCoordinatorDriver::new(
@@ -1071,6 +1066,7 @@ async fn concurrent_insert_if_not_exists_exactly_one_applies_through_engine() {
     })
     .with_local_applier(applier_b)
     .with_local_reader(reader_b)
+    .with_local_accord_state(node_b.accord_state.clone())
     .with_condition_gate(if_not_exists_gate());
 
     let (res_a, res_b) = tokio::join!(driver_a.run_transaction(), driver_b.run_transaction());

@@ -32,6 +32,7 @@ use ferrosa_common::accord::{
 };
 use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnStatus};
 use ferrosa_storage::accord::sync_writer::SyncWriter;
+use tokio::sync::Notify;
 
 use crate::accord::apply::{ApplyMutation, NoopStorageApplier, StorageApplier, StorageReader};
 
@@ -98,6 +99,16 @@ pub struct AccordStateMachine {
     /// [`AccordStateMachine::with_applier_and_reader`] so generic predicates can
     /// read the real row at `t`.
     reader: Option<Arc<dyn StorageReader>>,
+    /// Broadcast wake fired after every successful [`Self::handle_apply`].
+    ///
+    /// The `ReadVote` dep-wait (see the `AccordRead` handler) parks on this
+    /// notify after dropping the state lock, so a conflicting transaction
+    /// reaching `Applied` re-wakes any read that is blocked waiting for it.
+    /// Using a broadcast `Notify::notify_waiters` (rather than per-txn
+    /// channels) keeps the apply path lock-cheap and is safe because the waiter
+    /// always re-checks the unapplied-conflict condition under the lock after a
+    /// wake — a spurious or coalesced wake just costs one extra re-check.
+    applied_notify: Arc<Notify>,
 }
 
 impl AccordStateMachine {
@@ -117,6 +128,7 @@ impl AccordStateMachine {
             last_notified: Vec::new(),
             applier: Arc::new(NoopStorageApplier::new()),
             reader: None,
+            applied_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -138,6 +150,7 @@ impl AccordStateMachine {
             last_notified: Vec::new(),
             applier: Arc::new(NoopStorageApplier::new()),
             reader: None,
+            applied_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -161,6 +174,7 @@ impl AccordStateMachine {
             last_notified: Vec::new(),
             applier,
             reader: None,
+            applied_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -187,6 +201,7 @@ impl AccordStateMachine {
             last_notified: Vec::new(),
             applier,
             reader: Some(reader),
+            applied_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -220,6 +235,66 @@ impl AccordStateMachine {
     /// Whether a [`StorageReader`] is wired (generic-`IF` read-at-`t` available).
     pub fn has_reader(&self) -> bool {
         self.reader.is_some()
+    }
+
+    /// Handle to the broadcast notify fired after every successful apply.
+    ///
+    /// A `ReadVote` dep-wait acquires this, drops the state lock, and parks on
+    /// [`Notify::notified`]; a conflicting transaction reaching `Applied` (via
+    /// [`Self::handle_apply`]) wakes it so it can re-check its condition.
+    pub fn applied_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.applied_notify)
+    }
+
+    /// Conflicting transactions on `key` that a linearizable read-at-`t` must
+    /// wait for before reading: those that are **`Committed`** (their final
+    /// execution timestamp is locked) ordered **before** `t` (`t_committed < t`)
+    /// and not yet `Applied` on this replica.
+    ///
+    /// This is the dep-wait set for the `AccordRead` (ReadVote) handler. Reading
+    /// the row before such a transaction applies would observe stale state — the
+    /// concurrent-`INSERT IF NOT EXISTS` double-apply (the ReadVote
+    /// linearizability gap): two contenders both read the key as absent before
+    /// either applies, both gates pass, and both insert.
+    ///
+    /// # Which phases are waited on
+    ///
+    /// - `PreAccepted` / `Accepted`: a genuinely concurrent contender whose `t0 <
+    ///   t` (so it may yet commit with a final `t' < t` and apply a write before
+    ///   our read is valid). We wait for it to resolve — it will either apply, be
+    ///   finalized as a no-write, or its final `t` will be re-evaluated against
+    ///   `t` once committed (the caller re-checks this set in a bounded loop, so a
+    ///   contender that commits *after* `t` simply drops out of the set on the
+    ///   next iteration).
+    /// - `Committed`: wait only if its locked final `t < t` (it is ordered before
+    ///   us and will apply or no-write-finalize). A `Committed` txn with `t > t`
+    ///   is ordered after us and is NOT a dependency.
+    /// - `Applied` / pruned: already applied — never waited on.
+    ///
+    /// A failed transaction never lingers here: a replica whose `PreAccept`
+    /// fsync fails rolls back its conflict-index registration (see
+    /// [`Self::handle_preaccept`]), and a committed-but-condition-failed LWT is
+    /// finalized to `Applied` as a no-write. So the wait is always bounded by
+    /// real protocol progress, not by abandoned phantom entries.
+    pub fn unapplied_conflicts_before(&self, key: &[u8], t: &Timestamp) -> Vec<TxnId> {
+        let mut pending = Vec::new();
+        for dep_id in self.conflict_index.deps_before_t(key, t) {
+            if let Some(state) = self.txn_states.get(&dep_id) {
+                let wait = match state.phase {
+                    // Already applied: nothing to wait for.
+                    TxnPhase::Applied => false,
+                    // Final t locked: dependency only if ordered before us.
+                    TxnPhase::Committed => state.t < *t,
+                    // Final t not yet locked but t0 < t (from deps_before_t):
+                    // a possible ordered-before write still in flight — wait.
+                    TxnPhase::PreAccepted | TxnPhase::Accepted => true,
+                };
+                if wait {
+                    pending.push(dep_id);
+                }
+            }
+        }
+        pending
     }
 
     /// Get the current state for a transaction (if any).
@@ -312,6 +387,10 @@ impl AccordStateMachine {
             tracing::error!(%e, "accord: conflict_index register failed");
         }
 
+        // Track whether THIS call created the TxnState, so a persist failure can
+        // roll back cleanly (a retried/duplicate PreAccept must not be erased).
+        let newly_created = !self.txn_states.contains_key(&txn_id);
+
         // Create or update TxnState.
         let state = self
             .txn_states
@@ -323,6 +402,15 @@ impl AccordStateMachine {
         let data = format!("PreAccepted:{}:{}", txn_id.0.time, t.time);
         let result = self.sync_writer.write_and_sync(data.as_bytes());
         if !result.is_ok() {
+            // Persist failed: this PreAccept is NOT durable. Roll back the
+            // conflict-index registration (and the TxnState if we created it) so
+            // the non-durable txn does not linger as a phantom dependency that
+            // would make later linearizable reads on this key dep-wait until
+            // timeout. Mirrors the commit/apply persist-before-advance discipline.
+            self.conflict_index.remove(&txn_id);
+            if newly_created {
+                self.txn_states.remove(&txn_id);
+            }
             return SmResponse::None;
         }
 
@@ -491,18 +579,29 @@ impl AccordStateMachine {
             return SmResponse::None;
         }
 
-        // Persist the real mutation to local storage. The applier is idempotent
-        // on (txn_id, t) and must durably write before returning Ok. If it
-        // fails we MUST NOT advance to Applied — fail loud, never fake success:
-        // the coordinator gets no implicit ack and the Apply can be retried.
-        let mutation = ApplyMutation {
-            data: result_data.clone(),
-            t,
-            deps,
-        };
-        if let Err(e) = self.applier.apply(txn_id, mutation) {
-            tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
-            return SmResponse::None;
+        // No-write finalize: an LWT whose IF condition did NOT hold still
+        // *commits* (it is ordered by Accord), but applies NO row write — the
+        // coordinator sends an Apply with an EMPTY payload to finalize it. We
+        // must still advance the txn to `Applied` (and wake dep-waiters / GC the
+        // conflict index) so it stops being a phantom dependency: a later read at
+        // `t' > t` that waited on this conflict would otherwise block until its
+        // dep-wait timeout. We deliberately skip the storage applier (there is no
+        // row to write), which also avoids decoding empty bytes as a Mutation.
+        if !result_data.is_empty() {
+            // Persist the real mutation to local storage. The applier is
+            // idempotent on (txn_id, t) and must durably write before returning
+            // Ok. If it fails we MUST NOT advance to Applied — fail loud, never
+            // fake success: the coordinator gets no implicit ack and the Apply
+            // can be retried.
+            let mutation = ApplyMutation {
+                data: result_data.clone(),
+                t,
+                deps,
+            };
+            if let Err(e) = self.applier.apply(txn_id, mutation) {
+                tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
+                return SmResponse::None;
+            }
         }
 
         // Durable in storage — now safe to mark Applied and GC the conflict index.
@@ -510,6 +609,11 @@ impl AccordStateMachine {
             state.apply(result_data);
         }
         self.conflict_index.mark_applied(&txn_id);
+
+        // Wake any ReadVote dep-wait parked on a conflicting transaction reaching
+        // Applied. Broadcast (all parked reads re-check their own condition under
+        // the lock); see [`Self::applied_notify`].
+        self.applied_notify.notify_waiters();
 
         SmResponse::None
     }

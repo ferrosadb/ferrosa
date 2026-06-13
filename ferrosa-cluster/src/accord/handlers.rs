@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use ferrosa_common::accord::Timestamp;
 
 use ferrosa_net::message::Message;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
@@ -39,12 +40,76 @@ pub struct AccordHandler {
     local_node_id: u64,
 }
 
+/// Total bound on how long a `ReadVote` dep-wait will block for conflicting
+/// transactions to reach `Applied` before abstaining (fail-loud).
+const READ_DEP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-iteration cap on a single `notified()` wait. A coalesced/lost broadcast
+/// wake (the apply fired between our unlock and re-arming the notify) costs at
+/// most this long before the loop re-checks the condition under the lock again,
+/// so the wait can never hang past [`READ_DEP_WAIT_TIMEOUT`].
+const READ_DEP_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 impl AccordHandler {
     pub fn new(state: AccordState, local_node_id: u64) -> Self {
         Self {
             state,
             local_node_id,
         }
+    }
+}
+
+/// Block until every conflicting transaction ordered before `t` (`t0 < t`) has
+/// reached `Applied` on the replica behind `state`, or until
+/// [`READ_DEP_WAIT_TIMEOUT`] elapses.
+///
+/// Returns `true` if all conflicts applied (a read-at-`t` may now proceed
+/// linearizably), `false` on timeout (the caller MUST ABSTAIN — never read
+/// stale). Shared by the inbound `AccordRead` handler (remote replicas) and by
+/// the coordinator's own local read-vote (its self-send Apply is unreachable, so
+/// it reads its local state machine directly).
+///
+/// # Deadlock safety
+///
+/// The `parking_lot` state lock is acquired only to *compute* the pending set
+/// and to grab the apply-notify handle, then released BEFORE every `.await`.
+/// `handle_apply` (which fires the notify that unblocks us) takes the same lock,
+/// so holding it across the await would deadlock.
+pub(crate) async fn await_conflicting_deps_applied(
+    state: &AccordState,
+    key: &[u8],
+    t: Timestamp,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + READ_DEP_WAIT_TIMEOUT;
+    loop {
+        // Compute the pending set and grab the notify UNDER the lock, then drop
+        // the lock before awaiting. The future only enrolls on first poll, so a
+        // wake fired between unlock and poll could be missed; the bounded poll
+        // timeout below makes such a missed wake self-correcting (the loop
+        // re-checks the condition under the lock) rather than a hang.
+        let notify = {
+            let sm = state.lock();
+            if sm.unapplied_conflicts_before(key, &t).is_empty() {
+                return true;
+            }
+            sm.applied_notify()
+        };
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            tracing::error!(
+                "accord: ReadVote dep-wait timed out after {:?} waiting for conflicting \
+                 transactions to apply — abstaining (fail-loud)",
+                READ_DEP_WAIT_TIMEOUT
+            );
+            return false;
+        }
+
+        // Wait for the next apply (broadcast) or the per-iteration poll cap,
+        // whichever comes first, but never past the overall deadline.
+        let wait = READ_DEP_WAIT_POLL.min(deadline - now);
+        let _ = tokio::time::timeout(wait, notify.notified()).await;
+        // Loop: re-check the pending set under the lock.
     }
 }
 
@@ -163,6 +228,44 @@ impl RpcHandler for AccordHandler {
                 // A full production implementation would read actual storage.
                 if let Ok(vote_req) = bincode::deserialize::<ReadVotePayload>(&b) {
                     use crate::accord::wire::ReadPredicate;
+
+                    // DEP-WAIT (linearizability): before evaluating the IF
+                    // condition at the agreed `t`, every conflicting transaction
+                    // ordered before `t` (t0 < t) that is committed-but-not-yet-
+                    // Applied on this replica must first reach `Applied`. Without
+                    // this, two genuinely concurrent `INSERT IF NOT EXISTS` both
+                    // observe the key as absent before either applies, both gates
+                    // pass, and BOTH apply — a lost-update / double-apply. We park
+                    // on the state machine's apply-notify, re-checking the
+                    // condition under the lock after each wake, with a BOUNDED
+                    // total timeout. On timeout we ABSTAIN (return no row /
+                    // condition_holds=false) rather than read stale: the
+                    // coordinator's F+1 agreement then fails loud instead of
+                    // letting a stale read masquerade as success.
+                    //
+                    // This applies to BOTH predicate kinds: the existence path
+                    // (`read_condition_holds_at`) and the generic read-row path
+                    // share the same staleness hazard, so they share the dep-wait.
+                    //
+                    // CRITICAL: the parking_lot state lock is NEVER held across
+                    // an `.await` — handle_apply needs the same lock to make
+                    // progress (and to fire the notify that unblocks us), so
+                    // holding it across the wait would deadlock.
+                    if !await_conflicting_deps_applied(&self.state, &vote_req.key, vote_req.t).await
+                    {
+                        // Dep-wait timed out: abstain. No current_row, and
+                        // condition_holds=false so neither the existence path nor
+                        // a generic read fabricates a "row absent" success.
+                        let ok = ReadVoteOkPayload {
+                            txn_id: vote_req.txn_id,
+                            from: self.local_node_id,
+                            condition_holds: false,
+                            current_row: vec![],
+                        };
+                        let resp_bytes = bincode::serialize(&ok).ok()?;
+                        return Some(Message::AccordReadOK(Bytes::from(resp_bytes)));
+                    }
+
                     let sm = self.state.lock();
                     let (condition_holds, current_row) = match &vote_req.predicate {
                         // INSERT IF NOT EXISTS: existence path (no schema needed).
@@ -179,22 +282,16 @@ impl RpcHandler for AccordHandler {
                         // as a neutral value — the coordinator's evaluation is
                         // authoritative.
                         //
-                        // Linearizability of THIS read rests on two guarantees:
-                        // (1) the coordinator requires F+1 *identical* row bytes
+                        // Linearizability of THIS read rests on three guarantees:
+                        // (1) the dep-wait above blocked until every conflicting
+                        //     dep `t0 < t` Applied locally, so the engine's state
+                        //     is the row as-of-`t`;
+                        // (2) the coordinator requires F+1 *identical* row bytes
                         //     (`agreed_row`) before evaluating the predicate and
                         //     fails loud on divergence — so the gate verdict is
                         //     never taken on a non-quorum / skewed read; and
-                        // (2) `EngineStorageReader::read_row_at` bounds cells to
+                        // (3) `EngineStorageReader::read_row_at` bounds cells to
                         //     `ts <= t.time` (as-of-`t`).
-                        // KNOWN GAP (tracked): this handler does not yet BLOCK on
-                        // the DepWaitGraph until every dep `t' < t` is Applied
-                        // before reading; it relies on the protocol ordering that
-                        // Commit→ReadVote follows the deps' Apply in practice. A
-                        // genuinely concurrent dep could make a minority replica
-                        // read stale, which (2)'s F+1-agreement turns into a
-                        // fail-loud abort rather than a wrong answer — correct, but
-                        // it can spuriously abort instead of waiting. Enforcing an
-                        // explicit dep-wait here is deferred.
                         ReadPredicate::ReadRow { keyspace, table } => {
                             let row =
                                 sm.read_row_bytes_at(keyspace, table, &vote_req.key, vote_req.t);
