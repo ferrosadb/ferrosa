@@ -295,6 +295,92 @@ pub struct ResetCounts {
     pub backup_path: Option<PathBuf>,
 }
 
+/// A persisted log entry whose bytes no decode path understands —
+/// written by a build with an incompatible wire layout.
+///
+/// The Display text is what reaches the operator inside openraft's
+/// `Fatal` at startup, so it names the index, the blast radius, and the
+/// recovery tooling instead of a bare bincode message.
+#[derive(Debug)]
+struct UnreadableLogEntry {
+    index: Option<u64>,
+    detail: String,
+}
+
+impl std::fmt::Display for UnreadableLogEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.index {
+            Some(index) => write!(f, "raft log entry {index} is unreadable")?,
+            None => f.write_str("a raft log entry with a malformed key is unreadable")?,
+        }
+        write!(
+            f,
+            " ({}): the entry was written by a build with an incompatible wire \
+             layout. The metadata plane is down (no DDL replication or membership \
+             changes; /readyz reports not-ready) while CQL continues to serve. \
+             Recover: stop this node, run `ferrosa-ctl raft log-inspect --data-dir \
+             <raft-dir>` to map the damage, then `ferrosa-ctl raft log-truncate \
+             --data-dir <raft-dir> --from <first-bad-index>` to drop the unreadable \
+             tail (or `ferrosa-ctl raft reset` to resync everything from the \
+             leader). See specs/implemented/bug-raft-log-bincode-format-instability.md",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnreadableLogEntry {}
+
+/// One undecodable entry found by [`SledLogStore::inspect`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UndecodableEntry {
+    /// Log index (from the sled key).
+    pub index: u64,
+    /// Decode error text.
+    pub error: String,
+    /// Hex of the first bytes of the on-disk value, for drift forensics.
+    pub preview_hex: String,
+}
+
+/// Offline report over a node's persisted raft log
+/// (`ferrosa-ctl raft log-inspect`).
+#[derive(Debug, Clone, Serialize)]
+pub struct LogInspection {
+    /// Persisted vote (term, voted-for), if any.
+    pub vote: Option<Vote<u64>>,
+    /// Persisted committed marker, if any.
+    pub committed: Option<LogId<u64>>,
+    /// Purge point — entries at or below this are snapshot-covered.
+    pub last_purged: Option<LogId<u64>>,
+    /// Entries present in the log tree.
+    pub total_entries: u64,
+    /// Entries that decode with the current build.
+    pub decoded_entries: u64,
+    /// Entries no decode path understands.
+    pub undecodable_count: u64,
+    /// Lowest index present.
+    pub first_index: Option<u64>,
+    /// Highest index present.
+    pub last_index: Option<u64>,
+    /// The lowest-index undecodable entry — the `--from` for log-truncate.
+    pub first_undecodable: Option<UndecodableEntry>,
+}
+
+/// Outcome of [`SledLogStore::truncate_from`]
+/// (`ferrosa-ctl raft log-truncate`).
+#[derive(Debug, Clone, Serialize)]
+pub struct TruncateReport {
+    /// Entries removed.
+    pub removed_entries: u64,
+    /// Lowest removed index.
+    pub first_removed_index: Option<u64>,
+    /// Highest index remaining in the log, if any.
+    pub new_last_index: Option<u64>,
+    /// Committed marker before truncation.
+    pub committed_before: Option<LogId<u64>>,
+    /// Committed marker after clamping to the surviving log/purge point.
+    pub committed_after: Option<LogId<u64>>,
+}
+
 #[allow(clippy::result_large_err)] // StorageIOError is 224 bytes — dictated by openraft
 impl SledLogStore {
     /// Open (or create) a log store at the given filesystem `path`.
@@ -376,6 +462,125 @@ impl SledLogStore {
         })
     }
 
+    /// Offline scan of a stopped node's raft log: decode every entry with
+    /// the current build and report what is readable, what is not, and
+    /// where the damage starts.
+    ///
+    /// Opens sled, so this fails fast with a lock error if the node is
+    /// still running — by design; never inspect a live store.
+    pub fn inspect(path: &Path) -> Result<LogInspection, Box<dyn std::error::Error + Send + Sync>> {
+        let store = Self::new(path)?;
+
+        let vote = Self::load_meta::<Vote<u64>>(&store.meta, META_VOTE)?;
+        let committed =
+            Self::load_meta::<Option<LogId<u64>>>(&store.meta, META_COMMITTED)?.unwrap_or(None);
+        let last_purged = Self::load_meta::<LogId<u64>>(&store.meta, META_LAST_PURGED)?;
+
+        let mut report = LogInspection {
+            vote,
+            committed,
+            last_purged,
+            total_entries: 0,
+            decoded_entries: 0,
+            undecodable_count: 0,
+            first_index: None,
+            last_index: None,
+            first_undecodable: None,
+        };
+
+        for item in store.log.iter() {
+            let (k, v) = item?;
+            let index = Self::index_from_key(&k)
+                .ok_or_else(|| format!("malformed log key ({} bytes; expected 8)", k.len()))?;
+            report.total_entries += 1;
+            report.first_index.get_or_insert(index);
+            report.last_index = Some(index);
+
+            match Self::deserialize_entry(&v) {
+                Ok(_) => report.decoded_entries += 1,
+                Err(e) => {
+                    report.undecodable_count += 1;
+                    if report.first_undecodable.is_none() {
+                        report.first_undecodable = Some(UndecodableEntry {
+                            index,
+                            error: e.to_string(),
+                            preview_hex: hex_preview(&v, 16),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Offline removal of all log entries with index >= `from_index` from a
+    /// stopped node's raft log, clamping the committed marker to the
+    /// surviving log (or the purge point if the log empties).
+    ///
+    /// This is the recovery path for format-drift damage: the snapshot
+    /// covers state through `last_purged`, the unreadable tail is
+    /// discarded, and the cluster re-forms from the snapshot. Entries
+    /// removed here that were committed are lost from the metadata plane —
+    /// callers (ferrosa-ctl) must require explicit operator confirmation.
+    pub fn truncate_from(
+        path: &Path,
+        from_index: u64,
+    ) -> Result<TruncateReport, Box<dyn std::error::Error + Send + Sync>> {
+        let store = Self::new(path)?;
+
+        let committed_before = Self::load_meta::<Option<LogId<u64>>>(&store.meta, META_COMMITTED)
+            .map_err(|e| format!("reading committed marker: {e}"))?
+            .unwrap_or(None);
+        let last_purged = Self::load_meta::<LogId<u64>>(&store.meta, META_LAST_PURGED)
+            .map_err(|e| format!("reading last_purged marker: {e}"))?;
+
+        // Collect doomed keys first so the report is exact.
+        let mut doomed = Vec::new();
+        for item in store.log.range(Self::index_key(from_index)..) {
+            let (k, _v) = item?;
+            doomed.push(k);
+        }
+        let removed_entries = doomed.len() as u64;
+        let first_removed_index = doomed.first().and_then(|k| Self::index_from_key(k));
+
+        let mut batch = sled::Batch::default();
+        for key in doomed {
+            batch.remove(key);
+        }
+        store.log.apply_batch(batch)?;
+
+        // The committed marker must not point past the surviving log: openraft
+        // would otherwise wait on entries that no longer exist. Clamp to the
+        // new last entry, falling back to the snapshot-covered purge point.
+        let new_last = match store.log.last()? {
+            Some((k, v)) => Some(Self::deserialize_entry_at(&k, &v).map_err(|e| {
+                format!(
+                    "entry below the truncation point is also unreadable — rerun \
+                     log-inspect and truncate from the first bad index: {e}"
+                )
+            })?),
+            None => None,
+        };
+        let new_last_log_id = new_last.map(|e| e.log_id);
+        let new_last_index = new_last_log_id.map(|id| id.index);
+
+        let committed_after = match committed_before {
+            Some(c) if c.index >= from_index => new_last_log_id.or(last_purged),
+            other => other,
+        };
+        Self::save_meta(&store.meta, META_COMMITTED, &committed_after)?;
+        store.db.flush()?;
+
+        Ok(TruncateReport {
+            removed_entries,
+            first_removed_index,
+            new_last_index,
+            committed_before,
+            committed_after,
+        })
+    }
+
     // -- helpers ----------------------------------------------------------
 
     fn unique_reset_backup_path(path: &Path) -> PathBuf {
@@ -399,6 +604,11 @@ impl SledLogStore {
 
     fn index_key(index: u64) -> [u8; 8] {
         index.to_be_bytes()
+    }
+
+    /// Recover the entry index from a log-tree key (big-endian u64).
+    fn index_from_key(key: &[u8]) -> Option<u64> {
+        key.try_into().ok().map(u64::from_be_bytes)
     }
 
     /// Magic prefix that disambiguates log-entry framings (W1.19c).
@@ -469,6 +679,21 @@ impl SledLogStore {
         }
     }
 
+    /// [`Self::deserialize_entry`] with the entry index threaded into the
+    /// error so the operator-facing fatal names what is damaged and how to
+    /// recover (bug-raft-log-bincode-format-instability item 4).
+    fn deserialize_entry_at(
+        key: &[u8],
+        bytes: &[u8],
+    ) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
+        Self::deserialize_entry(bytes).map_err(|e| {
+            StorageIOError::read_logs(to_any_error(UnreadableLogEntry {
+                index: Self::index_from_key(key),
+                detail: e.to_string(),
+            }))
+        })
+    }
+
     fn save_meta<T: serde::Serialize>(
         meta: &sled::Tree,
         key: &[u8],
@@ -520,8 +745,8 @@ impl SledLogStore {
         use openraft::EntryPayload;
         // Iterate backwards (last entry first) through the log.
         for item in self.log.iter().rev() {
-            let (_k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
-            let entry = Self::deserialize_entry(&v)?;
+            let (k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
+            let entry = Self::deserialize_entry_at(&k, &v)?;
             if let EntryPayload::Membership(membership) = entry.payload {
                 return Ok(Some(openraft::StoredMembership::new(
                     Some(entry.log_id),
@@ -544,8 +769,8 @@ impl SledLogStore {
         let mut token_map = BTreeMap::new();
 
         for item in self.log.iter() {
-            let (_k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
-            let entry = Self::deserialize_entry(&v)?;
+            let (k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
+            let entry = Self::deserialize_entry_at(&k, &v)?;
             let EntryPayload::Normal(cmd) = entry.payload else {
                 continue;
             };
@@ -583,8 +808,8 @@ impl SledLogStore {
             .last()
             .map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
         match last {
-            Some((_k, v)) => {
-                let entry = Self::deserialize_entry(&v)?;
+            Some((k, v)) => {
+                let entry = Self::deserialize_entry_at(&k, &v)?;
                 Ok(Some(entry.log_id))
             }
             None => Ok(None),
@@ -614,8 +839,8 @@ impl RaftLogReader<FerrosRaftConfig> for SledLogStore {
 
         let mut entries = Vec::new();
         for item in self.log.range((start_bytes, end_bytes)) {
-            let (_k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
-            let entry = Self::deserialize_entry(&v)?;
+            let (k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
+            let entry = Self::deserialize_entry_at(&k, &v)?;
             entries.push(entry);
         }
         Ok(entries)
@@ -791,6 +1016,11 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
 /// Convert an error into an `AnyError` for openraft storage errors.
 fn to_any_error(e: impl std::error::Error + Send + Sync + 'static) -> AnyError {
     AnyError::new(&e)
+}
+
+/// Lowercase hex of the first `max` bytes of `bytes`.
+fn hex_preview(bytes: &[u8], max: usize) -> String {
+    bytes.iter().take(max).map(|b| format!("{b:02x}")).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1528,5 +1758,355 @@ mod tests {
         assert_eq!(counts.log_entries, None);
         assert_eq!(counts.meta_keys, None);
         assert_eq!(counts.backup_path, None);
+    }
+
+    // -- offline log inspect / truncate (raft-log operator tooling) --------
+
+    /// Bytes that fail every decode path (tagged, current bare, legacy
+    /// pre-UpdateNodeInfo). ASCII text reproduces the real-world failure
+    /// shape from bug-raft-log-bincode-format-instability: a value blob
+    /// misread as an enum tag.
+    fn undecodable_bytes() -> Vec<u8> {
+        b"avioactive-not-a-raft-entry-written-by-a-drifted-build".to_vec()
+    }
+
+    /// Populate a store at `path` with blank entries for `indexes`, then
+    /// overwrite `bad` indexes with undecodable bytes. Drops the store so
+    /// the sled lock is released for the offline functions.
+    async fn seed_store(path: &Path, indexes: std::ops::RangeInclusive<u64>, bad: &[u64]) {
+        let mut store = SledLogStore::new(path).unwrap();
+        let mut batch = sled::Batch::default();
+        for idx in indexes {
+            let entry = blank_entry(2, idx);
+            batch.insert(
+                &SledLogStore::index_key(idx),
+                SledLogStore::serialize_entry(&entry).unwrap(),
+            );
+        }
+        for &idx in bad {
+            batch.insert(&SledLogStore::index_key(idx), undecodable_bytes());
+        }
+        store.log.apply_batch(batch).unwrap();
+
+        let committed = Some(LogId::new(CommittedLeaderId::new(2, 0), 5));
+        <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_committed(
+            &mut store, committed,
+        )
+        .await
+        .unwrap();
+        let vote = Vote::new(2, 1);
+        <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_vote(
+            &mut store, &vote,
+        )
+        .await
+        .unwrap();
+        store.db.flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_healthy_log() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_store(dir.path(), 1..=5, &[]).await;
+
+        let report = SledLogStore::inspect(dir.path()).expect("inspect healthy store");
+
+        assert_eq!(report.total_entries, 5);
+        assert_eq!(report.decoded_entries, 5);
+        assert_eq!(report.undecodable_count, 0);
+        assert_eq!(report.first_index, Some(1));
+        assert_eq!(report.last_index, Some(5));
+        assert!(report.first_undecodable.is_none());
+        assert_eq!(report.committed.map(|c| c.index), Some(5));
+        assert_eq!(report.vote, Some(Vote::new(2, 1)));
+        assert_eq!(report.last_purged, None);
+    }
+
+    #[tokio::test]
+    async fn inspect_locates_first_undecodable_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        // Good 1..=3 and 5; index 4 is drifted-build garbage.
+        seed_store(dir.path(), 1..=5, &[4]).await;
+
+        let report = SledLogStore::inspect(dir.path()).expect("inspect damaged store");
+
+        assert_eq!(report.total_entries, 5);
+        assert_eq!(report.decoded_entries, 4);
+        assert_eq!(report.undecodable_count, 1);
+        let bad = report
+            .first_undecodable
+            .expect("must locate the first undecodable entry");
+        assert_eq!(bad.index, 4);
+        assert!(!bad.error.is_empty());
+        assert!(
+            bad.preview_hex.starts_with("6176696f"),
+            "preview must show the raw on-disk bytes, got {}",
+            bad.preview_hex
+        );
+    }
+
+    #[tokio::test]
+    async fn truncate_from_removes_tail_and_clamps_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        // committed=5 (set by seed_store); truncate from 4.
+        seed_store(dir.path(), 1..=5, &[4]).await;
+
+        let report = SledLogStore::truncate_from(dir.path(), 4).expect("truncate damaged tail");
+
+        assert_eq!(report.removed_entries, 2);
+        assert_eq!(report.first_removed_index, Some(4));
+        assert_eq!(report.new_last_index, Some(3));
+        assert_eq!(report.committed_before.map(|c| c.index), Some(5));
+        assert_eq!(
+            report.committed_after.map(|c| c.index),
+            Some(3),
+            "committed marker must be clamped to the new last entry"
+        );
+
+        // Re-open and verify on-disk state matches the report.
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let remaining = store.try_get_log_entries(1u64..10u64).await.unwrap();
+        assert_eq!(remaining.len(), 3);
+        assert_eq!(remaining.last().unwrap().log_id.index, 3);
+        let committed =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::read_committed(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.map(|c| c.index), Some(3));
+    }
+
+    #[tokio::test]
+    async fn truncate_from_to_empty_log_clamps_committed_to_last_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = SledLogStore::new(dir.path()).unwrap();
+            // Snapshot covered through 2; live entries 3..=4.
+            let purged: LogId<u64> = LogId::new(CommittedLeaderId::new(1, 0), 2);
+            SledLogStore::save_meta(&store.meta, META_LAST_PURGED, &purged).unwrap();
+            let mut batch = sled::Batch::default();
+            for idx in 3u64..=4 {
+                let entry = blank_entry(1, idx);
+                batch.insert(
+                    &SledLogStore::index_key(idx),
+                    SledLogStore::serialize_entry(&entry).unwrap(),
+                );
+            }
+            store.log.apply_batch(batch).unwrap();
+            let committed = Some(LogId::new(CommittedLeaderId::new(1, 0), 4));
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_committed(
+                &mut store, committed,
+            )
+            .await
+            .unwrap();
+            store.db.flush().unwrap();
+        }
+
+        let report = SledLogStore::truncate_from(dir.path(), 3).expect("truncate to empty");
+
+        assert_eq!(report.removed_entries, 2);
+        assert_eq!(report.new_last_index, None);
+        assert_eq!(
+            report.committed_after.map(|c| c.index),
+            Some(2),
+            "with an empty log the committed marker must fall back to last_purged"
+        );
+    }
+
+    /// The decode error surfaced through openraft's fatal must name the
+    /// entry index and the recovery tooling, so the 3 AM operator is not
+    /// left with a bare bincode message (per
+    /// bug-raft-log-bincode-format-instability item 4).
+    #[tokio::test]
+    async fn decode_error_names_entry_index_and_recovery_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_store(dir.path(), 6..=8, &[7]).await;
+
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let err = store
+            .try_get_log_entries(6u64..9u64)
+            .await
+            .expect_err("entry 7 is undecodable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("raft log entry 7"),
+            "error must name the failing index, got: {msg}"
+        );
+        assert!(
+            msg.contains("ferrosa-ctl raft log-inspect"),
+            "error must name the recovery tooling, got: {msg}"
+        );
+    }
+
+    // -- golden-file decode gate (CI format-drift tripwire) -----------------
+
+    /// Deterministic, representative entry set for the golden fixture.
+    /// Covers blank, membership, and Normal payloads across the RaftOp
+    /// variants whose embedded types have historically drifted
+    /// (NodeInfo, IndexMetadata + FilterPredicate single/conjunction).
+    fn golden_entries() -> Vec<Entry<FerrosRaftConfig>> {
+        use ferrosa_index::{FilterClause, FilterOp, FilterPredicate, IndexType};
+
+        fn cmd(index: u64, op: RaftOp) -> Entry<FerrosRaftConfig> {
+            Entry {
+                log_id: LogId::new(CommittedLeaderId::new(3, 1), index),
+                payload: EntryPayload::Normal(RaftCommand {
+                    op,
+                    schema_version: Uuid::from_u128(0xFE01u128 + index as u128),
+                }),
+            }
+        }
+        let node = NodeInfo {
+            host_id: Uuid::from_u128(0xAA),
+            addr: "10.0.0.1:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: Some("10.0.0.1:9042".to_string()),
+        };
+        let single_idx = IndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: "idx_single".into(),
+            index_type: IndexType::Filtered,
+            target_columns: vec!["status".into()],
+            filter_predicate: Some(FilterPredicate::single(0, FilterOp::Eq, b"active".to_vec())),
+            options: std::collections::HashMap::new(),
+        };
+        let conj_idx = IndexMetadata {
+            filter_predicate: Some(FilterPredicate::conjunction(vec![
+                FilterClause::new(0, FilterOp::Eq, b"active".to_vec()),
+                FilterClause::new(2, FilterOp::Gt, b"100".to_vec()),
+            ])),
+            name: "idx_conj".into(),
+            ..single_idx.clone()
+        };
+
+        let membership = openraft::Membership::<u64, openraft::BasicNode>::new(
+            vec![[1u64, 2, 3].into_iter().collect()],
+            [
+                (1u64, openraft::BasicNode::new("10.0.0.1:7000")),
+                (2u64, openraft::BasicNode::new("10.0.0.2:7000")),
+                (3u64, openraft::BasicNode::new("10.0.0.3:7000")),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        );
+
+        vec![
+            blank_entry(3, 1),
+            Entry {
+                log_id: LogId::new(CommittedLeaderId::new(3, 1), 2),
+                payload: EntryPayload::Membership(membership),
+            },
+            cmd(3, RaftOp::JoinNode(node.clone())),
+            cmd(4, RaftOp::UpdateNodeInfo(node)),
+            cmd(
+                5,
+                RaftOp::AssignTokens {
+                    node_id: 42,
+                    tokens: vec![-9_223_372_036_854_775_808, 0, 9_223_372_036_854_775_807],
+                },
+            ),
+            cmd(
+                6,
+                RaftOp::SetNodeState {
+                    node_id: 42,
+                    state: NodeState::Leaving,
+                },
+            ),
+            cmd(7, RaftOp::LeaveNode { node_id: 42 }),
+            cmd(
+                8,
+                RaftOp::ApproveNode {
+                    host_id: Uuid::from_u128(0xBB),
+                },
+            ),
+            cmd(9, RaftOp::CreateIndex(single_idx)),
+            cmd(10, RaftOp::CreateIndex(conj_idx)),
+            cmd(
+                11,
+                RaftOp::DropIndex {
+                    keyspace: "ks".into(),
+                    table: "tbl".into(),
+                    index: "idx_single".into(),
+                },
+            ),
+            cmd(12, RaftOp::DropKeyspace("ks".into())),
+            cmd(
+                13,
+                RaftOp::DropTable {
+                    keyspace: "ks".into(),
+                    table: "tbl".into(),
+                },
+            ),
+        ]
+    }
+
+    /// CI gate: raft log entry bytes written by a previous build of this
+    /// crate must decode forever. The fixture freezes serialize_entry
+    /// output at the time it was generated; if this test fails, the
+    /// current change altered the persisted wire format and WILL brick
+    /// existing clusters on upgrade (see
+    /// specs/implemented/bug-raft-log-bincode-format-instability.md).
+    ///
+    /// Regenerate ONLY for an intentional, version-bumped format change:
+    /// `FERROSA_REGEN_RAFT_GOLDEN=1 cargo test -p ferrosa-cluster golden_raft_log_entries_decode`
+    #[test]
+    fn golden_raft_log_entries_decode() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/raft_log_entries_golden_v1.bin");
+
+        let blobs: Vec<Vec<u8>> = if std::env::var_os("FERROSA_REGEN_RAFT_GOLDEN").is_some() {
+            let blobs: Vec<Vec<u8>> = golden_entries()
+                .iter()
+                .map(|e| SledLogStore::serialize_entry(e).unwrap())
+                .collect();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bincode::serialize(&blobs).unwrap()).unwrap();
+            blobs
+        } else {
+            let raw = fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "golden raft log fixture missing at {} ({e}); regenerate with \
+                     FERROSA_REGEN_RAFT_GOLDEN=1 cargo test -p ferrosa-cluster \
+                     golden_raft_log_entries_decode",
+                    path.display()
+                )
+            });
+            bincode::deserialize(&raw).expect("golden fixture container must decode")
+        };
+
+        let expected = golden_entries();
+        assert_eq!(blobs.len(), expected.len(), "fixture entry count drifted");
+
+        for (i, blob) in blobs.iter().enumerate() {
+            let entry = SledLogStore::deserialize_entry(blob).unwrap_or_else(|e| {
+                panic!(
+                    "golden raft log entry {i} (index {}) no longer decodes — this \
+                     change altered the persisted raft log wire format and will brick \
+                     existing clusters on upgrade. Either restore wire compatibility \
+                     or bump ENTRY_FORMAT_VERSION with a migration path. Error: {e}",
+                    expected[i].log_id.index
+                )
+            });
+            assert_eq!(
+                entry.log_id, expected[i].log_id,
+                "golden entry {i} decoded to a different log id"
+            );
+        }
+
+        // Spot-check the drift-prone embedded types survived.
+        let decoded_conj = SledLogStore::deserialize_entry(&blobs[9]).unwrap();
+        match decoded_conj.payload {
+            EntryPayload::Normal(RaftCommand {
+                op: RaftOp::CreateIndex(meta),
+                ..
+            }) => {
+                let pred = meta.filter_predicate.expect("conjunction predicate");
+                assert_eq!(pred.clauses().len(), 2, "conjunction clauses must survive");
+            }
+            other => panic!("golden entry 9 must be CreateIndex, got {other:?}"),
+        }
     }
 }
