@@ -1906,6 +1906,92 @@ async fn aggregate_distinct_deduplicates_inputs_per_group() {
 }
 
 #[tokio::test]
+async fn aggregate_collect_skips_null_property_values() {
+    // openCypher: collect() ignores null values. A node whose `age` is unset
+    // must NOT contribute a null entry to collect(n.age).
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(schema, storage);
+
+    for query in [
+        "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000a101', name: 'Alice', age: 10})",
+        // Bob has no age property at all -> n.age is null.
+        "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000b202', name: 'Bob'})",
+        "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000c303', name: 'Cara', age: 20})",
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({ "query": query, "keyspace": "social" })),
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "setup query failed: {query}");
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN collect(n.age) AS ages, count(n.age) AS aged",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "collect query failed: {body:?}");
+    let row = body["rows"][0].as_array().expect("aggregate row");
+    let mut collected = row[0]
+        .as_array()
+        .expect("collect result must be an array, never null")
+        .iter()
+        .map(|v| v.as_i64().expect("collect must skip nulls -> only integers remain"))
+        .collect::<Vec<_>>();
+    collected.sort_unstable();
+    assert_eq!(collected, vec![10, 20], "collect(n.age) must skip the null age");
+    // count(n.age) also skips nulls -> 2 aged persons.
+    assert_eq!(row[1].as_i64(), Some(2));
+}
+
+#[tokio::test]
+async fn aggregate_empty_input_semantics() {
+    // openCypher empty-input semantics over zero matched rows:
+    //   count -> 0, sum -> 0, collect -> [], avg/min/max -> null.
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(schema, storage);
+
+    // No Person nodes created -> the MATCH yields zero rows.
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN count(n.age) AS c, sum(n.age) AS s, collect(n.age) AS col, avg(n.age) AS a, min(n.age) AS mn, max(n.age) AS mx",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "empty-input query failed: {body:?}");
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "aggregate over empty input collapses to one row");
+    let row = rows[0].as_array().expect("aggregate row");
+    assert_eq!(row[0].as_i64(), Some(0), "count over empty input -> 0");
+    assert_eq!(row[1].as_i64(), Some(0), "sum over empty input -> 0");
+    assert_eq!(
+        row[2],
+        serde_json::json!([]),
+        "collect over empty input -> []"
+    );
+    assert!(row[3].is_null(), "avg over empty input -> null");
+    assert!(row[4].is_null(), "min over empty input -> null");
+    assert!(row[5].is_null(), "max over empty input -> null");
+}
+
+#[tokio::test]
 async fn where_in_list_literal_filters_rows() {
     let (schema, storage, _dir) = setup();
     create_social_graph_schema(&schema);
