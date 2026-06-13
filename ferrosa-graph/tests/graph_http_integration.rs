@@ -4309,6 +4309,252 @@ fn migration_proof_no_direct_table_reference() {
     }
 }
 
+// ── Slice 12: DETACH DELETE cascade (URS-QEC-D01/D03/D07, T-QEC-D01/D03) ──────
+
+/// blake3 content-address key for a `name`-keyed vertex, mirroring
+/// `content_addressed_key` (`name\x00<value>\x00`).
+fn vertex_key_bytes(name: &str) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(format!("name\x00{name}\x00").as_bytes());
+    h.finalize().as_bytes().to_vec()
+}
+
+/// Register the `social` schema + storage tables and wire the synchronous
+/// adjacency observer so MERGE edge writes land OUT/IN adjacency entries.
+/// Returns an engine that drives Cypher directly.
+fn detach_delete_engine() -> (Arc<GraphEngine>, Arc<StorageEngine>, Arc<Schema>, TempDir) {
+    use ferrosa_graph::adjacency::observer::AdjacencyIndexObserver;
+    use ferrosa_graph::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
+
+    let (schema, storage, dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    // Register the adjacency keyspace + table so the observer's derived
+    // mutations have a registered home and the planner can resolve them.
+    let adj_ks_name = adjacency_keyspace_name("social");
+    schema
+        .create_keyspace(
+            KeyspaceMetadata {
+                name: adj_ks_name.clone(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            },
+            &superuser_auth(),
+        )
+        .unwrap();
+    schema
+        .create_table(adjacency_table_metadata("social"), &superuser_auth())
+        .unwrap();
+    storage
+        .register_table(adjacency_table_metadata("social").to_storage_schema())
+        .unwrap();
+
+    // Synchronous observer: adjacency entries are written in the same write
+    // call as the edge, so no drain task / yield is required.
+    let observer = Arc::new(AdjacencyIndexObserver::new(
+        Arc::clone(&schema),
+        "social".to_string(),
+    ));
+    storage.register_observer(observer as Arc<dyn ferrosa_storage::WriteObserver>);
+
+    let (_app, engine) = build_app_and_engine(Arc::clone(&schema), Arc::clone(&storage));
+    (engine, storage, schema, dir)
+}
+
+/// Count live rows in a single-partition read (None partition => 0).
+fn live_row_count(storage: &StorageEngine, keyspace: &str, table: &str, key_bytes: &[u8]) -> usize {
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    let tid = TableId::new(keyspace, table);
+    let key = DecoratedKey::new(PartitionKey::new(key_bytes.to_vec()));
+    match storage.read(&tid, &key).unwrap() {
+        Some(partition) => partition
+            .rows
+            .iter()
+            .filter(|r| r.deletion.is_live())
+            .count(),
+        None => 0,
+    }
+}
+
+/// T-QEC-D01 / T-QEC-D03 (URS-QEC-D01/D03/D07): a node with N inbound +
+/// M outbound edges, on `DETACH DELETE`, loses the node and **all** N+M
+/// incident edges, and the adjacency index has **zero** references to the
+/// node afterward — verified via direct CQL reads of `knows_e` and
+/// `system_graph_social.adjacency`, and via MATCH — all **without** running
+/// reconciliation.
+#[tokio::test]
+async fn detach_delete_removes_node_all_incident_edges_and_adjacency() {
+    let (engine, storage, _schema, _dir) = detach_delete_engine();
+    let auth = superuser_auth();
+    let ks = "social";
+
+    // Build the graph: Center with 2 outbound + 2 inbound edges.
+    let out_neighbors = ["OutA", "OutB"];
+    let in_neighbors = ["InX", "InY"];
+    for name in ["Center", "OutA", "OutB", "InX", "InY"] {
+        engine
+            .execute(
+                &format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                ks,
+                &auth,
+            )
+            .await
+            .expect("node MERGE must succeed");
+    }
+    for dst in out_neighbors {
+        engine
+            .execute(
+                &format!(
+                    "MERGE (a:Person {{name: 'Center'}})-[r:KNOWS]->(b:Person {{name: '{dst}'}}) RETURN r"
+                ),
+                ks,
+                &auth,
+            )
+            .await
+            .expect("outbound edge MERGE must succeed");
+    }
+    for src in in_neighbors {
+        engine
+            .execute(
+                &format!(
+                    "MERGE (a:Person {{name: '{src}'}})-[r:KNOWS]->(b:Person {{name: 'Center'}}) RETURN r"
+                ),
+                ks,
+                &auth,
+            )
+            .await
+            .expect("inbound edge MERGE must succeed");
+    }
+
+    let center = vertex_key_bytes("Center");
+
+    // Precondition: edges + adjacency exist before the delete.
+    assert_eq!(
+        live_row_count(&storage, ks, "knows_e", &center),
+        2,
+        "precondition: Center must have 2 outbound knows_e rows"
+    );
+    for src in in_neighbors {
+        assert_eq!(
+            live_row_count(&storage, ks, "knows_e", &vertex_key_bytes(src)),
+            1,
+            "precondition: inbound edge {src}->Center must exist"
+        );
+    }
+    let adj_ks = "system_graph_social";
+    assert!(
+        live_row_count(&storage, adj_ks, "adjacency", &center) >= 4,
+        "precondition: Center adjacency must hold 2 OUT + 2 IN entries (got {})",
+        live_row_count(&storage, adj_ks, "adjacency", &center)
+    );
+
+    // The DETACH DELETE under test. Adjacency keyspace is already registered
+    // (the MERGEs registered it), so this query does NOT trigger reconciliation.
+    engine
+        .execute(
+            "MATCH (n:Person {name: 'Center'}) DETACH DELETE n",
+            ks,
+            &auth,
+        )
+        .await
+        .expect("DETACH DELETE must succeed");
+
+    // (1) The node is gone from MATCH and from person_v storage.
+    let match_center = engine
+        .execute("MATCH (n:Person {name: 'Center'}) RETURN n.name", ks, &auth)
+        .await
+        .expect("MATCH after delete must succeed");
+    assert!(
+        match_center.rows.is_empty(),
+        "Center node must be gone after DETACH DELETE; got rows: {:?}",
+        match_center.rows
+    );
+    assert_eq!(
+        live_row_count(&storage, ks, "person_v", &center),
+        0,
+        "Center vertex row must be tombstoned in person_v"
+    );
+
+    // (2) ALL outbound edges gone: knows_e partition for Center has no live rows.
+    assert_eq!(
+        live_row_count(&storage, ks, "knows_e", &center),
+        0,
+        "all outbound edges from Center must be tombstoned in knows_e"
+    );
+
+    // (3) ALL inbound edges gone: each inbound src->Center knows_e row tombstoned.
+    for src in in_neighbors {
+        assert_eq!(
+            live_row_count(&storage, ks, "knows_e", &vertex_key_bytes(src)),
+            0,
+            "inbound edge {src}->Center must be tombstoned in knows_e"
+        );
+    }
+
+    // (4) Adjacency scan finds ZERO references to Center:
+    //     (a) Center's own partition (both OUT and IN entries) is empty.
+    assert_eq!(
+        live_row_count(&storage, adj_ks, "adjacency", &center),
+        0,
+        "Center adjacency partition must have zero live entries after DETACH DELETE"
+    );
+    //     (b) Each neighbor's mirror entry pointing back at Center is gone.
+    //         Out-neighbors held an IN entry (Center as neighbor); in-neighbors
+    //         held an OUT entry (Center as neighbor).
+    for name in out_neighbors.iter().chain(in_neighbors.iter()) {
+        let nbr_key = vertex_key_bytes(name);
+        let refs_center = adjacency_partition_references(&storage, adj_ks, &nbr_key, &center);
+        assert!(
+            !refs_center,
+            "neighbor {name} adjacency partition must not reference Center after DETACH DELETE"
+        );
+    }
+
+    // (5) MATCH hop over KNOWS from/through Center returns nothing.
+    let hop = engine
+        .execute(
+            "MATCH (a:Person {name: 'Center'})-[:KNOWS]->(b:Person) RETURN b.name",
+            ks,
+            &auth,
+        )
+        .await
+        .expect("hop MATCH after delete must succeed");
+    assert!(
+        hop.rows.is_empty(),
+        "no outbound KNOWS hop from Center may survive; got: {:?}",
+        hop.rows
+    );
+}
+
+/// True if any live adjacency row in `vertex`'s partition names `neighbor`
+/// as its neighbor_id (i.e. an incident-edge reference to `neighbor`).
+fn adjacency_partition_references(
+    storage: &StorageEngine,
+    adj_keyspace: &str,
+    vertex_key_bytes: &[u8],
+    neighbor: &[u8],
+) -> bool {
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
+    use ferrosa_graph::executor::expand::extract_neighbor_id;
+    use ferrosa_storage::TableId;
+
+    let tid = TableId::new(adj_keyspace, "adjacency");
+    let key = DecoratedKey::new(PartitionKey::new(vertex_key_bytes.to_vec()));
+    let Some(partition) = storage.read(&tid, &key).unwrap() else {
+        return false;
+    };
+    partition.rows.iter().any(|row| {
+        row.deletion.is_live()
+            && extract_neighbor_id(&row.clustering, None).as_deref() == Some(neighbor)
+    })
+}
+
 /// Remove all single-quoted string literals from a Cypher query string,
 /// replacing them with empty strings. Used by `migration_proof_no_direct_table_reference`
 /// to distinguish quoted value literals from unquoted identifiers.
