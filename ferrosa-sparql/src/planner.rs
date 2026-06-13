@@ -34,10 +34,15 @@ pub enum TripleOp {
 }
 
 /// A sort ordering for ORDER BY.
+///
+/// Holds the full ORDER BY expression (which may be a plain variable, an
+/// arithmetic expression like `?a + ?b`, a function call, etc.). The executor
+/// evaluates the expression per solution and sorts by the resulting value
+/// (URS-QEC-S04).
 #[derive(Debug, Clone)]
 pub struct OrderCondition {
-    /// Variable name to sort on.
-    pub variable: String,
+    /// Expression to evaluate per solution and sort on.
+    pub expression: spargebra::algebra::Expression,
     /// True for ascending, false for descending.
     pub ascending: bool,
 }
@@ -285,37 +290,18 @@ fn collect_ops(
         GraphPattern::OrderBy {
             inner, expression, ..
         } => {
+            // URS-QEC-S04: ORDER BY on arbitrary expressions. The executor
+            // evaluates the expression per solution and sorts by the result;
+            // a plain `?var` is just the trivial Variable expression.
             for cond in expression {
-                match cond {
-                    spargebra::algebra::OrderExpression::Asc(
-                        spargebra::algebra::Expression::Variable(v),
-                    ) => {
-                        order_by.push(OrderCondition {
-                            variable: v.as_str().to_string(),
-                            ascending: true,
-                        });
-                    }
-                    spargebra::algebra::OrderExpression::Desc(
-                        spargebra::algebra::Expression::Variable(v),
-                    ) => {
-                        order_by.push(OrderCondition {
-                            variable: v.as_str().to_string(),
-                            ascending: false,
-                        });
-                    }
-                    other => {
-                        // URS-QEC-S04 / URS-QEC-X01: non-variable ORDER BY
-                        // expressions are not implemented.  Silently ignoring
-                        // them would return results in an arbitrary order with
-                        // no indication that the ordering was not applied —
-                        // that is a silent wrong result.  Fail loud instead.
-                        return Err(SparqlError::Plan(format!(
-                            "ORDER BY expression is not implemented: only \
-                             plain variable references (?var) are supported; \
-                             got: {other:?}"
-                        )));
-                    }
-                }
+                let (expr, ascending) = match cond {
+                    spargebra::algebra::OrderExpression::Asc(e) => (e.clone(), true),
+                    spargebra::algebra::OrderExpression::Desc(e) => (e.clone(), false),
+                };
+                order_by.push(OrderCondition {
+                    expression: expr,
+                    ascending,
+                });
             }
             collect_ops(
                 inner,
@@ -676,8 +662,31 @@ mod tests {
             .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert_eq!(plan.order_by.len(), 1);
-        assert_eq!(plan.order_by[0].variable, "name");
+        assert!(matches!(
+            &plan.order_by[0].expression,
+            spargebra::algebra::Expression::Variable(v) if v.as_str() == "name"
+        ));
         assert!(plan.order_by[0].ascending);
+    }
+
+    #[test]
+    fn plan_order_by_expression() {
+        // URS-QEC-S04: ORDER BY on an arithmetic expression must plan, not fail.
+        let query = spargebra::SparqlParser::new()
+            .parse_query(
+                "SELECT ?a ?b WHERE { ?s <http://ex/a> ?a ; <http://ex/b> ?b } ORDER BY DESC(?a + ?b)",
+            )
+            .unwrap();
+        let plan = plan_query(&query, "default").unwrap();
+        assert_eq!(plan.order_by.len(), 1);
+        assert!(!plan.order_by[0].ascending);
+        assert!(
+            matches!(
+                &plan.order_by[0].expression,
+                spargebra::algebra::Expression::Add(_, _)
+            ),
+            "ORDER BY (?a + ?b) must capture the Add expression"
+        );
     }
 
     #[test]
