@@ -168,7 +168,7 @@ fn restamp_row(row: &mut ferrosa_sstable::types::Row, cell_ts: i64) {
 /// the local [`StorageEngine`].
 ///
 /// `ApplyMutation.data` is decoded as a self-describing commit-log
-/// [`Mutation`], which carries the `(keyspace, table)` → [`TableId`], the
+/// [`Mutation`], which carries the `(keyspace, table)` → `TableId`, the
 /// [`DecoratedKey`](ferrosa_common::DecoratedKey), the row data, and the
 /// write timestamp. Each row is written via [`StorageEngine::write`], which
 /// appends to the commit log and the memtable (persist-before-return).
@@ -178,7 +178,7 @@ fn restamp_row(row: &mut ferrosa_sstable::types::Row, cell_ts: i64) {
 /// Accord delivers `Apply` at-least-once, and recovery may re-drive it. The
 /// applier records every `(txn_id, t)` it has applied and treats a repeat as a
 /// no-op. This is required for correctness: cells are persisted at the agreed
-/// `t` (see [`accord_cell_timestamp`]), so a re-applied old mutation re-uses
+/// `t` (see `accord_cell_timestamp`), so a re-applied old mutation re-uses
 /// its *original* `t` and a naive re-write would resurrect a stale value over a
 /// newer write to the same key (a lost-update hazard, since LWW cannot tell the
 /// re-write apart from the first). Tracking applied transactions makes re-apply
