@@ -454,6 +454,18 @@ pub struct AccordCoordinatorDriver {
     /// committed mutation locally during the Apply phase. Set via
     /// [`Self::with_local_applier`].
     local_applier: Option<Arc<dyn crate::accord::apply::StorageApplier>>,
+    /// Optional handle to the coordinator's OWN replica state machine.
+    ///
+    /// The coordinator's self-send is unreachable over the network, so its local
+    /// read-vote cannot go through the inbound `AccordRead` handler. When this is
+    /// wired, the coordinator's local generic-`IF` read-at-`t` performs the SAME
+    /// dependency-wait the remote handler does — blocking until every conflicting
+    /// transaction `t0 < t` known to the local state machine has reached
+    /// `Applied` — so a genuinely concurrent contender's write is observed before
+    /// the read. Without it, two concurrent `INSERT IF NOT EXISTS` could each read
+    /// the key as absent before either applies and BOTH apply (a double-apply /
+    /// lost update). `None` keeps the bare-reader behavior (no local dep-wait).
+    local_accord_state: Option<crate::accord::handlers::AccordState>,
     /// For the generic-`IF` path: evaluates the IF predicate against the
     /// F+1-agreed row bytes at `t`. Returns `true` iff the write should apply.
     ///
@@ -541,6 +553,7 @@ impl AccordCoordinatorDriver {
             last_read_row: None,
             local_reader: None,
             local_applier: None,
+            local_accord_state: None,
             condition_gate: None,
         }
     }
@@ -572,6 +585,22 @@ impl AccordCoordinatorDriver {
         reader: Arc<dyn crate::accord::apply::StorageReader>,
     ) -> Self {
         self.local_reader = Some(reader);
+        self
+    }
+
+    /// Supply the coordinator's OWN replica state machine so its local generic-`IF`
+    /// read-vote performs the same dependency-wait the remote `AccordRead` handler
+    /// does (block until every conflicting `t0 < t` has `Applied` locally).
+    ///
+    /// The coordinator's self-send is unreachable over the network, so without this
+    /// the coordinator's local read-at-`t` would skip the dep-wait and could observe
+    /// a key as absent while a genuinely concurrent contender (with a smaller `t`)
+    /// is still mid-apply — the concurrent `INSERT IF NOT EXISTS` double-apply.
+    /// Production wires the same [`AccordState`](crate::accord::handlers::AccordState)
+    /// the node's inbound handlers use, backed by the same engine as the local
+    /// reader.
+    pub fn with_local_accord_state(mut self, state: crate::accord::handlers::AccordState) -> Self {
+        self.local_accord_state = Some(state);
         self
     }
 
@@ -627,6 +656,59 @@ impl AccordCoordinatorDriver {
             result_data: self.mutation.clone(),
         };
         bincode::serialize(&apply_payload).map_err(|e| AccordDriverError::Codec(e.to_string()))
+    }
+
+    /// Finalize this transaction as a *no-write* commit across the cluster after
+    /// the IF condition was found NOT to hold.
+    ///
+    /// A failed-IF LWT still committed (Accord ordered it), so on every replica
+    /// it sits in `Committed` with a pending mutation it will never apply. Left
+    /// there, it is a phantom dependency: a *later* transaction reading the same
+    /// key at `t' > t` would dep-wait on it until timeout. We therefore broadcast
+    /// an `Apply` carrying an EMPTY payload, which `handle_apply` treats as a
+    /// no-write finalize — it advances the txn to `Applied`, wakes dep-waiters,
+    /// and GCs the conflict index WITHOUT writing any row.
+    ///
+    /// Best-effort: this is a cleanup, not a correctness gate for THIS txn (which
+    /// is already aborting). Failures are logged, not propagated.
+    async fn finalize_no_write(&self) {
+        use crate::accord::wire::ApplyPayload;
+        let txn_id = self.coordinator.txn_id;
+
+        // Finalize the coordinator's own replica state machine (its self-send is
+        // unreachable). Empty payload => no-write finalize.
+        if let Some(local_sm) = &self.local_accord_state {
+            local_sm.lock().handle_apply(txn_id, Vec::new());
+        }
+
+        let payload = ApplyPayload {
+            txn_id,
+            result_data: Vec::new(),
+        };
+        let bytes = match bincode::serialize(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(txn_id = ?txn_id, error = %e, "accord: encode no-write finalize failed");
+                return;
+            }
+        };
+        let msg = Message::AccordApply(Bytes::from(bytes));
+
+        let futs: Vec<_> = self
+            .replica_ids
+            .iter()
+            .filter(|&&id| id != self.self_id)
+            .map(|&peer_id| {
+                let peers = Arc::clone(&self.peers);
+                let msg = msg.clone();
+                async move { peers.send(peer_id, msg, Lane::Data).await }
+            })
+            .collect();
+        for result in futures::future::join_all(futs).await {
+            if let Err(e) = result {
+                tracing::warn!(txn_id = ?txn_id, error = %e, "accord: no-write finalize RPC failed");
+            }
+        }
     }
 
     /// Run the full Accord protocol for this transaction.
@@ -907,15 +989,44 @@ impl AccordCoordinatorDriver {
         // the result is deterministic across all replicas. The applier already
         // persisted earlier conflicting txns locally before this read (dep-wait).
         if is_generic {
-            if let (Some(reader), crate::accord::wire::ReadPredicate::ReadRow { keyspace, table }) =
-                (&self.local_reader, &self.read_predicate)
+            if let crate::accord::wire::ReadPredicate::ReadRow { keyspace, table } =
+                &self.read_predicate
             {
-                match reader.read_row_at(keyspace, table, &key, commit_t) {
-                    Ok(bytes) => read_rows.push(bytes.unwrap_or_default()),
-                    Err(e) => {
-                        return Err(AccordDriverError::Network(format!(
-                            "coordinator local read-at-t failed: {e}"
-                        )));
+                // Prefer the local state machine when wired: it performs the SAME
+                // dep-wait the remote handler does (block until every conflicting
+                // `t0 < t` has Applied locally) before reading at `t`. This is what
+                // serializes a genuinely concurrent contender's write ahead of this
+                // read — without it the coordinator's own replica could read the key
+                // as absent while a smaller-`t` contender is mid-apply (the
+                // concurrent INSERT IF NOT EXISTS double-apply). On dep-wait timeout
+                // we ABSTAIN (push no row) so F+1 agreement fails loud rather than
+                // reading stale.
+                if let Some(local_sm) = &self.local_accord_state {
+                    if crate::accord::handlers::await_conflicting_deps_applied(
+                        local_sm, &key, commit_t,
+                    )
+                    .await
+                    {
+                        let row = local_sm
+                            .lock()
+                            .read_row_bytes_at(keyspace, table, &key, commit_t);
+                        read_rows.push(row.unwrap_or_default());
+                    } else {
+                        tracing::error!(
+                            txn_id = ?txn_id,
+                            "accord: coordinator local read-vote dep-wait timed out — abstaining"
+                        );
+                        // Abstain: contribute no local read. F+1 agreement then
+                        // fails loud below rather than treating a stale read as truth.
+                    }
+                } else if let Some(reader) = &self.local_reader {
+                    match reader.read_row_at(keyspace, table, &key, commit_t) {
+                        Ok(bytes) => read_rows.push(bytes.unwrap_or_default()),
+                        Err(e) => {
+                            return Err(AccordDriverError::Network(format!(
+                                "coordinator local read-at-t failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -1016,6 +1127,10 @@ impl AccordCoordinatorDriver {
                         txn_id = ?txn_id,
                         "accord: generic IF condition not met — [applied]=false, no Apply"
                     );
+                    // Finalize this committed-but-not-applied txn as a no-write
+                    // across replicas so it does not linger as a phantom dep that
+                    // would stall later reads' dep-wait on this key.
+                    self.finalize_no_write().await;
                     return Err(AccordDriverError::ConditionNotMet {
                         current_row: agreed_row_bytes,
                     });
@@ -1031,6 +1146,10 @@ impl AccordCoordinatorDriver {
                     sq,
                     "accord: IF condition not met — [applied]=false"
                 );
+                // Finalize this committed-but-not-applied txn as a no-write
+                // across replicas so it does not linger as a phantom dep that
+                // would stall later reads' dep-wait on this key.
+                self.finalize_no_write().await;
                 return Err(AccordDriverError::ConditionNotMet {
                     current_row: dissenting_row,
                 });
