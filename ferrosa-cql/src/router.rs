@@ -21449,4 +21449,107 @@ mod tests {
             "point read needs no continuation"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Cross-crate roundtrip: the router's `build_lwt_mutation` serialize_into
+    // output is EXACTLY what the real `EngineStorageApplier` deserialize_from
+    // can decode and persist — with real partition-key extraction and real
+    // cell values from the INSERT, and the persisted cell timestamp honoring
+    // the Accord-agreed `t` (not the coordinator's materialize-time wall clock).
+    //
+    // This guards two production-correctness contracts that no in-crate test
+    // can cover, because the producer (`build_lwt_mutation`, ferrosa-cql) and
+    // the consumer (`EngineStorageApplier`, ferrosa-cluster) live in different
+    // crates:
+    //   1. SERIALIZATION SKEW: if the router's `Mutation::serialize_into` and
+    //      the applier's `Mutation::deserialize_from` ever drift apart, the
+    //      decode fails (or yields a wrong key/row) and this test fails loud.
+    //   2. LINEARIZABILITY: the router stamps cells with `SystemTime::now()`
+    //      micros; under clock skew that wall-clock stamp can invert the
+    //      Accord order. The applier MUST re-stamp to `t`, so the persisted
+    //      cell timestamp equals the agreed `t`, not the wall clock.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn build_lwt_mutation_round_trips_through_engine_storage_applier() {
+        use ferrosa_cluster::accord::apply::{ApplyMutation, EngineStorageApplier, StorageApplier};
+        use ferrosa_common::accord::{Timestamp, TxnId};
+        use ferrosa_storage::TableId;
+
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        // Real keyspace + table.
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE lwt_rt WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt =
+            crate::parser::parse("CREATE TABLE lwt_rt.accts (id text PRIMARY KEY, balance text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Parse a real LWT INSERT. `build_lwt_mutation` ignores the IF clause
+        // (that is the read-phase predicate); it materializes the write.
+        let stmt = crate::parser::parse(
+            "INSERT INTO lwt_rt.accts (id, balance) VALUES ('acct-1', '100') IF NOT EXISTS",
+        )
+        .unwrap();
+
+        // PRODUCER: the router builds the (key, mutation) wire payload exactly
+        // as the Accord coordinator would ship it in the Apply phase.
+        let (key_bytes, mutation_bytes) =
+            build_lwt_mutation(&state, &ctx, &stmt).expect("router must build the LWT mutation");
+
+        // The conflict-ordering key must be the real partition-key bytes —
+        // proving real key extraction (not the old `b"lwt-placeholder-key"`).
+        assert_eq!(
+            key_bytes,
+            b"acct-1".to_vec(),
+            "Accord key must be the real partition-key bytes, not a placeholder"
+        );
+
+        // CONSUMER: a real applier over the SAME engine decodes those exact
+        // bytes and persists. The agreed `t` is deliberately a tiny value
+        // (777), far below the wall-clock micros the router stamped cells with,
+        // so a successful read at ts==777 proves the applier re-stamped to `t`.
+        let agreed = Timestamp::synthetic(777);
+        let applier = EngineStorageApplier::new(state.engine.clone());
+        applier
+            .apply(
+                TxnId::new(1, agreed),
+                ApplyMutation {
+                    data: mutation_bytes,
+                    t: agreed,
+                    deps: vec![],
+                },
+            )
+            .expect("applier must decode the router's bytes and persist (no skew)");
+
+        // The row the router serialized must now be readable via the engine,
+        // with the REAL cell value from the INSERT.
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(key_bytes));
+        let partition = state
+            .engine
+            .read(&TableId::new("lwt_rt", "accts"), &key)
+            .unwrap()
+            .expect("the round-tripped row must be persisted and readable");
+        let row = partition.rows.first().expect("one row");
+        let (_, balance_cell) = row
+            .cells
+            .iter()
+            .find(|(_, c)| c.value.as_deref() == Some(b"100".as_slice()))
+            .expect("the real INSERT cell value must survive the roundtrip");
+
+        // The persisted LWW cell timestamp must equal the Accord-agreed `t`
+        // (777), NOT the router's materialize-time wall clock. If the applier
+        // honored the wall clock, this would be ~1.7e15 micros and fail.
+        assert_eq!(
+            balance_cell.timestamp, 777,
+            "persisted cell timestamp must be the Accord-agreed t, not the coordinator wall clock"
+        );
+    }
 }
