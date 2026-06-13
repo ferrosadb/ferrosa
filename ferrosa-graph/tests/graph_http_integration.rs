@@ -5692,3 +5692,113 @@ async fn http_foreach_partial_failure_rolls_back() {
         "FOREACH body failure must roll back: expected zero Person nodes, got {rows:?}"
     );
 }
+
+/// Regression: a NESTED FOREACH whose body fails validation must roll back the
+/// OUTER element writes too. Previously phase 1 skipped nested-FOREACH bodies,
+/// so the outer CREATEs committed before the nested body ever validated — a
+/// partial write survived a failing FOREACH. The whole statement must be planned
+/// (recursively, including nested bodies) before any write, so an unknown label
+/// in the nested body aborts with ZERO outer writes.
+#[tokio::test]
+async fn http_foreach_nested_body_failure_rolls_back_outer() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "FOREACH (x IN ['Ada', 'Babbage'] | \
+                      CREATE (p:Person {name: x}) \
+                      FOREACH (y IN [1] | CREATE (g:Ghost {name: x})))",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "FOREACH with a nested body targeting an unknown label must fail loud"
+    );
+
+    // The outer CREATE (Person) must NOT have persisted — the failing nested
+    // FOREACH body has to be validated/planned before any outer write.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert!(
+        rows.is_empty(),
+        "nested FOREACH failure must roll back outer writes: expected zero Person nodes, got {rows:?}"
+    );
+}
+
+/// A nested FOREACH whose body is entirely valid runs once per (outer × inner)
+/// element, in source order, materializing both loop variables. Proves the
+/// recursive flatten preserves per-element semantics rather than batching all
+/// outer clauses ahead of nested loops.
+#[tokio::test]
+async fn http_foreach_nested_creates_cross_product() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "FOREACH (x IN ['Ada', 'Babbage'] | \
+                      FOREACH (y IN ['x', 'y'] | \
+                      CREATE (n:Person {name: x})))",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "valid nested FOREACH must return 200"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let mut names: Vec<String> = rows
+        .iter()
+        .map(|r| r[0].as_str().expect("name string").to_string())
+        .collect();
+    names.sort();
+    // 2 outer × 2 inner = 4 nodes; each named after the OUTER element.
+    assert_eq!(
+        names,
+        vec![
+            "Ada".to_string(),
+            "Ada".to_string(),
+            "Babbage".to_string(),
+            "Babbage".to_string()
+        ],
+        "nested FOREACH must create one node per (outer, inner) element pair"
+    );
+}

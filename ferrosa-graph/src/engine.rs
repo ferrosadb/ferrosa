@@ -721,13 +721,22 @@ impl GraphEngine {
     }
 
     /// Execute `FOREACH (var IN list | body...)`: run each body update clause
-    /// once per list element, atomically with respect to the whole statement.
+    /// once per list element.
     ///
-    /// Atomicity: every (element × body-clause) is validated and planned **before
-    /// any** is executed. If any iteration fails to validate or plan (unknown
-    /// label, type error, malformed clause), the call returns the error with zero
-    /// writes performed — partial failure rolls back, never leaving some elements
-    /// written and others not. Planned plans are then executed in order.
+    /// The whole FOREACH tree — including **nested FOREACH bodies** — is recursively
+    /// materialized, validated, and planned into one ordered list of physical plans
+    /// **before any is executed** (`plan_foreach`). The plans preserve openCypher
+    /// per-element source ordering: for each outer element, that element's body
+    /// clauses (and the fully-expanded plans of any nested FOREACH) appear in source
+    /// order before the next element's. Execution then runs the list in order.
+    ///
+    /// Rollback scope (deliberate, fail-loud): WritePath has no cross-statement
+    /// transaction, so the guaranteed-atomic class is the **validate/plan failure
+    /// class** — if any (element × clause), at any nesting depth, fails to validate
+    /// or plan (unknown label, type error, malformed clause), the call returns the
+    /// error with ZERO writes performed. An execution-time failure (a write error
+    /// after earlier plans committed) is surfaced loudly but cannot be rolled back
+    /// here; that would require a storage-level batch and is not claimed.
     async fn execute_foreach(
         &self,
         var: &str,
@@ -736,43 +745,16 @@ impl GraphEngine {
         keyspace: &str,
         auth: &AuthContext,
     ) -> Result<GraphResult> {
-        // Evaluate the list once. Top-level FOREACH has no outer bindings.
-        let list_value = eval_expr(list, &HashMap::new())
-            .map_err(|e| GraphError::Validation(format!("FOREACH list expression: {e}")))?;
-        let elements = match list_value {
-            Value::Array(items) => items,
-            Value::Null => Vec::new(),
-            other => {
-                return Err(GraphError::Validation(format!(
-                    "FOREACH expects a list, got {other}"
-                )));
-            }
-        };
+        // Phase 1 — recursively plan the entire FOREACH tree. Any validation/plan
+        // failure (at any depth) aborts here, before a single write.
+        let planned = self
+            .plan_foreach(var, list, body, keyspace, auth)
+            .await?;
+        let element_count = planned.element_count;
 
-        // Phase 1 — materialize, validate, and plan every iteration up front so a
-        // failure on any element aborts before a single write (atomic rollback).
-        let mut planned: Vec<PhysicalPlan> = Vec::new();
-        for element in &elements {
-            let replacement = value_to_expr(element)?;
-            for stmt in body {
-                // Nested FOREACH inside a body is expanded recursively at execution
-                // time; here we only pre-plan the leaf update clauses.
-                if let Statement::Foreach { .. } = stmt {
-                    continue;
-                }
-                let bound = subst_var_statement(stmt.clone(), var, &replacement);
-                if statement_requires_adjacency(&bound) {
-                    self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
-                }
-                let snap = self.schema.snapshot();
-                let logical = validate(&snap, auth, keyspace, bound)?;
-                planned.push(plan(logical)?);
-            }
-        }
-
-        // Phase 2 — execute the pre-planned leaf clauses, then any nested FOREACH.
+        // Phase 2 — execute the pre-planned clauses in source order.
         let mut stats = QueryStats::default();
-        for physical in planned {
+        for physical in planned.plans {
             let wp = self.write_path.load();
             let result = execute(
                 physical,
@@ -786,36 +768,78 @@ impl GraphEngine {
             stats.vertices_written += result.stats.vertices_written;
             stats.vertices_deleted += result.stats.vertices_deleted;
         }
-        for element in &elements {
-            let replacement = value_to_expr(element)?;
-            for stmt in body {
-                if let Statement::Foreach {
-                    var: inner_var,
-                    list: inner_list,
-                    body: inner_body,
-                } = subst_var_statement(stmt.clone(), var, &replacement)
-                {
-                    let nested = Box::pin(self.execute_foreach(
-                        &inner_var,
-                        &inner_list,
-                        &inner_body,
-                        keyspace,
-                        auth,
-                    ))
-                    .await?;
-                    stats.vertices_written += nested.stats.vertices_written;
-                    stats.vertices_deleted += nested.stats.vertices_deleted;
-                }
-            }
-        }
 
         Ok(GraphResult {
             columns: vec!["status".to_string()],
             rows: vec![vec![Value::String(format!(
-                "FOREACH applied to {} element(s)",
-                elements.len()
+                "FOREACH applied to {element_count} element(s)"
             ))]],
             stats,
+        })
+    }
+
+    /// Recursively materialize + validate + plan a FOREACH into an ordered list of
+    /// physical plans, preserving per-element source ordering. Nested FOREACHs are
+    /// expanded in place (their plans interleave at the point the nested clause
+    /// appears, once per outer element). No execution happens here, so any failure
+    /// leaves zero writes.
+    async fn plan_foreach(
+        &self,
+        var: &str,
+        list: &Expr,
+        body: &[Statement],
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<PlannedForeach> {
+        let list_value = eval_expr(list, &HashMap::new())
+            .map_err(|e| GraphError::Validation(format!("FOREACH list expression: {e}")))?;
+        let elements = match list_value {
+            Value::Array(items) => items,
+            Value::Null => Vec::new(),
+            other => {
+                return Err(GraphError::Validation(format!(
+                    "FOREACH expects a list, got {other}"
+                )));
+            }
+        };
+
+        let mut plans: Vec<PhysicalPlan> = Vec::new();
+        for element in &elements {
+            let replacement = value_to_expr(element)?;
+            for stmt in body {
+                let bound = subst_var_statement(stmt.clone(), var, &replacement);
+                match bound {
+                    Statement::Foreach {
+                        var: inner_var,
+                        list: inner_list,
+                        body: inner_body,
+                    } => {
+                        // Expand the nested loop in place, preserving source order.
+                        let nested = Box::pin(self.plan_foreach(
+                            &inner_var,
+                            &inner_list,
+                            &inner_body,
+                            keyspace,
+                            auth,
+                        ))
+                        .await?;
+                        plans.extend(nested.plans);
+                    }
+                    leaf => {
+                        if statement_requires_adjacency(&leaf) {
+                            self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
+                        }
+                        let snap = self.schema.snapshot();
+                        let logical = validate(&snap, auth, keyspace, leaf)?;
+                        plans.push(plan(logical)?);
+                    }
+                }
+            }
+        }
+
+        Ok(PlannedForeach {
+            plans,
+            element_count: elements.len(),
         })
     }
 
@@ -1323,6 +1347,13 @@ fn bind_statement_params(
 /// scalars become `Literal`s, arrays become `Expr::List`, and objects become
 /// `Expr::Map`, so nested structures (e.g. `FOREACH (m IN [{name:'a'}] | ...)`)
 /// substitute correctly.
+/// Fully-expanded plan for a FOREACH subtree: physical plans in per-element
+/// source order, plus the outer element count for the status row.
+struct PlannedForeach {
+    plans: Vec<PhysicalPlan>,
+    element_count: usize,
+}
+
 fn value_to_expr(value: &Value) -> Result<Expr> {
     Ok(match value {
         Value::Null => Expr::Literal(Literal::Null),
@@ -1568,8 +1599,9 @@ fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statem
                 body,
             }
         }
-        // REMOVE/DELETE bodies reference bound variables (not value-substituted by
-        // the loop var directly); pass through unchanged.
+        // REMOVE/DELETE (and any non-update statement) are rejected in a FOREACH
+        // body at parse time, so they never reach substitution here; pass through
+        // unchanged defensively.
         other => other,
     }
 }
