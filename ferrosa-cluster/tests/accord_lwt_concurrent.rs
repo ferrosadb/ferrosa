@@ -163,6 +163,7 @@ async fn two_coordinators_concurrent_insert_if_not_exists() {
         false, // not leaseholder
         &clock_a,
         key.clone(),
+        Vec::new(), // protocol-only test: no mutation payload
     );
     let mut driver_b = AccordCoordinatorDriver::new(
         node_b.node_id,
@@ -171,6 +172,7 @@ async fn two_coordinators_concurrent_insert_if_not_exists() {
         false, // not leaseholder
         &clock_b,
         key.clone(),
+        Vec::new(), // protocol-only test: no mutation payload
     );
 
     // Fire both transactions concurrently (real RPC over TCP).
@@ -308,6 +310,7 @@ async fn single_coordinator_round_trips_to_remote_replica() {
         false,
         &clock,
         b"round-trip-key".to_vec(),
+        Vec::new(), // protocol-only test: no mutation payload
     );
 
     let result = driver.run_transaction().await;
@@ -389,6 +392,7 @@ async fn gap4_gap5_read_vote_and_apply_round_trip() {
         false,
         &clock1,
         key.clone(),
+        Vec::new(), // protocol-only test: no mutation payload
     );
 
     let result1 = driver1.run_transaction().await;
@@ -445,6 +449,7 @@ async fn gap4_gap5_read_vote_and_apply_round_trip() {
         false,
         &clock2,
         key.clone(),
+        Vec::new(), // protocol-only test: no mutation payload
     );
 
     let result2 = driver2.run_transaction().await;

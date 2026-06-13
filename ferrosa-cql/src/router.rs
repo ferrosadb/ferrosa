@@ -967,6 +967,73 @@ pub enum RouteResult {
 
 // ── Accord LWT dispatch ──────────────────────────────────────────────────
 
+/// Materialize an LWT statement into the real partition key and the encoded
+/// mutation that Accord must replicate and apply.
+///
+/// Returns `(decorated_key_bytes, mutation_bytes)` where:
+/// - `decorated_key_bytes` is the partition-key token+bytes used by Accord for
+///   conflict ordering (the transaction's "key").
+/// - `mutation_bytes` is a self-describing commit-log [`Mutation`]
+///   (keyspace/table, `DecoratedKey`, rows, timestamp) serialized with
+///   `serialize_into`, replacing the former `b"lwt-placeholder-key"` stub that
+///   carried nothing. The mutation is now threaded across the wire so the Apply
+///   phase has the real bytes to persist.
+///
+///   NOTE: a replica only *persists* these bytes once it is constructed with an
+///   [`EngineStorageApplier`](ferrosa_cluster::accord::apply). Production today
+///   still builds `AccordStateMachine` with the default `NoopStorageApplier`
+///   (see `controller/cluster.rs`), so on a live replica the decode-and-write
+///   step is a no-op pending the inc6 startup-wiring increment — no client path
+///   reaches `route_lwt_via_accord` yet, so this is not user-visible.
+///
+/// Reuses the same `materialize_insert`/`materialize_update`/`materialize_delete`
+/// path as logged batches, so an Accord-routed INSERT/UPDATE/DELETE produces
+/// byte-identical storage writes to the local path.
+///
+/// # Errors
+///
+/// Fails loud (`CqlError::Invalid`) for any statement that is not an
+/// INSERT/UPDATE/DELETE — never silently fabricates a mutation.
+fn build_lwt_mutation(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+) -> Result<(Vec<u8>, Vec<u8>), CqlError> {
+    use ferrosa_storage::Mutation;
+
+    let now_micros = || -> Result<i64, CqlError> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64)
+    };
+
+    let (table_id, key, row, ts) = match stmt {
+        Statement::Insert(s) => materialize_insert(state, ctx, s, now_micros()?)?,
+        Statement::Update(s) => materialize_update(state, ctx, s, now_micros()?)?,
+        Statement::Delete(s) => materialize_delete(state, ctx, s, now_micros()?)?,
+        _ => {
+            return Err(CqlError::Invalid(
+                "LWT via Accord supports only INSERT/UPDATE/DELETE statements".into(),
+            ));
+        }
+    };
+
+    let key_bytes = key.key.as_bytes().to_vec();
+
+    let mutation = Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        key,
+        vec![row],
+        ts,
+    );
+    let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
+    mutation.serialize_into(&mut mutation_bytes);
+
+    Ok((key_bytes, mutation_bytes))
+}
+
 /// Route a LWT statement through the Accord consensus protocol.
 ///
 /// Constructs an `AccordCoordinatorDriver`, runs the full PreAccept → Commit
@@ -983,8 +1050,8 @@ pub enum RouteResult {
 /// - The Accord quorum cannot be reached (network failure / too few replicas).
 async fn route_lwt_via_accord(
     state: &SharedState,
-    _ctx: &RequestContext<'_>,
-    _stmt: &Statement,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
     peers: Arc<ferrosa_net::peer::PeerManager>,
     clock: Arc<ferrosa_common::accord::HybridLogicalClock>,
 ) -> Result<RouteResult, CqlError> {
@@ -1010,10 +1077,12 @@ async fn route_lwt_via_accord(
     let host_bytes = host_id.as_bytes();
     let node_id = u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
 
-    // Use a simple key derived from the statement type for now.
-    // Full partition key bytes will replace this once the CQL planner is
-    // integrated with the Accord execution path.
-    let key = b"lwt-placeholder-key".to_vec();
+    // Extract the REAL partition key + serialized mutation from the statement.
+    // `key` is the Accord conflict-ordering key (partition-key bytes); `mutation`
+    // is the encoded commit-log Mutation that each replica decodes and writes in
+    // the Apply phase. This replaces the former `b"lwt-placeholder-key"` stub
+    // that persisted nothing (the phantom-write bug).
+    let (key, mutation) = build_lwt_mutation(state, ctx, stmt)?;
 
     let mut driver = AccordCoordinatorDriver::new(
         node_id,
@@ -1022,6 +1091,7 @@ async fn route_lwt_via_accord(
         false, // not leaseholder (derive from TokenRing in future)
         &clock,
         key,
+        mutation,
     );
 
     match driver.run_transaction().await {
