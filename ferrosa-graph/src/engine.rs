@@ -774,9 +774,7 @@ impl GraphEngine {
     ) -> Result<GraphResult> {
         // Phase 1 — recursively plan the entire FOREACH tree. Any validation/plan
         // failure (at any depth) aborts here, before a single write.
-        let planned = self
-            .plan_foreach(var, list, body, keyspace, auth)
-            .await?;
+        let planned = self.plan_foreach(var, list, body, keyspace, auth).await?;
         let element_count = planned.element_count;
 
         // Phase 2 — execute the pre-planned clauses in source order.
@@ -937,9 +935,7 @@ impl GraphEngine {
             }
             let bound_inner = fold_constants_statement(bound_inner)?;
 
-            let inner_result = self
-                .execute_statement(bound_inner, keyspace, auth)
-                .await?;
+            let inner_result = self.execute_statement(bound_inner, keyspace, auth).await?;
             stats.vertices_written += inner_result.stats.vertices_written;
             stats.vertices_deleted += inner_result.stats.vertices_deleted;
             stats.vertices_read += inner_result.stats.vertices_read;
@@ -1566,19 +1562,14 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         Expr::Function { name, args } => {
             is_aggregate_function(name) || args.iter().any(expr_contains_aggregate)
         }
-        Expr::Distinct(inner)
-        | Expr::Not(inner)
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner) => expr_contains_aggregate(inner),
+        Expr::Distinct(inner) | Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_contains_aggregate(inner)
+        }
         Expr::Comparison { left, right, .. }
         | Expr::Arithmetic { left, right, .. }
         | Expr::And(left, right)
-        | Expr::Or(left, right) => {
-            expr_contains_aggregate(left) || expr_contains_aggregate(right)
-        }
-        Expr::In { value, list } => {
-            expr_contains_aggregate(value) || expr_contains_aggregate(list)
-        }
+        | Expr::Or(left, right) => expr_contains_aggregate(left) || expr_contains_aggregate(right),
+        Expr::In { value, list } => expr_contains_aggregate(value) || expr_contains_aggregate(list),
         Expr::List(items) => items.iter().any(expr_contains_aggregate),
         Expr::Index { target, index } => {
             expr_contains_aggregate(target) || expr_contains_aggregate(index)
@@ -1610,7 +1601,10 @@ fn project_trailing_return(
     config: &GraphEngineConfig,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     let columns = build_columns(rc);
-    let has_aggregate = rc.items.iter().any(|item| expr_contains_aggregate(&item.expr));
+    let has_aggregate = rc
+        .items
+        .iter()
+        .any(|item| expr_contains_aggregate(&item.expr));
 
     let mut rows = if has_aggregate {
         project_trailing_aggregate(rc, bindings, config)?
@@ -1751,8 +1745,8 @@ fn eval_trailing_aggregate(
             )))
         }
     };
-    let count_star = name.eq_ignore_ascii_case("count")
-        && matches!(arg, Some(Expr::Var(v)) if v == "*");
+    let count_star =
+        name.eq_ignore_ascii_case("count") && matches!(arg, Some(Expr::Var(v)) if v == "*");
 
     let mut acc = create_accumulator(name, count_star, config.max_collect_size)?;
     let mut seen: HashSet<String> = HashSet::new();
@@ -2171,11 +2165,7 @@ fn subst_var_return_clause(rc: ReturnClause, var: &str, replacement: &Expr) -> R
 
 /// Substitute the imported variable inside a WITH pipeline (its projection and
 /// trailing WHERE filter).
-fn subst_var_with_pipeline(
-    wp: WithPipeline,
-    var: &str,
-    replacement: &Expr,
-) -> WithPipeline {
+fn subst_var_with_pipeline(wp: WithPipeline, var: &str, replacement: &Expr) -> WithPipeline {
     WithPipeline {
         clause: subst_var_return_clause(wp.clause, var, replacement),
         where_clause: wp.where_clause.map(|w| subst_var_expr(w, var, replacement)),
@@ -3165,7 +3155,8 @@ mod tests {
             binding(&[("a", Value::from(2))]),
             binding(&[("a", Value::from(3))]),
         ];
-        let (cols, out) = project_trailing_return(&rc, &rows, &GraphEngineConfig::default()).unwrap();
+        let (cols, out) =
+            project_trailing_return(&rc, &rows, &GraphEngineConfig::default()).unwrap();
         assert_eq!(cols, vec!["n".to_string()]);
         assert_eq!(out, vec![vec![Value::from(3u64)]]);
     }
@@ -3179,7 +3170,8 @@ mod tests {
             },
             "n",
         );
-        let (_cols, out) = project_trailing_return(&rc, &[], &GraphEngineConfig::default()).unwrap();
+        let (_cols, out) =
+            project_trailing_return(&rc, &[], &GraphEngineConfig::default()).unwrap();
         assert_eq!(
             out,
             vec![vec![Value::from(0u64)]],
@@ -3203,7 +3195,8 @@ mod tests {
             binding(&[("one", Value::from(1))]),
             binding(&[("one", Value::from(1))]),
         ];
-        let (_cols, out) = project_trailing_return(&rc, &rows, &GraphEngineConfig::default()).unwrap();
+        let (_cols, out) =
+            project_trailing_return(&rc, &rows, &GraphEngineConfig::default()).unwrap();
         assert_eq!(out, vec![vec![Value::from(1)]]);
     }
 
@@ -3216,7 +3209,8 @@ mod tests {
             binding(&[("a", Value::from(20))]),
             binding(&[("a", Value::from(30))]),
         ];
-        let (_cols, out) = project_trailing_return(&rc, &rows, &GraphEngineConfig::default()).unwrap();
+        let (_cols, out) =
+            project_trailing_return(&rc, &rows, &GraphEngineConfig::default()).unwrap();
         assert_eq!(out.len(), 1, "LIMIT 1 must truncate to one row");
     }
 

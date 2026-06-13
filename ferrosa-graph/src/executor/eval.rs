@@ -180,7 +180,13 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
             list,
             filter,
             projection,
-        } => eval_list_comprehension(var, list, filter.as_deref(), projection.as_deref(), bindings),
+        } => eval_list_comprehension(
+            var,
+            list,
+            filter.as_deref(),
+            projection.as_deref(),
+            bindings,
+        ),
         Expr::MapProjection { var, selectors } => eval_map_projection(var, selectors, bindings),
         Expr::PatternComprehension { .. } => Err(GraphError::Validation(
             "pattern comprehension requires graph-aware evaluation".into(),

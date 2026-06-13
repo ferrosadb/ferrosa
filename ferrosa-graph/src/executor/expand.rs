@@ -635,7 +635,9 @@ fn expr_has_pattern_comprehension(expr: &Expr) -> bool {
             ..
         } => {
             expr_has_pattern_comprehension(list)
-                || filter.as_deref().is_some_and(expr_has_pattern_comprehension)
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_has_pattern_comprehension)
                 || projection
                     .as_deref()
                     .is_some_and(expr_has_pattern_comprehension)
@@ -741,9 +743,14 @@ async fn eval_pattern_comprehension(
         ));
     }
 
-    let neighbor_ids =
-        outgoing_neighbor_ids(write_path, keyspace, schema, current_key, hop.rel_type.as_deref())
-            .await?;
+    let neighbor_ids = outgoing_neighbor_ids(
+        write_path,
+        keyspace,
+        schema,
+        current_key,
+        hop.rel_type.as_deref(),
+    )
+    .await?;
 
     let mut out = Vec::new();
     for neighbor_id in neighbor_ids {
