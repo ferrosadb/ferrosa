@@ -25,6 +25,7 @@ use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::{reconcile_once, spawn_reconciliation};
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
+use crate::executor::eval::eval_expr;
 use crate::executor::expand::{build_columns, execute, GraphEngineConfig};
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::executor::subscribe::SubscriptionRegistry;
@@ -274,6 +275,7 @@ fn statement_requires_adjacency(statement: &Statement) -> bool {
                     .as_ref()
                     .is_some_and(return_clause_requires_adjacency)
         }
+        Statement::Foreach { body, .. } => body.iter().any(statement_requires_adjacency),
     }
 }
 
@@ -676,6 +678,11 @@ impl GraphEngine {
         params: &HashMap<String, Value>,
     ) -> Result<GraphResult> {
         let statement = bind_statement_params(parse(query)?, params)?;
+        if let Statement::Foreach { var, list, body } = statement {
+            return self
+                .execute_foreach(&var, &list, &body, keyspace, auth)
+                .await;
+        }
         if statement_requires_adjacency(&statement) {
             let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
             if adjacency_registered {
@@ -711,6 +718,105 @@ impl GraphEngine {
             Some(&self.schema),
         )
         .await
+    }
+
+    /// Execute `FOREACH (var IN list | body...)`: run each body update clause
+    /// once per list element, atomically with respect to the whole statement.
+    ///
+    /// Atomicity: every (element × body-clause) is validated and planned **before
+    /// any** is executed. If any iteration fails to validate or plan (unknown
+    /// label, type error, malformed clause), the call returns the error with zero
+    /// writes performed — partial failure rolls back, never leaving some elements
+    /// written and others not. Planned plans are then executed in order.
+    async fn execute_foreach(
+        &self,
+        var: &str,
+        list: &Expr,
+        body: &[Statement],
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<GraphResult> {
+        // Evaluate the list once. Top-level FOREACH has no outer bindings.
+        let list_value = eval_expr(list, &HashMap::new())
+            .map_err(|e| GraphError::Validation(format!("FOREACH list expression: {e}")))?;
+        let elements = match list_value {
+            Value::Array(items) => items,
+            Value::Null => Vec::new(),
+            other => {
+                return Err(GraphError::Validation(format!(
+                    "FOREACH expects a list, got {other}"
+                )));
+            }
+        };
+
+        // Phase 1 — materialize, validate, and plan every iteration up front so a
+        // failure on any element aborts before a single write (atomic rollback).
+        let mut planned: Vec<PhysicalPlan> = Vec::new();
+        for element in &elements {
+            let replacement = value_to_expr(element)?;
+            for stmt in body {
+                // Nested FOREACH inside a body is expanded recursively at execution
+                // time; here we only pre-plan the leaf update clauses.
+                if let Statement::Foreach { .. } = stmt {
+                    continue;
+                }
+                let bound = subst_var_statement(stmt.clone(), var, &replacement);
+                if statement_requires_adjacency(&bound) {
+                    self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
+                }
+                let snap = self.schema.snapshot();
+                let logical = validate(&snap, auth, keyspace, bound)?;
+                planned.push(plan(logical)?);
+            }
+        }
+
+        // Phase 2 — execute the pre-planned leaf clauses, then any nested FOREACH.
+        let mut stats = QueryStats::default();
+        for physical in planned {
+            let wp = self.write_path.load();
+            let result = execute(
+                physical,
+                &wp,
+                keyspace,
+                &self.config,
+                Some(self.schema.virtual_tables()),
+                Some(&self.schema),
+            )
+            .await?;
+            stats.vertices_written += result.stats.vertices_written;
+            stats.vertices_deleted += result.stats.vertices_deleted;
+        }
+        for element in &elements {
+            let replacement = value_to_expr(element)?;
+            for stmt in body {
+                if let Statement::Foreach {
+                    var: inner_var,
+                    list: inner_list,
+                    body: inner_body,
+                } = subst_var_statement(stmt.clone(), var, &replacement)
+                {
+                    let nested = Box::pin(self.execute_foreach(
+                        &inner_var,
+                        &inner_list,
+                        &inner_body,
+                        keyspace,
+                        auth,
+                    ))
+                    .await?;
+                    stats.vertices_written += nested.stats.vertices_written;
+                    stats.vertices_deleted += nested.stats.vertices_deleted;
+                }
+            }
+        }
+
+        Ok(GraphResult {
+            columns: vec!["status".to_string()],
+            rows: vec![vec![Value::String(format!(
+                "FOREACH applied to {} element(s)",
+                elements.len()
+            ))]],
+            stats,
+        })
     }
 
     /// Explain a query: parse -> validate -> plan (return plan description).
@@ -1200,7 +1306,272 @@ fn bind_statement_params(
                 .transpose()?,
         },
         Statement::Unsubscribe { stream_id } => Statement::Unsubscribe { stream_id },
+        Statement::Foreach { var, list, body } => Statement::Foreach {
+            var,
+            list: bind_expr_params(list, params)?,
+            body: body
+                .into_iter()
+                .map(|stmt| bind_statement_params(stmt, params))
+                .collect::<Result<Vec<_>>>()?,
+        },
     })
+}
+
+/// Convert a runtime JSON value into the equivalent literal `Expr`.
+///
+/// Used to materialize a FOREACH loop element into the body's expressions:
+/// scalars become `Literal`s, arrays become `Expr::List`, and objects become
+/// `Expr::Map`, so nested structures (e.g. `FOREACH (m IN [{name:'a'}] | ...)`)
+/// substitute correctly.
+fn value_to_expr(value: &Value) -> Result<Expr> {
+    Ok(match value {
+        Value::Null => Expr::Literal(Literal::Null),
+        Value::Bool(b) => Expr::Literal(Literal::Bool(*b)),
+        Value::String(s) => Expr::Literal(Literal::String(s.clone())),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Expr::Literal(Literal::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Expr::Literal(Literal::Float(f))
+            } else {
+                return Err(GraphError::Validation(
+                    "FOREACH element number cannot be represented".to_string(),
+                ));
+            }
+        }
+        Value::Array(items) => Expr::List(
+            items
+                .iter()
+                .map(value_to_expr)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Value::Object(map) => Expr::Map(
+            map.iter()
+                .map(|(k, v)| Ok((k.clone(), value_to_expr(v)?)))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+/// Substitute every reference to FOREACH loop variable `var` in `expr` with
+/// `replacement` (the materialized current element). A nested FOREACH/comprehension
+/// that rebinds the same name shadows the outer binding, so substitution stops at
+/// the shadowing scope.
+fn subst_var_expr(expr: Expr, var: &str, replacement: &Expr) -> Expr {
+    let recur = |e: Expr| subst_var_expr(e, var, replacement);
+    let boxed = |e: Box<Expr>| Box::new(subst_var_expr(*e, var, replacement));
+    match expr {
+        Expr::Var(name) if name == var => replacement.clone(),
+        Expr::Function { name, args } => Expr::Function {
+            name,
+            args: args.into_iter().map(recur).collect(),
+        },
+        Expr::Distinct(inner) => Expr::Distinct(boxed(inner)),
+        Expr::Comparison { left, op, right } => Expr::Comparison {
+            left: boxed(left),
+            op,
+            right: boxed(right),
+        },
+        Expr::In { value, list } => Expr::In {
+            value: boxed(value),
+            list: boxed(list),
+        },
+        Expr::Arithmetic { left, op, right } => Expr::Arithmetic {
+            left: boxed(left),
+            op,
+            right: boxed(right),
+        },
+        Expr::And(l, r) => Expr::And(boxed(l), boxed(r)),
+        Expr::Or(l, r) => Expr::Or(boxed(l), boxed(r)),
+        Expr::Not(inner) => Expr::Not(boxed(inner)),
+        Expr::List(items) => Expr::List(items.into_iter().map(recur).collect()),
+        Expr::ListPredicate {
+            kind,
+            var: inner_var,
+            list,
+            predicate,
+        } => {
+            let list = boxed(list);
+            // Inner var shadows the loop var inside the predicate.
+            let predicate = if inner_var == var {
+                predicate
+            } else {
+                boxed(predicate)
+            };
+            Expr::ListPredicate {
+                kind,
+                var: inner_var,
+                list,
+                predicate,
+            }
+        }
+        Expr::ListComprehension {
+            var: inner_var,
+            list,
+            filter,
+            projection,
+        } => {
+            let list = boxed(list);
+            let shadowed = inner_var == var;
+            let map_inner = |b: Box<Expr>| {
+                if shadowed {
+                    b
+                } else {
+                    Box::new(subst_var_expr(*b, var, replacement))
+                }
+            };
+            Expr::ListComprehension {
+                var: inner_var,
+                list,
+                filter: filter.map(map_inner),
+                projection: projection.map(map_inner),
+            }
+        }
+        Expr::Map(props) => Expr::Map(
+            props
+                .into_iter()
+                .map(|(k, v)| (k, subst_var_expr(v, var, replacement)))
+                .collect(),
+        ),
+        Expr::Index { target, index } => Expr::Index {
+            target: boxed(target),
+            index: boxed(index),
+        },
+        Expr::Slice { target, start, end } => Expr::Slice {
+            target: boxed(target),
+            start: start.map(boxed),
+            end: end.map(boxed),
+        },
+        Expr::IsNull(inner) => Expr::IsNull(boxed(inner)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(boxed(inner)),
+        other => other,
+    }
+}
+
+/// Substitute the loop variable in a property map (pattern props / map literals).
+fn subst_var_prop_map(
+    props: Vec<(String, Expr)>,
+    var: &str,
+    replacement: &Expr,
+) -> Vec<(String, Expr)> {
+    props
+        .into_iter()
+        .map(|(k, v)| (k, subst_var_expr(v, var, replacement)))
+        .collect()
+}
+
+/// Substitute the loop variable inside a pattern's property values.
+fn subst_var_pattern(pattern: Pattern, var: &str, replacement: &Expr) -> Pattern {
+    match pattern {
+        Pattern::Node {
+            var: node_var,
+            label,
+            props,
+        } => Pattern::Node {
+            var: node_var,
+            label,
+            props: subst_var_prop_map(props, var, replacement),
+        },
+        Pattern::Rel {
+            var: rel_var,
+            rel_type,
+            direction,
+            props,
+            length_range,
+        } => Pattern::Rel {
+            var: rel_var,
+            rel_type,
+            direction,
+            props: subst_var_prop_map(props, var, replacement),
+            length_range,
+        },
+        Pattern::Path(elements) => Pattern::Path(
+            elements
+                .into_iter()
+                .map(|p| subst_var_pattern(p, var, replacement))
+                .collect(),
+        ),
+    }
+}
+
+/// Substitute the FOREACH loop variable `var` throughout a body update statement,
+/// materializing the current element as `replacement`. Only update clauses appear
+/// in a FOREACH body; non-update statements are returned unchanged (they are
+/// rejected at parse time, so this is purely defensive).
+fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statement {
+    match stmt {
+        Statement::Create {
+            patterns,
+            return_clause,
+        } => Statement::Create {
+            patterns: patterns
+                .into_iter()
+                .map(|p| subst_var_pattern(p, var, replacement))
+                .collect(),
+            return_clause,
+        },
+        Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        } => Statement::Merge {
+            patterns: patterns
+                .into_iter()
+                .map(|p| subst_var_pattern(p, var, replacement))
+                .collect(),
+            set_clause: set_clause
+                .into_iter()
+                .map(|a| Assignment {
+                    var: a.var,
+                    property: a.property,
+                    value: subst_var_expr(a.value, var, replacement),
+                })
+                .collect(),
+            return_clause,
+        },
+        Statement::Set {
+            pattern,
+            where_clause,
+            assignments,
+        } => Statement::Set {
+            pattern: pattern
+                .into_iter()
+                .map(|p| subst_var_pattern(p, var, replacement))
+                .collect(),
+            where_clause: where_clause.map(|w| subst_var_expr(w, var, replacement)),
+            assignments: assignments
+                .into_iter()
+                .map(|a| Assignment {
+                    var: a.var,
+                    property: a.property,
+                    value: subst_var_expr(a.value, var, replacement),
+                })
+                .collect(),
+        },
+        // Nested FOREACH: the inner loop var shadows the outer one inside its body.
+        Statement::Foreach {
+            var: inner_var,
+            list,
+            body,
+        } => {
+            let list = subst_var_expr(list, var, replacement);
+            let body = if inner_var == var {
+                body
+            } else {
+                body.into_iter()
+                    .map(|s| subst_var_statement(s, var, replacement))
+                    .collect()
+            };
+            Statement::Foreach {
+                var: inner_var,
+                list,
+                body,
+            }
+        }
+        // REMOVE/DELETE bodies reference bound variables (not value-substituted by
+        // the loop var directly); pass through unchanged.
+        other => other,
+    }
 }
 
 /// Format a physical plan as a human-readable string for EXPLAIN output.

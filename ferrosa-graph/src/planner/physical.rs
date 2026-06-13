@@ -411,6 +411,12 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             set_clause,
             return_clause.as_ref(),
         ),
+        // FOREACH is desugared into its per-element body statements by the engine
+        // before planning; a `Foreach` reaching the planner is an internal
+        // invariant violation — fail loud rather than silently no-op.
+        Statement::Foreach { .. } => Err(GraphError::Validation(
+            "FOREACH must be expanded into its body clauses before planning".to_string(),
+        )),
     }
 }
 

@@ -351,6 +351,21 @@ pub enum Statement {
         set_clause: Vec<Assignment>,
         return_clause: Option<ReturnClause>,
     },
+    /// `FOREACH (var IN list_expr | update_clause [update_clause ...])`
+    ///
+    /// Executes each contained update clause once per element of `list`, with
+    /// `var` bound to the current element. The body may contain only update
+    /// clauses (CREATE / SET / MERGE / DELETE / REMOVE / nested FOREACH); it
+    /// never projects rows. Atomic with the surrounding statement: if any
+    /// iteration's clause fails, the whole FOREACH writes nothing.
+    Foreach {
+        /// Loop variable bound to each element of `list` in turn.
+        var: String,
+        /// Expression evaluated once to the list being iterated.
+        list: Expr,
+        /// Update clauses executed per element, in order.
+        body: Vec<Statement>,
+    },
 }
 
 #[cfg(test)]
