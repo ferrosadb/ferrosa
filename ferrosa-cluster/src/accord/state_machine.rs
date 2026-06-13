@@ -33,6 +33,8 @@ use ferrosa_common::accord::{
 use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnStatus};
 use ferrosa_storage::accord::sync_writer::SyncWriter;
 
+use crate::accord::apply::{ApplyMutation, NoopStorageApplier, StorageApplier};
+
 // ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
@@ -85,10 +87,19 @@ pub struct AccordStateMachine {
     committed_txns: HashSet<TxnId>,
     /// Notified waiters from the last commit (for test inspection).
     last_notified: Vec<TxnId>,
+    /// Storage integration seam: persists the committed mutation to the local
+    /// `StorageEngine` during `handle_apply`. Defaults to [`NoopStorageApplier`]
+    /// for protocol-only tests; production wires a real engine-backed applier
+    /// via [`AccordStateMachine::with_applier`].
+    applier: Arc<dyn StorageApplier>,
 }
 
 impl AccordStateMachine {
     /// Create a new state machine for the given node.
+    ///
+    /// Uses a [`NoopStorageApplier`]: the apply seam records `(txn_id, t)` but
+    /// does NOT persist the row. Production must use [`Self::with_applier`] to
+    /// supply a real engine-backed applier.
     pub fn new(node_id: u64, sync_writer: Arc<dyn SyncWriter>) -> Self {
         Self {
             node_id,
@@ -98,10 +109,13 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
+            applier: Arc::new(NoopStorageApplier::new()),
         }
     }
 
     /// Create with a custom conflict index capacity.
+    ///
+    /// Uses a [`NoopStorageApplier`] (see [`Self::new`]).
     pub fn with_capacity(
         node_id: u64,
         sync_writer: Arc<dyn SyncWriter>,
@@ -115,6 +129,29 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
+            applier: Arc::new(NoopStorageApplier::new()),
+        }
+    }
+
+    /// Create with a real [`StorageApplier`] (production wiring).
+    ///
+    /// The applier persists each committed mutation to the local storage engine
+    /// during [`Self::handle_apply`], closing the phantom-write gap
+    /// (`bug-accord-lwt-acks-phantom-write.md`).
+    pub fn with_applier(
+        node_id: u64,
+        sync_writer: Arc<dyn SyncWriter>,
+        applier: Arc<dyn StorageApplier>,
+    ) -> Self {
+        Self {
+            node_id,
+            txn_states: HashMap::new(),
+            conflict_index: ConflictIndex::new(100_000),
+            sync_writer,
+            dep_waiters: HashMap::new(),
+            committed_txns: HashSet::new(),
+            last_notified: Vec::new(),
+            applier,
         }
     }
 
@@ -357,29 +394,56 @@ impl AccordStateMachine {
 
     /// Handle an Apply (fire-and-forget).
     ///
-    /// 1. Transition to Applied phase.
-    /// 2. Persist to main log BEFORE setting the applied flag.
+    /// 1. Idempotent no-op if already Applied.
+    /// 2. Persist the protocol-log marker BEFORE applying (recovery ordering).
+    /// 3. Persist the real mutation to local storage via the [`StorageApplier`]
+    ///    — closes the phantom-write gap (`bug-accord-lwt-acks-phantom-write.md`):
+    ///    the row must be durably written to the engine, not merely logged.
+    /// 4. Only after the mutation is durable do we set the Applied flag and mark
+    ///    the conflict index — so a crash before the storage write leaves the txn
+    ///    recoverable (re-Apply), never falsely Applied (persist-before-Applied).
     pub fn handle_apply(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> SmResponse {
-        if let Some(state) = self.txn_states.get_mut(&txn_id) {
-            // Already applied: idempotent.
-            if state.phase == TxnPhase::Applied {
-                return SmResponse::None;
+        // Read the agreed timestamp + deps from committed state BEFORE mutating,
+        // so the mutation we hand to storage carries the real `(t, deps)`.
+        let (t, deps): (Timestamp, Vec<TxnId>) = match self.txn_states.get(&txn_id) {
+            Some(state) => {
+                // Already applied: idempotent — do not re-persist or re-apply.
+                if state.phase == TxnPhase::Applied {
+                    return SmResponse::None;
+                }
+                (state.t, state.deps.iter().copied().collect())
             }
+            // No state for this txn: nothing to apply.
+            None => return SmResponse::None,
+        };
 
-            // Persist to main log BEFORE setting applied flag.
-            let data = format!("Applied:{}", txn_id.0.time);
-            let sync_result = self.sync_writer.write_and_sync(data.as_bytes());
-            if !sync_result.is_ok() {
-                // Fsync failed: do NOT set applied flag.
-                return SmResponse::None;
-            }
-
-            // Now safe to set applied flag.
-            state.apply(result_data);
-
-            // Mark applied in conflict index for later GC.
-            self.conflict_index.mark_applied(&txn_id);
+        // Persist the protocol-log marker BEFORE applying the mutation.
+        let data = format!("Applied:{}", txn_id.0.time);
+        if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
+            // Fsync failed: do NOT apply or set the applied flag.
+            return SmResponse::None;
         }
+
+        // Persist the real mutation to local storage. The applier is idempotent
+        // on (txn_id, t) and must durably write before returning Ok. If it
+        // fails we MUST NOT advance to Applied — fail loud, never fake success:
+        // the coordinator gets no implicit ack and the Apply can be retried.
+        let mutation = ApplyMutation {
+            data: result_data.clone(),
+            t,
+            deps,
+        };
+        if let Err(e) = self.applier.apply(txn_id, mutation) {
+            tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
+            return SmResponse::None;
+        }
+
+        // Durable in storage — now safe to mark Applied and GC the conflict index.
+        if let Some(state) = self.txn_states.get_mut(&txn_id) {
+            state.apply(result_data);
+        }
+        self.conflict_index.mark_applied(&txn_id);
+
         SmResponse::None
     }
 
