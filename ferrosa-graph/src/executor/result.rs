@@ -20,5 +20,6 @@ pub struct QueryStats {
     pub edges_read: usize,
     pub vertices_written: usize,
     pub vertices_deleted: usize,
+    pub edges_deleted: usize,
     pub execution_ms: u64,
 }
