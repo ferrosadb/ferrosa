@@ -1108,7 +1108,7 @@ impl ModeController {
         let accord_state_for_maintenance;
         {
             use crate::accord::handlers::{AccordHandler, AccordState};
-            use crate::accord::state_machine::AccordStateMachine;
+            use crate::accord::state_machine::build_accord_state_machine;
             use ferrosa_storage::accord::sync_writer::FileSyncWriter;
 
             let accord_dir = std::env::var("FERROSA_DATA_DIR")
@@ -1125,9 +1125,18 @@ impl ModeController {
                 }
             };
             let sync_writer = Arc::new(FileSyncWriter::new(accord_dir));
-            let accord_state: AccordState = Arc::new(parking_lot::Mutex::new(
-                AccordStateMachine::new(uuid_to_node_id(self.local_host_id), sync_writer),
-            ));
+            // Wire the live StorageEngine into the Accord state machine so an
+            // applied LWT is durably persisted BEFORE the replica returns
+            // ApplyOK — closing the production phantom-write gap
+            // (bug-accord-lwt-acks-phantom-write.md). Previously this used
+            // `AccordStateMachine::new`, which carries a NoopStorageApplier:
+            // a replica recorded (txn_id, t) and acked while nothing landed.
+            let accord_state: AccordState =
+                Arc::new(parking_lot::Mutex::new(build_accord_state_machine(
+                    uuid_to_node_id(self.local_host_id),
+                    sync_writer,
+                    self.storage.clone(),
+                )));
             accord_state_for_maintenance = accord_state.clone();
 
             let accord_handler = Arc::new(AccordHandler::new(
