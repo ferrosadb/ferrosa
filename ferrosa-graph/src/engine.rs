@@ -123,7 +123,26 @@ fn expr_requires_adjacency(expr: &Expr) -> bool {
         Expr::ListPredicate {
             list, predicate, ..
         } => expr_requires_adjacency(list) || expr_requires_adjacency(predicate),
+        Expr::ListComprehension {
+            list,
+            filter,
+            projection,
+            ..
+        } => {
+            expr_requires_adjacency(list)
+                || filter.as_deref().is_some_and(expr_requires_adjacency)
+                || projection.as_deref().is_some_and(expr_requires_adjacency)
+        }
+        // A pattern comprehension always traverses edges.
+        Expr::PatternComprehension { .. } => true,
         Expr::Map(props) => prop_map_requires_adjacency(props),
+        Expr::MapProjection { selectors, .. } => selectors.iter().any(|s| match s {
+            crate::parser::MapProjectionSelector::Literal { value, .. } => {
+                expr_requires_adjacency(value)
+            }
+            crate::parser::MapProjectionSelector::Property(_)
+            | crate::parser::MapProjectionSelector::All => false,
+        }),
         Expr::Slice { target, start, end } => {
             expr_requires_adjacency(target)
                 || start.as_deref().is_some_and(expr_requires_adjacency)

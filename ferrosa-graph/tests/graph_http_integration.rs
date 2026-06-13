@@ -5431,3 +5431,150 @@ fn strip_quoted_strings(s: &str) -> String {
     }
     result
 }
+
+// ── Comprehensions & map projection (QE-M4) ──────────────────────────────────
+
+/// List comprehension `[x IN list WHERE pred | expr]` evaluates end-to-end
+/// through the HTTP query path.
+#[tokio::test]
+async fn list_comprehension_projects_through_http() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "RETURN [x IN [1, 2, 3, 4] WHERE x > 2 | x * 10] AS doubled",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "list comprehension must return 200");
+    let body = response_json(resp).await;
+    assert_eq!(body["rows"], serde_json::json!([[[30, 40]]]));
+}
+
+/// Map projection `n {.name, .age}` builds a map by selecting properties off a
+/// matched node, end-to-end through the HTTP query path.
+#[tokio::test]
+async fn map_projection_selects_properties_through_http() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    // Create a Person to project.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (n:Person {name: 'Projee'}) SET n.age = 41 RETURN n",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'Projee'}) RETURN n {.name, .age} AS proj",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "map projection must return 200");
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "expected one matched Person, got {rows:?}");
+    let proj = &rows[0][0];
+    assert_eq!(proj["name"], serde_json::json!("Projee"));
+    // age is projected through whatever the storage layer returns; assert the
+    // key is present and carries the stored value (not null/missing).
+    assert!(
+        !proj["age"].is_null(),
+        "map projection must carry the .age property, got {proj:?}"
+    );
+    assert_eq!(
+        proj.as_object().unwrap().len(),
+        2,
+        "exactly name + age projected, got {proj:?}"
+    );
+}
+
+/// Pattern comprehension `[ (n)-[:KNOWS]->(m) | m.name ]` traverses real edges
+/// and collects projected target properties — it must NOT silently return an
+/// empty list when edges exist.
+#[tokio::test]
+async fn pattern_comprehension_traverses_edges_through_http() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    // Create two friends of Anchor.
+    for name in ["Anchor", "FriendA", "FriendB"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    for friend in ["FriendA", "FriendB"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!(
+                    "MERGE (a:Person {{name: 'Anchor'}})-[r:KNOWS]->(b:Person {{name: '{friend}'}}) RETURN r"
+                ),
+                "keyspace": "social"
+            })),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "edge MERGE must return 200");
+    }
+
+    // Pattern comprehension collecting friend names.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'Anchor'}) \
+                      RETURN [ (n)-[:KNOWS]->(m:Person) | m.name ] AS friends",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "pattern comprehension must return 200"
+    );
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "expected one anchor row, got {rows:?}");
+    let friends = rows[0][0].as_array().expect("friends list");
+    let mut names: Vec<String> = friends
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["FriendA".to_string(), "FriendB".to_string()],
+        "pattern comprehension must collect both traversed friends, not silently empty"
+    );
+}

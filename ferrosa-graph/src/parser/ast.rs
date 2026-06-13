@@ -105,8 +105,43 @@ pub enum Expr {
         list: Box<Expr>,
         predicate: Box<Expr>,
     },
+    /// List comprehension: `[x IN list WHERE pred | expr]`.
+    ///
+    /// `filter` (the `WHERE pred`) and `projection` (the `| expr`) are both
+    /// optional. `[x IN xs]` is the whole list; `[x IN xs WHERE p]` filters;
+    /// `[x IN xs | e]` maps; `[x IN xs WHERE p | e]` filters then maps.
+    ListComprehension {
+        var: String,
+        list: Box<Expr>,
+        filter: Option<Box<Expr>>,
+        projection: Option<Box<Expr>>,
+    },
+    /// Pattern comprehension: `[ (n)-[:R]->(m) WHERE pred | m.prop ]`.
+    ///
+    /// Evaluates a graph pattern starting from an already-bound variable,
+    /// optionally filters each match, and projects an expression per match,
+    /// collecting the results into a list. Requires graph-aware evaluation.
+    ///
+    /// Unlike [`Expr::PatternPredicate`], each hop carries its target node's
+    /// binding variable so the `WHERE`/projection expressions can reference
+    /// matched nodes (e.g. `m` in `| m.name`).
+    PatternComprehension {
+        start_var: String,
+        hops: Vec<PatternComprehensionHop>,
+        filter: Option<Box<Expr>>,
+        projection: Box<Expr>,
+    },
     /// Map literal: `{name: 'Alice'}`.
     Map(PropMap),
+    /// Map projection over a bound variable: `n {.name, .age, foo: expr, .*}`.
+    ///
+    /// Builds a map by selecting properties off `var` (and/or computed
+    /// entries). Distinct from a [`Expr::Map`] literal, which has no base
+    /// variable.
+    MapProjection {
+        var: String,
+        selectors: Vec<MapProjectionSelector>,
+    },
     /// List/map/string indexing: `expr[index]`.
     Index { target: Box<Expr>, index: Box<Expr> },
     /// List/string slicing: `expr[start..end]`.
@@ -129,11 +164,36 @@ pub enum Expr {
 /// A property map in a node or edge pattern: `{name: 'Alice', age: 30}`.
 pub type PropMap = Vec<(String, Expr)>;
 
+/// One selector inside a map projection: `n {.name, alias: expr, .*}`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MapProjectionSelector {
+    /// `.prop` — copy `var.prop` into the projected map under key `prop`.
+    Property(String),
+    /// `key: expr` — insert a computed entry under `key`.
+    Literal { key: String, value: Expr },
+    /// `.*` — copy every property of `var` into the projected map.
+    All,
+}
+
 /// One relationship+target-node hop in a WHERE pattern predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternPredicateHop {
     pub rel_type: Option<String>,
     pub direction: Direction,
+    pub target_label: Option<String>,
+    pub target_props: PropMap,
+}
+
+/// One relationship+target-node hop in a pattern comprehension.
+///
+/// Like [`PatternPredicateHop`] but additionally preserves the target node's
+/// binding variable so the comprehension's filter and projection can refer to
+/// matched nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternComprehensionHop {
+    pub rel_type: Option<String>,
+    pub direction: Direction,
+    pub target_var: Option<String>,
     pub target_label: Option<String>,
     pub target_props: PropMap,
 }

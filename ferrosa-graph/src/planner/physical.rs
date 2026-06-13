@@ -478,9 +478,45 @@ fn collect_referenced_vars(expr: &Expr, out: &mut std::collections::HashSet<Stri
             collect_referenced_vars(list, out);
             collect_referenced_vars(predicate, out);
         }
+        Expr::ListComprehension {
+            list,
+            filter,
+            projection,
+            ..
+        } => {
+            // The comprehension variable is internally scoped — only the
+            // outer-referenced list/filter/projection vars escape.
+            collect_referenced_vars(list, out);
+            if let Some(f) = filter {
+                collect_referenced_vars(f, out);
+            }
+            if let Some(p) = projection {
+                collect_referenced_vars(p, out);
+            }
+        }
+        Expr::PatternComprehension {
+            start_var,
+            filter,
+            projection,
+            ..
+        } => {
+            out.insert(start_var.clone());
+            if let Some(f) = filter {
+                collect_referenced_vars(f, out);
+            }
+            collect_referenced_vars(projection, out);
+        }
         Expr::Map(m) => {
             for (_, e) in m {
                 collect_referenced_vars(e, out);
+            }
+        }
+        Expr::MapProjection { var, selectors } => {
+            out.insert(var.clone());
+            for s in selectors {
+                if let crate::parser::MapProjectionSelector::Literal { value, .. } = s {
+                    collect_referenced_vars(value, out);
+                }
             }
         }
         Expr::Index { target, index } => {
