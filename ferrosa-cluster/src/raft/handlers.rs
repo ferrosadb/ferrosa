@@ -939,7 +939,21 @@ impl RpcHandler for ReadRequestHandler {
             self.storage
                 .read_clustering_row(&table_id, &key, &req.clustering)
         } else if page_size > 0 && page_offset == 0 {
-            self.storage.read_limited_rows(&table_id, &key, page_size)
+            // First page: over-read by one row so the paging logic below can
+            // tell whether a tail exists past this page.
+            //
+            // `read_limited_rows(key, page_size)` truncates to EXACTLY
+            // `page_size` rows, which destroys the `rows.len() > page_size`
+            // signal used to set `has_more`. A partition with more than
+            // `page_size` rows then looks "complete" after the first page and
+            // the coordinator stops paging — silently dropping every row past
+            // the first page (count(*) under-count / data loss, FRSA-BUG:
+            // first-page cap hides partition tail). Reading `page_size + 1`
+            // lets the slice logic detect the tail and emit `next_page_state`.
+            // `page_size` is a `u32` widened to `usize`, so `+ 1` cannot
+            // overflow on any supported target.
+            self.storage
+                .read_limited_rows(&table_id, &key, page_size + 1)
         } else {
             self.storage.read(&table_id, &key)
         };
@@ -1694,6 +1708,93 @@ mod tests {
         assert!(resp.partition.is_some(), "full partition data expected");
         assert_eq!(resp.timestamp, 5000);
         assert!(resp.digest.is_some(), "digest should be populated");
+    }
+
+    /// Regression for the cluster `count(*)` under-count / data-loss bug.
+    ///
+    /// A partition with MORE rows than the coordinator's remote read page size
+    /// must page out every row. The historical bug read EXACTLY `page_size`
+    /// rows on the first page (`read_limited_rows(key, page_size)`), which
+    /// erased the `rows.len() > page_size` signal the handler uses to set
+    /// `has_more`. The coordinator therefore stopped after one page and the
+    /// partition tail (rows `page_size..`) vanished from scans/`count(*)` while
+    /// still being individually retrievable by point read — the exact symptom
+    /// in `tests/cluster/test_data_loss_reproduction.py` (5100 rows written,
+    /// `count(*)` == 5000, all 100 canaries survive point reads).
+    ///
+    /// This drives `ReadRequestHandler` through the same page loop the
+    /// coordinator runs and asserts no row is lost.
+    #[tokio::test]
+    async fn read_request_handler_pages_full_partition_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key_bytes = b"wide_partition".as_slice();
+        let dk = DecoratedKey::new(PartitionKey::new(key_bytes.to_vec()));
+
+        // Write more rows than a single page holds. Distinct clustering keys
+        // keep them as separate rows in one partition (cell-merge does not
+        // collapse them). 25 rows with page_size 10 => 3 pages (10/10/5).
+        const TOTAL_ROWS: usize = 25;
+        const PAGE_SIZE: u32 = 10;
+        for i in 0..TOTAL_ROWS {
+            let row = Row {
+                clustering: (i as u32).to_be_bytes().to_vec(),
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("v{i}").into_bytes(), 1000 + i as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
+            };
+            storage.write(&table_id, &dk, row, 1000 + i as i64).unwrap();
+        }
+
+        let handler = ReadRequestHandler::new(storage);
+
+        // Mirror the coordinator's `read_one_replica_limited_rows` page loop.
+        let mut collected = 0usize;
+        let mut page_state: Vec<u8> = vec![];
+        let mut pages = 0usize;
+        loop {
+            let req = ReadRequestPayload {
+                keyspace: "test_ks".to_string(),
+                table: "test_tbl".to_string(),
+                key: key_bytes.to_vec(),
+                digest_only: false,
+                page_size: PAGE_SIZE,
+                page_state: page_state.clone(),
+                clustering: vec![],
+            };
+            let req_bytes = bincode::serialize(&req).unwrap();
+            let msg = Message::ReadRequest(Bytes::from(req_bytes));
+            let response = handler
+                .handle(make_peer_id(), msg)
+                .await
+                .expect("handler responds");
+            let Message::ReadResponse(resp_bytes) = response else {
+                panic!("expected ReadResponse");
+            };
+            let resp: ReadResponsePayload = bincode::deserialize(&resp_bytes).unwrap();
+            assert!(resp.found, "partition must be found on every page");
+            let part = partition_from_wire(resp.partition.expect("page carries rows"));
+            collected += part.rows.len();
+            pages += 1;
+            assert!(pages <= 8, "paging must terminate, not loop forever");
+            if resp.has_more && !resp.next_page_state.is_empty() {
+                page_state = resp.next_page_state;
+                continue;
+            }
+            break;
+        }
+
+        assert_eq!(
+            collected, TOTAL_ROWS,
+            "every row in a partition larger than one page must be paged out; \
+             losing the tail is the cluster count(*) data-loss bug"
+        );
     }
 
     #[tokio::test]
