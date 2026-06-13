@@ -73,6 +73,19 @@ fn engine(storage: Arc<StorageEngine>, write_path: Arc<WritePath>) -> SparqlEngi
     SparqlEngine::new(storage, write_path, config)
 }
 
+/// Count the triples currently visible in the default graph via a SELECT, so a
+/// fail-loud update can be proven to have left pre-existing data untouched.
+async fn default_graph_triple_count(eng: &SparqlEngine) -> usize {
+    let res = eng
+        .execute("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", KS)
+        .await
+        .expect("scan default graph");
+    match res {
+        ferrosa_sparql::engine::SparqlResult::Select(r) => r.results.bindings.len(),
+        other => panic!("expected SELECT result, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CREATE — implemented as a success no-op (graphs are implicit).
 // ---------------------------------------------------------------------------
@@ -205,6 +218,67 @@ async fn copy_from_named_graph_fails_loud() {
     eng.execute_update("COPY <http://ex/g1> TO DEFAULT", KS)
         .await
         .expect_err("COPY from a named graph must fail loud (named graph not readable)");
+}
+
+/// S02-copy-named-source-atomic: `COPY <g1> TO DEFAULT` desugars to
+/// `[Drop(DEFAULT), DeleteInsert(read <g1> -> insert DEFAULT)]`. The first op
+/// would clear the default graph; the second is unaddressable and must fail
+/// loud. SPARQL 1.1 update atomicity (and URS-QEC-X01) require that an update
+/// request which errors leaves the store UNMUTATED — so the seeded default-graph
+/// triple MUST survive. A naive sequential executor would run the Drop first and
+/// destroy the data before failing, which is a silent destructive side effect.
+#[tokio::test]
+async fn copy_from_named_graph_is_atomic_default_survives() {
+    let (storage, wp, _dir) = setup();
+    let eng = engine(storage, wp);
+
+    eng.execute_update(
+        "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }",
+        KS,
+    )
+    .await
+    .expect("seed");
+    assert_eq!(default_graph_triple_count(&eng).await, 1, "seed visible");
+
+    eng.execute_update("COPY <http://ex/g1> TO DEFAULT", KS)
+        .await
+        .expect_err("COPY from a named graph must fail loud (named graph not readable)");
+
+    // The pre-existing default-graph data must be intact: the failing update
+    // must not have run its (desugared) Drop(DEFAULT) op.
+    assert_eq!(
+        default_graph_triple_count(&eng).await,
+        1,
+        "default graph must survive a failed COPY/MOVE-from-named (update atomicity)"
+    );
+}
+
+/// S02-move-named-source-atomic: `MOVE <g1> TO DEFAULT` desugars to
+/// `[Drop(DEFAULT), DeleteInsert(read <g1> -> DEFAULT), Drop(<g1>)]`. Same
+/// atomicity requirement as COPY: the unaddressable named-graph read must make
+/// the whole request fail loud BEFORE the leading Drop(DEFAULT) destroys data.
+#[tokio::test]
+async fn move_from_named_graph_is_atomic_default_survives() {
+    let (storage, wp, _dir) = setup();
+    let eng = engine(storage, wp);
+
+    eng.execute_update(
+        "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }",
+        KS,
+    )
+    .await
+    .expect("seed");
+    assert_eq!(default_graph_triple_count(&eng).await, 1, "seed visible");
+
+    eng.execute_update("MOVE <http://ex/g1> TO DEFAULT", KS)
+        .await
+        .expect_err("MOVE from a named graph must fail loud");
+
+    assert_eq!(
+        default_graph_triple_count(&eng).await,
+        1,
+        "default graph must survive a failed MOVE-from-named (update atomicity)"
+    );
 }
 
 /// S02-add-named: `ADD DEFAULT TO <g>` must fail loud for the same reason as
