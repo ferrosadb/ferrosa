@@ -104,6 +104,9 @@ fn error_to_response(err: &GraphError) -> Response {
         GraphError::ResourceLimit(msg) => {
             (StatusCode::BAD_REQUEST, format!("resource limit: {msg}"))
         }
+        // URS-QEC-D02: a constraint violation is a client error; the message is
+        // the safe Neo4j-style guidance, not internal detail, so expose it.
+        GraphError::ConstraintViolation(msg) => (StatusCode::CONFLICT, msg.clone()),
         // T8: Internal errors are never exposed to the client.
         GraphError::Storage(_) | GraphError::Schema(_) | GraphError::Internal(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

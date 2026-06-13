@@ -13,6 +13,9 @@ pub enum GraphError {
     PermissionDenied(String),
     /// Query exceeded resource limits.
     ResourceLimit(String),
+    /// A Neo4j-style schema/constraint violation, e.g. a plain `DELETE n`
+    /// on a node that still has surviving relationships (URS-QEC-D02).
+    ConstraintViolation(String),
     /// Query exceeded time limit.
     Timeout,
     /// Storage engine error.
@@ -30,6 +33,7 @@ impl fmt::Display for GraphError {
             Self::Validation(msg) => write!(f, "validation error: {msg}"),
             Self::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
             Self::ResourceLimit(msg) => write!(f, "resource limit: {msg}"),
+            Self::ConstraintViolation(msg) => write!(f, "constraint violation: {msg}"),
             Self::Timeout => write!(f, "query timeout"),
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::Schema(e) => write!(f, "schema error: {e}"),

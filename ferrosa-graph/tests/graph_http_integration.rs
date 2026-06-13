@@ -4532,6 +4532,117 @@ async fn detach_delete_removes_node_all_incident_edges_and_adjacency() {
     );
 }
 
+/// T-QEC-D02 (URS-QEC-D02): a plain `DELETE n` (no DETACH) on a node that
+/// still has surviving relationships must **fail loud** with a Neo4j-style
+/// constraint error and delete **nothing** — neither the node nor any of its
+/// incident edges/adjacency entries may be tombstoned. The adjacency index is
+/// probed *before* any write, so the failure is detected with zero side
+/// effects.
+#[tokio::test]
+async fn plain_delete_with_surviving_relationships_fails_loud_deletes_nothing() {
+    let (engine, storage, _schema, _dir) = detach_delete_engine();
+    let auth = superuser_auth();
+    let ks = "social";
+
+    // Build the graph: Center with 1 outbound + 1 inbound edge.
+    for name in ["Center", "Out", "In"] {
+        engine
+            .execute(
+                &format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                ks,
+                &auth,
+            )
+            .await
+            .expect("node MERGE must succeed");
+    }
+    engine
+        .execute(
+            "MERGE (a:Person {name: 'Center'})-[r:KNOWS]->(b:Person {name: 'Out'}) RETURN r",
+            ks,
+            &auth,
+        )
+        .await
+        .expect("outbound edge MERGE must succeed");
+    engine
+        .execute(
+            "MERGE (a:Person {name: 'In'})-[r:KNOWS]->(b:Person {name: 'Center'}) RETURN r",
+            ks,
+            &auth,
+        )
+        .await
+        .expect("inbound edge MERGE must succeed");
+
+    let center = vertex_key_bytes("Center");
+    let adj_ks = "system_graph_social";
+
+    // Preconditions: node, both edges, and adjacency entries exist.
+    assert_eq!(
+        live_row_count(&storage, ks, "person_v", &center),
+        1,
+        "precondition: Center vertex must exist"
+    );
+    assert_eq!(
+        live_row_count(&storage, ks, "knows_e", &center),
+        1,
+        "precondition: Center outbound edge must exist"
+    );
+    assert_eq!(
+        live_row_count(&storage, ks, "knows_e", &vertex_key_bytes("In")),
+        1,
+        "precondition: inbound In->Center edge must exist"
+    );
+    let adj_before = live_row_count(&storage, adj_ks, "adjacency", &center);
+    assert!(
+        adj_before >= 2,
+        "precondition: Center adjacency must hold OUT + IN entries (got {adj_before})"
+    );
+
+    // The plain DELETE under test — MUST fail loud, deleting nothing.
+    let err = engine
+        .execute("MATCH (n:Person {name: 'Center'}) DELETE n", ks, &auth)
+        .await
+        .expect_err("plain DELETE of a node with surviving relationships must fail loud");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("still has relationships") || msg.contains("DETACH DELETE"),
+        "error must be a Neo4j-style constraint violation; got: {msg}"
+    );
+
+    // Nothing was deleted: node, both edges, and adjacency are all intact.
+    assert_eq!(
+        live_row_count(&storage, ks, "person_v", &center),
+        1,
+        "Center vertex must survive a failed DELETE"
+    );
+    assert_eq!(
+        live_row_count(&storage, ks, "knows_e", &center),
+        1,
+        "Center outbound edge must survive a failed DELETE"
+    );
+    assert_eq!(
+        live_row_count(&storage, ks, "knows_e", &vertex_key_bytes("In")),
+        1,
+        "inbound In->Center edge must survive a failed DELETE"
+    );
+    assert_eq!(
+        live_row_count(&storage, adj_ks, "adjacency", &center),
+        adj_before,
+        "Center adjacency entries must be untouched by a failed DELETE"
+    );
+
+    // And the node is still queryable via MATCH.
+    let match_center = engine
+        .execute("MATCH (n:Person {name: 'Center'}) RETURN n.name", ks, &auth)
+        .await
+        .expect("MATCH after failed delete must succeed");
+    assert_eq!(
+        match_center.rows.len(),
+        1,
+        "Center must still be MATCHable after a failed DELETE; got: {:?}",
+        match_center.rows
+    );
+}
+
 /// True if any live adjacency row in `vertex`'s partition names `neighbor`
 /// as its neighbor_id (i.e. an incident-edge reference to `neighbor`).
 fn adjacency_partition_references(
