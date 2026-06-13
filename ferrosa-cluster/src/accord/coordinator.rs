@@ -394,6 +394,12 @@ impl std::fmt::Display for AccordDriverError {
 
 impl std::error::Error for AccordDriverError {}
 
+/// Generic-`IF` condition gate: given the F+1-agreed row bytes at `t`
+/// (`None` if the row was absent), returns `true` iff the IF predicate holds
+/// (the write should apply). Injected by the CQL router; see
+/// [`AccordCoordinatorDriver::with_condition_gate`].
+pub type ConditionGate = Box<dyn Fn(Option<&[u8]>) -> bool + Send + Sync>;
+
 /// A driver that connects the pure `AccordCoordinator` state machine to real
 /// network I/O via `PeerManager`.
 ///
@@ -448,6 +454,20 @@ pub struct AccordCoordinatorDriver {
     /// committed mutation locally during the Apply phase. Set via
     /// [`Self::with_local_applier`].
     local_applier: Option<Arc<dyn crate::accord::apply::StorageApplier>>,
+    /// For the generic-`IF` path: evaluates the IF predicate against the
+    /// F+1-agreed row bytes at `t`. Returns `true` iff the write should apply.
+    ///
+    /// The CQL operators (`IfCondition`/`CqlValue`) live in `ferrosa-cql`, which
+    /// depends on this crate, so the coordinator cannot evaluate them directly.
+    /// The router injects this closure (wrapping the canonical
+    /// `eval_if_conditions`); the coordinator calls it in the read-vote phase and
+    /// ABORTS with [`AccordDriverError::ConditionNotMet`] BEFORE the Apply phase
+    /// when it returns `false`. This is what GATES the write on the condition —
+    /// without it the generic path would apply unconditionally (a lost-update /
+    /// wrong-`[applied]` bug). `None` keeps a permissive default (apply) for
+    /// callers that have no generic predicate. Set via
+    /// [`Self::with_condition_gate`].
+    condition_gate: Option<ConditionGate>,
 }
 
 /// Return the row bytes that at least `quorum` of `reads` agree on, if any.
@@ -521,6 +541,7 @@ impl AccordCoordinatorDriver {
             last_read_row: None,
             local_reader: None,
             local_applier: None,
+            condition_gate: None,
         }
     }
 
@@ -571,6 +592,24 @@ impl AccordCoordinatorDriver {
     /// `keyspace`/`table` so replicas read the row at `t` and return its bytes.
     pub fn with_read_predicate(mut self, predicate: crate::accord::wire::ReadPredicate) -> Self {
         self.read_predicate = predicate;
+        self
+    }
+
+    /// Supply the generic-`IF` condition gate.
+    ///
+    /// `gate(Some(row_bytes))` / `gate(None)` is called in the read-vote phase
+    /// with the F+1-agreed row at `t` (or `None` if absent). It must return
+    /// `true` iff the IF predicate holds (the write should apply). When it
+    /// returns `false`, [`Self::run_transaction`] aborts with
+    /// [`AccordDriverError::ConditionNotMet`] carrying the agreed row bytes —
+    /// BEFORE the Apply phase — so a failing `IF col=val` never persists its
+    /// mutation. This is the linearizable-LWT gate; see the field docs on
+    /// `condition_gate`.
+    ///
+    /// The router wraps the canonical `ferrosa-cql` `eval_if_conditions` here so
+    /// there is no forked evaluator.
+    pub fn with_condition_gate(mut self, gate: ConditionGate) -> Self {
+        self.condition_gate = Some(gate);
         self
     }
 
@@ -938,9 +977,14 @@ impl AccordCoordinatorDriver {
             // the linearizable read: a divergent read is non-linearizable and must
             // abort (fail loud) rather than have the coordinator guess.
             let agreed = agreed_row(&read_rows, sq);
-            match agreed {
+            let agreed_row_bytes = match agreed {
                 Some(row) => {
-                    self.last_read_row = if row.is_empty() { None } else { Some(row) };
+                    self.last_read_row = if row.is_empty() {
+                        None
+                    } else {
+                        Some(row.clone())
+                    };
+                    row
                 }
                 None => {
                     return Err(AccordDriverError::Network(format!(
@@ -948,6 +992,33 @@ impl AccordCoordinatorDriver {
                          (got {} reads) — refusing a non-linearizable LWT",
                         read_rows.len()
                     )));
+                }
+            };
+
+            // GATE THE WRITE on the IF condition. The coordinator owns the table
+            // schema (via the injected gate, which wraps the canonical
+            // eval_if_conditions); it evaluates the predicate against the
+            // F+1-agreed, linearizable row-at-`t` and ABORTS before the Apply
+            // phase when the condition does not hold. Without this the generic
+            // path would persist its mutation unconditionally and still report
+            // [applied]=false — a lost-update / wrong-[applied] data-loss bug.
+            //
+            // Determinism: every replica sees the same `t` and the same agreed
+            // row bytes, so the gate's verdict is identical everywhere.
+            if let Some(gate) = &self.condition_gate {
+                let row_arg: Option<&[u8]> = if agreed_row_bytes.is_empty() {
+                    None
+                } else {
+                    Some(agreed_row_bytes.as_slice())
+                };
+                if !gate(row_arg) {
+                    tracing::info!(
+                        txn_id = ?txn_id,
+                        "accord: generic IF condition not met — [applied]=false, no Apply"
+                    );
+                    return Err(AccordDriverError::ConditionNotMet {
+                        current_row: agreed_row_bytes,
+                    });
                 }
             }
         } else {

@@ -1041,7 +1041,7 @@ fn build_lwt_mutation(
 ///
 /// Returns `Ok(None)` when there is no agreed row (row absent at `t`).
 fn decode_agreed_row_to_map(
-    state: &SharedState,
+    schema: &Schema,
     ks: &str,
     table: &str,
     agreed_row: Option<&[u8]>,
@@ -1056,7 +1056,7 @@ fn decode_agreed_row_to_map(
     let mutation = Mutation::deserialize_from(bytes)
         .map_err(|e| CqlError::ServerError(format!("failed to decode LWT read-vote row: {e}")))?;
 
-    let snap = state.schema.snapshot();
+    let snap = schema.snapshot();
     let table_meta = snap
         .tables
         .get(&(ks.to_string(), table.to_string()))
@@ -1066,7 +1066,7 @@ fn decode_agreed_row_to_map(
     let all_col_types: Vec<CqlType> = table_meta
         .columns
         .values()
-        .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+        .map(|c| resolve_col_type(&c.column_type, ks, schema))
         .collect::<Result<Vec<_>, _>>()?;
     let pk_indices: Vec<usize> = table_meta
         .partition_key
@@ -1101,11 +1101,8 @@ fn decode_agreed_row_to_map(
         Some(r) => r,
     };
 
-    let map: HashMap<String, Option<CqlValue>> = all_col_names
-        .iter()
-        .cloned()
-        .zip(row_values)
-        .collect();
+    let map: HashMap<String, Option<CqlValue>> =
+        all_col_names.iter().cloned().zip(row_values).collect();
     Ok(Some(map))
 }
 
@@ -1179,7 +1176,7 @@ async fn route_lwt_via_accord(
     peers: Arc<ferrosa_net::peer::PeerManager>,
     clock: Arc<ferrosa_common::accord::HybridLogicalClock>,
 ) -> Result<RouteResult, CqlError> {
-    use ferrosa_cluster::accord::{AccordCoordinatorDriver, AccordDriverError};
+    use ferrosa_cluster::accord::AccordCoordinatorDriver;
 
     // Build the replica set from the live peer map plus this node itself.
     // Ordering is deterministic: local node first, then peers sorted by UUID.
@@ -1254,54 +1251,117 @@ async fn route_lwt_via_accord(
             state.engine.clone(),
         ));
         driver = driver.with_local_reader(reader);
+
+        // GATE THE WRITE on the IF condition. The coordinator evaluates this
+        // closure against the F+1-agreed, linearizable row-at-`t` DURING the
+        // read-vote phase and aborts (ConditionNotMet, no Apply) when it returns
+        // false — so a failing `IF col=val` never persists its mutation. The
+        // closure wraps the canonical eval_if_conditions (via
+        // eval_lwt_for_statement), so there is no forked evaluator. We capture
+        // owned clones (schema Arc, ks/table, the statement) because the gate is
+        // a 'static closure called inside the driver.
+        //
+        // Fail-loud: a decode failure of our own read-vote bytes is a real
+        // corruption signal. The gate cannot return an error, so it records the
+        // failure into `gate_err`; we surface it after run_transaction instead of
+        // silently treating it as "condition not met" (which would be a fake
+        // failure). A genuine decode of the agreed bytes is deterministic and
+        // identical across replicas, so the verdict is consistent.
+        let schema = state.schema.clone();
+        let gate_ks = ks.clone();
+        let gate_table = table.clone();
+        let gate_stmt = stmt.clone();
+        let gate_err: Arc<std::sync::Mutex<Option<CqlError>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let gate_err_w = gate_err.clone();
+        let gate = Box::new(move |row: Option<&[u8]>| -> bool {
+            match decode_agreed_row_to_map(&schema, &gate_ks, &gate_table, row) {
+                Ok(agreed) => {
+                    crate::accord_router::eval_lwt_for_statement(&gate_stmt, agreed.as_ref())
+                        .map(|r| r.applied)
+                        // Not an LWT reaching the gate (defensive): never silently apply
+                        // — treat as condition-not-met so the write does not persist.
+                        .unwrap_or(false)
+                }
+                Err(e) => {
+                    *gate_err_w.lock().expect("gate_err mutex poisoned") = Some(e);
+                    // Refuse to apply on a decode error (fail closed); the real
+                    // error is surfaced below.
+                    false
+                }
+            }
+        });
+        driver = driver.with_condition_gate(gate);
+        // Stash the error cell so the post-run match can surface a decode failure
+        // rather than reporting a bogus [applied]=false.
+        return finish_lwt_via_accord(state, &ks, &table, driver, Some(gate_err)).await;
     }
 
-    match driver.run_transaction().await {
+    finish_lwt_via_accord(state, &ks, &table, driver, None).await
+}
+
+/// Drive the Accord transaction to completion and map its result to a CQL LWT
+/// result set.
+///
+/// For the generic-`IF` path the condition has ALREADY been evaluated inside the
+/// driver (the [`AccordCoordinatorDriver::with_condition_gate`] closure), which
+/// aborts with `ConditionNotMet` before the Apply phase when the condition is
+/// false. So:
+/// - `Ok(_)` ⇒ the condition held (or there was none) and the write applied ⇒
+///   `[applied]=true`.
+/// - `ConditionNotMet { current_row }` ⇒ the condition did not hold and NOTHING
+///   was persisted ⇒ `[applied]=false` + the real current row.
+///
+/// `gate_err` carries any decode failure recorded inside the generic-IF gate so
+/// it is surfaced as a server error rather than a fake `[applied]=false`.
+async fn finish_lwt_via_accord(
+    state: &SharedState,
+    ks: &str,
+    table: &str,
+    mut driver: ferrosa_cluster::accord::AccordCoordinatorDriver,
+    gate_err: Option<Arc<std::sync::Mutex<Option<CqlError>>>>,
+) -> Result<RouteResult, CqlError> {
+    use ferrosa_cluster::accord::AccordDriverError;
+
+    let outcome = driver.run_transaction().await;
+
+    // Surface any decode failure recorded by the generic-IF gate first — a
+    // corrupt read-vote row must fail loud, never masquerade as [applied]=false.
+    if let Some(cell) = &gate_err {
+        if let Some(e) = cell.lock().expect("gate_err mutex poisoned").take() {
+            return Err(e);
+        }
+    }
+
+    match outcome {
         Ok(_) => {
-            // Gap 5: F+1 apply acknowledgements received (write is durable).
-            //
-            // Decide [applied] from the IF predicate:
-            // - Generic IF: evaluate the F+1-agreed row-at-`t` with the canonical
-            //   eval_if_conditions (reused, not forked). A mismatch returns
-            //   [applied]=false + the real current row.
-            // - INSERT IF NOT EXISTS: the read-vote already gated this (a present
-            //   row yields ConditionNotMet below), so reaching Ok means applied.
-            let lwt = match predicate_kind {
-                Some(LwtPredicateKind::Generic) => {
-                    let agreed =
-                        decode_agreed_row_to_map(state, &ks, &table, driver.last_read_row())?;
-                    crate::accord_router::eval_lwt_for_statement(stmt, agreed.as_ref()).unwrap_or(
-                        crate::accord_router::LwtResult {
-                            applied: true,
-                            current_values: HashMap::new(),
-                        },
-                    )
-                }
-                _ => crate::accord_router::LwtResult {
-                    applied: true,
-                    current_values: HashMap::new(),
-                },
+            // The write applied: the read-vote either had no predicate (INSERT IF
+            // NOT EXISTS reaching Ok means the row was absent) or the generic-IF
+            // gate passed (the condition held). Either way [applied]=true.
+            let lwt = crate::accord_router::LwtResult {
+                applied: true,
+                current_values: HashMap::new(),
             };
-            let cond_cols = lwt_condition_columns(state, &ks, &table, &lwt)?;
-            let result = crate::accord_router::encode_lwt_result(&lwt, &ks, &table, &cond_cols);
+            let cond_cols = lwt_condition_columns(state, ks, table, &lwt)?;
+            let result = crate::accord_router::encode_lwt_result(&lwt, ks, table, &cond_cols);
             Ok(RouteResult::Result(result))
         }
         Err(AccordDriverError::ConditionNotMet { current_row }) => {
-            // Gap 4: F+1 read-votes agreed the IF condition did NOT hold
-            // (INSERT IF NOT EXISTS: the row already existed). Return
-            // [applied]=false with the real current row from the read-vote.
+            // The IF condition did NOT hold — and the mutation was NOT applied
+            // (the driver aborted before the Apply phase). Return [applied]=false
+            // with the real current row from the F+1-agreed read-vote.
             let agreed_bytes: Option<&[u8]> = if current_row.is_empty() {
                 None
             } else {
                 Some(current_row.as_slice())
             };
-            let agreed = decode_agreed_row_to_map(state, &ks, &table, agreed_bytes)?;
+            let agreed = decode_agreed_row_to_map(&state.schema, ks, table, agreed_bytes)?;
             let lwt = crate::accord_router::LwtResult {
                 applied: false,
                 current_values: agreed.unwrap_or_default(),
             };
-            let cond_cols = lwt_condition_columns(state, &ks, &table, &lwt)?;
-            let result = crate::accord_router::encode_lwt_result(&lwt, &ks, &table, &cond_cols);
+            let cond_cols = lwt_condition_columns(state, ks, table, &lwt)?;
+            let result = crate::accord_router::encode_lwt_result(&lwt, ks, table, &cond_cols);
             Ok(RouteResult::Result(result))
         }
         Err(AccordDriverError::QuorumUnavailable) => Err(CqlError::ServerError(
