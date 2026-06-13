@@ -92,6 +92,39 @@ pub(crate) struct ReadVotePayload {
     pub(crate) t: Timestamp,
     /// Partition key bytes.
     pub(crate) key: Vec<u8>,
+    /// Predicate descriptor: how the replica should answer the read-vote.
+    ///
+    /// Defaults (via `#[serde(default)]`) to [`ReadPredicate::NotExists`] so a
+    /// pre-upgrade coordinator that omits the field still gets the existing
+    /// `INSERT IF NOT EXISTS` existence semantics.
+    #[serde(default)]
+    pub(crate) predicate: ReadPredicate,
+}
+
+/// What the read-vote must determine on the replica.
+///
+/// The replica never interprets CQL predicate operators (those types live in
+/// `ferrosa-cql`, which depends on this crate). For a generic `IF col=val`, the
+/// replica only performs the linearizable read-at-`t` and returns the row
+/// bytes; the coordinator (which owns the table schema) evaluates the predicate
+/// with the canonical `eval_if_conditions`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ReadPredicate {
+    /// `INSERT IF NOT EXISTS`: condition holds iff the row does NOT exist at `t`.
+    /// Evaluated on the replica via the existence path (no schema needed).
+    #[default]
+    NotExists,
+    /// Generic `IF <conditions>`: the replica reads the row at `t` and returns
+    /// its serialized bytes; the coordinator evaluates the predicate. Carries the
+    /// `keyspace`/`table` so the replica's [`StorageReader`] can target the read.
+    ///
+    /// [`StorageReader`]: crate::accord::apply::StorageReader
+    ReadRow {
+        /// Keyspace of the target table.
+        keyspace: String,
+        /// Target table name.
+        table: String,
+    },
 }
 
 /// Read-vote response from a replica.
@@ -193,6 +226,16 @@ mod tests {
             txn_id,
             t,
             key: b"read-vote-key".to_vec(),
+            predicate: ReadPredicate::NotExists,
+        });
+        assert_bincode_roundtrip(&ReadVotePayload {
+            txn_id,
+            t,
+            key: b"read-vote-key".to_vec(),
+            predicate: ReadPredicate::ReadRow {
+                keyspace: "ks".into(),
+                table: "t".into(),
+            },
         });
     }
 

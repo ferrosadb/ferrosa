@@ -82,6 +82,157 @@ pub trait StorageApplier: Send + Sync + 'static {
 }
 
 // ---------------------------------------------------------------------------
+// StorageReader trait — linearizable read-at-t seam (symmetric to StorageApplier)
+// ---------------------------------------------------------------------------
+
+/// Error reading a row for the linearizable IF-condition read-vote.
+#[derive(Debug, Clone)]
+pub struct RowReadError {
+    pub reason: String,
+}
+
+impl std::fmt::Display for RowReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "read-at-t failed: {}", self.reason)
+    }
+}
+
+impl std::error::Error for RowReadError {}
+
+/// Storage integration seam for the linearizable read-at-`t` that backs the
+/// Accord IF-condition read-vote (Gap 4), symmetric to [`StorageApplier`].
+///
+/// A replica calls [`read_row_at`](StorageReader::read_row_at) during
+/// `ReadVote` handling, **after** dep-wait has applied every dependency
+/// `t' < t`. Because the apply seam re-stamps cells to the agreed `t` and every
+/// conflicting earlier transaction is already Applied, the engine's current
+/// state for the key is exactly the row state "as of `t`" — so reading the
+/// live row is the linearizable read-at-`t`.
+///
+/// The returned bytes are a serialized single-row commit-log
+/// [`Mutation`] (the same self-describing format the
+/// applier consumes). `Ok(None)` means the row does not exist at `t`. Returning
+/// the *raw* row — rather than a CQL-decoded value — keeps this seam in
+/// `ferrosa-cluster` (which has no CQL schema): the coordinator, which owns the
+/// table metadata, decodes and evaluates the predicate with the canonical
+/// `eval_if_conditions`, so no divergent evaluator is forked.
+pub trait StorageReader: Send + Sync + 'static {
+    /// Read the current row for `(keyspace, table, key)` as of the agreed
+    /// execution timestamp `t`.
+    ///
+    /// Returns the serialized single-partition [`Mutation`] bytes (decodable by
+    /// the coordinator), or `Ok(None)` if no live row exists at `t`.
+    fn read_row_at(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key: &[u8],
+        t: Timestamp,
+    ) -> Result<Option<Vec<u8>>, RowReadError>;
+}
+
+// ---------------------------------------------------------------------------
+// EngineStorageReader — real read-at-t via StorageEngine
+// ---------------------------------------------------------------------------
+
+/// Production [`StorageReader`] backed by the live [`StorageEngine`].
+///
+/// Reads the current partition for the key and, if any live row exists, returns
+/// it serialized as a single-partition [`Mutation`] (keyspace/table/key/rows).
+/// The read is the linearizable read-at-`t`: see [`StorageReader`] for why the
+/// engine's current state equals the state as of `t` when called after dep-wait.
+pub struct EngineStorageReader {
+    engine: Arc<StorageEngine>,
+}
+
+impl EngineStorageReader {
+    /// Create a reader backed by the live storage engine.
+    pub fn new(engine: Arc<StorageEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+impl StorageReader for EngineStorageReader {
+    fn read_row_at(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key: &[u8],
+        t: Timestamp,
+    ) -> Result<Option<Vec<u8>>, RowReadError> {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        use ferrosa_storage::TableId;
+
+        let table_id = TableId::new(keyspace, table);
+        let decorated = DecoratedKey::new(PartitionKey::new(key.to_vec()));
+
+        let partition = self
+            .engine
+            .read(&table_id, &decorated)
+            .map_err(|e| RowReadError {
+                reason: format!("engine read for {keyspace}.{table} failed: {e}"),
+            })?;
+
+        let partition = match partition {
+            None => return Ok(None),
+            Some(p) => p,
+        };
+
+        // Keep only cells written at or before the agreed `t` — the row state
+        // "as of t". Cells are stamped at the agreed execution timestamp by the
+        // apply seam, so `t.time` is the correct upper bound for what this LWT
+        // is allowed to observe. (After dep-wait, no conflicting cell with
+        // ts >= t.time exists, but bounding here is defensive and keeps the read
+        // honestly as-of-t even if the engine merged a concurrent unrelated cell.)
+        let cell_ts_bound = i64::try_from(t.time).unwrap_or(i64::MAX);
+        let rows: Vec<ferrosa_sstable::types::Row> = partition
+            .rows
+            .into_iter()
+            .filter_map(|mut row| {
+                row.cells
+                    .retain(|(_, cell)| cell.timestamp <= cell_ts_bound);
+                // Drop a row that has no surviving live cell AND no live PK
+                // liveness (it did not exist at `t`).
+                let has_live_cell = row.cells.iter().any(|(_, c)| c.value.is_some());
+                let has_pk_liveness = row.primary_key_liveness.has_timestamp()
+                    && row.primary_key_liveness.timestamp <= cell_ts_bound;
+                if has_live_cell || has_pk_liveness {
+                    Some(row)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        // Serialize as a single-partition Mutation so the coordinator can decode
+        // it with the same machinery it uses for the apply mutation.
+        //
+        // DETERMINISM: use the legacy-zero `mutation_id` (NOT a fresh UUID v4
+        // from `Mutation::new`). Read-vote bytes are compared across replicas for
+        // F+1 agreement; a per-instance random id would make identical row state
+        // serialize to different bytes and break the agreement (hence
+        // linearizability). The id is only a write-dedup marker, irrelevant to a
+        // read snapshot.
+        let cell_ts = i64::try_from(t.time).unwrap_or(i64::MAX);
+        let mutation = Mutation {
+            mutation_id: [0u8; 16],
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            key: decorated,
+            rows,
+            timestamp: cell_ts,
+        };
+        let mut buf = vec![0u8; mutation.serialized_size()];
+        mutation.serialize_into(&mut buf);
+        Ok(Some(buf))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NoopStorageApplier — used in tests and when storage is not wired
 // ---------------------------------------------------------------------------
 
@@ -869,6 +1020,85 @@ mod engine_applier_tests {
             read_cell0_ts(&engine, &key),
             Some(42),
             "cell timestamp must be re-stamped to the agreed t, not the wall clock"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageReader / EngineStorageReader: linearizable read-at-t.
+    //
+    // The reader is symmetric to the applier: a replica calls read_row_at
+    // during ReadVote (after dep-wait), and the coordinator decodes the
+    // returned Mutation bytes to evaluate the generic IF predicate.
+    // -----------------------------------------------------------------------
+
+    fn decode_cell0(bytes: &[u8]) -> Option<Vec<u8>> {
+        let m = Mutation::deserialize_from(bytes).expect("reader bytes must decode as a Mutation");
+        let row = m.rows.first()?;
+        row.cells.first().and_then(|(_, c)| c.value.clone())
+    }
+
+    #[test]
+    fn read_row_at_returns_none_for_absent_row() {
+        let (engine, _dir) = make_engine();
+        let reader = EngineStorageReader::new(engine);
+
+        let got = reader
+            .read_row_at(KS, TABLE, b"missing", accord_ts(1000))
+            .expect("read must succeed");
+        assert!(got.is_none(), "absent row must read as None at t");
+    }
+
+    #[test]
+    fn read_row_at_returns_serialized_row_when_present() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+        let reader = EngineStorageReader::new(engine.clone());
+
+        let key = make_key("pk1");
+        let t = accord_ts(1000);
+        applier
+            .apply(
+                txn(1, 1000),
+                encoded_mutation(key.clone(), b"hello", 1000, t, vec![]),
+            )
+            .unwrap();
+
+        let bytes = reader
+            .read_row_at(KS, TABLE, b"pk1", accord_ts(1000))
+            .expect("read must succeed")
+            .expect("row written at t must be visible to read_row_at");
+        assert_eq!(
+            decode_cell0(&bytes).as_deref(),
+            Some(b"hello".as_slice()),
+            "read_row_at must return the row that was applied at t"
+        );
+    }
+
+    #[test]
+    fn read_row_at_excludes_cells_written_after_t() {
+        // A cell written at a HIGHER agreed t must NOT be visible to a read at a
+        // lower t — the read is honestly as-of-t (defensive bound).
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+        let reader = EngineStorageReader::new(engine.clone());
+
+        let key = make_key("pk1");
+        // Write at agreed t=2000 (cell stamped 2000 by the applier).
+        applier
+            .apply(
+                txn(1, 2000),
+                encoded_mutation(key.clone(), b"future", 5_000, accord_ts(2000), vec![]),
+            )
+            .unwrap();
+
+        // Read as of t=1000 — the future write (cell ts 2000) is excluded, so
+        // the row reads as absent.
+        let got = reader
+            .read_row_at(KS, TABLE, b"pk1", accord_ts(1000))
+            .expect("read must succeed");
+        assert!(
+            got.is_none(),
+            "a cell written at a later agreed t must not be visible to a read at an earlier t"
         );
     }
 }
