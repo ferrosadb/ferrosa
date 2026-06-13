@@ -595,6 +595,34 @@ impl AccordStateMachine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Production wiring: construct a state machine with a real storage applier
+// ---------------------------------------------------------------------------
+
+/// Build the production [`AccordStateMachine`] wired to durably persist
+/// applied LWT mutations to the live
+/// [`StorageEngine`](ferrosa_storage::engine::StorageEngine).
+///
+/// This is the single construction seam used by the cluster controller
+/// (`controller/cluster.rs`). It wires an
+/// [`EngineStorageApplier`](crate::accord::apply::EngineStorageApplier) so that
+/// `handle_apply` writes the row to storage BEFORE marking the transaction
+/// `Applied` — closing the production phantom-write gap
+/// (`bug-accord-lwt-acks-phantom-write.md`), where a replica recorded
+/// `(txn_id, t)` and returned `ApplyOK` while nothing was persisted.
+///
+/// `node_id` is the Accord node identifier, `sync_writer` the protocol-log
+/// fsync writer, and `storage` the live engine handle whose write/batch path
+/// the applier persists through.
+pub fn build_accord_state_machine(
+    node_id: u64,
+    sync_writer: Arc<dyn SyncWriter>,
+    storage: Arc<ferrosa_storage::engine::StorageEngine>,
+) -> AccordStateMachine {
+    let applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(storage));
+    AccordStateMachine::with_applier(node_id, sync_writer, applier)
+}
+
 // Helper extension for TxnPhase to expose rank for comparison.
 trait TxnPhaseExt {
     fn rank(&self) -> u8;
@@ -1788,6 +1816,182 @@ mod tests {
         assert!(
             sm.get_state(&applied).is_none(),
             "applied transaction must be pruned"
+        );
+    }
+}
+
+// ===========================================================================
+// Production-wiring tests — the state machine built for production
+// (`build_accord_state_machine`) MUST durably persist an applied LWT mutation
+// to the live StorageEngine. This is the headline proof that the PRODUCTION
+// construction path (controller/cluster.rs) is not a phantom write: a replica
+// that returns ApplyOK must have actually written the row.
+//
+// These tests exercise the SAME factory the controller calls (not just the
+// apply unit seam covered in apply.rs), driving a real serialized commit-log
+// Mutation through the full PreAccept -> Accept -> Commit -> Apply lifecycle
+// and then reading the row back through the engine.
+// ===========================================================================
+
+#[cfg(test)]
+mod production_wiring_tests {
+    use super::*;
+    use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+    use ferrosa_storage::engine::StorageEngine;
+    use ferrosa_storage::{Mutation, StorageEngineConfig, TableId};
+
+    const KS: &str = "lwt_ks";
+    const TABLE: &str = "lwt_table";
+
+    fn ts(micros: u64) -> Timestamp {
+        Timestamp::synthetic(micros)
+    }
+
+    fn txn(src: u64, micros: u64) -> TxnId {
+        TxnId::new(src, ts(micros))
+    }
+
+    fn test_schema() -> TableSchema {
+        TableSchema {
+            keyspace: KS.to_string(),
+            table: TABLE.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    fn make_engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        (Arc::new(engine), dir)
+    }
+
+    fn make_key(s: &str) -> DecoratedKey {
+        DecoratedKey::new(PartitionKey::new(s.as_bytes().to_vec()))
+    }
+
+    fn make_row(value: &[u8], cell_ts: i64) -> Row {
+        Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(value.to_vec(), cell_ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(cell_ts),
+        }
+    }
+
+    /// Serialize a commit-log `Mutation` — the apply-payload wire format the
+    /// production applier decodes.
+    fn serialized_mutation(key: DecoratedKey, value: &[u8], cell_ts: i64) -> Vec<u8> {
+        let m = Mutation::new(
+            KS.to_string(),
+            TABLE.to_string(),
+            key,
+            vec![make_row(value, cell_ts)],
+            cell_ts,
+        );
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        buf
+    }
+
+    fn read_cell0(engine: &StorageEngine, key: &DecoratedKey) -> Option<Vec<u8>> {
+        let partition = engine.read(&TableId::new(KS, TABLE), key).unwrap()?;
+        let row = partition.rows.first()?;
+        row.cells.first().and_then(|(_, c)| c.value.clone())
+    }
+
+    /// RED (inc6 / task #31): the PRODUCTION state machine built by
+    /// `build_accord_state_machine` must durably persist an applied LWT to the
+    /// live engine. With the old wiring (`AccordStateMachine::new`, a
+    /// `NoopStorageApplier`) `handle_apply` records `(txn_id, t)` and returns
+    /// without writing the row — the engine read below returns `None` and this
+    /// assertion FAILS. With the engine-backed applier it persists and the row
+    /// is readable: the phantom write is gone.
+    #[test]
+    fn production_state_machine_persists_applied_lwt_to_engine() {
+        let (engine, _dir) = make_engine();
+
+        // Build EXACTLY as the controller does: the production factory.
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = build_accord_state_machine(7, writer, engine.clone());
+
+        let key = make_key("pk-prod");
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        let t = ts(1001);
+        let payload = serialized_mutation(key.clone(), b"durable", 1001);
+
+        // Full lifecycle to Apply, carrying the real serialized mutation.
+        sm.handle_preaccept(txn_id, t0, key.key.as_bytes(), BallotNumber(0), 0);
+        sm.handle_accept(txn_id, t0, t, vec![], BallotNumber(1));
+        sm.handle_commit(txn_id, t0, t, vec![]);
+        sm.handle_apply(txn_id, payload);
+
+        // The replica returned (would return) ApplyOK only after marking Applied;
+        // Applied is reached ONLY if the engine write succeeded. Prove the row is
+        // actually durable and readable — not a phantom write.
+        assert_eq!(
+            sm.get_state(&txn_id).map(|s| s.phase),
+            Some(TxnPhase::Applied),
+            "production apply must reach Applied (engine write succeeded)"
+        );
+        assert_eq!(
+            read_cell0(&engine, &key).as_deref(),
+            Some(b"durable".as_slice()),
+            "applied LWT must be durably persisted + readable via the engine — \
+             the production phantom write must be gone"
+        );
+    }
+
+    /// Fail loud: if the production applier cannot persist (target table not
+    /// registered), `handle_apply` must NOT advance to Applied — so the replica
+    /// does NOT emit a spurious ApplyOK for a write that never landed.
+    #[test]
+    fn production_apply_failure_does_not_fake_applied() {
+        let (engine, _dir) = make_engine();
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = build_accord_state_machine(7, writer, engine.clone());
+
+        let key = make_key("pk-missing-table");
+        let txn_id = txn(2, 2000);
+        let t0 = ts(2000);
+        let t = ts(2001);
+
+        // Mutation targets a table that was never registered on the engine.
+        let m = Mutation::new(
+            KS.to_string(),
+            "unregistered_table".to_string(),
+            key.clone(),
+            vec![make_row(b"x", 2001)],
+            2001,
+        );
+        let mut payload = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut payload);
+
+        sm.handle_preaccept(txn_id, t0, key.key.as_bytes(), BallotNumber(0), 0);
+        sm.handle_accept(txn_id, t0, t, vec![], BallotNumber(1));
+        sm.handle_commit(txn_id, t0, t, vec![]);
+        sm.handle_apply(txn_id, payload);
+
+        assert_ne!(
+            sm.get_state(&txn_id).map(|s| s.phase),
+            Some(TxnPhase::Applied),
+            "a failed engine apply must NOT mark the txn Applied (no fake ApplyOK)"
         );
     }
 }
