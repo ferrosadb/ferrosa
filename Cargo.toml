@@ -24,11 +24,15 @@ members = [
 [patch.crates-io]
 # Sprint 3 (ADR-012): the ferrosadb/openraft fork carries PreVote +
 # CheckQuorum + Leadership Transfer + the separate-replication-timeout
-# patch on top of upstream 0.9.24. Pinned to the fork's default branch
-# (`main`) so we pick up rebases automatically; for reproducible builds
-# switch to a specific `rev = "..."` tag. Fork README and rationale:
+# patch on top of upstream 0.9.24. Pinned to an explicit fork commit for
+# reproducible builds. `af87fa60` is the commit that fully wires the engine
+# PreVote path into the election tick (`run_pre_vote_round` gated behind
+# `Config::enable_pre_vote`), closing the runaway-term gap from
+# `bug-raft-stale-candidate-runaway-term-no-prevote.md`; the
+# `sprint-03-engine-prevote` acceptance tests in ferrosa-cluster depend on
+# it. Fork README and rationale:
 #   https://github.com/ferrosadb/openraft/blob/main/README-FERROSADB.md
-openraft = { git = "https://github.com/ferrosadb/openraft.git", branch = "main" }
+openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "af87fa60bab5256cac6c08d09f84379e40636294" }
 
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.

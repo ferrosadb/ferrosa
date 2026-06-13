@@ -1036,7 +1036,6 @@ async fn election_storm_guard_fires_at_production_cadence() {
 /// Build a Config that mirrors the sprint-03 ferrosa defaults: PreVote enabled,
 /// CheckQuorum ratio 0.75. Mirrors the wiring in
 /// `controller/cluster.rs:840`. See ADR-012.
-#[cfg(feature = "sprint-03-engine-prevote")]
 fn prevote_checkquorum_raft_config() -> Arc<Config> {
     Arc::new(
         Config {
@@ -1062,22 +1061,19 @@ fn prevote_checkquorum_raft_config() -> Arc<Config> {
 /// most 0** during the partition window — the protocol-level fix for
 /// `bug-raft-stale-candidate-runaway-term-no-prevote.md`.
 ///
-/// # Gating
+/// # Gap closed
 ///
-/// Gated on `#[cfg(feature = "sprint-03-engine-prevote")]` because the
-/// engine-side `handle_pre_vote_req` is not yet wired in the openraft fork
-/// (see `specs/in-process/sprint-03-openraft-patches.md` items W3.3 and
-/// W3.7-engine). Without that wire-up the test fails — node3's term still
-/// advances by 5–10 over the partition window because openraft's existing
-/// election path increments the term unconditionally on election-timer fire.
+/// This test previously sat behind `#[cfg(feature = "sprint-03-engine-prevote")]`
+/// because the engine-side PreVote path was not wired in the openraft fork —
+/// the election tick called `Engine::elect()` unconditionally, incrementing the
+/// term on every timer fire even while partitioned. The fork commit pinned in
+/// the workspace `Cargo.toml` (`af87fa60…`) closes that gap: `handle_tick_election`
+/// now runs a synchronous `run_pre_vote_round()` gated behind
+/// `Config::enable_pre_vote` and only proceeds to `elect()` (term bump) when the
+/// pre-vote is granted by a quorum. A partitioned node therefore cannot win a
+/// pre-vote round and never advances its persisted term — `term_advance == 0`.
 ///
-/// To run the test (and watch it fail until the engine lands):
-///   `cargo test -p ferrosa-cluster --features sprint-03-engine-prevote
-///    --test raft_election_storm ferrosa_partitioned_node_does_not_advance_term`
-///
-/// When the engine wire-up lands, the feature flag is removed and this test
-/// joins the default test suite.
-#[cfg(feature = "sprint-03-engine-prevote")]
+/// The gate is removed; this runs in the default suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ferrosa_partitioned_node_does_not_advance_term() {
     ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);

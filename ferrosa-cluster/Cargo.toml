@@ -39,10 +39,9 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
 default = []
-# Sprint 3 (ADR-012): enable W3.12 / W3.13 acceptance tests that depend on
-# engine-side PreVote/TimeoutNow handling in the openraft fork. Off by default
-# until the corresponding engine wire-up lands (W3.3, W3.7-engine, W3.8-engine,
-# W3.9 in `specs/in-process/sprint-03-openraft-patches.md`). When the engine
-# work lands, remove this gate and these tests join the default suite.
-sprint-03-engine-prevote = []
+# Sprint 3 (ADR-012): the engine-side PreVote wire-up has landed in the openraft
+# fork (commit pinned in the workspace Cargo.toml), so the W3.12 PreVote
+# acceptance tests now run in the default suite — the `sprint-03-engine-prevote`
+# gate has been removed. The leadership-transfer (W3.13) gate remains until that
+# engine wire-up's acceptance tests land.
 sprint-03-engine-transfer = []
