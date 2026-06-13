@@ -47,6 +47,15 @@ pub async fn execute_update(
         .parse_update(update_str)
         .map_err(|e| SparqlError::Parse(format!("{e}")))?;
 
+    // SPARQL 1.1 update atomicity (URS-QEC-X01): an update request that errors
+    // must NOT have partially mutated the store. The executor below applies
+    // operations sequentially with no rollback, so we MUST reject the whole
+    // request up-front if ANY operation is unaddressable in this
+    // single-graph-per-keyspace engine. Without this, a desugared
+    // `COPY/MOVE <g> TO DEFAULT` would run its leading `Drop(DEFAULT)` and wipe
+    // the default graph before the later unaddressable named-graph read fails.
+    validate_update(&update, keyspace)?;
+
     let mut total_inserted = 0usize;
     let mut total_deleted = 0usize;
 
@@ -106,6 +115,154 @@ pub async fn execute_update(
         triples_inserted: total_inserted,
         triples_deleted: total_deleted,
     })
+}
+
+/// Validate EVERY operation of a parsed update before any of them runs, so an
+/// update request that contains an unaddressable operation fails loud with zero
+/// mutations (SPARQL 1.1 atomicity / URS-QEC-X01).
+///
+/// This is the single chokepoint that makes the spargebra `COPY/MOVE/ADD`
+/// desugaring safe: those rewrite into a leading `Drop` plus a `DeleteInsert`
+/// that reads from / writes to a named graph this engine cannot address. By
+/// rejecting the whole request here — before the destructive `Drop` executes —
+/// we guarantee no partial side effects.
+fn validate_update(update: &spargebra::Update, keyspace: &str) -> Result<(), SparqlError> {
+    for op in &update.operations {
+        match op {
+            spargebra::GraphUpdateOperation::InsertData { data } => {
+                for quad in data {
+                    check_graph_name(&quad.graph_name, keyspace, "INSERT DATA")?;
+                }
+            }
+            spargebra::GraphUpdateOperation::DeleteData { data } => {
+                for quad in data {
+                    check_graph_name(&quad.graph_name, keyspace, "DELETE DATA")?;
+                }
+            }
+            spargebra::GraphUpdateOperation::DeleteInsert {
+                delete,
+                insert,
+                pattern,
+                ..
+            } => {
+                for tmpl in delete {
+                    check_quad_graph_pattern(&tmpl.graph_name, keyspace, "DELETE")?;
+                }
+                for tmpl in insert {
+                    check_quad_graph_pattern(&tmpl.graph_name, keyspace, "INSERT")?;
+                }
+                // Reject a WHERE clause that reads from a named graph
+                // (`GraphPattern::Graph`), e.g. the COPY/MOVE/ADD source.
+                check_pattern_graph_reads(pattern, keyspace)?;
+            }
+            spargebra::GraphUpdateOperation::Clear { graph, silent }
+            | spargebra::GraphUpdateOperation::Drop { graph, silent } => {
+                check_graph_target(graph, keyspace, *silent)?;
+            }
+            spargebra::GraphUpdateOperation::Load { .. } => {
+                return Err(SparqlError::Plan(
+                    "SPARQL LOAD is not implemented: this endpoint has no RDF \
+                     document fetch/parse pipeline"
+                        .into(),
+                ));
+            }
+            spargebra::GraphUpdateOperation::Create { .. } => {
+                // CREATE is a success no-op (graphs are implicit); nothing to
+                // validate. See the execution loop for the rationale.
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a concrete (`InsertData`/`DeleteData`) quad's graph name.
+fn check_graph_name(
+    graph: &spargebra::term::GraphName,
+    keyspace: &str,
+    op: &str,
+) -> Result<(), SparqlError> {
+    match graph {
+        spargebra::term::GraphName::DefaultGraph => Ok(()),
+        spargebra::term::GraphName::NamedNode(n) if n.as_str() == keyspace => Ok(()),
+        spargebra::term::GraphName::NamedNode(n) => {
+            Err(named_graph_unsupported(op, n.as_str(), keyspace))
+        }
+    }
+}
+
+/// Validate a `CLEAR`/`DROP` target for the atomicity check.
+///
+/// All `CLEAR`/`DROP` targets are *safe* in this engine: `DefaultGraph`,
+/// `NamedGraphs`, and `AllGraphs` resolve to "every triple in this keyspace"
+/// (clearable), a `NamedNode` equal to the keyspace is that same graph, and any
+/// other `NamedNode` simply does not exist here, so `exec_clear` deletes nothing
+/// (a true no-op — it never fakes or mis-targets a deletion, per URS-QEC-X01 and
+/// the M1 `clear_non_matching_named_graph_deletes_nothing` contract).
+///
+/// Because every `CLEAR`/`DROP` is non-destructive-to-other-data, none of them
+/// can violate atomicity, so this validation always passes. It exists so the
+/// up-front pass is exhaustive over operation kinds (and as the place to tighten
+/// non-SILENT semantics later, if the single-graph model ever gains real named
+/// graphs).
+fn check_graph_target(
+    _target: &GraphTarget,
+    _keyspace: &str,
+    _silent: bool,
+) -> Result<(), SparqlError> {
+    Ok(())
+}
+
+/// Recursively reject any `GraphPattern::Graph` reading from a graph other than
+/// the keyspace default graph. Such a named-graph read (produced by the
+/// COPY/MOVE/ADD desugaring, or by an explicit `GRAPH <g> { … }` block in a
+/// WHERE clause) is not addressable here and must fail loud BEFORE any
+/// preceding destructive op runs.
+fn check_pattern_graph_reads(
+    pattern: &spargebra::algebra::GraphPattern,
+    keyspace: &str,
+) -> Result<(), SparqlError> {
+    use spargebra::algebra::GraphPattern as G;
+    match pattern {
+        G::Graph { name, inner } => {
+            match name {
+                NamedNodePattern::NamedNode(n) if n.as_str() == keyspace => {}
+                NamedNodePattern::NamedNode(n) => {
+                    return Err(SparqlError::Plan(format!(
+                        "reading from named graph <{}> is not supported: this endpoint \
+                         exposes a single graph per keyspace ('{keyspace}') — so \
+                         ADD/MOVE/COPY from a named graph cannot be honored",
+                        n.as_str()
+                    )));
+                }
+                NamedNodePattern::Variable(v) => {
+                    return Err(SparqlError::Plan(format!(
+                        "GRAPH ?{} (variable-bound graph read) is not supported: this \
+                         endpoint exposes a single graph per keyspace ('{keyspace}')",
+                        v.as_str()
+                    )));
+                }
+            }
+            check_pattern_graph_reads(inner, keyspace)
+        }
+        G::Bgp { .. } | G::Path { .. } | G::Values { .. } => Ok(()),
+        G::Join { left, right } | G::Union { left, right } | G::Minus { left, right } => {
+            check_pattern_graph_reads(left, keyspace)?;
+            check_pattern_graph_reads(right, keyspace)
+        }
+        G::LeftJoin { left, right, .. } => {
+            check_pattern_graph_reads(left, keyspace)?;
+            check_pattern_graph_reads(right, keyspace)
+        }
+        G::Filter { inner, .. }
+        | G::Extend { inner, .. }
+        | G::OrderBy { inner, .. }
+        | G::Project { inner, .. }
+        | G::Distinct { inner }
+        | G::Reduced { inner }
+        | G::Slice { inner, .. }
+        | G::Group { inner, .. }
+        | G::Service { inner, .. } => check_pattern_graph_reads(inner, keyspace),
+    }
 }
 
 /// Execute `DELETE … INSERT … WHERE` (covers `DELETE WHERE`, where `insert` is
