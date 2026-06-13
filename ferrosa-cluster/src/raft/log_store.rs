@@ -15,7 +15,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openraft::storage::LogFlushed;
 use openraft::{
@@ -391,6 +391,53 @@ impl SledLogStore {
         Ok(Self { db, log, meta })
     }
 
+    /// Open a store for **offline** operator tooling (`inspect` /
+    /// `truncate_from`), retrying briefly on transient lock contention.
+    ///
+    /// These tools run against a *stopped* node, but the path's previous
+    /// handle may still be releasing sled's exclusive directory lock when we
+    /// open — a just-exited node process, or in tests a just-dropped store.
+    /// sled surfaces that as an `Io` "could not acquire lock" error
+    /// (`EWOULDBLOCK`). Failing a legitimate offline open on a millisecond-
+    /// scale race would be wrong, so we retry with a bounded backoff
+    /// (≤ `MAX_ATTEMPTS` × `BACKOFF` ≈ 500 ms), log each retry, and surface the
+    /// error loudly if it never clears (a genuinely held lock = node still up).
+    fn open_offline(path: &Path) -> Result<Self, sled::Error> {
+        const MAX_ATTEMPTS: u32 = 10;
+        const BACKOFF: Duration = Duration::from_millis(50);
+        let mut attempt: u32 = 1;
+        loop {
+            match Self::new(path) {
+                Ok(store) => return Ok(store),
+                Err(err) if attempt < MAX_ATTEMPTS && Self::is_lock_contention(&err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %err,
+                        "offline sled open hit a transient directory lock; retrying after backoff"
+                    );
+                    std::thread::sleep(BACKOFF);
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// True only for the transient "directory lock already held" condition,
+    /// not a real corruption/IO fault. sled wraps the OS `EWOULDBLOCK` as
+    /// `Error::Io` whose message contains "could not acquire lock".
+    fn is_lock_contention(err: &sled::Error) -> bool {
+        match err {
+            sled::Error::Io(io) => {
+                io.kind() == std::io::ErrorKind::WouldBlock
+                    || io.to_string().contains("could not acquire lock")
+            }
+            _ => false,
+        }
+    }
+
     /// Internal helper for `append` that does the actual sled work. Split
     /// out so the public `append` can route both success and failure
     /// through `LogFlushed::log_io_completed` (W1.19a). Test code can
@@ -466,10 +513,12 @@ impl SledLogStore {
     /// the current build and report what is readable, what is not, and
     /// where the damage starts.
     ///
-    /// Opens sled, so this fails fast with a lock error if the node is
-    /// still running — by design; never inspect a live store.
+    /// Opens sled via [`open_offline`](Self::open_offline): a brief transient
+    /// lock (a just-exited node still releasing the directory lock) is retried,
+    /// but a genuinely held lock — the node is still running — surfaces loudly.
+    /// Never inspect a live store.
     pub fn inspect(path: &Path) -> Result<LogInspection, Box<dyn std::error::Error + Send + Sync>> {
-        let store = Self::new(path)?;
+        let store = Self::open_offline(path)?;
 
         let vote = Self::load_meta::<Vote<u64>>(&store.meta, META_VOTE)?;
         let committed =
@@ -527,7 +576,7 @@ impl SledLogStore {
         path: &Path,
         from_index: u64,
     ) -> Result<TruncateReport, Box<dyn std::error::Error + Send + Sync>> {
-        let store = Self::new(path)?;
+        let store = Self::open_offline(path)?;
 
         let committed_before = Self::load_meta::<Option<LogId<u64>>>(&store.meta, META_COMMITTED)
             .map_err(|e| format!("reading committed marker: {e}"))?
@@ -1842,6 +1891,55 @@ mod tests {
             "preview must show the raw on-disk bytes, got {}",
             bad.preview_hex
         );
+    }
+
+    #[test]
+    fn is_lock_contention_classifies_only_the_lock_error() {
+        let lock = sled::Error::Io(std::io::Error::other(
+            "could not acquire lock on \"/tmp/x/db\": WouldBlock",
+        ));
+        assert!(SledLogStore::is_lock_contention(&lock));
+        let wouldblock = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "resource temporarily unavailable",
+        ));
+        assert!(SledLogStore::is_lock_contention(&wouldblock));
+        // A genuine corruption fault must NOT be retried.
+        let corrupt = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "torn page",
+        ));
+        assert!(!SledLogStore::is_lock_contention(&corrupt));
+    }
+
+    /// Regression for the offline-open lock race (CI flake in
+    /// `inspect_locates_first_undecodable_entry`): a still-releasing handle on
+    /// the same path must not fail an offline open. Hold the store, start the
+    /// offline open concurrently, release shortly after — `open_offline` must
+    /// retry through the transient lock and succeed.
+    #[tokio::test]
+    async fn open_offline_retries_through_a_transient_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_store(dir.path(), 1..=3, &[]).await;
+
+        let holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
+        let path = dir.path().to_path_buf();
+        let releaser = std::thread::spawn(move || {
+            // Release well within the retry budget (10 × 50 ms ≈ 500 ms).
+            std::thread::sleep(Duration::from_millis(120));
+            drop(holder);
+        });
+
+        // First plain open must observe the lock (proves the race is real).
+        assert!(
+            SledLogStore::new(&path).is_err(),
+            "a second open while the holder is alive must fail with a lock error"
+        );
+
+        let store = SledLogStore::open_offline(&path)
+            .expect("open_offline must retry past the transient lock and succeed");
+        drop(store);
+        releaser.join().unwrap();
     }
 
     #[tokio::test]
