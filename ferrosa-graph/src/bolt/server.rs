@@ -664,6 +664,7 @@ fn error_code(err: &GraphError) -> &'static str {
         GraphError::Validation(_) => "Neo.ClientError.Statement.SemanticError",
         GraphError::PermissionDenied(_) => "Neo.ClientError.Security.Forbidden",
         GraphError::ResourceLimit(_) => "Neo.TransientError.General.OutOfMemoryError",
+        GraphError::ConstraintViolation(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
         GraphError::Timeout => "Neo.TransientError.Transaction.LockClientStopped",
         GraphError::Storage(_) | GraphError::Schema(_) | GraphError::Internal(_) => {
             "Neo.DatabaseError.General.UnknownError"

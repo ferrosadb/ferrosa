@@ -3911,6 +3911,84 @@ async fn delete_with_adjacency(
     Ok(edges_deleted)
 }
 
+/// Probe the adjacency index for any **live** incident edge of `vertex_key`
+/// (URS-QEC-D02). Returns `true` if the vertex still has at least one surviving
+/// relationship in either direction. Read-only: performs no writes, so a plain
+/// `DELETE n` can fail loud before tombstoning anything.
+async fn vertex_has_incident_edges(
+    write_path: &WritePath,
+    keyspace: &str,
+    vertex_key: &DecoratedKey,
+) -> Result<bool> {
+    let adj_ks = adjacency_keyspace_name(keyspace);
+    let adj_table = TableId::new(&adj_ks, "adjacency");
+    let Some(partition) = write_path.read(&adj_table, vertex_key).await? else {
+        return Ok(false);
+    };
+    let has_live = partition.rows.iter().any(|row| {
+        row.deletion.is_live()
+            && row.clustering.len() >= 3
+            && extract_neighbor_id(&row.clustering, None).is_some()
+    });
+    Ok(has_live)
+}
+
+/// Validate the plain-`DELETE n` constraint (URS-QEC-D02) for every matched
+/// non-edge vertex BEFORE any tombstone is written: if any target node still
+/// has surviving relationships, return a Neo4j-style constraint error so the
+/// whole `DELETE` deletes nothing. Read-only.
+async fn check_plain_delete_constraint(
+    write_path: &WritePath,
+    expand_result: &GraphResult,
+    keyspace: &str,
+    variables: &[String],
+    schema: Option<&Schema>,
+    variable_tables: &HashMap<String, String>,
+) -> Result<()> {
+    for row_values in &expand_result.rows {
+        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+            if !variables.iter().any(|v| v == col_name) {
+                continue;
+            }
+            let hex_id = match row_values.get(col_idx) {
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Object(map)) => {
+                    map.get("_id").and_then(|v| v.as_str()).map(String::from)
+                }
+                _ => None,
+            };
+            let Some(hex_id) = hex_id else { continue };
+            let table_name = variable_tables
+                .get(col_name)
+                .map(String::as_str)
+                .unwrap_or(col_name);
+            // Edge tables have no adjacency partition keyed by the edge row;
+            // the constraint only governs vertices.
+            let is_edge_table = table_metadata_for(schema, keyspace, table_name)
+                .as_ref()
+                .is_some_and(|meta| {
+                    meta.extensions
+                        .get("graph.type")
+                        .is_some_and(|graph_type| graph_type == "edge")
+                });
+            if is_edge_table {
+                continue;
+            }
+            let key_bytes = hex::decode(&hex_id)
+                .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
+            let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+            if vertex_has_incident_edges(write_path, keyspace, &key).await? {
+                return Err(GraphError::ConstraintViolation(format!(
+                    "Cannot delete node {hex_id}, because it still has relationships. \
+                     To delete this node, you must first delete its relationships, \
+                     or use DETACH DELETE."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_delete(
     write_path: &WritePath,
@@ -3943,6 +4021,22 @@ async fn execute_delete(
         .unwrap_or_default()
         .as_secs() as u32;
     let strategy = graph_replication_strategy(schema, keyspace)?;
+
+    // URS-QEC-D02: for a plain `DELETE n` (no DETACH), validate the
+    // no-surviving-relationships constraint across ALL matched vertices BEFORE
+    // writing any tombstone, so a failure deletes NOTHING even when several
+    // vertices match. Probing is read-only.
+    if !detach {
+        check_plain_delete_constraint(
+            write_path,
+            &expand_result,
+            keyspace,
+            variables,
+            schema,
+            variable_tables,
+        )
+        .await?;
+    }
 
     // For each matched vertex in the specified variables, write a tombstone.
     for row_values in &expand_result.rows {
@@ -4020,6 +4114,10 @@ async fn execute_delete(
                     stats.vertices_deleted += 1;
                     continue;
                 }
+
+                // Plain `DELETE n` constraint (URS-QEC-D02) was already
+                // validated for every matched vertex by the pre-pass above, so
+                // by here the write is guaranteed safe.
 
                 // Write a row-level tombstone.
                 let tombstone_row = Row {
