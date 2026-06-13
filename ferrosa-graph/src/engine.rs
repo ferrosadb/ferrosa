@@ -224,6 +224,14 @@ fn statement_requires_adjacency(statement: &Statement) -> bool {
                     .iter()
                     .any(|assignment| expr_requires_adjacency(&assignment.value))
         }
+        Statement::Remove {
+            pattern,
+            where_clause,
+            ..
+        } => {
+            pattern.iter().any(pattern_requires_adjacency)
+                || where_clause.as_ref().is_some_and(expr_requires_adjacency)
+        }
         Statement::Delete {
             pattern,
             where_clause,
@@ -1126,6 +1134,19 @@ fn bind_statement_params(
                 .transpose()?,
             assignments: bind_assignments_params(assignments, params)?,
         },
+        Statement::Remove {
+            pattern,
+            where_clause,
+            items,
+        } => Statement::Remove {
+            pattern: bind_patterns_params(pattern, params)?,
+            where_clause: where_clause
+                .map(|expr| bind_expr_params(expr, params))
+                .transpose()?,
+            // REMOVE items carry only variable/property/label identifiers, no
+            // parameterizable expressions, so they pass through unchanged.
+            items,
+        },
         Statement::Delete {
             pattern,
             where_clause,
@@ -1253,6 +1274,19 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push_str("SetProperties {\n");
             out.push_str(&format!("  expand: {}\n", format_plan(expand)));
             out.push_str(&format!("  assignments: {}\n", assignments.len()));
+            out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::RemoveProperties {
+            expand,
+            items,
+            variable_tables,
+        } => {
+            let mut out = String::new();
+            out.push_str("RemoveProperties {\n");
+            out.push_str(&format!("  expand: {}\n", format_plan(expand)));
+            out.push_str(&format!("  items: {}\n", items.len()));
             out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
             out.push('}');
             out

@@ -271,6 +271,15 @@ impl<'input> Parser<'input> {
                     assignments,
                 })
             }
+            TokenKind::Keyword(Keyword::Remove) => {
+                self.lexer.next_token()?;
+                let items = self.parse_remove_items()?;
+                Ok(Statement::Remove {
+                    pattern,
+                    where_clause,
+                    items,
+                })
+            }
             TokenKind::Keyword(Keyword::Delete) => {
                 self.lexer.next_token()?;
                 let variables = self.parse_var_list()?;
@@ -300,7 +309,7 @@ impl<'input> Parser<'input> {
             )),
             _ => Err(ParseError::new(
                 format!(
-                    "expected RETURN, OPTIONAL MATCH, WITH, SET, DELETE, or DETACH DELETE after MATCH, got {:?}",
+                    "expected RETURN, OPTIONAL MATCH, WITH, SET, REMOVE, DELETE, or DETACH DELETE after MATCH, got {:?}",
                     tok.kind
                 ),
                 tok.span,
@@ -1349,6 +1358,63 @@ impl<'input> Parser<'input> {
         })
     }
 
+    fn parse_remove_items(&mut self) -> ParseResult<Vec<RemoveItem>> {
+        let mut items = vec![self.parse_remove_item()?];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            items.push(self.parse_remove_item()?);
+        }
+        Ok(items)
+    }
+
+    fn parse_remove_item(&mut self) -> ParseResult<RemoveItem> {
+        let tok = self.lexer.next_token()?;
+        let var = match tok.kind {
+            TokenKind::Ident(name) => name.to_string(),
+            _ => {
+                return Err(ParseError::new(
+                    format!("expected variable name in REMOVE, got {:?}", tok.kind),
+                    tok.span,
+                ));
+            }
+        };
+        let sep = self.lexer.next_token()?;
+        match sep.kind {
+            TokenKind::Dot => {
+                let prop_tok = self.lexer.next_token()?;
+                match prop_tok.kind {
+                    TokenKind::Ident(name) => Ok(RemoveItem::Property {
+                        var,
+                        property: name.to_string(),
+                    }),
+                    _ => Err(ParseError::new(
+                        format!("expected property name after '.', got {:?}", prop_tok.kind),
+                        prop_tok.span,
+                    )),
+                }
+            }
+            TokenKind::Colon => {
+                let label_tok = self.lexer.next_token()?;
+                match label_tok.kind {
+                    TokenKind::Ident(name) => Ok(RemoveItem::Label {
+                        var,
+                        label: name.to_string(),
+                    }),
+                    _ => Err(ParseError::new(
+                        format!("expected label name after ':', got {:?}", label_tok.kind),
+                        label_tok.span,
+                    )),
+                }
+            }
+            _ => Err(ParseError::new(
+                format!(
+                    "expected '.' (property) or ':' (label) in REMOVE, got {:?}",
+                    sep.kind
+                ),
+                sep.span,
+            )),
+        }
+    }
+
     fn parse_var_list(&mut self) -> ParseResult<Vec<String>> {
         let mut vars = vec![];
         let tok = self.lexer.next_token()?;
@@ -1699,6 +1765,42 @@ mod tests {
             assert_eq!(assignments[0].property, "age");
         } else {
             panic!("expected Set");
+        }
+    }
+
+    // --- REMOVE ---
+
+    #[test]
+    fn parse_remove_property() {
+        let stmt = parse("MATCH (n:Person) WHERE n.name = 'Alice' REMOVE n.age").unwrap();
+        if let Statement::Remove { items, .. } = stmt {
+            assert_eq!(items.len(), 1);
+            match &items[0] {
+                RemoveItem::Property { var, property } => {
+                    assert_eq!(var, "n");
+                    assert_eq!(property, "age");
+                }
+                other => panic!("expected Property remove item, got {other:?}"),
+            }
+        } else {
+            panic!("expected Remove");
+        }
+    }
+
+    #[test]
+    fn parse_remove_label() {
+        let stmt = parse("MATCH (n:Person) REMOVE n:Person").unwrap();
+        if let Statement::Remove { items, .. } = stmt {
+            assert_eq!(items.len(), 1);
+            match &items[0] {
+                RemoveItem::Label { var, label } => {
+                    assert_eq!(var, "n");
+                    assert_eq!(label, "Person");
+                }
+                other => panic!("expected Label remove item, got {other:?}"),
+            }
+        } else {
+            panic!("expected Remove");
         }
     }
 

@@ -24,7 +24,8 @@ use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::parser::{
-    CompareOp, Direction, Expr, Literal, ReturnClause, ReturnItem, SortDir, WithPipeline,
+    CompareOp, Direction, Expr, Literal, RemoveItem, ReturnClause, ReturnItem, SortDir,
+    WithPipeline,
 };
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
 
@@ -217,6 +218,24 @@ pub async fn execute(
                 *expand,
                 keyspace,
                 &assignments,
+                &variable_tables,
+                config,
+                virtual_tables,
+                start,
+                schema,
+            )
+            .await
+        }
+        PhysicalPlan::RemoveProperties {
+            expand,
+            items,
+            variable_tables,
+        } => {
+            execute_remove(
+                write_path,
+                *expand,
+                keyspace,
+                &items,
                 &variable_tables,
                 config,
                 virtual_tables,
@@ -3715,6 +3734,181 @@ async fn execute_set(
         columns: vec!["status".to_string()],
         rows: vec![vec![serde_json::Value::String(format!(
             "updated {} vertices",
+            stats.vertices_written
+        ))]],
+        stats,
+    })
+}
+
+/// Execute a REMOVE plan: run the inner expand to find matching vertices, then
+/// for each `REMOVE n.prop` write a cell-level tombstone so the property is
+/// unset and invisible to subsequent reads (URS-QEC-D06 / T-QEC-D07).
+///
+/// Mirrors `execute_set`, but instead of writing a live cell it writes a
+/// `CellValue::tombstone` at the property's column. `REMOVE n:Label` has no
+/// representation in this label-as-table storage model, so it fails loud rather
+/// than silently no-op (URS-QEC-X01).
+#[allow(clippy::too_many_arguments)]
+async fn execute_remove(
+    write_path: &WritePath,
+    expand: PhysicalPlan,
+    keyspace: &str,
+    items: &[RemoveItem],
+    variable_tables: &HashMap<String, String>,
+    config: &GraphEngineConfig,
+    virtual_tables: Option<&VirtualTableRegistry>,
+    start: Instant,
+    schema: Option<&Schema>,
+) -> Result<GraphResult> {
+    // Fail loud on label removal: there is no storage representation for
+    // dropping a label (label == table membership), so never fake success.
+    for item in items {
+        if let RemoveItem::Label { label, .. } = item {
+            return Err(GraphError::Validation(format!(
+                "execute_remove: REMOVE n:{label} (label removal) is not supported \
+                 in the label-as-table storage model"
+            )));
+        }
+    }
+
+    let expand_result = Box::pin(execute(
+        expand,
+        write_path,
+        keyspace,
+        config,
+        virtual_tables,
+        schema,
+    ))
+    .await?;
+    let mut stats = QueryStats::default();
+    stats.vertices_read = expand_result.stats.vertices_read;
+    stats.edges_read = expand_result.stats.edges_read;
+
+    let timestamp = now_micros();
+    let local_deletion_time = timestamp.div_euclid(1_000_000).clamp(0, i32::MAX as i64) as i32;
+    let strategy = graph_replication_strategy(schema, keyspace)?;
+
+    for row_values in &expand_result.rows {
+        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+            let matching_props: Vec<&str> = items
+                .iter()
+                .filter_map(|item| match item {
+                    RemoveItem::Property { var, property } if var == col_name => {
+                        Some(property.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if matching_props.is_empty() {
+                continue;
+            }
+
+            let hex_id = match row_values.get(col_idx) {
+                Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                Some(serde_json::Value::Object(map)) => map.get("_id").and_then(|v| v.as_str()),
+                _ => None,
+            };
+            let Some(hex_id) = hex_id else { continue };
+
+            let table_name = variable_tables
+                .get(col_name)
+                .map(String::as_str)
+                .unwrap_or(col_name);
+            let table_id = TableId::new(keyspace, table_name);
+            let table_meta = table_metadata_for(schema, keyspace, table_name);
+            let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
+                meta.extensions
+                    .get("graph.type")
+                    .is_some_and(|graph_type| graph_type == "edge")
+            });
+            let key_hex = if is_edge_table {
+                row_values
+                    .get(col_idx)
+                    .and_then(|value| value.as_object())
+                    .and_then(|map| map.get("__ferrosa_key"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(hex_id)
+            } else {
+                hex_id
+            };
+            let key_bytes = hex::decode(key_hex)
+                .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
+            let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+            let clustering = if is_edge_table {
+                row_values
+                    .get(col_idx)
+                    .and_then(|value| value.as_object())
+                    .and_then(|map| map.get("__ferrosa_clustering"))
+                    .and_then(|value| value.as_str())
+                    .map(hex::decode)
+                    .transpose()
+                    .map_err(|e| {
+                        GraphError::Internal(format!("invalid hex storage clustering: {e}"))
+                    })?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            let mut cells = Vec::with_capacity(matching_props.len());
+            for prop in &matching_props {
+                let Some(column_idx) =
+                    regular_column_index_for_property(schema, keyspace, table_name, prop)
+                else {
+                    if matches!(
+                        column_kind_for_property(schema, keyspace, table_name, prop),
+                        Some(
+                            ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                                | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                        )
+                    ) {
+                        return Err(GraphError::Validation(format!(
+                            "execute_remove: REMOVE cannot unset key column '{}' on table '{}.{}'",
+                            prop, keyspace, table_name
+                        )));
+                    }
+                    return Err(GraphError::Validation(format!(
+                        "execute_remove: REMOVE references unknown property '{}' on table '{}.{}'",
+                        prop, keyspace, table_name
+                    )));
+                };
+                cells.push((
+                    column_idx,
+                    CellValue::tombstone(timestamp, local_deletion_time),
+                ));
+            }
+
+            if cells.is_empty() {
+                continue;
+            }
+
+            let update_row = Row {
+                clustering,
+                cells,
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::NONE,
+            };
+
+            write_path
+                .write(
+                    &table_id,
+                    &key,
+                    update_row,
+                    timestamp,
+                    graph_write_consistency(),
+                    &strategy,
+                )
+                .await?;
+            stats.vertices_written += 1;
+        }
+    }
+
+    stats.execution_ms = start.elapsed().as_millis() as u64;
+
+    Ok(GraphResult {
+        columns: vec!["status".to_string()],
+        rows: vec![vec![serde_json::Value::String(format!(
+            "removed properties on {} vertices",
             stats.vertices_written
         ))]],
         stats,

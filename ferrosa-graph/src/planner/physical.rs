@@ -9,7 +9,8 @@ use std::time::Duration;
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::is_aggregate_function;
 use crate::parser::{
-    Assignment, Direction, Expr, Pattern, PropMap, ReturnClause, Statement, WithPipeline,
+    Assignment, Direction, Expr, Pattern, PropMap, RemoveItem, ReturnClause, Statement,
+    WithPipeline,
 };
 use crate::planner::logical::{LogicalPlan, ResolvedTable};
 
@@ -203,6 +204,18 @@ pub enum PhysicalPlan {
         /// Cypher variable.
         variable_tables: HashMap<String, String>,
     },
+    /// Unset properties / drop labels on matched nodes/rels (Cypher `REMOVE`).
+    RemoveProperties {
+        /// First: expand to find matching vertices.
+        expand: Box<PhysicalPlan>,
+        /// REMOVE targets, resolved to (var, kind). `Property` unsets a cell;
+        /// `Label` drops a label.
+        items: Vec<RemoveItem>,
+        /// Mapping from variable name to resolved storage table name so writes
+        /// tombstone the matched label table rather than a table named after
+        /// the Cypher variable.
+        variable_tables: HashMap<String, String>,
+    },
     /// Delete matched nodes/rels.
     DeleteNodes {
         /// First: expand to find matching vertices.
@@ -352,6 +365,11 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             where_clause,
             assignments,
         } => plan_set(pattern, &logical.bindings, where_clause, assignments),
+        Statement::Remove {
+            pattern,
+            where_clause,
+            items,
+        } => plan_remove(pattern, &logical.bindings, where_clause, items),
         Statement::Delete {
             pattern,
             where_clause,
@@ -1011,6 +1029,59 @@ fn plan_set(
                     .map(|rt| (a.var.clone(), rt.table.clone()))
             })
             .collect(),
+    })
+}
+
+/// Variable referenced by a REMOVE item.
+fn remove_item_var(item: &RemoveItem) -> &str {
+    match item {
+        RemoveItem::Property { var, .. } | RemoveItem::Label { var, .. } => var,
+    }
+}
+
+/// Plan a REMOVE statement: build an Expand plan from the pattern, then wrap it
+/// with RemoveProperties containing the targets. Mirrors `plan_set`.
+fn plan_remove(
+    patterns: &[Pattern],
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+    where_clause: &Option<Expr>,
+    items: &[RemoveItem],
+) -> Result<PhysicalPlan> {
+    let filters = extract_filters(where_clause);
+
+    // Return all variables referenced by the items so the expand plan can find
+    // matching vertices. De-duplicate so repeated vars produce one return item.
+    let mut return_vars: Vec<String> = Vec::new();
+    for item in items {
+        let var = remove_item_var(item).to_string();
+        if !return_vars.contains(&var) {
+            return_vars.push(var);
+        }
+    }
+    let return_clause = ReturnClause {
+        distinct: false,
+        items: return_vars
+            .iter()
+            .map(|v| crate::parser::ReturnItem {
+                expr: Expr::Var(v.clone()),
+                alias: None,
+            })
+            .collect(),
+        order_by: vec![],
+        limit: None,
+    };
+
+    let expand = plan_match(patterns, bindings, filters, return_clause)?;
+
+    let variable_tables: HashMap<String, String> = return_vars
+        .iter()
+        .filter_map(|v| bindings.get(v).map(|rt| (v.clone(), rt.table.clone())))
+        .collect();
+
+    Ok(PhysicalPlan::RemoveProperties {
+        expand: Box::new(expand),
+        items: items.to_vec(),
+        variable_tables,
     })
 }
 
