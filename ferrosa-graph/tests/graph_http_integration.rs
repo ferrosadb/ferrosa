@@ -1946,10 +1946,17 @@ async fn aggregate_collect_skips_null_property_values() {
         .as_array()
         .expect("collect result must be an array, never null")
         .iter()
-        .map(|v| v.as_i64().expect("collect must skip nulls -> only integers remain"))
+        .map(|v| {
+            v.as_i64()
+                .expect("collect must skip nulls -> only integers remain")
+        })
         .collect::<Vec<_>>();
     collected.sort_unstable();
-    assert_eq!(collected, vec![10, 20], "collect(n.age) must skip the null age");
+    assert_eq!(
+        collected,
+        vec![10, 20],
+        "collect(n.age) must skip the null age"
+    );
     // count(n.age) also skips nulls -> 2 aged persons.
     assert_eq!(row[1].as_i64(), Some(2));
 }
@@ -1977,7 +1984,11 @@ async fn aggregate_empty_input_semantics() {
     let body = response_json(resp).await;
     assert_eq!(status, StatusCode::OK, "empty-input query failed: {body:?}");
     let rows = body["rows"].as_array().expect("rows array");
-    assert_eq!(rows.len(), 1, "aggregate over empty input collapses to one row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "aggregate over empty input collapses to one row"
+    );
     let row = rows[0].as_array().expect("aggregate row");
     assert_eq!(row[0].as_i64(), Some(0), "count over empty input -> 0");
     assert_eq!(row[1].as_i64(), Some(0), "sum over empty input -> 0");
@@ -6056,7 +6067,11 @@ async fn http_call_subquery_trailing_return_applies_limit() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "trailing LIMIT must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "trailing LIMIT must return 200"
+    );
     let body = response_json(resp).await;
     let rows = body["rows"].as_array().expect("rows array");
     assert_eq!(
@@ -6088,7 +6103,11 @@ async fn http_call_subquery_trailing_return_applies_distinct() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "trailing DISTINCT must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "trailing DISTINCT must return 200"
+    );
     let body = response_json(resp).await;
     let rows = body["rows"].as_array().expect("rows array");
     assert_eq!(
@@ -6096,7 +6115,11 @@ async fn http_call_subquery_trailing_return_applies_distinct() {
         1,
         "trailing CALL {{}} RETURN DISTINCT must collapse 3 identical rows to 1"
     );
-    assert_eq!(rows[0][0].as_i64(), Some(1), "the surviving distinct row is 1");
+    assert_eq!(
+        rows[0][0].as_i64(),
+        Some(1),
+        "the surviving distinct row is 1"
+    );
 }
 
 /// Trailing `RETURN ... ORDER BY` after a `CALL {}` must sort the united result.
@@ -6121,10 +6144,17 @@ async fn http_call_subquery_trailing_return_applies_order_by() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "trailing ORDER BY must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "trailing ORDER BY must return 200"
+    );
     let body = response_json(resp).await;
     let rows = body["rows"].as_array().expect("rows array");
-    let ages: Vec<i64> = rows.iter().map(|r| r[0].as_i64().expect("age int")).collect();
+    let ages: Vec<i64> = rows
+        .iter()
+        .map(|r| r[0].as_i64().expect("age int"))
+        .collect();
     assert_eq!(
         ages,
         vec![72, 49, 36],
@@ -6155,7 +6185,11 @@ async fn http_call_subquery_trailing_return_aggregates_count() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "trailing aggregation must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "trailing aggregation must return 200"
+    );
     let body = response_json(resp).await;
     let rows = body["rows"].as_array().expect("rows array");
     assert_eq!(
@@ -6192,7 +6226,11 @@ async fn http_call_subquery_trailing_return_grouped_aggregate() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "trailing grouped aggregate must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "trailing grouped aggregate must return 200"
+    );
     let body = response_json(resp).await;
     let rows = body["rows"].as_array().expect("rows array");
     let pairs: Vec<(i64, i64)> = rows
