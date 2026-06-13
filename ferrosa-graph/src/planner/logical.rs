@@ -30,6 +30,13 @@ pub struct ResolvedTable {
 pub struct LogicalPlan {
     /// Variable bindings: variable name -> resolved table.
     pub bindings: HashMap<String, ResolvedTable>,
+    /// Per-arm resolved bindings for `Statement::Union`, one entry per arm in
+    /// arm order. Empty for all other statements. UNION arms have *independent*
+    /// variable scope, so each arm keeps its own resolution map — the same
+    /// variable name may resolve to a different table in different arms. The
+    /// physical planner plans each arm against its own entry here, never the
+    /// flat `bindings` map.
+    pub arm_bindings: Vec<HashMap<String, ResolvedTable>>,
     /// The original parsed statement.
     pub statement: Statement,
     /// The keyspace context for this query.
@@ -132,17 +139,26 @@ pub fn validate(
     let perm = permission_for_statement(&statement);
     let mut bindings = HashMap::new();
 
-    // UNION / UNION ALL: each arm is an independent single query. Resolve every
-    // arm's pattern labels so the physical planner can find each arm's anchor.
-    // Arms share one flat bindings map — pattern variables that recur across
-    // arms (e.g. `n`) resolve to the same table, so merging is sound.
+    // UNION / UNION ALL: each arm is an independent single query with its OWN
+    // variable scope. Resolve every arm separately and keep each arm's bindings
+    // in `arm_bindings` (arm order). The same variable name (e.g. `n`) may bind
+    // to a different table in different arms — `MATCH (n:Person) ... UNION
+    // MATCH (n:Company) ...` is legal openCypher — so we must NOT flatten arm
+    // maps into one last-write-wins map and share it across arms (that would
+    // make every arm scan whichever table won the merge, silently dropping the
+    // other arms' rows). The flat `bindings` map is still populated (merged) so
+    // `table_dependencies()`/SUBSCRIBE see every table the query touches, but
+    // the physical planner plans each arm against its own `arm_bindings` entry.
     if let Statement::Union { arms, .. } = &statement {
+        let mut arm_bindings = Vec::with_capacity(arms.len());
         for arm in arms {
             let arm_plan = validate(snap, auth, keyspace, arm.clone())?;
-            bindings.extend(arm_plan.bindings);
+            bindings.extend(arm_plan.bindings.clone());
+            arm_bindings.push(arm_plan.bindings);
         }
         return Ok(LogicalPlan {
             bindings,
+            arm_bindings,
             statement,
             keyspace: keyspace.to_string(),
         });
@@ -190,6 +206,7 @@ pub fn validate(
         Statement::Unsubscribe { .. } => {
             return Ok(LogicalPlan {
                 bindings,
+                arm_bindings: Vec::new(),
                 statement,
                 keyspace: keyspace.to_string(),
             });
@@ -203,6 +220,7 @@ pub fn validate(
 
     Ok(LogicalPlan {
         bindings,
+        arm_bindings: Vec::new(),
         statement,
         keyspace: keyspace.to_string(),
     })

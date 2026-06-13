@@ -290,10 +290,24 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             plan_match(pattern, &logical.bindings, filters, return_clause.clone())
         }
         Statement::Union { arms, all } => {
+            // Each arm has independent variable scope: plan it against its OWN
+            // bindings (resolved per-arm in the logical planner), never the flat
+            // merged map. `arm_bindings` is populated 1:1 with `arms` by
+            // `validate()`; a length mismatch means an arm was built without
+            // resolving its labels, so fail loud rather than scan a wrong table.
+            if logical.arm_bindings.len() != arms.len() {
+                return Err(GraphError::Validation(format!(
+                    "UNION planner expected {} per-arm binding maps, got {}; \
+                     arms must be resolved per-arm before physical planning",
+                    arms.len(),
+                    logical.arm_bindings.len()
+                )));
+            }
             let mut planned = Vec::with_capacity(arms.len());
-            for arm in arms {
+            for (arm, arm_bindings) in arms.iter().zip(logical.arm_bindings.iter()) {
                 planned.push(plan(LogicalPlan {
-                    bindings: logical.bindings.clone(),
+                    bindings: arm_bindings.clone(),
+                    arm_bindings: Vec::new(),
                     statement: arm.clone(),
                     keyspace: logical.keyspace.clone(),
                 })?);
@@ -1613,6 +1627,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Node {
                     var: Some("n".into()),
@@ -1645,6 +1660,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
@@ -1692,6 +1708,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Create {
                 patterns: vec![Pattern::Node {
                     var: Some("n".into()),
@@ -1723,6 +1740,7 @@ mod tests {
     fn plan_create_empty_patterns_returns_error() {
         let logical = LogicalPlan {
             bindings: HashMap::new(),
+            arm_bindings: Vec::new(),
             statement: Statement::Create {
                 patterns: vec![],
                 return_clause: None,
@@ -1741,6 +1759,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Set {
                 pattern: vec![Pattern::Node {
                     var: Some("n".into()),
@@ -1784,6 +1803,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Delete {
                 pattern: vec![Pattern::Node {
                     var: Some("n".into()),
@@ -1838,6 +1858,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Node {
                     var: Some("n".into()),
@@ -1890,6 +1911,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Node {
                     var: Some("n".into()),
@@ -1918,6 +1940,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
@@ -1971,6 +1994,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
@@ -2024,6 +2048,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Subscribe {
                 inner: Box::new(inner),
                 interval: Some(std::time::Duration::from_secs(5)),
@@ -2066,6 +2091,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Subscribe {
                 inner: Box::new(inner),
                 interval: None,
@@ -2095,6 +2121,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
@@ -2147,6 +2174,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
@@ -2218,6 +2246,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
@@ -2303,6 +2332,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
@@ -2393,6 +2423,7 @@ mod tests {
         };
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     mk_node("a"),
@@ -2434,6 +2465,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Merge {
                 patterns: vec![crate::parser::Pattern::Node {
                     var: Some("n".into()),
@@ -2474,6 +2506,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Merge {
                 patterns: vec![
                     crate::parser::Pattern::Node {
@@ -2565,6 +2598,7 @@ mod tests {
 
         let logical = LogicalPlan {
             bindings,
+            arm_bindings: Vec::new(),
             statement: Statement::Match {
                 pattern: vec![Pattern::Path(vec![
                     Pattern::Node {
