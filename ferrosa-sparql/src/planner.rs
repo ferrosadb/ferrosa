@@ -85,6 +85,13 @@ pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, Sparq
     }
 }
 
+/// Plan a bare `GraphPattern` (e.g. the WHERE clause of a SPARQL UPDATE) into a
+/// [`QueryPlan`] so it can be evaluated by the SELECT executor to bind
+/// solutions. Used by `update.rs` for `DELETE WHERE` / `DELETE/INSERT … WHERE`.
+pub fn plan_where(pattern: &GraphPattern, default_graph: &str) -> Result<QueryPlan, SparqlError> {
+    plan_select(pattern, default_graph, None, false)
+}
+
 fn plan_select(
     pattern: &GraphPattern,
     default_graph: &str,
