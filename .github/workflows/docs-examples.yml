@@ -6,9 +6,8 @@ on:
     paths:
       - 'examples/**'
       - '.github/workflows/docs-examples.yml'
-  # No `branches:` filter — also run on stacked PRs (base may be a feature
-  # branch). The `paths:` filter still keeps non-examples PRs cheap.
   pull_request:
+    branches: [main]
     paths:
       - 'examples/**'
       - '.github/workflows/docs-examples.yml'
