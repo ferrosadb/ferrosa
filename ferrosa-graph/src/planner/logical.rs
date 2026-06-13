@@ -132,6 +132,22 @@ pub fn validate(
     let perm = permission_for_statement(&statement);
     let mut bindings = HashMap::new();
 
+    // UNION / UNION ALL: each arm is an independent single query. Resolve every
+    // arm's pattern labels so the physical planner can find each arm's anchor.
+    // Arms share one flat bindings map — pattern variables that recur across
+    // arms (e.g. `n`) resolve to the same table, so merging is sound.
+    if let Statement::Union { arms, .. } = &statement {
+        for arm in arms {
+            let arm_plan = validate(snap, auth, keyspace, arm.clone())?;
+            bindings.extend(arm_plan.bindings);
+        }
+        return Ok(LogicalPlan {
+            bindings,
+            statement,
+            keyspace: keyspace.to_string(),
+        });
+    }
+
     // Collect patterns from the statement.
     let patterns: &[Pattern] = match &statement {
         Statement::Unwind { .. } | Statement::Return { .. } | Statement::Union { .. } => &[],
