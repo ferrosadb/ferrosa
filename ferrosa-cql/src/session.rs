@@ -100,7 +100,7 @@ impl Default for TransactionState {
 ///   FAILS LOUD.
 /// * Reads inside the tx see the connection's own staged writes via
 ///   [`staged_ops`](Self::staged_ops).
-/// * [`commit`](Self::commit) materializes a [`BatchTxn`] from the engine's
+/// * [`commit`](Self::commit) materializes a `BatchTxn` from the engine's
 ///   `begin_batch()`, stages every queued op onto it, and calls
 ///   `BatchTxn::commit` — an **atomic, durable, all-or-nothing** apply. On any
 ///   engine error it returns `Err` and the connection has persisted *nothing*
@@ -228,7 +228,7 @@ impl ConnTxn {
 
     /// Atomically commit the staged batch via the storage primitive.
     ///
-    /// Opens a [`BatchTxn`] from `engine.begin_batch()`, stages every queued op,
+    /// Opens a `BatchTxn` from `engine.begin_batch()`, stages every queued op,
     /// and calls `BatchTxn::commit` (single atomic, durable apply). On engine
     /// error the connection state is still reset (the tx is over) but the `Err`
     /// is returned so the caller emits a Bolt `FAILURE` — the transaction is
