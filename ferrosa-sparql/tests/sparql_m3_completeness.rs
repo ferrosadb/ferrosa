@@ -13,7 +13,6 @@
 //! | URS-QEC-S03 | RDF* eval (silent → fail loud) + SPARQL XML results | annotated var must NOT silently be absent; XML serialization round-trip |
 //! | URS-QEC-S04 | ORDER BY expressions (silent → fail loud) | non-variable ORDER BY must return Err, not silently skip |
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use ferrosa_cluster::write_path::WritePath;
@@ -63,14 +62,6 @@ fn engine(storage: Arc<StorageEngine>, write_path: Arc<WritePath>) -> SparqlEngi
         ..Default::default()
     };
     SparqlEngine::new(storage, write_path, config)
-}
-
-async fn select_count(eng: &SparqlEngine, query: &str) -> usize {
-    match eng.execute(query, KS).await.expect("select must succeed") {
-        SparqlResult::Select(r) => r.results.bindings.len(),
-        SparqlResult::Ask(_) => panic!("expected SELECT result, got ASK"),
-        SparqlResult::Graph(_) => panic!("expected SELECT result, got Graph"),
-    }
 }
 
 async fn select_values(eng: &SparqlEngine, query: &str, var: &str) -> Vec<String> {
