@@ -56,8 +56,8 @@ pub use compaction::{
 };
 pub use data_store::{DataStore, LocalDataStore};
 pub use engine::{
-    PersistedIndexRow, StorageEngine, StorageEngineConfig, TempSortTableReservation,
-    TimeSeriesWasmAggregateExecutor, TimeSeriesWasmAggregateInvocation,
+    BatchOp, BatchTxn, PersistedIndexRow, StorageEngine, StorageEngineConfig,
+    TempSortTableReservation, TimeSeriesWasmAggregateExecutor, TimeSeriesWasmAggregateInvocation,
     FILTER_PREDICATE_OPTION_KEY,
 };
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
