@@ -54,6 +54,11 @@ pub enum CqlError {
     /// The connection handler should reply with an ERROR frame using the
     /// supported version so the driver falls back.
     ProtocolVersionMismatch { requested: u8, supported: u8 },
+    /// An explicit transaction exceeded its configured timeout and was aborted
+    /// (URS-QEC-B03). Reported as a write-timeout class error so drivers
+    /// classify it as a transient timeout; the message carries the budget and
+    /// the elapsed time. The transaction is aborted: nothing was persisted.
+    TransactionTimeout { timeout_ms: u64, elapsed_ms: u64 },
 }
 
 impl CqlError {
@@ -65,7 +70,7 @@ impl CqlError {
             Self::BadCredentials => 0x0100,
             Self::Unavailable { .. } => 0x1000,
             Self::Overloaded(_) => 0x1001,
-            Self::WriteTimeout { .. } => 0x1100,
+            Self::WriteTimeout { .. } | Self::TransactionTimeout { .. } => 0x1100,
             Self::ReadTimeout { .. } => 0x1200,
             Self::SyntaxError(_) => 0x2000,
             Self::Unauthorized(_) => 0x2100,
@@ -213,7 +218,23 @@ impl std::fmt::Display for CqlError {
                 "Invalid or unsupported protocol version ({requested}); \
                  the lowest supported version is 3 and the greatest is {supported}"
             ),
+            Self::TransactionTimeout {
+                timeout_ms,
+                elapsed_ms,
+            } => write!(
+                f,
+                "transaction timed out and was aborted: budget={timeout_ms}ms, \
+                 elapsed={elapsed_ms}ms; nothing was persisted"
+            ),
         }
+    }
+}
+
+impl CqlError {
+    /// `true` if this is a transaction-timeout error (URS-QEC-B03). Lets a
+    /// transport map a timed-out, aborted transaction to its own FAILURE class.
+    pub fn is_transaction_timeout(&self) -> bool {
+        matches!(self, Self::TransactionTimeout { .. })
     }
 }
 
