@@ -252,3 +252,120 @@ fn protocol_misuse_fails_loud() {
     // Nested BEGIN.
     assert!(tx.begin(2).is_err(), "nested BEGIN must fail");
 }
+
+// ── URS-QEC-B03: per-transaction timeout enforcement ────────────────────────
+//
+// A transaction opened with a deadline must, once that deadline is exceeded,
+// ABORT (discard all staged writes, close the tx) and FAIL LOUD on the next
+// `stage`/`commit` — never silently commit a timed-out transaction. The error
+// is a distinct timeout (so the caller emits a Bolt FAILURE the driver can
+// classify), not a generic Invalid.
+
+/// A COMMIT after the per-tx deadline has passed FAILS LOUD and persists
+/// NOTHING (URS-QEC-B03, fail-loud).
+#[test]
+fn commit_after_timeout_fails_loud_and_persists_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_with_table(dir.path(), "t");
+    let tid = TableId::new("ks", "t");
+    let key = make_key("p1");
+
+    let mut tx = ConnTxn::new();
+    tx.begin_with_timeout(7, Duration::from_millis(20))
+        .expect("begin opens tx with a deadline");
+    tx.stage(write_op("t", &key, ck(1), b"alpha", 100)).unwrap();
+
+    // Let the transaction deadline pass.
+    std::thread::sleep(Duration::from_millis(40));
+
+    let err = tx
+        .commit(&engine)
+        .expect_err("commit after the deadline must FAIL, never silently persist");
+    assert!(
+        err.is_transaction_timeout(),
+        "expected a transaction-timeout error, got: {err:?}"
+    );
+    // FAIL-LOUD, NEVER FAKE: nothing was persisted.
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(1)),
+        None,
+        "a timed-out COMMIT must persist NOTHING"
+    );
+    // The transaction is over.
+    assert!(!tx.is_open(), "a timed-out tx is closed");
+}
+
+/// Staging a write after the per-tx deadline has passed FAILS LOUD and aborts
+/// the transaction (URS-QEC-B03).
+#[test]
+fn stage_after_timeout_fails_loud_and_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_with_table(dir.path(), "t");
+    let tid = TableId::new("ks", "t");
+    let key = make_key("p1");
+
+    let mut tx = ConnTxn::new();
+    tx.begin_with_timeout(9, Duration::from_millis(20)).unwrap();
+    tx.stage(write_op("t", &key, ck(1), b"alpha", 100)).unwrap();
+
+    std::thread::sleep(Duration::from_millis(40));
+
+    let err = tx
+        .stage(write_op("t", &key, ck(2), b"beta", 100))
+        .expect_err("staging after the deadline must FAIL");
+    assert!(
+        err.is_transaction_timeout(),
+        "expected a transaction-timeout error, got: {err:?}"
+    );
+    assert!(
+        !tx.is_open(),
+        "the timed-out tx is aborted on the late stage"
+    );
+
+    // Even an attempt to commit now is a no-op failure — nothing persisted.
+    assert!(tx.commit(&engine).is_err());
+    assert_eq!(read_cell(&engine, &tid, &key, &ck(1)), None);
+}
+
+/// A transaction that COMMITs within its timeout still persists normally:
+/// the deadline must not abort a healthy tx (URS-QEC-B03).
+#[test]
+fn commit_within_timeout_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_with_table(dir.path(), "t");
+    let tid = TableId::new("ks", "t");
+    let key = make_key("p1");
+
+    let mut tx = ConnTxn::new();
+    tx.begin_with_timeout(11, Duration::from_secs(30)).unwrap();
+    tx.stage(write_op("t", &key, ck(1), b"alpha", 100)).unwrap();
+    tx.commit(&engine)
+        .expect("commit within the timeout persists");
+
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(1)).as_deref(),
+        Some(&b"alpha"[..])
+    );
+}
+
+/// A transaction opened without a timeout (`begin`) never times out: it is the
+/// unbounded default and a late COMMIT still succeeds (URS-QEC-B03).
+#[test]
+fn begin_without_timeout_never_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_with_table(dir.path(), "t");
+    let tid = TableId::new("ks", "t");
+    let key = make_key("p1");
+
+    let mut tx = ConnTxn::new();
+    tx.begin(13).unwrap();
+    tx.stage(write_op("t", &key, ck(1), b"alpha", 100)).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    tx.commit(&engine)
+        .expect("a no-timeout tx must never expire");
+
+    assert_eq!(
+        read_cell(&engine, &tid, &key, &ck(1)).as_deref(),
+        Some(&b"alpha"[..])
+    );
+}
