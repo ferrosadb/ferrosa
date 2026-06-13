@@ -2550,10 +2550,6 @@ async fn http_unsupported_cypher_clauses_return_explicit_400() {
             "unsupported Cypher clause: Keyword(Call)",
         ),
         (
-            "FOREACH (x IN [1] | CREATE (:Person {name: 'x'}))",
-            "unsupported Cypher clause: Keyword(Foreach)",
-        ),
-        (
             "LOAD CSV FROM 'file:///people.csv' AS row RETURN row",
             "unsupported Cypher clause: Keyword(Load)",
         ),
@@ -5452,7 +5448,11 @@ async fn list_comprehension_projects_through_http() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "list comprehension must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "list comprehension must return 200"
+    );
     let body = response_json(resp).await;
     assert_eq!(body["rows"], serde_json::json!([[[30, 40]]]));
 }
@@ -5488,7 +5488,11 @@ async fn map_projection_selects_properties_through_http() {
         })),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "map projection must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "map projection must return 200"
+    );
     let body = response_json(resp).await;
     let rows = body["rows"].as_array().expect("rows array");
     assert_eq!(rows.len(), 1, "expected one matched Person, got {rows:?}");
@@ -5576,5 +5580,115 @@ async fn pattern_comprehension_traverses_edges_through_http() {
         names,
         vec!["FriendA".to_string(), "FriendB".to_string()],
         "pattern comprehension must collect both traversed friends, not silently empty"
+    );
+}
+
+/// FOREACH (x IN list | CREATE (:Person {name: x})) must execute the contained
+/// update clause once per list element, creating exactly one node per element.
+#[tokio::test]
+async fn http_foreach_creates_one_node_per_list_element() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "FOREACH (x IN ['Ada', 'Babbage', 'Cantor'] | \
+                      CREATE (n:Person {name: x}))",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "FOREACH with a CREATE body must return 200"
+    );
+
+    // MATCH back — must see exactly the three nodes, one per list element,
+    // each carrying the element's value as its name.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let mut names: Vec<String> = rows
+        .iter()
+        .map(|r| r[0].as_str().expect("name string").to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "Ada".to_string(),
+            "Babbage".to_string(),
+            "Cantor".to_string()
+        ],
+        "FOREACH must CREATE exactly one Person per list element, named after the element"
+    );
+}
+
+/// FOREACH must be atomic with respect to its body: if the contained update
+/// clause fails for any element, the whole statement rolls back and no nodes
+/// are created (no partial writes from the earlier, successful elements).
+///
+/// Here the body targets a label with no backing table (`Ghost`), which fails
+/// validation. The earlier `Person` elements must NOT be persisted.
+#[tokio::test]
+async fn http_foreach_partial_failure_rolls_back() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    // The body first creates a VALID Person, then a CREATE against an unknown
+    // label `Ghost`. The Person create would succeed on its own; only the Ghost
+    // create fails. Atomicity requires the whole FOREACH to roll back, so NONE of
+    // the Person nodes (for any element) may be persisted.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "FOREACH (x IN ['Ada', 'Babbage'] | \
+                      CREATE (p:Person {name: x}) \
+                      CREATE (g:Ghost {name: x}))",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "FOREACH whose body targets a non-existent label must fail loud, not 200"
+    );
+
+    // No Person nodes — and critically nothing partially written — should remain.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert!(
+        rows.is_empty(),
+        "FOREACH body failure must roll back: expected zero Person nodes, got {rows:?}"
     );
 }
