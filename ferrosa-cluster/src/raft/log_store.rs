@@ -513,10 +513,10 @@ impl SledLogStore {
     /// the current build and report what is readable, what is not, and
     /// where the damage starts.
     ///
-    /// Opens sled via [`open_offline`](Self::open_offline): a brief transient
-    /// lock (a just-exited node still releasing the directory lock) is retried,
-    /// but a genuinely held lock — the node is still running — surfaces loudly.
-    /// Never inspect a live store.
+    /// Opens sled via `open_offline`: a brief transient lock (a just-exited
+    /// node still releasing the directory lock) is retried, but a genuinely
+    /// held lock — the node is still running — surfaces loudly. Never inspect
+    /// a live store.
     pub fn inspect(path: &Path) -> Result<LogInspection, Box<dyn std::error::Error + Send + Sync>> {
         let store = Self::open_offline(path)?;
 
