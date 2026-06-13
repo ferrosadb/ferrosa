@@ -411,3 +411,182 @@ async fn order_by_desc_expression_fails_loud() {
         "error must mention unsupported ORDER BY expression: {msg}"
     );
 }
+
+/// S03-a (object position, URS-QEC-X01): an RDF* quoted triple in OBJECT
+/// position (`?s :p << ?a :q ?b >>`) must also fail loud. The planner has a
+/// distinct branch for this; without a test it could silently regress to a
+/// FullScan that ignores the embedded triple and returns wrong rows.
+#[tokio::test]
+async fn rdf_star_object_quoted_triple_fails_loud() {
+    let (storage, wp, _dir) = setup();
+    let eng = engine(storage, wp);
+
+    let err = eng
+        .execute(
+            "SELECT ?s WHERE { \
+                ?s <http://ex/states> \
+                   << <http://ex/a> <http://ex/link> <http://ex/b> >> }",
+            KS,
+        )
+        .await
+        .expect_err(
+            "RDF* object-position quoted triple must return Err (fail loud), \
+             not a silent scan that drops the embedded triple",
+        );
+
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("rdf*")
+            || msg.contains("rdf-star")
+            || msg.contains("quoted")
+            || msg.contains("not implemented")
+            || msg.contains("unsupported"),
+        "error must explain the unimplemented RDF* object triple: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// URS-QEC-S03b — XML results for ASK + structural/escaping correctness
+//
+// Part (b) of S03 names BOTH "SELECT/ASK". ASK→XML was implemented but never
+// tested, and the SELECT XML test only string-`contains`-checks the value. The
+// W3C SPARQL 1.1 Query Results XML Format mandates a specific element shape and
+// well-formedness (escaping). These RED tests pin that contract.
+// ---------------------------------------------------------------------------
+
+/// S03-b (ASK): An ASK query serialized to XML must produce the W3C
+/// `<boolean>true</boolean>` form under the `<sparql>` root — not a SELECT-style
+/// `<results>` body. The `false` case must likewise render `<boolean>false</boolean>`.
+#[tokio::test]
+async fn ask_query_xml_serialization_boolean_form() {
+    use ferrosa_sparql::results::ResultFormat;
+    let (storage, wp, _dir) = setup();
+    let eng = engine(storage, wp);
+
+    eng.execute_update(
+        "INSERT DATA { <http://ex/alice> <http://ex/name> \"Alice\" }",
+        KS,
+    )
+    .await
+    .expect("insert");
+
+    // ASK that matches -> true.
+    let yes = eng
+        .execute("ASK { <http://ex/alice> <http://ex/name> ?n }", KS)
+        .await
+        .expect("ask true");
+    assert!(
+        matches!(yes, SparqlResult::Ask(_)),
+        "ASK must produce an Ask result"
+    );
+    let xml = String::from_utf8(
+        yes.serialize(ResultFormat::Xml)
+            .expect("ASK XML serialization must succeed"),
+    )
+    .expect("XML must be valid UTF-8");
+    assert!(
+        xml.contains("<sparql"),
+        "ASK XML must carry the <sparql> root: {xml}"
+    );
+    assert!(
+        xml.contains("<boolean>true</boolean>"),
+        "matching ASK must serialize <boolean>true</boolean>, not a SELECT body: {xml}"
+    );
+    assert!(
+        !xml.contains("<results"),
+        "ASK XML must NOT contain a <results> element: {xml}"
+    );
+
+    // ASK that does not match -> false.
+    let no = eng
+        .execute("ASK { <http://ex/nobody> <http://ex/name> ?n }", KS)
+        .await
+        .expect("ask false");
+    let xml_no = String::from_utf8(
+        no.serialize(ResultFormat::Xml)
+            .expect("ASK XML serialization must succeed"),
+    )
+    .expect("XML must be valid UTF-8");
+    assert!(
+        xml_no.contains("<boolean>false</boolean>"),
+        "non-matching ASK must serialize <boolean>false</boolean>: {xml_no}"
+    );
+}
+
+/// S03-b (SELECT structure): The SELECT XML must use the W3C element shape —
+/// each bound variable wrapped in `<binding name="...">` with a typed leaf
+/// (`<uri>` for IRIs, `<literal>` for literals) — not just the raw value text.
+#[tokio::test]
+async fn select_xml_uses_w3c_binding_element_shape() {
+    let (storage, wp, _dir) = setup();
+    let eng = engine(storage, wp);
+
+    eng.execute_update(
+        "INSERT DATA { <http://ex/alice> <http://ex/name> \"Alice\" }",
+        KS,
+    )
+    .await
+    .expect("insert");
+
+    let result = eng
+        .execute("SELECT ?s ?name WHERE { ?s <http://ex/name> ?name }", KS)
+        .await
+        .expect("select");
+    let xml = String::from_utf8(result.to_xml().expect("XML serialization")).unwrap();
+
+    // Head must declare the projected variables.
+    assert!(
+        xml.contains("<variable name=\"s\"") && xml.contains("<variable name=\"name\""),
+        "XML <head> must declare each projected <variable>: {xml}"
+    );
+    // The IRI subject binding must be a <uri> leaf inside a named <binding>.
+    assert!(
+        xml.contains("<binding name=\"s\"><uri>http://ex/alice</uri></binding>"),
+        "subject must serialize as <binding name=\"s\"><uri>…</uri></binding>: {xml}"
+    );
+    // The literal object binding must be a <literal> leaf inside a named <binding>.
+    assert!(
+        xml.contains("<binding name=\"name\">") && xml.contains("<literal"),
+        "literal binding must use a <literal> leaf inside <binding name=\"name\">: {xml}"
+    );
+    // Result rows must be wrapped in <result> under <results>.
+    assert!(
+        xml.contains("<results") && xml.contains("<result>"),
+        "rows must be wrapped in <results>/<result>: {xml}"
+    );
+}
+
+/// S03-b (escaping / well-formedness): A literal value containing XML
+/// metacharacters (`<`, `&`, `>`) must be entity-escaped so the output stays
+/// well-formed XML. An unescaped `<` would corrupt the document and is also an
+/// injection vector — the raw substring must NOT appear, but its escaped form must.
+#[tokio::test]
+async fn select_xml_escapes_special_characters_in_literals() {
+    let (storage, wp, _dir) = setup();
+    let eng = engine(storage, wp);
+
+    // Literal value carries '<', '&', '>'.
+    eng.execute_update(
+        "INSERT DATA { <http://ex/a> <http://ex/note> \"a < b & c > d\" }",
+        KS,
+    )
+    .await
+    .expect("insert");
+
+    let result = eng
+        .execute("SELECT ?note WHERE { ?s <http://ex/note> ?note }", KS)
+        .await
+        .expect("select");
+    let xml = String::from_utf8(result.to_xml().expect("XML serialization")).unwrap();
+
+    // The escaped entities must be present.
+    assert!(
+        xml.contains("a &lt; b &amp; c &gt; d"),
+        "literal metacharacters must be entity-escaped: {xml}"
+    );
+    // The raw, unescaped literal payload must NOT leak into the document body.
+    assert!(
+        !xml.contains("a < b & c > d"),
+        "raw unescaped '<'/'&'/'>' must not appear in the XML body (well-formedness): {xml}"
+    );
+}
