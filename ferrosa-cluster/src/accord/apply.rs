@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ferrosa_common::accord::{Timestamp, TxnId};
-use ferrosa_storage::{Mutation, StorageEngine, TableId};
+use ferrosa_storage::{BatchOp, Mutation, StorageEngine};
 use parking_lot::Mutex;
 
 use crate::accord::dep_wait::DepWaitGraph;
@@ -226,8 +226,6 @@ impl StorageApplier for EngineStorageApplier {
             reason: format!("failed to decode apply mutation: {e}"),
         })?;
 
-        let table_id = TableId::new(&decoded.keyspace, &decoded.table);
-
         // Re-stamp every cell to the Accord-agreed execution timestamp `t`.
         //
         // The coordinator stamps cells at materialize time with its own wall
@@ -241,18 +239,30 @@ impl StorageApplier for EngineStorageApplier {
             restamp_row(row, cell_ts);
         }
 
-        // Persist every row at the agreed timestamp. `StorageEngine::write`
-        // appends to the commit log (durable) before the memtable, and returns
-        // an error if the table is unregistered or admission is denied — we
-        // propagate that as `ApplyError` (never fake success).
-        for row in decoded.rows {
-            self.engine
-                .write(&table_id, &decoded.key, row, cell_ts)
-                .map_err(|e| ApplyError {
-                    txn_id,
-                    reason: format!("storage write failed for {table_id}: {e}"),
-                })?;
-        }
+        // Persist all rows atomically via the batch primitive. `apply_batch`
+        // preflights every target table BEFORE appending any commit-log record,
+        // so either all rows land durably or none do — no partial apply.
+        // Returns an error if any table is unregistered or the append fails;
+        // propagated as `ApplyError` (never fake success).
+        let ops: Vec<BatchOp> = decoded
+            .rows
+            .into_iter()
+            .map(|row| BatchOp::Write {
+                keyspace: decoded.keyspace.clone(),
+                table: decoded.table.clone(),
+                key: decoded.key.clone(),
+                row,
+                timestamp: cell_ts,
+            })
+            .collect();
+
+        self.engine.apply_batch(ops).map_err(|e| ApplyError {
+            txn_id,
+            reason: format!(
+                "storage apply_batch failed for {}.{}: {e}",
+                decoded.keyspace, decoded.table
+            ),
+        })?;
 
         // Record only after all rows are durable, so a mid-apply failure leaves
         // the txn re-appliable rather than falsely marked applied.
