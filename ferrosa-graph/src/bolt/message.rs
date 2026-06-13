@@ -14,6 +14,12 @@ pub const TAG_HELLO: u8 = 0x01;
 pub const TAG_LOGON: u8 = 0x6A;
 /// LOGOFF — client de-authenticates (Bolt 5+).
 pub const TAG_LOGOFF: u8 = 0x6B;
+/// BEGIN — open an explicit transaction (Bolt 3+).
+pub const TAG_BEGIN: u8 = 0x11;
+/// COMMIT — commit the open explicit transaction (Bolt 3+).
+pub const TAG_COMMIT: u8 = 0x12;
+/// ROLLBACK — abort the open explicit transaction (Bolt 3+).
+pub const TAG_ROLLBACK: u8 = 0x13;
 /// RUN — execute a Cypher query.
 pub const TAG_RUN: u8 = 0x10;
 /// PULL — pull results from the last RUN.
@@ -46,6 +52,12 @@ pub enum BoltMessage {
     Logon { auth: Vec<(String, PackValue)> },
     /// De-authenticate the current identity (Bolt 5+).
     Logoff,
+    /// Begin an explicit transaction with optional metadata.
+    Begin { extra: Vec<(String, PackValue)> },
+    /// Commit the open explicit transaction.
+    Commit,
+    /// Roll back the open explicit transaction.
+    Rollback,
     /// Execute a query with parameters and extra metadata.
     Run {
         query: String,
@@ -100,6 +112,18 @@ impl BoltMessage {
             },
             Self::Logoff => PackValue::Structure {
                 tag: TAG_LOGOFF,
+                fields: vec![],
+            },
+            Self::Begin { extra } => PackValue::Structure {
+                tag: TAG_BEGIN,
+                fields: vec![PackValue::Map(extra.clone())],
+            },
+            Self::Commit => PackValue::Structure {
+                tag: TAG_COMMIT,
+                fields: vec![],
+            },
+            Self::Rollback => PackValue::Structure {
+                tag: TAG_ROLLBACK,
                 fields: vec![],
             },
             Self::Run {
@@ -168,6 +192,12 @@ impl BoltMessage {
                 Ok(Self::Logon { auth })
             }
             TAG_LOGOFF => Ok(Self::Logoff),
+            TAG_BEGIN => {
+                let extra = take_map(&mut fields, 0)?;
+                Ok(Self::Begin { extra })
+            }
+            TAG_COMMIT => Ok(Self::Commit),
+            TAG_ROLLBACK => Ok(Self::Rollback),
             TAG_RUN => {
                 let query = take_string(&mut fields, 0)?;
                 let params = take_map(&mut fields, 1)?;
@@ -443,5 +473,66 @@ mod tests {
     fn encode_decode_ignored() {
         let decoded = roundtrip(&BoltMessage::Ignored);
         assert!(matches!(decoded, BoltMessage::Ignored));
+    }
+
+    #[test]
+    fn encode_decode_begin() {
+        let msg = BoltMessage::Begin {
+            extra: vec![
+                ("tx_timeout".into(), PackValue::Int(30_000)),
+                ("mode".into(), PackValue::String("w".into())),
+            ],
+        };
+        let decoded = roundtrip(&msg);
+        match decoded {
+            BoltMessage::Begin { extra } => {
+                assert_maps_eq(
+                    &extra,
+                    &[
+                        ("tx_timeout".into(), PackValue::Int(30_000)),
+                        ("mode".into(), PackValue::String("w".into())),
+                    ],
+                );
+            }
+            other => panic!("expected Begin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn begin_uses_tag_0x11() {
+        let bytes = BoltMessage::Begin { extra: vec![] }.encode();
+        // PackStream structure marker for 1 field is 0xB1, followed by the tag.
+        assert_eq!(bytes[0], 0xB1, "expected 1-field structure marker");
+        assert_eq!(bytes[1], TAG_BEGIN, "expected BEGIN tag");
+        assert_eq!(TAG_BEGIN, 0x11);
+    }
+
+    #[test]
+    fn encode_decode_commit() {
+        let decoded = roundtrip(&BoltMessage::Commit);
+        assert!(matches!(decoded, BoltMessage::Commit));
+    }
+
+    #[test]
+    fn commit_uses_tag_0x12() {
+        let bytes = BoltMessage::Commit.encode();
+        // PackStream structure marker for 0 fields is 0xB0, followed by the tag.
+        assert_eq!(bytes[0], 0xB0, "expected 0-field structure marker");
+        assert_eq!(bytes[1], TAG_COMMIT, "expected COMMIT tag");
+        assert_eq!(TAG_COMMIT, 0x12);
+    }
+
+    #[test]
+    fn encode_decode_rollback() {
+        let decoded = roundtrip(&BoltMessage::Rollback);
+        assert!(matches!(decoded, BoltMessage::Rollback));
+    }
+
+    #[test]
+    fn rollback_uses_tag_0x13() {
+        let bytes = BoltMessage::Rollback.encode();
+        assert_eq!(bytes[0], 0xB0, "expected 0-field structure marker");
+        assert_eq!(bytes[1], TAG_ROLLBACK, "expected ROLLBACK tag");
+        assert_eq!(TAG_ROLLBACK, 0x13);
     }
 }
