@@ -39,16 +39,42 @@ jobs:
                dc_partition_plus_dc_slow_nemesis_registered \
             2>&1 | tee tier-config.log
 
+      # Build the workload binary up front, BEFORE bring-up, so the workload
+      # step does not compile under load alongside the 6 node containers.
+      # The previous runs died ~30s into the workload step with exit 143
+      # (hosted-runner SIGTERM) — a `cargo run` that still had to link the
+      # release binary while 6 containers churned CPU/RAM is a prime OOM/eviction
+      # trigger. Pre-building keeps the heavy compile isolated and cached.
+      - name: Pre-build workload binary (before bring-up, avoids rebuild under load)
+        run: cargo build --release -p ferrosa-jepsen
+
       - name: Bring up T3 (3+3 dual-DC) topology
         run: |
+          set -euo pipefail
           docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \
             up -d --build
-          # Wait for both DCs to reach Cluster mode.
+          # Wait for the first node in each DC to report ready on /health
+          # (leader-aware: in Forming/Cluster mode this is 503 until a Raft
+          # leader is elected, so a green probe means the DC actually formed).
+          # Fail-loud: if 60 tries (~120s) elapse without both DCs ready, dump
+          # node logs and `exit 1` so a genuine non-formation is caught instead
+          # of silently sailing into the workload step (the old loop's trailing
+          # `sleep` always succeeded, so the step could never fail).
+          ready=0
           for i in $(seq 1 60); do
-            curl -sf http://localhost:29090/health && \
-            curl -sf http://localhost:29190/health && break
+            if curl -sf http://localhost:29090/health >/dev/null \
+               && curl -sf http://localhost:29190/health >/dev/null; then
+              ready=1
+              break
+            fi
             sleep 2
           done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::T3 dual-DC topology did not reach ready on /health within ~120s"
+            docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml ps
+            docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml logs --tail 200
+            exit 1
+          fi
 
       - name: Run tier-multi-dc 1h bank workload
         env:
@@ -61,6 +87,23 @@ jobs:
             --output-dir ./jepsen-out \
             2>&1 | tee tier-multi-dc.log
 
+      # Capture runner + container resource state on ANY failure so the next
+      # red run proves OOM-vs-other (the exit-143 evidence aged out before this
+      # could be confirmed). Best-effort: never fails the job itself.
+      - name: Diagnostics on failure (resource + container state)
+        if: failure()
+        run: |
+          echo "=== free -m ==="; free -m || true
+          echo "=== docker stats (snapshot) ==="
+          docker stats --no-stream || true
+          echo "=== docker compose ps ==="
+          docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml ps || true
+          echo "=== dmesg tail (OOM killer?) ==="
+          sudo dmesg 2>/dev/null | tail -50 || dmesg 2>/dev/null | tail -50 || true
+          echo "=== node + rustfs logs ==="
+          docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml logs --tail 200 \
+            > compose-logs.txt 2>&1 || true
+
       - name: Upload Jepsen logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -69,8 +112,10 @@ jobs:
           path: |
             tier-config.log
             tier-multi-dc.log
+            compose-logs.txt
             jepsen-out/
           retention-days: 30
+          if-no-files-found: ignore
 
       - name: Tear down compose
         if: always()
