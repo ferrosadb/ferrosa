@@ -603,6 +603,7 @@ fn execute_return_only(return_clause: &ReturnClause, start: Instant) -> Result<G
             edges_read: 0,
             vertices_written: 0,
             vertices_deleted: 0,
+            edges_deleted: 0,
             execution_ms: start.elapsed().as_millis() as u64,
         },
     })
@@ -663,6 +664,7 @@ fn execute_unwind(
             edges_read: 0,
             vertices_written: 0,
             vertices_deleted: 0,
+            edges_deleted: 0,
             execution_ms: start.elapsed().as_millis() as u64,
         },
     })
@@ -3722,12 +3724,200 @@ async fn execute_set(
 /// Execute a DELETE plan: run the expand to find matching vertices, then write
 /// tombstones for each one.
 #[allow(clippy::too_many_arguments)]
+/// Build the standard composite adjacency clustering key
+/// `[u16 1][1B direction][u16 label_len][label][u16 nid_len][neighbor_id]`,
+/// matching `make_adjacency_mutation`'s wire format. Defined once so the
+/// DETACH-DELETE cascade tombstones the exact key the observer wrote.
+fn adjacency_clustering_bytes(direction: u8, edge_label: &str, neighbor_id: &[u8]) -> Vec<u8> {
+    let mut clustering = Vec::new();
+    clustering.extend_from_slice(&1u16.to_be_bytes());
+    clustering.push(direction);
+    clustering.extend_from_slice(&(edge_label.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(edge_label.as_bytes());
+    clustering.extend_from_slice(&(neighbor_id.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(neighbor_id);
+    clustering
+}
+
+/// Read the edge-label string out of an adjacency clustering key
+/// (component 1 of the standard composite layout).
+fn adjacency_edge_label(clustering: &[u8]) -> Option<String> {
+    if clustering.len() < 5 {
+        return None;
+    }
+    let dir_len = u16::from_be_bytes([clustering[0], clustering[1]]) as usize;
+    let label_len_pos = 2 + dir_len;
+    if label_len_pos + 2 > clustering.len() {
+        return None;
+    }
+    let label_len =
+        u16::from_be_bytes([clustering[label_len_pos], clustering[label_len_pos + 1]]) as usize;
+    let label_start = label_len_pos + 2;
+    if label_start + label_len > clustering.len() {
+        return None;
+    }
+    std::str::from_utf8(&clustering[label_start..label_start + label_len])
+        .ok()
+        .map(str::to_string)
+}
+
+/// Build a pure-tombstone [`Mutation`] for one row in `keyspace.table`.
+/// `clustering = None` deletes the whole partition; `Some` deletes one row.
+/// Mirrors `StorageEngine`'s `BatchOp::Tombstone` lowering so the
+/// DETACH-DELETE cascade and the engine batch path agree on representation.
+fn tombstone_mutation(
+    keyspace: &str,
+    table: &str,
+    key: &DecoratedKey,
+    clustering: Option<Vec<u8>>,
+    timestamp: i64,
+) -> Mutation {
+    let local_deletion_time = timestamp.div_euclid(1_000_000).clamp(0, u32::MAX as i64) as u32;
+    let row = Row {
+        clustering: clustering.unwrap_or_default(),
+        cells: vec![],
+        deletion: DeletionTime::new(timestamp, local_deletion_time),
+        primary_key_liveness: LivenessInfo::NONE,
+    };
+    Mutation::new(
+        keyspace.to_string(),
+        table.to_string(),
+        key.clone(),
+        vec![row],
+        timestamp,
+    )
+}
+
+/// DETACH DELETE cascade for one vertex (URS-QEC-D01/D03/D07).
+///
+/// Enumerates ALL incident edges via the adjacency index (forward OUT +
+/// backward IN), then collects tombstones for each edge row, its OWN
+/// adjacency entry, the neighbor's mirror adjacency entry, and finally the
+/// vertex row, into ONE batch applied atomically through the shared
+/// `StorageEngine` multi-write primitive (`WritePath::write_batch` →
+/// `write_atomic_batch`/`coordinate_logged_batch`). No new batch path is
+/// invented; adjacency cleanup happens inside the delete, so a subsequent
+/// scan finds zero references without reconciliation (URS-QEC-D03).
+///
+/// Returns the number of incident edges tombstoned.
+async fn delete_with_adjacency(
+    write_path: &WritePath,
+    keyspace: &str,
+    vertex_key: &DecoratedKey,
+    vertex_table: &TableId,
+    timestamp: i64,
+    strategy: &ReplicationStrategy,
+) -> Result<usize> {
+    let vid = vertex_key.key.as_bytes().to_vec();
+    let adj_ks = adjacency_keyspace_name(keyspace);
+    let adj_table = TableId::new(&adj_ks, "adjacency");
+
+    let mut mutations: Vec<Mutation> = Vec::new();
+    let mut edges_deleted = 0usize;
+
+    // Enumerate incident edges from the vertex's adjacency partition.
+    if let Some(partition) = write_path.read(&adj_table, vertex_key).await? {
+        for row in &partition.rows {
+            if !row.deletion.is_live() {
+                continue;
+            }
+            // Standard composite: direction byte sits at offset 2.
+            if row.clustering.len() < 3 {
+                continue;
+            }
+            let direction = row.clustering[2];
+            let Some(neighbor_id) = extract_neighbor_id(&row.clustering, None) else {
+                continue;
+            };
+            let Some(edge_label) = adjacency_edge_label(&row.clustering) else {
+                continue;
+            };
+            // The edge table FQN is stored in the row's first cell value.
+            let Some(edge_fqn) = row
+                .cells
+                .first()
+                .and_then(|(_, cell)| cell.value.as_ref())
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            else {
+                continue;
+            };
+            let Some((edge_ks, edge_tbl)) = edge_fqn.split_once('.') else {
+                continue;
+            };
+
+            // Reconstruct the edge's storage key: partition = source vertex,
+            // clustering = target vertex.
+            let (src_id, dst_id) = if direction == DIRECTION_OUT {
+                (vid.clone(), neighbor_id.clone())
+            } else {
+                (neighbor_id.clone(), vid.clone())
+            };
+            let edge_src_key = DecoratedKey::new(PartitionKey::new(src_id));
+
+            // (a) Tombstone the edge row itself.
+            mutations.push(tombstone_mutation(
+                edge_ks,
+                edge_tbl,
+                &edge_src_key,
+                Some(dst_id),
+                timestamp,
+            ));
+
+            // (b) Tombstone this vertex's adjacency entry (exact clustering).
+            mutations.push(tombstone_mutation(
+                &adj_ks,
+                "adjacency",
+                vertex_key,
+                Some(row.clustering.clone()),
+                timestamp,
+            ));
+
+            // (c) Tombstone the neighbor's mirror adjacency entry: flipped
+            //     direction, neighbor = this vertex.
+            let mirror_direction = if direction == DIRECTION_OUT {
+                DIRECTION_IN
+            } else {
+                DIRECTION_OUT
+            };
+            let neighbor_key = DecoratedKey::new(PartitionKey::new(neighbor_id));
+            let mirror_clustering = adjacency_clustering_bytes(mirror_direction, &edge_label, &vid);
+            mutations.push(tombstone_mutation(
+                &adj_ks,
+                "adjacency",
+                &neighbor_key,
+                Some(mirror_clustering),
+                timestamp,
+            ));
+
+            edges_deleted += 1;
+        }
+    }
+
+    // Finally, tombstone the vertex row (whole-partition delete).
+    mutations.push(tombstone_mutation(
+        &vertex_table.keyspace,
+        &vertex_table.table,
+        vertex_key,
+        None,
+        timestamp,
+    ));
+
+    let rf = strategy.replication_factor();
+    write_path
+        .write_batch(mutations, graph_write_consistency(), rf)
+        .await
+        .map_err(GraphError::Storage)?;
+
+    Ok(edges_deleted)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_delete(
     write_path: &WritePath,
     expand: PhysicalPlan,
     keyspace: &str,
     variables: &[String],
-    _detach: bool,
+    detach: bool,
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
     start: Instant,
@@ -3816,6 +4006,20 @@ async fn execute_delete(
                 } else {
                     Vec::new()
                 };
+
+                if detach && !is_edge_table {
+                    // DETACH DELETE: cascade through the adjacency index,
+                    // tombstoning every incident edge (both directions) and its
+                    // adjacency entries together with the vertex, atomically
+                    // (URS-QEC-D01/D03/D07).
+                    let edges_deleted = delete_with_adjacency(
+                        write_path, keyspace, &key, &table_id, timestamp, &strategy,
+                    )
+                    .await?;
+                    stats.edges_deleted += edges_deleted;
+                    stats.vertices_deleted += 1;
+                    continue;
+                }
 
                 // Write a row-level tombstone.
                 let tombstone_row = Row {
