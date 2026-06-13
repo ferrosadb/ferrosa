@@ -156,6 +156,27 @@ fn register_social_tables_with_storage(storage: &StorageEngine) {
         .unwrap();
 }
 
+/// Register the `company_v` vertex table in storage. Used to exercise UNION
+/// arms that reuse the same pattern variable (`n`) with different labels —
+/// each arm has independent variable scope, so they must resolve to their own
+/// table, not a flat-merged last-write-wins binding.
+fn register_company_table_with_storage(storage: &StorageEngine) {
+    storage
+        .register_table(TableSchema {
+            keyspace: "social".to_string(),
+            table: "company_v".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "name".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: HashMap::new(),
+        })
+        .unwrap();
+}
+
 fn register_social_likes_table_with_storage(storage: &StorageEngine) {
     let schema = TableSchema {
         keyspace: "social".to_string(),
@@ -329,6 +350,59 @@ fn create_social_graph_schema(schema: &Schema) {
                 params: TableParams::default(),
                 flags: HashSet::new(),
                 extensions: knows_ext,
+                is_system: false,
+            },
+            &auth,
+        )
+        .unwrap();
+}
+
+/// Create a second vertex table `company_v` labeled `Company` in the `social`
+/// keyspace. The keyspace and grants are created by `create_social_graph_schema`,
+/// which must run first.
+fn create_company_vertex_schema(schema: &Schema) {
+    let auth = superuser_auth();
+
+    let mut company_cols = IndexMap::new();
+    company_cols.insert(
+        "id".to_string(),
+        ColumnMetadata {
+            name: "id".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    company_cols.insert(
+        "name".to_string(),
+        ColumnMetadata {
+            name: "name".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "text".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+
+    let mut company_ext = HashMap::new();
+    company_ext.insert("graph.type".to_string(), "vertex".to_string());
+    company_ext.insert("graph.label".to_string(), "Company".to_string());
+
+    schema
+        .create_table(
+            TableMetadata {
+                keyspace: "social".to_string(),
+                name: "company_v".to_string(),
+                id: Uuid::new_v4(),
+                columns: company_cols,
+                partition_key: vec!["id".to_string()],
+                clustering_key: vec![],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: company_ext,
                 is_system: false,
             },
             &auth,
@@ -2290,6 +2364,75 @@ async fn union_over_match_deduplicates_rows() {
         union_all_body["rows"].as_array().unwrap().len(),
         6,
         "UNION ALL must preserve every duplicate row from both arms"
+    );
+}
+
+/// UNION arms have **independent variable scope** (openCypher). Reusing the
+/// same pattern variable (`n`) with *different labels* across arms is legal and
+/// common: `MATCH (n:Person) RETURN n.name AS a UNION MATCH (n:Company) RETURN n.name AS a`.
+/// Each arm must scan its own table — the Person arm must return Person rows and
+/// the Company arm must return Company rows. A flat last-write-wins binding map
+/// shared across arms would make both arms scan whichever table won the merge,
+/// silently dropping the other arm's rows (the worst failure class: no error,
+/// no crash, lost rows).
+#[tokio::test]
+async fn union_arms_with_same_var_different_labels_keep_all_rows() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    create_company_vertex_schema(&schema);
+    register_company_table_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    // Seed one Person (Alice) and one Company (Acme).
+    let person_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000f001', name: 'Alice'}) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    assert_eq!(
+        app.clone().oneshot(person_req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let company_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (n:Company {id: '00000000-0000-0000-0000-00000000f002', name: 'Acme'}) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    assert_eq!(
+        app.clone().oneshot(company_req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // Same variable `n`, different labels across arms. Result must contain BOTH
+    // Alice (from the Person arm) and Acme (from the Company arm).
+    let union_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name AS a \
+                      UNION \
+                      MATCH (n:Company) RETURN n.name AS a",
+            "keyspace": "social"
+        })),
+    );
+    let union_resp = app.oneshot(union_req).await.unwrap();
+    let status = union_resp.status();
+    let union_body = response_json(union_resp).await;
+    assert_eq!(status, StatusCode::OK, "UNION query failed: {union_body:?}");
+    assert_eq!(union_body["columns"], serde_json::json!(["a"]));
+    let mut rows = union_body["rows"].as_array().unwrap().clone();
+    rows.sort_by_key(|r| r.to_string());
+    assert_eq!(
+        rows,
+        vec![serde_json::json!(["Acme"]), serde_json::json!(["Alice"])],
+        "each UNION arm must scan its OWN labelled table; neither arm's rows may be dropped"
     );
 }
 
