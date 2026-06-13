@@ -2096,6 +2096,7 @@ dependencies = [
  "serde_urlencoded",
  "sparesults",
  "spargebra",
+ "tempfile",
  "tokio",
  "tower-http",
  "tracing",
