@@ -1273,6 +1273,79 @@ async fn merge_set_updates_properties() {
     assert_eq!(resp.status(), StatusCode::OK, "MERGE + SET must return 200");
 }
 
+/// T-QEC-D07 / URS-QEC-D06: `REMOVE n.prop` unsets the property — a subsequent
+/// MATCH must show it gone (null), not the old value.
+#[tokio::test]
+async fn remove_property_unsets_it() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    // Create a Person with an age.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (n:Person {name: 'Dana'}) SET n.age = 42 RETURN n",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "MERGE + SET must return 200");
+
+    // Confirm the age is present before REMOVE.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'Dana'}) RETURN n.age",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = response_json(resp).await["rows"].clone();
+    assert_eq!(
+        rows,
+        serde_json::json!([[42]]),
+        "age must be present before REMOVE"
+    );
+
+    // REMOVE the age property.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'Dana'}) REMOVE n.age",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "REMOVE must return 200");
+
+    // A subsequent MATCH must show the property gone (null).
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person {name: 'Dana'}) RETURN n.age",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = response_json(resp).await["rows"].clone();
+    assert_eq!(
+        rows,
+        serde_json::json!([[serde_json::Value::Null]]),
+        "age must be unset (null) after REMOVE n.age"
+    );
+}
+
 /// MERGE with an unknown label must return HTTP 400, not 500 or panic.
 #[tokio::test]
 async fn merge_missing_endpoint_returns_error() {

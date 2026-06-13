@@ -19,6 +19,7 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "DELETE" => Keyword::Delete,
     "DETACH" => Keyword::Detach,
     "SET" => Keyword::Set,
+    "REMOVE" => Keyword::Remove,
     "ORDER" => Keyword::Order,
     "BY" => Keyword::By,
     "LIMIT" => Keyword::Limit,
