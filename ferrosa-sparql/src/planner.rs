@@ -61,9 +61,24 @@ pub struct QueryPlan {
     pub order_by: Vec<OrderCondition>,
     /// FILTER expressions to evaluate against binding sets.
     pub filters: Vec<spargebra::algebra::Expression>,
+    /// Non-None for CONSTRUCT/DESCRIBE query forms; None for SELECT/ASK.
+    pub graph_mode: Option<GraphQueryMode>,
 }
 
-/// Plan a SPARQL SELECT or ASK query.
+/// The template/mode for a query form that produces a graph result.
+#[derive(Debug, Clone)]
+pub enum GraphQueryMode {
+    /// `CONSTRUCT { template }` — the template triples to instantiate per solution.
+    Construct(Vec<TriplePattern>),
+    /// `DESCRIBE <iri> [<iri> …]` — literal IRI(s) to describe; the planner
+    /// has already built SubjectLookup ops and the executor just needs to
+    /// assemble the result from the SELECT output.
+    DescribeIris(Vec<String>),
+    /// `DESCRIBE ?var WHERE { … }` — subjects are derived from WHERE solutions.
+    Describe(String),
+}
+
+/// Plan a SPARQL SELECT, ASK, CONSTRUCT, or DESCRIBE query.
 pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, SparqlError> {
     match query {
         Query::Select {
@@ -79,9 +94,73 @@ pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, Sparq
             plan.limit = Some(1);
             Ok(plan)
         }
-        _ => Err(SparqlError::Plan(
-            "only SELECT and ASK queries are supported in Sprint 1".into(),
-        )),
+        Query::Construct {
+            template,
+            pattern,
+            base_iri: _,
+            ..
+        } => {
+            // Plan the WHERE clause exactly like SELECT so the executor can
+            // bind solutions; then attach the CONSTRUCT template.
+            let mut plan = plan_select(pattern, default_graph, None, false)?;
+            // CONSTRUCT projects all variables — projection is derived from the template.
+            plan.graph_mode = Some(GraphQueryMode::Construct(template.clone()));
+            Ok(plan)
+        }
+        Query::Describe {
+            dataset: _,
+            pattern,
+            base_iri: _,
+        } => {
+            // DESCRIBE <iri> is parsed by spargebra as:
+            //   Extend { inner: Bgp { patterns: [] },
+            //            variable: _freshvar,
+            //            expression: NamedNode(<iri>) }
+            //
+            // Extract all described IRIs from `Extend` nodes, then build a
+            // SELECT-style plan that does a SubjectLookup per IRI.
+            let iris = extract_describe_iris(pattern);
+            if iris.is_empty() {
+                // DESCRIBE ?var WHERE { … } — plan the WHERE clause normally.
+                let mut plan = plan_select(pattern, default_graph, None, false)?;
+                plan.graph_mode = Some(GraphQueryMode::Describe(default_graph.to_string()));
+                return Ok(plan);
+            }
+
+            // Build ops: one SubjectLookup per described IRI.
+            let mut ops = Vec::new();
+            for iri in &iris {
+                let tp = TriplePattern {
+                    subject: spargebra::term::TermPattern::NamedNode(
+                        spargebra::term::NamedNode::new_unchecked(iri.as_str()),
+                    ),
+                    predicate: NamedNodePattern::Variable(
+                        spargebra::term::Variable::new_unchecked("__p"),
+                    ),
+                    object: TermPattern::Variable(spargebra::term::Variable::new_unchecked("__o")),
+                };
+                ops.push((
+                    tp,
+                    TripleOp::SubjectLookup {
+                        graph: default_graph.to_string(),
+                        subject: iri.clone(),
+                        predicate_filter: None,
+                    },
+                ));
+            }
+
+            Ok(QueryPlan {
+                ops,
+                projection: vec!["__p".into(), "__o".into()],
+                limit: None,
+                offset: None,
+                is_ask: false,
+                distinct: false,
+                order_by: vec![],
+                filters: vec![],
+                graph_mode: Some(GraphQueryMode::DescribeIris(iris)),
+            })
+        }
     }
 }
 
@@ -127,6 +206,7 @@ fn plan_select(
         distinct,
         order_by,
         filters,
+        graph_mode: None,
     })
 }
 
@@ -145,7 +225,7 @@ fn collect_ops(
     match pattern {
         GraphPattern::Bgp { patterns } => {
             for tp in patterns {
-                let op = plan_triple_pattern(tp, default_graph);
+                let op = plan_triple_pattern(tp, default_graph)?;
                 ops.push((tp.clone(), op));
             }
         }
@@ -223,11 +303,17 @@ fn collect_ops(
                             ascending: false,
                         });
                     }
-                    _ => {
-                        tracing::warn!(
-                            "ORDER BY expression type not supported; \
-                             only simple variable ordering is implemented"
-                        );
+                    other => {
+                        // URS-QEC-S04 / URS-QEC-X01: non-variable ORDER BY
+                        // expressions are not implemented.  Silently ignoring
+                        // them would return results in an arbitrary order with
+                        // no indication that the ordering was not applied —
+                        // that is a silent wrong result.  Fail loud instead.
+                        return Err(SparqlError::Plan(format!(
+                            "ORDER BY expression is not implemented: only \
+                             plain variable references (?var) are supported; \
+                             got: {other:?}"
+                        )));
                     }
                 }
             }
@@ -286,7 +372,7 @@ fn collect_ops(
                     ),
                     object: object.clone(),
                 };
-                let op = plan_triple_pattern(&tp, default_graph);
+                let op = plan_triple_pattern(&tp, default_graph)?;
                 ops.push((tp, op));
             } else {
                 // Transitive/closure path — emit PropertyPath op for BFS.
@@ -407,7 +493,27 @@ fn extract_predicate_from_path(
 }
 
 /// Choose a storage operation for a single triple pattern.
-fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> TripleOp {
+///
+/// Returns `Err` when the triple pattern contains an embedded quoted triple
+/// (RDF* / SPARQL-star syntax), which is parsed successfully by spargebra but
+/// whose annotation evaluation is not yet implemented (URS-QEC-S03 /
+/// URS-QEC-X01).  Failing loud here prevents silent wrong results.
+fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> Result<TripleOp, SparqlError> {
+    // URS-QEC-S03 / URS-QEC-X01: detect RDF* embedded triple terms and fail loud.
+    if matches!(&tp.subject, TermPattern::Triple(_)) {
+        return Err(SparqlError::Plan(
+            "RDF* (RDF-star) annotation evaluation is not yet implemented. \
+             Quoted triple patterns << ?s ?p ?o >> are parsed but the annotation \
+             variable binding against edge_annotations is not supported."
+                .into(),
+        ));
+    }
+    if matches!(&tp.object, TermPattern::Triple(_)) {
+        return Err(SparqlError::Plan(
+            "RDF* (RDF-star) object quoted triples are not yet implemented.".into(),
+        ));
+    }
+
     let graph = default_graph.to_string();
 
     let subject_bound = matches!(&tp.subject, TermPattern::NamedNode(_));
@@ -417,7 +523,7 @@ fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> TripleOp {
         TermPattern::NamedNode(_) | TermPattern::Literal(_)
     );
 
-    if subject_bound {
+    let op = if subject_bound {
         let subject = match &tp.subject {
             TermPattern::NamedNode(n) => n.as_str().to_string(),
             _ => unreachable!(),
@@ -450,6 +556,50 @@ fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> TripleOp {
         TripleOp::ObjectScan { graph, object }
     } else {
         TripleOp::FullScan { graph }
+    };
+    Ok(op)
+}
+
+/// Extract literal IRI strings from `DESCRIBE <iri>` patterns.
+///
+/// `DESCRIBE <iri>` is parsed by spargebra as an `Extend` node that binds a
+/// fresh variable to the literal IRI.  This function walks the pattern tree
+/// and collects the IRI strings from such `Extend` nodes.  Returns an empty
+/// `Vec` if the pattern is a WHERE clause (variable describe) rather than
+/// literal IRIs.
+/// Extract literal IRI strings from `DESCRIBE <iri>` patterns.
+///
+/// `DESCRIBE <iri>` is parsed by spargebra as:
+///   `Project { inner: Extend { inner: Bgp { patterns: [] },
+///                              variable: _freshvar,
+///                              expression: NamedNode(<iri>) },
+///              variables: [_freshvar] }`
+///
+/// This function recursively walks the pattern tree and collects the IRI
+/// strings from `Extend` nodes whose `expression` is a literal `NamedNode`.
+/// Returns an empty `Vec` if the pattern is a WHERE clause (variable describe)
+/// rather than literal IRIs.
+pub fn extract_describe_iris(pattern: &spargebra::algebra::GraphPattern) -> Vec<String> {
+    use spargebra::algebra::{Expression, GraphPattern};
+    match pattern {
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => {
+            let mut iris = extract_describe_iris(inner);
+            if let Expression::NamedNode(n) = expression {
+                iris.push(n.as_str().to_string());
+            }
+            iris
+        }
+        // spargebra wraps the Extend in a Project — recurse through wrapper nodes.
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner } => extract_describe_iris(inner),
+        GraphPattern::Slice { inner, .. } => extract_describe_iris(inner),
+        GraphPattern::OrderBy { inner, .. } => extract_describe_iris(inner),
+        GraphPattern::Filter { inner, .. } => extract_describe_iris(inner),
+        GraphPattern::Bgp { .. } => vec![],
+        _ => vec![],
     }
 }
 
