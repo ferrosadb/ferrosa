@@ -12,6 +12,7 @@ pub enum Keyword {
     Delete,
     Detach,
     Set,
+    Remove,
     Order,
     By,
     Limit,

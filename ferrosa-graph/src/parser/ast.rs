@@ -203,6 +203,16 @@ pub struct Assignment {
     pub value: Expr,
 }
 
+/// A single target of a REMOVE clause: either a property to unset
+/// (`n.prop`) or a label to drop (`n:Label`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoveItem {
+    /// `REMOVE n.prop` — unset a property on the matched node/rel.
+    Property { var: String, property: String },
+    /// `REMOVE n:Label` — drop a label from the matched node.
+    Label { var: String, label: String },
+}
+
 /// Top-level Cypher statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -251,6 +261,12 @@ pub enum Statement {
         pattern: Vec<Pattern>,
         where_clause: Option<Expr>,
         assignments: Vec<Assignment>,
+    },
+    /// `MATCH pattern [WHERE expr] REMOVE items`
+    Remove {
+        pattern: Vec<Pattern>,
+        where_clause: Option<Expr>,
+        items: Vec<RemoveItem>,
     },
     /// `MATCH pattern [WHERE expr] [DETACH] DELETE vars`
     Delete {
