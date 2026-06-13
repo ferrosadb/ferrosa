@@ -2542,11 +2542,9 @@ async fn http_unsupported_cypher_clauses_return_explicit_400() {
             "unsupported Cypher clause: Keyword(With)",
         ),
         (
+            // Bare top-level CALL (stored procedure) is still unsupported; only the
+            // `CALL {}` subquery form (which requires a driving query) is supported.
             "CALL db.labels()",
-            "unsupported Cypher clause: Keyword(Call)",
-        ),
-        (
-            "MATCH (n) CALL { WITH n RETURN n } RETURN n",
             "unsupported Cypher clause: Keyword(Call)",
         ),
         (
@@ -5800,5 +5798,181 @@ async fn http_foreach_nested_creates_cross_product() {
             "Babbage".to_string()
         ],
         "nested FOREACH must create one node per (outer, inner) element pair"
+    );
+}
+
+/// Seed three Person nodes with ages, returning each id so the test can assert
+/// per-node behaviour later. Helper shared by the CALL {} subquery tests.
+async fn seed_three_people(schema: &Arc<Schema>, storage: &Arc<StorageEngine>) {
+    for (name, age) in [("Ada", 36), ("Babbage", 49), ("Cantor", 72)] {
+        let app = build_app(Arc::clone(schema), Arc::clone(storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("CREATE (n:Person {{name: '{name}', age: {age}}})"),
+                "keyspace": "social"
+            })),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "seed CREATE must return 200");
+    }
+}
+
+/// Correlated `CALL {}` subquery: the inner query unit runs once per outer row,
+/// with the imported variable (`WITH p`) bound to that row. The inner results are
+/// UNITED, and (because the outer query keeps projecting) each inner row is paired
+/// with its driving outer row. Here each outer Person drives an inner query that
+/// derives a value from the imported node's own properties — a true correlation,
+/// not a constant subquery.
+#[tokio::test]
+async fn http_call_subquery_correlated_returns_per_row_inner_results() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    // For each Person p, the inner subquery imports p and projects a label derived
+    // from p's own age. One inner row per outer row -> three result rows total,
+    // each pairing the outer name with the correlated inner value.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p RETURN p.age + 1 AS next_age } \
+                      RETURN p.name, next_age",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "correlated CALL {{}} subquery must return 200"
+    );
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let mut pairs: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_str().expect("name string").to_string(),
+                r[1].as_i64().expect("next_age int"),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), 37),
+            ("Babbage".to_string(), 50),
+            ("Cantor".to_string(), 73),
+        ],
+        "each outer row must drive its own correlated inner result (p.age + 1)"
+    );
+}
+
+/// Unit `CALL {}` subquery (no inner RETURN): the inner query only performs
+/// updates, executed once per outer row. Here every Person drives a CREATE that
+/// writes a new node named after the imported person — a per-row write side effect.
+/// A unit subquery does not change the outer cardinality; the outer query still
+/// projects its own rows.
+#[tokio::test]
+async fn http_call_subquery_unit_performs_writes_per_row() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    // For each existing Person p, create a mirror Person carrying p's imported name
+    // and an age derived from p's imported age. 3 outer rows -> 3 new nodes, each
+    // correlated to its driving row. The new node's name equals the original's
+    // (proving per-row import) while its age is shifted so the mirror is
+    // distinguishable from the source.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p CREATE (m:Person {name: p.name, age: p.age + 1000}) }",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "unit CALL {{}} subquery performing writes must return 200"
+    );
+
+    // Now there must be 6 Person nodes: the 3 originals plus 3 mirrors, each
+    // mirror sharing its source's name (so each name appears exactly twice).
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name, n.age",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    let mut pairs: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_str().expect("name string").to_string(),
+                r[1].as_i64().expect("age int"),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), 36),
+            ("Ada".to_string(), 1036),
+            ("Babbage".to_string(), 49),
+            ("Babbage".to_string(), 1049),
+            ("Cantor".to_string(), 72),
+            ("Cantor".to_string(), 1072),
+        ],
+        "unit CALL {{}} must perform one correlated write per outer row (mirror with age + 1000)"
+    );
+}
+
+/// Fail loud: a `CALL {}` nested inside another `CALL {}` is not supported. The
+/// engine must return a clear Cypher error (non-200), never silently no-op or
+/// return wrong/empty results.
+#[tokio::test]
+async fn http_call_subquery_nested_call_fails_loud() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    seed_three_people(&schema, &storage).await;
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (p:Person) \
+                      CALL { WITH p CALL { WITH p RETURN p.age AS a } RETURN a } \
+                      RETURN p.name, a",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a CALL {{}} nested inside a CALL {{}} must fail loud, not silently succeed"
     );
 }
