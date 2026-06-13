@@ -103,10 +103,10 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Return) => Ok(Statement::Return {
                 return_clause: self.parse_return_clause()?,
             }),
+            TokenKind::Keyword(Keyword::Foreach) => self.parse_foreach(),
             TokenKind::Keyword(Keyword::With)
             | TokenKind::Keyword(Keyword::Union)
             | TokenKind::Keyword(Keyword::Call)
-            | TokenKind::Keyword(Keyword::Foreach)
             | TokenKind::Keyword(Keyword::Load) => Err(ParseError::new(
                 format!("unsupported Cypher clause: {:?}", tok.kind),
                 tok.span,
@@ -332,6 +332,102 @@ impl<'input> Parser<'input> {
             patterns,
             return_clause,
         })
+    }
+
+    /// Parse `FOREACH (var IN list_expr | clause [clause ...])`.
+    ///
+    /// The body is a sequence of update clauses executed once per list element
+    /// with `var` bound to the element. Grammar (openCypher):
+    ///   FOREACH '(' Variable IN Expression '|' UpdatingClause+ ')'
+    fn parse_foreach(&mut self) -> ParseResult<Statement> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Foreach))?;
+        self.lexer.expect(&TokenKind::LParen)?;
+
+        // Loop variable.
+        let tok = self.lexer.next_token()?;
+        let var = match tok.kind {
+            TokenKind::Ident(name) => name.to_string(),
+            _ => {
+                return Err(ParseError::new(
+                    format!("expected loop variable after FOREACH (, got {:?}", tok.kind),
+                    tok.span,
+                ));
+            }
+        };
+
+        self.lexer.expect(&TokenKind::Keyword(Keyword::In))?;
+        let list = self.parse_expr()?;
+        self.lexer.expect(&TokenKind::Pipe)?;
+
+        // One or more update clauses until the closing ')'.
+        let mut body = vec![self.parse_foreach_body_clause()?];
+        while self.lexer.peek()?.kind != TokenKind::RParen {
+            body.push(self.parse_foreach_body_clause()?);
+        }
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        Ok(Statement::Foreach { var, list, body })
+    }
+
+    /// Parse a single update clause permitted inside a FOREACH body.
+    ///
+    /// openCypher restricts the body to updating clauses: CREATE, MERGE, SET,
+    /// REMOVE, DELETE/DETACH DELETE, and nested FOREACH. Anything else (MATCH,
+    /// RETURN, WITH, ...) is a parse error — FOREACH never projects rows.
+    fn parse_foreach_body_clause(&mut self) -> ParseResult<Statement> {
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Create) => self.parse_create(),
+            TokenKind::Keyword(Keyword::Merge) => self.parse_merge(),
+            TokenKind::Keyword(Keyword::Foreach) => self.parse_foreach(),
+            TokenKind::Keyword(Keyword::Set) => {
+                self.lexer.next_token()?;
+                let assignments = self.parse_assignment_list()?;
+                Ok(Statement::Set {
+                    pattern: vec![],
+                    where_clause: None,
+                    assignments,
+                })
+            }
+            TokenKind::Keyword(Keyword::Remove) => {
+                self.lexer.next_token()?;
+                let items = self.parse_remove_items()?;
+                Ok(Statement::Remove {
+                    pattern: vec![],
+                    where_clause: None,
+                    items,
+                })
+            }
+            TokenKind::Keyword(Keyword::Detach) => {
+                self.lexer.next_token()?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Delete))?;
+                let variables = self.parse_var_list()?;
+                Ok(Statement::Delete {
+                    pattern: vec![],
+                    where_clause: None,
+                    detach: true,
+                    variables,
+                })
+            }
+            TokenKind::Keyword(Keyword::Delete) => {
+                self.lexer.next_token()?;
+                let variables = self.parse_var_list()?;
+                Ok(Statement::Delete {
+                    pattern: vec![],
+                    where_clause: None,
+                    detach: false,
+                    variables,
+                })
+            }
+            _ => Err(ParseError::new(
+                format!(
+                    "FOREACH body may only contain update clauses \
+                     (CREATE, MERGE, SET, REMOVE, DELETE, FOREACH), got {:?}",
+                    tok.kind
+                ),
+                tok.span,
+            )),
+        }
     }
 
     // --- Pattern parsing ---
@@ -2616,10 +2712,6 @@ mod tests {
                 "unsupported Cypher clause: Keyword(Call)",
             ),
             (
-                "FOREACH (x IN [1] | CREATE (:Person {name: 'x'}))",
-                "unsupported Cypher clause: Keyword(Foreach)",
-            ),
-            (
                 "LOAD CSV FROM 'file:///people.csv' AS row RETURN row",
                 "unsupported Cypher clause: Keyword(Load)",
             ),
@@ -2631,6 +2723,32 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn parse_foreach_create_body_succeeds() {
+        let stmt = parse("FOREACH (x IN [1, 2, 3] | CREATE (:Person {name: x}))").unwrap();
+        match stmt {
+            Statement::Foreach { var, list, body } => {
+                assert_eq!(var, "x");
+                assert!(matches!(list, Expr::List(_)));
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0], Statement::Create { .. }));
+            }
+            other => panic!("expected Foreach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_foreach_rejects_non_update_body() {
+        // RETURN is not an update clause; FOREACH never projects rows.
+        let err = parse("FOREACH (x IN [1] | RETURN x)").unwrap_err();
+        assert!(
+            err.message
+                .contains("FOREACH body may only contain update clauses"),
+            "got: {}",
+            err.message
+        );
     }
 
     // --- MERGE: relationship patterns and multi-clause ---
@@ -2782,10 +2900,7 @@ mod tests {
             Expr::MapProjection { var, selectors } => {
                 assert_eq!(var, "n");
                 assert_eq!(selectors.len(), 2);
-                assert_eq!(
-                    selectors[0],
-                    MapProjectionSelector::Property("name".into())
-                );
+                assert_eq!(selectors[0], MapProjectionSelector::Property("name".into()));
                 assert_eq!(selectors[1], MapProjectionSelector::Property("age".into()));
             }
             other => panic!("expected MapProjection, got {other:?}"),
@@ -2800,10 +2915,7 @@ mod tests {
             Expr::MapProjection { var, selectors } => {
                 assert_eq!(var, "n");
                 assert_eq!(selectors.len(), 3);
-                assert_eq!(
-                    selectors[0],
-                    MapProjectionSelector::Property("name".into())
-                );
+                assert_eq!(selectors[0], MapProjectionSelector::Property("name".into()));
                 assert!(matches!(
                     &selectors[1],
                     MapProjectionSelector::Literal { key, .. } if key == "total"

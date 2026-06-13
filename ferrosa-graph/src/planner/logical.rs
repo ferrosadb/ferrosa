@@ -124,6 +124,7 @@ fn permission_for_statement(stmt: &Statement) -> Permission {
         Statement::Subscribe { .. } => Permission::Select,
         Statement::Unsubscribe { .. } => Permission::Select,
         Statement::Merge { .. } => Permission::Modify,
+        Statement::Foreach { .. } => Permission::Modify,
     }
 }
 
@@ -212,6 +213,14 @@ pub fn validate(
             });
         }
         Statement::Merge { patterns, .. } => patterns,
+        // FOREACH is desugared into its per-element body statements by the engine
+        // before validation; a `Foreach` reaching here is an internal invariant
+        // violation, so fail loud rather than silently no-op.
+        Statement::Foreach { .. } => {
+            return Err(GraphError::Validation(
+                "FOREACH must be expanded into its body clauses before validation".to_string(),
+            ));
+        }
     };
 
     for pat in patterns {
