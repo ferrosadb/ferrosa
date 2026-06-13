@@ -37,6 +37,123 @@ use ferrosa_storage::accord::sync_writer::MockSyncWriter;
 // Test node setup helpers
 // ---------------------------------------------------------------------------
 
+/// Like [`TestNode`] but its state machine is backed by a REAL StorageEngine
+/// (applier + reader), so generic-`IF` read-at-`t` exercises real storage.
+struct EngineTestNode {
+    node_id: u64,
+    peer_manager: Arc<PeerManager>,
+    #[allow(dead_code)]
+    server: Arc<RpcServer>,
+    #[allow(dead_code)]
+    accord_state: AccordState,
+    local_addr: std::net::SocketAddr,
+    engine: Arc<ferrosa_storage::StorageEngine>,
+    #[allow(dead_code)]
+    dir: Arc<tempfile::TempDir>,
+}
+
+const E2E_KS: &str = "lwt_e2e_ks";
+const E2E_TABLE: &str = "lwt_e2e_t";
+
+fn e2e_schema() -> ferrosa_common::schema::TableSchema {
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    TableSchema {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        regular_columns: vec![ColumnDefinition {
+            name: "v".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+        }],
+        extensions: Default::default(),
+    }
+}
+
+async fn start_engine_test_node(host_id: uuid::Uuid) -> EngineTestNode {
+    use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+
+    let node_id = uuid_to_node_id(host_id);
+
+    let dir = Arc::new(tempfile::tempdir().unwrap());
+    let config = StorageEngineConfig::test_config(dir.path());
+    let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+    engine.register_table(e2e_schema()).unwrap();
+
+    // Use a real engine-backed applier+reader, but a Mock sync writer so the
+    // persist-before-reply step is in-memory (matches start_test_node; the
+    // FileSyncWriter is exercised elsewhere and is not what this test asserts).
+    let sync_writer = Arc::new(MockSyncWriter::new());
+    let applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+        engine.clone(),
+    ));
+    let reader = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+        engine.clone(),
+    ));
+    let accord_state: AccordState = Arc::new(parking_lot::Mutex::new(
+        AccordStateMachine::with_applier_and_reader(node_id, sync_writer, applier, reader),
+    ));
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let accord_handler = Arc::new(AccordHandler::new(accord_state.clone(), node_id));
+    registry.register(MsgType::AccordPreAccept, accord_handler.clone());
+    registry.register(MsgType::AccordAccept, accord_handler.clone());
+    registry.register(MsgType::AccordCommit, accord_handler.clone());
+    registry.register(MsgType::AccordRead, accord_handler.clone());
+    registry.register(MsgType::AccordApply, accord_handler.clone());
+    registry.register(MsgType::AccordRecover, accord_handler);
+
+    let net_cfg = NetConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        ..NetConfig::default()
+    };
+    let server = Arc::new(RpcServer::new(net_cfg.clone(), host_id, registry.clone()));
+    let local_addr = server.start_and_get_addr().await.expect("bind failed");
+
+    let peer_manager = Arc::new(PeerManager::new(
+        Arc::new(net_cfg),
+        host_id,
+        Arc::new(NoopListener),
+    ));
+
+    EngineTestNode {
+        node_id,
+        peer_manager,
+        server,
+        accord_state,
+        local_addr,
+        engine,
+        dir,
+    }
+}
+
+/// Serialize a single-row Mutation for `(E2E_KS, E2E_TABLE)` carrying `v=value`
+/// under partition key `pk`, stamped at `cell_ts`.
+fn e2e_mutation_bytes(pk: &str, value: i32, cell_ts: i64) -> Vec<u8> {
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use ferrosa_storage::Mutation;
+
+    let key = DecoratedKey::new(PartitionKey::new(pk.as_bytes().to_vec()));
+    let row = Row {
+        clustering: vec![],
+        cells: vec![(0, CellValue::live(value.to_be_bytes().to_vec(), cell_ts))],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(cell_ts),
+    };
+    let m = Mutation::new(
+        E2E_KS.to_string(),
+        E2E_TABLE.to_string(),
+        key,
+        vec![row],
+        cell_ts,
+    );
+    let mut buf = vec![0u8; m.serialized_size()];
+    m.serialize_into(&mut buf);
+    buf
+}
+
 /// A self-contained Accord node: RPC server + state machine + peer manager.
 struct TestNode {
     #[allow(dead_code)] // identity field — used in setup, referenced for diagnostics
@@ -502,6 +619,139 @@ async fn gap4_gap5_read_vote_and_apply_round_trip() {
         .shutdown(std::time::Duration::from_millis(100))
         .await;
     replica_node
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Task #30: generic IF col=val via the linearizable read-at-t seam (e2e).
+// ---------------------------------------------------------------------------
+
+/// Decode the `v` (Int32) cell from a serialized single-row Mutation produced by
+/// the generic-`IF` read-vote.
+fn decode_v_from_read_row(bytes: &[u8]) -> Option<i32> {
+    use ferrosa_storage::Mutation;
+    let m = Mutation::deserialize_from(bytes).expect("read-row bytes must decode as a Mutation");
+    let row = m.rows.first()?;
+    let (_, cell) = row.cells.first()?;
+    let v = cell.value.clone()?;
+    Some(i32::from_be_bytes(v[..4].try_into().ok()?))
+}
+
+/// End-to-end generic IF: a row written via Accord is read back at `t` by the
+/// generic read-vote across a real 2-node cluster over TCP, against a real
+/// StorageEngine on each replica. The coordinator's F+1-agreed `last_read_row`
+/// must carry the REAL stored value — this is the seam the CQL coordinator
+/// evaluates `IF col=val` against.
+#[tokio::test]
+async fn generic_if_reads_real_row_at_t_across_cluster() {
+    let id_coord = uuid::Uuid::from_bytes([0x71; 16]);
+    let id_replica = uuid::Uuid::from_bytes([0x72; 16]);
+
+    let coord = start_engine_test_node(id_coord).await;
+    let replica = start_engine_test_node(id_replica).await;
+
+    coord
+        .peer_manager
+        .ensure_peer(id_replica, &replica.local_addr.to_string())
+        .await
+        .expect("coord -> replica connect");
+    replica
+        .peer_manager
+        .ensure_peer(id_coord, &coord.local_addr.to_string())
+        .await
+        .expect("replica -> coord connect");
+
+    let replica_ids = vec![id_coord, id_replica];
+    let pk = "row1";
+    let key = pk.as_bytes().to_vec();
+
+    // -----------------------------------------------------------------------
+    // Step 1: write v=50 via a full Accord transaction. The mutation persists
+    // (Gap 5) on BOTH replicas at the agreed t (cells re-stamped to t).
+    // -----------------------------------------------------------------------
+    let clock1 = HybridLogicalClock::new(coord.node_id, 500_000_000);
+    let mut writer = AccordCoordinatorDriver::new(
+        coord.node_id,
+        replica_ids.clone(),
+        Arc::clone(&coord.peer_manager),
+        false,
+        &clock1,
+        key.clone(),
+        e2e_mutation_bytes(pk, 50, 1),
+    );
+    // Give the coordinator a local applier (so its own replica persists what it
+    // coordinates) and a local reader (so its read-at-`t` counts toward F+1).
+    let coord_applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+        coord.engine.clone(),
+    ));
+    let coord_reader = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+        coord.engine.clone(),
+    ));
+    writer = writer
+        .with_local_applier(coord_applier.clone())
+        .with_local_reader(coord_reader.clone());
+    writer
+        .run_transaction()
+        .await
+        .expect("write txn (v=50) must commit + apply");
+
+    // The remote replica persisted the row at t (Gap 5, real engine).
+    let stored = replica
+        .engine
+        .read(
+            &ferrosa_storage::TableId::new(E2E_KS, E2E_TABLE),
+            &ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(key.clone())),
+        )
+        .unwrap();
+    assert!(
+        stored.is_some(),
+        "Gap 5: remote replica must have persisted the v=50 row"
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 2: a generic-IF transaction reads the row at t across the cluster.
+    // The coordinator's read-vote uses ReadPredicate::ReadRow; F+1 replicas
+    // return the SAME row bytes, and last_read_row carries the real v=50.
+    // -----------------------------------------------------------------------
+    let clock2 = HybridLogicalClock::new(coord.node_id, 500_000_100);
+    let mut reader_txn = AccordCoordinatorDriver::new(
+        coord.node_id,
+        replica_ids.clone(),
+        Arc::clone(&coord.peer_manager),
+        false,
+        &clock2,
+        key.clone(),
+        e2e_mutation_bytes(pk, 99, 2), // the UPDATE's new value (applied regardless)
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    })
+    .with_local_applier(coord_applier)
+    .with_local_reader(coord_reader);
+
+    reader_txn
+        .run_transaction()
+        .await
+        .expect("generic-IF read-vote txn must reach F+1 row agreement");
+
+    let agreed = reader_txn
+        .last_read_row()
+        .expect("generic-IF read-vote must capture the agreed row at t");
+    assert_eq!(
+        decode_v_from_read_row(agreed),
+        Some(50),
+        "the F+1-agreed row read at t must carry the REAL stored value v=50 — \
+         this is what the CQL coordinator evaluates IF col=val against"
+    );
+
+    coord
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    replica
         .server
         .shutdown(std::time::Duration::from_millis(100))
         .await;

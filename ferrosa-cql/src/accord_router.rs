@@ -195,6 +195,64 @@ pub fn eval_if_conditions(
 }
 
 // ---------------------------------------------------------------------------
+// LWT predicate classification + statement-level evaluation
+// ---------------------------------------------------------------------------
+
+/// How an LWT statement's IF clause must be evaluated against the row at `t`.
+///
+/// This mirrors the replica-side `ReadPredicate` but stays in the CQL layer
+/// where the predicate operators (`IfCondition`/`Term`/`CqlValue`) are defined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LwtPredicateKind {
+    /// `INSERT IF NOT EXISTS`: condition holds iff the row is absent at `t`.
+    /// The replica answers this via its existence path (no schema needed).
+    NotExists,
+    /// Generic `IF <conditions>` / `IF EXISTS` on UPDATE/DELETE (or an INSERT
+    /// with explicit IF conditions): the coordinator reads the row at `t` and
+    /// evaluates the predicate with [`eval_if_conditions`].
+    Generic,
+}
+
+/// Classify the LWT predicate an INSERT/UPDATE/DELETE carries.
+///
+/// Returns `None` for statements with no conditional clause (not an LWT — must
+/// not route through the read-vote path).
+pub fn classify_lwt(stmt: &Statement) -> Option<LwtPredicateKind> {
+    match stmt {
+        Statement::Insert(s) if s.if_not_exists => Some(LwtPredicateKind::NotExists),
+        Statement::Update(s) if s.if_exists || !s.if_conditions.is_empty() => {
+            Some(LwtPredicateKind::Generic)
+        }
+        Statement::Delete(s) if s.if_exists || !s.if_conditions.is_empty() => {
+            Some(LwtPredicateKind::Generic)
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate an LWT statement's IF clause against the row state at `t`.
+///
+/// `existing_row` is the row read at the Accord-agreed timestamp `t` (decoded to
+/// `column -> value`), or `None` if the row was absent at `t`. Reuses the
+/// canonical [`eval_insert_if_not_exists`] / [`eval_if_conditions`] evaluators —
+/// no divergent logic. Returns `None` if the statement is not an LWT.
+pub fn eval_lwt_for_statement(
+    stmt: &Statement,
+    existing_row: Option<&HashMap<String, Option<CqlValue>>>,
+) -> Option<LwtResult> {
+    match stmt {
+        Statement::Insert(s) if s.if_not_exists => Some(eval_insert_if_not_exists(existing_row)),
+        Statement::Update(s) if s.if_exists || !s.if_conditions.is_empty() => Some(
+            eval_if_conditions(&s.if_conditions, s.if_exists, existing_row),
+        ),
+        Statement::Delete(s) if s.if_exists || !s.if_conditions.is_empty() => Some(
+            eval_if_conditions(&s.if_conditions, s.if_exists, existing_row),
+        ),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LWT result set encoding
 // ---------------------------------------------------------------------------
 
@@ -1060,5 +1118,120 @@ mod tests {
         }];
 
         assert!(!eval_if_conditions(&cond_in_miss, false, Some(&row)).applied);
+    }
+
+    // -----------------------------------------------------------------------
+    // Generic-IF: statement classification + read-row evaluation (Task #30).
+    // -----------------------------------------------------------------------
+
+    fn insert_if_not_exists() -> Statement {
+        Statement::Insert(InsertStatement {
+            keyspace: Some("ks".into()),
+            table: "t".into(),
+            columns: vec!["id".into()],
+            values: vec![Term::IntegerLiteral(1)],
+            if_not_exists: true,
+            using_timestamp: None,
+            using_ttl: None,
+        })
+    }
+
+    fn update_if_v_eq(expected: i64) -> Statement {
+        Statement::Update(UpdateStatement {
+            keyspace: Some("ks".into()),
+            table: "t".into(),
+            assignments: vec![Assignment::Simple {
+                column: "v".into(),
+                value: Term::IntegerLiteral(99),
+            }],
+            where_clauses: vec![WhereClause {
+                column: "id".into(),
+                op: ComparisonOp::Eq,
+                value: Term::IntegerLiteral(1),
+                token_fn: false,
+            }],
+            if_exists: false,
+            if_conditions: vec![IfCondition {
+                column: "v".into(),
+                operator: IfOperator::Eq,
+                value: Term::IntegerLiteral(expected),
+            }],
+            using_timestamp: None,
+            using_ttl: None,
+        })
+    }
+
+    #[test]
+    fn classify_lwt_distinguishes_not_exists_from_generic() {
+        assert_eq!(
+            classify_lwt(&insert_if_not_exists()),
+            Some(LwtPredicateKind::NotExists)
+        );
+        assert_eq!(
+            classify_lwt(&update_if_v_eq(50)),
+            Some(LwtPredicateKind::Generic)
+        );
+        // A plain INSERT with no IF is not an LWT.
+        let plain = Statement::Insert(InsertStatement {
+            keyspace: Some("ks".into()),
+            table: "t".into(),
+            columns: vec!["id".into()],
+            values: vec![Term::IntegerLiteral(1)],
+            if_not_exists: false,
+            using_timestamp: None,
+            using_ttl: None,
+        });
+        assert_eq!(classify_lwt(&plain), None);
+    }
+
+    // (a) UPDATE … IF v=50 where the stored row matches -> applied.
+    #[test]
+    fn eval_generic_if_match_applies() {
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Some(CqlValue::Int(1)));
+        row.insert("v".to_string(), Some(CqlValue::Int(50)));
+
+        let res =
+            eval_lwt_for_statement(&update_if_v_eq(50), Some(&row)).expect("UPDATE IF is an LWT");
+        assert!(res.applied, "matching IF v=50 must apply");
+    }
+
+    // (b) UPDATE … IF v=50 where the stored row does NOT match -> not applied,
+    //     and current_values returns the real stored row.
+    #[test]
+    fn eval_generic_if_mismatch_returns_current_values() {
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Some(CqlValue::Int(1)));
+        row.insert("v".to_string(), Some(CqlValue::Int(999)));
+
+        let res =
+            eval_lwt_for_statement(&update_if_v_eq(50), Some(&row)).expect("UPDATE IF is an LWT");
+        assert!(!res.applied, "non-matching IF v=50 must NOT apply");
+        assert_eq!(
+            res.current_values.get("v"),
+            Some(&Some(CqlValue::Int(999))),
+            "current_values must carry the real stored row"
+        );
+    }
+
+    // (c) INSERT IF NOT EXISTS via the existence path: absent -> applied,
+    //     present -> not applied (existence semantics, no generic predicate).
+    #[test]
+    fn eval_insert_if_not_exists_via_existence_path() {
+        let applied = eval_lwt_for_statement(&insert_if_not_exists(), None)
+            .expect("INSERT IF NOT EXISTS is an LWT");
+        assert!(
+            applied.applied,
+            "absent row -> INSERT IF NOT EXISTS applies"
+        );
+
+        let mut row = HashMap::new();
+        row.insert("id".to_string(), Some(CqlValue::Int(1)));
+        let not_applied = eval_lwt_for_statement(&insert_if_not_exists(), Some(&row))
+            .expect("INSERT IF NOT EXISTS is an LWT");
+        assert!(
+            !not_applied.applied,
+            "present row -> INSERT IF NOT EXISTS must not apply"
+        );
     }
 }
