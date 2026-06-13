@@ -134,6 +134,36 @@ impl StorageApplier for NoopStorageApplier {
 // EngineStorageApplier — real persistence via StorageEngine
 // ---------------------------------------------------------------------------
 
+/// Map an Accord-agreed [`Timestamp`] to the i64 cell timestamp used for
+/// last-write-wins conflict resolution.
+///
+/// The cell-timestamp domain is `i64` micros-since-epoch; the agreed `t.time`
+/// is the hybrid-logical-clock value that totally orders conflicting Accord
+/// transactions. We use `t.time` directly (saturating into `i64`) so that two
+/// LWTs whose Accord order is `t1 < t2` always persist cell timestamps in the
+/// same order — independent of any coordinator wall-clock skew.
+fn accord_cell_timestamp(t: Timestamp) -> i64 {
+    i64::try_from(t.time).unwrap_or(i64::MAX)
+}
+
+/// Re-stamp every conflict-resolution timestamp carried by `row` to `cell_ts`.
+///
+/// Touches only the last-write-wins timestamps (live + tombstone cell stamps,
+/// primary-key liveness, row deletion marker) — never `ttl` or
+/// `local_deletion_time`, which encode TTL/expiry semantics that are
+/// independent of write ordering and must survive unchanged.
+fn restamp_row(row: &mut ferrosa_sstable::types::Row, cell_ts: i64) {
+    for (_, cell) in &mut row.cells {
+        cell.timestamp = cell_ts;
+    }
+    if row.primary_key_liveness.has_timestamp() {
+        row.primary_key_liveness.timestamp = cell_ts;
+    }
+    if !row.deletion.is_live() {
+        row.deletion.marked_for_delete_at = cell_ts;
+    }
+}
+
 /// Production [`StorageApplier`] that durably persists a committed mutation to
 /// the local [`StorageEngine`].
 ///
@@ -147,11 +177,18 @@ impl StorageApplier for NoopStorageApplier {
 ///
 /// Accord delivers `Apply` at-least-once, and recovery may re-drive it. The
 /// applier records every `(txn_id, t)` it has applied and treats a repeat as a
-/// no-op. This is required for correctness: re-decoding and re-writing an old
-/// mutation would resurrect a stale value over a newer write to the same key
-/// (last-write-wins would normally protect us, but a re-applied mutation
-/// re-uses its *original* cell timestamp, so a naive re-write is a lost-update
-/// hazard). Tracking applied transactions makes re-apply a true no-op.
+/// no-op. This is required for correctness: cells are persisted at the agreed
+/// `t` (see [`accord_cell_timestamp`]), so a re-applied old mutation re-uses
+/// its *original* `t` and a naive re-write would resurrect a stale value over a
+/// newer write to the same key (a lost-update hazard, since LWW cannot tell the
+/// re-write apart from the first). Tracking applied transactions makes re-apply
+/// a true no-op.
+///
+/// # Last-write-wins vs the Accord total order
+///
+/// Cell timestamps are re-stamped to the agreed `t` at apply time, never the
+/// coordinator's materialize-time wall clock — so LWW resolves against Accord's
+/// agreed order even under coordinator clock skew.
 pub struct EngineStorageApplier {
     engine: Arc<StorageEngine>,
     /// `(txn_id, t.time)` pairs already persisted — for idempotent re-apply.
@@ -184,20 +221,33 @@ impl StorageApplier for EngineStorageApplier {
         }
 
         // Decode the self-describing commit-log mutation. Fail loud on garbage.
-        let decoded = Mutation::deserialize_from(&mutation.data).map_err(|e| ApplyError {
+        let mut decoded = Mutation::deserialize_from(&mutation.data).map_err(|e| ApplyError {
             txn_id,
             reason: format!("failed to decode apply mutation: {e}"),
         })?;
 
         let table_id = TableId::new(&decoded.keyspace, &decoded.table);
 
-        // Persist every row at the mutation's timestamp. `StorageEngine::write`
+        // Re-stamp every cell to the Accord-agreed execution timestamp `t`.
+        //
+        // The coordinator stamps cells at materialize time with its own wall
+        // clock, BEFORE consensus picks `t`. Honoring that wall clock for LWW
+        // would let coordinator clock skew invert the Accord total order
+        // (lost update / non-linearizable). The agreed `t` exists precisely to
+        // order conflicting writes, so it — not the wall clock — must drive the
+        // last-write-wins cell timestamp.
+        let cell_ts = accord_cell_timestamp(mutation.t);
+        for row in &mut decoded.rows {
+            restamp_row(row, cell_ts);
+        }
+
+        // Persist every row at the agreed timestamp. `StorageEngine::write`
         // appends to the commit log (durable) before the memtable, and returns
         // an error if the table is unregistered or admission is denied — we
         // propagate that as `ApplyError` (never fake success).
         for row in decoded.rows {
             self.engine
-                .write(&table_id, &decoded.key, row, decoded.timestamp)
+                .write(&table_id, &decoded.key, row, cell_ts)
                 .map_err(|e| ApplyError {
                     txn_id,
                     reason: format!("storage write failed for {table_id}: {e}"),
@@ -610,6 +660,13 @@ mod engine_applier_tests {
         row.cells.first().and_then(|(_, c)| c.value.clone())
     }
 
+    /// Read the LWW cell timestamp persisted for column 0 of the first row.
+    fn read_cell0_ts(engine: &StorageEngine, key: &DecoratedKey) -> Option<i64> {
+        let partition = engine.read(&TableId::new(KS, TABLE), key).unwrap()?;
+        let row = partition.rows.first()?;
+        row.cells.first().map(|(_, c)| c.timestamp)
+    }
+
     // -----------------------------------------------------------------------
     // RED: applying persists a row that is then readable via the engine.
     // -----------------------------------------------------------------------
@@ -726,5 +783,82 @@ mod engine_applier_tests {
             .apply(txn(1, 1000), mutation)
             .expect_err("malformed mutation bytes must fail loud");
         assert!(!err.reason.is_empty(), "decode error must carry a reason");
+    }
+
+    // -----------------------------------------------------------------------
+    // LWW honors the Accord-agreed order, NOT the coordinator wall clock.
+    //
+    // The coordinator stamps the Mutation's cells at materialize time with its
+    // own `SystemTime::now()` micros, BEFORE consensus picks the execution
+    // timestamp `t`. Under coordinator clock skew the wall-clock cell stamps can
+    // invert the Accord order. The applier MUST persist cells at a timestamp
+    // derived from the agreed `t` so last-write-wins resolves against Accord's
+    // total order — otherwise a lost update / non-linearizable result occurs.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_restamps_cells_to_accord_timestamp_not_wall_clock() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let key = make_key("pk1");
+
+        // Txn A: Accord order t=100 (earlier), but coordinator wall clock is
+        // SKEWED HIGH so its cell stamp is 9_000 (later than B's wall clock).
+        let a = encoded_mutation(key.clone(), b"A", 9_000, accord_ts(100), vec![]);
+        applier.apply(txn(1, 100), a).unwrap();
+
+        // Txn B: Accord order t=200 (later), coordinator wall clock SKEWED LOW
+        // so its cell stamp is 1_000 (earlier than A's wall clock).
+        let b = encoded_mutation(key.clone(), b"B", 1_000, accord_ts(200), vec![]);
+        applier.apply(txn(2, 200), b).unwrap();
+
+        // If the applier wrote at the wall-clock cell stamp (9_000 vs 1_000),
+        // A would win LWW and we'd read "A" — the lost-update bug. With the
+        // agreed `t` (100 < 200) driving the cell timestamp, B wins.
+        assert_eq!(
+            read_cell0(&engine, &key).as_deref(),
+            Some(b"B".as_slice()),
+            "later Accord-agreed txn must win LWW regardless of coordinator clock skew"
+        );
+        // And the persisted cell timestamp must derive from B's agreed t (200),
+        // not its wall-clock stamp (1_000).
+        assert_eq!(
+            read_cell0_ts(&engine, &key),
+            Some(200),
+            "persisted cell timestamp must be the Accord-agreed t, not wall clock"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end serialize round-trip: a Mutation carrying realistic cells
+    // (whose own stamp differs from `t`) survives serialize -> deserialize and
+    // is persisted readable, with the cell timestamp re-stamped to `t`. Guards
+    // the router serialize_into -> applier deserialize_from contract.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_round_trips_serialized_mutation_and_restamps() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let key = make_key("pk-roundtrip");
+        // Cell stamped with a wall-clock micros value far from the agreed t.
+        let wall = 1_700_000_000_000_000_i64;
+        let agreed = accord_ts(42);
+        let mutation = encoded_mutation(key.clone(), b"payload", wall, agreed, vec![]);
+
+        applier
+            .apply(txn(7, 42), mutation)
+            .expect("serialized mutation must round-trip and persist");
+
+        assert_eq!(
+            read_cell0(&engine, &key).as_deref(),
+            Some(b"payload".as_slice()),
+            "round-tripped mutation value must be readable"
+        );
+        assert_eq!(
+            read_cell0_ts(&engine, &key),
+            Some(42),
+            "cell timestamp must be re-stamped to the agreed t, not the wall clock"
+        );
     }
 }

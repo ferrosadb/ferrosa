@@ -244,6 +244,7 @@ async fn packet_reorder_linearizability() {
             false,
             &clock_a,
             key_round.clone(),
+            Vec::new(), // protocol-only test: no mutation payload
         );
         let mut driver_b = AccordCoordinatorDriver::new(
             node_b.node_id,
@@ -252,6 +253,7 @@ async fn packet_reorder_linearizability() {
             false,
             &clock_b,
             key_round.clone(),
+            Vec::new(), // protocol-only test: no mutation payload
         );
 
         // Inject delay nemesis: a pre-transaction sleep shifts one coordinator's
@@ -428,6 +430,7 @@ async fn run_batch_atomicity_round(nemesis_name: &str) {
             false,
             &clock_a,
             key_a,
+            Vec::new(), // protocol-only test: no mutation payload
         );
 
         // For partition-halves: skip node_b's driver entirely (it would panic on empty replicas).
@@ -444,6 +447,7 @@ async fn run_batch_atomicity_round(nemesis_name: &str) {
                 false,
                 &clock_b,
                 key_b,
+                Vec::new(), // protocol-only test: no mutation payload
             );
             BatchAtomicityResult::from_driver_result(driver_b.run_transaction().await)
         };
@@ -578,6 +582,7 @@ async fn disk_fail_no_phantom_commits() {
         true, // leaseholder — implicit local PreAccept vote
         &clock,
         key.clone(),
+        Vec::new(), // protocol-only test: no mutation payload
     );
 
     let failed_result = tokio::time::timeout(TXN_TIMEOUT, driver.run_transaction())
@@ -657,6 +662,7 @@ async fn disk_fail_no_phantom_commits() {
         true,
         &clock2,
         key.clone(),
+        Vec::new(), // protocol-only test: no mutation payload
     );
 
     let healed_result = tokio::time::timeout(TXN_TIMEOUT, driver2.run_transaction())
