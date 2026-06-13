@@ -171,12 +171,30 @@ impl RpcHandler for AccordHandler {
                             sm.read_condition_holds_at(&vote_req.key, &vote_req.t),
                             vec![],
                         ),
-                        // Generic IF col=val: the replica only does the
-                        // linearizable read-at-`t` and returns the row bytes; the
-                        // coordinator (which owns the table schema) evaluates the
-                        // predicate via `eval_if_conditions`. The replica reports
-                        // `condition_holds=true` as a neutral value — the
-                        // coordinator's evaluation is authoritative.
+                        // Generic IF col=val: the replica does the read-at-`t`
+                        // and returns the row bytes; the coordinator (which owns
+                        // the table schema) evaluates the predicate via the
+                        // injected gate wrapping `eval_if_conditions` and GATES the
+                        // Apply on it. The replica reports `condition_holds=true`
+                        // as a neutral value — the coordinator's evaluation is
+                        // authoritative.
+                        //
+                        // Linearizability of THIS read rests on two guarantees:
+                        // (1) the coordinator requires F+1 *identical* row bytes
+                        //     (`agreed_row`) before evaluating the predicate and
+                        //     fails loud on divergence — so the gate verdict is
+                        //     never taken on a non-quorum / skewed read; and
+                        // (2) `EngineStorageReader::read_row_at` bounds cells to
+                        //     `ts <= t.time` (as-of-`t`).
+                        // KNOWN GAP (tracked): this handler does not yet BLOCK on
+                        // the DepWaitGraph until every dep `t' < t` is Applied
+                        // before reading; it relies on the protocol ordering that
+                        // Commit→ReadVote follows the deps' Apply in practice. A
+                        // genuinely concurrent dep could make a minority replica
+                        // read stale, which (2)'s F+1-agreement turns into a
+                        // fail-loud abort rather than a wrong answer — correct, but
+                        // it can spuriously abort instead of waiting. Enforcing an
+                        // explicit dep-wait here is deferred.
                         ReadPredicate::ReadRow { keyspace, table } => {
                             let row =
                                 sm.read_row_bytes_at(keyspace, table, &vote_req.key, vote_req.t);
