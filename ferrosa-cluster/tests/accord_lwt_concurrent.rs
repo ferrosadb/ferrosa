@@ -756,3 +756,190 @@ async fn generic_if_reads_real_row_at_t_across_cluster() {
         .shutdown(std::time::Duration::from_millis(100))
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// Generic IF must GATE the write (lost-update / wrong-[applied] regression)
+// ---------------------------------------------------------------------------
+
+/// Read the current `v` value persisted on a replica's engine for the e2e key,
+/// or `None` if the row is absent. Reuses the production [`StorageReader`] with a
+/// far-future `t` so it observes whatever is currently stored.
+fn engine_v(engine: Arc<ferrosa_storage::StorageEngine>, key: &[u8]) -> Option<i32> {
+    use ferrosa_cluster::accord::apply::StorageReader;
+    let reader = ferrosa_cluster::accord::EngineStorageReader::new(engine);
+    let far_future = ferrosa_common::accord::Timestamp {
+        epoch: u64::MAX,
+        time: u64::MAX,
+        seq: u32::MAX,
+        node: 0,
+    };
+    let bytes = reader
+        .read_row_at(E2E_KS, E2E_TABLE, key, far_future)
+        .expect("engine read must not error")?;
+    decode_v_from_read_row(&bytes)
+}
+
+/// Build the generic-IF condition gate the CQL layer supplies: decode the agreed
+/// row's `v` cell and apply iff it equals `expected`. Mirrors `eval_if_conditions`
+/// for `IF v = expected` without depending on ferrosa-cql.
+fn if_v_eq_gate(expected: i32) -> ferrosa_cluster::accord::ConditionGate {
+    Box::new(move |row: Option<&[u8]>| match row {
+        Some(bytes) if !bytes.is_empty() => decode_v_from_read_row(bytes) == Some(expected),
+        // Row absent at t: `IF v = x` cannot hold (CQL: applied=false).
+        _ => false,
+    })
+}
+
+/// Regression for the generic-IF lost-update bug: a generic `IF col=val` whose
+/// condition is FALSE against the F+1-agreed row at `t` must ABORT before the
+/// Apply phase — the mutation must NOT persist, and the driver must report
+/// `ConditionNotMet` carrying the real current row. Conversely a matching
+/// condition must apply. This is the linearizable-LWT correctness proof.
+#[tokio::test]
+async fn generic_if_mismatch_does_not_persist_and_match_does() {
+    let id_coord = uuid::Uuid::from_bytes([0x81; 16]);
+    let id_replica = uuid::Uuid::from_bytes([0x82; 16]);
+
+    let coord = start_engine_test_node(id_coord).await;
+    let replica = start_engine_test_node(id_replica).await;
+
+    coord
+        .peer_manager
+        .ensure_peer(id_replica, &replica.local_addr.to_string())
+        .await
+        .expect("coord -> replica connect");
+    replica
+        .peer_manager
+        .ensure_peer(id_coord, &coord.local_addr.to_string())
+        .await
+        .expect("replica -> coord connect");
+
+    let replica_ids = vec![id_coord, id_replica];
+    let pk = "rowgate";
+    let key = pk.as_bytes().to_vec();
+
+    let coord_applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+        coord.engine.clone(),
+    ));
+    let coord_reader = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+        coord.engine.clone(),
+    ));
+
+    // Step 1: seed v=50 via a full Accord write on both replicas.
+    let clock1 = HybridLogicalClock::new(coord.node_id, 600_000_000);
+    let mut writer = AccordCoordinatorDriver::new(
+        coord.node_id,
+        replica_ids.clone(),
+        Arc::clone(&coord.peer_manager),
+        false,
+        &clock1,
+        key.clone(),
+        e2e_mutation_bytes(pk, 50, 1),
+    )
+    .with_local_applier(coord_applier.clone())
+    .with_local_reader(coord_reader.clone());
+    writer
+        .run_transaction()
+        .await
+        .expect("seed write v=50 must commit + apply");
+    assert_eq!(
+        engine_v(coord.engine.clone(), &key),
+        Some(50),
+        "coord seeded v=50"
+    );
+    assert_eq!(
+        engine_v(replica.engine.clone(), &key),
+        Some(50),
+        "replica seeded v=50"
+    );
+
+    // Step 2: UPDATE ... SET v=99 IF v=999 (MISMATCH: stored is 50).
+    // The mutation must NOT persist; the driver must return ConditionNotMet
+    // carrying the real current row (v=50).
+    let clock2 = HybridLogicalClock::new(coord.node_id, 600_000_100);
+    let mut mismatch = AccordCoordinatorDriver::new(
+        coord.node_id,
+        replica_ids.clone(),
+        Arc::clone(&coord.peer_manager),
+        false,
+        &clock2,
+        key.clone(),
+        e2e_mutation_bytes(pk, 99, 2),
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    })
+    .with_local_applier(coord_applier.clone())
+    .with_local_reader(coord_reader.clone())
+    .with_condition_gate(if_v_eq_gate(999));
+
+    let err = mismatch
+        .run_transaction()
+        .await
+        .expect_err("IF v=999 against stored v=50 must NOT apply");
+    match err {
+        AccordDriverError::ConditionNotMet { current_row } => {
+            assert_eq!(
+                decode_v_from_read_row(&current_row),
+                Some(50),
+                "ConditionNotMet must carry the REAL current row (v=50)"
+            );
+        }
+        other => panic!("expected ConditionNotMet, got {other:?}"),
+    }
+    // CRITICAL: the failed LWT must NOT have persisted v=99 on EITHER node.
+    assert_eq!(
+        engine_v(coord.engine.clone(), &key),
+        Some(50),
+        "lost-update bug: coordinator persisted v=99 on a FAILED IF"
+    );
+    assert_eq!(
+        engine_v(replica.engine.clone(), &key),
+        Some(50),
+        "lost-update bug: replica persisted v=99 on a FAILED IF"
+    );
+
+    // Step 3: UPDATE ... SET v=77 IF v=50 (MATCH). Must apply + persist.
+    let clock3 = HybridLogicalClock::new(coord.node_id, 600_000_200);
+    let mut matching = AccordCoordinatorDriver::new(
+        coord.node_id,
+        replica_ids.clone(),
+        Arc::clone(&coord.peer_manager),
+        false,
+        &clock3,
+        key.clone(),
+        e2e_mutation_bytes(pk, 77, 3),
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    })
+    .with_local_applier(coord_applier)
+    .with_local_reader(coord_reader)
+    .with_condition_gate(if_v_eq_gate(50));
+
+    matching
+        .run_transaction()
+        .await
+        .expect("IF v=50 against stored v=50 must apply");
+    assert_eq!(
+        engine_v(coord.engine.clone(), &key),
+        Some(77),
+        "matching IF must persist v=77 on coordinator"
+    );
+    assert_eq!(
+        engine_v(replica.engine.clone(), &key),
+        Some(77),
+        "matching IF must persist v=77 on replica"
+    );
+
+    coord
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    replica
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+}

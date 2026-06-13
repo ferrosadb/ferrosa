@@ -45,7 +45,7 @@ pub use clock_validation::{
 };
 pub use coordinator::{
     fast_quorum_size, slow_quorum_size, AccordCoordinator, AccordCoordinatorDriver,
-    AccordDriverError, CoordinatorDecision, CoordinatorPhase,
+    AccordDriverError, ConditionGate, CoordinatorDecision, CoordinatorPhase,
 };
 pub use cross_dc_adapter::{
     cross_dc_vote_commit_count, CrossDcAccordAdapter, CROSS_DC_VOTE_COMMITS,
