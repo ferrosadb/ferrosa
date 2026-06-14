@@ -6867,6 +6867,15 @@ impl StorageEngine {
             .unwrap_or(0)
     }
 
+    /// Test-only: drop a generation's pooled (already-open) reader so the next
+    /// read reopens it from its on-disk component files. Used to exercise the
+    /// disk-reopen path (e.g. a corrupt/degenerate `Filter.db`) instead of a
+    /// cache hit on the reader the flush seeded.
+    #[cfg(test)]
+    pub(crate) fn evict_pooled_reader_for_test(&self, table_id: &TableId, gen: u64) {
+        self.reader_pool.remove(&(table_id.to_string(), gen));
+    }
+
     /// Returns the count of SSTable read errors for a table.
     pub fn sstable_read_errors(&self, table_id: &TableId) -> u64 {
         self.tables
@@ -12521,6 +12530,192 @@ mod tests {
             "t2 must remain readable via read_clustering_row across a concurrent compaction \
              that deleted its SSTable (no spurious Ok(None) on the point-read hot path)"
         );
+    }
+
+    /// Window (1), DELETED-`Filter.db` variant — fail-loud + retry path.
+    ///
+    /// A read snapshots a view referencing the sole-survivor input SSTable
+    /// (gen2). Compaction deletes gen2 and swaps in a merged output holding the
+    /// key; gen2's `Data.db` is then restored on disk WITHOUT its `Filter.db`,
+    /// so the stale view reopens a Filter-less SSTable. `open_file_sstable` must
+    /// FAIL LOUD on the absent `Filter.db` (FIX A) — converting the window into
+    /// an open `Err` that engages the existing view-retry, which reopens against
+    /// the merged view and finds the key. Asserts the read returns `Some`.
+    ///
+    /// (Note: the bare empty-filter case is also caught by `BloomFilter::read`'s
+    /// length check; this test pins the *diagnosable* fail-loud behavior and
+    /// guards against a future change that would make that check tolerant.)
+    #[tokio::test]
+    async fn read_during_compaction_filter_db_deleted_retries_against_new_view() {
+        use crate::store::read_race_test_hook::{ReadViewBarrier, ARMED};
+        use std::sync::Arc;
+
+        let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let data_dir = dir.path().to_path_buf();
+        let (engine, tid, gen2_dir, gen2, backups) = setup_window1_compaction(&dir);
+
+        // Submit a compaction merging gen1+gen2; control when the swap applies.
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            let task = crate::compaction::metadata::CompactionTask {
+                inputs: metadata,
+                output_dir: data_dir.join("compaction"),
+                schema: test_schema(),
+                table_id: tid.clone(),
+            };
+            engine.compaction_executor.submit(task).unwrap();
+        }
+
+        let barrier = ReadViewBarrier::new();
+        let b_reader = Arc::clone(&barrier);
+        let eng = Arc::clone(&engine);
+        let rtid = tid.clone();
+        let reader = std::thread::spawn(move || {
+            ARMED.with(|c| *c.borrow_mut() = Some(b_reader));
+            eng.read(&rtid, &make_key("t2"))
+                .expect("read must not error")
+        });
+
+        barrier.wait_reached();
+        let mut swapped = false;
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                swapped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            swapped,
+            "compaction swap should merge the two inputs into one"
+        );
+
+        // Restore gen2's Data/Partitions/Rows (NOT Filter.db).
+        std::fs::create_dir_all(&gen2_dir).unwrap();
+        for (path, bytes) in &backups {
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert!(
+            !gen2_dir.join(format!("{gen2}-Filter.db")).exists(),
+            "gen2 Filter.db must remain DELETED to exercise window-1"
+        );
+        assert!(
+            gen2_dir.join(format!("{gen2}-Data.db")).exists(),
+            "gen2 Data.db must be present (only Filter.db is missing)"
+        );
+
+        barrier.release();
+        let got = reader.join().unwrap();
+        assert!(
+            got.is_some(),
+            "t2 must remain readable when gen2's Filter.db was concurrently \
+             deleted mid-open (no spurious Ok(None) / no panic)"
+        );
+    }
+
+    /// Window (1), DEGENERATE-`Filter.db` variant — the genuinely-silent case.
+    ///
+    /// A truncated/corrupt `Filter.db` consisting of just a valid 8-byte header
+    /// with `word_count == 0` parses successfully (it passes `BloomFilter::read`)
+    /// into a zero-bit filter. Before the fix, probing that filter executed
+    /// `hash % 0` and PANICKED inside the read — crashing the point read. The
+    /// `num_bits == 0 => may-contain` guard (FIX B) makes the probe return
+    /// `true` instead, so the real SSTable read runs and the key is found.
+    /// Asserts the read neither panics nor returns a spurious `Ok(None)`.
+    #[tokio::test]
+    async fn read_with_zero_bit_filter_db_does_not_panic_or_lose_row() {
+        use std::sync::Arc;
+
+        let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let (engine, tid, gen2_dir, gen2, _backups) = setup_window1_compaction(&dir);
+
+        // Overwrite gen2's Filter.db with a degenerate 0-word filter: a valid
+        // 8-byte header (hash_count=3, word_count=0). This parses OK and yields
+        // num_bits == 0 — the `% 0` panic / false-negative window.
+        let mut degenerate = Vec::new();
+        degenerate.extend_from_slice(&3i32.to_be_bytes());
+        degenerate.extend_from_slice(&0i32.to_be_bytes());
+        std::fs::write(gen2_dir.join(format!("{gen2}-Filter.db")), &degenerate).unwrap();
+
+        // Drop gen2's pooled reader (the flush seeded it with the original,
+        // valid in-memory filter) so the next read REOPENS gen2 from disk and
+        // actually parses the degenerate Filter.db we just wrote.
+        engine.evict_pooled_reader_for_test(&tid, gen2);
+
+        // No compaction: gen2 still holds t2 and is still in the live view. The
+        // read opens gen2, probes the zero-bit filter, and must find t2.
+        let eng = Arc::clone(&engine);
+        let rtid = tid.clone();
+        let got = std::thread::spawn(move || {
+            eng.read(&rtid, &make_key("t2"))
+                .expect("read must not error")
+        })
+        .join()
+        .expect("read thread must not panic on a zero-bit filter");
+
+        assert!(
+            got.is_some(),
+            "t2 must remain readable through a degenerate zero-bit Filter.db \
+             (no `% 0` panic, no false-negative prune to Ok(None))"
+        );
+    }
+
+    /// Shared setup for the window-1 tests: t1 -> gen1, t2 -> gen2 (t2 lives
+    /// ONLY in gen2). Returns the engine, table id, gen2's directory + number,
+    /// and a backup of gen2's non-filter components (for the deletion variant).
+    #[allow(clippy::type_complexity)]
+    fn setup_window1_compaction(
+        dir: &tempfile::TempDir,
+    ) -> (
+        std::sync::Arc<StorageEngine>,
+        TableId,
+        std::path::PathBuf,
+        u64,
+        Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        use std::sync::Arc;
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        engine
+            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let gens = StorageEngine::list_generations_in_dir(&table_dir);
+        let gen2 = *gens.iter().max().expect("a gen2 must exist");
+        let gen2_dir = StorageEngine::generation_dir_path(&table_dir, gen2)
+            .expect("gen2 directory must resolve");
+
+        let mut backups: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+        for comp in [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Statistics.db",
+            "TOC.txt",
+            "CompressionInfo.db",
+        ] {
+            let p = gen2_dir.join(format!("{gen2}-{comp}"));
+            if let Ok(bytes) = std::fs::read(&p) {
+                backups.push((p, bytes));
+            }
+        }
+        assert!(!backups.is_empty(), "gen2 must have at least Data.db");
+        (engine, tid, gen2_dir, gen2, backups)
     }
 
     #[test]
