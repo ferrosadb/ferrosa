@@ -63,6 +63,12 @@ impl BloomFilter {
     /// increment: `hash_i = h2 + i * h1`. See `BloomFilter.java` line 101-103.
     pub fn add(&mut self, h1: i64, h2: i64) {
         let num_bits = (self.bits.len() * 64) as i64;
+        // A zero-bit filter has no storage; there is nothing to set. Probing
+        // `hash % num_bits` would divide by zero, so skip (matches the
+        // "may contain everything" semantics enforced in `is_present`).
+        if num_bits == 0 {
+            return;
+        }
         for i in 0..self.hash_count as i64 {
             let hash = h2.wrapping_add(i.wrapping_mul(h1));
             let bit_index = (hash % num_bits).unsigned_abs() as usize;
@@ -75,6 +81,14 @@ impl BloomFilter {
     /// Test if a key might be present (false positives possible).
     pub fn is_present(&self, h1: i64, h2: i64) -> bool {
         let num_bits = (self.bits.len() * 64) as i64;
+        // A zero-bit filter carries no information. Treat it as "may contain"
+        // (conservative true) instead of computing `hash % 0` (which panics).
+        // A false positive only forces a real read; a false negative here would
+        // prune the only SSTable holding the key -> spurious `Ok(None)` =
+        // silent data loss. Safety over precision.
+        if num_bits == 0 {
+            return true;
+        }
         for i in 0..self.hash_count as i64 {
             let hash = h2.wrapping_add(i.wrapping_mul(h1));
             let bit_index = (hash % num_bits).unsigned_abs() as usize;
@@ -230,6 +244,44 @@ mod tests {
     #[test]
     fn read_too_short() {
         assert!(BloomFilter::read(&[0; 4]).is_err());
+    }
+
+    /// A validly-serialized zero-word filter (8-byte header, `word_count == 0`)
+    /// has `num_bits == 0`. Probing it must NOT divide-by-zero (`hash % 0`
+    /// panics) and must report "may contain" (`true`) rather than a false
+    /// "absent" — a false negative here would prune the only SSTable holding a
+    /// key and surface as a spurious `Ok(None)` (silent data loss). A
+    /// "may contain" only forces a real read, which is always safe.
+    #[test]
+    fn zero_bit_filter_is_present_returns_true_and_does_not_panic() {
+        // hash_count = 3, word_count = 0 -> bits is empty, num_bits == 0.
+        let mut serialized = Vec::new();
+        serialized.extend_from_slice(&3i32.to_be_bytes());
+        serialized.extend_from_slice(&0i32.to_be_bytes());
+        let bf = BloomFilter::read(&serialized).expect("zero-word filter parses");
+        assert!(bf.bits().is_empty(), "fixture must have zero bits");
+
+        // Must not panic, and must conservatively report "present".
+        assert!(
+            bf.is_present(12345, 67890),
+            "empty/zero-bit filter must report may-contain, never a false absent"
+        );
+        assert!(
+            bf.is_present(-1, i64::MIN),
+            "empty/zero-bit filter must report may-contain for extreme hashes too"
+        );
+    }
+
+    /// Adding to a zero-bit filter must also be a no-op rather than panicking
+    /// on `hash % 0`, so constructing/writing such a filter never crashes.
+    #[test]
+    fn zero_bit_filter_add_does_not_panic() {
+        let mut serialized = Vec::new();
+        serialized.extend_from_slice(&3i32.to_be_bytes());
+        serialized.extend_from_slice(&0i32.to_be_bytes());
+        let mut bf = BloomFilter::read(&serialized).expect("zero-word filter parses");
+        bf.add(12345, 67890); // must not panic
+        assert!(bf.is_present(12345, 67890));
     }
 
     #[test]

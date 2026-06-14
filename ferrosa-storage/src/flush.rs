@@ -905,9 +905,11 @@ struct FileComponentPaths {
 /// in `dir`. Shared by [`FileFlushTarget::open_reader`] and the engine's
 /// startup/load path so on-demand reopens go through one code path.
 ///
-/// Required components (`Data.db`, `Partitions.db`, `Rows.db`) must exist;
-/// optional components (`Filter.db`, `Statistics.db`, `CompressionInfo.db`)
-/// default to empty/absent when missing, matching the historical engine loader.
+/// Required components (`Data.db`, `Partitions.db`, `Rows.db`, `Filter.db`) must
+/// exist — `Filter.db` is always written for a live SSTable, so its absence while
+/// `Data.db` is present means a concurrent compaction/eviction deleted it and we
+/// fail loud (see the inline comment at the read). Genuinely-optional components
+/// (`Statistics.db`, `CompressionInfo.db`) default to empty/absent when missing.
 pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
     let required = |suffix: &str| -> Result<PathBuf> {
         let p = dir.join(format!("{gen}-{suffix}"));
@@ -925,7 +927,18 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
     let partitions = FileReadAt::open(required("Partitions.db")?)?;
     let rows = FileReadAt::open(required("Rows.db")?)?;
 
-    let filter = std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap_or_default();
+    // `Filter.db` is ALWAYS written for a live SSTable (flush and compaction
+    // both emit it unconditionally — see `file_flush_target_creates_component_files`).
+    // So unlike a legitimately-optional component, an *absent* `Filter.db` while
+    // `Data.db` is present means a concurrent compaction/eviction deleted it out
+    // from under this open. Substituting an empty filter (the old
+    // `unwrap_or_default()`) would build a DEGRADED reader whose bloom rejects
+    // every key, silently pruning the only SSTable holding a row and surfacing
+    // as a spurious `Ok(None)` (silent data loss) with NO open error — so the
+    // read-path view-retry would never fire. Fail loud instead: this converts
+    // the window into an open `Err`, engaging the existing `with_retried_view`
+    // retry which reopens against the freshly-compacted view that holds the key.
+    let filter = std::fs::read(required("Filter.db")?)?;
     let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap_or_default();
     let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
 
@@ -1580,6 +1593,66 @@ mod tests {
             .path()
             .join(format!("{gen}-CompressionInfo.db"))
             .exists());
+    }
+
+    /// Window-1 fail-loud: `Filter.db` is always written for a live SSTable, so
+    /// its absence while `Data.db` is still present means a concurrent
+    /// compaction/eviction deleted it mid-open. Silently substituting an empty
+    /// filter (`unwrap_or_default()`) builds a DEGRADED reader whose bloom
+    /// rejects every key — pruning the only SSTable holding a row and surfacing
+    /// as a spurious `Ok(None)` (silent data loss) with NO open error, so the
+    /// read-path view-retry never fires. `open_file_sstable` must instead return
+    /// `Err` so the retry reopens against the freshly-compacted view.
+    #[test]
+    fn open_file_sstable_errors_when_filter_db_deleted_mid_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![make_partition("k1", b"v1", 5000)];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let _reader = target.flush(output).unwrap();
+        let gen = target.generation();
+
+        // Sanity: a healthy SSTable opens fine.
+        open_file_sstable(dir.path(), &gen.to_string())
+            .expect("healthy sstable with Filter.db must open");
+
+        // Simulate a concurrent compaction deleting ONLY Filter.db while
+        // Data/Partitions/Rows are still on disk and still referenced by a
+        // stale read view.
+        let filter = dir.path().join(format!("{gen}-Filter.db"));
+        assert!(filter.exists(), "fixture must have a Filter.db to delete");
+        std::fs::remove_file(&filter).unwrap();
+        assert!(dir.path().join(format!("{gen}-Data.db")).exists());
+
+        let err = match open_file_sstable(dir.path(), &gen.to_string()) {
+            Ok(_) => panic!(
+                "open must FAIL LOUD when Filter.db is absent but Data.db is present \
+                 (concurrent delete) — never build a degraded empty-bloom reader"
+            ),
+            Err(e) => e,
+        };
+        // The error must explicitly name the missing Filter.db so the cause is
+        // diagnosable, rather than relying on a downstream "bloom filter too
+        // short" parse error from feeding empty bytes to BloomFilter::read
+        // (which `unwrap_or_default()` masks the *reason* for). This pins the
+        // fail-loud point to the genuine cause: a concurrently-deleted filter.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Filter.db"),
+            "error must name the absent Filter.db (got: {msg:?})"
+        );
     }
 
     #[test]
