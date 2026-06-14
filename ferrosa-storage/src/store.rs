@@ -424,6 +424,11 @@ pub struct TableStore<F: FlushTarget> {
     write_barrier: parking_lot::RwLock<()>,
     /// Counter of SSTable read errors during get_partition.
     pub sstable_read_errors: std::sync::atomic::AtomicU64,
+    /// Counter of reads that exhausted the store-view retry bound while an
+    /// SSTable was still failing to open. Non-zero in steady state means a
+    /// genuinely corrupt/missing file (not a transient compaction swap) and a
+    /// read may have returned an incomplete result — alert on it.
+    pub view_retry_exhausted: std::sync::atomic::AtomicU64,
     pub(crate) flush_target: F,
     options: WriteOptions,
     /// Secondary index declarations: `(index_name, column_position)` pairs.
@@ -811,6 +816,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
                 crate::reader_pool::configured_reader_cache_cap(),
             )),
@@ -1015,6 +1021,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
             pool_table_key,
         }
@@ -1091,6 +1098,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
             pool_table_key: String::new(),
         }
@@ -1279,14 +1287,36 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         row_limit: usize,
     ) -> Result<Option<Partition>> {
-        // A read takes an atomic snapshot of the store view. If an SSTable in
-        // that snapshot is concurrently compacted away (its local file deleted)
-        // before we open it, the data has already moved into a new SSTable in a
-        // newer view — so reload and retry instead of returning a partial result
-        // that silently drops the key (a fail-loud violation). Bounded so a
-        // genuinely corrupt/missing file still falls through to tolerant handling.
+        self.with_retried_view("read_limited_rows", |view| {
+            self.read_with_view(view, key, row_limit)
+        })
+    }
+
+    /// Run a single-snapshot read `attempt` under the store-view retry policy.
+    ///
+    /// A read takes an atomic snapshot of the store view. If an SSTable in that
+    /// snapshot is concurrently compacted away (its local file deleted, or a
+    /// component such as `Filter.db` removed) before we open it, the data has
+    /// already moved into a new SSTable in a newer view — so reload and retry
+    /// instead of returning a result that silently drops the key (a fail-loud
+    /// violation). `attempt` returns `(result, stale_view_failed)` where
+    /// `stale_view_failed` means a snapshotted SSTable could not be fully
+    /// consulted; whenever it is set we reload the view and retry.
+    ///
+    /// Retry is **not** gated on the view pointer changing: a deletion that
+    /// leaves the live view referencing the same generation (e.g. S3
+    /// local-cache eviction) must still be retried so the reopen re-resolves /
+    /// re-fetches the file. Bounded by `MAX_VIEW_RETRIES`; if a fresh reopen
+    /// against the current view still fails after the bound, the file is
+    /// genuinely corrupt/missing and the (tolerant) result is returned — but
+    /// the exhaustion is logged and metered so it is never silent.
+    fn with_retried_view<R>(
+        &self,
+        op: &'static str,
+        mut attempt: impl FnMut(&StoreView) -> Result<(Option<R>, bool)>,
+    ) -> Result<Option<R>> {
         const MAX_VIEW_RETRIES: usize = 8;
-        for attempt in 0..=MAX_VIEW_RETRIES {
+        for n in 0..=MAX_VIEW_RETRIES {
             let view = self.view.load_full();
 
             #[cfg(test)]
@@ -1294,12 +1324,21 @@ impl<F: FlushTarget> TableStore<F> {
                 barrier.reach_and_wait();
             }
 
-            let (result, sstable_open_failed) = self.read_with_view(&view, key, row_limit)?;
-            if sstable_open_failed
-                && attempt < MAX_VIEW_RETRIES
-                && !Arc::ptr_eq(&view, &self.view.load_full())
-            {
+            let (result, stale_view_failed) = attempt(&view)?;
+            if stale_view_failed && n < MAX_VIEW_RETRIES {
                 continue;
+            }
+            if stale_view_failed {
+                // Bound exhausted with a still-failing open: fail loud rather
+                // than silently returning a possibly-incomplete result.
+                self.view_retry_exhausted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    op,
+                    retries = MAX_VIEW_RETRIES,
+                    "read exhausted view retries with an SSTable still failing to open — \
+                     result may be incomplete (genuinely corrupt/missing file?)"
+                );
             }
             return Ok(result);
         }
@@ -1447,9 +1486,28 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         clustering: &[u8],
     ) -> Result<Option<Partition>> {
-        let guard = self.view.load();
+        // Route through the shared store-view retry policy so a stale-view
+        // SSTable open failure (compaction swap or local-cache eviction) retries
+        // against a fresh view instead of silently returning `Ok(None)` — the
+        // same data-loss class as a partition read. This path is a production
+        // hot path (full primary-key CQL point reads).
+        self.with_retried_view("read_clustering_row", |view| {
+            self.read_clustering_row_with_view(view, key, clustering)
+        })
+    }
+
+    /// One attempt of [`read_clustering_row`] against a fixed `view` snapshot.
+    /// Returns the matching row (if any) plus whether any SSTable failed to
+    /// open — the signal the caller uses to retry against a fresh view.
+    fn read_clustering_row_with_view(
+        &self,
+        guard: &StoreView,
+        key: &DecoratedKey,
+        clustering: &[u8],
+    ) -> Result<(Option<Partition>, bool)> {
         let schema = self.schema.load();
         let mut sources: Vec<Partition> = Vec::new();
+        let mut sstable_open_failed = false;
 
         if let Some(p) = guard.active.get(key)? {
             if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
@@ -1476,6 +1534,7 @@ impl<F: FlushTarget> TableStore<F> {
                     tracing::error!(%e, gen = %desc.gen, "clustering read: failed to open SSTable reader");
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sstable_open_failed = true;
                     continue;
                 }
             };
@@ -1509,15 +1568,15 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         if sources.is_empty() {
-            return Ok(None);
+            return Ok((None, sstable_open_failed));
         }
 
         let mut merged = merge::merge_partitions(sources);
         merged.rows.retain(|row| row.clustering == clustering);
         if merged.rows.is_empty() {
-            Ok(None)
+            Ok((None, sstable_open_failed))
         } else {
-            Ok(Some(merged))
+            Ok((Some(merged), sstable_open_failed))
         }
     }
 
