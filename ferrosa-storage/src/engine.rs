@@ -12439,6 +12439,90 @@ mod tests {
         );
     }
 
+    /// Window (3): the same read-vs-compaction data-loss race, but exercised
+    /// through `read_clustering_row` — the production full-primary-key point-read
+    /// hot path (write_path.rs routes CQL `=` point reads here). Before the fix
+    /// this path had NO view-retry loop at all: a stale-view open failure just
+    /// `continue`d and the read returned a spurious `Ok(None)` = silent data loss.
+    /// It must now retry against the freshly-swapped view like the partition read.
+    #[tokio::test]
+    async fn clustering_read_during_compaction_retries_against_new_view() {
+        use crate::store::read_race_test_hook::{ReadViewBarrier, ARMED};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // t1 -> gen1, t2 -> gen2. t2 lives ONLY in gen2 (no survivor SSTable).
+        // Both use clustering [0,0,0,1] (see make_row).
+        engine
+            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+
+        // Submit a compaction merging gen1+gen2; control exactly when the swap
+        // (view -> merged, input files deleted) is applied via poll_compactions.
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            let task = crate::compaction::metadata::CompactionTask {
+                inputs: metadata,
+                output_dir: dir.path().join("compaction"),
+                schema: test_schema(),
+                table_id: tid.clone(),
+            };
+            engine.compaction_executor.submit(task).unwrap();
+        }
+
+        // Reader thread issues a full-primary-key clustering read; arm it so the
+        // read pauses right after snapshotting the still-unswapped view (gen2).
+        let barrier = ReadViewBarrier::new();
+        let b_reader = Arc::clone(&barrier);
+        let eng = Arc::clone(&engine);
+        let rtid = tid.clone();
+        let clustering = vec![0x00, 0x00, 0x00, 0x01];
+        let reader = std::thread::spawn(move || {
+            ARMED.with(|c| *c.borrow_mut() = Some(b_reader));
+            eng.read_clustering_row(&rtid, &make_key("t2"), &clustering)
+                .expect("read must not error")
+        });
+
+        // Drive the swap to completion under the paused read.
+        barrier.wait_reached();
+        let mut swapped = false;
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                swapped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            swapped,
+            "compaction swap should merge the two inputs into one (background merge never completed)"
+        );
+        barrier.release();
+
+        let got = reader.join().unwrap();
+        assert!(
+            got.is_some(),
+            "t2 must remain readable via read_clustering_row across a concurrent compaction \
+             that deleted its SSTable (no spurious Ok(None) on the point-read hot path)"
+        );
+    }
+
     #[test]
     fn commit_log_position_exposed() {
         let dir = tempfile::tempdir().unwrap();
