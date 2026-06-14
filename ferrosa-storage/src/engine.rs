@@ -4882,11 +4882,30 @@ impl StorageEngine {
     /// Scan a table directory and return the generations that fail the startup
     /// smoke test, paired with the failure reason. The healthy gens are left
     /// untouched. Pure read — moves no files.
-    pub fn scan_table_dir_for_corrupt(table_dir: &std::path::Path) -> Vec<(u64, String)> {
+    /// Smoke-test every generation in `table_dir`, returning the corrupt ones.
+    ///
+    /// `verified` is an in/out cache of generations already smoke-tested OK.
+    /// SSTable generations are **immutable** — once a generation passes the
+    /// smoke test it can never become corrupt — so verified generations are
+    /// skipped on subsequent scans. This is what keeps the periodic self-heal
+    /// corruption scan from re-reading every SSTable's rows on every tick (the
+    /// idle-CPU spin — ../specs/bug-idle-cpu-spin-3cores.md): on an idle cluster
+    /// with no new flushes/compactions there is nothing new to test, so a tick
+    /// costs O(dir listing), not O(all data).
+    pub fn scan_table_dir_for_corrupt(
+        table_dir: &std::path::Path,
+        verified: &mut std::collections::BTreeSet<u64>,
+    ) -> Vec<(u64, String)> {
         let mut corrupt = Vec::new();
         for gen in Self::list_generations_in_dir(table_dir) {
-            if let Err(e) = Self::smoke_test_generation(table_dir, gen) {
-                corrupt.push((gen, e.to_string()));
+            if verified.contains(&gen) {
+                continue;
+            }
+            match Self::smoke_test_generation(table_dir, gen) {
+                Ok(_) => {
+                    verified.insert(gen);
+                }
+                Err(e) => corrupt.push((gen, e.to_string())),
             }
         }
         corrupt
