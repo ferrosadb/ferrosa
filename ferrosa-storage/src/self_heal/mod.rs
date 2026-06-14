@@ -172,6 +172,11 @@ pub struct SelfHealController {
     ledger: BTreeMap<(TableKey, IssueKind), AttemptState>,
     /// Logical tick counter — the snapshot's deterministic clock.
     tick: u64,
+    /// Per-table cache of SSTable generations already smoke-tested OK.
+    /// SSTable generations are immutable, so verified ones are skipped on
+    /// later ticks — this keeps the periodic corruption scan from re-reading
+    /// every SSTable's rows every tick (../specs/bug-idle-cpu-spin-3cores.md).
+    verified_gens: BTreeMap<TableKey, std::collections::BTreeSet<u64>>,
     refill: Box<dyn RefillScheduler + Send + Sync>,
     /// Port that schedules a prompt targeted refill after a successful
     /// quarantine (FMEA #10). Defaults to [`NoopRepairTrigger`]; the binary
@@ -194,6 +199,7 @@ impl SelfHealController {
             config,
             ledger: BTreeMap::new(),
             tick: 0,
+            verified_gens: BTreeMap::new(),
             refill: Box::new(LoggingRefillScheduler),
             repair_trigger: Arc::new(NoopRepairTrigger),
         }
@@ -268,17 +274,30 @@ impl SelfHealController {
     }
 
     /// Build the snapshot for the current tick from observable state.
-    fn build_snapshot(&self) -> HealthSnapshot {
+    fn build_snapshot(&mut self) -> HealthSnapshot {
         let mut issues = Vec::new();
         let mut owners_by_table = BTreeMap::new();
 
-        for (table, dir) in self.scan_targets() {
-            if let Some(owners) = self.cluster.owners(&table) {
+        // `scan_targets()` returns an owned Vec (releases the `self` borrow);
+        // `cluster` is an Arc clone so the closure below doesn't borrow `self`
+        // while `self.verified_gens` is borrowed mutably.
+        let targets = self.scan_targets();
+        let cluster = self.cluster.clone();
+        for (table, dir) in targets {
+            if let Some(owners) = cluster.owners(&table) {
                 owners_by_table.insert(table.clone(), owners);
             }
-            let posture = self.cluster.replica_posture(&table);
-            // Detector emits the loud WARN + metric unconditionally.
-            if let Some(issue) = detector::detect_corrupt_sstables(&table, &dir, posture) {
+            // Detector emits the loud WARN + metric unconditionally. Two costs
+            // are made lazy/incremental so an idle cluster doesn't spin CPU
+            // (../specs/bug-idle-cpu-spin-3cores.md):
+            //   - `verified_gens` skips re-smoke-testing immutable SSTable
+            //     generations already validated on a previous tick;
+            //   - posture is probed (full-range Merkle RPC) only if a corrupt
+            //     SSTable is actually found.
+            let verified = self.verified_gens.entry(table.clone()).or_default();
+            if let Some(issue) = detector::detect_corrupt_sstables(&table, &dir, verified, || {
+                cluster.replica_posture(&table)
+            }) {
                 issues.push(issue);
             }
             // Extension point: detector::detect_bloat / detect_divergence here.
@@ -452,6 +471,52 @@ mod controller_tests {
         assert_eq!(metrics::self_heal_metrics().corrupt_sstable_tables, 0);
         assert_eq!(metrics::self_heal_metrics().actions_executed_total, 0);
         assert_eq!(c.tick(), 1);
+    }
+
+    /// A cluster view that counts `replica_posture` probes. `replica_posture`
+    /// is an expensive full-range Merkle-digest RPC, so the self-heal control
+    /// loop must NOT call it on every table every tick — only when a corrupt
+    /// SSTable is actually detected (the rare case). Otherwise an idle cluster
+    /// busy-spins building Merkle trees cluster-wide
+    /// (../specs/bug-idle-cpu-spin-3cores.md).
+    struct CountingCluster {
+        posture: ReplicaPosture,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ClusterView for CountingCluster {
+        fn this_host(&self) -> u64 {
+            0
+        }
+        fn owners(&self, _t: &TableKey) -> Option<Vec<u64>> {
+            None
+        }
+        fn replica_posture(&self, _t: &TableKey) -> ReplicaPosture {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.posture
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn clean_tick_does_not_probe_replica_posture() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        // Registered table(s) with NO corruption.
+        let engine = table_dir_with_n_generations_engine(2);
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cluster = Arc::new(CountingCluster {
+            posture: ReplicaPosture::HealthyReplicaAvailable,
+            probes: probes.clone(),
+        });
+        let mut c = SelfHealController::new(engine, cluster, SelfHealConfig::default());
+        c.run_one_tick();
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "self-heal must NOT probe replica_posture (an expensive full-range \
+             Merkle-digest RPC) when no corrupt SSTable is found — eager probing \
+             per table per tick is the idle-CPU spin"
+        );
     }
 
     #[test]
