@@ -108,6 +108,37 @@ impl std::fmt::Display for ApplyError {
 }
 
 // ---------------------------------------------------------------------------
+// Deferred system-table writes
+// ---------------------------------------------------------------------------
+
+/// Severity for the log line emitted if a deferred system-table write fails.
+///
+/// `WarnReplay` is used for the create-DDL sites where a failure is expected
+/// during Raft log replay on startup (the `system_schema.*` tables are not yet
+/// registered); everything else is a genuine `Error`.
+#[derive(Debug, Clone, Copy)]
+enum SystemWriteLogLevel {
+    WarnReplay,
+    Error,
+}
+
+/// A `SystemTableMutation` collected during `apply_command` to be executed
+/// **after** the in-memory state mutation, on a blocking thread.
+///
+/// `apply_command` runs on the openraft apply task (a runtime worker). The
+/// `engine.write` calls inside `SystemTableWriter::apply` are synchronous and
+/// touch the memtable/commit-log, which previously parked the raft worker and
+/// delayed heartbeat responses. Collecting the mutations and draining them via
+/// `spawn_blocking` (awaited before the next entry, preserving openraft's
+/// sequential apply ordering) keeps that blocking work off the worker.
+struct PendingSystemWrite {
+    mutation: SystemTableMutation,
+    level: SystemWriteLogLevel,
+    /// Static context string mirroring the original inline log message.
+    context: &'static str,
+}
+
+// ---------------------------------------------------------------------------
 // RaftState
 // ---------------------------------------------------------------------------
 
@@ -797,10 +828,16 @@ impl FerrosStateMachine {
 
     /// Apply a single [`RaftCommand`] to `self.state`, updating BTreeMaps
     /// and optionally propagating side effects.
-    fn apply_command(&mut self, cmd: RaftCommand) -> RaftResponse {
+    /// Apply the in-memory state mutation for `cmd` and collect any
+    /// system-table writes to be executed off the raft worker by the caller.
+    ///
+    /// Returns the `RaftResponse` plus the deferred `system_schema.*`/
+    /// `system_auth.*` writes; the caller drains them via `spawn_blocking`.
+    fn apply_command(&mut self, cmd: RaftCommand) -> (RaftResponse, Vec<PendingSystemWrite>) {
         let RaftCommand { op, schema_version } = cmd;
         let mut schema_changed = true;
         let mut apply_errors: Vec<ApplyError> = Vec::new();
+        let mut pending_system_writes: Vec<PendingSystemWrite> = Vec::new();
         match op {
             // ---- DDL: Keyspaces ----------------------------------------
             RaftOp::CreateKeyspace(ks) => {
@@ -818,11 +855,12 @@ impl FerrosStateMachine {
                             tracing::error!(%e, "Raft apply: create_keyspace_internal failed — schema diverged from Raft state");
                         }
                     }
-                    if let Some(writer) = &self.system_writer {
-                        if let Err(e) = writer.apply(SystemTableMutation::KeyspaceCreated(ks_clone))
-                        {
-                            tracing::warn!(%e, "Raft apply: system table write skipped for CreateKeyspace (expected during log replay)");
-                        }
+                    if self.system_writer.is_some() {
+                        pending_system_writes.push(PendingSystemWrite {
+                            mutation: SystemTableMutation::KeyspaceCreated(ks_clone),
+                            level: SystemWriteLogLevel::WarnReplay,
+                            context: "Raft apply: system table write skipped for CreateKeyspace (expected during log replay)",
+                        });
                     }
                 }
             }
@@ -865,11 +903,12 @@ impl FerrosStateMachine {
                         }
                     }
                 }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::KeyspaceDropped(name.clone()))
-                    {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::KeyspaceDropped(name.clone()),
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
             }
             RaftOp::AlterKeyspace { name, updates } => {
@@ -886,13 +925,13 @@ impl FerrosStateMachine {
                         tracing::error!(%e, "Raft apply: alter_keyspace_internal failed");
                     }
                 }
-                if let Some(writer) = &self.system_writer {
+                if self.system_writer.is_some() {
                     if let Some(ks) = self.state.keyspaces.get(&name) {
-                        if let Err(e) =
-                            writer.apply(SystemTableMutation::KeyspaceCreated(ks.clone()))
-                        {
-                            tracing::error!(%e, "Raft apply: system table write failed for AlterKeyspace");
-                        }
+                        pending_system_writes.push(PendingSystemWrite {
+                            mutation: SystemTableMutation::KeyspaceCreated(ks.clone()),
+                            level: SystemWriteLogLevel::Error,
+                            context: "Raft apply: system table write failed for AlterKeyspace",
+                        });
                     }
                 }
             }
@@ -925,13 +964,15 @@ impl FerrosStateMachine {
                             });
                         }
                     }
-                    if let Some(writer) = &self.system_writer {
-                        if let Err(e) = writer.apply(SystemTableMutation::TableCreated(table)) {
-                            // Warn, not error: during Raft log replay on startup,
-                            // system_schema tables may not be registered yet.  The
-                            // schema bootstrap populates them once loading completes.
-                            tracing::warn!(%e, "Raft apply: system table write skipped for CreateTable (expected during log replay)");
-                        }
+                    if self.system_writer.is_some() {
+                        // Warn, not error: during Raft log replay on startup,
+                        // system_schema tables may not be registered yet.  The
+                        // schema bootstrap populates them once loading completes.
+                        pending_system_writes.push(PendingSystemWrite {
+                            mutation: SystemTableMutation::TableCreated(table),
+                            level: SystemWriteLogLevel::WarnReplay,
+                            context: "Raft apply: system table write skipped for CreateTable (expected during log replay)",
+                        });
                     }
                 }
             }
@@ -960,13 +1001,15 @@ impl FerrosStateMachine {
                         });
                     }
                 }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::TableDropped {
-                        keyspace: keyspace.clone(),
-                        table: table.clone(),
-                    }) {
-                        tracing::error!(%e, "Raft apply: system table write failed for DropTable");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::TableDropped {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                        },
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed for DropTable",
+                    });
                 }
             }
             RaftOp::AlterTable {
@@ -1048,10 +1091,12 @@ impl FerrosStateMachine {
                             .or_insert(IndexNodeStatus::Building);
                     }
                 }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::IndexCreated(index.clone())) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::IndexCreated(index.clone()),
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_index_internal(index) {
@@ -1073,14 +1118,16 @@ impl FerrosStateMachine {
                     table.clone(),
                     index.clone(),
                 ));
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::IndexDropped {
-                        keyspace: keyspace.clone(),
-                        table: table.clone(),
-                        name: index.clone(),
-                    }) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::IndexDropped {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                            name: index.clone(),
+                        },
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_index_internal(&keyspace, &table, &index) {
@@ -1108,10 +1155,12 @@ impl FerrosStateMachine {
             RaftOp::CreateType(udt) => {
                 let key = (udt.keyspace.clone(), udt.name.clone());
                 self.state.types.entry(key).or_insert_with(|| udt.clone());
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::TypeCreated(udt.clone())) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::TypeCreated(udt.clone()),
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_type_internal(&udt) {
@@ -1121,13 +1170,15 @@ impl FerrosStateMachine {
             }
             RaftOp::DropType { keyspace, name } => {
                 self.state.types.remove(&(keyspace.clone(), name.clone()));
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::TypeDropped {
-                        keyspace: keyspace.clone(),
-                        name: name.clone(),
-                    }) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::TypeDropped {
+                            keyspace: keyspace.clone(),
+                            name: name.clone(),
+                        },
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_type_internal(&keyspace, &name) {
@@ -1147,11 +1198,12 @@ impl FerrosStateMachine {
                     .functions
                     .entry(key)
                     .or_insert_with(|| func.clone());
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::FunctionCreated(func.clone()))
-                    {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::FunctionCreated(func.clone()),
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_function_internal(&func) {
@@ -1166,14 +1218,16 @@ impl FerrosStateMachine {
             } => {
                 let key = (keyspace.clone(), name.clone(), arg_types.clone());
                 self.state.functions.remove(&key);
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::FunctionDropped {
-                        keyspace: keyspace.clone(),
-                        name: name.clone(),
-                        arg_types: arg_types.clone(),
-                    }) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::FunctionDropped {
+                            keyspace: keyspace.clone(),
+                            name: name.clone(),
+                            arg_types: arg_types.clone(),
+                        },
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_function_internal(&keyspace, &name, &arg_types) {
@@ -1219,10 +1273,12 @@ impl FerrosStateMachine {
                     .roles
                     .entry(role.name.clone())
                     .or_insert_with(|| role.clone());
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::RoleCreated(role.clone())) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::RoleCreated(role.clone()),
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_role_internal(role) {
@@ -1245,12 +1301,13 @@ impl FerrosStateMachine {
                         role.member_of = member_of.clone();
                     }
                 }
-                if let Some(writer) = &self.system_writer {
+                if self.system_writer.is_some() {
                     if let Some(role) = self.state.roles.get(&name) {
-                        if let Err(e) = writer.apply(SystemTableMutation::RoleCreated(role.clone()))
-                        {
-                            tracing::error!(%e, "Raft apply: system table write failed");
-                        }
+                        pending_system_writes.push(PendingSystemWrite {
+                            mutation: SystemTableMutation::RoleCreated(role.clone()),
+                            level: SystemWriteLogLevel::Error,
+                            context: "Raft apply: system table write failed",
+                        });
                     }
                 }
                 if let Some(schema) = &self.schema {
@@ -1267,10 +1324,12 @@ impl FerrosStateMachine {
                         tracing::error!(%e, "Raft apply: schema.drop_role_internal failed");
                     }
                 }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::RoleDropped(name.clone())) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::RoleDropped(name.clone()),
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
             }
             RaftOp::Grant(entry) => {
@@ -1282,10 +1341,12 @@ impl FerrosStateMachine {
                 } else {
                     grants.push(entry.clone());
                 }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::GrantUpdated(entry.clone())) {
-                        tracing::error!(%e, "Raft apply: system table write failed");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::GrantUpdated(entry.clone()),
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.grant_internal(entry) {
@@ -1307,14 +1368,16 @@ impl FerrosStateMachine {
                         self.state.grants.remove(&role);
                     }
                 }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::PermissionRevoked {
-                        role: role.clone(),
-                        resource: resource.clone(),
-                        permission,
-                    }) {
-                        tracing::error!(%e, "Raft apply: system table write failed for PermissionRevoked");
-                    }
+                if self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::PermissionRevoked {
+                            role: role.clone(),
+                            resource: resource.clone(),
+                            permission,
+                        },
+                        level: SystemWriteLogLevel::Error,
+                        context: "Raft apply: system table write failed for PermissionRevoked",
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.revoke_internal(&role, &resource, &permission) {
@@ -1342,13 +1405,13 @@ impl FerrosStateMachine {
                     if let Some(role) = self.state.roles.get_mut(&member) {
                         role.member_of.insert(granted_role.clone());
                     }
-                    if let Some(writer) = &self.system_writer {
+                    if self.system_writer.is_some() {
                         if let Some(role) = self.state.roles.get(&member) {
-                            if let Err(e) =
-                                writer.apply(SystemTableMutation::RoleCreated(role.clone()))
-                            {
-                                tracing::error!(%e, "Raft apply: system table write failed for GrantRole");
-                            }
+                            pending_system_writes.push(PendingSystemWrite {
+                                mutation: SystemTableMutation::RoleCreated(role.clone()),
+                                level: SystemWriteLogLevel::Error,
+                                context: "Raft apply: system table write failed for GrantRole",
+                            });
                         }
                     }
                     if let Some(schema) = &self.schema {
@@ -1365,12 +1428,13 @@ impl FerrosStateMachine {
                 if let Some(role) = self.state.roles.get_mut(&member) {
                     role.member_of.remove(&granted_role);
                 }
-                if let Some(writer) = &self.system_writer {
+                if self.system_writer.is_some() {
                     if let Some(role) = self.state.roles.get(&member) {
-                        if let Err(e) = writer.apply(SystemTableMutation::RoleCreated(role.clone()))
-                        {
-                            tracing::error!(%e, "Raft apply: system table write failed for RevokeRole");
-                        }
+                        pending_system_writes.push(PendingSystemWrite {
+                            mutation: SystemTableMutation::RoleCreated(role.clone()),
+                            level: SystemWriteLogLevel::Error,
+                            context: "Raft apply: system table write failed for RevokeRole",
+                        });
                     }
                 }
                 if let Some(schema) = &self.schema {
@@ -1514,7 +1578,7 @@ impl FerrosStateMachine {
         // W1.7 — surface accumulated sub-errors instead of silently
         // returning Ok.  Callers can detect engine/schema/system_writer
         // failures and decide whether to retry, alert, or escalate.
-        if apply_errors.is_empty() {
+        let response = if apply_errors.is_empty() {
             RaftResponse::Ok
         } else {
             let summary = apply_errors
@@ -1523,6 +1587,57 @@ impl FerrosStateMachine {
                 .collect::<Vec<_>>()
                 .join("; ");
             RaftResponse::Error(summary)
+        };
+        (response, pending_system_writes)
+    }
+
+    /// Execute the system-table writes collected by `apply_command` on a
+    /// blocking thread, then emit the per-mutation log lines on the worker.
+    ///
+    /// The `engine.write` calls inside `SystemTableWriter::apply` are
+    /// synchronous and would otherwise park the raft apply worker, delaying
+    /// heartbeat responses (1s lane deadline). Running them under
+    /// `spawn_blocking` isolates that work; awaiting the handle here preserves
+    /// openraft's sequential apply ordering. A `JoinError` is surfaced loudly
+    /// rather than swallowed.
+    async fn flush_pending_system_writes(&self, pending: Vec<PendingSystemWrite>) {
+        if pending.is_empty() {
+            return;
+        }
+        let Some(writer) = self.system_writer.clone() else {
+            return;
+        };
+
+        let outcomes = ferrosa_net::task_pool::TaskPool::current("raft-system-table-apply")
+            .spawn_blocking(move || {
+                pending
+                    .into_iter()
+                    .map(|p| {
+                        let result = writer.apply(p.mutation);
+                        (p.level, p.context, result.err())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+
+        let outcomes = match outcomes {
+            Ok(outcomes) => outcomes,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    "Raft apply: system-table write task panicked or was cancelled"
+                );
+                return;
+            }
+        };
+
+        for (level, context, err) in outcomes {
+            if let Some(e) = err {
+                match level {
+                    SystemWriteLogLevel::WarnReplay => tracing::warn!(%e, "{context}"),
+                    SystemWriteLogLevel::Error => tracing::error!(%e, "{context}"),
+                }
+            }
         }
     }
 }
@@ -1609,7 +1724,12 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Normal(cmd) => {
-                    let resp = self.apply_command(cmd);
+                    let (resp, pending) = self.apply_command(cmd);
+                    // Drain the collected system-table writes off the raft
+                    // worker. Awaiting here (before the next entry) preserves
+                    // openraft's sequential apply ordering while keeping the
+                    // blocking `engine.write` calls off the worker thread.
+                    self.flush_pending_system_writes(pending).await;
                     responses.push(resp);
                 }
                 EntryPayload::Membership(membership) => {
@@ -3561,6 +3681,61 @@ mod tests {
         assert!(
             partition.is_some(),
             "CreateTable should write to system_schema.tables"
+        );
+    }
+
+    /// RED for the raft-apply offload: the synchronous `engine.write` in
+    /// `SystemTableWriter::apply` must run on a tokio blocking thread, not
+    /// inline on the raft apply worker (where it parks raft core and delays
+    /// heartbeat responses). We drive `apply()` on a single-worker multi-thread
+    /// runtime, capture that worker's thread id, and assert the system-table
+    /// write recorded a *different* thread.
+    #[test]
+    fn system_table_apply_runs_off_the_raft_worker_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let apply_thread_handle = sm
+            .system_writer
+            .as_ref()
+            .expect("with_side_effects installs a system writer")
+            .last_apply_thread_handle();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let worker_thread = rt.block_on(async move {
+            let worker = std::thread::current().id();
+            let ks = simple_keyspace("offload_ks");
+            let entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
+            sm.apply(vec![entry]).await.unwrap();
+            worker
+        });
+
+        // The CreateKeyspace must have written to system_schema.keyspaces.
+        let tid = TableId::new("system_schema", "keyspaces");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"offload_ks".to_vec(),
+        ));
+        assert!(
+            engine.read(&tid, &key).unwrap().is_some(),
+            "CreateKeyspace should write to system_schema.keyspaces"
+        );
+
+        let apply_thread = apply_thread_handle
+            .lock()
+            .unwrap()
+            .expect("SystemTableWriter::apply must have run");
+        assert_ne!(
+            apply_thread, worker_thread,
+            "system-table apply ran inline on the raft worker thread instead of \
+             being offloaded to a blocking thread"
         );
     }
 
