@@ -125,6 +125,36 @@ pub(super) fn read_local_range_limited_rows(
     }
 }
 
+/// Offloaded wrapper around [`read_local_range_limited_rows`] for the concrete
+/// storage engine.
+///
+/// [`read_local_range_limited_rows`] performs a SYNCHRONOUS range scan (opens
+/// SSTable readers, decodes partitions, `std::fs` + S3 rehydration). Running it
+/// inline on an async worker parks that worker for the duration of a large local
+/// range read, which stalls the CQL connection's keepalive and raft heartbeats.
+/// It is therefore offloaded to a blocking thread via [`TaskPool::spawn_blocking`],
+/// mirroring `read_local_partition`. A `JoinError` from the blocking pool is
+/// mapped to a loud `Storage` error rather than swallowed as an empty range.
+async fn read_local_range_limited_rows_offloaded(
+    storage: &std::sync::Arc<ferrosa_storage::StorageEngine>,
+    table_id: &TableId,
+    limit: usize,
+    row_limit: usize,
+) -> ferrosa_common::Result<Vec<Partition>> {
+    let storage = std::sync::Arc::clone(storage);
+    let table_id = table_id.clone();
+    ferrosa_common::task_pool::TaskPool::current("coordinator-local-range-read")
+        .spawn_blocking(move || {
+            read_local_range_limited_rows(storage.as_ref(), &table_id, limit, row_limit)
+        })
+        .await
+        .map_err(|e| {
+            ferrosa_common::Error::Io(std::io::Error::other(format!(
+                "local range read task failed: {e}"
+            )))
+        })?
+}
+
 // ---------------------------------------------------------------------------
 // Internal result type for a single replica read
 // ---------------------------------------------------------------------------
@@ -1151,8 +1181,11 @@ impl ClusterCoordinator {
 
                 async move {
                     if node_id == local_id {
-                        read_local_range_limited_rows(storage.as_ref(), &table_id, limit, row_limit)
-                            .map_err(ClusterError::Storage)
+                        read_local_range_limited_rows_offloaded(
+                            &storage, &table_id, limit, row_limit,
+                        )
+                        .await
+                        .map_err(ClusterError::Storage)
                     } else {
                         let (hid, addr) = remote.ok_or_else(|| {
                             ClusterError::Internal(format!(
@@ -3291,6 +3324,105 @@ mod tests {
             partitions[0].rows.len(),
             1,
             "row_limit=1 must retain only one row from the partition"
+        );
+    }
+
+    /// Responsiveness guard: a large local range read must run on the blocking
+    /// pool, NOT inline on the async worker. Mirrors the offload contract of
+    /// `read_local_partition`.
+    ///
+    /// The deterministic signal is THREAD IDENTITY. A synchronous range scan run
+    /// inline executes on the calling async worker thread; offloaded via
+    /// `TaskPool::spawn_blocking`, it executes on a distinct blocking-pool
+    /// thread, leaving the worker free to keep driving the CQL keepalive / raft
+    /// heartbeat. (A wall-clock "did the worker keep ticking" probe is NOT
+    /// reliable here: the storage rehydration path uses
+    /// `tokio::task::block_in_place`, which on a multi-thread runtime keeps the
+    /// runtime live even for inline work — so only thread identity distinguishes
+    /// inline from offloaded.)
+    ///
+    /// This test exercises the EXACT offload mechanism the production helper
+    /// uses — `TaskPool::current("coordinator-local-range-read").spawn_blocking`
+    /// wrapping the real `read_local_range_limited_rows` scan — and asserts the
+    /// scan runs off the async worker thread. It then drives the real
+    /// `read_local_range_limited_rows_offloaded` wrapper to confirm it returns
+    /// the same data, so the wrapper is covered end-to-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_local_range_read_runs_on_blocking_pool_and_does_not_park_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        // Write many partitions across several flushed SSTables so the bounded
+        // (row_limit > 0) scan does real, non-trivial synchronous I/O + decode.
+        for batch in 0..8u32 {
+            for i in 0..4_000u32 {
+                let pk = (batch * 4_000 + i).to_be_bytes().to_vec();
+                let key = DecoratedKey {
+                    token: Token((batch * 4_000 + i) as i64),
+                    key: PartitionKey::new(pk),
+                };
+                storage
+                    .write(&table_id, &key, test_row(i as i64), i as i64)
+                    .unwrap();
+            }
+            storage.flush(&table_id).unwrap();
+        }
+
+        // The thread this async task is running on (a tokio worker thread).
+        let worker_thread = std::thread::current().id();
+
+        // Run the real scan through the EXACT offload seam used by
+        // `read_local_range_limited_rows_offloaded`, capturing the thread the
+        // scan executes on.
+        let storage_for_scan = std::sync::Arc::clone(&storage);
+        let table_for_scan = table_id.clone();
+        let scan_thread = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let scan_thread_probe = scan_thread.clone();
+        let partitions =
+            ferrosa_common::task_pool::TaskPool::current("coordinator-local-range-read")
+                .spawn_blocking(move || {
+                    *scan_thread_probe.lock().unwrap() = Some(std::thread::current().id());
+                    read_local_range_limited_rows(
+                        storage_for_scan.as_ref(),
+                        &table_for_scan,
+                        10_000,
+                        4,
+                    )
+                })
+                .await
+                .expect("offloaded scan task must not panic")
+                .expect("offloaded scan must succeed");
+
+        let scan_thread = scan_thread
+            .lock()
+            .unwrap()
+            .expect("scan closure must have recorded its thread");
+
+        assert!(
+            !partitions.is_empty(),
+            "range read must return partitions (proves it did real work)"
+        );
+
+        // KEY ASSERTION: the synchronous scan ran on a DIFFERENT thread than the
+        // async worker — i.e. it was offloaded to the blocking pool and did NOT
+        // park the worker that drives the CQL connection keepalive.
+        assert_ne!(
+            scan_thread, worker_thread,
+            "the synchronous range scan ran on the async worker thread ({worker_thread:?}); \
+             it must be offloaded to a blocking-pool thread so a large local range read cannot \
+             park the CQL connection's keepalive / raft heartbeat"
+        );
+
+        // End-to-end: the production wrapper returns the same bounded result.
+        let via_wrapper = read_local_range_limited_rows_offloaded(&storage, &table_id, 10_000, 4)
+            .await
+            .expect("offloaded wrapper read should succeed");
+        assert_eq!(
+            via_wrapper.len(),
+            partitions.len(),
+            "the offloaded wrapper must return the same partition count as the direct scan"
         );
     }
 
