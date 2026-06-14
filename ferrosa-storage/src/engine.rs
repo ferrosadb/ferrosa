@@ -781,6 +781,14 @@ pub struct StorageEngine {
     /// maintenance loop consumes this flag to run an urgent S3 upload/eviction
     /// pass instead of waiting for the next normal flush tick.
     s3_sync_requested: AtomicBool,
+    /// Last observed free bytes on `config.data_dir`, refreshed by
+    /// `disk_free_bytes_cached()` at most ~once per second. Reading this on the
+    /// per-write admission path keeps the blocking `statvfs` syscall off the
+    /// async worker threads (raft apply, coordinator, CQL handlers).
+    cached_disk_free_bytes: AtomicU64,
+    /// Milliseconds since [`reference_instant`] of the last successful disk-free
+    /// refresh. `u64::MAX` is the sentinel for "never checked".
+    disk_free_checked_at_ms: AtomicU64,
     /// Set when the write path observes a memtable at/near the flush threshold.
     /// The process maintenance loop consumes this flag to run an urgent flush
     /// outside request handling.
@@ -1624,16 +1632,65 @@ impl StorageEngine {
         Ok(count)
     }
 
+    /// Free bytes on `config.data_dir`, served from a time-gated cache so the
+    /// blocking `statvfs` syscall runs at most ~once per second instead of on
+    /// every write. The cache is at most ~1s stale, which is well within the
+    /// tolerance of the disk-reserve guard.
+    ///
+    /// Refresh is single-flight: a `compare_exchange` on the timestamp elects
+    /// exactly one caller to run `statvfs` per ~1s window; everyone else reads
+    /// the last cached value. On `statvfs` error we log and return the cached
+    /// value rather than clobbering it (fail-visible, not fail-silent).
+    fn disk_free_bytes_cached(&self) -> u64 {
+        let now_ms = reference_instant().elapsed().as_millis() as u64;
+        let last = self.disk_free_checked_at_ms.load(Ordering::Acquire);
+        let stale = last == u64::MAX || now_ms.saturating_sub(last) >= 1000;
+        if stale
+            && self
+                .disk_free_checked_at_ms
+                .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            match fs2::available_space(&self.config.data_dir) {
+                Ok(available) => {
+                    self.cached_disk_free_bytes
+                        .store(available, Ordering::Release);
+                    if available < self.local_disk_eviction_low_water_bytes() {
+                        self.request_s3_sync();
+                    }
+                    return available;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %self.config.data_dir.display(),
+                        error = %e,
+                        "statvfs failed during disk-free refresh; serving cached value"
+                    );
+                }
+            }
+        }
+        self.cached_disk_free_bytes.load(Ordering::Acquire)
+    }
+
+    /// Test-only override of the disk-free cache. Marks the cache fresh so the
+    /// admission gate reads the injected value instead of immediately running a
+    /// live `statvfs` that would overwrite it.
+    #[cfg(test)]
+    pub(crate) fn set_disk_free_cache_for_test(&self, bytes: u64) {
+        self.cached_disk_free_bytes.store(bytes, Ordering::Release);
+        self.disk_free_checked_at_ms.store(
+            reference_instant().elapsed().as_millis() as u64,
+            Ordering::Release,
+        );
+    }
+
     pub fn check_write_admission(&self) -> ferrosa_common::Result<()> {
         let reserve = self.config.local_disk_free_reserve_bytes;
         if reserve == 0 {
             return Ok(());
         }
 
-        let available = fs2::available_space(&self.config.data_dir)?;
-        if available < self.local_disk_eviction_low_water_bytes() {
-            self.request_s3_sync();
-        }
+        let available = self.disk_free_bytes_cached();
         if available < reserve {
             return Err(ferrosa_common::Error::InvalidData(format!(
                 "local disk free space below write reserve: available={available} reserve={reserve} path={}",
@@ -1773,6 +1830,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
+            cached_disk_free_bytes: AtomicU64::new(0),
+            disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             reader_pool,
@@ -1940,6 +1999,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
+            cached_disk_free_bytes: AtomicU64::new(0),
+            disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             reader_pool,
@@ -2084,6 +2145,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
+            cached_disk_free_bytes: AtomicU64::new(0),
+            disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             reader_pool,
@@ -8019,6 +8082,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
+            cached_disk_free_bytes: AtomicU64::new(0),
+            disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             reader_pool,
@@ -8798,6 +8863,30 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn check_write_admission_reads_cached_disk_free_not_live_statvfs() {
+        // RED: the admission gate must consult the time-gated disk-free cache,
+        // not run a live statvfs on every write. With a real writable temp
+        // data_dir (which has free space) a live statvfs would always pass;
+        // this test forces the cache below the reserve and expects a failure.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_disk_free_reserve_bytes = 1024;
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.set_disk_free_cache_for_test(10);
+        assert!(
+            engine.check_write_admission().is_err(),
+            "cached free space below reserve must reject the write"
+        );
+
+        engine.set_disk_free_cache_for_test(1_000_000_000);
+        assert!(
+            engine.check_write_admission().is_ok(),
+            "cached free space above reserve must admit the write"
+        );
     }
 
     #[test]
