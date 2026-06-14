@@ -182,6 +182,13 @@ pub struct SSTableComponents<R> {
     pub statistics: Vec<u8>,
 }
 
+/// Hard ceiling on resident `seek_to_token` summary entries per SSTable
+/// reader. The summary is downsampled to at most this many `(token, offset)`
+/// pairs (~16 B each → ~1 MB) regardless of partition count, so a reader's
+/// memory does not scale with table size. Tables with fewer partitions keep a
+/// full (stride-1) index. See `build_token_summary`.
+const PARTITION_TOKEN_SUMMARY_MAX_ENTRIES: usize = 65_536;
+
 /// Composes all SSTable component readers into a single read interface.
 pub struct SSTableReader<R: ReadAt> {
     partition_index: PartitionIndex<CachedReadAt<R>>,
@@ -307,30 +314,62 @@ impl<R: ReadAt> SSTableReader<R> {
     /// linear scan from byte 0.
     pub fn partition_token_offsets(&self) -> std::sync::Arc<Vec<(i64, u64)>> {
         self.partition_token_offsets
-            .get_or_init(|| {
-                let mut out: Vec<(i64, u64)> = Vec::new();
-                let mut iter = match self.partitions_iter() {
-                    Ok(it) => it,
-                    Err(_) => {
-                        // Match `partition_offsets()`: silent empty
-                        // cache; callers detect and fall back.
-                        return std::sync::Arc::new(out);
-                    }
-                };
-                loop {
-                    let pos = iter.pos;
-                    match iter.peek_partition_key() {
-                        Ok(Some(dk)) => out.push((dk.token.0, pos)),
-                        Ok(None) => break,
-                        Err(_) => break,
-                    }
-                    if iter.skip_to_next_partition().is_err() {
-                        break;
+            .get_or_init(|| self.build_token_summary(PARTITION_TOKEN_SUMMARY_MAX_ENTRIES))
+            .clone()
+    }
+
+    /// Build a **bounded, downsampled** `(token, byte-offset)` summary for
+    /// `seek_to_token`: at most `max_entries` samples, taken at an even
+    /// stride derived from the on-disk partition count, so a reader's
+    /// resident seek index is O(max_entries) rather than O(num_partitions).
+    ///
+    /// This is the fix for the recovery OOM where the old full index held
+    /// one entry per partition (tens of millions → ~1 GB live during a
+    /// repair Merkle scan — see
+    /// `../ferrosa/specs/bug-recovery-oom-nonstreaming-snapshot.md`).
+    ///
+    /// Invariants the seek floor-scan relies on: samples are in token
+    /// (== file) order, and the **first partition is always included** as
+    /// the floor anchor. The walk advances with `next_partition_metadata`
+    /// (the index-free advance) — NOT `skip_to_next_partition`, which would
+    /// build the full `partition_offsets` index and reintroduce the OOM.
+    ///
+    /// On error the summary is left empty; callers fall back to a linear
+    /// scan from byte 0 (same contract as before).
+    pub(crate) fn build_token_summary(
+        &self,
+        max_entries: usize,
+    ) -> std::sync::Arc<Vec<(i64, u64)>> {
+        let mut out: Vec<(i64, u64)> = Vec::new();
+        let mut iter = match self.partitions_iter() {
+            Ok(it) => it,
+            Err(_) => return std::sync::Arc::new(out),
+        };
+        let n = self.partition_index.key_count() as usize;
+        let max = max_entries.max(1);
+        // Even downsample to a hard entry ceiling. stride == 1 for tables
+        // with <= max partitions, so small tables keep a full index and
+        // their seek behaviour is byte-identical to the old code.
+        let stride = if n <= max { 1 } else { n.div_ceil(max) };
+        let mut i = 0usize;
+        loop {
+            let pos = iter.pos;
+            match iter.peek_partition_key() {
+                Ok(Some(dk)) => {
+                    if i.is_multiple_of(stride) {
+                        out.push((dk.token.0, pos));
                     }
                 }
-                std::sync::Arc::new(out)
-            })
-            .clone()
+                Ok(None) => break,
+                Err(_) => break,
+            }
+            i += 1;
+            match iter.next_partition_metadata() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        std::sync::Arc::new(out)
     }
 
     /// Look up a partition by its decorated key.
@@ -1110,18 +1149,48 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// iterator stays at its current position — callers fall back to
     /// the existing linear `next_partition + token-filter` shape.
     pub fn seek_to_token(&mut self, target: i64) -> Result<()> {
-        let tokens = self.sst.partition_token_offsets();
-        if tokens.is_empty() {
+        let summary = self.sst.partition_token_offsets();
+        self.seek_to_token_within(&summary, target)
+    }
+
+    /// Position the iterator at the first partition whose `token >= target`,
+    /// driven by a BOUNDED downsampled `summary` (see
+    /// [`SSTableReader::build_token_summary`]). Binary-search the summary for
+    /// the floor sample (`token < target`), jump there, then forward-scan —
+    /// bounded by the sample stride — to the exact landing.
+    ///
+    /// The scan advances with `next_partition_metadata` (index-free) so it
+    /// never materializes the full `partition_offsets` index. For a stride-1
+    /// summary (small tables) this lands on exactly the same partition as the
+    /// old full-index seek, one metadata decode later.
+    ///
+    /// Empty summary (cache build failed) → no-op; callers fall back to a
+    /// linear `next_partition + token-filter` scan, as before.
+    pub(crate) fn seek_to_token_within(
+        &mut self,
+        summary: &[(i64, u64)],
+        target: i64,
+    ) -> Result<()> {
+        if summary.is_empty() {
             return Ok(());
         }
-        // First entry with `token >= target`. partition_point splits
-        // the slice on the first element NOT satisfying the
-        // predicate; we want the first NOT `< target`.
-        let idx = tokens.partition_point(|(t, _)| *t < target);
-        self.pos = match tokens.get(idx) {
-            Some(&(_, pos)) => pos,
-            None => self.sst.data.len()?, // every token < target → EOF
-        };
+        // Floor sample: last sample with `token < target`, or sample 0 when
+        // target precedes everything. The exact partition is at/after it,
+        // within one stride. `build_token_summary` guarantees sample 0 is the
+        // first partition, so the anchor is always a valid scan start.
+        let idx = summary.partition_point(|(t, _)| *t < target);
+        let anchor = if idx == 0 { 0 } else { idx - 1 };
+        self.pos = summary[anchor].1;
+        loop {
+            match self.peek_partition_key()? {
+                Some(dk) if dk.token.0 < target => {
+                    if self.next_partition_metadata()?.is_none() {
+                        break; // EOF before any token >= target
+                    }
+                }
+                _ => break, // token >= target, or EOF
+            }
+        }
         Ok(())
     }
 
@@ -2218,6 +2287,84 @@ mod tests {
         let mut iter = reader.partitions_iter().expect("partitions_iter");
         iter.seek_to_token(above_max).expect("seek above max");
         assert!(iter.next_partition().expect("next").is_none());
+    }
+
+    /// The seek index must be a BOUNDED, downsampled summary — not a
+    /// full `(token, offset)` entry per partition — so a reader's
+    /// resident memory does not scale with partition count. (Confirmed
+    /// OOM source: ../ferrosa/specs/bug-recovery-oom-nonstreaming-snapshot.md.)
+    /// Downsampling must preserve: token order, inclusion of the first
+    /// partition (the floor-seek anchor), and exact `seek_to_token`
+    /// landing via a bounded forward scan between samples.
+    #[test]
+    fn token_summary_is_downsampled_yet_seek_lands_exactly() {
+        let header = test_header();
+        let n = 64usize;
+        let mut dks: Vec<_> = (0..n)
+            .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:04}").as_bytes())))
+            .collect();
+        dks.sort_by_key(|dk| dk.token.0);
+
+        let mut data_bytes = Vec::new();
+        let mut positions = Vec::new();
+        for dk in &dks {
+            positions.push(data_bytes.len() as u64);
+            data_bytes.extend_from_slice(&build_data_blob(dk.key.as_bytes()));
+        }
+        let dk_pos: Vec<_> = dks.iter().zip(positions.iter().copied()).collect();
+        let partitions_bytes =
+            build_partition_index(&dk_pos.iter().map(|(d, p)| (*d, *p)).collect::<Vec<_>>());
+        let filter_bytes = build_bloom_filter(&dks.iter().collect::<Vec<_>>());
+        let stats_bytes = build_statistics(header);
+        let components = SSTableComponents {
+            data: data_bytes,
+            partitions: partitions_bytes,
+            rows: Vec::new(),
+            filter: filter_bytes,
+            compression_info: None,
+            statistics: stats_bytes,
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Downsample target smaller than the partition count → the summary
+        // must be bounded by `max`, not equal to `n`.
+        let max = 8usize;
+        let summary = reader.build_token_summary(max);
+        assert!(
+            !summary.is_empty() && summary.len() <= max,
+            "summary len {} must be in 1..={}",
+            summary.len(),
+            max
+        );
+        // Token order preserved.
+        for w in summary.windows(2) {
+            assert!(w[0].0 <= w[1].0, "summary must be token-sorted");
+        }
+        // First partition is always anchored at offset 0 (floor-seek relies on it).
+        assert_eq!(summary[0].1, 0, "summary must include the first partition");
+
+        // seek_to_token, driven by the bounded summary + forward scan, must
+        // still land at the first partition whose token >= target — for an
+        // exact match, the floor anchor, and beyond-last (EOF).
+        for probe in [dks[n / 2].token.0, dks[0].token.0, dks[n - 1].token.0] {
+            let mut iter = reader.partitions_iter().unwrap();
+            iter.seek_to_token_within(&summary, probe).unwrap();
+            let first = iter
+                .next_partition()
+                .unwrap()
+                .expect("a partition exists at or after target");
+            assert_eq!(
+                first.key.token.0, probe,
+                "bounded-summary seek must land on the exact first token >= target"
+            );
+        }
+        let above_max = dks.last().unwrap().token.0.saturating_add(1);
+        let mut iter = reader.partitions_iter().unwrap();
+        iter.seek_to_token_within(&summary, above_max).unwrap();
+        assert!(
+            iter.next_partition().unwrap().is_none(),
+            "seek beyond last token parks at EOF"
+        );
     }
 
     /// After `next_partition_header_only` parks the iterator at
