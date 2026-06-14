@@ -152,14 +152,42 @@ fn dedup_by_token(partitions: Vec<Partition>) -> Vec<Partition> {
         .collect()
 }
 
+/// Read a bounded local range from the storage engine for the streaming
+/// coordinator.
+///
+/// Two paths, both kept off the async worker thread:
+///
+/// * `row_limit > 0` (capped, partition-key-equality scans) materializes a
+///   bounded window via [`StorageEngine::read_range_limited_rows`], which is a
+///   SYNCHRONOUS scan that opens SSTable readers and decodes partitions inline
+///   (`std::fs`, S3 rehydration, a `std::sync::Mutex` guard). It is offloaded to
+///   a blocking thread via [`TaskPool::spawn_blocking`] — mirroring
+///   `read_local_partition` in `read.rs` — so it never parks an async worker
+///   (raft heartbeat, CQL keepalive). A `JoinError` is mapped to a loud
+///   `Storage` error rather than swallowed as a missing/empty range.
+/// * `row_limit == 0` (unbounded) pulls from [`StorageEngine::range_iter`],
+///   whose producer already runs the blocking merge on a `TaskPool` blocking
+///   thread and delivers partitions over an `mpsc` channel; `stream.next()` only
+///   awaits `rx.recv()`, so this path is already cooperative and is left as-is.
 async fn read_local_range_stream_limited_rows(
-    storage: &ferrosa_storage::StorageEngine,
+    storage: &std::sync::Arc<ferrosa_storage::StorageEngine>,
     table_id: &TableId,
     limit: usize,
     row_limit: usize,
 ) -> ferrosa_common::Result<Vec<Partition>> {
     if row_limit > 0 {
-        return storage.read_range_limited_rows(table_id, None, None, limit, row_limit);
+        let storage = std::sync::Arc::clone(storage);
+        let table_id = table_id.clone();
+        return TaskPool::current("coordinator-local-range-read")
+            .spawn_blocking(move || {
+                storage.read_range_limited_rows(&table_id, None, None, limit, row_limit)
+            })
+            .await
+            .map_err(|e| {
+                ferrosa_common::Error::Io(std::io::Error::other(format!(
+                    "local range read task failed: {e}"
+                )))
+            })?;
     }
 
     let mut stream = storage.range_iter(table_id, None, None);
@@ -1553,17 +1581,13 @@ impl ClusterCoordinator {
         let expected_done = remotes.len();
 
         // Local read goes direct — no internode hop.
-        let mut all_partitions = match read_local_range_stream_limited_rows(
-            self.storage.as_ref(),
-            table_id,
-            limit,
-            row_limit,
-        )
-        .await
-        {
-            Ok(ps) => ps,
-            Err(e) => return Err(ClusterError::Storage(e)),
-        };
+        let mut all_partitions =
+            match read_local_range_stream_limited_rows(&self.storage, table_id, limit, row_limit)
+                .await
+            {
+                Ok(ps) => ps,
+                Err(e) => return Err(ClusterError::Storage(e)),
+            };
 
         // No remote replicas → done after the local read.
         if expected_done == 0 {
@@ -2347,6 +2371,16 @@ mod tests {
         assert!(
             helper.contains("range_iter") && helper.contains("while partitions.len() < limit"),
             "streaming local read helper must pull from range_iter under the requested limit: {helper}"
+        );
+        // The capped (row_limit > 0) branch materializes a bounded window via the
+        // SYNCHRONOUS `read_range_limited_rows` scan; it must be offloaded to a
+        // blocking thread so a large local range read cannot park the async
+        // worker (and stall the CQL connection keepalive). See the runtime
+        // responsiveness test in `read.rs`.
+        assert!(
+            helper.contains("spawn_blocking") && helper.contains("read_range_limited_rows"),
+            "capped streaming local read must offload the synchronous range scan via \
+             spawn_blocking, not run it inline on the async worker: {helper}"
         );
     }
 
