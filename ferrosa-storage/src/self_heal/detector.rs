@@ -27,12 +27,22 @@ use super::snapshot::{CorruptSstable, IssueKind, ReplicaPosture, TableIssue, Tab
 pub fn detect_corrupt_sstables(
     table: &TableKey,
     table_dir: &Path,
-    replica_posture: ReplicaPosture,
+    // In/out cache of generations already smoke-tested OK. SSTable generations
+    // are immutable, so verified ones are skipped — this keeps the periodic
+    // scan from re-reading every SSTable's rows every tick (the idle-CPU spin,
+    // ../specs/bug-idle-cpu-spin-3cores.md).
+    verified: &mut std::collections::BTreeSet<u64>,
+    // Lazy: `replica_posture` is an expensive full-range Merkle-digest RPC to
+    // peers, but it is only needed once a corrupt SSTable is actually found
+    // (the rare case). Taking a closure keeps the common healthy path from
+    // probing every peer for every table every self-heal tick.
+    replica_posture: impl FnOnce() -> ReplicaPosture,
 ) -> Option<TableIssue> {
-    let corrupt = StorageEngine::scan_table_dir_for_corrupt(table_dir);
+    let corrupt = StorageEngine::scan_table_dir_for_corrupt(table_dir, verified);
     if corrupt.is_empty() {
         return None;
     }
+    let replica_posture = replica_posture();
 
     // LOUD, ALWAYS — independent of remediation (FMEA #6 / "logs warnings if
     // data has issues").
@@ -75,8 +85,12 @@ mod tests {
         metrics::_reset_self_heal_metrics_for_tests();
         let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
         let table = TableKey::new("test_ks", "test_table");
-        let issue =
-            detect_corrupt_sstables(&table, &table_dir, ReplicaPosture::HealthyReplicaAvailable);
+        let issue = detect_corrupt_sstables(
+            &table,
+            &table_dir,
+            &mut std::collections::BTreeSet::new(),
+            || ReplicaPosture::HealthyReplicaAvailable,
+        );
         assert!(issue.is_none(), "healthy table → no issue");
         assert_eq!(
             metrics::self_heal_metrics().corrupt_sstable_detected_total,
@@ -94,14 +108,51 @@ mod tests {
         let table = TableKey::new("test_ks", "test_table");
         // SingleNode posture → remediation will be refused. Detection still
         // fires (loud-on-issue, FMEA #6).
-        let issue = detect_corrupt_sstables(&table, &table_dir, ReplicaPosture::SingleNode)
-            .expect("corruption must surface an issue");
+        let issue = detect_corrupt_sstables(
+            &table,
+            &table_dir,
+            &mut std::collections::BTreeSet::new(),
+            || ReplicaPosture::SingleNode,
+        )
+        .expect("corruption must surface an issue");
         assert_eq!(issue.kind, IssueKind::CorruptSstables);
         assert_eq!(issue.corrupt_sstables.len(), 1);
         assert_eq!(issue.corrupt_sstables[0].generation, corrupted_gen);
         assert_eq!(
             metrics::self_heal_metrics().corrupt_sstable_detected_total,
             1
+        );
+    }
+
+    /// SSTable generations are immutable: once smoke-tested OK they are cached
+    /// in `verified` and MUST be skipped on later scans, so the periodic
+    /// self-heal corruption scan does not re-read every SSTable's rows every
+    /// tick (the idle-CPU spin, ../specs/bug-idle-cpu-spin-3cores.md).
+    #[test]
+    #[serial]
+    fn scan_skips_already_verified_generations() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
+        corrupt_one_generation(&table_dir);
+
+        // Fresh cache → the corrupt generation IS detected.
+        let mut fresh = std::collections::BTreeSet::new();
+        assert!(
+            !StorageEngine::scan_table_dir_for_corrupt(&table_dir, &mut fresh).is_empty(),
+            "corruption must be detected on a fresh scan"
+        );
+
+        // Cache marking every current generation as already verified → the
+        // generations are skipped (not re-smoke-tested), so even the corrupt
+        // one is not re-read. Proves the immutable-generation skip that
+        // eliminates the per-tick full re-scan.
+        let mut verified: std::collections::BTreeSet<u64> =
+            StorageEngine::list_generations_in_dir(&table_dir)
+                .into_iter()
+                .collect();
+        assert!(
+            StorageEngine::scan_table_dir_for_corrupt(&table_dir, &mut verified).is_empty(),
+            "generations already in the verified cache must be skipped, not re-smoke-tested"
         );
     }
 }
