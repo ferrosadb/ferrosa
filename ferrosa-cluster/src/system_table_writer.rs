@@ -29,18 +29,42 @@ fn now_micros() -> i64 {
 /// Holds an `Arc<StorageEngine>` and translates `SystemTableMutation` values
 /// into `StorageEngine::write()` calls. Each mutation writes to the appropriate
 /// system table (`system_schema.*` or `system_auth.*`).
+#[derive(Clone)]
 pub struct SystemTableWriter {
     engine: Arc<StorageEngine>,
+    /// Test-only observability seam: records the OS thread on which the most
+    /// recent [`SystemTableWriter::apply`] ran. The raft apply-offload
+    /// regression test uses this to prove the synchronous system-table write
+    /// executes on a blocking thread rather than inline on the raft worker.
+    /// Per-instance (not global) so parallel tests cannot race the recording.
+    #[cfg(test)]
+    last_apply_thread: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
 }
 
 impl SystemTableWriter {
     /// Create a new writer backed by the given storage engine.
     pub fn new(engine: Arc<StorageEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            #[cfg(test)]
+            last_apply_thread: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Test-only handle to the thread recorder; see [`Self::last_apply_thread`].
+    #[cfg(test)]
+    pub(crate) fn last_apply_thread_handle(
+        &self,
+    ) -> Arc<std::sync::Mutex<Option<std::thread::ThreadId>>> {
+        Arc::clone(&self.last_apply_thread)
     }
 
     /// Apply a system table mutation by writing to the storage engine.
     pub fn apply(&self, mutation: SystemTableMutation) -> ferrosa_common::Result<()> {
+        #[cfg(test)]
+        {
+            *self.last_apply_thread.lock().unwrap() = Some(std::thread::current().id());
+        }
         match mutation {
             SystemTableMutation::KeyspaceCreated(ks) => {
                 let (key, row, ts) = keyspace_to_row(&ks);
