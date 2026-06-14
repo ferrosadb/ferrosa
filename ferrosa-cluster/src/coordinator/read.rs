@@ -153,17 +153,37 @@ fn encode_read_request(payload: &ReadRequestPayload) -> Bytes {
     Bytes::from(bincode::serialize(payload).unwrap_or_default())
 }
 
-fn read_local_partition(
-    storage: &ferrosa_storage::StorageEngine,
-    table_id: &TableId,
-    key: &DecoratedKey,
+/// Read a partition from the local storage engine.
+///
+/// The storage read is synchronous and, on an evicted-SSTable miss, performs
+/// blocking I/O (S3 rehydration, `std::fs`, a `std::sync::Mutex` guard). It is
+/// offloaded to a blocking thread via [`TaskPool::spawn_blocking`] — mirroring
+/// the range-scan path in `ferrosa-storage`'s `TableStore` — so it never parks
+/// an async worker thread (raft apply, coordinator, CQL handler). Args are
+/// owned so they can move into the `'static` blocking closure.
+///
+/// A `JoinError` from the blocking pool is mapped to a loud `Storage` error
+/// rather than swallowed, so a panicked read surfaces instead of masquerading
+/// as a missing partition.
+async fn read_local_partition(
+    storage: &std::sync::Arc<ferrosa_storage::StorageEngine>,
+    table_id: TableId,
+    key: DecoratedKey,
     row_limit: usize,
-    clustering: Option<&[u8]>,
+    clustering: Option<Vec<u8>>,
 ) -> ferrosa_common::Result<Option<Partition>> {
-    match clustering {
-        Some(clustering) => storage.read_clustering_row(table_id, key, clustering),
-        None => storage.read_limited_rows(table_id, key, row_limit),
-    }
+    let storage = std::sync::Arc::clone(storage);
+    ferrosa_common::task_pool::TaskPool::current("coordinator-local-read")
+        .spawn_blocking(move || match clustering {
+            Some(clustering) => storage.read_clustering_row(&table_id, &key, &clustering),
+            None => storage.read_limited_rows(&table_id, &key, row_limit),
+        })
+        .await
+        .map_err(|e| {
+            ferrosa_common::Error::Io(std::io::Error::other(format!(
+                "local partition read task failed: {e}"
+            )))
+        })?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,7 +199,7 @@ async fn digest_read_attempt(
     clustering: Option<Vec<u8>>,
 ) -> ReplicaRead {
     if replica_id == local_node_id {
-        match read_local_partition(&storage, &table_id, &key, row_limit, clustering.as_deref()) {
+        match read_local_partition(&storage, table_id, key, row_limit, clustering).await {
             Ok(Some(p)) => {
                 use crate::raft::handlers::compute_partition_digest;
                 let ts = p
@@ -515,13 +535,9 @@ impl ClusterCoordinator {
                 async move {
                     if full_replica == local_node_id {
                         // Local full read.
-                        match read_local_partition(
-                            &storage,
-                            &table_id,
-                            &key,
-                            row_limit,
-                            clustering.as_deref(),
-                        ) {
+                        match read_local_partition(&storage, table_id, key, row_limit, clustering)
+                            .await
+                        {
                             Ok(opt) => ReplicaRead::Full(opt),
                             Err(_) => ReplicaRead::Failed,
                         }
@@ -833,9 +849,16 @@ impl ClusterCoordinator {
 
         for &target in &candidates {
             if target == self.local_node_id {
-                match read_local_partition(&self.storage, table_id, key, row_limit, clustering)
-                    .map(|opt| opt.map(|p| p.rows))
-                    .map_err(ClusterError::Storage)
+                match read_local_partition(
+                    &self.storage,
+                    table_id.clone(),
+                    key.clone(),
+                    row_limit,
+                    clustering.map(<[u8]>::to_vec),
+                )
+                .await
+                .map(|opt| opt.map(|p| p.rows))
+                .map_err(ClusterError::Storage)
                 {
                     Ok(Some(rows)) if !rows.is_empty() => return Ok(Some(rows)),
                     Ok(_) => continue, // no data on this replica, try next
@@ -1799,6 +1822,124 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// CL=ONE, local replica: should read directly from storage.
+    /// RED for the point-read worker-thread offload.
+    ///
+    /// `read_local_partition` must run the (synchronous, potentially blocking)
+    /// storage read on a tokio blocking thread, not inline on the async runtime
+    /// worker. We make the read deterministically exercise the blocking
+    /// evicted-SSTable miss path by deleting the `Data.db` after flush and
+    /// serving the addressed range from a backup via a path-scoped
+    /// `file_read_range_hook`. The hook records the OS thread it runs on; with
+    /// the fix that thread differs from the single async worker, proving the
+    /// read was offloaded. With the pre-fix inline call it equals the worker
+    /// thread.
+    #[test]
+    fn local_read_runs_off_the_async_worker_thread() {
+        use std::sync::Mutex as StdMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        storage
+            .write(&table_id, &key, test_row(1000), 1000)
+            .unwrap();
+        storage.flush(&table_id).unwrap();
+
+        // Locate the flushed Data.db component(s) for this table and back them
+        // up, then evict (delete) them so reads fall through to the range hook.
+        let table_sstable_dir = dir.path().join("sstables").join(table_id.to_string());
+        let backup_dir = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let mut evicted_data: std::collections::HashMap<std::path::PathBuf, Vec<u8>> =
+            std::collections::HashMap::new();
+        for entry in std::fs::read_dir(&table_sstable_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.to_string_lossy().ends_with("-Data.db") {
+                let bytes = std::fs::read(&path).unwrap();
+                evicted_data.insert(path.clone(), bytes);
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        assert!(
+            !evicted_data.is_empty(),
+            "test setup: expected at least one Data.db to evict"
+        );
+
+        // Path-scoped hooks that record the executing thread and serve the
+        // evicted Data.db from the in-memory backup. All three read hooks are
+        // registered so we capture whichever the read path exercises; each
+        // returns a pass-through (`Ok(None)`/`Ok(false)`) for paths it does not
+        // own, so it never interferes with other tests.
+        let observed_thread: Arc<StdMutex<Option<std::thread::ThreadId>>> =
+            Arc::new(StdMutex::new(None));
+        {
+            let observed = observed_thread.clone();
+            let data = evicted_data.clone();
+            ferrosa_sstable::io::register_file_read_range_hook(Arc::new(
+                move |path, offset, len| {
+                    let Some(bytes) = data.get(path) else {
+                        return Ok(None);
+                    };
+                    *observed.lock().unwrap() = Some(std::thread::current().id());
+                    let start = (offset as usize).min(bytes.len());
+                    let end = (start + len).min(bytes.len());
+                    Ok(Some(bytes[start..end].to_vec()))
+                },
+            ));
+        }
+        {
+            let observed = observed_thread.clone();
+            let data = evicted_data.clone();
+            ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
+                let Some(bytes) = data.get(path) else {
+                    return Ok(None);
+                };
+                *observed.lock().unwrap() = Some(std::thread::current().id());
+                Ok(Some(bytes.len() as u64))
+            }));
+        }
+        {
+            let observed = observed_thread.clone();
+            let data = evicted_data.clone();
+            ferrosa_sstable::io::register_file_read_rehydration_hook(Arc::new(move |path| {
+                let Some(bytes) = data.get(path) else {
+                    return Ok(false);
+                };
+                *observed.lock().unwrap() = Some(std::thread::current().id());
+                std::fs::write(path, bytes)?;
+                Ok(true)
+            }));
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (worker_thread, result_rows) = rt.block_on(async move {
+            let worker = std::thread::current().id();
+            let result = read_local_partition(&storage, table_id.clone(), key.clone(), 0, None)
+                .await
+                .unwrap();
+            (worker, result.map(|p| p.rows.len()).unwrap_or(0))
+        });
+
+        assert_eq!(result_rows, 1, "read should return the written row");
+        let read_thread = observed_thread
+            .lock()
+            .unwrap()
+            .expect("range hook must have served the evicted Data.db read");
+        assert_ne!(
+            read_thread, worker_thread,
+            "local read ran inline on the async worker thread instead of \
+             being offloaded to a blocking thread"
+        );
+    }
+
     #[tokio::test]
     async fn coordinate_read_local_replica_returns_data() {
         let dir = tempfile::tempdir().unwrap();
