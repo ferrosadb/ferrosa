@@ -17070,6 +17070,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn fulltext_index_fts_match_reads_unflushed_memtable_row() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE fts_mem WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fts_mem.docs (id int PRIMARY KEY, body text)",
+            "CREATE INDEX docs_fts ON fts_mem.docs (body) USING 'fulltext'",
+            "INSERT INTO fts_mem.docs (id, body) VALUES (1, 'ferrosaftsfresh native fts probe body')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT id FROM fts_mem.docs WHERE body = fts_match('ferrosaftsfresh')",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "fts_match query errored: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "fts_match must return a row that is still only in the memtable"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     /// Phonetic index: equality on regular column (not part of PK) matches
     /// by Double Metaphone. This exercises the index-based scan path.
     #[tokio::test]

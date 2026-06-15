@@ -4232,6 +4232,82 @@ impl<F: FlushTarget> TableStore<F> {
         &self.fulltext_indexes
     }
 
+    /// Search active/flushing memtables for a declared full-text index.
+    ///
+    /// Persisted FTI sidecars are produced only on flush, so read-after-write
+    /// queries must also consult the live memtable tiers. This builds a small
+    /// transient FTI over the current memtable snapshots and runs the same query
+    /// evaluator used by sidecar readers so fresh rows and flushed rows follow
+    /// the same matching semantics.
+    pub fn fulltext_memtable_search(
+        &self,
+        index_name: &str,
+        query: &str,
+    ) -> ferrosa_common::Result<Vec<(Vec<u8>, f64)>> {
+        use ferrosa_index::fulltext::builder::{serialize_fti, FullTextIndexBuilder};
+        use ferrosa_index::fulltext::query::parse_fts_query;
+        use ferrosa_index::fulltext::reader::FullTextIndexReader;
+
+        let Some((_, col_pos)) = self
+            .fulltext_indexes
+            .iter()
+            .find(|(name, _)| name == index_name)
+        else {
+            return Ok(vec![]);
+        };
+
+        let parsed_query = parse_fts_query(query).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}"))
+        })?;
+
+        let guard = self.view.load();
+        let mut builder = FullTextIndexBuilder::new();
+        let mut add_partitions = |partitions: Vec<Partition>| {
+            for partition in partitions {
+                let pk_bytes = partition.key.key.as_bytes().to_vec();
+                let mut text = String::new();
+                for row in &partition.rows {
+                    for (col_idx, cell) in &row.cells {
+                        if *col_idx as usize == *col_pos {
+                            if let Some(ref val) = cell.value {
+                                if let Ok(s) = std::str::from_utf8(val) {
+                                    text.push_str(s);
+                                    text.push(' ');
+                                }
+                            }
+                        }
+                    }
+                }
+                if !text.is_empty() {
+                    builder.add_document(pk_bytes, text.trim());
+                }
+            }
+        };
+        add_partitions(guard.active.snapshot());
+        if let Some(ref flushing) = guard.flushing {
+            add_partitions(flushing.snapshot());
+        }
+        drop(guard);
+
+        let fti = builder.build();
+        if fti.doc_count == 0 {
+            return Ok(vec![]);
+        }
+
+        let bytes = serialize_fti(&fti).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match memtable index error: {e}"))
+        })?;
+        let reader = FullTextIndexReader::open(bytes).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match memtable index error: {e}"))
+        })?;
+
+        Ok(reader
+            .search(&parsed_query)
+            .into_iter()
+            .map(|hit| (hit.partition_key, hit.score))
+            .collect())
+    }
+
     /// Register a full-text index for this table.
     pub fn add_fulltext_index(&mut self, index_name: String, column_position: usize) {
         if !self.fulltext_indexes.iter().any(|(n, _)| n == &index_name) {
