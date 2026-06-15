@@ -194,19 +194,25 @@ jobs:
     runs-on: ubuntu-latest
     # Was 10 min and timed out nightly (image build + 2-node bring-up + smoke
     # exceeds 10 min on the runner). Give it headroom to complete.
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Run Docker smoke test
+        env:
+          PAIR_CQL_TIMEOUT: 180
         run: bash tests/docker-smoke.sh
 
       - name: Collect Docker logs on failure
         if: failure()
         run: |
-          docker compose logs node1 > node1.log 2>&1 || true
-          docker compose logs node2 > node2.log 2>&1 || true
+          docker compose ps > docker-compose-ps.log 2>&1 || true
+          for service in node1 node2 node3 rustfs rustfs-init; do
+            if [ ! -s "${service}.log" ]; then
+              docker compose logs "$service" > "${service}.log" 2>&1 || true
+            fi
+          done
 
       - name: Upload Docker logs
         if: failure()
@@ -214,8 +220,12 @@ jobs:
         with:
           name: docker-smoke-logs
           path: |
+            docker-compose-ps.log
             node1.log
             node2.log
+            node3.log
+            rustfs.log
+            rustfs-init.log
           retention-days: 14
 
       - name: Cleanup
