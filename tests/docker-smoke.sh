@@ -127,6 +127,18 @@ collect_default_compose_logs() {
     done
 }
 
+preflight_fail() {
+    echo -e "${RED}FAIL${NC}: $1"
+    exit 1
+}
+
+require_command() {
+    local name=$1
+    if ! command -v "$name" >/dev/null 2>&1; then
+        preflight_fail "Required command not found: $name"
+    fi
+}
+
 pass() { echo -e "${GREEN}PASS${NC}: $1"; }
 fail() {
     echo -e "${RED}FAIL${NC}: $1"
@@ -217,6 +229,10 @@ cleanup() {
     docker compose down -v --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT
+
+require_command docker
+require_command cqlsh
+require_command curl
 
 # Helper: run CQL and capture output (suppress cqlsh version warnings)
 cql1() { cqlsh localhost 9042 -e "$1" 2>/dev/null; }
