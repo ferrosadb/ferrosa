@@ -5746,6 +5746,19 @@ impl StorageEngine {
             .collect();
 
         let mut score_map: HashMap<Vec<u8>, f64> = HashMap::new();
+        {
+            let tables = self.tables.read();
+            let Some(state) = tables.get(table_id) else {
+                return Ok(vec![]);
+            };
+            for (partition_key, score) in state.store.fulltext_memtable_search(index_name, query)? {
+                let entry = score_map.entry(partition_key).or_insert(0.0);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
+        }
+
         for fti_path in fti_files {
             let bytes = match std::fs::read(&fti_path) {
                 Ok(b) => b,
@@ -17788,6 +17801,40 @@ mod tests {
         assert!(
             !result_keys.contains(&"r3".to_string()),
             "r3 has neither term"
+        );
+    }
+
+    #[test]
+    fn fts_query_sees_unflushed_memtable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        engine
+            .write(
+                &tid,
+                &make_key("fresh"),
+                make_row(b"ferrosaftsfresh native fts probe body", 1000),
+                1000,
+            )
+            .unwrap();
+
+        let results = engine
+            .fulltext_search(&tid, "idx_body", "ferrosaftsfresh")
+            .unwrap();
+        let result_keys: Vec<String> = results
+            .iter()
+            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .collect();
+
+        assert_eq!(
+            result_keys,
+            vec!["fresh".to_string()],
+            "fts_match must include rows that are still only in the active memtable"
         );
     }
 
