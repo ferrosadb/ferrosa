@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<!-- ferrosadb.com marketing site -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How Ferrosa Memory Works — Architecture, Retrieval &amp; Auditable Forgetting</title>
+  <meta name="description" content="How Ferrosa Memory works: the agent → MCP → memory-semantics → Ferrosa DB architecture, the memory primitives, hybrid Reciprocal Rank Fusion retrieval, dream-cycle consolidation, auditable forgetting, and the hook-driven session lifecycle.">
+  <link rel="icon" type="image/svg+xml" href="assets/brand/fm-logo.svg">
+  <style>
+    :root {
+      --bg-primary: #05070c;
+      --bg-secondary: #09111f;
+      --bg-card: #0e1828;
+      --bg-card-hover: #142337;
+      --text-primary: #e8eef7;
+      --text-secondary: #9fb0c6;
+      --text-muted: #647794;
+      --accent: #348cff;
+      --accent-glow: rgba(52, 140, 255, 0.18);
+      --accent-secondary: #7ee7ff;
+      --accent-cool: #7ee7ff;
+      --accent-steel: #516d92;
+      --accent-green: #6bc9a0;
+      --border: #17273d;
+      --border-hover: #25395a;
+      --code-bg: #060b14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Navigation ── */
+    nav {
+      position: fixed;
+      top: 0;
+      width: 100%;
+      z-index: 100;
+      background: rgba(5, 7, 12, 0.85);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+    }
+
+    nav .nav-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+
+    nav .logo {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      text-decoration: none;
+    }
+
+    nav .logo span { color: var(--accent); }
+
+    nav .nav-links {
+      display: flex;
+      gap: 2rem;
+      list-style: none;
+    }
+
+    nav .nav-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    nav .nav-links a:hover { color: var(--text-primary); }
+
+    nav .nav-cta {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.5rem 1.25rem;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+
+    nav .nav-cta:hover { opacity: 0.9; }
+
+    nav .nav-toggle {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 2.5rem;
+      height: 2.5rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-card);
+      color: var(--text-primary);
+      cursor: pointer;
+    }
+
+    nav .nav-toggle span,
+    nav .nav-toggle span::before,
+    nav .nav-toggle span::after {
+      display: block;
+      width: 1.1rem;
+      height: 2px;
+      border-radius: 2px;
+      background: currentColor;
+      content: '';
+      transition: transform 0.2s, opacity 0.2s;
+    }
+
+    nav .nav-toggle span { position: relative; }
+    nav .nav-toggle span::before { position: absolute; transform: translateY(-6px); }
+    nav .nav-toggle span::after { position: absolute; transform: translateY(6px); }
+
+    nav.nav-open .nav-toggle span { background: transparent; }
+    nav.nav-open .nav-toggle span::before { background: var(--text-primary); transform: rotate(45deg); }
+    nav.nav-open .nav-toggle span::after { background: var(--text-primary); transform: rotate(-45deg); }
+
+    /* ── Sections ── */
+    section {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 6rem 2rem;
+    }
+
+    /* ── Hero ── */
+    .hero {
+      padding-top: 11rem;
+      padding-bottom: 6rem;
+      text-align: center;
+      position: relative;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -60%);
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-logo {
+      width: 88px;
+      height: 88px;
+      border-radius: 22px;
+      margin: 0 auto 1.75rem;
+      display: block;
+      box-shadow: 0 10px 40px rgba(52, 140, 255, 0.25);
+      position: relative;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 0.375rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2rem;
+    }
+
+    .hero-badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .hero h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 1.5rem;
+      position: relative;
+    }
+
+    .hero h1 .gradient {
+      background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero p {
+      font-size: 1.25rem;
+      color: var(--text-secondary);
+      max-width: 680px;
+      margin: 0 auto 2.5rem;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 30px var(--accent-glow);
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      border: 1px solid var(--border);
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--border-hover);
+      background: var(--bg-card-hover);
+    }
+
+    /* ── Section headers ── */
+    .section-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1rem;
+    }
+
+    .section-title {
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+      line-height: 1.15;
+    }
+
+    .section-subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      max-width: 680px;
+      line-height: 1.7;
+    }
+
+    .section-subtitle.centered {
+      margin: 0 auto;
+      text-align: center;
+    }
+
+    .section-title.centered { text-align: center; }
+    .section-label.centered { text-align: center; }
+
+    /* ── Problem section ── */
+    .problem {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .problem section { padding: 5rem 2rem; }
+
+    /* ── Feature grid ── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2.25rem;
+      transition: border-color 0.2s, transform 0.15s;
+    }
+
+    .feature-card:hover {
+      border-color: var(--border-hover);
+      transform: translateY(-2px);
+    }
+
+    .feature-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .feature-icon.steel { background: rgba(52, 140, 255, 0.14); }
+    .feature-icon.cyan { background: rgba(126, 231, 255, 0.14); }
+    .feature-icon.cql { background: rgba(124, 156, 245, 0.12); }
+    .feature-icon.graph { background: rgba(107, 201, 160, 0.12); }
+    .feature-icon.lock { background: rgba(200, 130, 240, 0.12); }
+    .feature-icon.index { background: rgba(100, 200, 220, 0.12); }
+    .feature-icon.observe { background: rgba(240, 200, 100, 0.12); }
+
+    .feature-card h3 {
+      font-size: 1.1875rem;
+      font-weight: 700;
+      margin-bottom: 0.625rem;
+    }
+
+    .feature-card p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.65;
+    }
+
+    /* ── Comparison table ── */
+    .comparison {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .comparison-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 3rem;
+      font-size: 0.9375rem;
+    }
+
+    .comparison-table th,
+    .comparison-table td {
+      text-align: left;
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .comparison-table thead th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .comparison-table thead th:first-child { color: var(--text-secondary); }
+
+    .comparison-table thead th.ferrosa-col {
+      color: var(--accent);
+    }
+
+    .comparison-table tbody td:first-child {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .comparison-table tbody td {
+      color: var(--text-secondary);
+    }
+
+    .comparison-table tbody td.ferrosa-col {
+      color: var(--accent-green);
+      font-weight: 600;
+    }
+
+    .comparison-table tbody tr:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .check { color: var(--accent-green); }
+    .cross { color: var(--text-muted); }
+
+    /* ── CTA section ── */
+    .cta-section {
+      text-align: center;
+      padding: 6rem 2rem;
+    }
+
+    .cta-section h2 {
+      font-size: clamp(2rem, 4vw, 3rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+
+    .cta-section p {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2.5rem;
+      max-width: 520px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    /* ── Beta Banner ── */
+    .beta-banner {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      text-align: center;
+      padding: 0.5rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      position: fixed;
+      top: 64px;
+      width: 100%;
+      z-index: 99;
+    }
+
+    .beta-tag {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 0.125rem 0.5rem;
+      border-radius: 4px;
+      margin-right: 0.375rem;
+      vertical-align: middle;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 768px) {
+      .features-grid { grid-template-columns: 1fr; }
+      nav { padding: 0 1rem; }
+      nav .nav-inner {
+        height: 64px;
+        min-height: 64px;
+        gap: 0.75rem;
+        padding: 0;
+        position: relative;
+      }
+      body { overflow-x: hidden; }
+      nav .logo { margin-right: auto; }
+      nav .nav-cta {
+        display: inline-flex;
+        flex-shrink: 0;
+        padding: 0.5rem 0.75rem;
+      }
+      nav .nav-toggle { display: inline-flex; }
+      nav .nav-links {
+        position: fixed;
+        top: 64px;
+        left: 0;
+        right: 0;
+        display: none;
+        flex-direction: column;
+        gap: 0;
+        padding: 0.5rem 1rem 1rem;
+        background: rgba(5, 7, 12, 0.98);
+        border-bottom: 1px solid var(--border);
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+      }
+      nav.nav-open .nav-links { display: flex; }
+      nav .nav-links li { list-style: none; }
+      nav .nav-links a {
+        display: block;
+        padding: 0.75rem 0;
+        white-space: nowrap;
+      }
+      section {
+        width: 100%;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        overflow-wrap: anywhere;
+      }
+      .hero { padding-top: 11rem; }
+      .hero h1 { font-size: clamp(2rem, 11vw, 3rem); }
+      .hero p { font-size: 1rem; }
+      .hero-actions { flex-direction: column; align-items: stretch; }
+      .btn-primary,
+      .btn-secondary { width: 100%; text-align: center; }
+      .beta-banner { top: 148px; font-size: 0.75rem; }
+      .comparison-table { font-size: 0.8125rem; }
+      .comparison-table th,
+      .comparison-table td { padding: 0.75rem 0.75rem; }
+    }
+  </style>
+
+<style>
+  .suite-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:1.5rem; margin-top:2.5rem; }
+  .suite-card { background: var(--bg-card); border:1px solid var(--border); border-radius:18px; padding:2rem; text-decoration:none; transition:border-color .2s, transform .2s, background .2s; }
+  .suite-card:hover { border-color:var(--accent); transform:translateY(-2px); background:var(--bg-card-hover); }
+  .kicker { color:var(--accent); font-size:.75rem; letter-spacing:.12em; font-weight:800; text-transform:uppercase; margin-bottom:.75rem; }
+  .cool { color:var(--accent-cool); }
+  .pill-row { display:flex; flex-wrap:wrap; gap:.5rem; margin:1.25rem 0; }
+  .pill { border:1px solid var(--border); background:var(--bg-secondary); color:var(--text-secondary); border-radius:999px; padding:.35rem .75rem; font-size:.8125rem; }
+  .doc-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:1rem; margin-top:1.5rem; }
+  .doc-card { background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:1.4rem; transition:border-color .2s; }
+  .doc-card:hover { border-color:var(--border-hover); }
+  .doc-card h3 { margin-bottom:.5rem; }
+  .doc-card p, .suite-card p { color:var(--text-secondary); }
+  .doc-card .tag { display:inline-block; font-family:var(--font-mono); font-size:.72rem; color:var(--accent-cool); margin-bottom:.5rem; letter-spacing:.04em; }
+  .code-block { background:var(--code-bg); border:1px solid var(--border); border-radius:14px; padding:1.25rem; overflow:auto; margin:1rem 0; }
+  .code-block code, pre { font-family:var(--font-mono); font-size:.875rem; color:#cfe0f5; }
+  .note { border-left:3px solid var(--accent-cool); background:rgba(126,231,255,.08); padding:1rem 1.25rem; border-radius:0 12px 12px 0; color:var(--text-secondary); margin:1.5rem 0; }
+  .two-col { display:grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap:2rem; align-items:start; }
+
+  .reference-table-wrap { margin-top:1.5rem; border:1px solid var(--border); border-radius:16px; overflow:hidden; background:rgba(255,255,255,.02); }
+  .reference-table { width:100%; border-collapse:collapse; font-size:.875rem; }
+  .reference-table caption { text-align:left; padding:1rem 1.1rem; color:var(--text-secondary); border-bottom:1px solid var(--border); }
+  .reference-table th { text-align:left; padding:.75rem 1rem; color:var(--text-muted); font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; background:rgba(255,255,255,.025); border-bottom:1px solid var(--border); }
+  .reference-table td { padding:.8rem 1rem; color:var(--text-secondary); border-bottom:1px solid rgba(255,255,255,.055); vertical-align:top; }
+  .reference-table tr:last-child td { border-bottom:0; }
+  .reference-table a { color:var(--text-primary); text-decoration:none; border-bottom:1px solid rgba(126,231,255,.35); }
+  .reference-table a:hover { color:var(--accent-cool); border-bottom-color:var(--accent-cool); }
+  .reference-table .ref-id { color:var(--accent-cool); font-family:var(--font-mono); white-space:nowrap; }
+  .reference-table .ref-theme { color:var(--text-muted); white-space:nowrap; }
+  @media (max-width: 760px) { .reference-table th:nth-child(3), .reference-table td:nth-child(3) { display:none; } }
+  @media (max-width: 800px) { .two-col { grid-template-columns:1fr; } }
+</style>
+
+<style>
+  /* Layered architecture diagram — built only from existing palette tokens. */
+  .arch-diagram { display:flex; flex-direction:column; gap:.75rem; margin:1rem 0; }
+  .arch-layer { border:1px solid var(--border); border-radius:14px; padding:1.1rem 1.25rem; background:var(--bg-card); }
+  .arch-layer .arch-role { font-family:var(--font-mono); font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted); margin-bottom:.4rem; }
+  .arch-layer .arch-name { font-weight:700; color:var(--text-primary); }
+  .arch-layer .arch-detail { color:var(--text-secondary); font-size:.9rem; margin-top:.35rem; }
+  .arch-layer.agent { border-color:var(--accent-steel); }
+  .arch-layer.mcp { border-color:var(--accent); }
+  .arch-layer.semantics { border-color:var(--accent-cool); }
+  .arch-layer.db { border-color:var(--accent-green); }
+  .arch-arrow { text-align:center; color:var(--accent-cool); font-family:var(--font-mono); font-size:1rem; line-height:1; }
+  .arch-chips { display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.55rem; }
+  .arch-chip { border:1px solid var(--border); background:var(--bg-secondary); color:var(--text-secondary); border-radius:999px; padding:.25rem .6rem; font-size:.74rem; font-family:var(--font-mono); }
+  .signal-list { list-style:none; margin-top:1.25rem; display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:.6rem; }
+  .signal-list li { border:1px solid var(--border); border-radius:10px; padding:.7rem .9rem; background:var(--bg-card); color:var(--text-secondary); font-size:.9rem; }
+  .signal-list li b { color:var(--text-primary); font-weight:650; }
+  .step-row { display:grid; grid-template-columns: auto 1fr; gap:1rem; align-items:start; margin-top:1.1rem; }
+  .step-num { width:2rem; height:2rem; flex:none; border-radius:8px; background:rgba(52,140,255,.14); color:var(--accent); font-weight:800; font-family:var(--font-mono); display:flex; align-items:center; justify-content:center; }
+  .step-row p { color:var(--text-secondary); }
+  .step-row h4 { font-size:1.0625rem; font-weight:700; margin-bottom:.25rem; }
+</style>
+
+</head>
+<body>
+<!-- ═══════════════════ Navigation ═══════════════════ -->
+<nav>
+  <div class="nav-inner">
+    <a href="/" class="logo" style="display:flex;align-items:center;gap:0.5rem;">
+      <img src="assets/brand/fm-logo.svg" alt="Fm" width="28" height="28" style="border-radius:7px;">
+      ferrosa <span>memory</span>
+    </a>
+    <ul class="nav-links" id="site-nav-links">
+      <li><a href="./">Overview</a></li>
+      <li><a href="how-it-works.html">How it works</a></li>
+      <li><a href="tools.html">Tools</a></li>
+      <li><a href="compare.html">Compare</a></li>
+      <li><a href="getting-started.html">Setup</a></li>
+      <li><a href="../database/">Database</a></li>
+      <li><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+    </ul>
+    <a href="how-it-works.html" class="nav-cta">How it works</a>
+    <button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav-links"><span></span></button>
+  </div>
+</nav>
+
+<div class="beta-banner">
+  <span class="beta-tag">Developer Preview</span> Ferrosa Memory 0.15 — structured, linked, auditable memory for agentic systems.
+</div>
+
+<!-- ═══════════════════ Hero ═══════════════════ -->
+<section class="hero">
+  <img class="hero-logo" src="assets/brand/fm-logo.svg" alt="Ferrosa Memory logo">
+  <div class="hero-badge"><span class="dot"></span> Architecture · 0.15 · Developer Preview</div>
+  <h1>How Ferrosa Memory <span class="gradient">works.</span></h1>
+  <p>A thin memory layer over a real database — typed graph, bi-temporal facts, hybrid retrieval, background consolidation, and auditable forgetting — all reachable through MCP tools.</p>
+  <div class="hero-actions">
+    <a href="#architecture" class="btn-primary">Start with the architecture</a>
+    <a href="tools.html" class="btn-secondary">Browse the tools</a>
+  </div>
+</section>
+
+<!-- ═══════════════════ Architecture ═══════════════════ -->
+<section id="architecture">
+  <div class="section-label cool">The architecture</div>
+  <h2 class="section-title">Four layers, one clear contract.</h2>
+  <p class="section-subtitle">An agent never talks to storage directly. It calls MCP tools; Ferrosa Memory owns the <em>semantics</em> of memory; and Ferrosa DB provides durable, indexed substrate underneath. Each layer has a single job, so the layer above can stay simple.</p>
+  <div class="two-col" style="margin-top:2.5rem;">
+    <div>
+      <p style="color:var(--text-secondary);">At the top, an agent, IDE, or runtime issues a small, stable set of MCP calls — ingest, retrieve, link, explain, forget. It does not know how a fact is stored, indexed, or ranked; it only knows the tool contract.</p>
+      <p style="color:var(--text-secondary); margin-top:1rem;">The memory service translates those calls into <em>memory semantics</em>: entities and typed edges, bi-temporal facts, trajectory folds, context segments, intentions, and the forget journal. This is where dedup, supersession, ranking, and consolidation policy live.</p>
+      <p style="color:var(--text-secondary); margin-top:1rem;">Underneath, Ferrosa DB does the heavy lifting: CQL storage for the wide-column tables, HNSW vector indexes for semantic recall, a property graph for traversal, and S3-backed durability with hot/warm/cold tiering so memory survives restarts and scales past a single process.</p>
+    </div>
+    <div>
+      <div class="arch-diagram">
+        <div class="arch-layer agent">
+          <div class="arch-role">Caller</div>
+          <div class="arch-name">Agent · IDE · Runtime</div>
+          <div class="arch-detail">Issues a stable MCP tool contract; carries no storage knowledge.</div>
+        </div>
+        <div class="arch-arrow">▼ &nbsp;MCP tools</div>
+        <div class="arch-layer mcp">
+          <div class="arch-role">Interface</div>
+          <div class="arch-name">MCP tool surface</div>
+          <div class="arch-detail">ingest · retrieve · link · explain · forget</div>
+        </div>
+        <div class="arch-arrow">▼</div>
+        <div class="arch-layer semantics">
+          <div class="arch-role">Memory semantics</div>
+          <div class="arch-name">Ferrosa Memory service</div>
+          <div class="arch-chips">
+            <span class="arch-chip">entities + graph</span>
+            <span class="arch-chip">bi-temporal facts</span>
+            <span class="arch-chip">folds + segments</span>
+            <span class="arch-chip">hybrid retrieval</span>
+            <span class="arch-chip">consolidation</span>
+            <span class="arch-chip">forget journal</span>
+          </div>
+        </div>
+        <div class="arch-arrow">▼</div>
+        <div class="arch-layer db">
+          <div class="arch-role">Substrate</div>
+          <div class="arch-name">Ferrosa Database</div>
+          <div class="arch-chips">
+            <span class="arch-chip">CQL storage</span>
+            <span class="arch-chip">HNSW vectors</span>
+            <span class="arch-chip">property graph</span>
+            <span class="arch-chip">S3 tiering</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="code-block" style="margin-top:2rem;"><pre><code>Agent / IDE / runtime
+        │  MCP tools  (ingest · retrieve · link · explain · forget)
+        ▼
+Ferrosa Memory service        ← owns memory *semantics*
+  ├─ entities + typed graph
+  ├─ bi-temporal facts (supersession)
+  ├─ trajectory folds + context segments
+  ├─ hybrid retrieval (Reciprocal Rank Fusion)
+  ├─ dream-cycle consolidation
+  └─ auditable forget journal
+        │
+        ▼
+Ferrosa Database              ← durable, indexed substrate
+  CQL storage · HNSW vectors · property graph · S3 hot/warm/cold tiering</code></pre></div>
+</section>
+
+<!-- ═══════════════════ Primitives ═══════════════════ -->
+<section id="primitives" class="problem">
+  <section>
+    <div class="section-label cool">The memory primitives</div>
+    <h2 class="section-title">Memory as structured data, not opaque text.</h2>
+    <p class="section-subtitle">A vector store gives you one shape: a blob with an embedding. Ferrosa Memory gives you the shapes agents actually reason over — and stores each one natively so it can be queried, linked, and explained.</p>
+    <div class="doc-grid">
+      <div class="doc-card">
+        <span class="tag">entities · graph</span>
+        <h3>Entities &amp; typed graph</h3>
+        <p>Named entities are deduplicated with phonetic matching (Double Metaphone) and connected by typed edges — <code>depends_on</code>, <code>contains</code>, <code>calls</code>, <code>uses</code>, <code>references</code>, <code>related_to</code> — alongside legacy bidirectional links like <code>CO_OCCURS_WITH</code> and <code>SUPERSEDES</code>. An agent can follow relationships, not just match strings.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">bi-temporal</span>
+        <h3>Bi-temporal facts</h3>
+        <p>Facts are timestamped and superseded rather than overwritten. Retrieval returns the most-recent-valid value by default, while the full supersession chain stays inspectable — so you can audit what was known, and when, and time-travel back through it.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">memoization</span>
+        <h3>Memoization</h3>
+        <p>A content-hash-keyed cache of completed sub-call results. When a deterministic sub-task recurs, the prior result is returned from cache instead of paying for a redundant LLM call — memory that saves work, not just stores it.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">plan trees</span>
+        <h3>Plan trees</h3>
+        <p>Hierarchical, depth-nested plan and task nodes capture how a complex job decomposes. When a sub-task returns, parent context is re-injected, so a deep agent keeps its place instead of losing the thread.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">trajectory folds</span>
+        <h3>Trajectory folds</h3>
+        <p>Open a fold for a sub-task, append turns as work proceeds, then seal it with a summary and an embedding (a <code>FOLDED_INTO</code> edge). Long trajectories compress into recallable units without throwing away the detail underneath.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">document chunks</span>
+        <h3>Document chunks</h3>
+        <p>Documents are stored as a hierarchy — document → section → chunk — with semantic previous/next links. When a search hits one chunk, <code>get_chunk_context</code> expands around it to recover the surrounding evidence a single hit would miss.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">context segments</span>
+        <h3>Context segments</h3>
+        <p>Raw conversation turns are persisted as deterministic semantic segments, dual-indexed for both lexical (BM25) and vector recall, with temporal previous/next links for bounded expansion windows. The transcript becomes searchable structure.</p>
+      </div>
+    </div>
+  </section>
+</section>
+
+<!-- ═══════════════════ Hybrid retrieval ═══════════════════ -->
+<section id="retrieval">
+  <div class="section-label cool">Hybrid retrieval</div>
+  <h2 class="section-title">One ranked answer, fused from many kinds of evidence.</h2>
+  <p class="section-subtitle">No single signal is enough — vectors miss exact strings, keywords miss paraphrase, and neither knows what matters in <em>this</em> workspace. Ferrosa Memory runs many retrievers and combines them with Reciprocal Rank Fusion, so a result that several independent signals agree on rises to the top.</p>
+
+  <h3 style="margin-top:2.5rem; font-size:1.25rem; font-weight:700;">The signals fused by RRF</h3>
+  <ul class="signal-list">
+    <li><b>Phonetic entity match</b> — fuzzy name recall via Double Metaphone.</li>
+    <li><b>Entity ANN</b> — approximate-nearest-neighbour over entity embeddings (HNSW).</li>
+    <li><b>Fold-summary ANN</b> — semantic recall over sealed trajectory summaries.</li>
+    <li><b>Context-segment BM25</b> — lexical match over raw conversation segments.</li>
+    <li><b>Context-segment ANN</b> — semantic match over the same segments.</li>
+    <li><b>Document-chunk BM25</b> — lexical match over document chunks.</li>
+    <li><b>Document-chunk ANN</b> — semantic match over document chunks.</li>
+    <li><b>Document phonetic</b> — phonetic match against document content.</li>
+    <li><b>Warmth / recency</b> — session-aware decay favouring recently relevant memory.</li>
+    <li><b>PageRank centrality</b> — graph-structural authority of an entity.</li>
+    <li><b>Feedback reputation</b> — accumulated user-feedback signal on past results.</li>
+  </ul>
+
+  <div class="two-col" style="margin-top:2.5rem;">
+    <div class="feature-card">
+      <div class="feature-icon cyan">⚖️</div>
+      <h3>Fusion, then judgment</h3>
+      <p>Optional <strong>query decomposition</strong> expands a request into lexical and LLM-generated variants before retrieval. Reciprocal Rank Fusion merges every signal's ranking into one list. <strong>Workspace-aware reranking</strong> then boosts or demotes results by the current working directory, so local context wins. An optional <strong>LLM judge / reranker</strong> can take a final pass — but it is <em>off by default</em>.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon steel">🔁</div>
+      <h3>A retrieval loop that learns</h3>
+      <p>Relevance feedback on a result set is recorded and folded back into the <em>feedback reputation</em> signal, so future rankings reflect what actually helped. Recall is treated as a system that improves with use — not a fixed similarity threshold frozen at index time.</p>
+    </div>
+  </div>
+  <div class="note">Retrieval is capability-tuned, not magic. The point of fusing eleven signals is robustness: a result wins because phonetic, lexical, semantic, structural, and behavioural evidence agree — not because one embedding happened to land close.</div>
+</section>
+
+<!-- ═══════════════════ Consolidation ═══════════════════ -->
+<section id="consolidation" class="comparison">
+  <section>
+    <div class="section-label cool">Dream-cycle consolidation</div>
+    <h2 class="section-title">Memory that gets better while the agent is idle.</h2>
+    <p class="section-subtitle">Human memory consolidates during rest. Ferrosa Memory does the same: a background "dream cycle" runs during idle periods — and after enough new ingests — turning a pile of fresh facts into linked, ranked, durable knowledge. You can also force a pass with <code>run_consolidation</code> at wrap-up.</p>
+    <div class="doc-grid">
+      <div class="doc-card"><span class="tag">triage</span><h3>Triage</h3><p>Newly ingested memories are sorted and prepared for deeper processing, separating signal worth linking from noise that can rest.</p></div>
+      <div class="doc-card"><span class="tag">connect</span><h3>Connection discovery</h3><p>Within-fold and pairwise analysis surfaces relationships between memories that arrived separately, proposing new edges across the graph.</p></div>
+      <div class="doc-card"><span class="tag">insight</span><h3>Insight generation</h3><p>Clusters of co-occurring entities are summarized into higher-level insights, so recurring patterns become first-class, retrievable memory.</p></div>
+      <div class="doc-card"><span class="tag">rank</span><h3>PageRank recompute</h3><p>Graph centrality is recomputed as the structure grows, keeping the authority signal that feeds retrieval current with the latest links.</p></div>
+      <div class="doc-card"><span class="tag">decay</span><h3>Ebbinghaus warmth decay</h3><p>An Ebbinghaus-style forgetting curve cools memory that hasn't been touched, so stale context fades in ranking instead of crowding fresh recall.</p></div>
+      <div class="doc-card"><span class="tag">materialize</span><h3>Materialization</h3><p>High-confidence derived predicates are materialized for fast reuse, so repeatedly inferred facts don't have to be recomputed on every query.</p></div>
+    </div>
+  </section>
+</section>
+
+<!-- ═══════════════════ Auditable forgetting ═══════════════════ -->
+<section id="forgetting">
+  <div class="section-label cool">Auditable forgetting</div>
+  <h2 class="section-title">The 0.15 headline: memory you can safely remove.</h2>
+  <p class="section-subtitle">Deleting a memory in a connected graph is dangerous — it can orphan edges, break temporal chains, and invalidate derived facts. So <code>forget</code> is two-phase: look before you leap, then leap with a receipt.</p>
+
+  <div class="step-row">
+    <div class="step-num">1</div>
+    <div>
+      <h4>Propose — read-only</h4>
+      <p>A hybrid search finds forget candidates and computes their <strong>blast radius</strong>: direct edges, temporal supersession chains, derived facts that reference the entity, and inbound references. Nothing is mutated. The phase returns a <strong>signed, TTL'd token</strong> describing exactly what would change.</p>
+    </div>
+  </div>
+  <div class="step-row">
+    <div class="step-num">2</div>
+    <div>
+      <h4>Confirm — write</h4>
+      <p>Confirmation replays the token under a <strong>TOCTOU guard</strong>: a <code>content_hash</code> check rejects the operation if the underlying memory changed since the proposal, so you never delete something other than what you reviewed. The change is recorded in an <strong>append-only ForgetJournal</strong> before any state is touched.</p>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:2.5rem;">
+    <div class="feature-card">
+      <div class="feature-icon lock">↩️</div>
+      <h3>Reversible retract vs. hard delete</h3>
+      <p>The default mode is a <strong>reversible retraction</strong> — a soft-delete to <code>state=unavailable</code> that hides the memory from recall but keeps it restorable via <code>restore_forgotten</code>. When you genuinely need it gone, a <strong>hard delete</strong> performs a graph <code>DETACH DELETE</code>. Both are journaled.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon observe">🛟</div>
+      <h3>Crash recovery</h3>
+      <p>Because every forget is journaled before it executes, a crash mid-operation can't leave memory half-deleted. A startup <strong>recovery sweep</strong> reprocesses incomplete forgets to a clean state — the append-only journal is the source of truth.</p>
+    </div>
+  </div>
+  <div class="note">Memory you can remove — and prove you removed correctly — is memory you can trust. The blast-radius preview, signed token, TOCTOU guard, and journal exist so that forgetting is a deliberate, auditable operation rather than a destructive guess.</div>
+</section>
+
+<!-- ═══════════════════ Hooks & lifecycle ═══════════════════ -->
+<section id="lifecycle" class="problem">
+  <section>
+    <div class="section-label cool">Hooks &amp; session lifecycle</div>
+    <h2 class="section-title">Memory that shows up at the right moment — and stays quiet otherwise.</h2>
+    <p class="section-subtitle">The best memory layer is one an agent doesn't have to think about. Ferrosa Memory wires into the session lifecycle through hooks, so recall and capture happen automatically, scoped to the workspace, and biased toward silence over noise.</p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon steel">🌅</div>
+        <h3>SessionStart recall</h3>
+        <p>When a session begins, a hook automatically runs <code>check_intentions</code> and a hybrid search for the current context — so the agent opens with what it already knows, before it reads a single file.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon cyan">✍️</div>
+        <h3>Turn capture</h3>
+        <p>A turn-capture hook persists conversation turns into context segments and queues consolidation, so today's work becomes tomorrow's recallable memory without an explicit save step.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon graph">🧭</div>
+        <h3>Workspace isolation</h3>
+        <p>0.15 derives stable, per-workspace hook sessions instead of leaning on process-global state — and fallback recall stays semantic and procedural, never a raw episodic transcript leaking across sessions.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon lock">🤫</div>
+        <h3>Prefer silence over noise</h3>
+        <p>Recall-relevance guards, lexical-overlap checks, and workspace filtering mean a hook would rather surface nothing than inject low-confidence context. Quiet recall keeps the agent's window clean.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon observe">⏳</div>
+        <h3>Intentions — prospective memory</h3>
+        <p><code>set_intention</code> defers an action to fire later on a Topic, FilePattern, Duration, or Context trigger; <code>check_intentions</code> fires the matching ones at session start. Memory remembers not just the past, but what to do next.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon index">📌</div>
+        <h3>Durable session tasks</h3>
+        <p>A focus stack, working set, and recovery hints survive restarts and support multi-agent handoff — so an interrupted agent can pick up exactly where the last one left off.</p>
+      </div>
+    </div>
+  </section>
+</section>
+
+<!-- ═══════════════════ CTA ═══════════════════ -->
+<section id="get-started" class="cta-section">
+  <h2>See it as tools, and against the alternatives.</h2>
+  <p>The architecture is the why. The tool catalog is the how — and the comparison shows what structured memory buys you over a vector store.</p>
+  <div class="hero-actions">
+    <a href="tools.html" class="btn-primary">Browse the tools</a>
+    <a href="compare.html" class="btn-secondary">Compare alternatives</a>
+  </div>
+</section>
+
+<footer>
+  <div style="max-width: 1200px; margin: 0 auto; padding: 3rem 2rem; border-top: 1px solid var(--border); display:flex; justify-content:space-between; gap:2rem; flex-wrap:wrap; color:var(--text-muted);">
+    <div>Ferrosa Memory <span style="color:var(--accent);">0.15</span> · Developer preview</div>
+    <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+      <a href="./" style="color:var(--text-secondary); text-decoration:none;">Overview</a>
+      <a href="how-it-works.html" style="color:var(--text-secondary); text-decoration:none;">How it works</a>
+      <a href="tools.html" style="color:var(--text-secondary); text-decoration:none;">Tools</a>
+      <a href="compare.html" style="color:var(--text-secondary); text-decoration:none;">Compare</a>
+      <a href="getting-started.html" style="color:var(--text-secondary); text-decoration:none;">Setup</a>
+      <a href="../database/" style="color:var(--text-secondary); text-decoration:none;">Database</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('nav').forEach((nav) => {
+    const toggle = nav.querySelector('.nav-toggle');
+    if (!toggle) return;
+    toggle.addEventListener('click', () => {
+      const open = nav.classList.toggle('nav-open');
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+    });
+    nav.querySelectorAll('.nav-links a').forEach((link) => {
+      link.addEventListener('click', () => {
+        nav.classList.remove('nav-open');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-label', 'Open navigation');
+      });
+    });
+  });
+</script>
+</body>
+</html>
