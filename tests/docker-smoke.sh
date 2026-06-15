@@ -116,8 +116,23 @@ RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
+PAIR_CQL_TIMEOUT="${PAIR_CQL_TIMEOUT:-180}"
+
+collect_default_compose_logs() {
+    # Keep failure artifacts before the EXIT trap removes containers. The
+    # workflow's follow-up collection step may run after cleanup has completed.
+    docker compose ps > docker-compose-ps.log 2>&1 || true
+    for service in node1 node2 node3 rustfs rustfs-init; do
+        docker compose logs "$service" > "${service}.log" 2>&1 || true
+    done
+}
+
 pass() { echo -e "${GREEN}PASS${NC}: $1"; }
-fail() { echo -e "${RED}FAIL${NC}: $1"; exit 1; }
+fail() {
+    echo -e "${RED}FAIL${NC}: $1"
+    collect_default_compose_logs
+    exit 1
+}
 info() { echo -e "${YELLOW}INFO${NC}: $1"; }
 
 # Compose file for the cluster suite (trio / quint)
@@ -235,11 +250,11 @@ if $RUN_PAIR; then
 # ============================================================
 info "=== Phase 1: Bidirectional reads and writes ==="
 
-info "Building and starting services..."
-docker compose up -d --build
+info "Building and starting pair services..."
+docker compose up -d --build node1 node2
 
-wait_cql 9042 "node1"
-wait_cql 9043 "node2"
+wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
+wait_cql 9043 "node2" "$PAIR_CQL_TIMEOUT"
 
 info "Waiting for pair mode activation..."
 sleep 5
@@ -377,7 +392,7 @@ info "=== Phase 4: Rejoin and catch-up ==="
 
 info "Restarting node1..."
 docker compose start node1
-wait_cql 9042 "node1" 60
+wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
 
 # Wait for pair mode re-establishment and schema catch-up.
 # Schema should arrive via PairSchemaSync before mutation replay.
@@ -465,8 +480,8 @@ info ""
 info "=== Phase 6: Cluster Formation ==="
 
 info "Starting node3..."
-docker compose up -d node3
-wait_cql 9044 "node3" 60
+docker compose up -d --build node3
+wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
 
 info "Waiting for cluster formation..."
 sleep 15
@@ -608,8 +623,8 @@ info "=== Phase 10: Cluster Recovery ==="
 
 info "Restarting node2 and node3..."
 docker compose start node2 node3
-wait_cql 9043 "node2" 60
-wait_cql 9044 "node3" 60
+wait_cql 9043 "node2" "$PAIR_CQL_TIMEOUT"
+wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
 sleep 10
 
 # Verify cluster re-forms
@@ -703,7 +718,7 @@ docker compose stop node3 >/dev/null 2>&1
 sleep 3
 cql1 "INSERT INTO cluster_test.data (k, v, source) VALUES ('while_n3_down', 'catch_me', 'node1')"
 docker compose start node3 >/dev/null 2>&1
-wait_cql 9044 "node3" 60
+wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
 sleep 10
 RESULT=$(cql3 "SELECT v FROM cluster_test.data WHERE k = 'while_n3_down';" 2>&1) || true
 if echo "$RESULT" | grep -q "catch_me"; then
