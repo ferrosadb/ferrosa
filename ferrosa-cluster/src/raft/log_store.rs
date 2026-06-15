@@ -405,7 +405,7 @@ impl SledLogStore {
 
     /// Open a sled `Db` at `path`, retrying through **transient** directory-lock
     /// contention with a bounded backoff (≤ `MAX_ATTEMPTS` × `BACKOFF` ≈ 500 ms,
-    /// logged per attempt, classified by [`Self::is_lock_contention`]).
+    /// logged per attempt, classified by `is_lock_contention`).
     ///
     /// The single transient-lock retry primitive: used by [`Self::new`] and the
     /// offline tooling, and exposed (`pub`) for tools/tests that need the raw
