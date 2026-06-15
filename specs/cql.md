@@ -234,28 +234,28 @@ Enables full-table scan with post-filter evaluation of WHERE predicates. When a 
 | `min(column)` | Aggregate: minimum value |
 | `max(column)` | Aggregate: maximum value |
 | `sum(column)` | Aggregate: sum |
-| `fts_match(column, query)` | Full-text search predicate with BM25 ranking (see below) |
+| `column = fts_match(query)` | Full-text search predicate with BM25 ranking (see below) |
 
 ### Full-Text Search (`fts_match`)
 
 ```sql
 -- Single term
-SELECT * FROM articles WHERE fts_match(body, 'distributed');
+SELECT * FROM articles WHERE body = fts_match('distributed');
 
 -- Boolean AND/OR
-SELECT * FROM articles WHERE fts_match(body, 'rust AND cassandra');
+SELECT * FROM articles WHERE body = fts_match('rust AND cassandra');
 
 -- Phrase
-SELECT * FROM articles WHERE fts_match(body, '"S3 backed storage"');
+SELECT * FROM articles WHERE body = fts_match('"S3 backed storage"');
 
 -- Prefix wildcard
-SELECT * FROM articles WHERE fts_match(body, 'compac*');
+SELECT * FROM articles WHERE body = fts_match('compac*');
 
 -- NOT
-SELECT * FROM articles WHERE fts_match(body, 'NOT deprecated');
+SELECT * FROM articles WHERE body = fts_match('NOT deprecated');
 
 -- Combined with regular WHERE
-SELECT * FROM articles WHERE category = 'tech' AND fts_match(body, 'distributed') ALLOW FILTERING;
+SELECT * FROM articles WHERE category = 'tech' AND body = fts_match('distributed') ALLOW FILTERING;
 ```
 
 Requires a `CREATE INDEX ... USING 'fulltext'` on the target column. Results ranked by BM25 score.
